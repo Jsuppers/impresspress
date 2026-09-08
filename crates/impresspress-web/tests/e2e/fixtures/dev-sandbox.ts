@@ -1,4 +1,4 @@
-import { expect, type Page } from '@playwright/test';
+import { expect, type BrowserContext, type Page } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -43,6 +43,53 @@ export const ADMIN_EMAIL = 'admin@example.com';
 export const ADMIN_PASSWORD = 'admin123';
 
 /**
+ * Contexts already carrying a forwarder, so a spec that boots twice does not
+ * print every line twice.
+ */
+const FORWARDING = new WeakSet<BrowserContext>();
+
+/**
+ * Print the sandbox's own error and warning logs to the test runner's stdout.
+ *
+ * The runtime never sends an internal error's cause to the client: `err_internal`
+ * sanitizes it to `Internal server error (ref: <id>)` and logs the real cause
+ * behind that ref. On the native server that log is the process's stderr. In
+ * the browser it is `console.error` **inside the service worker**
+ * (`impresspress-browser`'s `tracing` bridge), and a service worker's console
+ * goes nowhere a test run can read. So four intermittent sanitized 500s across
+ * four unrelated pull requests were each diagnosed with the one piece of
+ * evidence that would have named the cause already destroyed.
+ *
+ * Chromium routes a service worker's console messages to the BROWSER CONTEXT,
+ * not to the worker handle and not to the page — `msg.page()` is null for them
+ * — which is why this listens on the context rather than on `page`. Both
+ * sources go to stdout rather than to a Playwright attachment, because CI tees
+ * the runner's output into the job log and that survives a run in which the
+ * report artifact is not what anyone opens first.
+ *
+ * Errors and warnings only: the sandbox logs steadily at info while it boots,
+ * migrates and seeds, and a forwarder that reprinted all of it would bury the
+ * one line worth having.
+ */
+export function forwardSandboxDiagnostics(page: Page) {
+  const context = page.context();
+  if (FORWARDING.has(context)) return;
+  FORWARDING.add(context);
+
+  context.on('console', (msg) => {
+    const level = msg.type();
+    if (level !== 'error' && level !== 'warning') return;
+    // A message with no page came from the service worker; the runtime's own
+    // logs are all of that kind, and they are the ones that carry the ref.
+    const origin = msg.page() === null ? 'worker' : 'page';
+    console.log(`[sandbox ${origin} ${level}] ${msg.text()}`);
+  });
+  page.on('pageerror', (error) => {
+    console.log(`[sandbox page uncaught] ${error.message}`);
+  });
+}
+
+/**
  * Load `/` and wait until the service worker is serving it.
  *
  * The first load of an origin gets the static boot shell: `loader.js`
@@ -62,6 +109,9 @@ export const ADMIN_PASSWORD = 'admin123';
  * neither `load` nor `domcontentloaded` fires promptly behind them.
  */
 export async function bootServiceWorker(page: Page) {
+  // Before the navigation that registers the worker: the listener has to be
+  // in place before the worker exists, or its boot-time logs are lost.
+  forwardSandboxDiagnostics(page);
   await page.goto('/', { waitUntil: 'commit' });
   await page.waitForFunction(() => navigator.serviceWorker.controller !== null, null, {
     timeout: 120_000,

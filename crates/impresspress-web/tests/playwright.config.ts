@@ -28,6 +28,17 @@ export default defineConfig({
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     serviceWorkers: 'allow',
+    // Kept for failures only, so a green run pays nothing. What it is for:
+    // the runtime sanitizes an internal error down to `Internal server error
+    // (ref: <id>)` and logs the real cause behind that ref, and in the browser
+    // that log goes to the service worker's console — which, without this,
+    // nothing records. Four sanitized 500s across four unrelated pull requests
+    // were diagnosed with their causes already gone. The trace carries the
+    // failing request, its response and the console alongside it, and both
+    // dev-sandbox CI jobs already upload the report (which embeds the trace)
+    // on failure. See also `forwardSandboxDiagnostics` in
+    // `e2e/fixtures/dev-sandbox.ts`, which puts the same lines in the job log.
+    trace: 'retain-on-failure',
   },
   projects: [
     { name: 'desktop-chrome', use: { ...devices['Desktop Chrome'] } },

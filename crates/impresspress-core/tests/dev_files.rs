@@ -8,7 +8,7 @@
 use base64ct::{Base64, Encoding};
 use impresspress_core::{
     blocks::dev::{
-        blobs, paths,
+        blobs, gc, paths,
         test_support::{FakeControl, FakeShell},
         workspace, DevBlock, DevShared,
     },
@@ -900,4 +900,87 @@ async fn unknown_types_that_are_not_utf8_still_come_back_as_base64() {
     .await;
     assert_eq!(r["encoding"], "base64");
     assert_eq!(r["content"], serde_json::json!(encoded));
+}
+
+// ---------------------------------------------------------------------------
+// A read is serialized against the mutations that run underneath it
+// ---------------------------------------------------------------------------
+
+/// A read holds the manifest it loaded until it has the blob that manifest
+/// names — so a write and a collection that land in between cannot turn it
+/// into a `500`.
+///
+/// The defect this pins is real and user-facing, not a fixture artifact.
+/// `DevShared::workspace` orders the manifest's writers against each other and
+/// orders nothing against a read, so before the fix `handle_read` loaded the
+/// manifest unlocked and fetched the blob afterwards. Every storage call is a
+/// suspension point and the sandbox's fetch events dispatch concurrently, so
+/// the two steps really do straddle a mutation: the entry is repointed, the
+/// blob the *old* entry named becomes unreachable, the collector reclaims it,
+/// and the fetch comes back `NotFound` — which the handler can only report as
+/// corruption, i.e. a sanitized internal error on a read that asked for
+/// nothing unusual.
+///
+/// The path is a `blocks/` one on purpose. A `site/` write publishes a
+/// generation, and a retained generation's site manifest is a collector root
+/// that would keep the superseded blob alive — the race would still be there
+/// and nothing would observe it. Block sources live in the workspace and in no
+/// generation at all (`blocks::dev::gc`'s header), so overwriting one makes
+/// the previous blob collectable immediately.
+///
+/// `hold_next_storage_get` is what makes the interleaving expressible: the
+/// fixture's store resolves every call on its first poll, so joined futures
+/// otherwise run one at a time and no ordering bug is observable. It parks the
+/// read's blob fetch, the other half of the join runs the write and the
+/// collection, and the read is released when they are done. Under the fix that
+/// release never arrives — the write is blocked on the lock the read is
+/// holding — so the park's poll budget expires instead, which is exactly the
+/// outcome that says the read was serialized.
+#[tokio::test]
+async fn a_read_holds_off_the_write_and_the_collection_that_would_pull_its_blob() {
+    const PATH: &str = "blocks/demo/src/lib.rs";
+
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+    let v1 = write_new(&ctx, PATH, "// v1").await;
+
+    // Park the read between its manifest load and its blob fetch.
+    let hold = ctx.hold_next_storage_get("impresspress/dev", blobs::FOLDER, &v1);
+
+    let read = dev_post(&ctx, "/b/dev/api/files/read", json!({"path": PATH}));
+    let mutate = async {
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/write",
+            json!({"path": PATH, "content": "// v2", "expected_sha256": v1}),
+        )
+        .await;
+        gc::collect(&ctx, &shared)
+            .await
+            .expect("the collector must run");
+        // Only reachable when the read did NOT hold the lock across its two
+        // steps; under the fix the write above is still waiting for it.
+        hold.release();
+    };
+    let (read_out, ()) = tokio::join!(read, mutate);
+
+    assert!(
+        hold.was_reached(),
+        "the read never fetched a blob, so nothing was interleaved and this \
+         test proved nothing",
+    );
+    let body = match read_out.collect_buffered().await {
+        Ok(buf) => buf.body,
+        Err(terminal) => panic!(
+            "the read must survive a write and a collection landing underneath \
+             it, but it terminated {terminal:?}",
+        ),
+    };
+    let read: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+    assert_eq!(
+        read["sha256"], v1,
+        "the read answered from the manifest it loaded, so it must return that \
+         manifest's content",
+    );
+    assert_eq!(read["content"], "// v1");
 }

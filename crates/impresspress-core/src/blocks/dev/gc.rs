@@ -184,8 +184,24 @@ pub async fn collect_interleaved(
 /// writes that store blobs and credited by [`collect`] as it frees them, and
 /// the builds table has a row per stored artifact because staging writes the
 /// row before the bytes and [`collect`] deletes the row with them.
-pub async fn storage_usage(ctx: &dyn Context) -> Result<StorageUsage, WaferError> {
-    let ws = workspace::load(ctx).await?;
+///
+/// The manifest read is under `DevShared::workspace`, like every other read of
+/// it (`super::files`' header): this is the *poll* the page runs three times a
+/// second while a tool call is outstanding, so it is the read most likely to
+/// land inside [`collect_blobs`]'s delete-and-save — and a progress panel that
+/// answers `500` while the collector works is the user-visible shape of that
+/// race. Pacing behind the collector is what the panel wants anyway.
+///
+/// Deadlock-free on the same rule as the mutators: the lock is held around the
+/// manifest load and nothing else, never across an activation.
+pub async fn storage_usage(
+    ctx: &dyn Context,
+    shared: &DevShared,
+) -> Result<StorageUsage, WaferError> {
+    let ws = {
+        let _serialized = shared.workspace.lock().await;
+        workspace::load(ctx).await?
+    };
     let artifacts = repo::builds::artifact_index(ctx).await?;
     Ok(StorageUsage {
         blobs: ws.blob_count,

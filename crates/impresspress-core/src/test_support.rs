@@ -598,6 +598,24 @@ impl TestContext {
         Ok(bytes)
     }
 
+    /// Park the fixture's object store on the next `get` of one object, and
+    /// hand back the handle that releases it.
+    ///
+    /// `block`, `folder` and `key` are the same three parts
+    /// [`Self::storage_get`] takes — the namespace owner, its folder and the
+    /// object — because the hold is installed *underneath* the per-block
+    /// namespacing wrapper, where the key really is `{block}/{folder}` +
+    /// `{key}`.
+    ///
+    /// This is the only way a fixture can put a suspension inside a handler:
+    /// the store resolves everything on the first poll, so joined futures
+    /// otherwise run to completion one at a time and no interleaving is
+    /// observable at all.
+    pub fn hold_next_storage_get(&self, block: &str, folder: &str, key: &str) -> Arc<HeldGet> {
+        self.storage()
+            .hold_next_get(&format!("{block}/{folder}"), key)
+    }
+
     /// Make the fixture's object store refuse the next `put`.
     ///
     /// The one failure a test cannot otherwise produce: a publish that fails
@@ -1912,6 +1930,63 @@ pub async fn openapi_document(ctx: &TestContext) -> serde_json::Value {
 // In-memory storage backend
 // ---------------------------------------------------------------------------
 
+/// A `get` [`InMemoryStorageService::hold_next_get`] has parked, and the
+/// handle that lets it through.
+///
+/// The park is **bounded** — it gives up after a fixed number of polls — and
+/// that bound is load-bearing rather than defensive. A test that parks a read
+/// and then drives a mutation is asserting one of two outcomes: either the
+/// mutation runs to completion while the read is suspended (the read is
+/// unserialized, and the release arrives), or the mutation blocks on the lock
+/// the read is holding and the release can never arrive at all. Only the bound
+/// distinguishes the second case from a hang, so the correct behaviour is the
+/// one that exhausts the budget.
+#[derive(Default)]
+pub struct HeldGet {
+    released: std::sync::atomic::AtomicBool,
+    reached: std::sync::atomic::AtomicBool,
+}
+
+impl HeldGet {
+    /// How many polls a parked `get` waits before giving up.
+    ///
+    /// Only ever reached when the release is unreachable, so its size costs
+    /// nothing; large enough that a released hold is never cut short by it.
+    const POLL_BUDGET: u32 = 256;
+
+    /// Let the parked `get` through.
+    pub fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a `get` ever actually parked here.
+    ///
+    /// A test that never reached its own seam proves nothing, so assert this.
+    pub fn was_reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Suspend until [`Self::release`] or the poll budget, whichever is first.
+    async fn park(&self) {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut polls = 0u32;
+        std::future::poll_fn(|cx| {
+            if self.released.load(std::sync::atomic::Ordering::SeqCst) || polls >= Self::POLL_BUDGET
+            {
+                return std::task::Poll::Ready(());
+            }
+            polls += 1;
+            // Wake immediately: the point is to hand the executor a chance to
+            // poll whatever else the test is driving, not to sleep.
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+}
+
 /// One object held by [`InMemoryStorageService`].
 struct StoredObject {
     data: Vec<u8>,
@@ -1950,6 +2025,16 @@ pub struct InMemoryStorageService {
     /// fixture can produce it: every other failure is refused before anything
     /// has been changed.
     fail_next_put: Mutex<Option<String>>,
+    /// Objects whose next `get` parks, keyed by `(folder, key)` and installed
+    /// by [`Self::hold_next_get`]. One-shot: the entry is taken by the `get`
+    /// that matches it.
+    ///
+    /// The store is otherwise entirely synchronous — every operation resolves
+    /// on its first poll — which is exactly why an ordering bug is invisible
+    /// in a fixture (`blocks::dev::gc`'s `GcInterleave` says the same thing
+    /// about the collector). A real backend suspends on every call; this is
+    /// how a test puts one suspension where the property under test lives.
+    held_gets: Mutex<std::collections::BTreeMap<(String, String), Arc<HeldGet>>>,
     /// Every mutating operation in the order it arrived, as
     /// `"{op} {folder}/{key}"`.
     ///
@@ -1965,6 +2050,23 @@ impl InMemoryStorageService {
     /// A store with no folders and no objects.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Park the next `get` of `folder`/`key` until the returned handle is
+    /// released, so a test can drive something else while one read is
+    /// suspended mid-flight.
+    ///
+    /// The suspension is what makes a concurrency test mean anything here: an
+    /// in-memory store never yields, so two futures joined against it run one
+    /// after the other and no interleaving a handler is vulnerable to can
+    /// occur. See [`HeldGet`] for why the park is bounded.
+    pub fn hold_next_get(&self, folder: &str, key: &str) -> Arc<HeldGet> {
+        let hold = Arc::new(HeldGet::default());
+        self.held_gets
+            .lock()
+            .expect("held_gets mutex poisoned")
+            .insert((folder.to_string(), key.to_string()), hold.clone());
+        hold
     }
 
     /// Make the next `put` refuse with `message`, storing nothing.
@@ -2032,6 +2134,17 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
         ),
         wafer_core::interfaces::storage::service::StorageError,
     > {
+        // Before the lookup, so a parked read observes whatever the code it
+        // was interleaved with left behind rather than a snapshot taken
+        // beforehand. The hold is taken out of the map here, so it fires once.
+        let hold = self
+            .held_gets
+            .lock()
+            .expect("held_gets mutex poisoned")
+            .remove(&(folder.to_string(), key.to_string()));
+        if let Some(hold) = hold {
+            hold.park().await;
+        }
         let guard = self.objects.lock().expect("objects mutex poisoned");
         let object = guard
             .get(&(folder.to_string(), key.to_string()))
