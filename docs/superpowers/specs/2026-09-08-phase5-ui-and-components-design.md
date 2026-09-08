@@ -5,7 +5,10 @@
 follows wherever they differ, and they override `docs/CODE_REVIEW_2026-09-05.md` wherever they
 contradict it — the review is three days and four phases stale, and the reconnaissance re-derived
 every count in this document from the tree. Pull requests execute in the order of ruling 5.6.
-Sections 0–8 are the reconnaissance and stay as the record; they are not re-litigated.
+Sections 0–8 below are the reconnaissance and stay as the record; they are not re-litigated. Note
+that the rulings are numbered 5.1–5.6 after the phase and the inventory's own §5 has subsections of
+the same numbers, so ruling headings carry the word "Ruling" and a bare `§5.n` always means the
+inventory.
 **Repos:** `impresspress` only, pull requests on the `Jsuppers` fork. No producer change — the
 `wafer-run` pin does not move in this phase.
 **Origin:** Phase 5 of `docs/CODE_REVIEW_2026-09-05.md` (§7, the phase-5 line at `:317`); theme T8;
@@ -26,7 +29,7 @@ checked against the tree after the fact and which were not. Everything else stan
 These are the rulings of 2026-09-08. They bind every phase 5 pull request and are not to be
 re-litigated.
 
-### 5.1 Three review items are CLOSED as already fixed, not carried
+### Ruling 5.1 — Three review items are CLOSED as already fixed, not carried
 
 The reconnaissance verified each against the tree with a named test. They are recorded here as
 closed **with the evidence that closed them**, rather than deleted: a finding that was fixed by
@@ -45,7 +48,7 @@ other work is a different thing from a finding that was wrong, and only the row 
 and matched every rendered URL against them. Zero misses. The one apparent mismatch is documented
 at `blocks/admin/mod.rs:422-423`, where both verbs map to the same handler.
 
-### 5.2 "Administration is fully first-generation" is REFUTED and the phase is re-aimed
+### Ruling 5.2 — "Administration is fully first-generation" is REFUTED and the phase is re-aimed
 
 The review's claim does not hold. Administration is mixed: **34 second-generation component calls
 already**. What is uniformly first-generation is narrower and more specific:
@@ -65,7 +68,7 @@ buttons that already carry the right classes.
 **The stat tile is refuted as a second renderer** — `ui/templates.rs` already delegates to
 `components::stat_card`. Leave it alone.
 
-### 5.3 No live cross-site-scripting sink. Do the hygiene anyway, and say why
+### Ruling 5.3 — No live cross-site-scripting sink. Do the hygiene anyway, and say why
 
 The reconnaissance traced all six interpolating attribute handlers to closed sets. This phase fixes
 duplication and a latent hazard, not a live vulnerability. **Do not describe it as a security fix in
@@ -77,7 +80,7 @@ escape, which is a real hazard the day any of them carries operator-supplied tex
 exists and is documented at `blocks/admin/pages/network.rs:62-65`; this phase applies it everywhere
 else.
 
-### 5.4 The baseline-moving change ships alone
+### Ruling 5.4 — The baseline-moving change ships alone
 
 Exactly one pull request moves rendered output: migrating administration's tables to the shared
 table component. It lands on its own branch, with no other change, because a baseline diff has to be
@@ -95,7 +98,7 @@ Two things about the baselines that the reconnaissance found and that bind:
 For the pull requests expected not to move baselines, a non-empty regeneration is a **finding**, not
 a chore. Report it before regenerating.
 
-### 5.5 Scope is the review's phase 5 line. Candidates are listed, not folded in
+### Ruling 5.5 — Scope is the review's phase 5 line. Candidates are listed, not folded in
 
 The reconnaissance surfaced tempting adjacent work: generalising the link gate to nine uncovered
 blocks, rendering the legal-pages endpoint list from the route table (it currently names one verb
@@ -108,7 +111,7 @@ renderer: the two copies **have already drifted**, one using semantic classes an
 colours, under reciprocal comments asking them to stay in sync. That is recorded as a defect rather
 than a candidate, because a "keep in sync" comment that has already failed is a finding.
 
-### 5.6 Six pull requests, in this order
+### Ruling 5.6 — Six pull requests, in this order
 
 Consolidating the reconnaissance's first two, which are both asset plumbing with no rendered change:
 
@@ -577,10 +580,27 @@ at `.gitignore:19-24`):
   "Created"], td[data-label="Created By"]`.** The `data-label` attribute is emitted **only by
   `components::data_table`** (`ui/components/table.rs:53`) — raw `table .table` markup emits none.
   See §6.3, this is load-bearing.
+
+  > **Correction (the masking pull request, landed with this document).** There is now a third
+  > locator in each of those three arrays, `[data-volatile-metric], .stat-card:has-text("Avg
+  > Response") .stat-value`, and the `time` half of the first locator has acquired matches it did
+  > not have: `blocks/admin/pages/network.rs` now wraps its two wall-clock stamps in `<time>` and
+  > its three duration figures in `<span data-volatile-metric>`. The wrappers sit inside the cell
+  > rather than on the `<td>`, precisely because `data_table` owns the `<td>` and takes only inner
+  > markup — see the coordination notes. Line numbers in this bullet predate that change.
 - **CI:** `.github/workflows/ci.yml` job `e2e-visual` (line 1136) runs the suite **on
   `pull_request` only**. `.github/workflows/ci-main.yml` has **no `e2e-visual` job** — post-merge
   pushes to main never run it. `products-browser` (`ci.yml:1225`) and `product-examples`
   (`ci.yml:1264`) run in both.
+- **The regen workflow cannot bake in a sub-tolerance change.** Playwright 1.59's
+  `--update-snapshots` rewrites only the baselines whose comparison *fails*; one that still passes
+  is left byte-identical on disk. So a change that repaints or shifts fewer than
+  `maxDiffPixelRatio` pixels — a newly added mask, for instance — produces "No baseline drift —
+  nothing to commit" and the stale image stays committed, to surface later mixed into whatever
+  larger change does exceed the tolerance. The way to force it is to delete the baseline in a
+  commit and let the regen recreate it: verified on 1.59.1 that a missing snapshot is written and
+  the run still exits 0, and the workflow's commit step already uses `git status --porcelain`
+  specifically so it picks the recreated file up as untracked.
 - **Regen:** `.github/workflows/regen-visual-baselines.yml`, `workflow_dispatch` with a `branch`
   input; runs `--update-snapshots` for all three suites and commits as `github-actions[bot]`. Per
   the standing note, a bot push does **not** retrigger PR checks unless `BASELINE_PUSH_TOKEN` is
