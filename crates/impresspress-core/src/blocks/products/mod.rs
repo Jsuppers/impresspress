@@ -1,3 +1,4 @@
+pub mod assets;
 pub(crate) mod config;
 pub mod contracts;
 mod handlers;

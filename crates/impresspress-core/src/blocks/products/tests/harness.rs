@@ -179,6 +179,29 @@ pub async fn output_to_html(out: OutputStream) -> String {
     }
 }
 
+/// Assert that `html` loads the products bundle `logical`, and hand back that
+/// bundle's source.
+///
+/// The pages delegate most of their behaviour to JavaScript, and that
+/// JavaScript is served from `/b/static/` rather than inlined into the page.
+/// A page test that wants to assert on it therefore has two halves to check,
+/// and this is both of them at once: the page's `<script src>` (carrying the
+/// bundle's content hash, so a rename cannot pass) and the bundle's own
+/// source. Asserting only the second would pass for a page that never loads
+/// the file — which is exactly what these assertions would have degraded into
+/// when the source moved out of the page.
+#[cfg(feature = "embed-assets")]
+pub fn loaded_bundle(html: &str, logical: &str) -> &'static str {
+    let url = crate::ui::assets::url(logical);
+    assert!(
+        html.contains(&format!("<script src=\"{url}\"")),
+        "the page must load {logical} from {url}"
+    );
+    let bytes = super::super::assets::bytes(logical)
+        .unwrap_or_else(|| panic!("{logical} is not an embedded products asset"));
+    std::str::from_utf8(bytes).expect("asset source is UTF-8")
+}
+
 /// Check if an `OutputStream` terminated with an error of the given code.
 pub async fn output_is_error(out: OutputStream, expected: ErrorCode) -> bool {
     use wafer_run::streams::output::TerminalNotResponse;

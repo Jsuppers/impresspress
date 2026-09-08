@@ -405,7 +405,11 @@ async fn admin_seller_api_and_pages_expose_owned_products_and_safe_capability_st
     .await;
     assert!(html.contains("Approve listing"));
     assert!(html.contains("Return to seller"));
-    assert!(html.contains("productManagerModerate"));
+    // The moderation verb the page renders. It used to be the JavaScript
+    // handler name, which was in the HTML only because the manager bundle was
+    // inlined into it; the bundle is an external file now, and the verb is the
+    // page's own half of the contract either way.
+    assert!(html.contains("data-action=\"pm-moderate\""));
 }
 
 #[test]

@@ -127,6 +127,18 @@ Consolidating the reconnaissance's first two, which are both asset plumbing with
 5. **The product wizard's JavaScript to a file.** About 650 lines. The risk is the products
    lifecycle end-to-end test, which mocks its origins and will fail to find the new asset URLs
    unless the static path passes through. Check that first, not last.
+
+   > **Correction (PR 5 of this ruling, 2026-09-09).** The named risk does not exist in the form
+   > stated, and the risk that does exist is a different one. `products-lifecycle.spec.ts`
+   > fabricates every page it tests in-process and serves it from `page.route()`; it never
+   > reaches a server, so there is no request for a `/b/static/` URL to 404 and nothing needed
+   > to be passed through. What it did do was read the Rust source of `pages.rs` and dig the
+   > script constants out with a regular expression — and that regular expression is what broke.
+   > Six specs did it (`products-lifecycle`, `-wizard`, `-manager`, `-seller-governance`,
+   > `-catalog-admin`, `-webhook-admin`); all six now read the `.js` file, as
+   > `products-storefront.spec.ts` always has. The eight lifecycle baselines are drawn from
+   > fabricated markup that this pull request does not touch, so they cannot move for this
+   > reason either.
 6. **Delete what is now unused.** Stylesheet deletion is blocked at `ui/mod.rs:1725` until ten
    non-administration raw tables migrate, which is out of scope, so this ships as "delete what is
    unused" and records the rest.
@@ -674,6 +686,14 @@ at `.gitignore:19-24`):
    and would 404 the new asset URL**, and it has no `maxDiffPixelRatio` override. That spec's 8
    baselines cover exactly the products flows this change touches. Verify the mock passes through
    `/b/static/*` before assuming it is safe.
+
+   > **Correction (PR 5 of ruling 5.6, 2026-09-09).** Verified, and the second half is wrong.
+   > `products-lifecycle.spec.ts` builds every page it exercises as a string in the spec file and
+   > fulfils it from `page.route()`, inlining the script source into that string. It issues no
+   > request for a page asset, so a new `/b/static/` URL cannot 404 there and the mock needed no
+   > pass-through. The real coupling was to `pages.rs` as a *text file*: six product specs
+   > extracted the script constants with a regular expression over the Rust source, and all six
+   > had to be pointed at the `.js` files instead.
 
 **Blind spots to bear in mind:** legalpages, tickets, messages and dev have **no visual coverage at
 all**, and llm has coverage only for the chat page. `blocks/legalpages/pages.rs` (627 lines),

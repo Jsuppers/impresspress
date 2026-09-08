@@ -2,16 +2,27 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const pagesPath = fileURLToPath(
-  new URL("../../../impresspress-core/src/blocks/products/pages.rs", import.meta.url),
+const bundlesUrl = new URL(
+  "../../../impresspress-core/src/blocks/products/assets/",
+  import.meta.url,
 );
-const widgetPath = fileURLToPath(
-  new URL(
-    "../../../impresspress-core/src/blocks/products/assets/storefront.js",
-    import.meta.url,
-  ),
-);
-const pagesSource = readFileSync(pagesPath, "utf8");
+const widgetPath = fileURLToPath(new URL("storefront.js", bundlesUrl));
+
+/**
+ * A products browser bundle, read from the very file the server serves at
+ * `/b/static/products-*.js`.
+ *
+ * This spec mocks every origin with `page.route()` and never reaches a real
+ * server, so it inlines the bundle into the markup it fabricates rather than
+ * letting the page load it. That is why moving these scripts out of `pages.rs`
+ * did not 404 anything here: there was no request to 404. What it did break is
+ * the regular expression that used to dig the Rust string constants out of
+ * `pages.rs` — the source is a file now, so the spec reads the file.
+ */
+function bundle(name: string) {
+  return readFileSync(fileURLToPath(new URL(name, bundlesUrl)), "utf8");
+}
+
 const adminOrigin = "https://admin.example";
 const shopOrigin = "https://shop.example";
 const apiOrigin = "https://api.example";
@@ -19,27 +30,9 @@ const checkoutOrigin = "https://checkout.stripe.test";
 const connectOrigin = "https://connect.stripe.test";
 const billingOrigin = "https://billing.stripe.test";
 
-function rustConst(name: string) {
-  const match = pagesSource.match(
-    new RegExp(`const ${name}: &str = r#"\\n([\\s\\S]*?)\\n"#;`),
-  );
-  if (!match) throw new Error(`Could not extract ${name} from pages.rs`);
-  return match[1];
-}
-
-function rustFunction(name: string) {
-  const match = pagesSource.match(
-    new RegExp(
-      `fn ${name}\\(\\) -> &'static str \\{\\s*r#"\\n([\\s\\S]*?)\\n"#\\s*\\}`,
-    ),
-  );
-  if (!match) throw new Error(`Could not extract ${name} from pages.rs`);
-  return match[1];
-}
-
-const productWizardScript = rustConst("PRODUCT_WIZARD_JS");
-const orderDetailScript = rustConst("ORDER_DETAIL_JS");
-const commercePortalScript = rustFunction("commerce_portal_js");
+const productWizardScript = bundle("products-wizard.js");
+const orderDetailScript = bundle("products-order-detail.js");
+const commercePortalScript = bundle("products-commerce-portal.js");
 
 const styles = `
   :root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#182128;background:#f3f6f4}
@@ -94,7 +87,7 @@ function wizardHtml(template: "simple_product" | "simple_subscription", seller =
       </div><div id="wizard-shipping-settings" hidden><label for="wizard-shipping-countries">Countries</label><input id="wizard-shipping-countries" value="NZ"><label for="wizard-shipping-options">Rates</label><textarea id="wizard-shipping-options"></textarea></div></section>
       <section class="card" data-wizard-step="5" hidden><h2>Review</h2><div id="wizard-review" aria-live="polite"></div></section>
       <div class="actions"><button id="wizard-previous" type="button" data-action="pw-previous" hidden>Back</button><button id="wizard-next" type="button" data-action="pw-next">Continue</button><button id="wizard-save-draft" type="button" data-action="pw-submit" data-wizard-intent="draft" hidden>Save draft</button><button id="wizard-publish" type="button" data-action="pw-submit" data-wizard-intent="publish" hidden>${seller ? "Submit for publication" : "Create and publish"}</button></div>
-    </form><script>window.__productWizardConfig={admin:${!seller},product_collection:"/b/products/api/${seller ? "products" : "admin/products"}",return_url:"/b/products/${seller ? "my-products" : "admin/manage"}"};${productWizardScript};initProductWizard();</script>`,
+    </form><script>window.__productWizardConfig={admin:${!seller},product_collection:"/b/products/api/${seller ? "products" : "admin/products"}",return_url:"/b/products/${seller ? "my-products" : "admin/manage"}"};${productWizardScript}</script>`,
     `<a href="/b/products/admin/manage">Products</a><a href="/b/products/admin/stripe">Stripe</a>`,
   );
 }

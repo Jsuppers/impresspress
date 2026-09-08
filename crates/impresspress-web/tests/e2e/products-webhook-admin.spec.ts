@@ -2,22 +2,23 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const pagesPath = fileURLToPath(
-  new URL(
-    "../../../impresspress-core/src/blocks/products/pages.rs",
-    import.meta.url,
-  ),
+const bundlesUrl = new URL(
+  "../../../impresspress-core/src/blocks/products/assets/",
+  import.meta.url,
 );
-const adminOrigin = "https://admin.example";
 
-function stripeSetupScript() {
-  const source = readFileSync(pagesPath, "utf8");
-  const match = source.match(
-    /fn stripe_setup_js\(\) -> &'static str \{\s*r#"\n([\s\S]*?)\n"#\s*\}/,
-  );
-  if (!match) throw new Error("Could not extract stripe_setup_js from pages.rs");
-  return match[1];
+/**
+ * A products browser bundle, read from the very file the server serves at
+ * `/b/static/products-*.js`. These used to be Rust string constants dug out
+ * of `pages.rs` with a regular expression; they are real files now, so the
+ * spec reads the file — the same way `products-storefront.spec.ts` has always
+ * read `storefront.js`.
+ */
+function bundle(name: string) {
+  return readFileSync(fileURLToPath(new URL(name, bundlesUrl)), "utf8");
 }
+
+const adminOrigin = "https://admin.example";
 
 function webhookEvent(
   overrides: Partial<Record<string, unknown>> = {},
@@ -69,7 +70,7 @@ async function json(route: Route, body: unknown, status = 200) {
 
 async function openWebhookOperations(page: Page) {
   await page.goto(`${adminOrigin}/b/products/admin/stripe`);
-  await page.addScriptTag({ content: stripeSetupScript() });
+  await page.addScriptTag({ content: bundle("products-stripe-setup.js") });
 }
 
 const operationsHtml = `<!doctype html>

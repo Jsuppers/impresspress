@@ -200,6 +200,10 @@ pub fn static_asset_bytes(logical: &str) -> Option<&'static [u8]> {
     if let Some(b) = files::assets::bytes(logical) {
         return Some(b);
     }
+    #[cfg(feature = "block-products")]
+    if let Some(b) = products::assets::bytes(logical) {
+        return Some(b);
+    }
     // Bound so a build with neither block still uses the parameter.
     let _ = logical;
     None
