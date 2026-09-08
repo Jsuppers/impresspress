@@ -917,11 +917,22 @@ pub async fn admin_seller_detail(
 }
 
 const SELLER_ADMIN_JS: &str = r#"
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action="psa-set-state"]');
-  if(el)adminSellerSetState(el);
-});
+// Guarded, because this whole script re-runs on every htmx partial swap: a tab
+// navigation asks for the page with `HX-Request`, `ui::shell_page` answers with
+// the body verbatim (`ui/mod.rs:226`), htmx executes the scripts in what it
+// swapped in, and `document` outlives the swap. Without the flag a user who
+// visits a second tab and comes back has this listener bound twice and every
+// mutating action fires twice. The declarations below are safe to re-run --
+// re-declaring a function replaces it -- so only the registration is guarded.
+(function(){
+  if(window.__sellerAdminDelegated)return;
+  window.__sellerAdminDelegated=true;
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action="psa-set-state"]');
+    if(el)adminSellerSetState(el);
+  });
+})();
 async function adminSellerSetState(button){if(window.__sellerAdminConfig.action==='suspend'&&!window.confirm('Suspend this seller? Active offers and Payment Links will be archived in Stripe before local access is revoked.'))return;button.disabled=true;var original=button.textContent;button.textContent='Working…';var target=document.getElementById('seller-admin-error');target.hidden=true;try{var response=await fetch(window.__sellerAdminConfig.action_url,{method:'POST',credentials:'same-origin',headers:{Accept:'application/json','Content-Type':'application/json'},body:'{}'}),text=await response.text(),payload={};if(text){try{payload=JSON.parse(text)}catch(_error){payload={message:text}}}if(!response.ok)throw new Error(payload.message||payload.error||('Request failed ('+response.status+')'));window.location.reload()}catch(error){target.textContent=error.message;target.hidden=false;button.disabled=false;button.textContent=original}}
 "#;
 
@@ -1686,27 +1697,35 @@ function initProductWizard(){productWizardTemplateChanged();productWizardShippin
 // the page -- the product manager loads this file too, for the visual editor's
 // "+ Add input"/"+ Add row" buttons, which is why those two verbs work on both
 // pages from this one listener.
-document.addEventListener('submit',function(e){
-  if(e.target&&e.target.id==='product-wizard-form')e.preventDefault();
-});
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action]');
-  if(!el)return;
-  var action=el.getAttribute('data-action');
-  if(action==='pw-add-variable')addWizardVariable();
-  else if(action==='pw-add-component')addWizardComponent();
-  else if(action==='pw-previous')productWizardPrevious();
-  else if(action==='pw-next')productWizardNext();
-  else if(action==='pw-submit')submitProductWizard(el.getAttribute('data-wizard-intent'));
-});
-document.addEventListener('change',function(e){
-  var el=e.target;
-  if(!(el instanceof Element))return;
-  var action=el.getAttribute('data-action');
-  if(action==='pw-template-changed')productWizardTemplateChanged();
-  else if(action==='pw-shipping-changed')productWizardShippingChanged();
-});
+//
+// Guarded for the reason spelled out at SELLER_ADMIN_JS: an htmx tab swap
+// re-executes this script against the same `document`, so an unguarded
+// registration accumulates one listener per visit.
+(function(){
+  if(window.__productWizardDelegated)return;
+  window.__productWizardDelegated=true;
+  document.addEventListener('submit',function(e){
+    if(e.target&&e.target.id==='product-wizard-form')e.preventDefault();
+  });
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action]');
+    if(!el)return;
+    var action=el.getAttribute('data-action');
+    if(action==='pw-add-variable')addWizardVariable();
+    else if(action==='pw-add-component')addWizardComponent();
+    else if(action==='pw-previous')productWizardPrevious();
+    else if(action==='pw-next')productWizardNext();
+    else if(action==='pw-submit')submitProductWizard(el.getAttribute('data-wizard-intent'));
+  });
+  document.addEventListener('change',function(e){
+    var el=e.target;
+    if(!(el instanceof Element))return;
+    var action=el.getAttribute('data-action');
+    if(action==='pw-template-changed')productWizardTemplateChanged();
+    else if(action==='pw-shipping-changed')productWizardShippingChanged();
+  });
+})();
 "#;
 
 // ---------------------------------------------------------------------------
@@ -2318,32 +2337,37 @@ async function productManagerLoadLinks(card){var target=card.querySelector('[dat
 function initProductManager(){document.querySelectorAll('[data-offer-card]').forEach(function(card){productManagerLoadLinks(card);productManagerLoadPresets(card)})}
 // The manager page's 17 controls, delegated. `pm-moderate` reads the decision
 // from the `data-moderation-action` attribute the two buttons already carried.
-document.addEventListener('submit',function(e){
-  if(e.target&&e.target.id==='product-manager-form')productManagerSaveProduct(e);
-});
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action]');
-  if(!el)return;
-  switch(el.getAttribute('data-action')){
-    case 'pm-open-visual-editor':productManagerOpenVisualEditor(el);break;
-    case 'pm-offer-action':productManagerOfferAction(el,el.getAttribute('data-offer-op'));break;
-    case 'pm-preview':productManagerPreview(el);break;
-    case 'pm-save-offer':productManagerSaveOffer(el);break;
-    case 'pm-create-link':productManagerCreateLink(el);break;
-    case 'pm-new-preset':productManagerNewPreset(el);break;
-    case 'pm-copy-field':productManagerCopyField(el);break;
-    case 'pm-moderate':productManagerModerate(el,el.getAttribute('data-moderation-action'));break;
-    case 'pm-duplicate':productManagerDuplicate(el);break;
-    case 'pm-set-status':productManagerSetStatus(el.getAttribute('data-product-status'),el);break;
-    case 'pm-close-visual-editor':productManagerCloseVisualEditor();break;
-    case 'pm-save-visual-offer':productManagerSaveVisualOffer(el);break;
-  }
-});
-document.addEventListener('change',function(e){
-  var el=e.target;
-  if(el instanceof Element&&el.getAttribute('data-action')==='pm-visual-mode-changed')productManagerVisualModeChanged();
-});
+// Guarded against htmx re-execution; see SELLER_ADMIN_JS.
+(function(){
+  if(window.__productManagerDelegated)return;
+  window.__productManagerDelegated=true;
+  document.addEventListener('submit',function(e){
+    if(e.target&&e.target.id==='product-manager-form')productManagerSaveProduct(e);
+  });
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action]');
+    if(!el)return;
+    switch(el.getAttribute('data-action')){
+      case 'pm-open-visual-editor':productManagerOpenVisualEditor(el);break;
+      case 'pm-offer-action':productManagerOfferAction(el,el.getAttribute('data-offer-op'));break;
+      case 'pm-preview':productManagerPreview(el);break;
+      case 'pm-save-offer':productManagerSaveOffer(el);break;
+      case 'pm-create-link':productManagerCreateLink(el);break;
+      case 'pm-new-preset':productManagerNewPreset(el);break;
+      case 'pm-copy-field':productManagerCopyField(el);break;
+      case 'pm-moderate':productManagerModerate(el,el.getAttribute('data-moderation-action'));break;
+      case 'pm-duplicate':productManagerDuplicate(el);break;
+      case 'pm-set-status':productManagerSetStatus(el.getAttribute('data-product-status'),el);break;
+      case 'pm-close-visual-editor':productManagerCloseVisualEditor();break;
+      case 'pm-save-visual-offer':productManagerSaveVisualOffer(el);break;
+    }
+  });
+  document.addEventListener('change',function(e){
+    var el=e.target;
+    if(el instanceof Element&&el.getAttribute('data-action')==='pm-visual-mode-changed')productManagerVisualModeChanged();
+  });
+})();
 "#;
 
 const PRODUCT_CATALOG_ADMIN_JS: &str = r#"
@@ -2357,19 +2381,27 @@ function productCatalogNew(){productCatalogClearError();var editor=productCatalo
 function productCatalogEditGroup(button){productCatalogNew();productCatalogById('group-editor-title').textContent='Edit group';productCatalogById('group-editor-id').value=button.dataset.recordId;productCatalogById('group-editor-name').value=button.dataset.recordName||'';productCatalogById('group-editor-description').value=button.dataset.recordDescription||'';productCatalogById('group-editor-status').value=button.dataset.recordStatus||'active'}
 async function productCatalogSaveGroup(event){event.preventDefault();productCatalogClearError();var form=event.target,name=productCatalogById('group-editor-name'),button=form.querySelector('button[type="submit"]');if(!form.checkValidity()){productCatalogError('Enter a group name before saving.',name);return}productCatalogBusy(button,true);try{var id=productCatalogById('group-editor-id').value,url='/b/products/api/admin/groups'+(id?'/'+encodeURIComponent(id):'');await productCatalogRequest(url,id?'PATCH':'POST',{name:name.value.trim(),description:productCatalogById('group-editor-description').value.trim(),status:productCatalogById('group-editor-status').value});window.location.reload()}catch(error){productCatalogError(error.message);productCatalogBusy(button,false)}}
 async function productCatalogDelete(button){if(!window.confirm('Delete group '+(button.dataset.recordName||'')+'? Products already using it may prevent deletion.'))return;productCatalogClearError();button.disabled=true;try{await productCatalogRequest('/b/products/api/admin/groups/'+encodeURIComponent(button.dataset.recordId),'DELETE');window.location.reload()}catch(error){productCatalogError(error.message);button.disabled=false}}
-document.addEventListener('submit',function(e){
-  if(e.target instanceof Element&&e.target.getAttribute('data-action')==='pc-save-group')productCatalogSaveGroup(e);
-});
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action]');
-  if(!el)return;
-  var action=el.getAttribute('data-action');
-  if(action==='pc-new')productCatalogNew();
-  else if(action==='pc-close')productCatalogClose();
-  else if(action==='pc-edit-group')productCatalogEditGroup(el);
-  else if(action==='pc-delete')productCatalogDelete(el);
-});
+// Guarded against htmx re-execution; see SELLER_ADMIN_JS. This is the page the
+// duplicate-listener defect was concrete on: Groups, Orders, Groups again used
+// to leave `pc-delete` bound twice, so one click raised two confirmations and
+// issued two DELETEs, the second answering not found.
+(function(){
+  if(window.__productCatalogDelegated)return;
+  window.__productCatalogDelegated=true;
+  document.addEventListener('submit',function(e){
+    if(e.target instanceof Element&&e.target.getAttribute('data-action')==='pc-save-group')productCatalogSaveGroup(e);
+  });
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action]');
+    if(!el)return;
+    var action=el.getAttribute('data-action');
+    if(action==='pc-new')productCatalogNew();
+    else if(action==='pc-close')productCatalogClose();
+    else if(action==='pc-edit-group')productCatalogEditGroup(el);
+    else if(action==='pc-delete')productCatalogDelete(el);
+  });
+})();
 "#;
 
 // ---------------------------------------------------------------------------
@@ -2687,7 +2719,14 @@ function renderStripeWebhookEvents(data){
   });
   table.appendChild(body);target.appendChild(table);
 }
+// Both lists are replaced wholesale, so two loads in flight at once can land
+// out of order and leave the list disagreeing with the filter that produced
+// it. Each load takes a ticket and only paints if it is still the newest --
+// last request wins, and a superseded response is dropped rather than blocked,
+// which a plain busy flag could not do without losing the newer filter value.
+var stripeWebhookLoadTicket=0;
 async function loadStripeWebhookEvents(){
+  var ticket=++stripeWebhookLoadTicket;
   var target=document.getElementById('stripe-webhook-events');
   var error=document.getElementById('stripe-webhook-error');
   var status=document.getElementById('stripe-webhook-filter').value;
@@ -2696,9 +2735,13 @@ async function loadStripeWebhookEvents(){
     var query='?page=1&page_size=50'+(status?'&status='+encodeURIComponent(status):'');
     var response=await fetch('/b/products/api/admin/webhook-events'+query,{credentials:'same-origin'});
     var data={};try{data=await response.json()}catch(_){}
+    if(ticket!==stripeWebhookLoadTicket)return;
     if(!response.ok)throw new Error(data.message||'Could not load webhook events.');
     renderStripeWebhookEvents(data);
-  }catch(err){target.replaceChildren();error.textContent=err.message||'Could not load webhook events.';error.hidden=false}
+  }catch(err){
+    if(ticket!==stripeWebhookLoadTicket)return;
+    target.replaceChildren();error.textContent=err.message||'Could not load webhook events.';error.hidden=false
+  }
 }
 async function replayStripeWebhookEvent(id,button){
   if(!window.confirm('Replay this Stripe webhook through the normal validation pipeline?'))return;
@@ -2741,7 +2784,10 @@ function renderStripeProviderOperations(data){
   });
   table.appendChild(body);target.appendChild(table);
 }
+// Ticketed for the same reason as loadStripeWebhookEvents above.
+var stripeProviderLoadTicket=0;
 async function loadStripeProviderOperations(){
+  var ticket=++stripeProviderLoadTicket;
   var target=document.getElementById('stripe-provider-operations-list');
   var error=document.getElementById('stripe-provider-error');
   var status=document.getElementById('stripe-provider-filter').value;
@@ -2750,9 +2796,13 @@ async function loadStripeProviderOperations(){
     var query='?page=1&page_size=50'+(status?'&status='+encodeURIComponent(status):'');
     var response=await fetch('/b/products/api/admin/provider-operations'+query,{credentials:'same-origin'});
     var data={};try{data=await response.json()}catch(_){}
+    if(ticket!==stripeProviderLoadTicket)return;
     if(!response.ok)throw new Error(data.message||'Could not load provider operations.');
     renderStripeProviderOperations(data);
-  }catch(err){target.replaceChildren();error.textContent=err.message||'Could not load provider operations.';error.hidden=false}
+  }catch(err){
+    if(ticket!==stripeProviderLoadTicket)return;
+    target.replaceChildren();error.textContent=err.message||'Could not load provider operations.';error.hidden=false
+  }
 }
 async function reconcileStripeProviderOperations(button){
   var error=document.getElementById('stripe-provider-error');
@@ -2767,24 +2817,37 @@ async function reconcileStripeProviderOperations(button){
   }catch(err){error.textContent=err.message||'Could not reconcile provider operations.';error.hidden=false}
   finally{button.disabled=false;button.textContent='Reconcile due operations'}
 }
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action]');
-  if(!el)return;
-  var action=el.getAttribute('data-action');
-  if(action==='ps-test-connection')testStripeConnection();
-  else if(action==='ps-load-webhooks')loadStripeWebhookEvents();
-  else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
-  else if(action==='ps-reconcile')reconcileStripeProviderOperations(el);
-});
-// The two filter <select>s raise the same verbs as their Refresh buttons.
-document.addEventListener('change',function(e){
-  var el=e.target;
-  if(!(el instanceof Element))return;
-  var action=el.getAttribute('data-action');
-  if(action==='ps-load-webhooks')loadStripeWebhookEvents();
-  else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
-});
+// Guarded against htmx re-execution; see SELLER_ADMIN_JS. The two initial
+// loads below stay outside the guard: the swap brought in empty containers, so
+// they have to be filled again even though the listeners are already bound.
+(function(){
+  if(window.__stripeSetupDelegated)return;
+  window.__stripeSetupDelegated=true;
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action]');
+    if(!el)return;
+    var action=el.getAttribute('data-action');
+    if(action==='ps-test-connection')testStripeConnection();
+    else if(action==='ps-reconcile')reconcileStripeProviderOperations(el);
+    // The two filter <select>s carry the same verbs as their Refresh buttons,
+    // and `closest('[data-action]')` matches the <select> itself -- so without
+    // this the mousedown that OPENS the dropdown would fire a load with the
+    // value the user is on their way to changing, and the change event would
+    // fire a second one. Only the buttons act on click.
+    else if(el.tagName!=='SELECT'){
+      if(action==='ps-load-webhooks')loadStripeWebhookEvents();
+      else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
+    }
+  });
+  document.addEventListener('change',function(e){
+    var el=e.target;
+    if(!(el instanceof Element))return;
+    var action=el.getAttribute('data-action');
+    if(action==='ps-load-webhooks')loadStripeWebhookEvents();
+    else if(action==='ps-load-provider-ops')loadStripeProviderOperations();
+  });
+})();
 loadStripeWebhookEvents();
 loadStripeProviderOperations();
 "#
@@ -3052,15 +3115,20 @@ async function manageBuyerBilling(){
 }
 // `pp-order-billing` is handled by ORDER_DETAIL_JS, which is emitted after
 // this file on the one page that needs it.
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action]');
-  if(!el)return;
-  var action=el.getAttribute('data-action');
-  if(action==='pp-seller-onboarding')startSellerOnboarding();
-  else if(action==='pp-seller-dashboard')openSellerDashboard();
-  else if(action==='pp-buyer-billing')manageBuyerBilling();
-});
+// Guarded against htmx re-execution; see SELLER_ADMIN_JS.
+(function(){
+  if(window.__commercePortalDelegated)return;
+  window.__commercePortalDelegated=true;
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action]');
+    if(!el)return;
+    var action=el.getAttribute('data-action');
+    if(action==='pp-seller-onboarding')startSellerOnboarding();
+    else if(action==='pp-seller-dashboard')openSellerDashboard();
+    else if(action==='pp-buyer-billing')manageBuyerBilling();
+  });
+})();
 "#
 }
 
@@ -3344,14 +3412,22 @@ function orderDetailError(message){var target=document.getElementById('order-det
 function parseOrderRefundMinor(value,exponent){value=value.trim();if(!value)return null;if(!/^[+]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))throw new Error('Enter a plain positive amount.');value=value.replace(/^\+/,'');var parts=value.split('.'),whole=parts[0]||'0',fraction=parts[1]||'';if(fraction.length>exponent&&/[1-9]/.test(fraction.slice(exponent)))throw new Error('The amount has too many decimal places for this currency.');fraction=fraction.slice(0,exponent).padEnd(exponent,'0');var minor=BigInt(whole)*(10n**BigInt(exponent))+BigInt(fraction||'0');if(minor<=0n)throw new Error('Refund amount must be positive.');if(minor>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('This amount is too large for the browser refund form.');return Number(minor)}
 async function submitOrderRefund(button){var config=window.__orderDetailConfig,target=document.getElementById('order-detail-error');if(target)target.hidden=true;button.disabled=true;button.textContent='Refunding…';try{var amount=parseOrderRefundMinor(document.getElementById('order-refund-amount').value,config.currency_exponent),note=document.getElementById('order-refund-note').value.trim(),body={note:note,idempotency_key:'ui_'+config.refunded_total+'_'+(amount===null?'full':amount)};if(amount!==null)body.amount_minor=amount;var response=await fetch(config.refund_url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)}),payload={};try{payload=await response.json()}catch(_error){}if(!response.ok)throw new Error(payload.message||payload.error||'Refund failed.');window.location.reload()}catch(error){orderDetailError(error.message);button.disabled=false;button.textContent='Create refund'}}
 async function manageOrderBilling(){var config=window.__orderDetailConfig;try{await commercePortalRedirect('/b/products/billing-portal',{return_url:window.location.href,order_id:config.order_id})}catch(error){orderDetailError(error.message)}}
-document.addEventListener('click',function(e){
-  if(!(e.target instanceof Element))return;
-  var el=e.target.closest('[data-action]');
-  if(!el)return;
-  var action=el.getAttribute('data-action');
-  if(action==='po-submit-refund')submitOrderRefund(el);
-  else if(action==='pp-order-billing')manageOrderBilling();
-});
+// Guarded against htmx re-execution; see SELLER_ADMIN_JS. The refund is the
+// one mutating action on these pages that carries an idempotency key, so a
+// double dispatch would not have double-charged -- but it would still have
+// raised two requests and two error paints.
+(function(){
+  if(window.__orderDetailDelegated)return;
+  window.__orderDetailDelegated=true;
+  document.addEventListener('click',function(e){
+    if(!(e.target instanceof Element))return;
+    var el=e.target.closest('[data-action]');
+    if(!el)return;
+    var action=el.getAttribute('data-action');
+    if(action==='po-submit-refund')submitOrderRefund(el);
+    else if(action==='pp-order-billing')manageOrderBilling();
+  });
+})();
 "#;
 
 async fn order_detail(

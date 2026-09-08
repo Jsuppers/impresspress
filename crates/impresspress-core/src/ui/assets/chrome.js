@@ -254,6 +254,16 @@ document.body.addEventListener("showToast", function(e) {
 // that does not recognise a verb MUST fall through silently — more than one
 // delegated listener sees every click.
 //
+// Two known exceptions to the prefix rule, both pre-existing and both safe only
+// because of where they sit. `blocks/files/assets/files-browser.js` owns the
+// bare verbs share/copy/delete/revoke/create/cancel, but binds them with
+// `addEventListener` on the elements it built itself rather than reading them
+// back from a delegated listener, so nothing here or there can collide.
+// `blocks/tickets/public.rs` puts `data-action="ticket_submit"` on a Cloudflare
+// Turnstile widget — `data-action` is Turnstile's OWN attribute there, not a
+// verb of ours; the page renders without the shell, so this file is not loaded
+// on it. Give that page a shell and the two meanings meet.
+//
 // Chrome's verbs:
 //   modal-open    + data-modal-target="<id>"   reveal that modal overlay
 //   modal-close   + data-modal-target="<id>"   hide it (omit the operand to
@@ -283,17 +293,30 @@ document.body.addEventListener("showToast", function(e) {
     if (window.__modalInit) return;
     window.__modalInit = true;
 
-    // `data-stop-propagation` has to run in the CAPTURE phase: the listener it
-    // exists to silence (htmx's, bound on the enclosing card) sits between
-    // `document` and the link, so a bubbling listener would fire too late.
+    // `data-stop-propagation` reproduces exactly what the inline
+    // `onclick="event.stopPropagation()"` it replaced did: a BUBBLE-phase
+    // listener ON THE MARKED ELEMENT, so everything at or below that element
+    // still fires and nothing above it does — the listener it exists to
+    // silence (htmx's, bound on the enclosing card) is above it.
+    //
+    // That cannot be done by stopping the event in a document listener.
+    // A bubbling one at `document` fires after the card, too late; a capturing
+    // one at `document` fires before anything and aborts the WHOLE dispatch,
+    // which would also silence the marked element's own listeners and every
+    // other delegated behaviour inside it — a trap for the next element that
+    // gets this attribute. So the capture pass only ARMS the real listener,
+    // on the element, for this one dispatch, and it removes itself again.
     // Stopping propagation does not cancel the default action, so the link
-    // still navigates — which is exactly what the inline
-    // `event.stopPropagation()` it replaced did.
+    // still navigates.
     document.addEventListener("click", function (e) {
         var t = e.target;
-        if (t instanceof Element && t.closest("[data-stop-propagation]")) {
-            e.stopPropagation();
-        }
+        if (!(t instanceof Element)) return;
+        var marked = t.closest("[data-stop-propagation]");
+        if (!marked) return;
+        marked.addEventListener("click", function stopOnce(inner) {
+            marked.removeEventListener("click", stopOnce);
+            inner.stopPropagation();
+        });
     }, true);
 
     function openModal(id) {

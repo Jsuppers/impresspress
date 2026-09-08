@@ -1040,81 +1040,230 @@ mod tests {
         );
     }
 
+    /// Every first-party source tree the two handler gates below walk.
+    ///
+    /// The markup lives in `src/blocks` and `src/ui`, but a handler attribute
+    /// is a handler attribute wherever it is written, and a gate whose roots
+    /// stop short of a directory that can emit HTML is a gate with a hole in
+    /// it. So this is every first-party `src` tree in the workspace plus the
+    /// one first-party JavaScript directory that is not under a `src`. What is
+    /// deliberately outside: vendored and generated trees — `node_modules`,
+    /// `pkg`, anything under a `vendor/`, and `*.min.js` — which are not ours
+    /// to fix.
+    const HANDLER_SCAN_ROOTS: [&str; 8] = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../impresspress/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../impresspress-browser/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../impresspress-browser/js"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../impresspress-bundle/src"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../impresspress-cloudflare/src"
+        ),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../impresspress-native/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../impresspress-web/src"),
+    ];
+
+    /// Blank every comment in `src` to spaces, keeping the newlines.
+    ///
+    /// Prose about the rule is not a violation of the rule, and both gates
+    /// below scan the whole file rather than line by line — a handler split
+    /// across two lines is still a handler — so a comment has to be neutralised
+    /// in place rather than skipped. Blanking keeps every line number correct.
+    ///
+    /// A comment has to OPEN its line to be treated as one, for `/*` exactly as
+    /// for `//`. Mid-line, those two characters are far more likely to be part
+    /// of a string: `crates/impresspress-web/src/lib.rs` carries a
+    /// content-security-policy line reading `https://*.huggingface.co`, and
+    /// treating that `/*` as a comment opener blanked every remaining line of
+    /// the file — a hole big enough to hide a whole crate behind. A block
+    /// comment that opens a line and closes on the same one is blanked only up
+    /// to its `*/`, so a handler written after it is still seen.
+    fn blank_comments(src: &str) -> String {
+        fn blanked(s: &str) -> String {
+            " ".repeat(s.chars().count())
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut in_block = false;
+        for line in src.split('\n') {
+            let opens = !in_block && line.trim_start().starts_with("/*");
+            if in_block || opens {
+                match line.find("*/") {
+                    Some(i) => {
+                        in_block = false;
+                        let cut = i + 2;
+                        out.push(format!("{}{}", blanked(&line[..cut]), &line[cut..]));
+                    }
+                    None => {
+                        in_block = true;
+                        out.push(blanked(line));
+                    }
+                }
+            } else if line.trim_start().starts_with("//") {
+                out.push(blanked(line));
+            } else {
+                out.push(line.to_string());
+            }
+        }
+        out.join("\n")
+    }
+
+    /// Every `.rs`/`.js` file under [`HANDLER_SCAN_ROOTS`], as
+    /// `(display path, comment-blanked source)`.
+    fn handler_scan_sources() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for root in HANDLER_SCAN_ROOTS {
+            assert!(
+                std::path::Path::new(root).is_dir(),
+                "{root} is not a directory — a root that quietly stops existing \
+                 is a gate that quietly stops running"
+            );
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let path = entry.path().to_string_lossy().into_owned();
+                let ext = entry.path().extension().and_then(|x| x.to_str());
+                if !(ext == Some("rs") || ext == Some("js"))
+                    || path.ends_with(".min.js")
+                    || path.contains("/vendor/")
+                {
+                    continue;
+                }
+                let src = std::fs::read_to_string(entry.path()).unwrap();
+                out.push((path, blank_comments(&src)));
+            }
+        }
+        out
+    }
+
+    /// Every event-handler attribute in `src`, as `(line number, snippet)`.
+    ///
+    /// Shapes matched: maud's `on…="…"`, `on…='…'`, `on…=(expr)` and
+    /// `on…={…}`, and the same in a raw HTML string, with any whitespace —
+    /// newlines included — on either side of the `=`, and with the event name
+    /// in any case. Those are the four ways a violation has actually been
+    /// spelled in this tree plus the ones it could be spelled in next.
+    ///
+    /// Deliberately not matched:
+    ///
+    /// - `el.onload = () => …` — a property assignment on an element a script
+    ///   built itself. It is not an attribute, the value is a function rather
+    ///   than source text, and there is nothing for the escaping rule to bite
+    ///   on. The `.` is what tells the two apart.
+    /// - an identifier that merely begins with `on` (`once`, `online`), because
+    ///   the run of letters has to be followed by `=` and a value opener.
+    /// - htmx's `hx-on--…` / `hx-on:…`, whose event name is empty at that
+    ///   point. That channel is pinned by
+    ///   [`htmx_handler_channel_is_pinned`] instead of being silently ignored.
+    fn handler_attributes(src: &str) -> Vec<(usize, String)> {
+        let bytes = src.as_bytes();
+        let mut found = Vec::new();
+        for (i, _) in src.match_indices("on") {
+            if i > 0 {
+                let prev = bytes[i - 1] as char;
+                if prev.is_ascii_alphanumeric() || prev == '_' || prev == '.' {
+                    continue;
+                }
+            }
+            let rest = &src[i + 2..];
+            let name_len = rest.chars().take_while(char::is_ascii_alphabetic).count();
+            if name_len == 0 {
+                continue;
+            }
+            let Some(value) = rest[name_len..].trim_start().strip_prefix('=') else {
+                continue;
+            };
+            if !value.trim_start().starts_with(['"', '\'', '(', '{']) {
+                continue;
+            }
+            let snippet = src[i..]
+                .chars()
+                .take(48)
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .collect();
+            found.push((src[..i].matches('\n').count() + 1, snippet));
+        }
+        found
+    }
+
+    /// The detector sees every shape a handler can be written in, and none of
+    /// the shapes that only look like one.
+    ///
+    /// Without this the gate's own coverage is unfalsifiable: it passes on a
+    /// clean tree whether it can see anything or not, and four of these cases
+    /// were false negatives it used to have — a single-quoted value, whitespace
+    /// after the `=`, a capitalised event name, and an attribute split across
+    /// lines.
+    #[test]
+    fn handler_attribute_detector_sees_every_shape() {
+        // Every fixture spells the handler prefix `{on}` and substitutes it,
+        // because a literal one written out here would be a real violation in
+        // a real scanned file — this one — and the gate below would fail on its
+        // own test data.
+        let fixture = |s: &str| blank_comments(&s.replace("{on}", "on"));
+
+        for spelling in [
+            r#"button {on}click="doThing()" { }"#,
+            r#"<button {on}click='doThing()'>"#,
+            r#"a {on}click = "doThing()""#,
+            r#"<button {on}Click="doThing()">"#,
+            "button\n    {on}mouseover=\"doThing()\"",
+            "button {on}click\n  =\"doThing()\"",
+            r#"select {on}change={"go('" (id) "')"}"#,
+            r#"button {on}click=(format!("go('{id}')"))"#,
+        ] {
+            assert!(
+                !handler_attributes(&fixture(spelling)).is_empty(),
+                "the gate must see `{spelling}`"
+            );
+        }
+        for innocent in [
+            "script.{on}load = () => resolve(window.Stripe);",
+            r#"el.textC{on}tent = "hello";"#,
+            r#"form hx-{on}--after-request="location.reload()""#,
+            r#"// {on}click="doThing()""#,
+            r#"/// {on}click="doThing()""#,
+            "/*\n * {on}click=\"doThing()\"\n */",
+        ] {
+            assert!(
+                handler_attributes(&fixture(innocent)).is_empty(),
+                "the gate must not flag `{innocent}`"
+            );
+        }
+
+        // The one accepted over-match, pinned so it is a decision rather than a
+        // surprise. An identifier that happens to start with `on` and is
+        // assigned a string or a parenthesised expression is indistinguishable
+        // from an attribute by shape alone — `let once = "first";` and
+        // `onclick = "doThing()"` differ only in what the letters spell. The
+        // gate errs toward flagging, because it is loud when it is wrong and
+        // silent when it is too narrow, and a security-hygiene door should fail
+        // the noisy way. Nothing in the workspace trips it today; if something
+        // does, rename the binding.
+        for over_match in [r#"let {on}ce = "first";"#, r#"{on}going = (a + b);"#] {
+            assert!(
+                !handler_attributes(&fixture(over_match)).is_empty(),
+                "this over-match is documented as accepted: `{over_match}`"
+            );
+        }
+    }
+
     /// No page emits an event-handler attribute. Behaviour is declared with
     /// `data-action` and read by a delegated listener — the rule and the shared
     /// vocabulary are written out in `ui/assets/chrome.js`, and the reason it
     /// exists is at `blocks/admin/pages/network.rs`: maud escapes an attribute
     /// value as HTML, but an `onclick` value is not HTML, it is JavaScript
     /// source, so nothing stands between interpolated text and script
-    /// execution. None of the 114 handlers this replaced was a live sink —
+    /// execution. None of the 104 occurrences this replaced was a live sink —
     /// every interpolating one was traced to a closed set — but there was no
     /// door keeping the next one safe, and this is that door.
-    ///
-    /// **What it does not cover.** htmx's own `hx-on--*` attributes carry
-    /// JavaScript in the same way and are deliberately out of scope here: they
-    /// are htmx's channel, not the browser's event-handler IDL attributes, and
-    /// the nine that exist (in `blocks/{products,messages,llm}`) all hold
-    /// literal text. Converting them is its own change. `hx-on` is spelled so
-    /// that the word-boundary rule below cannot see it, which is why this note
-    /// exists rather than a silent gap.
     #[test]
     fn pages_carry_no_event_handler_attributes() {
-        /// The maud (`on…="…"`, `on…=(expr)`, `on…={…}`) and raw-HTML shapes.
-        /// The leading character must not be a letter, so `textContent = "…"`
-        /// and `hx-on--after-request` are not mistaken for handlers, and
-        /// `el.onclick = function () {…}` — a property assignment on an element
-        /// the script itself created, which is not an attribute at all — is not
-        /// either, because a function expression follows the `=`.
-        fn handler_attribute(line: &str) -> Option<String> {
-            let bytes = line.as_bytes();
-            for (i, _) in line.match_indices("on") {
-                if i > 0 && (bytes[i - 1] as char).is_ascii_alphanumeric() {
-                    continue;
-                }
-                let rest = &line[i + 2..];
-                let name_len = rest.chars().take_while(|c| c.is_ascii_lowercase()).count();
-                if name_len == 0 {
-                    continue;
-                }
-                let after = rest[name_len..].trim_start();
-                if after.starts_with("=\"") || after.starts_with("=(") || after.starts_with("={") {
-                    return Some(line[i..].chars().take(48).collect());
-                }
-            }
-            None
-        }
-
-        let roots = [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui"),
-        ];
         let mut offenders = Vec::new();
-        for root in roots {
-            for entry in walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_map(Result::ok)
-                // The `.js` assets are scanned too — a handler written into an
-                // HTML string by a script is the same defect, and the llm
-                // chat's thread list used to build one. Vendored minified
-                // libraries are not ours to fix.
-                .filter(|e| {
-                    let p = e.path();
-                    let ext = p.extension().and_then(|x| x.to_str());
-                    (ext == Some("rs") || ext == Some("js"))
-                        && !p.to_string_lossy().ends_with(".min.js")
-                })
-            {
-                let src = std::fs::read_to_string(entry.path()).unwrap();
-                for (n, line) in src.lines().enumerate() {
-                    let trimmed = line.trim_start();
-                    // Prose about the rule is not a violation of it.
-                    if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                        continue;
-                    }
-                    if let Some(found) = handler_attribute(line) {
-                        offenders.push(format!("{}:{} ({found})", entry.path().display(), n + 1));
-                    }
-                }
+        for (path, src) in handler_scan_sources() {
+            for (line, snippet) in handler_attributes(&src) {
+                offenders.push(format!("{path}:{line} ({snippet})"));
             }
         }
         assert!(
@@ -1122,6 +1271,52 @@ mod tests {
             "event-handler attributes remain — declare a `data-action` verb and \
              read it from a delegated listener instead:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// htmx's `hx-on--*` attributes are pinned, not ignored.
+    ///
+    /// They carry JavaScript exactly the way an `onclick` value does, so they
+    /// are the same hazard through a different channel: four of the nine
+    /// interpolate a `format!`-built body, which is the identical shape the
+    /// rule above exists for. Converting them means moving behaviour off
+    /// htmx's own event names and is its own change, so this pull request
+    /// leaves them — but it does not leave the door open. A tenth site, in any
+    /// file, fails here.
+    ///
+    /// (`hx-on` also happens to slip past the detector above, whose event name
+    /// is empty after the `on`. This is what stops that from being a silent
+    /// gap; the detector's own doc comment used to claim a leading-character
+    /// rule saved them, which was wrong — `-` is not alphanumeric.)
+    #[test]
+    fn htmx_handler_channel_is_pinned() {
+        // Assembled rather than written out, because this file is one of the
+        // files scanned and a literal here would count itself.
+        let needle = format!("hx-{}", "on");
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (path, src) in handler_scan_sources() {
+            let n = src.matches(needle.as_str()).count();
+            if n > 0 {
+                let rel = path
+                    .rsplit_once("/src/")
+                    .map(|(_, tail)| tail.to_string())
+                    .unwrap_or(path);
+                *counts.entry(rel).or_default() += n;
+            }
+        }
+        let actual: Vec<(String, usize)> = counts.into_iter().collect();
+        let expected: Vec<(String, usize)> = vec![
+            ("blocks/llm/ui.rs".to_string(), 2),
+            ("blocks/messages/pages.rs".to_string(), 3),
+            ("blocks/products/pages.rs".to_string(), 4),
+        ];
+        assert_eq!(
+            actual, expected,
+            "the htmx handler-attribute inventory moved. Every one of these \
+             carries JavaScript in an attribute value: a new one needs the same \
+             argument the nine existing ones got, and a converted one should be \
+             struck from this pin."
         );
     }
 

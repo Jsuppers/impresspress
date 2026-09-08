@@ -39,22 +39,19 @@ pub use objects::{
     FolderListing, ObjectRow,
 };
 
-/// Render the bootstrap JSON in a script tag, escaping `<` to prevent
-/// `</script>` sequences from terminating the JSON-typed script element.
-/// The escaped `<` (`<`) is valid JSON and decodes back to `<` when
-/// the browser reads it via `JSON.parse`.
+/// Render the bootstrap JSON in a script tag, escaping `<` through
+/// [`crate::ui::script_json`] so a `</script>` sequence cannot terminate the
+/// JSON-typed script element early. That helper is where the reasoning lives;
+/// this used to spell the same `replace` out by hand.
 ///
 /// Shared by [`objects::object_list_page`] (real bucket + prefix bootstrap)
 /// and [`cloudstorage::cloudstorage_page`] (JS-bundle load only, called
 /// with empty bucket/prefix).
 fn render_bootstrap_script(bucket: &str, current_prefix: &str) -> Markup {
-    let bootstrap = serde_json::json!({
+    let bootstrap_json = crate::ui::script_json(&serde_json::json!({
         "bucket": bucket,
         "currentPrefix": current_prefix,
-    });
-    let bootstrap_json = serde_json::to_string(&bootstrap)
-        .unwrap_or_else(|_| "{}".to_string())
-        .replace('<', "\\u003c");
+    }));
     let js_url = crate::blocks::files::assets::files_browser_js_url();
     html! {
         script type="application/json" id="files-browser-bootstrap" {

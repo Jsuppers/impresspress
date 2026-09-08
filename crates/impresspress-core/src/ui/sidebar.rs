@@ -186,10 +186,14 @@ pub fn sidebar_grouped(
         }
         if (action === 'sidebar-collapse') {
             var s = document.querySelector('.sidebar');
-            if (!s) return;
-            s.classList.toggle('collapsed');
-            try { localStorage.setItem('sidebar.collapsed', s.classList.contains('collapsed') ? '1' : '0'); } catch (err) {}
-            return;
+            if (s) {
+                s.classList.toggle('collapsed');
+                try { localStorage.setItem('sidebar.collapsed', s.classList.contains('collapsed') ? '1' : '0'); } catch (err) {}
+            }
+            // Deliberately no `return`: the collapse toggle is outside both the
+            // profile button and the profile menu, so under the two separate
+            // listeners this replaced it also dismissed an open profile menu.
+            // Falling through to the outside-click branch keeps that.
         }
         var m = document.getElementById('profile-menu');
         var b = document.getElementById('user-menu-btn');

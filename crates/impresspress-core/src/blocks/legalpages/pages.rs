@@ -183,6 +183,14 @@ pub(super) fn editor_markup_for_test(
 
 const EDITOR_JS: &str = r#"
 (function() {
+    // Guarded: the editor is a `ui::shell_page`, so navigating to it can be an
+    // htmx partial swap, which returns the body verbatim (`ui/mod.rs:226`) and
+    // re-executes this script against a `document` that outlived the swap.
+    // Everything below is declarations and two registrations, so running it
+    // once is enough. The keydown listener predates the delegated click one
+    // and had the same accumulation bug; both are covered now.
+    if (window.__legalpagesEditorInit) return;
+    window.__legalpagesEditorInit = true;
     // Preview wiring: vanilla JS fetch (no json-enc htmx extension loaded)
     function setEditorTab(name) {
         document.querySelectorAll('.editor-tab').forEach(function(t) {

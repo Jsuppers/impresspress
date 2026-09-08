@@ -163,9 +163,12 @@ fn left_pane(tables: &[TableSummary], selected: Option<&str>, tab: Tab) -> Marku
     }
 }
 
-/// The table-list filter, which used to be a 430-character minified `oninput`
-/// attribute — the longest one in the tree, and unreadable, unlintable and
-/// untestable where it sat. It hides `[data-db-table]` rows that do not match,
+/// The table-list filter, which used to be a 478-character minified `oninput`
+/// attribute: the longest LITERAL handler in the tree, though not the longest
+/// handler — `blocks/userportal/pages/security.rs:73` built a ~521-character
+/// one with `format!`. (The specification's figure of 430 was a miscount and
+/// is corrected here rather than copied.) Wherever it sat it was unreadable,
+/// unlintable and untestable. It hides `[data-db-table]` rows that do not match,
 /// collapses a `[data-db-group]` whose rows are all hidden, and reveals
 /// `#db-filter-empty` when nothing matches at all.
 const TABLE_FILTER_JS: &str = r#"

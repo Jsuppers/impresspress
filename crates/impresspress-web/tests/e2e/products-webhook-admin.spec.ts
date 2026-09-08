@@ -425,4 +425,80 @@ test.describe("products admin webhook recovery", () => {
       },
     ]);
   });
+
+  /**
+   * The two filter dropdowns deliberately carry the SAME verbs as their Refresh
+   * buttons, and the click delegate resolves `closest('[data-action]')` — which
+   * matches the `<select>` itself. So a click that merely opened the dropdown
+   * used to fire a load with the value the user was on their way to changing,
+   * and choosing an option fired a second one. Two loads in flight, both
+   * replacing the list wholesale, and nothing deciding which of them wins.
+   *
+   * The click branch now acts only on the buttons, and each loader takes a
+   * ticket so a superseded response is dropped instead of painted. This case
+   * asserts both halves: opening the dropdown issues nothing, and a first load
+   * that is still in flight when the user changes the filter does not repaint
+   * the list it lost the race for.
+   */
+  test("a filter dropdown loads on change only, and an overtaken response never paints", async ({
+    page,
+  }) => {
+    const webhookQueries: string[] = [];
+    let firstWebhookLoad = true;
+
+    await page.route(`${adminOrigin}/**`, async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (request.resourceType() === "document") {
+        return route.fulfill({
+          status: 200,
+          contentType: "text/html",
+          body: operationsHtml,
+        });
+      }
+      if (url.pathname === "/b/products/api/admin/webhook-events") {
+        const status = url.searchParams.get("status") ?? "";
+        webhookQueries.push(status);
+        // The page's own first load, on the default `dead_letter` filter,
+        // answers slowly — so it lands AFTER the load the user's change
+        // starts. Without the ticket it would repaint with the filter the
+        // user has already left.
+        if (firstWebhookLoad) {
+          firstWebhookLoad = false;
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+        }
+        return json(route, {
+          records: [webhookEvent({ id: `evt_${status || "all"}` })],
+          total_count: status === "dead_letter" ? 11 : 22,
+          page: 1,
+          page_size: 50,
+        });
+      }
+      if (url.pathname === "/b/products/api/admin/provider-operations") {
+        return json(route, { records: [], total_count: 0, page: 1, page_size: 50 });
+      }
+      return json(route, { message: "unexpected request" }, 404);
+    });
+
+    await openWebhookOperations(page);
+
+    // Opening the dropdown is a click on an element carrying the verb.
+    await page.locator("#stripe-webhook-filter").click();
+    await page.waitForTimeout(250);
+    expect(webhookQueries).toEqual(["dead_letter"]);
+
+    // Choosing an option is the one event that loads.
+    await page.selectOption("#stripe-webhook-filter", "failed");
+    await expect(page.locator("#stripe-webhook-summary")).toHaveText(
+      "22 events match this filter.",
+    );
+    expect(webhookQueries).toEqual(["dead_letter", "failed"]);
+
+    // The overtaken first load lands here. It must change nothing.
+    await page.waitForTimeout(1500);
+    await expect(page.locator("#stripe-webhook-summary")).toHaveText(
+      "22 events match this filter.",
+    );
+    expect(webhookQueries).toEqual(["dead_letter", "failed"]);
+  });
 });

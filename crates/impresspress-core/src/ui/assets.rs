@@ -1253,10 +1253,22 @@ mod tests {
             js.contains("if (window.__modalInit) return;"),
             "the modal section must be a guarded IIFE"
         );
-        for line in ["function openModal(id) {", "function closeModal(id) {"] {
+        // Matched on the name alone, at column zero, rather than on one exact
+        // spelling: `function openModal (id) {` and `function openModal(id){`
+        // are the same global, and pinning a single spelling would let a
+        // re-globalised helper back in on a whitespace change. The assignment
+        // forms are covered too, because `window.openModal = …` is just as
+        // global as a declaration.
+        for name in ["openModal", "closeModal"] {
+            let declaration = format!("function {name}");
             assert!(
-                !js.lines().any(|l| l == line),
-                "{line} must not be a top-level (global) declaration"
+                !js.lines().any(|l| l.starts_with(&declaration)),
+                "{name} must not be a top-level (global) function declaration"
+            );
+            let assignment = format!("window.{name}");
+            assert!(
+                !js.contains(&assignment),
+                "{name} must not be published on `window` either"
             );
         }
         for verb in [

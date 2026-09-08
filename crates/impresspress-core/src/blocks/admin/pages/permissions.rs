@@ -291,11 +291,22 @@ pub(crate) async fn grants_custom_tab(
                     resourceEl.value = specificSelect.value;
                 }
             }
-            document.addEventListener('change', function (e) {
-                var el = e.target;
-                if (!(el instanceof Element)) return;
-                if (el.getAttribute('data-action') === 'grant-form-update') updateGrantForm();
-            });
+            // Guarded: this tab is reached by an htmx partial swap, which
+            // returns the body verbatim (`ui/mod.rs:226`) and re-executes the
+            // scripts in it against a `document` that outlived the swap. The
+            // `grantBlocks` assignment and the function declaration above are
+            // deliberately outside the guard -- they must be refreshed on
+            // every swap, and re-running them is idempotent. Only the
+            // registration accumulates.
+            (function () {
+                if (window.__grantFormDelegated) return;
+                window.__grantFormDelegated = true;
+                document.addEventListener('change', function (e) {
+                    var el = e.target;
+                    if (!(el instanceof Element)) return;
+                    if (el.getAttribute('data-action') === 'grant-form-update') updateGrantForm();
+                });
+            })();
             "#))
         }
 

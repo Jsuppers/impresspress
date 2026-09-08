@@ -1203,11 +1203,14 @@ jobs:
       # screenshotted would show up in them.
       #
       # delegated-actions.spec.ts is last and writes nothing — it filters a
-      # list, opens and closes a modal and toggles a password field, all of
-      # which are the browser-side half of the `data-action` rule that
+      # list, opens and closes a modal, toggles a password field, and hops
+      # between two products admin tabs, all of which are the browser-side half
+      # of the `data-action` rule that
       # `ui::tests::pages_carry_no_event_handler_attributes` enforces on the
       # markup. Neither that test nor a screenshot can see a listener that
-      # stopped firing.
+      # stopped firing — or one that started firing twice. The tab-hop case is
+      # the only one that issues a mutating request, and it intercepts it in
+      # the browser and refuses it, so the shared database is untouched.
       - name: Run visual-baseline and WebMCP end-to-end tests (native server, port 8093)
         working-directory: crates/impresspress-web
         env:
