@@ -416,6 +416,23 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     cf_deploy::wrangler_versions_promote(&final_upload.version_id, &final_upload.wrangler_toml)?;
     println!("-> promoted {}", final_upload.version_id);
 
+    // 7. Worker-level settings last. Neither `wrangler versions upload` nor
+    //    `wrangler versions deploy` applies them — they are not part of a
+    //    Worker version — so the `[triggers] crons` schedule reaches the live
+    //    Worker only here. After promotion, deliberately: the schedule points
+    //    at whatever code is serving, and until this line runs that is still
+    //    the previous version.
+    let triggers_toml = wrangler::generate_triggers(&cfg, repo_root, &out_dir)?;
+    cf_deploy::wrangler_triggers_deploy(&triggers_toml)?;
+    println!(
+        "-> applied worker-level settings ({})",
+        if cfg.crons.is_empty() {
+            "no cron schedule".to_string()
+        } else {
+            format!("crons {}", cfg.crons.join(", "))
+        }
+    );
+
     println!();
     println!("deploy complete");
     Ok(())

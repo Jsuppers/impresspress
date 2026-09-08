@@ -198,9 +198,19 @@ fn free_plan_ten_ms_compatible_config(
     Ok(Some(compatible_toml))
 }
 
-/// Apply worker-level settings (routes, `preview_urls`, observability) from
-/// the generated toml to the live worker without uploading code.
-fn wrangler_triggers_deploy(wrangler_toml: &Path) -> Result<()> {
+/// Apply worker-level settings from the generated toml to the live worker
+/// without uploading code: routes and custom domains, the `workers.dev` /
+/// `preview_urls` subdomain state, cron schedules, queue consumers, and
+/// workflow bindings.
+///
+/// These are exactly the settings `wrangler versions upload` and `wrangler
+/// versions deploy` do **not** touch — versioned settings travel with a Worker
+/// version, worker-level ones do not — which is why the upload closes with
+/// "Changes to triggers (routes, custom domains, cron schedules, etc) must be
+/// applied with the command `wrangler triggers deploy`". `impresspress deploy`
+/// is those two commands, so without this call the `[triggers] crons` an
+/// operator configured would never reach the live Worker.
+pub fn wrangler_triggers_deploy(wrangler_toml: &Path) -> Result<()> {
     let status = Command::new("wrangler")
         .args(["triggers", "deploy", "--config"])
         .arg(wrangler_toml)

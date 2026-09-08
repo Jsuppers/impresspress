@@ -131,10 +131,13 @@ fn resolve_preserves_configured_deploy_smoke_paths_and_trailing_slashes() {
     );
 }
 
+/// The sweep is opt-in: a consumer that exported no `scheduled` handler — and
+/// the CLI scaffolds none — must not be given a daily failed invocation by a
+/// configuration default it never set.
 #[test]
-fn resolve_defaults_crons_to_the_daily_sweep_and_takes_an_explicit_list() {
+fn resolve_defaults_crons_to_no_schedule_and_takes_an_explicit_list() {
     let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
-    assert_eq!(cfg.crons, vec!["17 3 * * *"]);
+    assert!(cfg.crons.is_empty());
 
     let configured = FULL_TOML.replace(
         "compatibility_date = \"2026-05-01\"",

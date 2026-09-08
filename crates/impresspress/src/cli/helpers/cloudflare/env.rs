@@ -40,8 +40,9 @@ pub struct RawCloudflareConfig {
     /// and env.
     pub head_sampling_rate: Option<f64>,
     /// Cloudflare cron expressions for the Worker's `scheduled` handler.
-    /// TOML-only; defaults to [`wrangler::DEFAULT_CRONS`]. An explicit empty
-    /// list disables the schedule.
+    /// TOML-only; defaults to [`wrangler::DEFAULT_CRONS`], which is empty.
+    /// Setting it is the second of the two steps that turn the sweep on — the
+    /// first is exporting a `scheduled` entry point.
     pub crons: Option<Vec<String>>,
     /// Ordinary application paths exercised before promotion. TOML-only;
     /// defaults to `/health` for existing consumers.
@@ -228,13 +229,17 @@ fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) ->
 }
 
 /// Resolve `[cloudflare].crons`: an explicit list (empty included, which
-/// disables the schedule) or [`wrangler::DEFAULT_CRONS`].
+/// disables the schedule) or [`wrangler::DEFAULT_CRONS`], which is empty — the
+/// scheduled sweep is opt-in, see that constant.
 ///
-/// Each entry is checked for the five whitespace-separated fields Cloudflare's
-/// cron parser requires. A malformed expression is rejected by `wrangler
-/// deploy` at the very end of a two-stage deployment, long after the candidate
-/// has been uploaded, so failing here — before anything is built — is worth
-/// the eleven lines.
+/// Each entry is checked for **the five whitespace-separated fields**
+/// Cloudflare's cron parser requires, and for nothing else. A four-field
+/// expression, a six-field one, and `@daily` are refused here; an out-of-range
+/// or otherwise malformed field (`99 3 * * *`) is not, and Cloudflare rejects
+/// it when `wrangler triggers deploy` runs — after promotion, at the very end
+/// of a two-stage deployment. Catching the shape errors before anything is
+/// built is still worth the eleven lines; it is not a validation of the
+/// expression.
 fn resolve_crons(crons: Option<Vec<String>>) -> Result<Vec<String>> {
     let crons = crons.unwrap_or_else(|| {
         wrangler::DEFAULT_CRONS
