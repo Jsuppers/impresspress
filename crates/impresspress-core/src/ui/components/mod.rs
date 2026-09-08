@@ -25,4 +25,4 @@ pub use form::{search_input, search_input_with_value};
 pub use modal::modal;
 pub use pagination::pagination;
 pub use stat::stat_card;
-pub use table::{data_table, TableCol};
+pub use table::{data_table, DataTable, TableCol, TableRow};
