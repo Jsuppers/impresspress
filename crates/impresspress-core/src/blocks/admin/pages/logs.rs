@@ -94,57 +94,39 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
 
         @match &result {
             Ok(list) => {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Status" }
-                                th { "Method" }
-                                th { "Path" }
-                                th { "Duration" }
-                                th { "User" }
-                                th { "Time" }
+                @let rows: Vec<Vec<Markup>> = list.rows.iter().map(|row| {
+                    let status = row.status.as_str();
+                    let path = row.path.as_str();
+                    let user_id = row.user_id.as_str();
+                    let created = row.created_at.as_str();
+                    let status_code = row.status_code;
+                    let variant = if status == "ERROR" {
+                        BadgeVariant::Danger
+                    } else if status_code >= 400 {
+                        BadgeVariant::Warning
+                    } else {
+                        BadgeVariant::Success
+                    };
+                    vec![
+                        Badge::new(variant).render(html! { (status_code) }),
+                        html! { span .font-medium { (row.method.to_uppercase()) } },
+                        html! { (path) },
+                        html! { span .text-muted { (row.duration_ms) "ms" } },
+                        html! {
+                            @if !user_id.is_empty() {
+                                span .text-muted { (user_id.get(..8).unwrap_or(user_id)) }
                             }
-                        }
-                        tbody {
-                            @if list.rows.is_empty() {
-                                tr {
-                                    td colspan="6" .text-center .text-muted .p-8 { "No request logs yet" }
-                                }
-                            }
-                            @for row in &list.rows {
-                                @let status = row.status.as_str();
-                                @let method = row.method.as_str();
-                                @let path = row.path.as_str();
-                                @let duration = row.duration_ms;
-                                @let user_id = row.user_id.as_str();
-                                @let created = row.created_at.as_str();
-                                @let status_code = row.status_code;
-                                tr {
-                                    td {
-                                        @let variant = if status == "ERROR" {
-                                            BadgeVariant::Danger
-                                        } else if status_code >= 400 {
-                                            BadgeVariant::Warning
-                                        } else {
-                                            BadgeVariant::Success
-                                        };
-                                        (Badge::new(variant).render(html! { (status_code) }))
-                                    }
-                                    td .text-sm .font-medium { (method.to_uppercase()) }
-                                    td .text-sm { (path) }
-                                    td .text-muted .text-sm { (duration) "ms" }
-                                    td .text-muted .text-sm {
-                                        @if !user_id.is_empty() {
-                                            (user_id.get(..8).unwrap_or(user_id))
-                                        }
-                                    }
-                                    td .text-muted .text-sm { (created.get(..19).unwrap_or(created)) }
-                                }
-                            }
-                        }
-                    }
-                }
+                        },
+                        html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
+                    ]
+                }).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &SYSTEM_LOG_COLUMNS,
+                    rows,
+                    None,
+                    html! { p .text-center .text-muted { "No request logs yet" } },
+                ))
 
                 (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/logs"))
             }
@@ -189,42 +171,24 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
 
         @match &result {
             Ok(list) => {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Action" }
-                                th { "Resource" }
-                                th { "User" }
-                                th { "IP" }
-                                th { "Time" }
-                            }
-                        }
-                        tbody {
-                            @if list.records.is_empty() {
-                                tr {
-                                    td colspan="5" .text-center .text-muted .p-8 { "No audit logs yet" }
-                                }
-                            }
-                            @for record in &list.records {
-                                @let action = record.str_field("action");
-                                @let resource = record.str_field("resource");
-                                @let user_id = record.str_field("user_id");
-                                @let ip = record.str_field("ip_address");
-                                @let created = record.str_field("created_at");
-                                tr {
-                                    td {
-                                        (badge(BadgeVariant::Info, action))
-                                    }
-                                    td .text-sm { (resource) }
-                                    td .text-muted .text-sm { (user_id.get(..8).unwrap_or(user_id)) }
-                                    td .text-muted .text-sm { (ip) }
-                                    td .text-muted .text-sm { (created.get(..19).unwrap_or(created)) }
-                                }
-                            }
-                        }
-                    }
-                }
+                @let rows: Vec<Vec<Markup>> = list.records.iter().map(|record| {
+                    let user_id = record.str_field("user_id");
+                    let created = record.str_field("created_at");
+                    vec![
+                        badge(BadgeVariant::Info, record.str_field("action")),
+                        html! { (record.str_field("resource")) },
+                        html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
+                        html! { span .text-muted { (record.str_field("ip_address")) } },
+                        html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
+                    ]
+                }).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &AUDIT_LOG_COLUMNS,
+                    rows,
+                    None,
+                    html! { p .text-center .text-muted { "No audit logs yet" } },
+                ))
 
                 (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/logs?tab=audit"))
             }
@@ -234,3 +198,55 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
         }
     }
 }
+
+/// The two log tables' columns. Declared once each so the `<td data-label>`
+/// the component stamps on every cell names the same column its header does.
+const SYSTEM_LOG_COLUMNS: [components::TableCol<'static>; 6] = [
+    components::TableCol {
+        label: "Status",
+        width: None,
+    },
+    components::TableCol {
+        label: "Method",
+        width: None,
+    },
+    components::TableCol {
+        label: "Path",
+        width: None,
+    },
+    components::TableCol {
+        label: "Duration",
+        width: None,
+    },
+    components::TableCol {
+        label: "User",
+        width: None,
+    },
+    components::TableCol {
+        label: "Time",
+        width: None,
+    },
+];
+
+const AUDIT_LOG_COLUMNS: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Action",
+        width: None,
+    },
+    components::TableCol {
+        label: "Resource",
+        width: None,
+    },
+    components::TableCol {
+        label: "User",
+        width: None,
+    },
+    components::TableCol {
+        label: "IP",
+        width: None,
+    },
+    components::TableCol {
+        label: "Time",
+        width: None,
+    },
+];

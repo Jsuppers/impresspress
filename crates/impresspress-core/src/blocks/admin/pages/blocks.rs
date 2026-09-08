@@ -1,4 +1,4 @@
-use maud::html;
+use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
@@ -6,7 +6,7 @@ use crate::{
     platform_state::block_settings,
     ui::{
         self,
-        components::{empty_state, tab_navigation, Badge, BadgeVariant, Tab},
+        components::{self, empty_state, tab_navigation, Badge, BadgeVariant, Tab},
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
@@ -406,57 +406,36 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
             // Endpoints
             @if !block.endpoints.is_empty() {
                 h4 .modal-section-title { "Endpoints" }
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th .w-70 { "Method" }
-                                th { "Path" }
-                                th { "Description" }
-                                th .w-80 { "Auth" }
-                            }
-                        }
-                        tbody {
-                            @for ep in &block.endpoints {
-                                tr {
-                                    td {
-                                        (Badge::new(method_badge_tone(ep.method)).classes("text-11").render(html! { (ep.method) }))
-                                    }
-                                    td .text-sm { code .text-xs { (ep.path) } }
-                                    td .text-sm .text-muted { (ep.summary) }
-                                    td {
-                                        (Badge::new(auth_badge_tone(ep.auth)).classes("text-10").render(html! { (ep.auth) }))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                @let rows: Vec<Vec<Markup>> = block.endpoints.iter().map(|ep| vec![
+                    Badge::new(method_badge_tone(ep.method)).classes("text-11").render(html! { (ep.method) }),
+                    html! { code .text-xs { (ep.path) } },
+                    html! { span .text-muted { (ep.summary) } },
+                    Badge::new(auth_badge_tone(ep.auth)).classes("text-10").render(html! { (ep.auth) }),
+                ]).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &ENDPOINT_COLUMNS,
+                    rows,
+                    None,
+                    html! {},
+                ))
             }
 
             // Config Keys
             @if !block.config_keys.is_empty() {
                 h4 .modal-section-title { "Configuration" }
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Key" }
-                                th { "Description" }
-                                th { "Default" }
-                            }
-                        }
-                        tbody {
-                            @for ck in &block.config_keys {
-                                tr {
-                                    td { code .text-xs { (ck.key) } }
-                                    td .text-sm .text-muted { (ck.description) }
-                                    td .text-sm { code .text-11 { @if ck.default.is_empty() { "\u{2014}" } @else { (ck.default) } } }
-                                }
-                            }
-                        }
-                    }
-                }
+                @let rows: Vec<Vec<Markup>> = block.config_keys.iter().map(|ck| vec![
+                    html! { code .text-xs { (ck.key) } },
+                    html! { span .text-muted { (ck.description) } },
+                    html! { code .text-11 { @if ck.default.is_empty() { "\u{2014}" } @else { (ck.default) } } },
+                ]).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &CONFIG_KEY_COLUMNS,
+                    rows,
+                    None,
+                    html! {},
+                ))
             }
 
             // Technical details
@@ -540,6 +519,44 @@ fn custom_tab_content() -> maud::Markup {
         }
     }
 }
+
+/// The block-detail modal's two tables' columns. Declared once each so the
+/// `<td data-label>` the component stamps on every cell names the same column
+/// its header does; the two widths are the ones the old `th .w-70` / `.w-80`
+/// utility classes gave those headers.
+const ENDPOINT_COLUMNS: [components::TableCol<'static>; 4] = [
+    components::TableCol {
+        label: "Method",
+        width: Some("70px"),
+    },
+    components::TableCol {
+        label: "Path",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "Auth",
+        width: Some("80px"),
+    },
+];
+
+const CONFIG_KEY_COLUMNS: [components::TableCol<'static>; 3] = [
+    components::TableCol {
+        label: "Key",
+        width: None,
+    },
+    components::TableCol {
+        label: "Description",
+        width: None,
+    },
+    components::TableCol {
+        label: "Default",
+        width: None,
+    },
+];
 
 /// Regression coverage for the swallowed-failure finding: block enable/disable
 /// must check the persistence result instead of discarding it

@@ -295,18 +295,16 @@
 	.data-table td:last-child { padding-top: var(--space-2); }
 }
 /* ===== Mobile table fallback =====
-   `.table-container` already has `overflow-x: auto`, but several admin
-   pages render `.table` directly (Logs, Network, Permissions) without the
-   wrapper. Apply the same scroll behavior to the parent .card so the page
-   body never blows out the viewport on narrow screens. */
+   This block used to also give an unwrapped `.table` its own horizontal
+   scroll, because the Logs, Network and Permissions administration pages
+   rendered `.table` directly, outside a `.table-container`. None of them
+   does any more — they render `.data-table`, which collapses to cards below
+   720px instead of scrolling — and every `.table` left in the tree is inside
+   a `.table-container`, which already has `overflow-x: auto`. Those two
+   selectors matched nothing and are gone.
+   The nowrap below is still live: it keeps the remaining raw tables'
+   columns (Permissions / Crypto pills) from wrapping inside that scroll. */
 @media (max-width: 720px) {
-	.card > .table,
-	.card .table:not(.table-container .table) {
-		display: block;
-		overflow-x: auto;
-		-webkit-overflow-scrolling: touch;
-	}
-	/* Permissions / Crypto pills: prevent column wrap that wastes space. */
 	.table th, .table td { white-space: nowrap; }
 }
 

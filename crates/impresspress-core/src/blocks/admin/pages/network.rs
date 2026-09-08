@@ -62,71 +62,66 @@ async fn network_inbound_tab(
             .detail-rows td { background: var(--bg-secondary, #f8fafc); font-size: 12px; }
             .detail-rows[hidden] { display: none; }
         ")) }
-        // Delegated click handler — the row carries `data-detail-*` attributes
-        // (maud-escaped) instead of an `onclick` JS-string literal, which maud
-        // does NOT escape and so let an attacker-controlled request path break
-        // out and run script in an admin's session. Bound once per document.
+        // Delegated click handler — the detail pane carries a `data-detail-url`
+        // attribute (maud-escaped) instead of an `onclick` JS-string literal,
+        // which maud does NOT escape and so let an attacker-controlled request
+        // path break out and run script in an admin's session. Bound once per
+        // document.
         //
         // This page stated that rule and was the only one applying it. It is
         // now how every page in the tree is written: the shared vocabulary and
         // the general argument live in `ui/assets/chrome.js`, and
         // `ui::tests::pages_carry_no_event_handler_attributes` keeps the next
         // page from reintroducing the sink. This handler keeps its own
-        // `data-detail-*` attributes rather than a `data-action` verb — the
+        // `data-detail-url` attribute rather than a `data-action` verb — the
         // attribute IS the operand here, and there is only one behaviour.
+        //
+        // The clicked row and its detail row are siblings because
+        // `TableRow::after` emits the second immediately after the first, so
+        // the handler walks to `nextElementSibling` rather than resolving an
+        // id it was handed. `components::data_table` owns the `<tr>` and takes
+        // no caller attributes; the pane inside the detail row is markup this
+        // page writes, so that is where the URL lives.
         script { (maud::PreEscaped("
             if (!window.__networkDetailBound) {
                 window.__networkDetailBound = true;
                 document.addEventListener('click', function (e) {
-                    var row = e.target.closest('.expand-row[data-detail-target]');
+                    var row = e.target.closest('tr.expand-row');
                     if (!row) return;
-                    var detail = document.getElementById(row.dataset.detailTarget);
+                    var dr = row.nextElementSibling;
+                    if (!dr || !dr.classList.contains('detail-rows')) return;
+                    var detail = dr.querySelector('[data-detail-url]');
                     if (!detail) return;
-                    var dr = detail.closest('tr');
                     if (!dr.hidden) { dr.hidden = true; return; }
                     dr.hidden = false;
                     if (!detail.innerHTML) {
-                        htmx.ajax('GET', row.dataset.detailUrl, {target: '#' + row.dataset.detailTarget, swap: 'innerHTML'});
+                        htmx.ajax('GET', detail.dataset.detailUrl, {target: '#' + detail.id, swap: 'innerHTML'});
                     }
                 });
             }
         ")) }
 
-        div .table-container {
-            table .table {
-                thead {
-                    tr {
-                        th .w-30 { "" }
-                        th { "Method" }
-                        th { "Path" }
-                        th { "Requests" }
-                        th { "Avg Duration" }
-                        th { "Errors" }
-                        th { "Last Seen" }
-                    }
-                }
-                tbody {
-                    @if summary.is_empty() {
-                        tr {
-                            td colspan="7" .text-center .text-muted .p-8 { "No inbound requests yet" }
-                        }
-                    }
-                    @for row in &summary {
-                        (inbound_row(&row.method, &row.path, row.count, row.avg_ms, row.errors, &row.last_seen))
-                    }
-                }
-            }
-        }
+        @let rows: Vec<components::TableRow> = summary.iter().map(|row| {
+            inbound_row(&row.method, &row.path, row.count, row.avg_ms, row.errors, &row.last_seen)
+        }).collect();
+
+        (components::DataTable::new(&INBOUND_COLUMNS)
+            .rows(rows)
+            .empty(html! { p .text-center .text-muted { "No inbound requests yet" } })
+            .render())
     })
 }
 
 /// Render one inbound-summary row: the clickable row plus its lazily-loaded
 /// detail row. `method`/`path` come from the request log and are
 /// attacker-controlled (any HTTP request with a crafted path is logged), so
-/// they appear only in maud-escaped attribute/text contexts. The row carries
-/// `data-detail-target`/`data-detail-url` that the delegated click handler
-/// reads — never an `onclick` JS-string literal (maud doesn't escape JS-string
-/// context, which was a stored-XSS sink).
+/// they appear only in maud-escaped attribute/text contexts. The `<tr>` itself
+/// carries no attribute the handler reads — `components::data_table` owns the
+/// row element and takes no caller attributes — so the detail URL lives on the
+/// pane inside the detail row this function writes, in a maud-escaped
+/// `data-detail-url`, and the delegated click handler reaches it by walking to
+/// `nextElementSibling`. Never an `onclick` JS-string literal (maud doesn't
+/// escape JS-string context, which was a stored-XSS sink).
 ///
 /// `avg_ms` and `last_seen` are per-run values — a latency measured by the
 /// running deployment and the wall-clock time of a request it served — so
@@ -142,35 +137,36 @@ fn inbound_row(
     avg_ms: i64,
     errors: i64,
     last_seen: &str,
-) -> Markup {
+) -> components::TableRow {
     let row_id = format!("inbound-{}-{}", method, path.replace('/', "_"));
     let detail_url = format!("/b/admin/network/detail/inbound?method={method}&path={path}");
-    html! {
-        tr .expand-row data-detail-target=(row_id) data-detail-url=(detail_url) {
-            td .text-muted { (icons::chevron_right()) }
-            td .text-sm .font-medium { (method.to_uppercase()) }
-            td .text-sm { (path) }
-            td .text-sm {
-                (Badge::new(BadgeVariant::Info).render(html! { (cnt) }))
+    components::TableRow::new(vec![
+        html! { span .text-muted { (icons::chevron_right()) } },
+        html! { span .font-medium { (method.to_uppercase()) } },
+        html! { (path) },
+        Badge::new(BadgeVariant::Info).render(html! { (cnt) }),
+        html! { span .text-muted { span data-volatile-metric { (avg_ms) "ms" } } },
+        html! {
+            @if errors > 0 {
+                (Badge::new(BadgeVariant::Danger).render(html! { (errors) }))
+            } @else {
+                span .text-muted { "0" }
             }
-            td .text-muted .text-sm { span data-volatile-metric { (avg_ms) "ms" } }
-            td .text-sm {
-                @if errors > 0 {
-                    (Badge::new(BadgeVariant::Danger).render(html! { (errors) }))
-                } @else {
-                    span .text-muted { "0" }
-                }
-            }
-            td .text-muted .text-sm {
+        },
+        html! {
+            span .text-muted {
                 time datetime=(last_seen) { (last_seen.get(..19).unwrap_or(last_seen)) }
             }
-        }
+        },
+    ])
+    .classes("expand-row")
+    .after(html! {
         tr .detail-rows hidden {
-            td colspan="7" .p-0 {
-                div id=(row_id) {}
+            td colspan=(INBOUND_COLUMNS.len()) .p-0 {
+                div id=(row_id) data-detail-url=(detail_url) {}
             }
         }
-    }
+    })
 }
 
 /// Render one row of the per-request detail table: status, duration, client
@@ -187,32 +183,88 @@ fn detail_row(
     client_ip: &str,
     user_id: &str,
     created: &str,
-) -> Markup {
-    html! {
-        tr {
-            td {
-                @let variant = if status_code >= 500 {
-                    BadgeVariant::Danger
-                } else if status_code >= 400 {
-                    BadgeVariant::Warning
-                } else {
-                    BadgeVariant::Success
-                };
-                (Badge::new(variant).render(html! { (status_code) }))
+) -> Vec<Markup> {
+    let variant = if status_code >= 500 {
+        BadgeVariant::Danger
+    } else if status_code >= 400 {
+        BadgeVariant::Warning
+    } else {
+        BadgeVariant::Success
+    };
+    vec![
+        Badge::new(variant).render(html! { (status_code) }),
+        html! { span .text-muted { span data-volatile-metric { (duration) "ms" } } },
+        html! { span .text-muted { (client_ip) } },
+        html! {
+            @if !user_id.is_empty() {
+                span .text-muted { (user_id.get(..8).unwrap_or(user_id)) }
             }
-            td .text-muted { span data-volatile-metric { (duration) "ms" } }
-            td .text-muted { (client_ip) }
-            td .text-muted {
-                @if !user_id.is_empty() {
-                    (user_id.get(..8).unwrap_or(user_id))
-                }
-            }
-            td .text-muted {
+        },
+        html! {
+            span .text-muted {
                 time datetime=(created) { (created.get(..19).unwrap_or(created)) }
             }
-        }
-    }
+        },
+    ]
 }
+
+/// The two network tables' columns. Declared once each so the
+/// `<td data-label>` the component stamps on every cell names the same column
+/// its header does. The summary's first column is the chevron and has no
+/// label; it keeps the 30px width the old `th .w-30` gave it.
+const INBOUND_COLUMNS: [components::TableCol<'static>; 7] = [
+    components::TableCol {
+        label: "",
+        width: Some("30px"),
+    },
+    components::TableCol {
+        label: "Method",
+        width: None,
+    },
+    components::TableCol {
+        label: "Path",
+        width: None,
+    },
+    components::TableCol {
+        label: "Requests",
+        width: None,
+    },
+    components::TableCol {
+        label: "Avg Duration",
+        width: None,
+    },
+    components::TableCol {
+        label: "Errors",
+        width: None,
+    },
+    components::TableCol {
+        label: "Last Seen",
+        width: None,
+    },
+];
+
+const DETAIL_COLUMNS: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Status",
+        width: None,
+    },
+    components::TableCol {
+        label: "Duration",
+        width: None,
+    },
+    components::TableCol {
+        label: "IP",
+        width: None,
+    },
+    components::TableCol {
+        label: "User",
+        width: None,
+    },
+    components::TableCol {
+        label: "Time",
+        width: None,
+    },
+];
 
 /// Htmx fragment: individual requests for a given inbound path.
 ///
@@ -239,29 +291,26 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
         &rows
     };
 
+    let rows: Vec<Vec<Markup>> = display_rows
+        .iter()
+        .map(|row| {
+            detail_row(
+                row.status_code,
+                row.duration_ms,
+                row.client_ip.as_str(),
+                row.user_id.as_str(),
+                row.created_at.as_str(),
+            )
+        })
+        .collect();
+
     let markup = html! {
-        table .table .m-0 {
-            thead {
-                tr {
-                    th { "Status" }
-                    th { "Duration" }
-                    th { "IP" }
-                    th { "User" }
-                    th { "Time" }
-                }
-            }
-            tbody {
-                @for row in display_rows {
-                    (detail_row(
-                        row.status_code,
-                        row.duration_ms,
-                        row.client_ip.as_str(),
-                        row.user_id.as_str(),
-                        row.created_at.as_str(),
-                    ))
-                }
-            }
-        }
+        (components::data_table::<fn(usize) -> Option<String>>(
+            &DETAIL_COLUMNS,
+            rows,
+            None,
+            html! { p .text-center .text-muted { "No requests logged for this path" } },
+        ))
         @if has_more {
             @let next_offset = offset + limit;
             div .text-center .p-2 {
@@ -280,33 +329,49 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
 mod tests {
     use super::*;
 
+    /// Render one summary row the way the page does: through the shared
+    /// component, against the columns it declares.
+    fn rendered_inbound_row(
+        method: &str,
+        path: &str,
+        cnt: i64,
+        avg_ms: i64,
+        errors: i64,
+        last_seen: &str,
+    ) -> String {
+        inbound_row(method, path, cnt, avg_ms, errors, last_seen)
+            .render(&INBOUND_COLUMNS, None)
+            .into_string()
+    }
+
     #[test]
     fn inbound_row_has_no_js_string_xss_sink() {
         // Attacker-controlled request path crafted to break out of the old
         // `onclick="toggleDetail('…')"` JS-string literal.
-        let html = inbound_row(
+        let html = rendered_inbound_row(
             "GET",
             "'); alert(document.cookie); //",
             1,
             2,
             0,
             "2026-01-01T00:00:00Z",
-        )
-        .into_string();
+        );
 
         // The JS-string sink is gone entirely.
         assert!(
             !html.contains("onclick"),
             "must not emit an onclick JS-string sink: {html}"
         );
-        // Replaced by maud-escaped data-* attributes the delegated handler reads.
-        assert!(
-            html.contains("data-detail-target="),
-            "row must carry data-detail-target: {html}"
-        );
+        // Replaced by a maud-escaped data-* attribute the delegated handler
+        // reads. It sits on the detail pane, not on the `<tr>` — the shared
+        // component owns the row element and takes no caller attributes.
         assert!(
             html.contains("data-detail-url="),
-            "row must carry data-detail-url: {html}"
+            "detail pane must carry data-detail-url: {html}"
+        );
+        assert!(
+            html.contains(r#"class="data-table__row expand-row""#),
+            "the row must keep the class the delegated handler selects on: {html}"
         );
         // maud escapes the attribute value (e.g. the URL's `&`), proving the
         // path lands in escaped attribute context, not a raw/JS sink.
@@ -330,13 +395,14 @@ mod tests {
     ///
     /// The mask hooks go INSIDE the cell, never on the `<td>`.
     /// `components::data_table` renders the `<td>` itself and accepts only
-    /// each cell's inner markup (`ui/components/table.rs:53`), so an
-    /// attribute on the `<td>` would be dropped the moment this table
-    /// migrates onto the shared component. Inner markup is carried through
-    /// verbatim and survives that migration.
+    /// each cell's inner markup, so an attribute on the `<td>` would have been
+    /// dropped when this table migrated onto the shared component. Inner
+    /// markup is carried through verbatim, and both hooks survived that
+    /// migration — which is what these two tests now assert against the
+    /// component's own output.
     #[test]
     fn inbound_row_marks_the_values_the_baseline_run_itself_produces() {
-        let html = inbound_row("GET", "/b/admin/", 4, 37, 0, "2026-01-01T00:00:00Z").into_string();
+        let html = rendered_inbound_row("GET", "/b/admin/", 4, 37, 0, "2026-01-01T00:00:00Z");
 
         assert!(
             html.contains("<span data-volatile-metric>37ms</span>"),
@@ -352,11 +418,13 @@ mod tests {
     /// Same contract for the lazily-loaded per-request detail table. It is
     /// collapsed until an operator clicks a row, so it is not inside the
     /// captured region today — but it is the same page module rendering the
-    /// same two kinds of per-run value, and the table migration may change
-    /// what fits in frame.
+    /// same two kinds of per-run value.
     #[test]
     fn detail_row_marks_the_values_the_baseline_run_itself_produces() {
-        let html = detail_row(200, 12, "127.0.0.1", "", "2026-01-01T00:00:00Z").into_string();
+        let html =
+            components::TableRow::new(detail_row(200, 12, "127.0.0.1", "", "2026-01-01T00:00:00Z"))
+                .render(&DETAIL_COLUMNS, None)
+                .into_string();
 
         assert!(
             html.contains("<span data-volatile-metric>12ms</span>"),

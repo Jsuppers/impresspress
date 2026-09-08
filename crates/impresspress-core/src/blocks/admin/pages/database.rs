@@ -19,7 +19,7 @@ use crate::{
         introspect_columns, introspect_table_summaries, validate_readonly_query, TableSummary,
     },
     ui::{
-        components::{Badge, BadgeVariant},
+        components::{self, Badge, BadgeVariant},
         html_response, icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
@@ -258,30 +258,20 @@ async fn schema_panel(ctx: &dyn Context, table: Option<&str>) -> Markup {
             @if columns.is_empty() {
                 div .empty-state { p { "No columns introspected (table may be empty or backend doesn't support it)." } }
             } @else {
-                div .table-container {
-                    table .table {
-                        thead {
-                            tr {
-                                th { "Column" }
-                                th { "Type" }
-                                th { "Not null" }
-                                th { "PK" }
-                                th { "Default" }
-                            }
-                        }
-                        tbody {
-                            @for c in &columns {
-                                tr {
-                                    td .font-medium { (c.name) }
-                                    td .text-muted { (c.ty) }
-                                    td { @if c.notnull { span aria-label="Yes" { (icons::check()) } } }
-                                    td { @if c.pk { span aria-label="Yes" { (icons::check()) } } }
-                                    td .text-muted .text-sm { (c.default_value.as_deref().unwrap_or("")) }
-                                }
-                            }
-                        }
-                    }
-                }
+                @let rows: Vec<Vec<Markup>> = columns.iter().map(|c| vec![
+                    html! { span .font-medium { (c.name) } },
+                    html! { span .text-muted { (c.ty) } },
+                    html! { @if c.notnull { span aria-label="Yes" { (icons::check()) } } },
+                    html! { @if c.pk { span aria-label="Yes" { (icons::check()) } } },
+                    html! { span .text-muted { (c.default_value.as_deref().unwrap_or("")) } },
+                ]).collect();
+
+                (components::data_table::<fn(usize) -> Option<String>>(
+                    &SCHEMA_COLUMNS,
+                    rows,
+                    None,
+                    html! {},
+                ))
             }
         }
     }
@@ -355,30 +345,28 @@ fn render_sql_results(rows: &[db::Record], duration_ms: u128) -> Markup {
         }
     }
 
+    // The result grid's columns are the query's, so they are built per render
+    // rather than declared as a const the way the fixed tables are.
+    let cols: Vec<components::TableCol<'_>> = columns
+        .iter()
+        .map(|c| components::TableCol {
+            label: c.as_str(),
+            width: None,
+        })
+        .collect();
+    let cells: Vec<Vec<Markup>> = rows
+        .iter()
+        .map(|r| {
+            columns
+                .iter()
+                .map(|c| html! { @if let Some(v) = r.data.get(c) { (format_cell(v)) } })
+                .collect()
+        })
+        .collect();
+
     html! {
         p .text-muted .text-sm { (rows.len()) " rows in " (duration_ms) "ms" }
-        div .table-container {
-            table .table {
-                thead {
-                    tr {
-                        @for c in &columns { th { (c) } }
-                    }
-                }
-                tbody {
-                    @for r in rows {
-                        tr {
-                            @for c in &columns {
-                                td .text-sm {
-                                    @if let Some(v) = r.data.get(c) {
-                                        (format_cell(v))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        (components::data_table::<fn(usize) -> Option<String>>(&cols, cells, None, html! {}))
     }
 }
 
@@ -458,6 +446,31 @@ pub async fn handle_database_query(
     };
     html_response(fragment)
 }
+
+/// The schema panel's columns. Declared once so the `<td data-label>` the
+/// component stamps on every cell names the same column the header does.
+const SCHEMA_COLUMNS: [components::TableCol<'static>; 5] = [
+    components::TableCol {
+        label: "Column",
+        width: None,
+    },
+    components::TableCol {
+        label: "Type",
+        width: None,
+    },
+    components::TableCol {
+        label: "Not null",
+        width: None,
+    },
+    components::TableCol {
+        label: "PK",
+        width: None,
+    },
+    components::TableCol {
+        label: "Default",
+        width: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {
