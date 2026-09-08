@@ -19,6 +19,7 @@ use crate::{
         introspect_columns, introspect_table_summaries, validate_readonly_query, TableSummary,
     },
     ui::{
+        components::{Badge, BadgeVariant},
         html_response, icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
@@ -53,11 +54,10 @@ fn backend_badge(backend: wafer_sql_utils::Backend, table_count: usize) -> Marku
         wafer_sql_utils::Backend::Sqlite => "SQLite",
         wafer_sql_utils::Backend::Postgres => "PostgreSQL",
     };
-    html! {
-        span .badge .badge-info .text-xs title="Database backend" {
-            (label) " · " (table_count) " tables"
-        }
-    }
+    Badge::new(BadgeVariant::Info)
+        .classes("text-xs")
+        .title("Database backend")
+        .render(html! { (label) " · " (table_count) " tables" })
 }
 
 fn left_pane(tables: &[TableSummary], selected: Option<&str>, tab: Tab) -> Markup {

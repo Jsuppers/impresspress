@@ -8,7 +8,7 @@ use crate::{
     blocks::admin::AUDIT_LOGS_TABLE as AUDIT_LOGS,
     platform_state::request_logs,
     ui::{
-        components::{self, pagination},
+        components::{self, badge, pagination, Badge, BadgeVariant},
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
@@ -122,9 +122,14 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                                 @let status_code = row.status_code;
                                 tr {
                                     td {
-                                        span .badge .(if status == "ERROR" { "badge-danger" } else if status_code >= 400 { "badge-warning" } else { "badge-success" }) {
-                                            (status_code)
-                                        }
+                                        @let variant = if status == "ERROR" {
+                                            BadgeVariant::Danger
+                                        } else if status_code >= 400 {
+                                            BadgeVariant::Warning
+                                        } else {
+                                            BadgeVariant::Success
+                                        };
+                                        (Badge::new(variant).render(html! { (status_code) }))
                                     }
                                     td .text-sm .font-medium { (method.to_uppercase()) }
                                     td .text-sm { (path) }
@@ -209,7 +214,7 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                                 @let created = record.str_field("created_at");
                                 tr {
                                     td {
-                                        span .badge .badge-info { (action) }
+                                        (badge(BadgeVariant::Info, action))
                                     }
                                     td .text-sm { (resource) }
                                     td .text-muted .text-sm { (user_id.get(..8).unwrap_or(user_id)) }

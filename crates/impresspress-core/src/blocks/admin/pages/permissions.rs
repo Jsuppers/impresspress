@@ -3,7 +3,10 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     platform_state::wrap_grants,
-    ui::{components, icons},
+    ui::{
+        components::{self, badge, Badge, BadgeVariant},
+        icons,
+    },
 };
 
 /// Render JUST the permissions settings body. The parent `settings_page`
@@ -96,20 +99,20 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                             @for grant in &block.grants {
                                 tr {
                                     td {
-                                        span .badge .badge-info { (block.name) }
+                                        (badge(BadgeVariant::Info, &block.name))
                                     }
                                     td {
                                         @if grant.grantee == "*" {
-                                            span .badge .badge-warning { "* (all blocks)" }
+                                            (badge(BadgeVariant::Warning, "* (all blocks)"))
                                         } @else {
                                             code { (grant.grantee) }
                                         }
                                     }
                                     td {
                                         @if let Some(ref rt) = grant.resource_type {
-                                            span .badge .badge-info .text-11 { (rt) }
+                                            (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
                                         } @else {
-                                            span .badge .badge-secondary .text-11 { "all" }
+                                            (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
                                         }
                                     }
                                     td {
@@ -117,9 +120,9 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                                     }
                                     td {
                                         @if grant.write {
-                                            span .badge .badge-danger { "read + write" }
+                                            (badge(BadgeVariant::Danger, "read + write"))
                                         } @else {
-                                            span .badge .badge-success { "read only" }
+                                            (badge(BadgeVariant::Success, "read only"))
                                         }
                                     }
                                 }
@@ -181,16 +184,16 @@ pub(crate) async fn grants_custom_tab(
                                 tr {
                                     td {
                                         @if grantee == "*" {
-                                            span .badge .badge-warning { "* (all blocks)" }
+                                            (badge(BadgeVariant::Warning, "* (all blocks)"))
                                         } @else {
                                             code { (grantee) }
                                         }
                                     }
                                     td {
                                         @if rt.is_empty() {
-                                            span .badge .badge-secondary .text-11 { "all" }
+                                            (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
                                         } @else {
-                                            span .badge .badge-info .text-11 { (rt) }
+                                            (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
                                         }
                                     }
                                     td {
@@ -198,9 +201,9 @@ pub(crate) async fn grants_custom_tab(
                                     }
                                     td {
                                         @if write {
-                                            span .badge .badge-danger { "read + write" }
+                                            (badge(BadgeVariant::Danger, "read + write"))
                                         } @else {
-                                            span .badge .badge-success { "read only" }
+                                            (badge(BadgeVariant::Success, "read only"))
                                         }
                                     }
                                     td .text-13 { (description) }
@@ -532,22 +535,22 @@ async fn permissions_all_tab(
                             @for row in &all_rows {
                                 tr {
                                     td {
-                                        @let badge_class = match row.type_label.as_str() {
-                                            "DB" | "DB/Config" => "badge-info",
-                                            "Config" => "badge-info",
-                                            "Storage" => "badge-warning",
-                                            "Network" => "badge-success",
-                                            "Crypto" => "badge-secondary",
-                                            _ => "badge-secondary",
+                                        @let variant = match row.type_label.as_str() {
+                                            "DB" | "DB/Config" => BadgeVariant::Info,
+                                            "Config" => BadgeVariant::Info,
+                                            "Storage" => BadgeVariant::Warning,
+                                            "Network" => BadgeVariant::Success,
+                                            "Crypto" => BadgeVariant::Secondary,
+                                            _ => BadgeVariant::Secondary,
                                         };
-                                        span .badge .(badge_class) .text-11 { (row.type_label) }
+                                        (Badge::new(variant).classes("text-11").render(html! { (row.type_label) }))
                                     }
                                     td .text-13 { (row.sentence) }
                                     td {
                                         @if row.origin == "code" {
-                                            span .badge .badge-secondary .text-10 { "code" }
+                                            (Badge::new(BadgeVariant::Secondary).classes("text-10").render(html! { "code" }))
                                         } @else {
-                                            span .badge .badge-primary .text-10 { "custom" }
+                                            (Badge::new(BadgeVariant::Primary).classes("text-10").render(html! { "custom" }))
                                         }
                                     }
                                 }

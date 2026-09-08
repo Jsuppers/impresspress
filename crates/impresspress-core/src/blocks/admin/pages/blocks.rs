@@ -6,7 +6,7 @@ use crate::{
     platform_state::block_settings,
     ui::{
         self,
-        components::{empty_state, tab_navigation, Tab},
+        components::{empty_state, tab_navigation, Badge, BadgeVariant, Tab},
         icons,
         shell::Topbar,
         templates::{list_page, PageHeader},
@@ -363,8 +363,8 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
             div {
                 div .flex .items-center .gap-2 {
                     h3 .modal-title { (block.name) }
-                    span .badge .badge-info .text-11 { "v" (block.version) }
-                    span .badge .badge--tone-slate .text-11 { (format!("{:?}", block.category)) }
+                    (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { "v" (block.version) }))
+                    (Badge::new(BadgeVariant::ToneSlate).classes("text-11").render(html! { (format!("{:?}", block.category)) }))
                 }
             }
             button .modal-close data-action="modal-close" data-modal-target="block-detail-modal-overlay" {
@@ -420,12 +420,12 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
                             @for ep in &block.endpoints {
                                 tr {
                                     td {
-                                        span .badge .(method_badge_tone(ep.method)) .text-11 { (ep.method) }
+                                        (Badge::new(method_badge_tone(ep.method)).classes("text-11").render(html! { (ep.method) }))
                                     }
                                     td .text-sm { code .text-xs { (ep.path) } }
                                     td .text-sm .text-muted { (ep.summary) }
                                     td {
-                                        span .badge .(auth_badge_tone(ep.auth)) .text-10 { (ep.auth) }
+                                        (Badge::new(auth_badge_tone(ep.auth)).classes("text-10").render(html! { (ep.auth) }))
                                     }
                                 }
                             }
@@ -464,13 +464,13 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
             div .modal-tech {
                 div .mb-2 {
                     b { "Interface: " }
-                    span .badge .badge--tone-slate .text-11 { (block.interface) }
+                    (Badge::new(BadgeVariant::ToneSlate).classes("text-11").render(html! { (block.interface) }))
                 }
                 @if !block.requires.is_empty() {
                     div .mb-2 {
                         b { "Requires: " }
                         @for req in &block.requires {
-                            span .badge .badge-primary .text-11 .mr-1 { (req) }
+                            (Badge::new(BadgeVariant::Primary).classes("text-11 mr-1").render(html! { (req) }))
                         }
                     }
                 }
@@ -478,7 +478,7 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
                     div .mb-2 {
                         b { "Database tables: " }
                         @for col in &block.collections {
-                            span .badge .badge--tone-slate .text-11 .mr-1 { (col.name) }
+                            (Badge::new(BadgeVariant::ToneSlate).classes("text-11 mr-1").render(html! { (col.name) }))
                         }
                     }
                 }
@@ -489,25 +489,25 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
     ui::html_response_opening_modal(markup, "block-detail-modal-overlay")
 }
 
-/// Tone class for an endpoint's HTTP-method badge. Shares its colour set with
+/// Tone variant for an endpoint's HTTP-method badge. Shares its colour set with
 /// [`auth_badge_tone`] — `Post`/`Public` and `Patch`/`Authenticated` render
 /// identically, so the tones live once in `styles/components/badge.css`
 /// rather than being declared per-enum.
-fn method_badge_tone(method: wafer_run::HttpMethod) -> &'static str {
+fn method_badge_tone(method: wafer_run::HttpMethod) -> BadgeVariant {
     match method {
-        wafer_run::HttpMethod::Get => "badge--tone-brand",
-        wafer_run::HttpMethod::Post => "badge--tone-green",
-        wafer_run::HttpMethod::Patch => "badge--tone-amber",
-        wafer_run::HttpMethod::Delete => "badge--tone-red",
+        wafer_run::HttpMethod::Get => BadgeVariant::ToneBrand,
+        wafer_run::HttpMethod::Post => BadgeVariant::ToneGreen,
+        wafer_run::HttpMethod::Patch => BadgeVariant::ToneAmber,
+        wafer_run::HttpMethod::Delete => BadgeVariant::ToneRed,
     }
 }
 
-/// Tone class for an endpoint's auth-level badge. See [`method_badge_tone`].
-fn auth_badge_tone(auth: wafer_run::AuthLevel) -> &'static str {
+/// Tone variant for an endpoint's auth-level badge. See [`method_badge_tone`].
+fn auth_badge_tone(auth: wafer_run::AuthLevel) -> BadgeVariant {
     match auth {
-        wafer_run::AuthLevel::Public => "badge--tone-green",
-        wafer_run::AuthLevel::Admin => "badge--tone-red",
-        wafer_run::AuthLevel::Authenticated => "badge--tone-amber",
+        wafer_run::AuthLevel::Public => BadgeVariant::ToneGreen,
+        wafer_run::AuthLevel::Admin => BadgeVariant::ToneRed,
+        wafer_run::AuthLevel::Authenticated => BadgeVariant::ToneAmber,
     }
 }
 
@@ -546,6 +546,50 @@ fn custom_tab_content() -> maud::Markup {
 /// (`let _ = set_enabled(..)`), and must only write the audit-log row after a
 /// confirmed successful write — a failed persist must not report success or
 /// log "block.enable"/"block.disable" as if it happened.
+#[cfg(test)]
+mod badge_tone_tests {
+    use maud::html;
+
+    use super::*;
+
+    /// The block-detail modal is the only place these two colour sets render,
+    /// and the seeded block in `page_link_tests` declares no endpoints, so no
+    /// page render exercises them. Pinned here against the exact class each
+    /// arm emitted before the tones became `BadgeVariant` values.
+    #[test]
+    fn method_and_auth_tones_render_the_classes_they_always_did() {
+        let rendered = |variant| {
+            Badge::new(variant)
+                .classes("text-11")
+                .render(html! { "x" })
+                .into_string()
+        };
+        for (method, class) in [
+            (wafer_run::HttpMethod::Get, "badge--tone-brand"),
+            (wafer_run::HttpMethod::Post, "badge--tone-green"),
+            (wafer_run::HttpMethod::Patch, "badge--tone-amber"),
+            (wafer_run::HttpMethod::Delete, "badge--tone-red"),
+        ] {
+            assert_eq!(
+                rendered(method_badge_tone(method)),
+                format!(r#"<span class="badge {class} text-11">x</span>"#),
+                "{method:?}"
+            );
+        }
+        for (auth, class) in [
+            (wafer_run::AuthLevel::Public, "badge--tone-green"),
+            (wafer_run::AuthLevel::Admin, "badge--tone-red"),
+            (wafer_run::AuthLevel::Authenticated, "badge--tone-amber"),
+        ] {
+            assert_eq!(
+                rendered(auth_badge_tone(auth)),
+                format!(r#"<span class="badge {class} text-11">x</span>"#),
+                "{auth:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod toggle_feature_tests {
     use wafer_core::clients::database as db;

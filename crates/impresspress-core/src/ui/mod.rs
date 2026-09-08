@@ -1772,6 +1772,35 @@ mod tests {
     /// grep before writing this) is a plain token list with no embedded
     /// quote, so a naive scan-to-next-`"` is exact here, not just a
     /// heuristic approximation.
+    /// Utility classes handed to a component builder as a string literal --
+    /// `Badge::new(..).classes("text-11 mr-1")`. They land in the rendered
+    /// `class` attribute exactly like a maud shorthand does, so this guard has
+    /// to see them; without this pass, moving a pill onto `components::Badge`
+    /// would quietly drop its utility classes out of the scan.
+    ///
+    /// Scanned over the whole file rather than inside an `html!` body, because
+    /// a component can be built outside one -- `admin::pages::database`'s
+    /// `backend_badge` returns a `Badge` with no surrounding `html!` at all.
+    fn find_component_class_literals(src: &[char]) -> Vec<(usize, String)> {
+        let needle: Vec<char> = ".classes(\"".chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + needle.len() <= src.len() {
+            if src[i..i + needle.len()] == needle[..] {
+                let val_start = i + needle.len();
+                let mut j = val_start;
+                while j < src.len() && src[j] != '"' {
+                    j += 1;
+                }
+                out.push((i, src[val_start..j].iter().collect()));
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
     fn find_class_attr_literals(body: &[char]) -> Vec<(usize, String)> {
         let needle: Vec<char> = "class=\"".chars().collect();
         let mut out = Vec::new();
@@ -1846,6 +1875,20 @@ mod tests {
         let chars: Vec<char> = src.chars().collect();
         let test_spans = find_test_mod_spans(&chars);
         let in_test = |pos: usize| test_spans.iter().any(|&(s, e)| pos >= s && pos < e);
+
+        for (idx, value) in find_component_class_literals(&chars) {
+            if in_test(idx) {
+                continue;
+            }
+            let line = 1 + chars[..idx].iter().filter(|&&c| c == '\n').count();
+            for tok in value.split_whitespace() {
+                if tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    used.entry(tok.to_string()).or_insert_with(|| {
+                        (path.to_string(), line, format!(".classes(\"{value}\")"))
+                    });
+                }
+            }
+        }
 
         let needle: Vec<char> = "html!".chars().collect();
         let mut i = 0;

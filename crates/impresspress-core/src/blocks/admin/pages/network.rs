@@ -3,7 +3,10 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     platform_state::request_logs,
-    ui::{components, icons},
+    ui::{
+        components::{self, Badge, BadgeVariant},
+        icons,
+    },
 };
 
 /// Render JUST the network monitoring body. The parent `settings_page`
@@ -148,12 +151,12 @@ fn inbound_row(
             td .text-sm .font-medium { (method.to_uppercase()) }
             td .text-sm { (path) }
             td .text-sm {
-                span .badge .badge-info { (cnt) }
+                (Badge::new(BadgeVariant::Info).render(html! { (cnt) }))
             }
             td .text-muted .text-sm { span data-volatile-metric { (avg_ms) "ms" } }
             td .text-sm {
                 @if errors > 0 {
-                    span .badge .badge-danger { (errors) }
+                    (Badge::new(BadgeVariant::Danger).render(html! { (errors) }))
                 } @else {
                     span .text-muted { "0" }
                 }
@@ -188,9 +191,14 @@ fn detail_row(
     html! {
         tr {
             td {
-                span .badge .(if status_code >= 500 { "badge-danger" } else if status_code >= 400 { "badge-warning" } else { "badge-success" }) {
-                    (status_code)
-                }
+                @let variant = if status_code >= 500 {
+                    BadgeVariant::Danger
+                } else if status_code >= 400 {
+                    BadgeVariant::Warning
+                } else {
+                    BadgeVariant::Success
+                };
+                (Badge::new(variant).render(html! { (status_code) }))
             }
             td .text-muted { span data-volatile-metric { (duration) "ms" } }
             td .text-muted { (client_ip) }
