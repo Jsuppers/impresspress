@@ -1091,6 +1091,7 @@ async fn a_denied_generations_read_is_403_not_500() {
     let ctx = TestContext::with_dev(FakeControl::new()).await.with_wrap(
         "test/ungranted",
         Vec::new(),
+        Vec::new(),
         "impresspress/admin",
     );
 
@@ -1117,6 +1118,7 @@ async fn a_denied_generations_read_is_403_not_500() {
 async fn a_denied_generations_read_is_still_never_cached() {
     let ctx = TestContext::with_dev(FakeControl::new()).await.with_wrap(
         "test/ungranted",
+        Vec::new(),
         Vec::new(),
         "impresspress/admin",
     );

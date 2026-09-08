@@ -779,6 +779,7 @@ mod tests {
         // pipeline does in production.
         let wrapped = ctx.clone().with_wrap(
             "impresspress/router",
+            Vec::new(),
             crate::blocks::auth::service::auth_grants(),
             "impresspress/admin",
         );

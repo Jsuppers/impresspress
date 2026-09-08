@@ -455,7 +455,12 @@ mod tests {
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
-        let ctx = ctx.with_wrap("impresspress/userportal", Vec::new(), "impresspress/admin");
+        let ctx = ctx.with_wrap(
+            "impresspress/userportal",
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
+            Vec::new(),
+            "impresspress/admin",
+        );
 
         let err = sessions::list_for_user(&ctx, "user-a")
             .await
@@ -476,6 +481,7 @@ mod tests {
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
             auth_grants(),
             "impresspress/admin",
         );
@@ -500,6 +506,7 @@ mod tests {
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
             auth_grants(),
             "impresspress/admin",
         );

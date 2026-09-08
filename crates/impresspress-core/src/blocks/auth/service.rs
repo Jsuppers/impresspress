@@ -758,6 +758,7 @@ mod tests {
 
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );

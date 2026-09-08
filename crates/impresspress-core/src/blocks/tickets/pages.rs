@@ -662,6 +662,7 @@ mod denial_tests {
         let ctx = TestContext::with_tickets().await.with_wrap(
             "test/ungranted",
             Vec::new(),
+            Vec::new(),
             "impresspress/admin",
         );
         let mut msg = admin_msg("retrieve", "/b/tickets/admin/tickets/any-id");

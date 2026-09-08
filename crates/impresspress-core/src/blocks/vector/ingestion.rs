@@ -15,18 +15,24 @@
 //! summary, then prepends that summary to every chunk. This is a
 //! simplification of Anthropic's per-chunk contextual retrieval recipe
 //! and trades some precision for one wire call instead of N.
+//!
+//! ### Where the degradation logs land
+//!
+//! All four of `add_context`'s degradation paths log through `tracing`, which
+//! reaches a subscriber on the two targets that run this code today: the
+//! native server installs one in `impresspress-native::log_init` (from
+//! `cli/server.rs`), and the browser installs one in
+//! `impresspress-browser::logger::init_console_tracing` (from
+//! `impresspress-web::initialize`). The Cloudflare Worker installs **no**
+//! `tracing` subscriber — it has a `LoggerService` (`ConsoleLoggerService`),
+//! which is a different channel — so a `tracing` event is dropped there.
+//! `block-vector` is not in that target's default feature set, so nothing
+//! runs this path on a Worker today; if that changes, the subscriber is what
+//! has to be installed first, or these logs are decoration.
 
-// `blocks::llm` is feature-gated (`reqwest/stream` it pulls in for the SSE
-// provider conflicts with `worker`'s `wasm-streams` on wasm32). When the
-// feature is off we degrade silently — same fallback path as "no LLM
-// configured at runtime".
-#[cfg(feature = "llm")]
 use wafer_block::wire::llm::{ChatContent, ChatMessage, ChatRequest, ChatRole, ChunkDelta};
-#[cfg(feature = "llm")]
 use wafer_core::clients::llm;
-use wafer_run::{context::Context, WaferError};
-#[cfg(feature = "llm")]
-use wafer_run::{InputStream, Message};
+use wafer_run::{context::Context, InputStream, Message, WaferError};
 
 /// Approximate max tokens per chunk. We use whitespace-split as a proxy
 /// for tokenization — close enough for bge-m3 / MiniLM at this
@@ -84,26 +90,26 @@ pub fn chunk(text: &str, chunk_tokens: usize, overlap_ratio: f32) -> Vec<String>
 /// per-chunk Anthropic Contextual Retrieval recipe (which makes N LLM
 /// calls per document) at the cost of less per-chunk specificity.
 ///
-/// Degrades silently — `chunks` is returned unchanged — when:
-///   * no LLM is configured (`IMPRESSPRESS__LLM__DEFAULT_MODEL` empty),
-///   * the chat call errors (block not registered, transport failure, …),
+/// Degrades — `chunks` is returned unchanged, and the reason is logged —
+/// when:
+///   * no LLM is configured (`IMPRESSPRESS__LLM__DEFAULT_MODEL` empty, or the
+///     llm block is not registered at all),
+///   * the chat call errors (transport failure, backend refusal, …),
 ///   * the LLM returns no text (empty stream).
 ///
 /// The ingest must not fail because the contextual step couldn't run; the
 /// raw chunks are still useful for retrieval.
-#[cfg(not(feature = "llm"))]
-pub async fn add_context(
-    ctx: &dyn Context,
-    document: &str,
-    chunks: Vec<String>,
-) -> Result<Vec<String>, WaferError> {
-    // wasm32 / no-LLM build: degrade silently — same fallback path as the
-    // `llm` feature build takes when no provider is configured.
-    let _ = (ctx, document);
-    Ok(chunks)
-}
-
-#[cfg(feature = "llm")]
+///
+/// Not gated on the `llm` cargo feature. It used to be, with a no-op twin
+/// under `cfg(not(feature = "llm"))`, so a build without that feature — every
+/// wasm32 build, where `block-vector` is enabled and `llm` cannot be —
+/// silently linked a function that returned `chunks` untouched while the
+/// ingest reported success. Nothing in this body needs the feature: it
+/// reaches the llm block through `wafer_core::clients::llm::chat` and
+/// `ctx.call_block`, both unconditional. The feature gates the *native
+/// provider backend* (`ProviderLlmService`, reqwest + tokio), which is a
+/// different question from whether an ingest can ask a registered llm block
+/// for a summary.
 pub async fn add_context(
     ctx: &dyn Context,
     document: &str,
@@ -155,6 +161,12 @@ pub async fn add_context(
     }
     let context = context.trim();
     if context.is_empty() {
+        // The fourth degradation path, and the last one that was silent: the
+        // model answered with no text at all. Same log level as the
+        // no-default-model path — expected enough not to be a warning, but an
+        // ingest that quietly stopped being contextual is not something an
+        // operator should have to infer from the retrieval quality.
+        tracing::debug!("contextual retrieval skipped: the model returned no text");
         return Ok(chunks);
     }
 
@@ -167,13 +179,14 @@ pub async fn add_context(
 /// Fetch the default `(provider, model)` LLM target via the llm block's
 /// internal discovery route. Returns `None` when no model is configured or
 /// when the llm block isn't registered — both cases trigger the same
-/// "degrade silently" fallback in `add_context`.
+/// degradation in `add_context`, which logs before returning the chunks
+/// unchanged.
 ///
 /// Going through `ctx.call_block(...)` rather than a direct in-process
-/// function call is what keeps the vector block independent of the llm
-/// block at the type/dep level — that's the dependency edge Phase 0b PR-2
-/// will turn into a Cargo feature gate.
-#[cfg(feature = "llm")]
+/// function call is what keeps the vector block independent of the llm block
+/// at the type/dep level — and it is why this whole path needs no cargo
+/// feature: the edge is a runtime dispatch, resolved against what is
+/// registered.
 async fn default_llm_target(ctx: &dyn Context) -> Option<(String, String)> {
     let resource = "/b/llm/api/internal/default-target";
     let mut msg = Message::new(format!("retrieve:{resource}"));
@@ -195,7 +208,6 @@ async fn default_llm_target(ctx: &dyn Context) -> Option<(String, String)> {
     Some((provider, model))
 }
 
-#[cfg(feature = "llm")]
 const CONTEXTUAL_SYSTEM_PROMPT: &str = "\
 You are summarizing a document so retrieval excerpts from it are easier to \
 understand out of context. Return one or two short sentences describing what \
@@ -243,5 +255,259 @@ mod tests {
         let c = chunk(&text, 5, 0.0);
         assert_eq!(c.len(), 4);
         assert!(c[1].starts_with("w6"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: contextual retrieval is a runtime capability, not a build-time one.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contextual_retrieval_tests {
+    use std::sync::Arc;
+
+    use wafer_block::{
+        common::ServiceOp,
+        wire::llm::{ChatChunk, FinishReason},
+    };
+    use wafer_run::{
+        Block, BlockCategory, BlockInfo, ErrorCode, InputStream, LifecycleEvent, Message,
+        OutputStream, WaferError,
+    };
+
+    use super::*;
+    use crate::test_support::TestContext;
+
+    /// A fixture that runs `add_context` under the vector block's real
+    /// identity: its own declared `requires` allowlist, which
+    /// `Wafer::make_block_context` installs on every context this block's
+    /// code runs in and `RuntimeContext::dispatch_call` enforces above every
+    /// other permission check.
+    ///
+    /// Sourced from `VectorBlock::new().info()`, never re-listed here — the
+    /// whole point is that the test and the runtime read the same
+    /// declaration. A test that called `add_context` on a bare
+    /// `TestContext` would pass while production answered
+    /// `PermissionDenied`, which is exactly how this path shipped broken:
+    /// `add_context` reaches two blocks (`impresspress/llm` for the default
+    /// target, `wafer-run/llm` for the completion) and the allowlist named
+    /// neither, so the permission denial was swallowed at the `.ok()?` and
+    /// logged as "no default LLM model configured".
+    async fn vector_ctx() -> TestContext {
+        TestContext::with_vector().await.with_wrap(
+            "impresspress/vector",
+            wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new()).requires,
+            Vec::new(),
+            "impresspress/admin",
+        )
+    }
+
+    /// Stub `impresspress/llm` feature block. `default_llm_target` reads one
+    /// internal route off it and nothing else; anything else errors loudly so
+    /// a test cannot silently exercise an unscripted path.
+    struct StubDefaultTargetBlock {
+        /// `None` renders a body with empty strings, which is how a runtime
+        /// with the llm block registered but no model configured answers.
+        target: Option<(&'static str, &'static str)>,
+    }
+
+    #[async_trait::async_trait]
+    impl Block for StubDefaultTargetBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new(
+                "impresspress/llm",
+                "0.0.1",
+                "http@v1",
+                "stub llm feature block for contextual-retrieval tests",
+            )
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            assert_eq!(msg.path(), "/b/llm/api/internal/default-target");
+            let (provider, model) = self.target.unwrap_or(("", ""));
+            OutputStream::respond(
+                serde_json::to_vec(&serde_json::json!({
+                    "provider": provider,
+                    "model": model,
+                }))
+                .expect("serialize default-target body"),
+            )
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn Context,
+            _e: LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
+    /// Stub `wafer-run/llm` service block streaming one scripted summary.
+    struct StubChatBlock {
+        summary: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Block for StubChatBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new(
+                "wafer-run/llm",
+                "0.0.1",
+                "llm@v1",
+                "stub llm service block for contextual-retrieval tests",
+            )
+            .category(BlockCategory::Service)
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            match msg.kind.as_str() {
+                ServiceOp::LLM_CHAT => {
+                    let frames: Vec<Vec<u8>> = vec![
+                        wafer_block::codec::encode(&ChatChunk::text(self.summary))
+                            .expect("encode text chunk"),
+                        wafer_block::codec::encode(&ChatChunk::finish(FinishReason::Stop, None))
+                            .expect("encode finish chunk"),
+                    ];
+                    OutputStream::from_producer(move |sink, _cancel| async move {
+                        for frame in frames {
+                            if sink.send_chunk(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                    })
+                }
+                other => OutputStream::error(WaferError::new(
+                    ErrorCode::Unimplemented,
+                    format!("StubChatBlock: unhandled op {other}"),
+                )),
+            }
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn Context,
+            _e: LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
+    /// The point of the whole module: with an llm block and a default model
+    /// configured, every chunk carries the document-level summary.
+    ///
+    /// This is what a build without the `llm` cargo feature could not do,
+    /// because `add_context` was `cfg`-gated and such a build linked a no-op
+    /// twin that returned `chunks` unchanged. Nothing in the real body needs
+    /// that feature — it reaches the llm block through
+    /// `wafer_core::clients::llm::chat` and `ctx.call_block`, both
+    /// unconditional — so the gate's only effect was silently degrading
+    /// wasm32 ingests.
+    #[tokio::test]
+    async fn add_context_prepends_the_summary_to_every_chunk() {
+        let mut ctx = vector_ctx().await;
+        ctx.register_block(
+            "impresspress/llm",
+            Arc::new(StubDefaultTargetBlock {
+                target: Some(("openai", "gpt-4o-mini")),
+            }),
+        );
+        ctx.register_block(
+            "wafer-run/llm",
+            Arc::new(StubChatBlock {
+                summary: "A quarterly report about widget sales.",
+            }),
+        );
+
+        let out = add_context(&ctx, "the document", vec!["one".into(), "two".into()])
+            .await
+            .expect("add_context never fails the ingest");
+
+        assert_eq!(
+            out,
+            vec![
+                "A quarterly report about widget sales.\n\none".to_string(),
+                "A quarterly report about widget sales.\n\ntwo".to_string(),
+            ]
+        );
+    }
+
+    /// The three degradation paths stay degradations: the ingest keeps its
+    /// chunks and never fails.
+    #[tokio::test]
+    async fn add_context_degrades_when_no_default_model_is_configured() {
+        let mut ctx = vector_ctx().await;
+        ctx.register_block(
+            "impresspress/llm",
+            Arc::new(StubDefaultTargetBlock { target: None }),
+        );
+
+        let out = add_context(&ctx, "the document", vec!["one".into()])
+            .await
+            .expect("add_context never fails the ingest");
+
+        assert_eq!(out, vec!["one".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn add_context_degrades_when_the_llm_block_is_absent() {
+        let ctx = vector_ctx().await;
+
+        let out = add_context(&ctx, "the document", vec!["one".into()])
+            .await
+            .expect("add_context never fails the ingest");
+
+        assert_eq!(out, vec!["one".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn add_context_degrades_when_the_model_returns_no_text() {
+        let mut ctx = vector_ctx().await;
+        ctx.register_block(
+            "impresspress/llm",
+            Arc::new(StubDefaultTargetBlock {
+                target: Some(("openai", "gpt-4o-mini")),
+            }),
+        );
+        ctx.register_block("wafer-run/llm", Arc::new(StubChatBlock { summary: "   " }));
+
+        let out = add_context(&ctx, "the document", vec!["one".into()])
+            .await
+            .expect("add_context never fails the ingest");
+
+        assert_eq!(out, vec!["one".to_string()]);
+    }
+
+    /// The three degradation tests above cannot see this on their own: a
+    /// contextual ingest that is refused by the allowlist degrades to exactly
+    /// the same raw chunks a missing model produces, which is what made the
+    /// original defect invisible. So the allowlist is pinned directly.
+    ///
+    /// Both names are load-bearing and neither is a hard dependency —
+    /// `add_context` degrades when they are absent. What it must not do is be
+    /// refused when they are *present*.
+    #[test]
+    fn the_block_declares_every_target_contextual_retrieval_reaches() {
+        let requires = wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new()).requires;
+        for target in ["impresspress/llm", "wafer-run/llm"] {
+            assert!(
+                requires.iter().any(|r| r == target),
+                "`ingestion::add_context` calls `{target}`, so the block must \
+                 declare it — `RuntimeContext::dispatch_call` refuses an \
+                 undeclared target before any grant check, and the refusal is \
+                 swallowed into a 'no default LLM model configured' log. \
+                 Declared: {requires:?}"
+            );
+        }
     }
 }

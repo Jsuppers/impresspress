@@ -45,7 +45,13 @@ pub mod rate_limit;
 pub mod router;
 pub mod storage;
 pub mod system;
-#[cfg(target_arch = "wasm32")]
+// Not gated on a target. The block is a thin wrapper over an injected
+// `Arc<dyn EmbeddingService>` and contains nothing platform-specific; which
+// runtimes *register* it is decided by whether a caller injected an embedding
+// service (`ImpresspressBuilder::embedding_service`), which is a runtime fact,
+// not a build-target one. Gating the module on `wasm32` meant a native caller
+// that injected an embedding service got the vector backend registered and
+// the block that serves it silently dropped.
 pub mod transformers_embed;
 #[cfg(feature = "block-userportal")]
 pub mod userportal;
@@ -80,8 +86,8 @@ pub mod vector;
 /// `ImpresspressBuilder::build`, because their constructors are not zero-argument:
 /// `impresspress/llm` (`Arc<dyn ProviderAdmin>`, via [`register_llm`]),
 /// `wafer-run/auth` (framework `AuthBlock` wrapping `AuthServiceImpl`, via
-/// [`register_auth`]), and `impresspress/transformers-embed` (wasm32-only,
-/// injected `Arc<dyn EmbeddingService>`). `llm`'s `BlockInfo` is still added to
+/// [`register_auth`]), and `impresspress/transformers-embed` (injected
+/// `Arc<dyn EmbeddingService>`). `llm`'s `BlockInfo` is still added to
 /// [`all_block_infos`] below via a `NoopProviderAdmin` handle (info is
 /// declarative and never drives the provider surface).
 macro_rules! feature_block_manifest {
@@ -123,7 +129,7 @@ macro_rules! feature_block_manifest {
         ///
         /// Called from `ImpresspressBuilder::build` on **both** native and wasm32 —
         /// there is no longer a native (linkme) / wasm32 (manual list) split.
-        /// The `impresspress/llm`, `wafer-run/auth`, and (wasm32)
+        /// The `impresspress/llm`, `wafer-run/auth` and
         /// `impresspress/transformers-embed` blocks are registered explicitly by
         /// the builder afterwards (non-zero-arg constructors).
         pub fn register_feature_blocks(

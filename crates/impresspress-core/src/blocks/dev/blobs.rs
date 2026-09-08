@@ -204,9 +204,12 @@ mod tests {
         // Act as `impresspress/files`: a shallow clone of the fixture with a
         // different WRAP identity, sharing the same storage block and the
         // same backing store.
-        let files_block =
-            ctx.clone()
-                .with_wrap("impresspress/files", Vec::new(), "impresspress/admin");
+        let files_block = ctx.clone().with_wrap(
+            "impresspress/files",
+            wafer_run::Block::info(&crate::blocks::files::FilesBlock::new()).requires,
+            Vec::new(),
+            "impresspress/admin",
+        );
         storage::put(
             &files_block,
             "uploads",

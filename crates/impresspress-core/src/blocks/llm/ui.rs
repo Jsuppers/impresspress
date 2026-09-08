@@ -36,8 +36,18 @@ use crate::{
 ///
 /// Fetches rows directly from the block's own collection (Option A: avoids a
 /// flash-of-empty during first paint).
+///
+/// The page renders the create form and the per-row actions only when the
+/// runtime can actually manage providers. A runtime built without the `llm`
+/// cargo feature holds a `NoopProviderAdmin`, and its CRUD handlers answer
+/// `501 Unimplemented` — but htmx does not swap on a non-2xx, so the
+/// administrator clicked and nothing visible happened at all. Before the
+/// handlers started refusing, the same click lied with a success. Neither is
+/// right: the page reads the same predicate the handlers do
+/// (`ProviderAdmin::manages_providers`) and says so instead of offering
+/// controls that cannot work.
 pub(super) async fn providers_page(
-    _block: &LlmBlock,
+    block: &LlmBlock,
     ctx: &dyn Context,
     msg: &Message,
 ) -> OutputStream {
@@ -55,24 +65,34 @@ pub(super) async fn providers_page(
             Err(e) => return err_internal("Database error", e),
         };
 
+    let manages = block.provider_admin.manages_providers();
+
     let content = html! {
         (components::page_header(
             "LLM Providers",
-            Some("Configure OpenAI, Anthropic, and OpenAI-compatible endpoints."),
+            Some(if manages {
+                "Configure OpenAI, Anthropic, and OpenAI-compatible endpoints."
+            } else {
+                "Read-only on this deployment."
+            }),
             None,
         ))
 
-        // Add-provider form. Posts JSON via htmx json-enc so the existing
-        // `POST /b/llm/api/providers` handler accepts the body without any
-        // form-urlencoded translation layer.
-        div .card .mb-6 {
-            h3 .card-title .mb-3 { "Add provider" }
-            (add_provider_form())
+        @if manages {
+            // Add-provider form. Posts JSON via htmx json-enc so the existing
+            // `POST /b/llm/api/providers` handler accepts the body without any
+            // form-urlencoded translation layer.
+            div .card .mb-6 {
+                h3 .card-title .mb-3 { "Add provider" }
+                (add_provider_form())
+            }
+        } @else {
+            (cannot_manage_providers_notice())
         }
 
         // Providers table. Rendered by a pure helper for testability.
         div .card .card--flush {
-            (render_providers_table(&configs))
+            (render_providers_table(&configs, manages))
         }
     };
 
@@ -83,6 +103,33 @@ pub(super) async fn providers_page(
         content,
     )
     .await
+}
+
+/// What the page says instead of the create form when the runtime holds a
+/// handle that cannot manage providers.
+///
+/// It names the two things an administrator needs: that the rows below are a
+/// read-only view, and where provider configuration lives on such a
+/// deployment. A browser runtime configures its providers inside
+/// `BrowserLlmService`, not through this block.
+fn cannot_manage_providers_notice() -> Markup {
+    html! {
+        div .card .mb-6 {
+            h3 .card-title .mb-3 { "This deployment cannot manage providers" }
+            p .text-muted {
+                "No provider backend is compiled into this runtime, so \
+                 creating, editing, discovering and deleting providers are \
+                 unavailable here — the API answers 501 for all four. Any \
+                 rows below are stored configuration, shown read-only."
+            }
+            p .text-muted .mt-2 {
+                "A browser deployment configures its providers inside its own \
+                 LLM service rather than through this page. A server \
+                 deployment gets these controls by building with the `llm` \
+                 feature."
+            }
+        }
+    }
 }
 
 /// Render the add-provider form. Separated out so the top-level page
@@ -198,11 +245,21 @@ document.currentScript.closest('form').addEventListener('htmx:configRequest', fu
 ///
 /// `configs` is `(row_id, ProviderConfig)` pairs so the Delete /
 /// Discover-models actions can target the concrete row ID.
-fn render_providers_table(configs: &[(String, ProviderConfig)]) -> Markup {
+///
+/// `manages` is `ProviderAdmin::manages_providers()`. When it is false the
+/// Actions column is dropped entirely rather than rendered disabled: the two
+/// buttons in it are the only things there, and a runtime that answers 501 to
+/// both has no action to offer.
+fn render_providers_table(configs: &[(String, ProviderConfig)], manages: bool) -> Markup {
     html! {
         @if configs.is_empty() {
             div .empty-state {
-                "No providers configured yet. Use the form above to add one."
+                @if manages {
+                    "No providers configured yet. Use the form above to add one."
+                } @else {
+                    "No providers are configured, and this deployment cannot \
+                     add one."
+                }
             }
         } @else {
             div .table-container {
@@ -215,12 +272,12 @@ fn render_providers_table(configs: &[(String, ProviderConfig)]) -> Markup {
                             th { "Key var" }
                             th { "Models" }
                             th { "Enabled" }
-                            th { "Actions" }
+                            @if manages { th { "Actions" } }
                         }
                     }
                     tbody {
                         @for (id, cfg) in configs {
-                            (provider_row(id, cfg))
+                            (provider_row(id, cfg, manages))
                         }
                     }
                 }
@@ -231,7 +288,9 @@ fn render_providers_table(configs: &[(String, ProviderConfig)]) -> Markup {
 
 /// Single provider row. Extracted so the loop body stays readable and so
 /// tests can render a one-row fixture without touching the outer `<table>`.
-fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
+///
+/// `manages` gates the Actions cell — see [`render_providers_table`].
+fn provider_row(id: &str, cfg: &ProviderConfig, manages: bool) -> Markup {
     let model_count = cfg.models.len();
     let models_label = if model_count == 0 {
         "(discover)".to_string()
@@ -269,24 +328,26 @@ fn provider_row(id: &str, cfg: &ProviderConfig) -> Markup {
                     span .badge.badge-warning { "Disabled" }
                 }
             }
-            td {
-                div .flex .gap-2 .flex-wrap {
-                    button
-                        .btn.btn--sm.btn--secondary
-                        hx-post={"/b/llm/api/providers/" (id) "/discover-models"}
-                        hx-confirm={"Discover models for \"" (cfg.name) "\" from its /v1/models endpoint?"}
-                        hx-on--after-request="if(event.detail.successful){location.reload()}"
-                    {
-                        "Discover"
-                    }
-                    button
-                        .btn.btn--sm.btn--danger
-                        hx-delete={"/b/llm/api/providers/" (id)}
-                        hx-confirm={"Delete provider \"" (cfg.name) "\"?"}
-                        hx-target="closest tr"
-                        hx-swap="outerHTML"
-                    {
-                        "Delete"
+            @if manages {
+                td {
+                    div .flex .gap-2 .flex-wrap {
+                        button
+                            .btn.btn--sm.btn--secondary
+                            hx-post={"/b/llm/api/providers/" (id) "/discover-models"}
+                            hx-confirm={"Discover models for \"" (cfg.name) "\" from its /v1/models endpoint?"}
+                            hx-on--after-request="if(event.detail.successful){location.reload()}"
+                        {
+                            "Discover"
+                        }
+                        button
+                            .btn.btn--sm.btn--danger
+                            hx-delete={"/b/llm/api/providers/" (id)}
+                            hx-confirm={"Delete provider \"" (cfg.name) "\"?"}
+                            hx-target="closest tr"
+                            hx-swap="outerHTML"
+                        {
+                            "Delete"
+                        }
                     }
                 }
             }
@@ -474,7 +535,7 @@ mod tests {
 
     #[test]
     fn render_providers_table_empty_shows_hint() {
-        let m = render_providers_table(&[]).into_string();
+        let m = render_providers_table(&[], true).into_string();
         assert!(
             m.contains("No providers configured"),
             "empty-state hint missing; got: {m}"
@@ -508,7 +569,7 @@ mod tests {
                 ),
             ),
         ];
-        let m = render_providers_table(&configs).into_string();
+        let m = render_providers_table(&configs, true).into_string();
 
         // Each provider's name and protocol token is rendered verbatim.
         assert!(m.contains("openai-main"));
@@ -532,6 +593,65 @@ mod tests {
 
         // Model-count badge for the multi-model row.
         assert!(m.contains("gpt-4o"));
+    }
+
+    /// A runtime that cannot manage providers offers no control that would
+    /// answer 501.
+    ///
+    /// htmx does not swap on a non-2xx, so a rendered Discover or Delete
+    /// button on such a deployment is a control that does nothing visible at
+    /// all when clicked. The rows themselves stay: they are stored
+    /// configuration and an administrator should be able to see it.
+    #[test]
+    fn a_runtime_that_cannot_manage_providers_renders_no_action_controls() {
+        let configs = vec![(
+            "row-1".to_string(),
+            ProviderConfig::new(
+                "openai-main",
+                ProviderProtocol::OpenAi,
+                "https://api.openai.com/v1",
+            ),
+        )];
+
+        let m = render_providers_table(&configs, false).into_string();
+
+        assert!(
+            m.contains("openai-main"),
+            "the stored rows must still be visible; got: {m}"
+        );
+        for absent in ["/discover-models", "hx-delete", "Actions"] {
+            assert!(
+                !m.contains(absent),
+                "`{absent}` must not be rendered when the runtime cannot \
+                 manage providers; got: {m}"
+            );
+        }
+    }
+
+    /// And it says why, rather than showing a create form whose submit does
+    /// nothing visible.
+    #[test]
+    fn the_inert_notice_names_the_refusal_and_where_providers_are_configured() {
+        let m = cannot_manage_providers_notice().into_string();
+
+        assert!(m.contains("cannot manage providers"), "got: {m}");
+        assert!(
+            m.contains("501"),
+            "the notice must name what the API actually answers; got: {m}"
+        );
+    }
+
+    /// The empty state stops telling an administrator to use a form that is
+    /// not on the page.
+    #[test]
+    fn the_empty_state_does_not_point_at_a_form_that_is_not_rendered() {
+        let m = render_providers_table(&[], false).into_string();
+
+        assert!(m.contains("No providers"), "got: {m}");
+        assert!(
+            !m.contains("form above"),
+            "no create form is rendered on such a deployment; got: {m}"
+        );
     }
 
     #[test]

@@ -1497,6 +1497,7 @@ mod table_tests {
         let ctx = TestContext::with_auth().await.with_wrap(
             "test/ungranted",
             Vec::new(),
+            Vec::new(),
             "impresspress/admin",
         );
         let mut msg = admin_msg("retrieve", "/b/legalpages/api/documents/doc-7");

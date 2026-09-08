@@ -171,7 +171,7 @@ mod typed_client_tests {
         // Seed BEFORE enabling WRAP — exec_raw fixture denied otherwise.
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        let ctx = ctx.with_wrap("wafer-run/auth", vec![], "impresspress/admin");
+        let ctx = ctx.with_wrap("wafer-run/auth", Vec::new(), vec![], "impresspress/admin");
 
         upsert(
             &ctx,

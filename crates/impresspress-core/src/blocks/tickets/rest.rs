@@ -256,6 +256,7 @@ mod denial_tests {
         TestContext::with_tickets().await.with_wrap(
             "test/ungranted",
             Vec::new(),
+            Vec::new(),
             "impresspress/admin",
         )
     }

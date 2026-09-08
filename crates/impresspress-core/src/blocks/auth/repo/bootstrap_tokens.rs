@@ -146,6 +146,7 @@ mod typed_client_tests {
     async fn insert_then_validate_round_trips_under_wrap() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -158,6 +159,7 @@ mod typed_client_tests {
     async fn unknown_hash_is_invalid() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -169,6 +171,7 @@ mod typed_client_tests {
     async fn expired_hash_is_invalid() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -181,6 +184,7 @@ mod typed_client_tests {
     async fn insert_then_delete_round_trips_under_wrap() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -195,6 +199,7 @@ mod typed_client_tests {
     async fn take_valid_by_hash_consumes_the_row_exactly_once() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -215,6 +220,7 @@ mod typed_client_tests {
     async fn take_valid_by_hash_unknown_hash_returns_false() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );
@@ -226,6 +232,7 @@ mod typed_client_tests {
     async fn take_valid_by_hash_does_not_consume_an_expired_row() {
         let ctx = TestContext::with_auth().await.with_wrap(
             "wafer-run/auth",
+            Vec::new(),
             vec![],
             "impresspress/admin",
         );

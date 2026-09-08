@@ -37,6 +37,11 @@ pub use boot::{
 };
 pub use config::{fill_config_service, RuntimeConfig, ServiceOnlyKey};
 pub use prepared::PreparedPlanExporter;
+/// Re-exported so `impresspress-cloudflare`'s wasm test lane can assert what
+/// this crate's own test code cannot: that a runtime built for wasm32 really
+/// does carry all six middleware blocks. See
+/// [`registration::register_middleware_blocks`].
+pub use registration::{register_middleware_blocks, MIDDLEWARE_BLOCKS};
 
 pub struct ImpresspressBuilder {
     database: Option<Arc<dyn DatabaseService>>,

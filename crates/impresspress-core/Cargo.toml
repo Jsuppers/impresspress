@@ -282,6 +282,12 @@ walkdir = "2"
 # (`default-features = false` — the writer needs no compression backend, so
 # the reader shouldn't pull one in either).
 zip = { version = "2", default-features = false }
+# `tests/manifest_block_parity.rs` reads this crate's, impresspress-web's and
+# impresspress-cloudflare's `Cargo.toml` and compares their `block-*` sets. It
+# parses them rather than grepping: a hand-rolled line matcher on a manifest is
+# the sort of approximate second implementation that goes stale exactly like
+# the "keep in sync" comments that test replaces.
+toml = "0.8"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
