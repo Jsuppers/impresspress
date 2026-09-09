@@ -202,14 +202,16 @@ referenced them. `IMPRESSPRESS_ASSETS.logo` (the square mark) and
 
 ## The release workflow has never produced a release
 
-Read this before you tag anything. The
-[Release workflow](../../actions/workflows/release.yml) has **zero runs** — no
-`v*` tag has ever existed in this repository or upstream, so the workflow has
-never executed a single time and no release has ever been published. Nothing
-below is a description of something observed working end to end.
+Read this before you tag anything. No `v*` tag has ever existed in this
+repository or upstream, so the
+[Release workflow](../../actions/workflows/release.yml) has never run on a tag
+and **no release has ever been published from it**. Its `publish` job has never
+executed. Nothing below the dry run is a description of something observed
+working end to end.
 
-That is what the dry run is for. It is not optional pre-flight advice; it is
-the only way anyone has ever seen this workflow run.
+The only runs this workflow has are the dry runs introduced with it. That is
+what the dry run is for: it is not optional pre-flight advice, it is the only
+way anyone has ever seen any of this workflow run.
 
 ## Pre-Release Checklist
 

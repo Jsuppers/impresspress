@@ -1,12 +1,14 @@
 name: Release
 
-# This workflow has NEVER produced a release. There are zero runs on this fork
-# and zero upstream, and no `v*` tag has ever existed in either repository, so
-# every line below is untested-by-history rather than proven-by-baseline. The
-# `workflow_dispatch` `dry_run` input exists for exactly that reason: it runs
-# every job this workflow has except `gh release create`, so the wasm build,
-# the version guard and all five cross-compile targets can be exercised on a
-# branch before a tag is ever pushed. See `RELEASE.md`.
+# This workflow has NEVER produced a release. No `v*` tag has ever existed on
+# this fork or upstream, so it has never run on a tag and the `publish` job
+# below has never executed — every line here is untested-by-history rather than
+# proven-by-baseline. The `workflow_dispatch` `dry_run` input exists for
+# exactly that reason: it runs every job this workflow has except
+# `gh release create`, so the version guard, the wasm build and all five
+# cross-compile targets can be exercised on a branch before a tag is ever
+# pushed. Those dry runs are the only runs this workflow has.
+# See `RELEASE.md`.
 
 on:
   push:
@@ -24,9 +26,14 @@ on:
   # second shape on a non-tag ref, because `gh release create --verify-tag`
   # cannot work without one.
   #
-  # Like `ci-main.yml`'s dispatch, this trigger only becomes usable once this
-  # file is on the default branch: a `workflow_dispatch` added on a branch is
-  # not dispatchable from that branch.
+  # `ci-main.yml`'s dispatch comment says a `workflow_dispatch` added on a
+  # branch is not dispatchable from that branch until the file carrying the
+  # trigger is on the default branch. That is not what happened here: the
+  # branch that added this trigger dispatched it successfully before merging,
+  # because `release.yml` itself already existed on the default branch (so the
+  # workflow had an id to dispatch) and GitHub read the trigger from the file
+  # at the requested ref. The rule bites when the FILE is new, not when the
+  # trigger is.
   workflow_dispatch:
     inputs:
       dry_run:
