@@ -9,6 +9,11 @@ on:
       - 'packages/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # `check-audit-expiry.sh` runs in the `audit` job below, so a change
+      # confined to it (or to any other script this workflow grows) must run
+      # this workflow. `ci.yml` has always listed this; `ci-main.yml` did not,
+      # which is why the two lists are otherwise identical.
+      - 'scripts/**'
       - '.github/workflows/ci-main.yml'
       # The dev-sandbox e2e stages this proof guest into a live browser
       # runtime, so a change to it must run CI.
@@ -30,9 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -72,9 +74,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -118,9 +117,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -196,9 +192,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -218,9 +211,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -338,9 +328,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -564,9 +551,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -959,15 +943,6 @@ jobs:
         with:
           node-version: 20
 
-      - name: Checkout wafer-run (for local dependency)
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
-      - name: "Build wafer-client-js (file: dep needs dist for tsc)"
-        working-directory: ../wafer-run/packages/wafer-client-js
-        run: |
-          npm ci
-          npm run build
-
       - name: Install and build SDK
         working-directory: packages/impresspress-js
         run: |
@@ -1012,9 +987,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1057,9 +1029,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
