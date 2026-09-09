@@ -5,7 +5,8 @@
 # silently living there forever. Nothing previously enforced that date —
 # this script fails if any marker's date has passed.
 #
-# Run from the Security Audit job in ci.yml (and ci-main.yml).
+# Run from the Security Audit job in `.github/workflows/ci-shared.yml`, the
+# one body both the pull-request gate and the merge gate call.
 set -euo pipefail
 
 AUDIT_TOML="${1:-.cargo/audit.toml}"

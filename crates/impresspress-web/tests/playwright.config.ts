@@ -20,7 +20,7 @@ export default defineConfig({
   // (`tests/`), not the working directory. CI uploads the report and the
   // actual/diff PNGs from the crate root, so both are lifted one level out
   // of `tests/`. Without this the html report was never written at all and
-  // every `Upload Playwright report on failure` step in ci.yml uploaded
+  // every `Upload Playwright report on failure` step in ci-shared.yml uploaded
   // nothing, leaving screenshot failures with no diff images to inspect.
   reporter: [['list'], ['html', { open: 'never', outputFolder: '../playwright-report' }]],
   outputDir: '../test-results',

@@ -12,8 +12,11 @@ jobs:
   # The impresspress crate's build.rs `include_bytes!`s the impresspress-web
   # wasm (`crates/impresspress-web/pkg/impresspress_web_bg.wasm`) and exits
   # non-zero when it is missing, so no release binary can be built until that
-  # wasm exists. Same job as ci.yml's `build-wasm`: build it once, publish
-  # `pkg/` as an artifact, and have every matrix target download it.
+  # wasm exists. Same job as `build-wasm.yml`'s: build it once, publish
+  # `pkg/` as an artifact, and have every matrix target download it. That file
+  # is a `workflow_call` workflow and this job could call it instead of copying
+  # it; not done here because this workflow has never run, so the change could
+  # not be proved the way the two CI gates' extraction was.
   build-wasm:
     name: Build impresspress-web wasm
     runs-on: ubuntu-latest
@@ -33,7 +36,7 @@ jobs:
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
         with:
-          # Pinned for the same reason as ci.yml: an unpinned lookup can fall
+          # Pinned for the same reason as `build-wasm.yml`: an unpinned lookup can fall
           # back to the action's ancient default, which cannot parse
           # workspace-inherited manifest fields.
           version: 'v0.15.0'

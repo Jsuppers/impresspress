@@ -76,7 +76,8 @@ jobs:
         uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa  # v0.4.0
         with:
           # Pin explicitly — unpinned "latest" falls back to v0.9.1 on a GitHub
-          # API flake, which can't parse `license.workspace = true`. Matches ci.yml.
+          # API flake, which can't parse `license.workspace = true`. Matches
+          # `build-wasm.yml`, where CI's copy of this pin lives.
           version: 'v0.15.0'
 
       - name: Setup Node
