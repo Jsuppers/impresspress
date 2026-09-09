@@ -110,7 +110,7 @@ jobs:
       # under `--no-default-features --features sqlite` (no `embed-assets`):
       # a call site invoked an embed-assets-gated function unconditionally.
       # No other job here builds this combination, so nothing caught it.
-      # Compile-check both crates under it so a repeat is caught at PR time.
+      # Compile-check both crates under it so a repeat is caught in CI.
       - name: Check impresspress + impresspress-core (no default features)
         run: |
           cargo check --locked -p impresspress --no-default-features --features sqlite
@@ -338,9 +338,9 @@ jobs:
       # target_arch = "wasm32"))]` module, so `--tests` is required to pull the
       # wasm32 dev-dep `conformance` feature and typecheck it — the plain check
       # above (no `--tests`) does not compile it. Unconditional here on purpose:
-      # the dedicated `browser-wasm-test` job below is path-filtered to
-      # crates/impresspress-browser/, so a wafer-run pin bump — the exact
-      # trait-surface drift this guards — would skip it.
+      # the dedicated `browser-wasm-test` job below is path-filtered on the
+      # pull-request side to crates/impresspress-browser/, so a wafer-run pin
+      # bump — the exact trait-surface drift this guards — would skip it there.
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
 
