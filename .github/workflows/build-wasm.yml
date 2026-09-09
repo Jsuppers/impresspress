@@ -10,9 +10,12 @@ name: Build wasm
 # only on the call. Keeping the builder callable lets those two start as soon
 # as the wasm exists instead of waiting for the whole shared suite.
 #
-# `release.yml:17-51` still carries its own copy of this job. Folding it in is
-# a separate change: that workflow has never run, so it cannot be proved by the
-# same means as this one.
+# `release.yml`'s own `build-wasm` job still carries a copy of this one.
+# Folding it in is a separate change: that workflow has never run, so it cannot
+# be proved by the same means as this one. (Named, not cited by line number: an
+# earlier version of this comment said `release.yml:17-51` and was already
+# wrong — the range moved when this branch edited that file's comment, and it
+# did not match `main` either.)
 
 on:
   workflow_call:

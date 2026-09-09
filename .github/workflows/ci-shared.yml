@@ -15,9 +15,19 @@ name: CI shared
 # `github.event.pull_request.base.sha`, which does not exist on a `push`. On
 # the merge side that gate step does not run, its `skip` output is therefore
 # empty, and every step guarded by `steps.<gate>.outputs.skip != 'true'` runs —
-# which is the behaviour the merge gate has always had. Nothing else in this
-# file reads the input: every job runs the same list of steps for both
-# callers, and only whether the three gate steps execute depends on it.
+# which is the behaviour the merge gate has always had.
+#
+# The input is read SIX times, in those same three jobs and nowhere else:
+#   * three `if: inputs.pull-request` on the gate steps, as above;
+#   * three `fetch-depth: ${{ inputs.pull-request && '0' || '1' }}` on those
+#     jobs' checkouts. Clone depth is a second, independent difference between
+#     the two callers: the gate's `git diff` needs the base commit, so the
+#     pull-request side clones in full, and the merge side clones SHALLOW.
+#     Both reproduce what each side did before this file existed. The quotes
+#     are load-bearing — a GitHub expression treats the number `0` as false,
+#     so an unquoted `&& 0 || 1` always yields `1` and the gate would diff
+#     against a commit the checkout does not have.
+# Every job runs the same list of steps for both callers; nothing else varies.
 #
 # `build-wasm` is not here; it is `build-wasm.yml`, which both callers run
 # before calling this file. See that file for why it is separate. Every job
@@ -37,9 +47,11 @@ on:
     inputs:
       pull-request:
         description: >-
-          True when the calling workflow's trigger is `pull_request`. Read only
-          by the three change-gate steps, which need the pull request's base
-          commit to diff against.
+          True when the calling workflow's trigger is `pull_request`. Read six
+          times, all inside the three gated jobs: the three change-gate steps'
+          `if:`, and the `fetch-depth:` of the three checkouts those gates diff
+          against — full clone on the pull-request side, shallow on the merge
+          side.
         required: true
         type: boolean
 

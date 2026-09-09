@@ -47,11 +47,30 @@ jobs:
   # `needs: build-wasm` is the edge that the six jobs inside `ci-shared.yml`
   # which download the `impresspress-web-pkg` artifact each used to carry. A job
   # cannot depend on a job inside a called workflow, only on the call, so the
-  # edge moves up here — and that also delays the six jobs which never needed
-  # the wasm (audit, sdk, the three products lanes, test-postgres) by
-  # `build-wasm`'s ~4 minutes. All six run for under 3.5 minutes and none is on
-  # the critical path (build-wasm -> e2e-dev-sandbox -> e2e-dev-compile, ~26
-  # minutes), so the run's wall clock and its runner minutes are both unchanged.
+  # edge moves up here, onto the whole call. That has two consequences, and the
+  # second one is not about timing:
+  #
+  #   * It delays the EIGHT jobs that never needed the wasm and had no `needs:`
+  #     at all — audit, sdk, the three products lanes, test-postgres, and both
+  #     wasm test lanes (cloudflare-wasm-test, browser-wasm-test, neither of
+  #     which downloads the artifact) — by `build-wasm`'s ~4 minutes. All eight
+  #     run for under 3.5 minutes and none is on the critical path (build-wasm
+  #     -> e2e-dev-sandbox -> e2e-dev-compile, ~26 minutes), so the run's wall
+  #     clock and its runner minutes are both unchanged.
+  #   * It changes what gets REPORTED when the wasm build fails. Those eight
+  #     used to run and report their own verdict whatever `build-wasm` did.
+  #     Now a failed `build-wasm` skips this call, and all sixteen jobs in
+  #     `ci-shared.yml` report nothing — sixteen of this gate's seventeen,
+  #     sixteen of `ci-main.yml`'s twenty-three. A dependency bump that both
+  #     breaks the wasm build and introduces a security advisory used to
+  #     surface two red jobs; now it surfaces one, and the advisory stays
+  #     invisible until the build is fixed and CI re-runs. Same for a
+  #     client-library or migration regression. This is not a false green
+  #     today: `build-wasm` is genuinely red when it fails, and this fork has
+  #     no required status checks. But a SKIPPED required check reports as
+  #     passing, so if required checks are ever configured on the prefixed job
+  #     names, sixteen of the twenty-three would report green on a build
+  #     failure. Configure `build-wasm` as required alongside them.
   ci:
     needs: build-wasm
     uses: ./.github/workflows/ci-shared.yml

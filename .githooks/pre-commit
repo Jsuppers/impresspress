@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Mirrors the checks CI's `check` job runs (.github/workflows/ci.yml), so a
-# commit that passes here passes there:
+# Mirrors the checks CI's `check` job runs, so a commit that passes here passes
+# there. That job lives in .github/workflows/ci-shared.yml, the one body both
+# `ci.yml` (pull requests) and `ci-main.yml` (merges) call; the callers hold no
+# job bodies of their own.
 #
 #   - rustfmt on the NIGHTLY toolchain. rustfmt.toml uses
 #     `imports_granularity` / `group_imports`, which stable rustfmt silently
