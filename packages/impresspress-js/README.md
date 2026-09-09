@@ -250,7 +250,7 @@ Config options:
 - `url`: The Impresspress server URL
 - `apiKey`: Optional API key for authentication
 - `headers`: Additional headers to include
-- `timeout`: Request timeout in milliseconds
+- `timeout`: Request timeout in milliseconds (JSON calls only — `uploadFile` and `downloadFile` opt out, see Transfer timeouts)
 
 ### Services
 

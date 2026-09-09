@@ -87,6 +87,72 @@ describe("HttpClient", () => {
     });
   });
 
+  describe("headers the fold-in had to preserve", () => {
+    it("sends no Content-Type on a download, so a cross-origin GET stays preflight-free", async () => {
+      const fetchFn = vi.fn().mockResolvedValue(fakeBlobResponse("bytes", "application/octet-stream"));
+      const http = new HttpClient({ url: "http://api.test", fetch: fetchFn as unknown as typeof fetch });
+
+      await http.request("GET", "/f", undefined, { responseType: "blob" });
+
+      const [, init] = fetchFn.mock.calls[0];
+      // `application/json` is not a CORS-safelisted request header, so setting
+      // it here would turn a simple cross-origin download into a preflighted
+      // one. `requestBlob` sent no headers at all before the fold-in.
+      expect(Object.keys(init.headers).map((k) => k.toLowerCase())).not.toContain("content-type");
+    });
+
+    it("drops a client-wide Content-Type for a raw body, so the multipart boundary survives", async () => {
+      const fetchFn = vi.fn().mockResolvedValue(fakeJsonResponse({ ok: true }));
+      const http = new HttpClient({
+        url: "http://api.test",
+        fetch: fetchFn as unknown as typeof fetch,
+        headers: { "Content-Type": "application/json" },
+      });
+
+      const form = new FormData();
+      form.append("file", "x");
+      await http.request("POST", "/u", form);
+
+      const [, init] = fetchFn.mock.calls[0];
+      // fetch sets `multipart/form-data; boundary=...` itself; any
+      // Content-Type we send survives and corrupts it.
+      expect(Object.keys(init.headers).map((k) => k.toLowerCase())).not.toContain("content-type");
+    });
+  });
+
+  describe("external signal lifecycle", () => {
+    it("detaches its abort listener when the request completes", async () => {
+      // A fresh response per call: a body can only be read once, and this
+      // test issues three requests.
+      const fetchFn = vi.fn().mockImplementation(() => Promise.resolve(fakeJsonResponse({ ok: true })));
+      const http = new HttpClient({ url: "http://api.test", fetch: fetchFn as unknown as typeof fetch });
+      const controller = new AbortController();
+
+      const added: string[] = [];
+      const removed: string[] = [];
+      const realAdd = controller.signal.addEventListener.bind(controller.signal);
+      const realRemove = controller.signal.removeEventListener.bind(controller.signal);
+      controller.signal.addEventListener = ((t: string, ...rest: unknown[]) => {
+        added.push(t);
+        return (realAdd as Function)(t, ...rest);
+      }) as typeof controller.signal.addEventListener;
+      controller.signal.removeEventListener = ((t: string, ...rest: unknown[]) => {
+        removed.push(t);
+        return (realRemove as Function)(t, ...rest);
+      }) as typeof controller.signal.removeEventListener;
+
+      // Three requests on one long-lived controller — the shape the README
+      // teaches for transfers. `{ once: true }` only self-removes when the
+      // event FIRES, so without an explicit detach these accumulate.
+      await http.request("GET", "/a", undefined, { signal: controller.signal });
+      await http.request("GET", "/b", undefined, { signal: controller.signal });
+      await http.request("GET", "/c", undefined, { signal: controller.signal });
+
+      expect(added.filter((t) => t === "abort")).toHaveLength(3);
+      expect(removed.filter((t) => t === "abort")).toHaveLength(3);
+    });
+  });
+
   describe("responseType", () => {
     it("returns the raw body for responseType 'blob' even when the server labels it JSON", async () => {
       const fetchFn = vi

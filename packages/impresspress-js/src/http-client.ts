@@ -161,15 +161,29 @@ export class HttpClient {
     const url = `${this.config.url}${path}${buildQueryString(options?.params)}`;
 
     const raw = isRawBody(data);
+    // A download asks for bytes and sends none. `requestBlob` sent no content
+    // type at all before these paths were folded together, and restoring that
+    // is not cosmetic: `application/json` is not CORS-safelisted, so adding it
+    // turns a cross-origin download from a simple request into a preflighted
+    // one. A raw body carries its own type (fetch adds the multipart
+    // boundary), so the JSON default would corrupt it. Every OTHER request
+    // keeps the JSON content type, bodyless ones included — that is what the
+    // SDK has always sent and what `services.test.ts` pins.
+    const download = options?.responseType === "blob";
     const headers: Record<string, string> = {
-      // A raw body carries its own content type (fetch adds the multipart
-      // boundary), so the JSON default would corrupt it. Every other request
-      // keeps the JSON content type, bodyless ones included — that is what
-      // the SDK has always sent and what `services.test.ts` pins.
-      ...(raw ? {} : { "Content-Type": "application/json" }),
+      ...(raw || download ? {} : { "Content-Type": "application/json" }),
       ...this.config.headers,
       ...options?.headers,
     };
+    // `config.headers` is merged after the default above, so a client-wide
+    // `Content-Type` would survive and corrupt the multipart boundary fetch
+    // is about to set. `requestFormData` ignored `config.headers` entirely;
+    // dropping just the one key keeps every other client header working.
+    if (raw) {
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === "content-type") delete headers[key];
+      }
+    }
     if (this.config.apiKey) {
       headers["Authorization"] = `Bearer ${this.config.apiKey}`;
     }
@@ -184,12 +198,16 @@ export class HttpClient {
     const controller = new AbortController();
     const externalSignal = options?.signal;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    // Named so the `finally` can detach it. `{ once: true }` only self-removes
+    // when the event FIRES; on a request that completes normally the listener
+    // would stay on the caller's signal forever, holding this request's
+    // controller. The README teaches one long-lived controller across many
+    // transfers, which is exactly the shape that accumulates them.
+    const onExternalAbort = () => controller.abort(externalSignal!.reason);
     if (externalSignal?.aborted) {
       controller.abort(externalSignal.reason);
     } else {
-      externalSignal?.addEventListener("abort", () => controller.abort(externalSignal.reason), {
-        once: true,
-      });
+      externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
       if (timeout > 0) {
         timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
       }
@@ -217,6 +235,7 @@ export class HttpClient {
       throw new ImpresspressError("network_error", message);
     } finally {
       if (timeoutId !== undefined) clearTimeout(timeoutId);
+      externalSignal?.removeEventListener("abort", onExternalAbort);
     }
 
     // A blob response is handed back untouched. This has to happen BEFORE any

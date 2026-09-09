@@ -21,6 +21,22 @@ export interface Extension {
   enabled: boolean;
 }
 
+/**
+ * `call`'s options, split by whether the method carries a body.
+ *
+ * `BaseService.request` used to switch on the method and silently drop `data`
+ * for GET and DELETE. The shared client forwards it instead, and `fetch`
+ * throws "Request with GET/HEAD method cannot have body", which surfaces as an
+ * opaque `network_error`. Neither dropping the caller's payload nor failing at
+ * the transport is right, so the combination is unrepresentable and the
+ * compiler says so at the call site.
+ */
+type ExtensionCallParams = Record<string, any>;
+
+export type ExtensionCallOptions =
+  | { method?: "GET" | "DELETE"; data?: never; params?: ExtensionCallParams }
+  | { method: "POST" | "PUT" | "PATCH"; data?: any; params?: ExtensionCallParams };
+
 export class ExtensionsService extends BaseService {
   /** List all available extensions (registered blocks). `GET /b/admin/api/extensions`. */
   async list(): Promise<Extension[]> {
@@ -39,11 +55,7 @@ export class ExtensionsService extends BaseService {
   async call<T = any>(
     extension: string,
     endpoint: string,
-    options?: {
-      method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
-      data?: any;
-      params?: Record<string, any>;
-    },
+    options?: ExtensionCallOptions,
   ): Promise<T> {
     return this.request<T>({
       method: options?.method || "GET",
