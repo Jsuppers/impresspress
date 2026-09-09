@@ -34,9 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,9 +78,6 @@ jobs:
 
       - name: Lint — WRAP-grant coverage on cross-block db::* callsites
         run: bash scripts/audit-wrap-grants.sh
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -148,9 +142,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -249,9 +240,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -271,9 +259,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -538,9 +523,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -684,9 +666,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -910,9 +889,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1416,17 +1392,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Checkout wafer-run (for local dependency)
-        if: steps.sdk-changes.outputs.skip != 'true'
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
-      - name: "Build wafer-client-js (file: dep needs dist for tsc)"
-        if: steps.sdk-changes.outputs.skip != 'true'
-        working-directory: ../wafer-run/packages/wafer-client-js
-        run: |
-          npm ci
-          npm run build
 
       - name: Install and build SDK
         if: steps.sdk-changes.outputs.skip != 'true'

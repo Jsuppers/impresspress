@@ -20,9 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,9 +81,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

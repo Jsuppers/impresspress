@@ -62,9 +62,6 @@ jobs:
           # secret; the final step below warns when that happened.
           token: ${{ secrets.BASELINE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

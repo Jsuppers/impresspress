@@ -3,9 +3,27 @@ name: Deploy Browser Demo
 on:
   push:
     branches: [main]
+    # Every input this job actually builds from. A path missing here is not a
+    # skipped run — it is demo.impresspress.org silently left on stale code
+    # until some unrelated change happens to trip the filter. Modelled on
+    # `deploy-dev-sandbox.yml`, which builds the same way.
     paths:
       - 'crates/impresspress-web/**'
       - 'crates/impresspress-core/**'
+      # `impresspress-web` depends on `impresspress-browser` by path, so the
+      # OPFS/database/network adapters compile into the wasm this job ships.
+      - 'crates/impresspress-browser/**'
+      # `cargo install --path crates/impresspress` below builds the CLI that
+      # the `impresspress build --target web` step then runs, and that build
+      # renders `sw.js` / `loader.js` / `index.html` out of the bundler's
+      # asset overlay.
+      - 'crates/impresspress/**'
+      - 'crates/impresspress-bundle/**'
+      # The workspace manifest and the lockfile the `--locked` install
+      # resolves against: a wafer-run pin bump changes what every crate above
+      # compiles to without touching one of their paths.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/deploy-demo.yml'
   workflow_dispatch:
 
@@ -14,9 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout wafer-run
-        run: git clone --depth 1 https://github.com/wafer-run/wafer-run.git "$GITHUB_WORKSPACE/../wafer-run"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
