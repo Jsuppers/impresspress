@@ -735,7 +735,7 @@ jobs:
       # to this crate: the un-scoped command is red on six pre-existing
       # impresspress-core warnings in other features' code.
       - name: Clippy (browser-devtools, wasm32)
-        run: cargo clippy -p impresspress-web --target wasm32-unknown-unknown --features browser-devtools --no-deps -- -D warnings
+        run: cargo clippy --locked -p impresspress-web --target wasm32-unknown-unknown --features browser-devtools --no-deps -- -D warnings
 
       # Debug build, as `e2e-build` does: the CLI only assembles static files
       # here, so its runtime speed is irrelevant and a debug compile is cheaper.
@@ -746,7 +746,7 @@ jobs:
         run: echo "$GITHUB_WORKSPACE/out/bin" >> "$GITHUB_PATH"
 
       - name: Build the proof guest (wasm32-wasip1)
-        run: cargo build --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
+        run: cargo build --locked --release --target wasm32-wasip1 --manifest-path experiments/browser-service-worker-blocks/guest/Cargo.toml
 
       # Ahead of `build.sh`, and 22 rather than the 20 this job installed after
       # it: `build-compiler.sh` refuses anything older, and `build.sh --check`

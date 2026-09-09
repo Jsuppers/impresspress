@@ -288,9 +288,11 @@ The [Release workflow](../../actions/workflows/release.yml) is intended to:
    already exist — the command will not invent one) with auto-generated notes
    from merged PRs
 
-Step 3 has never executed. If it fails, the artifacts from step 2 are still on
-the run: re-dispatch the workflow against the tag with `dry_run: false` rather
-than retagging.
+Step 3 has never executed. If it fails, re-run the failed `Publish Release`
+job on that same run — step 2's artifacts are still attached to it, so nothing
+rebuilds. A fresh dispatch does NOT reuse them: it starts a new run and
+rebuilds all five targets, which is the fallback once the run's artifacts have
+expired. Either way, do not retag.
 
 ## After Release
 
@@ -302,21 +304,26 @@ than retagging.
 
 Branch protection prevents pushing directly to `main` — hotfixes follow the same PR flow:
 
+The tag must equal `v` + `Cargo.toml`'s `[workspace.package] version`, so the
+version bump is part of the hotfix PR, not an afterthought — `verify-tag` fails
+the run otherwise, before anything builds.
+
 ```bash
 # 1. Create a hotfix branch
 git checkout main && git pull
-git checkout -b hotfix/v0.2.1
+git checkout -b hotfix/v0.1.1
 
-# 2. Fix the bug, commit, push
-git push -u origin hotfix/v0.2.1
+# 2. Fix the bug AND bump [workspace.package] version to 0.1.1 in Cargo.toml,
+#    then commit and push both together
+git push -u origin hotfix/v0.1.1
 
 # 3. Open a PR — CI must pass, 1 approval required
 gh pr create --title "fix: critical bug description"
 
-# 4. After merge, tag the patch release
+# 4. After merge, tag the patch release — v + the version just landed
 git checkout main && git pull
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## Undoing a Release
@@ -325,8 +332,8 @@ If a release was tagged by mistake or contains a critical issue:
 
 ```bash
 # Delete the tag locally and remotely
-git tag -d v0.2.0
-git push origin --delete v0.2.0
+git tag -d v0.1.0
+git push origin --delete v0.1.0
 ```
 
 Then delete the GitHub Release from the [Releases page](../../releases). Note: users who already downloaded the binary still have it.

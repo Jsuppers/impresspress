@@ -26,14 +26,11 @@ on:
   # second shape on a non-tag ref, because `gh release create --verify-tag`
   # cannot work without one.
   #
-  # `ci-main.yml`'s dispatch comment says a `workflow_dispatch` added on a
-  # branch is not dispatchable from that branch until the file carrying the
-  # trigger is on the default branch. That is not what happened here: the
-  # branch that added this trigger dispatched it successfully before merging,
-  # because `release.yml` itself already existed on the default branch (so the
-  # workflow had an id to dispatch) and GitHub read the trigger from the file
-  # at the requested ref. The rule bites when the FILE is new, not when the
-  # trigger is.
+  # This trigger was dispatchable from the branch that added it, before that
+  # branch merged: `release.yml` already existed on the default branch, so the
+  # workflow had an id, and GitHub read the trigger from the file at the
+  # requested ref. See `ci-main.yml`'s dispatch comment for the general rule —
+  # a new FILE has to land first, a new trigger on an existing file does not.
   workflow_dispatch:
     inputs:
       dry_run:
@@ -208,7 +205,12 @@ jobs:
   publish:
     name: Publish Release
     needs: build
-    if: inputs.dry_run != true
+    # `inputs` exists only for `workflow_dispatch`, so on a tag push
+    # `inputs.dry_run` is null and `null != true` is already true. The explicit
+    # `push` arm makes that independent of how the null coerces rather than
+    # resting on it: the failure mode it removes is a tag push that builds all
+    # five targets green and silently publishes nothing.
+    if: github.event_name == 'push' || inputs.dry_run != true
     runs-on: ubuntu-latest
     permissions:
       contents: write

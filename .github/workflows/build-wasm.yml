@@ -60,12 +60,14 @@ jobs:
           # pin (PR #75).
           version: 'v0.15.0'
 
-      # `-- --locked` forwards to the `cargo build` wasm-pack runs. Every other
-      # cargo invocation in this repository's workflows already passes it; this
-      # one did not, so the wasm blob that `crates/impresspress/build.rs` bakes
-      # into the binary was the one place a release resolved dependencies
-      # afresh instead of using the set CI tested. All the deploy workflows
-      # carry the same flag now for the same reason.
+      # `-- --locked` forwards to the `cargo build` wasm-pack runs. Every
+      # cargo invocation in these workflows that resolves against a committed
+      # lockfile now passes it; this one did not, so the wasm blob that
+      # `crates/impresspress/build.rs` bakes into the binary was the one place
+      # a release resolved dependencies afresh instead of using the set CI
+      # tested. All the deploy workflows carry the same flag now for the same
+      # reason. (`cargo install cargo-audit` is deliberately not in that set:
+      # it resolves a crates.io package, not this repository's lockfile.)
       - name: Build WASM
         run: cd crates/impresspress-web && wasm-pack build --target web --release --out-dir pkg -- --locked
 
