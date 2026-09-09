@@ -6,11 +6,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::files::repo,
-    ui::{
-        self, icons,
-        shell::Crumb,
-        templates::{list_page, PageHeader},
-    },
+    ui::{self, icons, shell::Crumb, templates::list_page},
     util::{format_bytes, format_timestamp, url_path_encode},
 };
 
@@ -266,11 +262,6 @@ pub async fn object_list_page(
     };
 
     let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
         Some(render_breadcrumbs(bucket, current_prefix)),
         table_with_js,
         None,

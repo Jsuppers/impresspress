@@ -62,6 +62,27 @@ header component at **15 sites** rendering one element and class set, against a 
 sites** rendering a different element and class set. All **seven** administration sites pass an
 empty title and therefore render nothing, so administration can cut over at no visual cost.
 
+> **Correction (PR 6 of ruling 5.6, 2026-09-09).** The count of empty-titled sites is not seven of
+> fifteen, it is **fifteen of fifteen** — files' seven (`pages_admin.rs` ×4, `pages_user/`
+> {`cloudstorage`,`buckets`,`objects`}) and vector's one pass exactly the same
+> `PageHeader { title: "", subtitle: None, primary_action: None }` as administration's seven. So
+> the older renderer had no rendered output *anywhere*, in any deployment, and its `.page-header*`
+> stylesheet rules styled nothing.
+>
+> That inverts the cheap path. A cutover to `components::page_header` would not have been free
+> even for administration: that component renders its wrapper and an empty `h2.page-title`
+> unconditionally, so an empty title through it emits
+> `div.flex.items-center.justify-between.mb-4 > div > h2.page-title`. An empty heading generates
+> no line box, so the cost is the `mb-4` wrapper's `1rem` bottom margin — not a heading box — on
+> all fifteen pages, where they currently draw nothing at all. The free move was **deletion**, and
+> that is what PR 6 did: `PageHeader`, `render_header`, the header parameter on `list_page` /
+> `tabbed_page` / `dashboard_page`, and **nine** `.page-header*` rules — one in
+> `components/card.css` and eight in `layouts/page.css` (the block itself, its `__text`,
+> `__title`, `__subtitle` and `__action` elements, the `body:has(.products-tabs)` override, and
+> one rule in each of two `@media` blocks) — plus the `.page-header` alternative of
+> `components/nav.css`'s `.products-tabs +` rule, which is a shortened selector list rather than a
+> tenth deleted rule. All 20 administration renders are byte-identical across the change.
+
 Aim the phase at the table markup and the page header. Do not spend a pull request re-classing
 buttons that already carry the right classes.
 
@@ -142,6 +163,44 @@ Consolidating the reconnaissance's first two, which are both asset plumbing with
 6. **Delete what is now unused.** Stylesheet deletion is blocked at `ui/mod.rs:1725` until ten
    non-administration raw tables migrate, which is out of scope, so this ships as "delete what is
    unused" and records the rest.
+
+   > **Shipped 2026-09-09.** Deleted: the first-generation page header (`PageHeader`,
+   > `render_header`, its parameter on three templates, 15 empty call sites, nine CSS rules and one
+   > selector alternative — see the correction under ruling 5.2), `templates::form_page` and its
+   > `.form-bar` rule (its last caller went on 2026-07-11 in `b56c84f3`, which stopped
+   > administration's Settings tabs nesting a per-tab `<form>` inside the template's outer one and
+   > moved them to the form-less `tabbed_page`; nothing has called it in the two months since),
+   > `templates::StatTile` (`dashboard_page` now takes rendered `stat_card`s), and four dead
+   > families in `table.css`: `.table th.sortable`, the single-dash
+   > `.pagination-info`/`-controls`/`-btn` family superseded by `components::pagination`'s
+   > `.pagination__*`, the flat `.db-table-list` the grouped redesign replaced, and the
+   > `.users-table`/`.col-created` pair that no code has ever rendered. `components/nav.css`'s
+   > `.products-tabs + header` rule went with them: `.page-header` was always a `<header>`
+   > element, and it was the only one that could sit directly after the tab strip, so the rule
+   > matched nothing once the header was gone.
+   >
+   > **One intent is discarded with the `.users-table` pair, not just dead code.** Those two rules
+   > were added deliberately, to stop the users table's Created date wrapping
+   > (`white-space: nowrap` on `td[data-label="Created"]` and `.col-created`). Nothing ever
+   > rendered either class, so the intent was never realised and deleting them changes no pixel —
+   > but if that column wraps today, the fix is to apply the intent to the class the migrated table
+   > actually carries (`.data-table`), not to resurrect these. Recorded here because the deletion
+   > otherwise leaves no trace of it.
+   >
+   > Still blocked, as predicted: the `.table` / `.table-container` family. The ten raw tables are
+   > legalpages ×3, tickets ×3, llm ×3, userportal ×1, and they are now pinned by
+   > `ui/components/table.rs::only_the_declared_files_still_hand_write_a_first_generation_table`,
+   > a ratchet on the badge test's model whose doc names the exact rules to delete when the list
+   > empties. Files and vector, which §7's row 7 also named, have no raw tables.
+   >
+   > **Deliberately not folded in:** roughly 25 further dead rules across `form.css`, `card.css`,
+   > `button.css`, `badge.css`, `stat.css`, `shell.css`, `auth-split.css` and `toast.css`, and five
+   > never-constructed enum variants (`BtnVariant::{Secondary,Ghost,Danger}`, `CtrlSize::Lg`,
+   > `AlertVariant::Info`) with the CSS they gate. None of it is two-generation drift; it
+   > accumulated because nothing guards the *defined → rendered* direction, which is a finding of
+   > its own. The button variants in particular must not be read as dead code: 87, 29 and 9 sites
+   > write `.btn--secondary` / `.btn--ghost` / `.btn--danger` by hand across the tree, which is the
+   > un-migrated button backlog ruling 5.2 left alone, not an unused API.
 
 ## Coordination notes
 
@@ -300,6 +359,15 @@ Callers split cleanly along the same line as everything else:
 pass `title: ""`, admin renders *nothing* through it today — so admin can be cut over to
 `components::page_header` with no pixel change, and the divergence survives only for files and
 vector. That is the cheap path.
+
+> **Correction (PR 6 of ruling 5.6, 2026-09-09).** Files' seven and vector's one pass `title: ""`
+> too — see the correction under ruling 5.2. There was no divergence left to survive: the older
+> renderer painted nothing on any page, so the whole of it was deleted rather than cut over, and
+> `components::page_header` is now the only page-header renderer in the tree.
+> `ui/mod.rs::the_first_generation_page_header_stays_deleted` pins that in both directions: no
+> `.page-header*` class in maud markup under `src/blocks` or `src/ui`, and no `.page-header*` rule
+> in any stylesheet — the shared `ui/styles/` bundle *and* the block-local sheets a block serves
+> with its own pages, which are as live to those pages as the bundle is.
 
 ### 1.4 The modal divergence (three mechanisms)
 

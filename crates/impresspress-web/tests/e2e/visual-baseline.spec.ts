@@ -111,9 +111,9 @@ test.describe('visual baseline — admin', () => {
           // `blocks/admin/pages/network.rs`); the timestamps beside them are
           // `<time>` elements and are already covered by the mask above. The
           // admin dashboard's "Avg Response" tile is reached by its label
-          // instead, because `StatTile::value` is a plain `&str` with nowhere to
-          // hang an attribute — a Rust test pins that label so a rename cannot
-          // silently unmask the tile.
+          // instead, because `components::stat_card` takes its value as a plain
+          // `&str` with nowhere to hang an attribute — a Rust test pins that
+          // label so a rename cannot silently unmask the tile.
           page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
         ],
       });

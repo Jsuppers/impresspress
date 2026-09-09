@@ -1,11 +1,7 @@
-/* Page Header */
-.page-header {
-	background: white;
-	border-bottom: 1px solid var(--border-color);
-	padding: var(--space-4) var(--space-8);
-}
-
-
+/* Page Header — `components::page_header`. The `.page-header` block that
+ * stood here belonged to `templates::render_header`, a second renderer that
+ * every one of its call sites invoked with an empty title, so it painted
+ * nothing on any page. */
 .page-title {
 	font-size: 1.5rem; font-weight: 600;
 	color: var(--text-primary); margin-bottom: var(--space-2);

@@ -6,11 +6,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::files::repo,
-    ui::{
-        self,
-        shell::Crumb,
-        templates::{list_page, PageHeader},
-    },
+    ui::{self, shell::Crumb, templates::list_page},
 };
 
 #[derive(Clone, Debug)]
@@ -158,16 +154,7 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
         (super::render_bootstrap_script("", ""))
     };
 
-    let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
-        Some(render_quota_card(&quota)),
-        shares_with_js,
-        None,
-    );
+    let body = list_page(Some(render_quota_card(&quota)), shares_with_js, None);
 
     ui::shell_page(
         ctx,

@@ -18,7 +18,7 @@ use crate::{
         components::{self, badge, pagination, Badge, BadgeVariant},
         icons,
         shell::Topbar,
-        templates::{list_page, PageHeader},
+        templates::list_page,
         UserInfo,
     },
     util::{parse_form_body, RecordExt},
@@ -73,16 +73,7 @@ pub async fn users_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
     };
 
-    let body = list_page(
-        PageHeader {
-            title: "",
-            subtitle: None,
-            primary_action: None,
-        },
-        Some(tabs_markup),
-        tab_content,
-        None,
-    );
+    let body = list_page(Some(tabs_markup), tab_content, None);
 
     admin_page(
         ctx,
