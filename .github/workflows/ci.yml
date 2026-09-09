@@ -11,6 +11,13 @@ on:
       - 'Cargo.lock'
       - 'scripts/**'
       - '.github/workflows/ci.yml'
+      # `ci-main.yml` is in THIS filter because it is not in its own trigger's
+      # reach on a pull request: a pull request that touches only the merge
+      # workflow would otherwise start no workflow at all and merge with no
+      # gate — the exact shape of any future fix to that file. Nothing here
+      # runs `ci-main.yml`; listing it just means the pull-request gate runs
+      # and the change is reviewed against a green build.
+      - '.github/workflows/ci-main.yml'
       # The dev-sandbox e2e stages this proof guest into a live browser
       # runtime, so a change to it must run CI.
       - 'experiments/browser-service-worker-blocks/guest/**'
@@ -296,7 +303,7 @@ jobs:
       # regression tests sat invisible. Same reasoning (and same fix) as the
       # `Check impresspress-browser conformance wiring` step below; kept
       # separate from the `cloudflare-wasm-test` job so it runs unconditionally
-      # even when that job's pull-request path filter skips it.
+      # even when that job's pull-request-only diff gate skips it.
       - name: Check impresspress-cloudflare tests (wasm32)
         run: cargo check --locked --tests -p impresspress-cloudflare --target wasm32-unknown-unknown
 
@@ -319,8 +326,8 @@ jobs:
       # no `#[cfg(test)]` code at all, so without it this step would build the
       # library under these two features and leave every wasm test in the crate
       # untouched under them. The `cloudflare-wasm-test` job enables neither
-      # feature (and is path-filtered on the pull-request side), so this is the
-      # only place they meet test code.
+      # feature (and on the pull-request side its diff gate can skip it
+      # outright), so this is the only place they meet test code.
       - name: Check impresspress-cloudflare optional blocks (wasm32)
         run: |
           cargo check --locked --tests -p impresspress-cloudflare --features block-llm --target wasm32-unknown-unknown
@@ -338,9 +345,14 @@ jobs:
       # target_arch = "wasm32"))]` module, so `--tests` is required to pull the
       # wasm32 dev-dep `conformance` feature and typecheck it — the plain check
       # above (no `--tests`) does not compile it. Unconditional here on purpose:
-      # the dedicated `browser-wasm-test` job below is path-filtered on the
-      # pull-request side to crates/impresspress-browser/, so a wafer-run pin
-      # bump — the exact trait-surface drift this guards — would skip it there.
+      # the dedicated `browser-wasm-test` job below runs only when its own
+      # git-diff gate sees a change under crates/impresspress-browser/,
+      # crates/impresspress-core/, `Cargo.toml` or `Cargo.lock` — so any change
+      # outside that list reaches this trait-surface assertion only here, and
+      # the assertion does not depend on that list staying correct. (A wafer-run
+      # pin bump specifically DOES reach that job, via `Cargo.lock`; its own
+      # comment below says so. This step is the cheap unconditional typecheck,
+      # not the pin-bump backstop.)
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
 

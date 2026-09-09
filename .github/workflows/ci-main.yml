@@ -19,8 +19,30 @@ on:
       # runtime, so a change to it must run CI.
       - 'experiments/browser-service-worker-blocks/guest/**'
 
+  # Lets a change to this file be exercised before it is the only gate on a
+  # merge — `gh workflow run ci-main.yml --ref main`, or the Actions UI.
+  #
+  # This trigger has to land one pull request BEFORE the pull request that
+  # wants to use it: a `workflow_dispatch` added on a branch is not
+  # dispatchable from that branch, because a workflow only becomes
+  # dispatchable once the file carrying the trigger is on the default branch.
+  # (If the dispatch 404s after that, see `regen-visual-baselines.yml`'s header
+  # — a fork with Actions disabled at fork time needs one push to the file on
+  # the default branch to index it.)
+  workflow_dispatch:
+
+# Keyed on the event name as well as the ref, not the ref alone: with
+# `cancel-in-progress` and a group shared across events, a manual dispatch on
+# `main` would cancel a live merge run — the merge gate silently losing its
+# result to a debugging dispatch. Push behaviour is bit-identical to the plain
+# `ci-main` group it replaces, since every merge carries the same event and the
+# same ref and so lands in one group exactly as before. The group name is
+# evaluated per run from the file at that run's commit, so the one-time cost of
+# renaming it is a single extra run: a merge run already in flight when this
+# lands keeps its old group, and the next merge joins the new one, so both
+# complete instead of one cancelling the other.
 concurrency:
-  group: ci-main
+  group: ci-main-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -300,7 +322,7 @@ jobs:
       # regression tests sat invisible. Same reasoning (and same fix) as the
       # `Check impresspress-browser conformance wiring` step below; kept
       # separate from the `cloudflare-wasm-test` job so it runs unconditionally
-      # even when that job's pull-request path filter skips it.
+      # even when that job's pull-request-only diff gate skips it.
       - name: Check impresspress-cloudflare tests (wasm32)
         run: cargo check --locked --tests -p impresspress-cloudflare --target wasm32-unknown-unknown
 
@@ -323,8 +345,8 @@ jobs:
       # no `#[cfg(test)]` code at all, so without it this step would build the
       # library under these two features and leave every wasm test in the crate
       # untouched under them. The `cloudflare-wasm-test` job enables neither
-      # feature (and is path-filtered on the pull-request side), so this is the
-      # only place they meet test code.
+      # feature (and on the pull-request side its diff gate can skip it
+      # outright), so this is the only place they meet test code.
       - name: Check impresspress-cloudflare optional blocks (wasm32)
         run: |
           cargo check --locked --tests -p impresspress-cloudflare --features block-llm --target wasm32-unknown-unknown
@@ -342,9 +364,15 @@ jobs:
       # target_arch = "wasm32"))]` module, so `--tests` is required to pull the
       # wasm32 dev-dep `conformance` feature and typecheck it — the plain check
       # above (no `--tests`) does not compile it. Unconditional here on purpose:
-      # the dedicated `browser-wasm-test` job below is path-filtered on the
-      # pull-request side to crates/impresspress-browser/, so a wafer-run pin
-      # bump — the exact trait-surface drift this guards — would skip it there.
+      # on the pull-request side the dedicated `browser-wasm-test` job runs
+      # only when its own git-diff gate sees a change under
+      # crates/impresspress-browser/, crates/impresspress-core/, `Cargo.toml` or
+      # `Cargo.lock`, so a change outside that list reaches this trait-surface
+      # assertion only here. On this side that job carries no gate at all (the
+      # gate reads a pull-request-only value, so it would skip every merge —
+      # which is why it is dropped here), making this step redundant on a merge.
+      # It is kept anyway: it is a cheap typecheck, and the two workflows are
+      # only auditable as a pair if the step lists match.
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
 
