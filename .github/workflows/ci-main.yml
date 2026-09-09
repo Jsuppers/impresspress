@@ -300,7 +300,7 @@ jobs:
       # regression tests sat invisible. Same reasoning (and same fix) as the
       # `Check impresspress-browser conformance wiring` step below; kept
       # separate from the `cloudflare-wasm-test` job so it runs unconditionally
-      # even when that job's path filter skips.
+      # even when that job's pull-request path filter skips it.
       - name: Check impresspress-cloudflare tests (wasm32)
         run: cargo check --locked --tests -p impresspress-cloudflare --target wasm32-unknown-unknown
 
@@ -322,9 +322,9 @@ jobs:
       # `--tests` for the same reason as the step above: a bare check compiles
       # no `#[cfg(test)]` code at all, so without it this step would build the
       # library under these two features and leave every wasm test in the crate
-      # untouched under them. The `cloudflare-wasm-test` job is path-filtered
-      # and enables neither feature, so this is the only place they meet test
-      # code.
+      # untouched under them. The `cloudflare-wasm-test` job enables neither
+      # feature (and is path-filtered on the pull-request side), so this is the
+      # only place they meet test code.
       - name: Check impresspress-cloudflare optional blocks (wasm32)
         run: |
           cargo check --locked --tests -p impresspress-cloudflare --features block-llm --target wasm32-unknown-unknown
