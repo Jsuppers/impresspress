@@ -363,16 +363,17 @@ jobs:
       # assertion (wafer-run #319). It lives in a `#[cfg(all(test,
       # target_arch = "wasm32"))]` module, so `--tests` is required to pull the
       # wasm32 dev-dep `conformance` feature and typecheck it — the plain check
-      # above (no `--tests`) does not compile it. Unconditional here on purpose:
-      # on the pull-request side the dedicated `browser-wasm-test` job runs
-      # only when its own git-diff gate sees a change under
-      # crates/impresspress-browser/, crates/impresspress-core/, `Cargo.toml` or
-      # `Cargo.lock`, so a change outside that list reaches this trait-surface
-      # assertion only here. On this side that job carries no gate at all (the
-      # gate reads a pull-request-only value, so it would skip every merge —
-      # which is why it is dropped here), making this step redundant on a merge.
-      # It is kept anyway: it is a cheap typecheck, and the two workflows are
-      # only auditable as a pair if the step lists match.
+      # above (no `--tests`) does not compile it. Unconditional on purpose. On
+      # the pull-request side the dedicated `browser-wasm-test` job runs only
+      # when its diff gate sees a change under crates/impresspress-browser/,
+      # crates/impresspress-core/, `Cargo.toml` or `Cargo.lock`, so a change
+      # outside that list reaches this trait-surface assertion only here; on the
+      # merge side that gate cannot exist (it reads a pull-request-only value)
+      # and the job is ungated, making this step redundant but free. Either way
+      # the assertion does not depend on that path list staying correct. Note a
+      # wafer-run pin bump specifically DOES reach that job, via `Cargo.lock` —
+      # see the gate's own comment in `ci.yml`; this step is the cheap
+      # unconditional typecheck, not the pin-bump backstop.
       - name: Check impresspress-browser conformance wiring (wasm32)
         run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
 
