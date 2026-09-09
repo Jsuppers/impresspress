@@ -12,8 +12,9 @@ export type OAuthProviderName = "google" | "github" | "microsoft";
 /**
  * The real shape returned under the `user` key by `POST /login`,
  * `POST /signup`, and `GET /me` — see `blocks/auth_ui/api/{login,signup,me}.rs`.
- * Distinct from the generated `AuthUser`/`User` DB-row types, which model a
- * different (out of date) column set that these endpoints never return.
+ * This is the whole user surface the SDK exposes: the endpoints project a
+ * session view, not a table row, and there is no column set behind it to
+ * mirror.
  */
 export interface AuthSessionUser {
   id: string;

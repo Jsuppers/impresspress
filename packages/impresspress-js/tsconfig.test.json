@@ -1,0 +1,12 @@
+{
+  "//": "Type-checks the test suite alongside `src`. The build tsconfig deliberately excludes tests (they must not reach `dist`), which meant `types-compatibility.test.ts` — a file whose entire purpose is to fail to COMPILE when a type drifts — was never type-checked by anything. `npm test` runs this first.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "rootDir": "."
+  },
+  "include": ["src/**/*", "test/**/*", "examples/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

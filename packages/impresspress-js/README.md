@@ -47,10 +47,18 @@ const { objects } = await impresspress.storage.listObjects('my-bucket');
 
 ## Type Safety
 
-The SDK includes TypeScript types generated from the backend models, ensuring type safety across your application:
+Every exported type describes a shape a handler actually returns, and lives
+next to the service that speaks it. Nothing here is generated, and nothing
+models a database row: the SDK talks to HTTP endpoints, whose projections are
+narrower than the tables behind them.
 
 ```typescript
-import { AuthUser, StorageObject, IAMRole } from '@impresspress/sdk';
+import type {
+  AuthSessionUser,   // GET /b/auth/api/me
+  StorageObjectInfo, // GET /b/storage/api/buckets/{name}/objects
+  Extension,         // GET /b/admin/api/extensions
+  IAMRole,           // GET /b/admin/api/iam/roles
+} from '@impresspress/sdk';
 ```
 
 ## Features
@@ -147,6 +155,25 @@ await impresspress.storage.deleteObject('images', 'photo.jpg');
 // Search the current user's uploads / recently viewed objects
 const results = await impresspress.storage.search('photo');
 const recent = await impresspress.storage.getRecentFiles();
+```
+
+`uploadFile` and `downloadFile` run with **no timeout** by default. Every other
+call gets the client's 30 s default, but a transfer's duration is a function of
+file size and link speed, so a fixed ceiling would just be a cap on how large a
+file the SDK can move. Bound or cancel a transfer explicitly when you want to:
+
+```typescript
+// Give this one upload a 10-minute ceiling
+await impresspress.storage.uploadFile('images', bigFile, {
+  key: 'raw.tiff',
+  timeout: 10 * 60 * 1000,
+});
+
+// Or cancel it on demand — an unbounded transfer is still abortable
+const controller = new AbortController();
+const download = impresspress.storage.downloadFile('images', 'raw.tiff', {
+  signal: controller.signal,
+});
 ```
 
 ### CloudStorage (sharing + quota)

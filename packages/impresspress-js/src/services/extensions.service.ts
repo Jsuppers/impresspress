@@ -1,17 +1,24 @@
 import { BaseService } from "./base.service";
 
+/**
+ * One registered block, as `GET /b/admin/api/extensions` lists them.
+ * `blocks/admin/mod.rs::handle_extensions` projects exactly these five keys
+ * off wafer-run's `BlockInfo`; there is no description, author, config blob
+ * or metadata object anywhere in that response, and `enabled` is a literal
+ * `true` for every row (a registered block is by definition enabled — there
+ * is no server-side enable/disable lifecycle).
+ */
 export interface Extension {
+  /** Block name in the canonical `{org}/{block}` form. */
   name: string;
+  /** Semantic version of the block implementation. */
   version: string;
-  description: string;
-  author: string;
+  /** Interface identifier, e.g. `"middleware@v1"`. */
+  interface: string;
+  /** One-line human-readable summary of what the block does. */
+  summary: string;
+  /** Always `true` — every listed block is registered, hence enabled. */
   enabled: boolean;
-  config?: Record<string, any>;
-  metadata?: {
-    tags?: string[];
-    homepage?: string;
-    license?: string;
-  };
 }
 
 export class ExtensionsService extends BaseService {

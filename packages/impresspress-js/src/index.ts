@@ -8,8 +8,8 @@ export { StorageService } from './services/storage.service';
 export { IAMService } from './services/iam.service';
 export * from './services/extensions.service';
 
-// Export types
-export * from './types';
+// Export the SDK config type (every wire shape is exported from its service)
+export type { ImpresspressConfig } from './types';
 
 // Export the error type and helpers every service throws/maps
 export { ImpresspressError, isNotFoundError, isUnauthorizedError } from './error';
@@ -52,6 +52,7 @@ export type {
 } from './services/storage.service';
 
 export type {
+  IAMRole,
   IAMRoleListResponse,
   CreateRoleRequest,
   UpdateRoleRequest,
