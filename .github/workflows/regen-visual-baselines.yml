@@ -87,7 +87,7 @@ jobs:
 
       - name: Pre-build impresspress-web wasm (build.rs prereq)
         working-directory: crates/impresspress-web
-        run: wasm-pack build --target web --release --out-dir pkg
+        run: wasm-pack build --target web --release --out-dir pkg -- --locked
 
       - name: Install impresspress CLI
         run: cargo install --path crates/impresspress --locked

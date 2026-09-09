@@ -39,12 +39,15 @@ on:
   # ./.github/workflows/...` against the same ref, so it exercises the branch's
   # shared body too, not `main`'s.
   #
-  # This trigger has to land one pull request BEFORE the pull request that
-  # wants to use it: a `workflow_dispatch` added on a branch is not
-  # dispatchable from that branch, because a workflow only becomes
-  # dispatchable once the file carrying the trigger is on the default branch.
-  # Once it IS on the default branch, dispatching any ref works — which is why
-  # landing it here unblocks every later pull request in this phase.
+  # The rule bites when the FILE is new to the repository, not when the
+  # trigger is new to an existing file. GitHub needs a workflow id to dispatch,
+  # and it only mints one for a file on the default branch; given that id it
+  # reads the trigger from the file at whatever ref is requested. So a
+  # `workflow_dispatch` ADDED on a branch, to a workflow that already exists on
+  # the default branch, is dispatchable from that branch straight away —
+  # `release.yml` did exactly that in run 34337201873, dispatching its own
+  # newly added trigger before merging. A brand-new workflow file still has to
+  # land first, which is why this one did.
   # (If the dispatch 404s after that, see `regen-visual-baselines.yml`'s header
   # — a fork with Actions disabled at fork time needs one push to the file on
   # the default branch to index it.)

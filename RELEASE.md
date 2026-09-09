@@ -200,6 +200,19 @@ image in Admin → Settings → Variables. It renders exactly as before.
 referenced them. `IMPRESSPRESS_ASSETS.logo` (the square mark) and
 `favicon.ico` are unchanged in name and now carry the new art.
 
+## The release workflow has never produced a release
+
+Read this before you tag anything. No `v*` tag has ever existed in this
+repository or upstream, so the
+[Release workflow](../../actions/workflows/release.yml) has never run on a tag
+and **no release has ever been published from it**. Its `publish` job has never
+executed. Nothing below the dry run is a description of something observed
+working end to end.
+
+The only runs this workflow has are the dry runs introduced with it. That is
+what the dry run is for: it is not optional pre-flight advice, it is the only
+way anyone has ever seen any of this workflow run.
+
 ## Pre-Release Checklist
 
 Before tagging a release, verify:
@@ -207,6 +220,7 @@ Before tagging a release, verify:
 - [ ] `main` branch CI is green (check the [Actions tab](../../actions))
 - [ ] Cross-platform builds pass (the `CI Main` workflow runs on every push to `main`)
 - [ ] Update `version` in `Cargo.toml` workspace section to match the intended release
+- [ ] **Run the release workflow as a dry run and see it green** (below)
 - [ ] No known critical bugs (check [open issues](../../issues))
 - [ ] Test the binary locally:
   ```bash
@@ -218,6 +232,36 @@ Before tagging a release, verify:
       to [Upgrade Notes](#upgrade-notes) so operators know to pass
       `--run-migrations`
 
+## Dry run — the pre-flight step
+
+```bash
+# Run everything the release does except creating the release.
+gh workflow run release.yml --ref main -f dry_run=true
+
+# Watch it.
+gh run list --workflow=release.yml --limit 1
+gh run watch <run-id>
+```
+
+A dry run executes, for real:
+
+1. **`verify-tag`** — reads `version` from `Cargo.toml`'s `[workspace.package]`
+   table and prints the tag you must push (`v<version>`). On a branch there is
+   no tag to compare, so it reports the expected one; on a tag it fails the run
+   if the two disagree.
+2. **`build-wasm`** — the `impresspress-web` wasm, via the same
+   `build-wasm.yml` every CI run uses.
+3. **`build`** — all five cross-compile targets, packaged as `.tar.gz`/`.zip`
+   and uploaded as run artifacts.
+
+It does **not** run `publish`, so no GitHub Release, and no tag, is created.
+A skipped `publish` does not turn a red run green: a run's conclusion is
+failure if any job failed, whatever was skipped afterwards.
+
+Dispatching a branch requires `dry_run: true`; a non-dry-run dispatch must
+target a tag, because `gh release create --verify-tag` has nothing to verify
+otherwise.
+
 ## Creating a Release
 
 ```bash
@@ -225,16 +269,30 @@ Before tagging a release, verify:
 git checkout main
 git pull
 
-# 2. Tag the release
-git tag v0.2.0
+# 2. Dry-run first (see above). Do not skip this — the publish path has never
+#    run, so a dry run is the only evidence that anything before it works.
+gh workflow run release.yml --ref main -f dry_run=true
 
-# 3. Push the tag — this triggers the release workflow
-git push origin v0.2.0
+# 3. Tag the release. The tag MUST be `v` + the workspace version in
+#    Cargo.toml, or the `verify-tag` job fails the run before anything builds.
+git tag v0.1.0
+
+# 4. Push the tag — this triggers the release workflow
+git push origin v0.1.0
 ```
 
-The [Release workflow](../../actions/workflows/release.yml) will automatically:
-1. Build binaries for all 5 platforms (Linux amd64/arm64, macOS amd64/arm64, Windows amd64)
-2. Create a GitHub Release with auto-generated notes from merged PRs
+The [Release workflow](../../actions/workflows/release.yml) is intended to:
+1. Check the tag against `Cargo.toml`'s workspace version and stop if they disagree
+2. Build binaries for all 5 platforms (Linux amd64/arm64, macOS amd64/arm64, Windows amd64)
+3. Create a GitHub Release (`gh release create --verify-tag`, so the tag must
+   already exist — the command will not invent one) with auto-generated notes
+   from merged PRs
+
+Step 3 has never executed. If it fails, re-run the failed `Publish Release`
+job on that same run — step 2's artifacts are still attached to it, so nothing
+rebuilds. A fresh dispatch does NOT reuse them: it starts a new run and
+rebuilds all five targets, which is the fallback once the run's artifacts have
+expired. Either way, do not retag.
 
 ## After Release
 
@@ -246,21 +304,26 @@ The [Release workflow](../../actions/workflows/release.yml) will automatically:
 
 Branch protection prevents pushing directly to `main` — hotfixes follow the same PR flow:
 
+The tag must equal `v` + `Cargo.toml`'s `[workspace.package] version`, so the
+version bump is part of the hotfix PR, not an afterthought — `verify-tag` fails
+the run otherwise, before anything builds.
+
 ```bash
 # 1. Create a hotfix branch
 git checkout main && git pull
-git checkout -b hotfix/v0.2.1
+git checkout -b hotfix/v0.1.1
 
-# 2. Fix the bug, commit, push
-git push -u origin hotfix/v0.2.1
+# 2. Fix the bug AND bump [workspace.package] version to 0.1.1 in Cargo.toml,
+#    then commit and push both together
+git push -u origin hotfix/v0.1.1
 
 # 3. Open a PR — CI must pass, 1 approval required
 gh pr create --title "fix: critical bug description"
 
-# 4. After merge, tag the patch release
+# 4. After merge, tag the patch release — v + the version just landed
 git checkout main && git pull
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## Undoing a Release
@@ -269,8 +332,8 @@ If a release was tagged by mistake or contains a critical issue:
 
 ```bash
 # Delete the tag locally and remotely
-git tag -d v0.2.0
-git push origin --delete v0.2.0
+git tag -d v0.1.0
+git push origin --delete v0.1.0
 ```
 
 Then delete the GitHub Release from the [Releases page](../../releases). Note: users who already downloaded the binary still have it.
