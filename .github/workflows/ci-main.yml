@@ -20,12 +20,18 @@ on:
       - 'experiments/browser-service-worker-blocks/guest/**'
 
   # Lets a change to this file be exercised before it is the only gate on a
-  # merge — `gh workflow run ci-main.yml --ref main`, or the Actions UI.
+  # merge. `gh workflow run ci-main.yml --ref <branch>` runs THAT branch's
+  # version of this file, which is the point: a pull request editing the merge
+  # workflow can see its own edit run green before it merges, instead of
+  # arguing from the file's text. (`--ref main`, or the Actions UI, re-runs the
+  # merge gate as it stands.)
   #
   # This trigger has to land one pull request BEFORE the pull request that
   # wants to use it: a `workflow_dispatch` added on a branch is not
   # dispatchable from that branch, because a workflow only becomes
   # dispatchable once the file carrying the trigger is on the default branch.
+  # Once it IS on the default branch, dispatching any ref works — which is why
+  # landing it here unblocks every later pull request in this phase.
   # (If the dispatch 404s after that, see `regen-visual-baselines.yml`'s header
   # — a fork with Actions disabled at fork time needs one push to the file on
   # the default branch to index it.)
