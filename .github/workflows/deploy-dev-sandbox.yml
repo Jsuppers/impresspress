@@ -17,6 +17,12 @@ on:
       # asset overlay (`cli/helpers/overlays.rs`) closely enough that
       # build.sh's own failure message names a stale CLI as the cause.
       - 'crates/impresspress/**'
+      # The CLI's third path dependency, declared unconditionally in
+      # `crates/impresspress/Cargo.toml`. It reaches only `cli/server.rs`, so
+      # it cannot change what this job ships — but it can break the
+      # `cargo install` the job depends on, and a break that skips its own gate
+      # is the failure this list exists to prevent.
+      - 'crates/impresspress-native/**'
       # The workspace manifest and the lockfile the `--locked` install
       # resolves against: a wafer-run pin bump changes what every crate above
       # compiles to without touching one of their paths.

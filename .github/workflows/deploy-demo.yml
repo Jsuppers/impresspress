@@ -19,6 +19,12 @@ on:
       # asset overlay.
       - 'crates/impresspress/**'
       - 'crates/impresspress-bundle/**'
+      # The CLI's third path dependency (`crates/impresspress/Cargo.toml`
+      # declares it unconditionally). It reaches only `cli/server.rs`, not the
+      # `build` path, so it cannot change the shipped wasm — but it can break
+      # the `cargo install` this job depends on, and a break that skips its own
+      # gate is the failure this list exists to prevent.
+      - 'crates/impresspress-native/**'
       # The workspace manifest and the lockfile the `--locked` install
       # resolves against: a wafer-run pin bump changes what every crate above
       # compiles to without touching one of their paths.
