@@ -2232,11 +2232,19 @@ mod tests {
     ///
     /// This guard keeps it deleted from both halves. A `.page-header` or
     /// `.page-header__*` class appearing in maud markup means the second
-    /// renderer is back; the same name appearing in `ui/styles/**` means a
-    /// rule is waiting for it. `pages_use_only_classes_defined_in_the_
-    /// stylesheet` above cannot see either case — it only asserts that markup
-    /// is a subset of the stylesheet, so a class in neither passes it, and a
-    /// class in the stylesheet alone passes it too.
+    /// renderer is back; the same name appearing in a stylesheet means a rule
+    /// is waiting for it. `pages_use_only_classes_defined_in_the_stylesheet`
+    /// above cannot see either case — it only asserts that markup is a subset
+    /// of the stylesheet, so a class in neither passes it, and a class in the
+    /// stylesheet alone passes it too.
+    ///
+    /// The stylesheet half reads the shared bundle *and* every stylesheet a
+    /// block owns and serves itself, for the reason that guard keeps them
+    /// apart: a block-local sheet is served with that block's pages, so a
+    /// `.page-header` rule in one is as live as a rule in `ui/styles/`. This
+    /// half deliberately merges the two rather than keeping them per block —
+    /// unlike the subset guard, it asks whether the rule exists anywhere at
+    /// all, not whether it reaches the page using it.
     #[test]
     fn the_first_generation_page_header_stays_deleted() {
         fn is_gen1_header(class: &str) -> bool {
@@ -2271,19 +2279,24 @@ mod tests {
         );
 
         let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entry in walkdir::WalkDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/styles"))
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
-        {
-            let css = std::fs::read_to_string(entry.path()).unwrap();
-            collect_css_classes(&strip_css_comments(&css), &mut defined);
+        for styles_root in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/styles"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"),
+        ] {
+            for entry in walkdir::WalkDir::new(styles_root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "css"))
+            {
+                let css = std::fs::read_to_string(entry.path()).unwrap();
+                collect_css_classes(&strip_css_comments(&css), &mut defined);
+            }
         }
         let mut in_styles: Vec<&String> = defined.iter().filter(|c| is_gen1_header(c)).collect();
         in_styles.sort();
         assert!(
             in_styles.is_empty(),
-            "ui/styles still carries first-generation page-header rules: {in_styles:?}"
+            "a stylesheet still carries first-generation page-header rules: {in_styles:?}"
         );
     }
 }

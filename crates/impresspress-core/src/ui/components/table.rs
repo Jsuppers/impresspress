@@ -488,10 +488,9 @@ mod tests {
     /// gate there is a Rust render test, not a screenshot.
     ///
     /// The scope is maud's bare `.table` class shorthand, the form all ten are
-    /// written in. `.table-container` and `.data-table` are excluded by
-    /// construction (the character after `.table` continues the class name, or
-    /// the `.` is not there at all). Comments are masked, since a comment
-    /// renders nothing.
+    /// written in; the counter is `test_support::count_bare_class_shorthand`,
+    /// shared with the badge ratchet rather than copied, and it reads every
+    /// boundary maud accepts, unspaced ones included.
     const HAND_WRITTEN_TABLES: &[(&str, usize)] = &[
         ("blocks/legalpages/pages.rs", 3),
         ("blocks/llm/pages.rs", 1),
@@ -500,58 +499,25 @@ mod tests {
         ("blocks/userportal/pages/admin_buttons.rs", 1),
     ];
 
-    /// Count maud's bare `.table` class shorthand in `src`: preceded by
-    /// whitespace, and not the start of `.table-container`. `src` is expected
-    /// comment-masked.
-    fn hand_written_tables(src: &str) -> usize {
-        let bytes = src.as_bytes();
-        let mut count = 0;
-        for (i, _) in src.match_indices(".table") {
-            let preceded_by_space = i
-                .checked_sub(1)
-                .is_some_and(|p| bytes[p].is_ascii_whitespace());
-            let next = bytes.get(i + ".table".len()).copied();
-            let continues_class =
-                next.is_some_and(|c| c == b'-' || c == b'_' || c.is_ascii_alphanumeric());
-            if preceded_by_space && !continues_class {
-                count += 1;
-            }
-        }
-        count
-    }
-
     #[test]
     fn only_the_declared_files_still_hand_write_a_first_generation_table() {
-        let src_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let expected: std::collections::BTreeMap<&str, usize> =
             HAND_WRITTEN_TABLES.iter().copied().collect();
-        let mut found: std::collections::BTreeMap<String, usize> = Default::default();
-        for entry in walkdir::WalkDir::new(src_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-        {
-            let rel = entry
-                .path()
-                .strip_prefix(src_root)
-                .unwrap()
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            let src = crate::ui::test_support::mask_rust_comments(
-                &std::fs::read_to_string(entry.path()).unwrap(),
-            );
-            let count = hand_written_tables(&src);
-            if count > 0 {
-                found.insert(rel, count);
-            }
-        }
+        // Skipped for the reason the badge ratchet skips its own pair: string
+        // literals are not masked, this file names `.table` in the assertion
+        // below and in the doc comment's rule list, and `ui/test_support.rs`
+        // holds the counter's own fixtures. Neither renders a page.
+        let found = crate::ui::test_support::hand_written_class_shorthand(
+            "table",
+            &["ui/components/table.rs", "ui/test_support.rs"],
+        );
         let found_refs: std::collections::BTreeMap<&str, usize> =
             found.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         assert_eq!(
             found_refs, expected,
             "first-generation table markup moved; update HAND_WRITTEN_TABLES only to \
              remove entries or lower counts, and when it empties delete the \
-             `.table`/`.table-container` rules from ui/styles/components/table.css"
+             .table / .table-container rules from ui/styles/components/table.css"
         );
     }
 }

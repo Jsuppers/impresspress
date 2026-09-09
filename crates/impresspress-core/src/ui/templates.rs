@@ -91,12 +91,12 @@ pub struct FormSection<'a> {
     pub body: Markup,
 }
 
-/// The tab-rail + sections chrome behind [`tabbed_page`] — the `.form-grid`
-/// with an optional `.form-tabs` left rail and the `.form-sections` column.
+/// The tab-rail + sections chrome behind [`tabbed_page`] — the `.form-grid`,
+/// its `.form-tabs` left rail and the `.form-sections` column.
 ///
-/// The rail is not optional: `form_page`, the single-column template that
-/// passed no tabs, had no callers and is gone, so `.form-grid` without
-/// `.form-grid--with-tabs` reached no page.
+/// The rail is not optional, and this signature is why: `form_page`, the
+/// single-column template that passed no tabs, had no callers and is gone, so
+/// `.form-grid` without `.form-grid--with-tabs` reached no page.
 fn form_grid(tabs: Vec<(String, String, bool)>, sections: Vec<FormSection<'_>>) -> Markup {
     html! {
         div .form-grid .form-grid--with-tabs {

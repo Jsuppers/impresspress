@@ -163,7 +163,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::ui::test_support::{css_rules, mask_rust_comments, strip_css_comments};
+    use crate::ui::test_support::{css_rules, hand_written_class_shorthand, strip_css_comments};
 
     /// Every `.badge-…` rule in the stylesheet that paints a `background` — the
     /// convention that separates a colour class from a layout modifier
@@ -234,7 +234,9 @@ mod tests {
     /// in it), a `class={ "badge" … }` expression, and a bare colour class
     /// with no `.badge` beside it. A ratchet on the one syntax in use is a
     /// gate on the migration; extending it to syntaxes nothing writes would be
-    /// speculative.
+    /// speculative. The counter is `test_support::count_bare_class_shorthand`,
+    /// shared with `components::table`'s first-generation-table ratchet rather
+    /// than copied a second time.
     ///
     /// Comments are excluded, since a comment renders nothing — a doc comment
     /// naming `.badge` in an administration file would otherwise fail this
@@ -258,54 +260,20 @@ mod tests {
         ("ui/templates.rs", 1),
     ];
 
-    /// Count maud's bare `.badge` class shorthand in `src`: preceded by
-    /// whitespace, and not the start of `.badge-success` or `.badge--tone-red`
-    /// (those follow the bare class on the same element, so counting them too
-    /// would count one pill several times). `src` is expected comment-masked.
-    fn hand_written_badges(src: &str) -> usize {
-        let bytes = src.as_bytes();
-        let mut count = 0;
-        for (i, _) in src.match_indices(".badge") {
-            let preceded_by_space = i
-                .checked_sub(1)
-                .is_some_and(|p| bytes[p].is_ascii_whitespace());
-            let next = bytes.get(i + ".badge".len()).copied();
-            let continues_class =
-                next.is_some_and(|c| c == b'-' || c == b'_' || c.is_ascii_alphanumeric());
-            if preceded_by_space && !continues_class {
-                count += 1;
-            }
-        }
-        count
-    }
-
     #[test]
     fn only_the_declared_files_still_hand_write_badge_markup() {
-        let src_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let expected: std::collections::BTreeMap<&str, usize> =
             HAND_WRITTEN_BADGES.iter().copied().collect();
-        let mut found: std::collections::BTreeMap<String, usize> = Default::default();
-        for entry in walkdir::WalkDir::new(src_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-        {
-            let rel = entry
-                .path()
-                .strip_prefix(src_root)
-                .unwrap()
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            // This module is where the markup is supposed to be written.
-            if rel == "ui/components/badge.rs" {
-                continue;
-            }
-            let src = mask_rust_comments(&std::fs::read_to_string(entry.path()).unwrap());
-            let count = hand_written_badges(&src);
-            if count > 0 {
-                found.insert(rel, count);
-            }
-        }
+        // Two files are read past rather than counted. This module is where
+        // the markup is supposed to be written, and it spells `.badge` out in
+        // its own prose and assertions; `ui/test_support.rs` holds the
+        // counter and the fixtures that exercise it. Neither renders a page,
+        // and string literals are deliberately not masked, so counting either
+        // would make this test fail against its own text.
+        let found = hand_written_class_shorthand(
+            "badge",
+            &["ui/components/badge.rs", "ui/test_support.rs"],
+        );
         let found_refs: std::collections::BTreeMap<&str, usize> =
             found.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         assert_eq!(

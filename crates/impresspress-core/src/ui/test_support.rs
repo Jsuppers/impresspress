@@ -1,16 +1,18 @@
 //! Scanning helpers shared by the source- and stylesheet-reading guards in
 //! `ui`.
 //!
-//! Two guards read the same two artefacts. `ui/mod.rs`'s undefined-class guard
-//! and `ui/components/badge.rs`'s stylesheet-parity guard both need a
+//! Several guards read the same two artefacts. `ui/mod.rs`'s undefined-class
+//! guard and `ui/components/badge.rs`'s stylesheet-parity guard both need a
 //! `ui/styles/**/*.css` file with its comments removed and its rules split into
-//! selector/body pairs; `ui/mod.rs`'s component-class scan and `badge.rs`'s
-//! hand-written-badge ratchet both need a `.rs` source with its comments
-//! removed. Both live in `#[cfg(test)] mod tests`, so neither can reach the
-//! other's private helpers — which is exactly how the second copy of each
-//! appeared. This module is the one copy.
+//! selector/body pairs; `ui/mod.rs`'s component-class scan and the
+//! hand-written-markup ratchets in `badge.rs` and `components/table.rs` both
+//! need a `.rs` source with its comments removed, and those two ratchets need
+//! the same shorthand counter and the same source-tree walk on top of it. Every
+//! one of them lives in a `#[cfg(test)] mod tests`, so none can reach another's
+//! private helpers — which is exactly how the second copy of each appeared.
+//! This module is the one copy.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Non-nested `/* ... */` stripper — CSS comments never nest, so this is
 /// exact, not a heuristic.
@@ -276,6 +278,84 @@ pub(crate) fn mask_rust_comments(src: &str) -> String {
     out
 }
 
+/// Count maud's bare `.<class>` class shorthand in `src` — the form
+/// `div .card { … }` writes, as opposed to a `class="…"` attribute or a
+/// dynamic `.(expr)`. `src` is expected comment-masked
+/// (`mask_rust_comments`), since a comment renders nothing.
+///
+/// A `.` opens a class token only at a maud "new selector position": the very
+/// start of the input, or after whitespace, `{`, `}` or `;`. That boundary set
+/// is `ui/mod.rs`'s `find_shorthand_classes`, and it is what separates a real
+/// shorthand from an ordinary Rust field access or method call
+/// (`readiness.reasons`, `.into_iter()`), which is always preceded by an
+/// identifier character. **Whitespace alone is not enough**: maud accepts
+/// `div{.table` and `};.badge` with no space, so a whitespace-only rule counts
+/// markup written that way as zero — a ratchet that reports clean while the
+/// markup it guards is being added, and a later "the list is empty, so delete
+/// the rules" cleanup would then strip chrome off a live page.
+///
+/// A match is only counted when the character after the class name does not
+/// continue an identifier, so `.badge-success`, `.badge--tone-red` and
+/// `.table-container` are excluded by construction: those follow the bare class
+/// on the same element (or are a different class entirely), and counting them
+/// too would count one element several times.
+pub(crate) fn count_bare_class_shorthand(src: &str, class: &str) -> usize {
+    let needle = format!(".{class}");
+    let bytes = src.as_bytes();
+    let mut count = 0;
+    for (i, _) in src.match_indices(&needle) {
+        let at_boundary = match i.checked_sub(1) {
+            None => true,
+            Some(p) => {
+                let c = bytes[p];
+                c.is_ascii_whitespace() || c == b'{' || c == b'}' || c == b';'
+            }
+        };
+        let next = bytes.get(i + needle.len()).copied();
+        let continues_class =
+            next.is_some_and(|c| c == b'-' || c == b'_' || c.is_ascii_alphanumeric());
+        if at_boundary && !continues_class {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Every `.rs` file under this crate's `src/` that writes `.{class}` by hand,
+/// with the count it writes, keyed by path relative to `src/` with `/`
+/// separators. Files named in `skip` are not read at all.
+///
+/// This is the walk behind both hand-written-markup ratchets. Each ratchet
+/// skips the file it lives in: that file spells its own class out in an
+/// assertion message and in the doc comment naming the rules to delete, and
+/// string literals are deliberately *not* masked, so a ratchet reading its own
+/// source would fail against itself the moment somebody reworded the message.
+pub(crate) fn hand_written_class_shorthand(class: &str, skip: &[&str]) -> BTreeMap<String, usize> {
+    let src_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    let mut found = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(src_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+    {
+        let rel = entry
+            .path()
+            .strip_prefix(src_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if skip.contains(&rel.as_str()) {
+            continue;
+        }
+        let src = mask_rust_comments(&std::fs::read_to_string(entry.path()).unwrap());
+        let count = count_bare_class_shorthand(&src, class);
+        if count > 0 {
+            found.insert(rel, count);
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +410,39 @@ mod tests {
         assert!(
             masked.contains("let y = 1;"),
             "code after comment lost: {masked}"
+        );
+    }
+
+    #[test]
+    fn count_bare_class_shorthand_reads_every_boundary_maud_accepts() {
+        // The spaced form both ratchets were written against, plus the three
+        // unspaced boundaries maud also accepts. A whitespace-only rule sees
+        // one of these four.
+        assert_eq!(count_bare_class_shorthand("div .table { }", "table"), 1);
+        assert_eq!(count_bare_class_shorthand("div{.table{}}", "table"), 1);
+        assert_eq!(count_bare_class_shorthand("div{}.table{}", "table"), 1);
+        assert_eq!(count_bare_class_shorthand("(x);.table{}", "table"), 1);
+        assert_eq!(count_bare_class_shorthand(".table { }", "table"), 1);
+    }
+
+    #[test]
+    fn count_bare_class_shorthand_skips_longer_classes_and_rust_syntax() {
+        // A longer class starting with the same name is a different class, and
+        // a modifier written beside the bare one would double-count the
+        // element that carries both.
+        assert_eq!(
+            count_bare_class_shorthand("div .table-container { table .table { } }", "table"),
+            1
+        );
+        assert_eq!(
+            count_bare_class_shorthand(" .badge .badge--tone-red", "badge"),
+            1
+        );
+        // Field access and method calls are preceded by an identifier
+        // character, never by a boundary.
+        assert_eq!(
+            count_bare_class_shorthand("cfg.table_name; x.table()", "table"),
+            0
         );
     }
 
