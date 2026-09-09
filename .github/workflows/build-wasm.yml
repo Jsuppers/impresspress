@@ -10,12 +10,12 @@ name: Build wasm
 # only on the call. Keeping the builder callable lets those two start as soon
 # as the wasm exists instead of waiting for the whole shared suite.
 #
-# `release.yml`'s own `build-wasm` job still carries a copy of this one.
-# Folding it in is a separate change: that workflow has never run, so it cannot
-# be proved by the same means as this one. (Named, not cited by line number: an
-# earlier version of this comment said `release.yml:17-51` and was already
-# wrong — the range moved when this branch edited that file's comment, and it
-# did not match `main` either.)
+# `release.yml` calls this workflow too, so the wasm a release binary embeds is
+# built by the same pinned wasm-pack, with the same flags, as every CI run's.
+# It used to carry a 35-line copy of the job below; folding that in was left
+# out of the reusable-workflow change because `release.yml` had never run and
+# so could not be proved by the same before/after job listing. It now has a
+# `workflow_dispatch` dry run, which is the proof.
 
 on:
   workflow_call:
@@ -60,8 +60,14 @@ jobs:
           # pin (PR #75).
           version: 'v0.15.0'
 
+      # `-- --locked` forwards to the `cargo build` wasm-pack runs. Every other
+      # cargo invocation in this repository's workflows already passes it; this
+      # one did not, so the wasm blob that `crates/impresspress/build.rs` bakes
+      # into the binary was the one place a release resolved dependencies
+      # afresh instead of using the set CI tested. All the deploy workflows
+      # carry the same flag now for the same reason.
       - name: Build WASM
-        run: cd crates/impresspress-web && wasm-pack build --target web --release --out-dir pkg
+        run: cd crates/impresspress-web && wasm-pack build --target web --release --out-dir pkg -- --locked
 
       - name: Upload pkg/ artifact
         uses: actions/upload-artifact@v4

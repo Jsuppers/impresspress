@@ -200,6 +200,17 @@ image in Admin → Settings → Variables. It renders exactly as before.
 referenced them. `IMPRESSPRESS_ASSETS.logo` (the square mark) and
 `favicon.ico` are unchanged in name and now carry the new art.
 
+## The release workflow has never produced a release
+
+Read this before you tag anything. The
+[Release workflow](../../actions/workflows/release.yml) has **zero runs** — no
+`v*` tag has ever existed in this repository or upstream, so the workflow has
+never executed a single time and no release has ever been published. Nothing
+below is a description of something observed working end to end.
+
+That is what the dry run is for. It is not optional pre-flight advice; it is
+the only way anyone has ever seen this workflow run.
+
 ## Pre-Release Checklist
 
 Before tagging a release, verify:
@@ -207,6 +218,7 @@ Before tagging a release, verify:
 - [ ] `main` branch CI is green (check the [Actions tab](../../actions))
 - [ ] Cross-platform builds pass (the `CI Main` workflow runs on every push to `main`)
 - [ ] Update `version` in `Cargo.toml` workspace section to match the intended release
+- [ ] **Run the release workflow as a dry run and see it green** (below)
 - [ ] No known critical bugs (check [open issues](../../issues))
 - [ ] Test the binary locally:
   ```bash
@@ -218,6 +230,36 @@ Before tagging a release, verify:
       to [Upgrade Notes](#upgrade-notes) so operators know to pass
       `--run-migrations`
 
+## Dry run — the pre-flight step
+
+```bash
+# Run everything the release does except creating the release.
+gh workflow run release.yml --ref main -f dry_run=true
+
+# Watch it.
+gh run list --workflow=release.yml --limit 1
+gh run watch <run-id>
+```
+
+A dry run executes, for real:
+
+1. **`verify-tag`** — reads `version` from `Cargo.toml`'s `[workspace.package]`
+   table and prints the tag you must push (`v<version>`). On a branch there is
+   no tag to compare, so it reports the expected one; on a tag it fails the run
+   if the two disagree.
+2. **`build-wasm`** — the `impresspress-web` wasm, via the same
+   `build-wasm.yml` every CI run uses.
+3. **`build`** — all five cross-compile targets, packaged as `.tar.gz`/`.zip`
+   and uploaded as run artifacts.
+
+It does **not** run `publish`, so no GitHub Release, and no tag, is created.
+A skipped `publish` does not turn a red run green: a run's conclusion is
+failure if any job failed, whatever was skipped afterwards.
+
+Dispatching a branch requires `dry_run: true`; a non-dry-run dispatch must
+target a tag, because `gh release create --verify-tag` has nothing to verify
+otherwise.
+
 ## Creating a Release
 
 ```bash
@@ -225,16 +267,28 @@ Before tagging a release, verify:
 git checkout main
 git pull
 
-# 2. Tag the release
-git tag v0.2.0
+# 2. Dry-run first (see above). Do not skip this — the publish path has never
+#    run, so a dry run is the only evidence that anything before it works.
+gh workflow run release.yml --ref main -f dry_run=true
 
-# 3. Push the tag — this triggers the release workflow
-git push origin v0.2.0
+# 3. Tag the release. The tag MUST be `v` + the workspace version in
+#    Cargo.toml, or the `verify-tag` job fails the run before anything builds.
+git tag v0.1.0
+
+# 4. Push the tag — this triggers the release workflow
+git push origin v0.1.0
 ```
 
-The [Release workflow](../../actions/workflows/release.yml) will automatically:
-1. Build binaries for all 5 platforms (Linux amd64/arm64, macOS amd64/arm64, Windows amd64)
-2. Create a GitHub Release with auto-generated notes from merged PRs
+The [Release workflow](../../actions/workflows/release.yml) is intended to:
+1. Check the tag against `Cargo.toml`'s workspace version and stop if they disagree
+2. Build binaries for all 5 platforms (Linux amd64/arm64, macOS amd64/arm64, Windows amd64)
+3. Create a GitHub Release (`gh release create --verify-tag`, so the tag must
+   already exist — the command will not invent one) with auto-generated notes
+   from merged PRs
+
+Step 3 has never executed. If it fails, the artifacts from step 2 are still on
+the run: re-dispatch the workflow against the tag with `dry_run: false` rather
+than retagging.
 
 ## After Release
 
