@@ -6,10 +6,13 @@
  * `npm pack && npm install` in a clean directory failed outright).
  *
  * `wafer-client-js` is a generic multi-backend Wafer transport; this SDK
- * only ever talks to one impresspress HTTP server and only needs
- * get/post/put/patch/delete with a bearer API key and cookie credentials —
- * so rather than re-adding an external dependency (versioned or git-based)
- * this is a small, self-contained client with zero runtime dependencies.
+ * only ever talks to one impresspress HTTP server — so rather than
+ * re-adding an external dependency (versioned or git-based) this is a
+ * small, self-contained client with zero runtime dependencies.
+ *
+ * It is the ONLY request path in the SDK: JSON calls, multipart uploads and
+ * raw downloads all go through `request`, so credentials, the bearer key,
+ * query-string encoding, abort handling and error decoding are defined once.
  *
  * Wire format: success responses are the raw JSON body with no envelope
  * (`ok_json(&value)` on the server just serializes `value`); error
@@ -18,10 +21,30 @@
  */
 import { ImpresspressError } from "./error";
 
+/** The methods this client can send. Anything else is refused up front. */
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+const HTTP_METHODS: readonly string[] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+/** Default timeout for a JSON control-plane call, in milliseconds. */
+export const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * `timeout` value that disables the timeout entirely: the request runs until
+ * the server ends it or the caller's `signal` fires. Used by the transfer
+ * paths (upload/download), whose duration is a function of file size and
+ * link speed and so has no defensible fixed ceiling.
+ */
+export const NO_TIMEOUT = 0;
+
 export interface HttpClientConfig {
   url: string;
   apiKey?: string;
   headers?: Record<string, string>;
+  /**
+   * Default request timeout in milliseconds. `NO_TIMEOUT` (0) disables it.
+   * Defaults to `DEFAULT_TIMEOUT_MS`.
+   */
   timeout?: number;
   /** Override for `fetch` (tests / non-browser environments). */
   fetch?: typeof fetch;
@@ -32,8 +55,19 @@ export interface HttpClientConfig {
 export interface HttpRequestOptions {
   headers?: Record<string, string>;
   params?: Record<string, unknown>;
+  /**
+   * Milliseconds before this request is aborted. `NO_TIMEOUT` (0) disables
+   * the timeout for this request only. Falls back to the client's `timeout`,
+   * then to `DEFAULT_TIMEOUT_MS`.
+   */
   timeout?: number;
   signal?: AbortSignal;
+  /**
+   * `"json"` (the default) parses the response body as JSON; `"blob"`
+   * returns the raw bytes untouched, which is what a file download needs
+   * even when the object's own content-type happens to be JSON.
+   */
+  responseType?: "json" | "blob";
 }
 
 function defaultCredentials(): RequestCredentials | undefined {
@@ -51,11 +85,33 @@ function buildQueryString(params?: Record<string, unknown>): string {
   return s ? `?${s}` : "";
 }
 
+/**
+ * True for a value `fetch` can send as-is. These are the `BodyInit` members
+ * the SDK can encounter; everything else (plain objects, strings, numbers)
+ * is JSON-encoded, which is what every impresspress JSON endpoint wants.
+ * A raw body must NOT be JSON-encoded and must NOT carry an explicit
+ * `Content-Type`, so `fetch` can set the multipart boundary itself.
+ */
+function isRawBody(data: unknown): data is BodyInit {
+  return (
+    (typeof FormData !== "undefined" && data instanceof FormData) ||
+    (typeof Blob !== "undefined" && data instanceof Blob) ||
+    (typeof URLSearchParams !== "undefined" && data instanceof URLSearchParams) ||
+    (typeof ArrayBuffer !== "undefined" &&
+      (data instanceof ArrayBuffer || ArrayBuffer.isView(data)))
+  );
+}
+
 export class HttpClient {
   private config: HttpClientConfig;
 
   constructor(config: HttpClientConfig) {
     this.config = { ...config, url: config.url.replace(/\/$/, "") };
+  }
+
+  /** Base URL this client talks to, with any trailing slash stripped. */
+  get baseUrl(): string {
+    return this.config.url;
   }
 
   setApiKey(apiKey: string): void {
@@ -86,18 +142,31 @@ export class HttpClient {
     return this.request<T>("DELETE", path, undefined, options);
   }
 
-  private async request<T>(
-    method: string,
+  async request<T>(
+    method: HttpMethod,
     path: string,
-    data: unknown,
+    data?: unknown,
     options?: HttpRequestOptions,
   ): Promise<T> {
+    const normalized = String(method).toUpperCase();
+    if (!HTTP_METHODS.includes(normalized)) {
+      throw new ImpresspressError(
+        "unsupported_method",
+        `Unsupported HTTP method: ${method}. Expected one of ${HTTP_METHODS.join(", ")}.`,
+      );
+    }
+
     const fetchFn = this.config.fetch ?? globalThis.fetch;
-    const timeout = options?.timeout ?? this.config.timeout ?? 30_000;
+    const timeout = options?.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT_MS;
     const url = `${this.config.url}${path}${buildQueryString(options?.params)}`;
 
+    const raw = isRawBody(data);
     const headers: Record<string, string> = {
-      "Content-Type": "application/json",
+      // A raw body carries its own content type (fetch adds the multipart
+      // boundary), so the JSON default would corrupt it. Every other request
+      // keeps the JSON content type, bodyless ones included — that is what
+      // the SDK has always sent and what `services.test.ts` pins.
+      ...(raw ? {} : { "Content-Type": "application/json" }),
       ...this.config.headers,
       ...options?.headers,
     };
@@ -105,7 +174,12 @@ export class HttpClient {
       headers["Authorization"] = `Bearer ${this.config.apiKey}`;
     }
 
-    const body = data !== undefined ? JSON.stringify(data) : undefined;
+    let body: BodyInit | undefined;
+    if (raw) {
+      body = data as BodyInit;
+    } else if (data !== undefined) {
+      body = JSON.stringify(data);
+    }
 
     const controller = new AbortController();
     const externalSignal = options?.signal;
@@ -116,7 +190,9 @@ export class HttpClient {
       externalSignal?.addEventListener("abort", () => controller.abort(externalSignal.reason), {
         once: true,
       });
-      timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
+      if (timeout > 0) {
+        timeoutId = setTimeout(() => controller.abort("timeout"), timeout);
+      }
     }
 
     const credentials = this.config.credentials ?? defaultCredentials();
@@ -124,7 +200,7 @@ export class HttpClient {
     let res: Response;
     try {
       res = await fetchFn(url, {
-        method,
+        method: normalized,
         headers,
         body,
         signal: controller.signal,
@@ -143,13 +219,21 @@ export class HttpClient {
       if (timeoutId !== undefined) clearTimeout(timeoutId);
     }
 
+    // A blob response is handed back untouched. This has to happen BEFORE any
+    // body read: a response body can only be consumed once, and an object
+    // whose own content-type is `application/json` would otherwise be eaten
+    // by the JSON branch below and never reach the caller.
+    if (res.ok && options?.responseType === "blob") {
+      return (await res.blob()) as T;
+    }
+
     const contentType = res.headers.get("content-type") ?? "";
     let parsed: unknown = null;
     if (contentType.includes("application/json")) {
-      const raw = await res.text();
-      if (raw.length > 0) {
+      const rawText = await res.text();
+      if (rawText.length > 0) {
         try {
-          parsed = JSON.parse(raw);
+          parsed = JSON.parse(rawText);
         } catch {
           parsed = null;
         }
@@ -161,10 +245,10 @@ export class HttpClient {
       let message = `HTTP ${res.status}`;
       let detailCode: string | undefined;
       if (parsed && typeof parsed === "object") {
-        const body = parsed as Record<string, unknown>;
-        if (typeof body.error === "string") code = body.error;
-        if (typeof body.message === "string") message = body.message;
-        if (typeof body.code === "string") detailCode = body.code;
+        const errorBody = parsed as Record<string, unknown>;
+        if (typeof errorBody.error === "string") code = errorBody.error;
+        if (typeof errorBody.message === "string") message = errorBody.message;
+        if (typeof errorBody.code === "string") detailCode = errorBody.code;
       }
       throw new ImpresspressError(code, message, res.status, parsed, detailCode);
     }

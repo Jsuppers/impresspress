@@ -1,5 +1,5 @@
 import { BaseService } from "./base.service";
-import { isNotFoundError, isUnauthorizedError } from "../error";
+import { ImpresspressError, isNotFoundError, isUnauthorizedError } from "../error";
 import { PopupAuthSession } from "../popup-auth-session";
 
 /**
@@ -232,7 +232,10 @@ export class AuthService extends BaseService {
   async refreshSession(refreshToken?: string): Promise<AuthTokens> {
     const token = refreshToken ?? this.tokens?.refresh_token;
     if (!token) {
-      throw new Error("No refresh token available — sign in first or pass one explicitly");
+      throw new ImpresspressError(
+        "no_refresh_token",
+        "No refresh token available — sign in first or pass one explicitly",
+      );
     }
     const tokens = await this.request<AuthTokens>({
       method: "POST",
@@ -312,7 +315,7 @@ export class AuthService extends BaseService {
           return undefined;
         }
         if (message.error) {
-          throw new Error(message.error);
+          throw new ImpresspressError("oauth_error", message.error);
         }
         return true;
       },
@@ -324,7 +327,10 @@ export class AuthService extends BaseService {
 
     const user = await this.getUser();
     if (!user) {
-      throw new Error("Authentication failed");
+      throw new ImpresspressError(
+        "authentication_failed",
+        "Authentication failed: the popup completed but no session was established",
+      );
     }
     return user;
   }

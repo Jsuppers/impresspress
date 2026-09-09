@@ -38,10 +38,10 @@ export class ExtensionsService extends BaseService {
       params?: Record<string, any>;
     },
   ): Promise<T> {
-    const queryString = options?.params ? this.buildQueryString(options.params) : "";
     return this.request<T>({
       method: options?.method || "GET",
-      url: `/b/${extension}/${endpoint}${queryString ? `?${queryString}` : ""}`,
+      url: `/b/${extension}/${endpoint}`,
+      params: options?.params,
       data: options?.data,
     });
   }

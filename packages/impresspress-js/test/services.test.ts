@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ImpresspressClient } from "../src/client";
 import { ImpresspressError } from "../src/error";
-import { fakeJsonResponse, fakeBlobResponse } from "./fixtures";
+import { fakeJsonResponse, fakeBlobResponse, hangingFetch } from "./fixtures";
 
 /**
  * These tests pin every SDK method to the REAL server route it now calls
@@ -279,6 +279,135 @@ describe("StorageService", () => {
     expect(result.total).toBe(1);
     expect(result.items[0].key).toBe("a.txt");
     expect(result.items[0].id).toBe("r2");
+  });
+});
+
+/**
+ * Transfer timeouts. Folding the upload/download paths into `HttpClient`
+ * brought them under a client that applies a 30 s default — which would have
+ * capped every large upload and download, silently, at half a minute. The
+ * transfer paths therefore opt out of the timeout by default (`NO_TIMEOUT`)
+ * and take a per-call override instead. These tests are the guard.
+ */
+describe("transfer timeouts", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("uploadFile is not capped by the 30 s JSON default", async () => {
+    const { fetchFn, captured } = hangingFetch();
+    fetchMock.mockImplementation(fetchFn);
+    const controller = new AbortController();
+
+    const promise = client().storage.uploadFile("b", new Blob(["x"]), {
+      key: "big.bin",
+      signal: controller.signal,
+    });
+    const assertion = expect(promise).rejects.toMatchObject({ code: "aborted" });
+
+    // Ten minutes into a slow upload: nothing may have aborted it.
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(captured.signal?.aborted).toBe(false);
+
+    controller.abort();
+    await assertion;
+  });
+
+  it("uploadFile honours an explicit timeout when the caller wants one", async () => {
+    const { fetchFn } = hangingFetch();
+    fetchMock.mockImplementation(fetchFn);
+
+    const promise = client().storage.uploadFile("b", new Blob(["x"]), {
+      key: "f.txt",
+      timeout: 5_000,
+    });
+    const assertion = expect(promise).rejects.toMatchObject({ code: "timeout" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await assertion;
+  });
+
+  it("downloadFile is not capped by the 30 s JSON default", async () => {
+    const { fetchFn, captured } = hangingFetch();
+    fetchMock.mockImplementation(fetchFn);
+    const controller = new AbortController();
+
+    const promise = client().storage.downloadFile("b", "big.bin", { signal: controller.signal });
+    const assertion = expect(promise).rejects.toMatchObject({ code: "aborted" });
+
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(captured.signal?.aborted).toBe(false);
+
+    controller.abort();
+    await assertion;
+  });
+
+  it("downloadFile honours an explicit timeout when the caller wants one", async () => {
+    const { fetchFn } = hangingFetch();
+    fetchMock.mockImplementation(fetchFn);
+
+    const promise = client().storage.downloadFile("b", "f.txt", { timeout: 5_000 });
+    const assertion = expect(promise).rejects.toMatchObject({ code: "timeout" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await assertion;
+  });
+
+  it("a plain JSON call still gets the 30 s default", async () => {
+    const { fetchFn } = hangingFetch();
+    fetchMock.mockImplementation(fetchFn);
+
+    const promise = client().storage.listBuckets();
+    const assertion = expect(promise).rejects.toMatchObject({ code: "timeout" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await assertion;
+  });
+});
+
+/**
+ * Every failure the SDK raises itself carries a machine-readable `code`, so a
+ * caller can branch on it without matching on message text.
+ */
+describe("SDK-raised error codes", () => {
+  it("refreshSession without a token throws code no_refresh_token", async () => {
+    const error = await client()
+      .auth.refreshSession()
+      .then(() => null)
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ImpresspressError);
+    expect((error as ImpresspressError).code).toBe("no_refresh_token");
+  });
+
+  it("uploadFile with a non-file throws code invalid_file_type", async () => {
+    const error = await client()
+      .storage.uploadFile("b", "not a file" as unknown as Blob)
+      .then(() => null)
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ImpresspressError);
+    expect((error as ImpresspressError).code).toBe("invalid_file_type");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The six services share ONE `HttpClient`, so credentials set anywhere apply
+ * everywhere — there is no per-service copy to keep in sync.
+ */
+describe("shared HttpClient", () => {
+  it("an API key set on one service is sent by every other service", async () => {
+    const c = client();
+    c.auth.setApiKey("k-123");
+
+    fetchMock.mockResolvedValueOnce(fakeJsonResponse({ buckets: [] }));
+    await c.storage.listBuckets();
+    expect(fetchMock.mock.calls[0][1].headers["Authorization"]).toBe("Bearer k-123");
+
+    c.removeApiKey();
+    fetchMock.mockResolvedValueOnce(fakeJsonResponse({ buckets: [] }));
+    await c.storage.listBuckets();
+    expect(fetchMock.mock.calls[1][1].headers["Authorization"]).toBeUndefined();
   });
 });
 

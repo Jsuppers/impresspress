@@ -13,6 +13,11 @@ export * from './types';
 
 // Export the error type and helpers every service throws/maps
 export { ImpresspressError, isNotFoundError, isUnauthorizedError } from './error';
+export type { SdkErrorCode } from './error';
+
+// Export the one HTTP client every service shares, and its timeout vocabulary
+export { HttpClient, DEFAULT_TIMEOUT_MS, NO_TIMEOUT } from './http-client';
+export type { HttpClientConfig, HttpRequestOptions, HttpMethod } from './http-client';
 
 // Export the OAuth popup abstraction (advanced usage — most callers just use
 // `client.auth.signInWithOAuthPopup`)
@@ -40,7 +45,10 @@ export type {
   StorageObjectInfo,
   ListObjectsResult,
   ListOptions,
+  TransferOptions,
   UploadFileOptions,
+  FileMetadataRecord,
+  SearchResult,
 } from './services/storage.service';
 
 export type {
