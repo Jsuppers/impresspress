@@ -200,18 +200,15 @@ mod test_helpers {
     /// in production.
     ///
     /// Both gates are now live: the shim is the registered block, and
-    /// [`TestContext::with_wrap`] installs the files block's OWN declared
-    /// `requires` plus the deployment's grants (sourced from the admin
-    /// block's declaration, which is where they live in production).
+    /// [`TestContext::with_files`] itself installs the files block's OWN
+    /// declared `requires` plus the deployment's grants (sourced from the
+    /// admin block's declaration, which is where they live in production).
     pub(super) async fn ctx_with_storage() -> TestContext {
         let mut ctx = TestContext::with_files().await;
         ctx.register_block(
             "wafer-run/storage",
-            crate::blocks::storage::create(
-                Arc::new(MemStorage::default()),
-                Arc::from(crate::blocks::files::test_wrap::ADMIN_BLOCK),
-            ),
+            crate::blocks::files::test_wrap::storage_block(Arc::new(MemStorage::default())),
         );
-        crate::blocks::files::test_wrap::as_files_block(ctx)
+        ctx
     }
 }

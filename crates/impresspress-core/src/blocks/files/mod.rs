@@ -25,13 +25,29 @@ pub(crate) mod storage;
 /// in every test and refused on the wire (`PermissionDenied: block '…' not in
 /// requires list`). That is how the share path shipped calling
 /// `wafer-run/crypto` without declaring it.
-#[cfg(test)]
+///
+/// The gate is applied at the ROOT — [`crate::test_support::TestContext::with_files`]
+/// calls [`test_wrap::as_files_block`] — so it covers every files-block test,
+/// not the handful of fixtures somebody remembered to wrap. Compiled under
+/// `feature = "test-support"` as well as `cfg(test)` because `test_support.rs`
+/// is part of the non-test lib build under that feature.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_wrap {
+    #[cfg(test)]
+    use std::sync::Arc;
+
+    #[cfg(test)]
+    use wafer_core::interfaces::storage::service::StorageService;
+
+    #[cfg(test)]
+    use crate::blocks::storage::ImpresspressStorageBlock;
     use crate::test_support::TestContext;
 
     /// The deployment's admin block — the WRAP admin identity, and the block
-    /// whose declaration publishes the deployment-wide grants.
-    pub(crate) const ADMIN_BLOCK: &str = "impresspress/admin";
+    /// whose declaration publishes the deployment-wide grants. The id itself
+    /// is owned by the admin block; this is a local name for it, not a second
+    /// copy of the string.
+    pub(crate) const ADMIN_BLOCK: &str = crate::blocks::admin::ADMIN_BLOCK_ID;
 
     /// `ctx` acting as `impresspress/files`, with this block's OWN declared
     /// `requires` and the admin block's declared grants.
@@ -39,10 +55,51 @@ pub(crate) mod test_wrap {
     /// Neither list is re-typed here: the point of the gate is that the test
     /// and the runtime read the same declaration, so `requires` comes off
     /// [`super::FilesBlock`] and the grants off `blocks::admin::AdminBlock`.
+    ///
+    /// Called from `TestContext::with_files()`, which is the only constructor
+    /// files-block tests use — so a new test is on the gate by construction
+    /// and cannot certify a `call_block` production refuses.
     pub(crate) fn as_files_block(ctx: TestContext) -> TestContext {
         let requires = wafer_run::Block::info(&super::FilesBlock::new()).requires;
-        let grants = wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants;
-        ctx.with_wrap(super::FilesBlock::BLOCK_NAME, requires, grants, ADMIN_BLOCK)
+        ctx.with_wrap(
+            super::FilesBlock::BLOCK_NAME,
+            requires,
+            deployment_grants(),
+            ADMIN_BLOCK,
+        )
+    }
+
+    /// The deployment-wide WRAP grants, off the declaration that publishes
+    /// them. A grant is owned by the block that owns the resource, so this
+    /// reads `blocks::admin::AdminBlock` rather than re-listing anything.
+    pub(crate) fn deployment_grants() -> Vec<wafer_run::ResourceGrant> {
+        wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants
+    }
+
+    /// The `wafer-run/storage` block a files-block fixture must register:
+    /// the production namespacing shim over `service`, with the deployment's
+    /// grants already installed.
+    ///
+    /// Both halves are production wiring. `builder::registration` registers
+    /// [`ImpresspressStorageBlock`] under that name — a fixture that registers
+    /// the bare `wafer-core` `StorageBlock` instead skips the namespacing and
+    /// the op match, which is how `storage.get_streaming` was missing from
+    /// that match through 60 green PRs. And `builder::boot::post_start` then
+    /// injects the collected grants; the shim's constructor leaves that list
+    /// empty and refuses every `@`-prefixed cross-block reach while it is,
+    /// regardless of what the deployment granted. Skipping it is fail-closed,
+    /// but it leaves the fixture unable to tell a missing grant from an
+    /// unwired block — and its doc claiming production fidelity untrue.
+    ///
+    /// `cfg(test)` alone: the `test-support` lib build compiles this module
+    /// for [`as_files_block`] (which `TestContext::with_files` calls); the
+    /// fixtures that register a storage block all live in this crate's own
+    /// `#[cfg(test)]` modules.
+    #[cfg(test)]
+    pub(crate) fn storage_block(service: Arc<dyn StorageService>) -> Arc<ImpresspressStorageBlock> {
+        let block = crate::blocks::storage::create(service, Arc::from(ADMIN_BLOCK));
+        block.update_wrap_grants(&deployment_grants());
+        block
     }
 }
 

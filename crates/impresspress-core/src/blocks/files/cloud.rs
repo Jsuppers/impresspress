@@ -343,14 +343,6 @@ mod tests {
         }
     }
 
-    /// Build a `TestContext` with a real crypto block (share-token signing
-    /// goes through `crypto::sign`) and a fake storage block whose `get`
-    /// always succeeds (the file-existence check needs *some* answer), plus
-    /// one bucket owned by `owner`. This is the minimum needed to drive
-    /// `handle_create_share` past bucket/key validation, the ownership
-    /// check, and the file-existence check, into the `expires_in_hours`
-    /// handling under test — without it, every case below would stop early
-    /// (PermissionDenied / NotFound) and never exercise the fix.
     /// Register a real `wafer-run/crypto` block over a fixed test secret, so
     /// share-token signing and verification run end to end.
     fn register_crypto(ctx: &mut TestContext) {
@@ -380,6 +372,18 @@ mod tests {
         repo::buckets::seed(ctx, data).await.expect("seed bucket");
     }
 
+    /// Build a `TestContext` with a real crypto block (share-token signing
+    /// goes through `crypto::sign`) and a fake storage block whose `get`
+    /// always succeeds (the file-existence check needs *some* answer), plus
+    /// one bucket owned by `owner`. This is the minimum needed to drive
+    /// `handle_create_share` past bucket/key validation, the ownership
+    /// check, and the file-existence check, into the `expires_in_hours`
+    /// handling under test — without it, every case below would stop early
+    /// (PermissionDenied / NotFound) and never exercise the fix.
+    ///
+    /// `requires` enforcement is not opted into here: it comes with
+    /// [`TestContext::with_files`], which is what makes every test in this
+    /// module run on the gate that refused `crypto::sign` in production.
     async fn ctx_with_owned_bucket(bucket: &str, owner: &str) -> TestContext {
         let mut ctx = TestContext::with_files().await;
 
@@ -387,15 +391,12 @@ mod tests {
 
         ctx.register_block(
             "wafer-run/storage",
-            crate::blocks::storage::create(
-                Arc::new(AlwaysFoundStorageService),
-                Arc::from(crate::blocks::files::test_wrap::ADMIN_BLOCK),
-            ),
+            crate::blocks::files::test_wrap::storage_block(Arc::new(AlwaysFoundStorageService)),
         );
 
         seed_bucket(&ctx, bucket, owner).await;
 
-        crate::blocks::files::test_wrap::as_files_block(ctx)
+        ctx
     }
 
     /// A fixture whose object store really holds bytes — the always-found
@@ -408,13 +409,12 @@ mod tests {
         register_crypto(&mut ctx);
         ctx.register_block(
             "wafer-run/storage",
-            crate::blocks::storage::create(
-                Arc::new(crate::test_support::InMemoryStorageService::new()),
-                Arc::from(crate::blocks::files::test_wrap::ADMIN_BLOCK),
-            ),
+            crate::blocks::files::test_wrap::storage_block(Arc::new(
+                crate::test_support::InMemoryStorageService::new(),
+            )),
         );
         seed_bucket(&ctx, bucket, owner).await;
-        crate::blocks::files::test_wrap::as_files_block(ctx)
+        ctx
     }
 
     /// CRUX regression (found by driving the live app): creating a share link

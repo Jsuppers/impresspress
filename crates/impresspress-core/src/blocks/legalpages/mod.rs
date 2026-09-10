@@ -1286,7 +1286,7 @@ mod write_loss_tests {
             LegalPagesBlock::BLOCK_NAME,
             wafer_run::Block::info(&LegalPagesBlock::new()).requires,
             wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants,
-            "impresspress/admin",
+            crate::blocks::admin::ADMIN_BLOCK_ID,
         );
         seed_doc(
             &ctx,
