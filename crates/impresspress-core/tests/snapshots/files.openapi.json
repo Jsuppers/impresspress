@@ -1190,6 +1190,7 @@
   },
   "/b/storage/api/recent": {
     "get": {
+      "description": "Object-view audit rows, newest first — one row per tracked download, naming the object viewed and when. Not object metadata.",
       "responses": {
         "200": {
           "content": {
@@ -1210,13 +1211,10 @@
                       "description": "One record in the [`RecordListView`] envelope: the row's `id` beside the\nrow's columns, exactly as `wafer_core::clients::database::Record`\nserializes. The backends put `id` in BOTH places (`row_to_record` inserts\nevery column into `data` and copies `id` out to the envelope), and\n`packages/impresspress-js` reads the envelope one\n(`flattenRecordList`: `{ id: r.id, ...r.data }`), so both are published.\n\nGeneric in the row type rather than carrying an untyped\n`serde_json::Map<String, Value>`. The SDK reads *named columns* out of\n`data` — `FileMetadataRecord` in `storage.service.ts`, `ShareRecord` in\n`extensions.service.ts` — so an untyped `data` would publish a schema\nthat says nothing about the fields those interfaces rely on, and the\nSDK's type-freshness gate would report green on exactly the columns that\ncan drift. `T` is the row struct the handler already had in hand, so the\nbytes are unchanged.",
                       "properties": {
                         "data": {
-                          "description": "One object-metadata row, decoded.",
+                          "description": "One object-view audit row, decoded.",
                           "properties": {
                             "bucket": {
-                              "description": "Bucket name; `(bucket, key)` is unique.",
-                              "type": "string"
-                            },
-                            "content_type": {
+                              "description": "Bucket holding the viewed object.",
                               "type": "string"
                             },
                             "created_at": {
@@ -1229,34 +1227,15 @@
                               "description": "Object key within the bucket.",
                               "type": "string"
                             },
-                            "size": {
-                              "description": "Size in bytes. `i64_field` so a TEXT-stored number still counts\ntoward the quota rather than reading as zero.",
-                              "format": "int64",
-                              "type": "integer"
-                            },
-                            "status": {
-                              "description": "`Pending` while the storage upload is in flight, `Complete` after.\nQuota accounting counts both; user-facing search and admin stats see\nonly `Complete`.",
-                              "oneOf": [
-                                {
-                                  "const": "pending",
-                                  "description": "Reserved: the row exists and counts against quota, the blob may not.",
-                                  "type": "string"
-                                },
-                                {
-                                  "const": "complete",
-                                  "description": "Uploaded: the blob is in storage and the object is listable.",
-                                  "type": "string"
-                                }
-                              ]
-                            },
                             "updated_at": {
                               "type": "string"
                             },
-                            "uploaded_at": {
-                              "description": "When the upload was reserved — the timestamp the object browser\nrenders as \"modified\", and the one `delete_stale_pending` compares.",
+                            "user_id": {
+                              "description": "The viewer.",
                               "type": "string"
                             },
-                            "uploaded_by": {
+                            "viewed_at": {
+                              "description": "RFC 3339 instant of the view.",
                               "type": "string"
                             }
                           },
@@ -1264,11 +1243,8 @@
                             "id",
                             "bucket",
                             "key",
-                            "size",
-                            "content_type",
-                            "status",
-                            "uploaded_by",
-                            "uploaded_at",
+                            "user_id",
+                            "viewed_at",
                             "created_at",
                             "updated_at"
                           ],

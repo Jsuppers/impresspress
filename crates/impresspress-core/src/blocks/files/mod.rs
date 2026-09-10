@@ -206,9 +206,21 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         .summary("Search objects")
         .output(response_schema_of::<contracts::RecordListView<repo::objects::ObjectRow>>)
         .tags(&["storage"]),
+    // The row type here is `views::ViewRow`, NOT `objects::ObjectRow`:
+    // `storage::handle_recent` reads `repo::views::list_recent_for_user`, so
+    // what goes on the wire is the object-view audit row (`user_id`,
+    // `viewed_at`), not object metadata (`size`, `content_type`, `status`).
+    // Both in-repo consumers — the summary below and the SDK's
+    // `getRecentFiles` — read as though it were metadata; which side is
+    // wrong is a product question, and the schema describes what the
+    // handler emits today rather than pre-judging it.
     EndpointRoute::authenticated(HttpMethod::Get, "/b/storage/api/recent", Route::Recent)
         .summary("Recently viewed objects")
-        .output(response_schema_of::<contracts::RecordListView<repo::objects::ObjectRow>>)
+        .description(
+            "Object-view audit rows, newest first — one row per tracked download, naming the \
+             object viewed and when. Not object metadata.",
+        )
+        .output(response_schema_of::<contracts::RecordListView<repo::views::ViewRow>>)
         .tags(&["storage"]),
     // The object rows bind `{key...}`: keys contain `/`, and dispatch has
     // always matched the rest of the path. The declaration used to say

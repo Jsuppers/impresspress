@@ -88,10 +88,41 @@ export interface FileMetadataRecord {
   uploaded_at: string;
 }
 
-export interface SearchResult {
-  items: FileMetadataRecord[];
+/**
+ * One row of the `impresspress__files__views` object-view audit table (see
+ * `crates/impresspress-core/src/blocks/files/repo/views.rs`), flattened from
+ * the wire `Record { id, data }` shape (`id` + the row's columns).
+ *
+ * This — not [`FileMetadataRecord`] — is what `/b/storage/api/recent`
+ * returns: `handle_recent` pages `repo::views::list_recent_for_user`, one row
+ * per tracked download, so the response carries the viewer and the view
+ * instant rather than the object's size, type or upload state.
+ */
+export interface FileViewRecord {
+  id: string;
+  /** Bucket holding the viewed object. */
+  bucket: string;
+  /** Object key within the bucket. */
+  key: string;
+  /** The viewer. */
+  user_id: string;
+  /** RFC 3339 instant of the view. */
+  viewed_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The flattened form of the server's `RecordList` envelope. */
+export interface RecordListResult<T> {
+  items: T[];
   total: number;
 }
+
+/** `search`'s result: object-metadata rows. */
+export type SearchResult = RecordListResult<FileMetadataRecord>;
+
+/** `getRecentFiles`'s result: object-view audit rows. */
+export type RecentViewsResult = RecordListResult<FileViewRecord>;
 
 /**
  * Wire shape of wafer-core's `RecordList` (see
@@ -107,9 +138,9 @@ interface RecordListWire<T> {
   page_size: number;
 }
 
-function flattenRecordList(
-  result: RecordListWire<Omit<FileMetadataRecord, "id">>,
-): SearchResult {
+function flattenRecordList<T extends object>(
+  result: RecordListWire<T>,
+): RecordListResult<{ id: string } & T> {
   return {
     items: result.records.map((r) => ({ id: r.id, ...r.data })),
     total: result.total_count,
@@ -246,12 +277,18 @@ export class StorageService extends BaseService {
   }
 
   /**
-   * The 20 most recently viewed objects for the current user.
+   * The current user's 20 most recent object views, newest first.
    * `GET /b/storage/api/recent` — takes no query parameters server-side.
+   *
+   * Returns audit rows ([`FileViewRecord`]), not object metadata: the
+   * endpoint pages `impresspress__files__views`, so each item names the
+   * object viewed (`bucket`, `key`) and when, and carries none of the
+   * object's own columns. Read the object's metadata with `search` or
+   * `listObjects` if you need size, content type or upload state.
    */
-  async getRecentFiles(): Promise<SearchResult> {
+  async getRecentFiles(): Promise<RecentViewsResult> {
     const result = await this.request<
-      RecordListWire<Omit<FileMetadataRecord, "id">>
+      RecordListWire<Omit<FileViewRecord, "id">>
     >({
       method: "GET",
       url: "/b/storage/api/recent",

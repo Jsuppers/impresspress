@@ -252,7 +252,13 @@ describe("StorageService", () => {
     ]);
   });
 
-  it("getRecentFiles calls /recent with no query parameters and decodes {records, total_count}", async () => {
+  /**
+   * The body here is an object-VIEW audit row, which is what
+   * `handle_recent` actually pages (`repo::views::list_recent_for_user`) —
+   * not an object-metadata row. The fixture used to send metadata columns,
+   * which is the shape the route's schema wrongly claimed.
+   */
+  it("getRecentFiles calls /recent with no query parameters and decodes the view rows", async () => {
     fetchMock.mockResolvedValueOnce(
       fakeJsonResponse({
         records: [
@@ -261,11 +267,10 @@ describe("StorageService", () => {
             data: {
               bucket: "b",
               key: "a.txt",
-              size: 1,
-              content_type: "text/plain",
-              status: "complete",
-              uploaded_by: "u1",
-              uploaded_at: "2026-01-02T00:00:00Z",
+              user_id: "u1",
+              viewed_at: "2026-01-02T00:00:00Z",
+              created_at: "2026-01-02T00:00:00Z",
+              updated_at: "2026-01-02T00:00:00Z",
             },
           },
         ],
@@ -279,6 +284,8 @@ describe("StorageService", () => {
     expect(result.total).toBe(1);
     expect(result.items[0].key).toBe("a.txt");
     expect(result.items[0].id).toBe("r2");
+    expect(result.items[0].user_id).toBe("u1");
+    expect(result.items[0].viewed_at).toBe("2026-01-02T00:00:00Z");
   });
 });
 

@@ -161,8 +161,9 @@ const blob = await impresspress.storage.downloadFile('images', 'photo.jpg');
 const url = impresspress.storage.getDownloadUrl('images', 'photo.jpg');
 await impresspress.storage.deleteObject('images', 'photo.jpg');
 
-// Search the current user's uploads / recently viewed objects
+// Search the current user's uploads (object-metadata rows)
 const results = await impresspress.storage.search('photo');
+// The current user's recent object views (audit rows: bucket, key, viewed_at)
 const recent = await impresspress.storage.getRecentFiles();
 ```
 

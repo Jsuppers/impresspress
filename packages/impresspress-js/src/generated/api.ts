@@ -13218,7 +13218,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Recently viewed objects */
+        /**
+         * Recently viewed objects
+         * @description Object-view audit rows, newest first — one row per tracked download, naming the object viewed and when. Not object metadata.
+         */
         get: {
             parameters: {
                 query?: never;
@@ -13240,34 +13243,19 @@ export interface paths {
                             /** Format: int64 */
                             page_size: number;
                             records: {
-                                /** @description One object-metadata row, decoded. */
+                                /** @description One object-view audit row, decoded. */
                                 data: {
-                                    /** @description Bucket name; `(bucket, key)` is unique. */
+                                    /** @description Bucket holding the viewed object. */
                                     bucket: string;
-                                    content_type: string;
                                     created_at: string;
                                     id: string;
                                     /** @description Object key within the bucket. */
                                     key: string;
-                                    /**
-                                     * Format: int64
-                                     * @description Size in bytes. `i64_field` so a TEXT-stored number still counts
-                                     *     toward the quota rather than reading as zero.
-                                     */
-                                    size: number;
-                                    /**
-                                     * @description `Pending` while the storage upload is in flight, `Complete` after.
-                                     *     Quota accounting counts both; user-facing search and admin stats see
-                                     *     only `Complete`.
-                                     */
-                                    status: "pending" | "complete";
                                     updated_at: string;
-                                    /**
-                                     * @description When the upload was reserved — the timestamp the object browser
-                                     *     renders as "modified", and the one `delete_stale_pending` compares.
-                                     */
-                                    uploaded_at: string;
-                                    uploaded_by: string;
+                                    /** @description The viewer. */
+                                    user_id: string;
+                                    /** @description RFC 3339 instant of the view. */
+                                    viewed_at: string;
                                 };
                                 id: string;
                             }[];
