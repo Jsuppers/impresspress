@@ -9,6 +9,7 @@ use crate::{
             bump_auth_version,
             repo::{local_credentials, tokens, users},
         },
+        auth_ui::contracts::MessageResponse,
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json},
@@ -107,7 +108,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
                         );
                         return err_internal("Password changed but session invalidation failed", e);
                     }
-                    ok_json(&serde_json::json!({"message": "Password changed successfully"}))
+                    ok_json(&MessageResponse {
+                        message: "Password changed successfully".to_string(),
+                    })
                 }
                 Err(e) => {
                     tracing::error!(

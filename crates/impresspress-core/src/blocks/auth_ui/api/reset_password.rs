@@ -9,6 +9,7 @@ use crate::{
             bump_auth_version,
             repo::{local_credentials, tokens, users},
         },
+        auth_ui::contracts::MessageResponse,
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ok_json},
@@ -122,7 +123,9 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         return err_internal("Password reset but session invalidation failed", e);
     }
 
-    ok_json(&serde_json::json!({"message": "Password reset successfully"}))
+    ok_json(&MessageResponse {
+        message: "Password reset successfully".to_string(),
+    })
 }
 
 #[cfg(test)]

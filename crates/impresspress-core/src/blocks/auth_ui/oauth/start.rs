@@ -6,7 +6,10 @@ use wafer_core::clients::config;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::oauth_pkce::{self, NewPkceState},
+    blocks::{
+        auth::repo::oauth_pkce::{self, NewPkceState},
+        auth_ui::contracts::OauthStartResponse,
+    },
     http::{err_bad_request, err_forbidden, err_internal, ok_json},
     util::urlencode,
 };
@@ -113,8 +116,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         None => return err_bad_request(&format!("Unsupported provider: {provider}")),
     };
 
-    ok_json(&serde_json::json!({
-        "auth_url": auth_url,
-        "provider": provider
-    }))
+    ok_json(&OauthStartResponse {
+        auth_url,
+        provider: provider.to_string(),
+    })
 }

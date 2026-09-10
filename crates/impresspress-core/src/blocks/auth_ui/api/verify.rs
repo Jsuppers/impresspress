@@ -6,7 +6,7 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::users,
+    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse},
     http::{err_bad_request, err_internal, ok_json},
     ui,
     ui::{components::auth_panel, icons, templates::auth_split},
@@ -125,7 +125,11 @@ pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStrea
     // unregistered one, an already-verified account from an unverified one,
     // or an account inside its cooldown from one outside it.
     let safe_msg = "If that email is registered, a verification link has been sent.";
-    let constant = || ok_json(&serde_json::json!({"message": safe_msg}));
+    let constant = || {
+        ok_json(&MessageResponse {
+            message: safe_msg.to_string(),
+        })
+    };
 
     // DELIBERATE, do not "fix": the `Err` arm is folded into the constant
     // response on purpose. It is the same collapse the T4 sweep removes
