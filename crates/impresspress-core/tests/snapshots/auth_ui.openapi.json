@@ -1,4 +1,69 @@
 {
+  "/b/auth/api/change-password": {
+    "post": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "The one-key body five endpoints on this surface answer: `POST\n/b/auth/api/logout`, `/change-password`, `/forgot-password`,\n`/reset-password` and `/resend-verification`.\n\nOne type because it is one shape. The *text* differs per endpoint and is\ndeliberately constant per endpoint rather than per outcome — the\npassword-reset and verification pair answer the same sentence whatever\nthe address's state, so nothing about an account can be learned from the\nresponse (`api::verify::resend_tests` pins that). A per-endpoint copy of\nthis struct would publish five schemas that must be kept identical by\nhand.",
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "message"
+                ],
+                "title": "MessageResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Change password",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/api/forgot-password": {
+    "post": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "The one-key body five endpoints on this surface answer: `POST\n/b/auth/api/logout`, `/change-password`, `/forgot-password`,\n`/reset-password` and `/resend-verification`.\n\nOne type because it is one shape. The *text* differs per endpoint and is\ndeliberately constant per endpoint rather than per outcome — the\npassword-reset and verification pair answer the same sentence whatever\nthe address's state, so nothing about an account can be learned from the\nresponse (`api::verify::resend_tests` pins that). A per-endpoint copy of\nthis struct would publish five schemas that must be kept identical by\nhand.",
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "message"
+                ],
+                "title": "MessageResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Request a password reset email",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
   "/b/auth/api/login": {
     "post": {
       "requestBody": {
@@ -113,7 +178,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "`POST /b/auth/api/logout` response body.",
+                "description": "The one-key body five endpoints on this surface answer: `POST\n/b/auth/api/logout`, `/change-password`, `/forgot-password`,\n`/reset-password` and `/resend-verification`.\n\nOne type because it is one shape. The *text* differs per endpoint and is\ndeliberately constant per endpoint rather than per outcome — the\npassword-reset and verification pair answer the same sentence whatever\nthe address's state, so nothing about an account can be learned from the\nresponse (`api::verify::resend_tests` pins that). A per-endpoint copy of\nthis struct would publish five schemas that must be kept identical by\nhand.",
                 "properties": {
                   "message": {
                     "type": "string"
@@ -122,7 +187,7 @@
                 "required": [
                   "message"
                 ],
-                "title": "LogoutResponse",
+                "title": "MessageResponse",
                 "type": "object"
               }
             }
@@ -370,6 +435,66 @@
       ]
     }
   },
+  "/b/auth/api/resend-verification": {
+    "post": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "The one-key body five endpoints on this surface answer: `POST\n/b/auth/api/logout`, `/change-password`, `/forgot-password`,\n`/reset-password` and `/resend-verification`.\n\nOne type because it is one shape. The *text* differs per endpoint and is\ndeliberately constant per endpoint rather than per outcome — the\npassword-reset and verification pair answer the same sentence whatever\nthe address's state, so nothing about an account can be learned from the\nresponse (`api::verify::resend_tests` pins that). A per-endpoint copy of\nthis struct would publish five schemas that must be kept identical by\nhand.",
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "message"
+                ],
+                "title": "MessageResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Re-send the verification email",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/api/reset-password": {
+    "post": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "The one-key body five endpoints on this surface answer: `POST\n/b/auth/api/logout`, `/change-password`, `/forgot-password`,\n`/reset-password` and `/resend-verification`.\n\nOne type because it is one shape. The *text* differs per endpoint and is\ndeliberately constant per endpoint rather than per outcome — the\npassword-reset and verification pair answer the same sentence whatever\nthe address's state, so nothing about an account can be learned from the\nresponse (`api::verify::resend_tests` pins that). A per-endpoint copy of\nthis struct would publish five schemas that must be kept identical by\nhand.",
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "message"
+                ],
+                "title": "MessageResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Reset password with a reset token",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
   "/b/auth/api/signup": {
     "post": {
       "requestBody": {
@@ -478,6 +603,59 @@
         }
       },
       "summary": "Create account",
+      "tags": [
+        "auth"
+      ]
+    }
+  },
+  "/b/auth/oauth/login": {
+    "get": {
+      "parameters": [
+        {
+          "in": "query",
+          "name": "provider",
+          "required": true,
+          "schema": {
+            "description": "OAuth provider to start the flow with",
+            "enum": [
+              "google",
+              "github",
+              "microsoft"
+            ],
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "`GET /b/auth/oauth/login?provider=` response body.\n\nThe browser-facing OAuth entry point answers JSON, not a redirect: the\ncaller (the SDK's `signInWithOAuth` / `signInWithOAuthPopup`, or the login\npage's buttons) decides whether to navigate the current tab or open a\npopup at `auth_url`.",
+                "properties": {
+                  "auth_url": {
+                    "description": "Absolute authorize URL at the provider, with `client_id`,\n`redirect_uri`, the single-use PKCE `state` and `code_challenge`\nalready interpolated.",
+                    "format": "uri",
+                    "type": "string"
+                  },
+                  "provider": {
+                    "description": "Echo of the requested provider — one of `OAUTH_PROVIDERS`.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "auth_url",
+                  "provider"
+                ],
+                "title": "OauthStartResponse",
+                "type": "object"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "summary": "Start OAuth flow",
       "tags": [
         "auth"
       ]

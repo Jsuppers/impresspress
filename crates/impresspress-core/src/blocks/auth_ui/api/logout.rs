@@ -11,7 +11,7 @@ use crate::{
                 sessions, tokens,
             },
         },
-        auth_ui::contracts::LogoutResponse,
+        auth_ui::contracts::MessageResponse,
     },
     crypto::{META_AUTH_EXP, META_AUTH_JTI},
     http::{err_internal, ResponseBuilder},
@@ -108,7 +108,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         .set_cookie(&cookie)
         .status(303)
         .set_header("Location", "/b/auth/login")
-        .json(&LogoutResponse {
+        .json(&MessageResponse {
             message: "Logged out successfully".to_string(),
         })
 }

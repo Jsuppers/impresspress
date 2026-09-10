@@ -26,7 +26,7 @@ use crate::util::{enum_column_or, RecordExt};
 pub const TABLE: &str = "impresspress__files__objects";
 
 /// One object-metadata row, decoded.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ObjectRow {
     pub id: String,
     /// Bucket name; `(bucket, key)` is unique.

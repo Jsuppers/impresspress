@@ -303,13 +303,15 @@ async fn endpoints_the_sdk_calls_publish_a_response_schema() {
                 let published = ep
                     .path
                     .split('/')
-                    .map(|seg| match seg
-                        .strip_prefix('{')
-                        .and_then(|n| n.strip_suffix('}'))
-                        .and_then(|n| n.strip_suffix("..."))
-                    {
-                        Some(rest) => format!("{{{rest}}}"),
-                        None => seg.to_string(),
+                    .map(|seg| {
+                        match seg
+                            .strip_prefix('{')
+                            .and_then(|n| n.strip_suffix('}'))
+                            .and_then(|n| n.strip_suffix("..."))
+                        {
+                            Some(rest) => format!("{{{rest}}}"),
+                            None => seg.to_string(),
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("/");
@@ -320,9 +322,7 @@ async fn endpoints_the_sdk_calls_publish_a_response_schema() {
 
     for (method, path, why) in NOT_JSON {
         assert!(
-            declared
-                .iter()
-                .any(|(m, p)| m == method && p == path),
+            declared.iter().any(|(m, p)| m == method && p == path),
             "`{} {path}` is excused from the JSON-schema requirement ({why}), but no block \
              declares it - drop the exception or fix the path",
             method.to_uppercase()

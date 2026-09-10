@@ -132,8 +132,11 @@ enum Route {
 /// surface, and reads by policy: a tool's `execute` runs in the visitor's
 /// page with their session cookie and full ambient authority, and any text
 /// the agent reads can steer it. `no_admin_write_is_an_agent_tool` enforces
-/// this. The remaining JSON rows (users, permissions, user-roles, settings,
-/// extensions) still echo raw rows and are declared without a schema until
+/// this. `GET /b/admin/api/extensions` also carries one — it is an SDK call
+/// site (`extensions.service.ts`), and an endpoint the SDK reads whose
+/// response nothing describes is one the type-freshness gate cannot see
+/// drift on. The remaining JSON rows (users, permissions, user-roles,
+/// settings) still echo raw rows and are declared without a schema until
 /// they are typed; every other row answers an SSR page or fragment.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // ── JSON API ──
@@ -335,7 +338,8 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/admin/api/extensions",
         Route::ExtensionsApi,
     )
-    .summary("List registered blocks API"),
+    .summary("List registered blocks API")
+    .output(response_schema_of::<Vec<contracts::AdminExtensionView>>),
     // ── Consolidated settings pages ──
     // The bare `/b/admin/settings` reaches this row through the matcher's
     // trailing-slash retry; `/b/admin/settings/email` does not, because the
@@ -670,17 +674,15 @@ crate::impresspress_feature_block! {
 /// `GET /b/admin/api/extensions`: every registered block, as the SDK's
 /// extensions service lists them.
 fn handle_extensions(ctx: &dyn Context) -> OutputStream {
-    let blocks: Vec<_> = ctx
+    let blocks: Vec<contracts::AdminExtensionView> = ctx
         .registered_blocks()
         .iter()
-        .map(|b| {
-            serde_json::json!({
-                "name": b.name,
-                "version": b.version,
-                "interface": b.interface,
-                "summary": b.summary,
-                "enabled": true,
-            })
+        .map(|b| contracts::AdminExtensionView {
+            name: b.name.clone(),
+            version: b.version.clone(),
+            interface: b.interface.clone(),
+            summary: b.summary.clone(),
+            enabled: true,
         })
         .collect();
     ok_json(&blocks)

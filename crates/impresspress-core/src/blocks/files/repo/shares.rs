@@ -20,7 +20,7 @@ pub const TABLE: &str = "impresspress__files__cloud_shares";
 pub const ACCESS_LOGS_TABLE: &str = "impresspress__files__cloud_access_logs";
 
 /// One share row, decoded.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ShareRow {
     pub id: String,
     /// The signed token embedded in the public `/b/storage/direct/{token}`
@@ -68,7 +68,7 @@ impl ShareRow {
 /// One access-log row, decoded. The child audit table of a share: a log row
 /// is meaningless without the share it points at, which is why both tables
 /// live behind this one module.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct AccessLogRow {
     pub id: String,
     pub share_id: String,

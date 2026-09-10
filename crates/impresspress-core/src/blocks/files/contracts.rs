@@ -51,32 +51,40 @@ pub enum ObjectStatus {
 /// every column into `data` and copies `id` out to the envelope), and
 /// `packages/impresspress-js` reads the envelope one
 /// (`flattenRecordList`: `{ id: r.id, ...r.data }`), so both are published.
-#[derive(Debug, Clone, Serialize)]
-pub struct RecordView {
+///
+/// Generic in the row type rather than carrying an untyped
+/// `serde_json::Map<String, Value>`. The SDK reads *named columns* out of
+/// `data` — `FileMetadataRecord` in `storage.service.ts`, `ShareRecord` in
+/// `extensions.service.ts` — so an untyped `data` would publish a schema
+/// that says nothing about the fields those interfaces rely on, and the
+/// SDK's type-freshness gate would report green on exactly the columns that
+/// can drift. `T` is the row struct the handler already had in hand, so the
+/// bytes are unchanged.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RecordView<T> {
     pub id: String,
-    pub data: serde_json::Map<String, serde_json::Value>,
+    pub data: T,
 }
 
-impl RecordView {
+impl<T: Serialize> RecordView<T> {
     /// Build the record envelope for one typed row.
     ///
     /// The row serializes to its columns — every row type mirrors its table
     /// column-for-column precisely so this cannot drop one — and `id` is
     /// lifted out to the envelope while staying in `data`.
-    pub fn from_row<T: Serialize>(row: &T) -> Self {
-        let data = match serde_json::to_value(row) {
-            Ok(serde_json::Value::Object(map)) => map,
+    pub fn from_row(row: T) -> Self {
+        let id = match serde_json::to_value(&row) {
+            Ok(serde_json::Value::Object(map)) => map
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             // Unreachable: every row type is a plain struct of scalars. A
             // non-object would mean a row grew a serde attribute that
             // changes its shape, which the round-trip test below catches.
-            _ => serde_json::Map::new(),
+            _ => String::new(),
         };
-        let id = data
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        Self { id, data }
+        Self { id, data: row }
     }
 }
 
@@ -93,19 +101,19 @@ impl RecordView {
 /// rather than modernised here. Changing it is a deliberate, separate
 /// change that moves the SDK in lockstep — see the follow-up in the PR that
 /// introduced this type.
-#[derive(Debug, Clone, Serialize)]
-pub struct RecordListView {
-    pub records: Vec<RecordView>,
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RecordListView<T> {
+    pub records: Vec<RecordView<T>>,
     pub total_count: i64,
     pub page: i64,
     pub page_size: i64,
 }
 
-impl RecordListView {
+impl<T: Serialize> RecordListView<T> {
     /// Build the envelope from a repo page of typed rows.
-    pub fn from_page<T: Serialize>(page: &Page<T>) -> Self {
+    pub fn from_page(page: Page<T>) -> Self {
         Self {
-            records: page.rows.iter().map(RecordView::from_row).collect(),
+            records: page.rows.into_iter().map(RecordView::from_row).collect(),
             total_count: page.total,
             page: page.page,
             page_size: page.page_size,
@@ -139,6 +147,92 @@ pub struct ObjectListResponse {
     /// Total number of objects matching the filter (across all pages). See
     /// `ObjectList::total_count` for the lower-bound caveat on some backends.
     pub total_count: i64,
+}
+
+/// `GET /b/storage/api/buckets` and `GET /b/storage/admin/api/buckets`
+/// response body — both routes reach the same handler
+/// ([`super::storage::buckets::handle_list_buckets`]), which differs only in
+/// whether it scopes the read to the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BucketListResponse {
+    /// Bucket names, from `repo::buckets::TABLE` — the single source of
+    /// truth for bucket existence. Not the blob namespace's folder list.
+    pub buckets: Vec<String>,
+}
+
+/// `POST /b/storage/api/buckets` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BucketCreatedResponse {
+    /// The bucket that now exists, echoed back from the request.
+    pub name: String,
+    /// Always `true` — the handler answers this body only after both the
+    /// folder and the metadata row are in place.
+    pub created: bool,
+}
+
+/// The body every delete on this block answers: bucket, object and share.
+/// One type because it is one shape; a per-endpoint copy is how the three
+/// would drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeletedResponse {
+    /// Always `true` — a delete that did not happen is an error status, not
+    /// `{"deleted": false}`.
+    pub deleted: bool,
+}
+
+/// `POST /b/storage/api/buckets/{name}/objects` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ObjectUploadedResponse {
+    pub bucket: String,
+    /// The stored key. For a multipart upload this is the key the handler
+    /// resolved, which may differ from the one the caller sent.
+    pub key: String,
+    /// Always `true`.
+    pub uploaded: bool,
+}
+
+/// `GET /b/storage/admin/api/stats` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StorageStatsResponse {
+    /// Objects in `Complete` status. A `Pending` reservation is not a file.
+    pub total_objects: i64,
+    /// Sum of `size` over the same set.
+    pub total_size_bytes: i64,
+    /// Rows in `repo::buckets::TABLE`, not folders in the blob namespace.
+    pub bucket_count: i64,
+}
+
+/// `POST /b/cloudstorage/shares` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ShareCreatedResponse {
+    /// Row id of the new share — the `{id}` of `DELETE
+    /// /b/cloudstorage/shares/{id}`.
+    pub id: String,
+    /// The signed token embedded in `direct_url`.
+    pub token: String,
+    /// Path of the public share link, relative to the deployment's origin.
+    pub direct_url: String,
+}
+
+/// The `usage` half of [`QuotaResponse`]. Both numbers are computed over the
+/// caller's object rows, not read from a counter column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct QuotaUsageView {
+    /// `SUM(size)` over the caller's rows, `Pending` reservations included —
+    /// an in-flight upload is charged, which is what closes the quota
+    /// TOCTOU window.
+    pub total_bytes: i64,
+    /// Number of object rows the caller owns, on the same basis.
+    pub file_count: i64,
+}
+
+/// `GET /b/cloudstorage/quota` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct QuotaResponse {
+    /// The caller's effective caps: their override row if they have one,
+    /// otherwise the block defaults.
+    pub quota: super::models::QuotaConfig,
+    pub usage: QuotaUsageView,
 }
 
 #[cfg(test)]
@@ -186,7 +280,7 @@ mod tests {
     /// reshaped this would break it silently.
     #[test]
     fn the_envelope_matches_the_sdk_s_record_list_wire() {
-        let body = serde_json::to_value(RecordListView::from_page(&object_page()))
+        let body = serde_json::to_value(RecordListView::from_page(object_page()))
             .expect("the view serializes");
 
         assert_eq!(body["total_count"], json!(7));
@@ -209,7 +303,7 @@ mod tests {
     #[test]
     fn the_record_view_publishes_id_in_both_places() {
         let body =
-            serde_json::to_value(RecordListView::from_page(&object_page())).expect("serializes");
+            serde_json::to_value(RecordListView::from_page(object_page())).expect("serializes");
         assert_eq!(body["records"][0]["id"], json!("o1"));
         assert_eq!(body["records"][0]["data"]["id"], json!("o1"));
     }
@@ -221,7 +315,7 @@ mod tests {
     #[test]
     fn the_object_row_publishes_every_column_of_its_table() {
         let body =
-            serde_json::to_value(RecordListView::from_page(&object_page())).expect("serializes");
+            serde_json::to_value(RecordListView::from_page(object_page())).expect("serializes");
         let data = body["records"][0]["data"]
             .as_object()
             .expect("data is an object")
@@ -273,7 +367,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
         });
-        let body = serde_json::to_value(RecordView::from_row(&row)).expect("serializes");
+        let body = serde_json::to_value(RecordView::from_row(row)).expect("serializes");
 
         assert_eq!(body["id"], json!("s1"));
         for field in [
@@ -312,7 +406,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
         });
-        let body = serde_json::to_value(RecordView::from_row(&row)).expect("serializes");
+        let body = serde_json::to_value(RecordView::from_row(row)).expect("serializes");
 
         assert_eq!(body["id"], json!("q1"));
         assert_eq!(body["data"]["user_id"], json!("u-9"));

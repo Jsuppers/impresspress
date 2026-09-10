@@ -128,31 +128,41 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/storage/admin/api/buckets",
         Route::AdminListBuckets,
     )
-    .summary("List every bucket (admin)"),
+    .summary("List every bucket (admin)")
+    .output(response_schema_of::<contracts::BucketListResponse>)
+    .tags(&["storage"]),
     EndpointRoute::admin(
         HttpMethod::Get,
         "/b/storage/admin/api/stats",
         Route::AdminStats,
     )
-    .summary("Storage totals (admin)"),
+    .summary("Storage totals (admin)")
+    .output(response_schema_of::<contracts::StorageStatsResponse>)
+    .tags(&["storage"]),
     EndpointRoute::admin(
         HttpMethod::Get,
         "/b/cloudstorage/admin/shares",
         Route::AdminListShares,
     )
-    .summary("Recent shares, all users (admin)"),
+    .summary("Recent shares, all users (admin)")
+    .output(response_schema_of::<contracts::RecordListView<repo::shares::ShareRow>>)
+    .tags(&["cloudstorage"]),
     EndpointRoute::admin(
         HttpMethod::Get,
         "/b/cloudstorage/admin/access-logs",
         Route::AdminAccessLogs,
     )
-    .summary("Share access logs (admin)"),
+    .summary("Share access logs (admin)")
+    .output(response_schema_of::<contracts::RecordListView<repo::shares::AccessLogRow>>)
+    .tags(&["cloudstorage"]),
     EndpointRoute::admin(
         HttpMethod::Get,
         "/b/cloudstorage/admin/quotas",
         Route::AdminListQuotas,
     )
-    .summary("Per-user quotas (admin)"),
+    .summary("Per-user quotas (admin)")
+    .output(response_schema_of::<contracts::RecordListView<repo::quota::QuotaRow>>)
+    .tags(&["cloudstorage"]),
     // PATCH is what clients send; `update` is the action both PUT and PATCH
     // map to, which is what the old delegated arm matched.
     EndpointRoute::admin(
@@ -160,7 +170,10 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/cloudstorage/admin/quotas/{id}",
         Route::AdminUpdateQuota,
     )
-    .summary("Set a user's quota (admin)"),
+    .summary("Set a user's quota (admin)")
+    .path_params(quota_user_id_path_schema)
+    .output(response_schema_of::<contracts::RecordView<repo::quota::QuotaRow>>)
+    .tags(&["cloudstorage"]),
     // ── Public share link ── `share::handle_direct_access` verifies the
     // token's signature, rate-limits per remote IP, and enforces expiry and
     // the access cap itself.
@@ -176,19 +189,27 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/storage/api/buckets",
         Route::ListBuckets,
     )
-    .summary("List buckets"),
+    .summary("List buckets")
+    .output(response_schema_of::<contracts::BucketListResponse>)
+    .tags(&["storage"]),
     EndpointRoute::authenticated(
         HttpMethod::Post,
         "/b/storage/api/buckets",
         Route::CreateBucket,
     )
-    .summary("Create bucket"),
+    .summary("Create bucket")
+    .output(response_schema_of::<contracts::BucketCreatedResponse>)
+    .tags(&["storage"]),
     // Never declared before this PR; `storage/search.rs` scopes both by
     // `msg.user_id()`.
     EndpointRoute::authenticated(HttpMethod::Get, "/b/storage/api/search", Route::Search)
-        .summary("Search objects"),
+        .summary("Search objects")
+        .output(response_schema_of::<contracts::RecordListView<repo::objects::ObjectRow>>)
+        .tags(&["storage"]),
     EndpointRoute::authenticated(HttpMethod::Get, "/b/storage/api/recent", Route::Recent)
-        .summary("Recently viewed objects"),
+        .summary("Recently viewed objects")
+        .output(response_schema_of::<contracts::RecordListView<repo::objects::ObjectRow>>)
+        .tags(&["storage"]),
     // The object rows bind `{key...}`: keys contain `/`, and dispatch has
     // always matched the rest of the path. The declaration used to say
     // `{key}`, a template no nested key could match.
@@ -217,7 +238,10 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/storage/api/buckets/{name}/objects/{key...}",
         Route::DeleteObject,
     )
-    .summary("Delete file"),
+    .summary("Delete file")
+    .path_params(object_path_schema)
+    .output(response_schema_of::<contracts::DeletedResponse>)
+    .tags(&["storage"]),
     EndpointRoute::authenticated(
         HttpMethod::Get,
         "/b/storage/api/buckets/{name}/objects",
@@ -239,7 +263,10 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/storage/api/buckets/{name}/objects",
         Route::UploadObject,
     )
-    .summary("Upload file"),
+    .summary("Upload file")
+    .path_params(list_objects_path_schema)
+    .output(response_schema_of::<contracts::ObjectUploadedResponse>)
+    .tags(&["storage"]),
     // Never declared before this PR; `storage/buckets.rs` refuses a bucket
     // the caller does not own (`is_bucket_access_denied`).
     EndpointRoute::authenticated(
@@ -247,26 +274,38 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/storage/api/buckets/{name}",
         Route::DeleteBucket,
     )
-    .summary("Delete bucket"),
+    .summary("Delete bucket")
+    .path_params(list_objects_path_schema)
+    .output(response_schema_of::<contracts::DeletedResponse>)
+    .tags(&["storage"]),
     // ── User cloud-storage JSON API ── never declared before this PR;
     // `cloud.rs` lists, creates and reads quota for `msg.user_id()` and
     // refuses to delete another user's share.
     EndpointRoute::authenticated(HttpMethod::Get, "/b/cloudstorage/shares", Route::ListShares)
-        .summary("List my share links"),
+        .summary("List my share links")
+        .output(response_schema_of::<contracts::RecordListView<repo::shares::ShareRow>>)
+        .tags(&["cloudstorage"]),
     EndpointRoute::authenticated(
         HttpMethod::Post,
         "/b/cloudstorage/shares",
         Route::CreateShare,
     )
-    .summary("Create a share link"),
+    .summary("Create a share link")
+    .output(response_schema_of::<contracts::ShareCreatedResponse>)
+    .tags(&["cloudstorage"]),
     EndpointRoute::authenticated(
         HttpMethod::Delete,
         "/b/cloudstorage/shares/{id}",
         Route::DeleteShare,
     )
-    .summary("Delete a share link"),
+    .summary("Delete a share link")
+    .path_params(share_id_path_schema)
+    .output(response_schema_of::<contracts::DeletedResponse>)
+    .tags(&["cloudstorage"]),
     EndpointRoute::authenticated(HttpMethod::Get, "/b/cloudstorage/quota", Route::GetQuota)
-        .summary("My quota and usage"),
+        .summary("My quota and usage")
+        .output(response_schema_of::<contracts::QuotaResponse>)
+        .tags(&["cloudstorage"]),
     // ── User SSR pages ── the two generic bucket rows last (see above).
     EndpointRoute::authenticated(HttpMethod::Get, "/b/storage/", Route::BucketListPage)
         .summary("Bucket list (user)"),
@@ -367,6 +406,30 @@ fn object_path_schema() -> serde_json::Value {
         "properties": {
             "name": {"type": "string", "description": "Bucket name"},
             "key": {"type": "string", "description": "Object key (may contain '/')"}
+        }
+    })
+}
+
+/// Path-parameter schema for `DELETE /b/cloudstorage/shares/{id}`.
+fn share_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+            "id": {"type": "string", "description": "Share row id, as `POST /b/cloudstorage/shares` returned it"}
+        }
+    })
+}
+
+/// Path-parameter schema for `PATCH /b/cloudstorage/admin/quotas/{id}`. The
+/// segment is the *user* whose quota is being set, not the quota row's id —
+/// `handle_update_quota` upserts by user.
+fn quota_user_id_path_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+            "id": {"type": "string", "description": "User id whose quota is being set"}
         }
     })
 }

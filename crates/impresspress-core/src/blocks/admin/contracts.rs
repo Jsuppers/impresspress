@@ -446,6 +446,28 @@ impl AdminAuditLogListResponse {
 // Shared query-param plumbing
 // ---------------------------------------------------------------------------
 
+/// One row of `GET /b/admin/api/extensions`: a registered block, projected
+/// off wafer-run's `BlockInfo`.
+///
+/// A closed field list for the same reason every view in this module is one
+/// — `BlockInfo` carries config keys, collection schemas, endpoint tables and
+/// capability grants that this endpoint has never published and must not
+/// start publishing because upstream grew a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AdminExtensionView {
+    /// Block name in the canonical `{org}/{block}` form.
+    pub name: String,
+    /// Semantic version of the block implementation.
+    pub version: String,
+    /// Interface identifier, e.g. `"http-handler@v1"`.
+    pub interface: String,
+    /// One-line summary of what the block does.
+    pub summary: String,
+    /// Always `true`. A registered block is by definition enabled; there is
+    /// no server-side enable/disable lifecycle behind this field.
+    pub enabled: bool,
+}
+
 /// Default page size for `GET /b/admin/api/users`.
 const DEFAULT_USER_PAGE_SIZE: u32 = 20;
 

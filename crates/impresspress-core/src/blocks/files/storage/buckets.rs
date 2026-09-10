@@ -8,7 +8,10 @@ use super::{
     access::is_bucket_access_denied, params::extract_bucket_name, validation::is_valid_bucket_name,
 };
 use crate::{
-    blocks::{crud, files::repo},
+    blocks::{
+        crud,
+        files::{contracts, repo},
+    },
     http::{err_bad_request, err_forbidden, err_internal, ok_json},
 };
 
@@ -27,10 +30,9 @@ pub(in crate::blocks::files) async fn handle_list_buckets(
         Some(msg.user_id())
     };
     match repo::buckets::list_visible(ctx, owner).await {
-        Ok(rows) => {
-            let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-            ok_json(&serde_json::json!({"buckets": names}))
-        }
+        Ok(rows) => ok_json(&contracts::BucketListResponse {
+            buckets: rows.into_iter().map(|r| r.name).collect(),
+        }),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -79,7 +81,10 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
         }
         return err_internal("Failed to create bucket", e);
     }
-    ok_json(&serde_json::json!({"name": body.name, "created": true}))
+    ok_json(&contracts::BucketCreatedResponse {
+        name: body.name,
+        created: true,
+    })
 }
 
 pub(in crate::blocks::files) async fn handle_delete_bucket(
@@ -124,7 +129,7 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
     if let Err(e) = repo::buckets::delete_by_name(ctx, bucket).await {
         return crud::db_error_internal(e, "Bucket deleted but its record could not be removed");
     }
-    ok_json(&serde_json::json!({"deleted": true}))
+    ok_json(&contracts::DeletedResponse { deleted: true })
 }
 
 #[cfg(test)]
