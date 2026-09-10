@@ -48,9 +48,18 @@ const { objects } = await impresspress.storage.listObjects('my-bucket');
 ## Type Safety
 
 Every exported type describes a shape a handler actually returns, and lives
-next to the service that speaks it. Nothing here is generated, and nothing
-models a database row: the SDK talks to HTTP endpoints, whose projections are
-narrower than the tables behind them.
+next to the service that speaks it. Nothing here models a database row: the
+SDK talks to HTTP endpoints, whose projections are narrower than the tables
+behind them.
+
+The exported types are hand-written, but they are *checked* against a
+generated one. `src/generated/api.ts` is produced by `npm run generate:types`
+from the committed per-block OpenAPI snapshots
+(`crates/impresspress-core/tests/snapshots/*.openapi.json`), which each block's
+`EndpointRoute` table generates in turn, and CI regenerates and diffs it.
+`test/generated-contract.test.ts` then asserts that what the server publishes
+is assignable to what these interfaces promise, so a reshaped response body is
+a compile error here rather than a runtime surprise for a consumer.
 
 ```typescript
 import type {
@@ -152,8 +161,9 @@ const blob = await impresspress.storage.downloadFile('images', 'photo.jpg');
 const url = impresspress.storage.getDownloadUrl('images', 'photo.jpg');
 await impresspress.storage.deleteObject('images', 'photo.jpg');
 
-// Search the current user's uploads / recently viewed objects
+// Search the current user's uploads (object-metadata rows)
 const results = await impresspress.storage.search('photo');
+// The current user's recent object views (audit rows: bucket, key, viewed_at)
 const recent = await impresspress.storage.getRecentFiles();
 ```
 

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
-    contracts::{RecordListView, RecordView},
+    contracts::{DeletedResponse, QuotaResponse, RecordListView, RecordView, ShareCreatedResponse},
     repo,
 };
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match repo::shares::list_for_user(ctx, msg.user_id(), 100).await {
-        Ok(page) => ok_json(&RecordListView::from_page(&page)),
+        Ok(page) => ok_json(&RecordListView::from_page(page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -123,11 +123,11 @@ pub(super) async fn handle_create_share(
         max_access_count: body.max_access_count,
     };
     match repo::shares::insert(ctx, new_share).await {
-        Ok(row) => ok_json(&serde_json::json!({
-            "id": row.id,
-            "token": token,
-            "direct_url": format!("/b/storage/direct/{}", token)
-        })),
+        Ok(row) => ok_json(&ShareCreatedResponse {
+            id: row.id,
+            direct_url: format!("/b/storage/direct/{token}"),
+            token,
+        }),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -150,7 +150,7 @@ pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> Out
     }
 
     match repo::shares::delete(ctx, id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Ok(()) => ok_json(&DeletedResponse { deleted: true }),
         Err(e) => crud::db_error(e, "Share not found", "Database error"),
     }
 }
@@ -164,17 +164,14 @@ pub(super) async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> Output
         Ok(usage) => usage,
         Err(e) => return err_internal("Quota usage lookup failed", e),
     };
-    ok_json(&serde_json::json!({
-        "quota": quota,
-        "usage": usage
-    }))
+    ok_json(&QuotaResponse { quota, usage })
 }
 
 pub(super) async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
     let offset = ((page - 1) * page_size) as i64;
     match repo::shares::list_recent(ctx, page_size as i64, offset).await {
-        Ok(page) => ok_json(&RecordListView::from_page(&page)),
+        Ok(page) => ok_json(&RecordListView::from_page(page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -186,14 +183,14 @@ pub(super) async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> Outp
     let offset = ((page - 1) * page_size) as i64;
 
     match repo::shares::list_access_logs(ctx, share_id, page_size as i64, offset).await {
-        Ok(page) => ok_json(&RecordListView::from_page(&page)),
+        Ok(page) => ok_json(&RecordListView::from_page(page)),
         Err(e) => err_internal("Database error", e),
     }
 }
 
 pub(super) async fn handle_admin_quotas(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     match repo::quota::list(ctx, 1000).await {
-        Ok(page) => ok_json(&RecordListView::from_page(&page)),
+        Ok(page) => ok_json(&RecordListView::from_page(page)),
         Err(e) => err_internal("Database error", e),
     }
 }
@@ -233,7 +230,7 @@ pub(super) async fn handle_update_quota(
     }
 
     match repo::quota::upsert_for_user(ctx, user_id, body).await {
-        Ok(row) => ok_json(&RecordView::from_row(&row)),
+        Ok(row) => ok_json(&RecordView::from_row(row)),
         Err(e) => err_internal("Database error", e),
     }
 }

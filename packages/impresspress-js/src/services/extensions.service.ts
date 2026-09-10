@@ -79,8 +79,17 @@ export interface ShareRecord {
   created_by: string;
   created_at: string;
   access_count: number;
-  expires_at?: string;
-  max_access_count?: number;
+  /**
+   * Absolute expiry, or `null` for a share that never expires.
+   *
+   * `null`, not absent. `ShareRow.expires_at` is an `Option<String>` with no
+   * `skip_serializing_if`, so the key is always present and carries JSON
+   * `null` when there is no expiry — this was declared `expires_at?: string`
+   * until `files.openapi.json` started describing the row and said otherwise.
+   */
+  expires_at: string | null;
+  /** Access cap, or `null` for unlimited. Always present — see `expires_at`. */
+  max_access_count: number | null;
 }
 
 export interface ListSharesResult {
@@ -144,7 +153,14 @@ export class CloudStorageExtension extends ExtensionsService {
     });
   }
 
-  /** Get the current user's storage quota and usage. `GET /b/cloudstorage/quota`. */
+  /**
+   * Get the current user's storage quota and usage.
+   * `GET /b/cloudstorage/quota`.
+   *
+   * `usage` was `Record<string, unknown>` until the endpoint declared a
+   * response schema. It is two numbers, both computed over the caller's
+   * object rows by `blocks::files::quota::get_user_usage`.
+   */
   async getQuota(): Promise<{
     quota: {
       max_storage_bytes: number;
@@ -152,7 +168,12 @@ export class CloudStorageExtension extends ExtensionsService {
       max_files_per_bucket: number;
       reset_period_days: number;
     };
-    usage: Record<string, unknown>;
+    usage: {
+      /** Bytes stored, in-flight (`pending`) uploads included. */
+      total_bytes: number;
+      /** Object rows owned by the caller, on the same basis. */
+      file_count: number;
+    };
   }> {
     return this.call("cloudstorage", "quota");
   }

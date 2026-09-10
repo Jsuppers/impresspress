@@ -48,7 +48,10 @@ export type {
   TransferOptions,
   UploadFileOptions,
   FileMetadataRecord,
+  FileViewRecord,
+  RecordListResult,
   SearchResult,
+  RecentViewsResult,
 } from './services/storage.service';
 
 export type {

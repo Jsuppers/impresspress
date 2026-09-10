@@ -14,7 +14,9 @@ use crate::{
     blocks::{
         crud,
         files::{
-            contracts::{ObjectInfoResponse, ObjectListResponse},
+            contracts::{
+                DeletedResponse, ObjectInfoResponse, ObjectListResponse, ObjectUploadedResponse,
+            },
             repo,
         },
     },
@@ -270,7 +272,11 @@ pub(in crate::blocks::files) async fn handle_upload_object(
             if let Err(e) = repo::objects::mark_complete(ctx, &pending_record.id).await {
                 tracing::warn!("Failed to mark upload as complete: {e}");
             }
-            ok_json(&serde_json::json!({"bucket": bucket, "key": key, "uploaded": true}))
+            ok_json(&ObjectUploadedResponse {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                uploaded: true,
+            })
         }
         Err(e) => {
             // Upload failed — delete the pending record so it doesn't block quota.
@@ -320,7 +326,7 @@ pub(in crate::blocks::files) async fn handle_delete_object(
     if !blob_existed && rows_removed == 0 {
         return err_not_found("Object not found");
     }
-    ok_json(&serde_json::json!({"deleted": true}))
+    ok_json(&DeletedResponse { deleted: true })
 }
 
 #[cfg(test)]

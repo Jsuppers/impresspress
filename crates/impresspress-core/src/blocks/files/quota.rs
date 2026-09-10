@@ -1,6 +1,6 @@
 use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 
-use super::{models::QuotaConfig, repo};
+use super::{contracts::QuotaUsageView, models::QuotaConfig, repo};
 use crate::http::{err_bad_request, err_internal};
 
 /// The user's effective quota: their override row when one exists,
@@ -31,11 +31,11 @@ pub async fn get_file_count(ctx: &dyn Context, user_id: &str) -> Result<i64, Waf
 pub async fn get_user_usage(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<serde_json::Value, WaferError> {
-    Ok(serde_json::json!({
-        "total_bytes": get_used_bytes(ctx, user_id).await?,
-        "file_count": get_file_count(ctx, user_id).await?,
-    }))
+) -> Result<QuotaUsageView, WaferError> {
+    Ok(QuotaUsageView {
+        total_bytes: get_used_bytes(ctx, user_id).await?,
+        file_count: get_file_count(ctx, user_id).await?,
+    })
 }
 
 /// Admit or refuse an upload of `file_size` bytes for `user_id`.

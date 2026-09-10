@@ -4,7 +4,7 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
-    blocks::auth::repo::users,
+    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse},
     http::{err_bad_request, err_internal, ok_json},
     util::{hex_encode, sha256_hex},
 };
@@ -32,10 +32,16 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // failure is logged so an outage on this endpoint is still findable.
     let user = match users::find_by_email(ctx, &email_lower).await {
         Ok(Some(user)) => user,
-        Ok(None) => return ok_json(&serde_json::json!({"message": safe_msg})),
+        Ok(None) => {
+            return ok_json(&MessageResponse {
+                message: safe_msg.to_string(),
+            })
+        }
         Err(e) => {
             tracing::error!(error = %e, "forgot-password: user lookup failed");
-            return ok_json(&serde_json::json!({"message": safe_msg}));
+            return ok_json(&MessageResponse {
+                message: safe_msg.to_string(),
+            });
         }
     };
 
@@ -57,7 +63,9 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // Send the raw token in the email; the hash lives only in the DB.
     super::send_template_email(ctx, "password_reset", &email_lower, &reset_token).await;
 
-    ok_json(&serde_json::json!({"message": safe_msg}))
+    ok_json(&MessageResponse {
+        message: safe_msg.to_string(),
+    })
 }
 
 #[cfg(test)]

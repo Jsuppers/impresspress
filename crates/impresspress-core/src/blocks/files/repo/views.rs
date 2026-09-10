@@ -16,10 +16,12 @@ use crate::util::RecordExt;
 pub const TABLE: &str = "impresspress__files__views";
 
 /// One object-view audit row, decoded.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ViewRow {
     pub id: String,
+    /// Bucket holding the viewed object.
     pub bucket: String,
+    /// Object key within the bucket.
     pub key: String,
     /// The viewer.
     pub user_id: String,

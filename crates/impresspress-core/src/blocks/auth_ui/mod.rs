@@ -116,6 +116,31 @@ enum Route {
     Bootstrap,
 }
 
+/// Query-parameter schema for `GET /b/auth/oauth/login`. Hand-written: the
+/// handler reads `provider` straight off the query string
+/// (`oauth::start::handle`), so there is no deserialized request struct to
+/// derive from. The accepted values are read from [`oauth::spec`] rather
+/// than restated, because that table is what `start.rs` looks the provider
+/// up in — a provider added there must not need a second edit here to
+/// become documented.
+fn oauth_start_query_schema() -> serde_json::Value {
+    let providers: Vec<&str> = oauth::spec::OAUTH_PROVIDERS
+        .iter()
+        .map(|p| p.name)
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "required": ["provider"],
+        "properties": {
+            "provider": {
+                "type": "string",
+                "description": "OAuth provider to start the flow with",
+                "enum": providers
+            }
+        }
+    })
+}
+
 /// The block's HTTP surface: what `handle()` dispatches on and what
 /// `info().endpoints` is generated from. Wire paths; `{id}` is bound into
 /// `req.param.*` for the api-key handlers' `msg.var` reader.
@@ -126,9 +151,13 @@ enum Route {
 /// with no session yet (login, signup, "forgot password"). The JSON API
 /// schemas are DERIVED from the types the handlers actually deserialize into
 /// and serialize out of, declared in [`contracts`], so they cannot drift from
-/// the handlers. Those are the core developer-facing auth endpoints; schema
-/// coverage of the remaining rows (OAuth, api-keys, password reset,
-/// bootstrap) is a follow-up.
+/// the handlers.
+///
+/// What is still undeclared, so nobody reads the coverage as complete: the
+/// four api-key rows, `GET`/`POST /b/auth/api/verify`,
+/// `GET /b/auth/api/oauth/providers` and `POST /b/auth/api/bootstrap`
+/// publish no schema at all; the password-reset and change-password rows
+/// publish a response schema but not their request bodies.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // ── Admin settings ── declared `Admin` so the central router enforces the
     // tier; the handler re-checks nothing. (The auth-ui prefix route is
@@ -170,7 +199,10 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         .summary("Bootstrap token redemption form"),
     // ── OAuth browser redirects ──
     EndpointRoute::public(HttpMethod::Get, "/b/auth/oauth/login", Route::OauthStart)
-        .summary("Start OAuth flow"),
+        .summary("Start OAuth flow")
+        .query_params(oauth_start_query_schema)
+        .output(response_schema_of::<contracts::OauthStartResponse>)
+        .tags(&["auth"]),
     // Public: the provider redirects the browser here with no session by
     // design; `oauth/callback.rs` consumes the single-use PKCE state.
     EndpointRoute::public(
@@ -199,7 +231,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         .tags(&["auth"]),
     EndpointRoute::authenticated(HttpMethod::Post, "/b/auth/api/logout", Route::Logout)
         .summary("Sign out")
-        .output(response_schema_of::<contracts::LogoutResponse>)
+        .output(response_schema_of::<contracts::MessageResponse>)
         .tags(&["auth"]),
     EndpointRoute::authenticated(HttpMethod::Get, "/b/auth/api/me", Route::Me)
         .summary("Get current user")
@@ -217,7 +249,9 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/auth/api/change-password",
         Route::ChangePassword,
     )
-    .summary("Change password"),
+    .summary("Change password")
+    .output(response_schema_of::<contracts::MessageResponse>)
+    .tags(&["auth"]),
     // ── API keys (admin user-management still hits these via htmx) ──
     EndpointRoute::authenticated(HttpMethod::Get, "/b/auth/api/api-keys", Route::ListApiKeys)
         .summary("List API keys"),
@@ -257,7 +291,9 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/auth/api/resend-verification",
         Route::ResendVerification,
     )
-    .summary("Re-send the verification email"),
+    .summary("Re-send the verification email")
+    .output(response_schema_of::<contracts::MessageResponse>)
+    .tags(&["auth"]),
     // ── Password reset ── public for the same reasons as the verification
     // pair: `forgot-password` issues a token to the address's owner behind a
     // constant response; `reset-password` consumes it (hash match + expiry).
@@ -266,13 +302,17 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/auth/api/forgot-password",
         Route::ForgotPassword,
     )
-    .summary("Request a password reset email"),
+    .summary("Request a password reset email")
+    .output(response_schema_of::<contracts::MessageResponse>)
+    .tags(&["auth"]),
     EndpointRoute::public(
         HttpMethod::Post,
         "/b/auth/api/reset-password",
         Route::ResetPassword,
     )
-    .summary("Reset password with a reset token"),
+    .summary("Reset password with a reset token")
+    .output(response_schema_of::<contracts::MessageResponse>)
+    .tags(&["auth"]),
     // ── OAuth API ──
     // Public: reports which providers are configured, the same fact the
     // login page renders as buttons for anonymous visitors.

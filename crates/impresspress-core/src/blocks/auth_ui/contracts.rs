@@ -140,9 +140,19 @@ pub struct SignupResponse {
     pub user: SignupUser,
 }
 
-/// `POST /b/auth/api/logout` response body.
+/// The one-key body five endpoints on this surface answer: `POST
+/// /b/auth/api/logout`, `/change-password`, `/forgot-password`,
+/// `/reset-password` and `/resend-verification`.
+///
+/// One type because it is one shape. The *text* differs per endpoint and is
+/// deliberately constant per endpoint rather than per outcome — the
+/// password-reset and verification pair answer the same sentence whatever
+/// the address's state, so nothing about an account can be learned from the
+/// response (`api::verify::resend_tests` pins that). A per-endpoint copy of
+/// this struct would publish five schemas that must be kept identical by
+/// hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct LogoutResponse {
+pub struct MessageResponse {
     pub message: String,
 }
 
@@ -193,4 +203,21 @@ pub struct RefreshResponse {
     pub token_type: TokenType,
     /// Access token lifetime in seconds
     pub expires_in: u64,
+}
+
+/// `GET /b/auth/oauth/login?provider=` response body.
+///
+/// The browser-facing OAuth entry point answers JSON, not a redirect: the
+/// caller (the SDK's `signInWithOAuth` / `signInWithOAuthPopup`, or the login
+/// page's buttons) decides whether to navigate the current tab or open a
+/// popup at `auth_url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OauthStartResponse {
+    /// Absolute authorize URL at the provider, with `client_id`,
+    /// `redirect_uri`, the single-use PKCE `state` and `code_challenge`
+    /// already interpolated.
+    #[schemars(extend("format" = "uri"))]
+    pub auth_url: String,
+    /// Echo of the requested provider — one of `OAUTH_PROVIDERS`.
+    pub provider: String,
 }

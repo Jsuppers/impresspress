@@ -1427,9 +1427,15 @@ jobs:
         # When this step does not run its `skip` output is empty, so every
         # `skip != 'true'` guard below passes and the job runs in full — the
         # unconditional behaviour the merge gate has always had.
+        #
+        # The committed OpenAPI snapshots are in the filter because they are an
+        # INPUT to this job: `check:types-fresh` regenerates
+        # `src/generated/api.ts` from them. A Rust-only change that reshapes a
+        # described response body touches no file under `packages/` and would
+        # otherwise skip the one job that notices.
         if: inputs.pull-request
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- packages/impresspress-js/)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- packages/impresspress-js/ crates/impresspress-core/tests/snapshots/)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -1449,6 +1455,19 @@ jobs:
           npm ci
           npm run build
           npm run lint
+
+      # The type-freshness gate. `src/generated/api.ts` is generated from the
+      # committed per-block OpenAPI snapshots; regenerating it here and
+      # diffing is what makes a reshaped response body a red build in this
+      # package rather than a silent contract change. Its reach is only as
+      # wide as the snapshots describe, which is why
+      # `endpoints_the_sdk_calls_publish_a_response_schema` (Rust) requires a
+      # response schema on every endpoint this package calls, and
+      # `test/api-coverage.test.ts` re-derives that set from the SDK source.
+      - name: Check generated API types are fresh
+        if: steps.sdk-changes.outputs.skip != 'true'
+        working-directory: packages/impresspress-js
+        run: npm run check:types-fresh
 
       - name: Test SDK
         if: steps.sdk-changes.outputs.skip != 'true'

@@ -1,4 +1,60 @@
 {
+  "/b/admin/api/extensions": {
+    "get": {
+      "responses": {
+        "200": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "description": "One row of `GET /b/admin/api/extensions`: a registered block, projected\noff wafer-run's `BlockInfo`.\n\nA closed field list for the same reason every view in this module is one\n— `BlockInfo` carries config keys, collection schemas, endpoint tables and\ncapability grants that this endpoint has never published and must not\nstart publishing because upstream grew a field.",
+                  "properties": {
+                    "enabled": {
+                      "description": "Always `true`. A registered block is by definition enabled; there is\nno server-side enable/disable lifecycle behind this field.",
+                      "type": "boolean"
+                    },
+                    "interface": {
+                      "description": "Interface identifier, e.g. `\"http-handler@v1\"`.",
+                      "type": "string"
+                    },
+                    "name": {
+                      "description": "Block name in the canonical `{org}/{block}` form.",
+                      "type": "string"
+                    },
+                    "summary": {
+                      "description": "One-line summary of what the block does.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "Semantic version of the block implementation.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "version",
+                    "interface",
+                    "summary",
+                    "enabled"
+                  ],
+                  "type": "object"
+                },
+                "title": "Array_of_AdminExtensionView",
+                "type": "array"
+              }
+            }
+          },
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "List registered blocks API"
+    }
+  },
   "/b/admin/api/iam/roles": {
     "get": {
       "responses": {

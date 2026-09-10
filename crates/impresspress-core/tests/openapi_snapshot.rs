@@ -181,6 +181,163 @@ async fn admin_json_api_appears_in_openapi() {
     }
 }
 
+/// Every endpoint `packages/impresspress-js` calls must publish a response
+/// schema.
+///
+/// This is the anti-vacuity gate for the SDK's type-freshness check
+/// (`packages/impresspress-js/scripts/generate-api-types.mjs`). That check
+/// regenerates TypeScript types from these snapshots and diffs them, so it can
+/// only see a reshaped response body on an endpoint that *describes* its
+/// response. Applied to the surface as it stood before this test, it would
+/// have covered eleven of the SDK's twenty-eight JSON call sites and reported
+/// green on the other seventeen — including the seven files handlers PR #22
+/// reshaped, which passed both existing snapshot gates for exactly this reason
+/// (`1ccbb452`, "publish the RecordList envelope the JS SDK reads").
+///
+/// The list below is the SDK's non-products call surface, one row per
+/// `this.request({ method, url })` in `src/services/{auth,iam,storage,
+/// extensions}.service.ts`, with `${…}` interpolations written as the path
+/// parameter the route declares. `packages/impresspress-js/test/
+/// api-coverage.test.ts` derives the same set from the SDK source and fails if
+/// a call site is added that this list does not carry, so the two cannot drift
+/// apart silently.
+///
+/// The products surface (`this.call("products", …)`) is not listed: it is
+/// already described end-to-end and its paths are assembled by helpers rather
+/// than written literally. The TypeScript census counts it.
+#[tokio::test]
+async fn endpoints_the_sdk_calls_publish_a_response_schema() {
+    // The two SDK call sites whose success response is deliberately not JSON.
+    // Each names what it answers instead; a JSON schema on either would
+    // describe a body the handler never sends.
+    const NOT_JSON: &[(&str, &str, &str)] = &[
+        (
+            "get",
+            "/b/storage/api/buckets/{name}/objects/{key}",
+            "raw object bytes with the stored Content-Type - \
+             `storage::objects::handle_get_object`",
+        ),
+        (
+            "post",
+            "/b/auth/api/verify",
+            "an SSR HTML page - `api::verify::handle` answers `html_respond(...)` on \
+             every branch",
+        ),
+    ];
+
+    const SDK_JSON_CALL_SITES: &[(&str, &str)] = &[
+        // auth.service.ts
+        ("post", "/b/auth/api/signup"),
+        ("post", "/b/auth/api/login"),
+        ("post", "/b/auth/api/logout"),
+        ("get", "/b/auth/api/me"),
+        ("patch", "/b/auth/api/me"),
+        ("post", "/b/auth/api/forgot-password"),
+        ("post", "/b/auth/api/reset-password"),
+        ("post", "/b/auth/api/change-password"),
+        ("post", "/b/auth/api/refresh"),
+        ("post", "/b/auth/api/resend-verification"),
+        ("get", "/b/auth/oauth/login"),
+        // iam.service.ts
+        ("get", "/b/admin/api/iam/roles"),
+        ("post", "/b/admin/api/iam/roles"),
+        ("patch", "/b/admin/api/iam/roles/{id}"),
+        ("delete", "/b/admin/api/iam/roles/{id}"),
+        // extensions.service.ts
+        ("get", "/b/admin/api/extensions"),
+        // storage.service.ts
+        ("get", "/b/storage/api/buckets"),
+        ("post", "/b/storage/api/buckets"),
+        ("delete", "/b/storage/api/buckets/{name}"),
+        ("get", "/b/storage/api/buckets/{name}/objects"),
+        ("post", "/b/storage/api/buckets/{name}/objects"),
+        ("delete", "/b/storage/api/buckets/{name}/objects/{key}"),
+        ("get", "/b/storage/api/search"),
+        ("get", "/b/storage/api/recent"),
+        // extensions.service.ts - CloudStorageExtension
+        ("get", "/b/cloudstorage/shares"),
+        ("post", "/b/cloudstorage/shares"),
+        ("delete", "/b/cloudstorage/shares/{id}"),
+        ("get", "/b/cloudstorage/quota"),
+    ];
+
+    let ctx = impresspress_core::test_support::TestContext::new().await;
+    let doc = impresspress_core::test_support::openapi_document(&ctx).await;
+
+    let mut undescribed = Vec::new();
+    for (method, path) in SDK_JSON_CALL_SITES {
+        let operation = &doc["paths"][*path][*method];
+        if operation.is_null() {
+            undescribed.push(format!(
+                "{} {path}: absent from /openapi.json entirely (the row declares no schema at all)",
+                method.to_uppercase()
+            ));
+            continue;
+        }
+        if operation["responses"]["200"]["content"]["application/json"]["schema"].is_null() {
+            undescribed.push(format!(
+                "{} {path}: declared, but its 200 has no `application/json` schema - add \
+                 `.output(response_schema_of::<T>)` to the row",
+                method.to_uppercase()
+            ));
+        }
+    }
+
+    assert!(
+        undescribed.is_empty(),
+        "the SDK's type-freshness check cannot see a reshaped response body on an endpoint \
+         that does not describe one:\n{}",
+        undescribed.join("\n")
+    );
+
+    // Anti-vacuity, both directions.
+    //
+    // The exceptions are the only two call sites allowed to answer without a
+    // JSON schema, so each must still be a *declared* row - an exception for a
+    // path the block does not serve would silently excuse nothing, and would
+    // survive the route being deleted.
+    let declared: Vec<(String, String)> = impresspress_core::test_support::real_block_infos()
+        .iter()
+        .flat_map(|info| {
+            info.endpoints.iter().map(|ep| {
+                let published = ep
+                    .path
+                    .split('/')
+                    .map(|seg| {
+                        match seg
+                            .strip_prefix('{')
+                            .and_then(|n| n.strip_suffix('}'))
+                            .and_then(|n| n.strip_suffix("..."))
+                        {
+                            Some(rest) => format!("{{{rest}}}"),
+                            None => seg.to_string(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                (format!("{:?}", ep.method).to_lowercase(), published)
+            })
+        })
+        .collect();
+
+    for (method, path, why) in NOT_JSON {
+        assert!(
+            declared.iter().any(|(m, p)| m == method && p == path),
+            "`{} {path}` is excused from the JSON-schema requirement ({why}), but no block \
+             declares it - drop the exception or fix the path",
+            method.to_uppercase()
+        );
+        assert!(
+            doc["paths"][*path][*method]["responses"]["200"]["content"]["application/json"]
+                ["schema"]
+                .is_null(),
+            "`{} {path}` answers {why}, so it must NOT publish an application/json response \
+             schema - either the handler changed or the exception is stale",
+            method.to_uppercase()
+        );
+    }
+}
+
 /// The products block's row endpoints used to echo database records, and the
 /// hand-written schemas beside them documented a row the handler never
 /// consulted. Each is now a `contracts::*View` the handler builds, and the

@@ -6,7 +6,10 @@
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::{crud::db_error_internal, files::repo},
+    blocks::{
+        crud::db_error_internal,
+        files::{contracts, repo},
+    },
     http::ok_json,
 };
 
@@ -35,11 +38,11 @@ pub(in crate::blocks::files) async fn handle_stats(
         Err(e) => return db_error_internal(e, "Storage stats: bucket count"),
     };
 
-    ok_json(&serde_json::json!({
-        "total_objects": total_objects,
-        "total_size_bytes": total_size as i64,
-        "bucket_count": bucket_count
-    }))
+    ok_json(&contracts::StorageStatsResponse {
+        total_objects,
+        total_size_bytes: total_size as i64,
+        bucket_count,
+    })
 }
 
 #[cfg(test)]
