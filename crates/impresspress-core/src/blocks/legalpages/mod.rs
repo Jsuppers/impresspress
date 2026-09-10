@@ -656,7 +656,14 @@ crate::impresspress_feature_block! {
     info: |_this| {
         BlockInfo::new("impresspress/legalpages", "0.0.1", "http-handler@v1", "Legal pages management with versioning and publishing")
             .instance_mode(InstanceMode::Singleton)
-            .requires(vec!["wafer-run/database".into()])
+            // `wafer-run/config`: `handle_get_public` reads this block's three
+            // theming keys plus `WAFER_RUN_SHARED__PRIMARY_COLOR`, and
+            // `SiteConfig::load` reads the shared site keys. The entry was
+            // missing, so the runtime refused every one of those calls;
+            // `config::get_default` swallows the refusal and answers with its
+            // fallback, so the public page rendered unthemed with no error
+            // anywhere. (Found by the requires sweep, not by a report.)
+            .requires(vec!["wafer-run/database".into(), "wafer-run/config".into()])
             .category(wafer_run::BlockCategory::Feature)
             .description("Legal document management with versioning and publishing. Create and manage terms of service, privacy policies, and other legal documents. Supports draft/published workflow with version tracking.")
             .endpoints(endpoint_match::declare(ROUTES))
@@ -1253,6 +1260,58 @@ mod write_loss_tests {
         )
         .await;
         assert!(editor.contains("Newer Terms"), "{editor}");
+    }
+
+    /// The public page's theming comes out of config, so the block has to be
+    /// allowed to call the config block.
+    ///
+    /// Found by the requires sweep that Bug 2 (the files block calling
+    /// `wafer-run/crypto` undeclared) prompted: this block reads four config
+    /// keys in `handle_get_public` while `info().requires` named only
+    /// `wafer-run/database`, so the runtime refused every one of those calls
+    /// at the `call_block` boundary. `config::get_default` swallows the
+    /// error and answers with its fallback, so the page rendered — silently
+    /// unthemed, with no 500 and nothing in the logs to point at.
+    ///
+    /// The fixture must enforce `requires` (`with_wrap`) or the bug is
+    /// invisible here exactly as it was invisible in CI: an empty
+    /// `caller_requires` is what production reads as "declares no requires".
+    #[tokio::test]
+    async fn the_public_page_reads_its_theming_config() {
+        use crate::test_support::{anon_msg, output_html};
+
+        let mut ctx = test_ctx().await;
+        ctx.set_config("IMPRESSPRESS__LEGALPAGES__BG_COLOR", "#123456");
+        let ctx = ctx.with_wrap(
+            LegalPagesBlock::BLOCK_NAME,
+            wafer_run::Block::info(&LegalPagesBlock::new()).requires,
+            wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants,
+            "impresspress/admin",
+        );
+        seed_doc(
+            &ctx,
+            DocumentType::Terms,
+            "Published Terms",
+            DocumentStatus::Published,
+            1,
+        )
+        .await;
+
+        let html = output_html(
+            LegalPagesBlock::new()
+                .handle(
+                    &ctx,
+                    anon_msg("retrieve", "/b/legalpages/terms"),
+                    InputStream::from_bytes(Vec::new()),
+                )
+                .await,
+        )
+        .await;
+
+        assert!(
+            html.contains("#123456"),
+            "the configured background colour must reach the rendered page: {html}"
+        );
     }
 }
 

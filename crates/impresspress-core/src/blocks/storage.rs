@@ -130,7 +130,11 @@ fn resolve_folder(caller: &str, folder: &str) -> ResolvedPath {
 /// Determine access type from the storage operation kind.
 fn access_type_for_op(kind: &str) -> &'static str {
     match kind {
-        "storage.get" | "storage.list" | "storage.list_folders" => "read",
+        // `get_streaming` is the streaming form of `get` — the same read of
+        // `{folder}/{key}`, so it is classified as a read here too. Left out,
+        // it fell through to "write" and a cross-block download would have
+        // been checked against a WRITE grant.
+        "storage.get" | "storage.get_streaming" | "storage.list" | "storage.list_folders" => "read",
         _ => "write",
     }
 }
@@ -251,6 +255,23 @@ fn rewrite_request_body(
         "storage.delete_folder" => rewrite_op::<wire::DeleteFolderRequest>(body, caller),
         "storage.put" => rewrite_op::<wire::PutRequest>(body, caller),
         "storage.get" => rewrite_op::<wire::GetRequest>(body, caller),
+        // `storage.get_streaming` is `storage.get`'s streaming twin, not a
+        // separate capability: `wafer-core`'s handler decodes it as the SAME
+        // `wire::GetRequest` and authorizes the SAME `{folder}/{key}` read
+        // (`interfaces/storage/handler.rs`, `ServiceOp::STORAGE_GET_STREAMING`),
+        // and `StorageService::get_streaming` has a default that calls `get`
+        // and wraps the buffered body as a single-chunk stream — so every
+        // backend answers it. The folder rewriting therefore applies
+        // unchanged.
+        //
+        // Omitting it made this shim answer `unknown storage op` to the only
+        // op the block's two download paths issue (`store::get_stream`, from
+        // `blocks/files/storage/objects.rs` and `blocks/files/share.rs`), so
+        // EVERY object download and every share link 500'd on the native
+        // backend. The callers stream deliberately — a multi-GB object must
+        // not be buffered into the isolate — so the missing arm is the bug,
+        // not the streaming.
+        "storage.get_streaming" => rewrite_op::<wire::GetRequest>(body, caller),
         "storage.delete" => rewrite_op::<wire::DeleteRequest>(body, caller),
         "storage.list" => rewrite_op::<wire::ListRequest>(body, caller),
         other => Err(WaferError::new(
@@ -524,6 +545,9 @@ mod tests {
     #[test]
     fn test_access_type_for_op() {
         assert_eq!(access_type_for_op("storage.get"), "read");
+        // The streaming download is a read, like its buffered twin —
+        // otherwise a cross-block download is checked against a WRITE grant.
+        assert_eq!(access_type_for_op("storage.get_streaming"), "read");
         assert_eq!(access_type_for_op("storage.list"), "read");
         assert_eq!(access_type_for_op("storage.list_folders"), "read");
         assert_eq!(access_type_for_op("storage.put"), "write");
@@ -564,6 +588,33 @@ mod tests {
 
         let req: wire::GetRequest = codec::decode(&rewritten).unwrap();
         assert_eq!(req.folder, "wafer-run/web/public");
+    }
+
+    /// `storage.get_streaming` carries the same `wire::GetRequest` as
+    /// `storage.get` and must be namespaced identically. Before the fix this
+    /// arm was absent, so the shim answered `unknown storage op` and every
+    /// object download / share link 500'd.
+    #[test]
+    fn test_rewrite_request_body_get_streaming() {
+        let body = codec::encode(&wire::GetRequest {
+            folder: "uploads".into(),
+            key: "photo.jpg".into(),
+        })
+        .unwrap();
+
+        let (rewritten, resolved) =
+            rewrite_request_body("storage.get_streaming", &body, "impresspress/files")
+                .expect("the streaming download must be a known op");
+
+        assert_eq!(resolved.path, "impresspress/files/uploads");
+        assert_eq!(
+            resolved.wrap_resource,
+            "impresspress/files/uploads/photo.jpg"
+        );
+        assert!(!resolved.cross_block);
+        let req: wire::GetRequest = codec::decode(&rewritten).unwrap();
+        assert_eq!(req.folder, "impresspress/files/uploads");
+        assert_eq!(req.key, "photo.jpg");
     }
 
     #[test]

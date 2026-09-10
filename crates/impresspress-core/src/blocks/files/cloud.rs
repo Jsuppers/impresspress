@@ -239,7 +239,7 @@ pub(super) async fn handle_update_quota(
 mod tests {
     use std::sync::Arc;
 
-    use wafer_core::interfaces::storage::service as storage_service;
+    use wafer_core::{clients::storage as store, interfaces::storage::service as storage_service};
     use wafer_run::InputStream;
 
     use super::{super::test_support::routed, *};
@@ -351,9 +351,9 @@ mod tests {
     /// check, and the file-existence check, into the `expires_in_hours`
     /// handling under test — without it, every case below would stop early
     /// (PermissionDenied / NotFound) and never exercise the fix.
-    async fn ctx_with_owned_bucket(bucket: &str, owner: &str) -> TestContext {
-        let mut ctx = TestContext::with_files().await;
-
+    /// Register a real `wafer-run/crypto` block over a fixed test secret, so
+    /// share-token signing and verification run end to end.
+    fn register_crypto(ctx: &mut TestContext) {
         let crypto_svc = Arc::new(
             wafer_block_crypto::service::Argon2JwtCryptoService::new(
                 // ≥ 32 bytes for HMAC-SHA256 minimum-length check.
@@ -367,24 +367,147 @@ mod tests {
                 crypto_svc,
             )),
         );
+    }
 
-        ctx.register_block(
-            "wafer-run/storage",
-            crate::blocks::storage::create(
-                Arc::new(AlwaysFoundStorageService),
-                Arc::from("impresspress/admin"),
-            ),
-        );
-
+    /// Seed one bucket owned by `owner`.
+    async fn seed_bucket(ctx: &TestContext, bucket: &str, owner: &str) {
         let data = crate::util::json_map(serde_json::json!({
             "name": bucket,
             "public": false,
             "created_by": owner,
             "created_at": crate::util::now_rfc3339(),
         }));
-        repo::buckets::seed(&ctx, data).await.expect("seed bucket");
+        repo::buckets::seed(ctx, data).await.expect("seed bucket");
+    }
 
-        ctx
+    async fn ctx_with_owned_bucket(bucket: &str, owner: &str) -> TestContext {
+        let mut ctx = TestContext::with_files().await;
+
+        register_crypto(&mut ctx);
+
+        ctx.register_block(
+            "wafer-run/storage",
+            crate::blocks::storage::create(
+                Arc::new(AlwaysFoundStorageService),
+                Arc::from(crate::blocks::files::test_wrap::ADMIN_BLOCK),
+            ),
+        );
+
+        seed_bucket(&ctx, bucket, owner).await;
+
+        crate::blocks::files::test_wrap::as_files_block(ctx)
+    }
+
+    /// A fixture whose object store really holds bytes — the always-found
+    /// fake above can prove a share was *created*, never that the shared file
+    /// comes back — wired through the production namespacing shim, plus a
+    /// real crypto block. Everything `POST /b/cloudstorage/shares` and
+    /// `GET /b/storage/direct/{token}` touch.
+    async fn ctx_for_share_round_trip(bucket: &str, owner: &str) -> TestContext {
+        let mut ctx = TestContext::with_files().await;
+        register_crypto(&mut ctx);
+        ctx.register_block(
+            "wafer-run/storage",
+            crate::blocks::storage::create(
+                Arc::new(crate::test_support::InMemoryStorageService::new()),
+                Arc::from(crate::blocks::files::test_wrap::ADMIN_BLOCK),
+            ),
+        );
+        seed_bucket(&ctx, bucket, owner).await;
+        crate::blocks::files::test_wrap::as_files_block(ctx)
+    }
+
+    /// CRUX regression (found by driving the live app): creating a share link
+    /// must succeed.
+    ///
+    /// `POST /b/cloudstorage/shares` 500'd on the live server because
+    /// `share::generate_share_token` calls `crypto::sign` while the block's
+    /// `info().requires` named only database, storage and config — so the
+    /// runtime refused the call with `PermissionDenied: block
+    /// 'wafer-run/crypto' not in requires list` above every grant check. No
+    /// test in the suite created a share against a fixture that enforced
+    /// `requires` (`ctx_with_owned_bucket` left it empty, which production
+    /// reads as unrestricted), so the whole feature shipped dead.
+    #[tokio::test]
+    async fn create_share_mints_a_token_for_an_existing_object() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let msg = auth_msg("create", "/b/cloudstorage/shares", "alice");
+        let out = handle_create_share(
+            &ctx,
+            &msg,
+            InputStream::from_bytes(share_body("photos", "a.png")),
+        )
+        .await;
+
+        let resp = output_json(out).await;
+        let token = resp["token"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !token.is_empty(),
+            "share creation must mint a signed token, got: {resp}"
+        );
+        assert_eq!(
+            resp["direct_url"],
+            serde_json::json!(format!("/b/storage/direct/{token}")),
+            "the response must point at the public link for that token"
+        );
+    }
+
+    /// The other half of the same outage: the public share link must serve
+    /// the shared object's BYTES.
+    ///
+    /// This crosses both bugs — the share is minted through `crypto::sign`
+    /// (bug 2) and served through `store::get_stream`, i.e.
+    /// `storage.get_streaming` (bug 1) — so it is the end-to-end proof that a
+    /// user can share a file and the recipient can download it.
+    #[tokio::test]
+    async fn shared_link_serves_the_stored_bytes() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        let stored: &[u8] = b"PNG\x89bytes-that-must-come-back";
+        store::put(&ctx, "photos", "a.png", stored, "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let create = handle_create_share(
+            &ctx,
+            &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+            InputStream::from_bytes(share_body("photos", "a.png")),
+        )
+        .await;
+        let token = output_json(create).await["token"]
+            .as_str()
+            .expect("share creation must mint a token")
+            .to_string();
+
+        // The public link takes no auth — the token is the credential.
+        let mut msg =
+            crate::test_support::anon_msg("retrieve", &format!("/b/storage/direct/{token}"));
+        msg.set_meta("req.param.token", &token);
+        let out = super::super::share::handle_direct_access(
+            &ctx,
+            &msg,
+            &crate::blocks::rate_limit::UserRateLimiter::default(),
+        )
+        .await;
+
+        let mut body = Vec::new();
+        let mut events = out;
+        while let Some(evt) = futures::StreamExt::next(&mut events).await {
+            match evt {
+                wafer_block::stream::StreamEvent::Chunk(bytes) => body.extend_from_slice(&bytes),
+                wafer_block::stream::StreamEvent::Error(e) => {
+                    panic!("the share link errored instead of serving: {}", e.message)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            body, stored,
+            "the share link must serve the stored bytes verbatim"
+        );
     }
 
     /// Regression (SEC-064): the share path used to inline its own bucket/key

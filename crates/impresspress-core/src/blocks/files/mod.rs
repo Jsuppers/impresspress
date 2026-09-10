@@ -16,6 +16,36 @@ pub(crate) mod repo;
 mod share;
 pub(crate) mod storage;
 
+/// Test-only: put a fixture on the two `call_block` gates production applies
+/// to this block, sourcing both sides from the declarations the runtime reads.
+///
+/// Every fixture in this block used to leave `caller_requires` empty, which
+/// production reads as "declares no `requires`" — unrestricted. The files
+/// block DOES declare one, so a call to a target missing from it was admitted
+/// in every test and refused on the wire (`PermissionDenied: block '…' not in
+/// requires list`). That is how the share path shipped calling
+/// `wafer-run/crypto` without declaring it.
+#[cfg(test)]
+pub(crate) mod test_wrap {
+    use crate::test_support::TestContext;
+
+    /// The deployment's admin block — the WRAP admin identity, and the block
+    /// whose declaration publishes the deployment-wide grants.
+    pub(crate) const ADMIN_BLOCK: &str = "impresspress/admin";
+
+    /// `ctx` acting as `impresspress/files`, with this block's OWN declared
+    /// `requires` and the admin block's declared grants.
+    ///
+    /// Neither list is re-typed here: the point of the gate is that the test
+    /// and the runtime read the same declaration, so `requires` comes off
+    /// [`super::FilesBlock`] and the grants off `blocks::admin::AdminBlock`.
+    pub(crate) fn as_files_block(ctx: TestContext) -> TestContext {
+        let requires = wafer_run::Block::info(&super::FilesBlock::new()).requires;
+        let grants = wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants;
+        ctx.with_wrap(super::FilesBlock::BLOCK_NAME, requires, grants, ADMIN_BLOCK)
+    }
+}
+
 use wafer_run::{BlockInfo, HttpMethod, InstanceMode};
 
 use super::rate_limit::{check_user_rate_limit_with, RateLimit, RateLimitOutcome, UserRateLimiter};
@@ -456,7 +486,13 @@ crate::impresspress_feature_block! {
 
         BlockInfo::new("impresspress/files", "0.0.1", "http-handler@v1", "File storage, sharing, quotas, and access logging")
             .instance_mode(InstanceMode::Singleton)
-            .requires(vec!["wafer-run/database".into(), "wafer-run/storage".into(), "wafer-run/config".into()])
+            // `wafer-run/crypto`: share links are JWTs. `share::generate_share_token`
+            // signs one with `crypto::sign` and `share::handle_direct_access`
+            // checks it with `crypto::verify`. The entry was missing, so
+            // `POST /b/cloudstorage/shares` was refused at the `call_block`
+            // boundary — above every grant check — and sharing was dead on
+            // arrival.
+            .requires(vec!["wafer-run/database".into(), "wafer-run/storage".into(), "wafer-run/config".into(), "wafer-run/crypto".into()])
             // No explicit Storage grant needed. Wave 26 (c18) made WRAP
             // namespace-aware for Storage; this block self-admits its
             // own `impresspress/files/*` namespace via Rule 3.
