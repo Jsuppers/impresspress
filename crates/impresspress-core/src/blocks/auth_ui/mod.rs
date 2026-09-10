@@ -116,19 +116,6 @@ enum Route {
     Bootstrap,
 }
 
-/// The block's HTTP surface: what `handle()` dispatches on and what
-/// `info().endpoints` is generated from. Wire paths; `{id}` is bound into
-/// `req.param.*` for the api-key handlers' `msg.var` reader.
-///
-/// Every row names the level the central router enforces. A `public` row is
-/// a decision recorded next to the row: the handler gates itself by a token,
-/// signature or shared secret, or the endpoint exists precisely for a caller
-/// with no session yet (login, signup, "forgot password"). The JSON API
-/// schemas are DERIVED from the types the handlers actually deserialize into
-/// and serialize out of, declared in [`contracts`], so they cannot drift from
-/// the handlers. Those are the core developer-facing auth endpoints; schema
-/// coverage of the remaining rows (OAuth, api-keys, password reset,
-/// bootstrap) is a follow-up.
 /// Query-parameter schema for `GET /b/auth/oauth/login`. Hand-written: the
 /// handler reads `provider` straight off the query string
 /// (`oauth::start::handle`), so there is no deserialized request struct to
@@ -154,6 +141,23 @@ fn oauth_start_query_schema() -> serde_json::Value {
     })
 }
 
+/// The block's HTTP surface: what `handle()` dispatches on and what
+/// `info().endpoints` is generated from. Wire paths; `{id}` is bound into
+/// `req.param.*` for the api-key handlers' `msg.var` reader.
+///
+/// Every row names the level the central router enforces. A `public` row is
+/// a decision recorded next to the row: the handler gates itself by a token,
+/// signature or shared secret, or the endpoint exists precisely for a caller
+/// with no session yet (login, signup, "forgot password"). The JSON API
+/// schemas are DERIVED from the types the handlers actually deserialize into
+/// and serialize out of, declared in [`contracts`], so they cannot drift from
+/// the handlers.
+///
+/// What is still undeclared, so nobody reads the coverage as complete: the
+/// four api-key rows, `GET`/`POST /b/auth/api/verify`,
+/// `GET /b/auth/api/oauth/providers` and `POST /b/auth/api/bootstrap`
+/// publish no schema at all; the password-reset and change-password rows
+/// publish a response schema but not their request bodies.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // ── Admin settings ── declared `Admin` so the central router enforces the
     // tier; the handler re-checks nothing. (The auth-ui prefix route is
