@@ -454,6 +454,8 @@ describe("CloudStorageExtension", () => {
               created_by: "u1",
               created_at: "2026-01-01T00:00:00Z",
               access_count: 0,
+              expires_at: null,
+              max_access_count: null,
             },
           },
         ],
@@ -474,13 +476,18 @@ describe("CloudStorageExtension", () => {
         created_by: "u1",
         created_at: "2026-01-01T00:00:00Z",
         access_count: 0,
+        expires_at: null,
+        max_access_count: null,
       },
     ]);
   });
 
   it("getQuota() returns the real {quota, usage} shape from /b/cloudstorage/quota", async () => {
     fetchMock.mockResolvedValueOnce(
-      fakeJsonResponse({ quota: { max_storage_bytes: 1 }, usage: { storage_used: 0 } }),
+      fakeJsonResponse({
+        quota: { max_storage_bytes: 1 },
+        usage: { total_bytes: 0, file_count: 0 },
+      }),
     );
     const result = await client().cloudStorage.getQuota();
     expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/b/cloudstorage/quota");
