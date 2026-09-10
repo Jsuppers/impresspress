@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { coverage, NOT_JSON } from "../scripts/api-coverage.mjs";
@@ -70,6 +74,48 @@ describe("the type-freshness gate covers the calls the SDK actually makes", () =
         .filter((s: Site) => !s.raw.startsWith("/b/products/${this."))
         .map((s: Site) => `${s.method} ${s.raw}`),
     ).toEqual([]);
+  });
+
+  /**
+   * What makes the assertion above worth anything: a call site the reader
+   * cannot reduce to a path template has to REACH the census as
+   * `resolved: false`. Both non-literal shapes used to be `continue`d away
+   * instead — a computed `url:`, and a `this.call(block, endpoint)` whose
+   * arguments are variables — so a refactor into either shape would have
+   * emptied `unresolved` and left the products-prefix filter above passing
+   * over a call site nobody had looked at.
+   */
+  it("reports non-literal call sites as unresolvable instead of dropping them", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-call-sites-"));
+    try {
+      writeFileSync(
+        join(dir, "fixture.service.ts"),
+        [
+          "class Fixture extends BaseService {",
+          "  async computedUrl() {",
+          "    return this.request<void>({ method: 'DELETE', url: this.buildPath('x') });",
+          "  }",
+          "  async computedCall(block: string, endpoint: string) {",
+          "    return this.call<void>(block, endpoint, { method: 'PUT' });",
+          "  }",
+          "}",
+          "",
+        ].join("\n"),
+      );
+
+      const sites: Site[] = callSites(dir);
+
+      expect(sites.map((s) => `${s.method} ${s.raw}`).sort()).toEqual([
+        "DELETE non-literal url: this.buildPath('x')",
+        "PUT this.call(block, endpoint) with a non-literal block or endpoint",
+      ]);
+      expect(sites.every((s) => !s.resolved)).toBe(true);
+      // None of them is excusable by the products-helper prefix that the
+      // coverage assertion tolerates, so a real one would fail that test.
+      expect(sites.filter((s) => s.raw.startsWith("/b/products/${this."))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   /**

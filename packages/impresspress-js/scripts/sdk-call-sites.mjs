@@ -22,6 +22,14 @@
  * `${this.ownerProductPath(productId, scope)}`, which expands to several path
  * segments — cannot be resolved this way and is reported as such rather than
  * quietly counted as covered or as missing.
+ *
+ * The same is true of a call site whose path is not a literal at all: a
+ * computed `url:`, or a `this.call(block, endpoint)` whose arguments are
+ * variables. Those reach the census as `resolved: false` with the reason on
+ * `raw`. They are never dropped — a dropped site leaves both the numerator
+ * and the denominator, which is exactly the silent under-count this file
+ * exists to prevent, and `test/api-coverage.test.ts` only tolerates
+ * unresolvables matching the products-helper prefix.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -206,55 +214,83 @@ function methodOf(text, fallback) {
   return match ? match[1] : fallback;
 }
 
-/** The `url:` property's literal body, or `null` when it is not a literal. */
+/**
+ * The `url:` property of a request-config object literal, as one of
+ * `{ kind: "literal", body }`, `{ kind: "computed", text }` (a `url:` that is
+ * some other expression) or `{ kind: "absent" }` (the object has no `url:`).
+ * The two non-literal kinds are returned rather than folded into `null`, so
+ * the caller can report *why* a site is unresolvable.
+ */
 function urlOf(text) {
   const at = text.search(/\burl\s*:\s*/);
-  if (at === -1) return null;
+  if (at === -1) return { kind: "absent" };
   const after = text.slice(at).replace(/^\burl\s*:\s*/, "");
   const quote = after[0];
-  if (quote !== '"' && quote !== "'" && quote !== "`") return null;
+  if (quote !== '"' && quote !== "'" && quote !== "`") {
+    return { kind: "computed", text: after.split(/[,\n]/)[0].replace(/[\s,}]+$/, "") };
+  }
   const end = skipString(after, 0);
-  return after.slice(1, end - 1);
+  return { kind: "literal", body: after.slice(1, end - 1) };
 }
 
 /**
- * Every call site in `src/services`, as
+ * Every call site in `dir` (default `src/services`), as
  * `{ service, method, path, raw, resolved }`. `resolved: false` means the
- * path could not be reduced to a template — the reason is on `raw`.
+ * path could not be reduced to a template — the reason is on `raw`. The
+ * directory is a parameter so the census can be exercised against a fixture.
  */
-export function callSites() {
+export function callSites(dir = SERVICES_DIR) {
   const sites = [];
-  const files = readdirSync(SERVICES_DIR).filter((f) => f.endsWith(".ts")).sort();
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ts")).sort();
 
   for (const file of files) {
-    const source = readFileSync(join(SERVICES_DIR, file), "utf8");
+    const source = readFileSync(join(dir, file), "utf8");
 
     for (const { text } of callArguments(source, "this.request")) {
-      const raw = urlOf(text);
+      const url = urlOf(text);
+      const method = methodOf(text, "GET");
+      if (url.kind !== "literal") {
+        // Not a path this reader can template. Reported, never skipped: a
+        // skipped site is invisible to `api-coverage.test.ts`, which is the
+        // one thing this census must not do.
+        const raw =
+          url.kind === "absent"
+            ? "this.request({ ... }) with no `url:` property"
+            : `non-literal url: ${url.text}`;
+        sites.push({ service: file, method, path: raw, raw, resolved: false });
+        continue;
+      }
       // `ExtensionsService.call` reaches the wire through `this.request`
       // with a computed url; its own call sites are collected below.
-      if (raw === null || raw.startsWith("/b/${extension}")) continue;
-      const path = normalizeLiteral(raw);
+      if (url.body.startsWith("/b/${extension}")) continue;
+      const path = normalizeLiteral(url.body);
       sites.push({
         service: file,
-        method: methodOf(text, "GET"),
-        path: path ?? raw,
-        raw,
+        method,
+        path: path ?? url.body,
+        raw: url.body,
         resolved: path !== null,
       });
     }
 
     for (const { text } of callArguments(source, "this.call")) {
       const args = splitArguments(text);
-      if (args.length < 2) continue;
-      const block = literalBody(args[0]);
-      const endpoint = literalBody(args[1]);
-      if (block === null || endpoint === null) continue;
+      const method = methodOf(args[2] ?? "", "GET");
+      const block = args.length > 0 ? literalBody(args[0]) : null;
+      const endpoint = args.length > 1 ? literalBody(args[1]) : null;
+      if (block === null || endpoint === null) {
+        // Same rule as above: a `this.call` whose block or endpoint is a
+        // variable is a call site whose path is unknown, not a non-call.
+        const shown = args.slice(0, 2).join(", ");
+        const raw = `this.call(${shown}) with a non-literal block or endpoint`;
+        sites.push({ service: file, method, path: raw, raw, resolved: false });
+        continue;
+      }
       const raw = `/b/${block}/${endpoint}`;
       const path = normalizeLiteral(raw);
       sites.push({
         service: file,
-        method: methodOf(args[2] ?? "", "GET"),
+        method,
         path: path ?? raw,
         raw,
         resolved: path !== null,
