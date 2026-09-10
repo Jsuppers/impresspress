@@ -1,5 +1,23 @@
 import { BaseService } from "./base.service";
-import { IAMRole } from "../types";
+
+/**
+ * One row of `GET /b/admin/api/iam/roles` — `AdminRoleView` on the server
+ * (`blocks/admin/iam.rs`). snake_case, like every impresspress API
+ * projection; `permissions` is advisory metadata for the IAM UI, WRAP
+ * grants are what the runtime actually enforces.
+ */
+export interface IAMRole {
+  id: string;
+  /** Unique role name — the value stored in `user_roles.role`. */
+  name: string;
+  description: string;
+  permissions: string[];
+  /** Built-in roles cannot be renamed or deleted. */
+  is_system: boolean;
+  /** RFC 3339. */
+  created_at: string;
+  updated_at: string;
+}
 
 /**
  * `GET /b/admin/api/iam/roles` response — `AdminRoleListResponse` on the

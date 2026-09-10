@@ -1,5 +1,5 @@
 import { BaseService } from "./base.service";
-import { isNotFoundError, isUnauthorizedError } from "../error";
+import { ImpresspressError, isNotFoundError, isUnauthorizedError } from "../error";
 import { PopupAuthSession } from "../popup-auth-session";
 
 /**
@@ -12,8 +12,9 @@ export type OAuthProviderName = "google" | "github" | "microsoft";
 /**
  * The real shape returned under the `user` key by `POST /login`,
  * `POST /signup`, and `GET /me` — see `blocks/auth_ui/api/{login,signup,me}.rs`.
- * Distinct from the generated `AuthUser`/`User` DB-row types, which model a
- * different (out of date) column set that these endpoints never return.
+ * This is the whole user surface the SDK exposes: the endpoints project a
+ * session view, not a table row, and there is no column set behind it to
+ * mirror.
  */
 export interface AuthSessionUser {
   id: string;
@@ -232,7 +233,10 @@ export class AuthService extends BaseService {
   async refreshSession(refreshToken?: string): Promise<AuthTokens> {
     const token = refreshToken ?? this.tokens?.refresh_token;
     if (!token) {
-      throw new Error("No refresh token available — sign in first or pass one explicitly");
+      throw new ImpresspressError(
+        "no_refresh_token",
+        "No refresh token available — sign in first or pass one explicitly",
+      );
     }
     const tokens = await this.request<AuthTokens>({
       method: "POST",
@@ -312,7 +316,7 @@ export class AuthService extends BaseService {
           return undefined;
         }
         if (message.error) {
-          throw new Error(message.error);
+          throw new ImpresspressError("oauth_error", message.error);
         }
         return true;
       },
@@ -324,7 +328,10 @@ export class AuthService extends BaseService {
 
     const user = await this.getUser();
     if (!user) {
-      throw new Error("Authentication failed");
+      throw new ImpresspressError(
+        "authentication_failed",
+        "Authentication failed: the popup completed but no session was established",
+      );
     }
     return user;
   }

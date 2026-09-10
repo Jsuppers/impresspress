@@ -13,6 +13,42 @@
  * `"invalid_credentials"`) that some handlers additionally attach as
  * structured meta — that value, when present, is surfaced as `detailCode`.
  */
+
+/**
+ * Codes the SDK raises itself, as opposed to the `WaferErrorCode` it echoes
+ * from a server error body. `code` on `ImpresspressError` stays a plain
+ * `string` because the server side of that vocabulary is open-ended; this
+ * union documents the closed client side so a caller can branch on it
+ * without matching message text.
+ *
+ * `"aborted"` and `"timeout"` are the transport's own words for "the caller
+ * cancelled" and "the deadline passed", and the OAuth popup reuses them for
+ * exactly those two events rather than inventing a parallel vocabulary.
+ */
+export type SdkErrorCode =
+  /** The caller's `AbortSignal` fired (or the OAuth popup session was cancelled). */
+  | "aborted"
+  /** The request (or the OAuth popup session) ran past its deadline. */
+  | "timeout"
+  /** `fetch` failed before a response existed (DNS, TLS, offline, CORS). */
+  | "network_error"
+  /** A non-2xx response whose body named no `error` code. */
+  | "internal_error"
+  /** A method `HttpClient` cannot send was passed to `request`. */
+  | "unsupported_method"
+  /** `uploadFile` was handed something that is not a File, Blob, or Buffer. */
+  | "invalid_file_type"
+  /** `refreshSession` had no cached token and none was passed. */
+  | "no_refresh_token"
+  /** The OAuth popup posted back an `error` of its own. */
+  | "oauth_error"
+  /** The OAuth popup completed, but no session existed afterwards. */
+  | "authentication_failed"
+  /** `window.open` returned null — a popup blocker stopped the flow. */
+  | "popup_blocked"
+  /** The OAuth popup closed before the flow completed. */
+  | "popup_closed";
+
 export class ImpresspressError extends Error {
   /** Coarse wafer error code from the `error` field (e.g. "NotFound"). */
   public readonly code: string;

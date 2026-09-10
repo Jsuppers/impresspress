@@ -1,18 +1,41 @@
 import { BaseService } from "./base.service";
 
+/**
+ * One registered block, as `GET /b/admin/api/extensions` lists them.
+ * `blocks/admin/mod.rs::handle_extensions` projects exactly these five keys
+ * off wafer-run's `BlockInfo`; there is no description, author, config blob
+ * or metadata object anywhere in that response, and `enabled` is a literal
+ * `true` for every row (a registered block is by definition enabled — there
+ * is no server-side enable/disable lifecycle).
+ */
 export interface Extension {
+  /** Block name in the canonical `{org}/{block}` form. */
   name: string;
+  /** Semantic version of the block implementation. */
   version: string;
-  description: string;
-  author: string;
+  /** Interface identifier, e.g. `"middleware@v1"`. */
+  interface: string;
+  /** One-line human-readable summary of what the block does. */
+  summary: string;
+  /** Always `true` — every listed block is registered, hence enabled. */
   enabled: boolean;
-  config?: Record<string, any>;
-  metadata?: {
-    tags?: string[];
-    homepage?: string;
-    license?: string;
-  };
 }
+
+/**
+ * `call`'s options, split by whether the method carries a body.
+ *
+ * `BaseService.request` used to switch on the method and silently drop `data`
+ * for GET and DELETE. The shared client forwards it instead, and `fetch`
+ * throws "Request with GET/HEAD method cannot have body", which surfaces as an
+ * opaque `network_error`. Neither dropping the caller's payload nor failing at
+ * the transport is right, so the combination is unrepresentable and the
+ * compiler says so at the call site.
+ */
+type ExtensionCallParams = Record<string, any>;
+
+export type ExtensionCallOptions =
+  | { method?: "GET" | "DELETE"; data?: never; params?: ExtensionCallParams }
+  | { method: "POST" | "PUT" | "PATCH"; data?: any; params?: ExtensionCallParams };
 
 export class ExtensionsService extends BaseService {
   /** List all available extensions (registered blocks). `GET /b/admin/api/extensions`. */
@@ -32,16 +55,12 @@ export class ExtensionsService extends BaseService {
   async call<T = any>(
     extension: string,
     endpoint: string,
-    options?: {
-      method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
-      data?: any;
-      params?: Record<string, any>;
-    },
+    options?: ExtensionCallOptions,
   ): Promise<T> {
-    const queryString = options?.params ? this.buildQueryString(options.params) : "";
     return this.request<T>({
       method: options?.method || "GET",
-      url: `/b/${extension}/${endpoint}${queryString ? `?${queryString}` : ""}`,
+      url: `/b/${extension}/${endpoint}`,
+      params: options?.params,
       data: options?.data,
     });
   }

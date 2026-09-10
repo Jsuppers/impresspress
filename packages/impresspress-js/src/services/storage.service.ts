@@ -1,4 +1,6 @@
 import { BaseService } from "./base.service";
+import { NO_TIMEOUT } from "../http-client";
+import { ImpresspressError } from "../error";
 
 /**
  * Aligned to the REAL dispatch table in
@@ -43,7 +45,20 @@ export interface ListOptions {
   page_size?: number;
 }
 
-export interface UploadFileOptions {
+/**
+ * Bounds for a byte transfer. Uploads and downloads deliberately run with NO
+ * timeout by default — their duration is a function of file size and link
+ * speed, so any fixed ceiling is a cap on how big a file the SDK can move.
+ * Pass `timeout` to impose one, and/or `signal` to cancel.
+ */
+export interface TransferOptions {
+  /** Milliseconds before the transfer aborts. Omitted means: no limit. */
+  timeout?: number;
+  /** Cancel the transfer (the only bound that applies by default). */
+  signal?: AbortSignal;
+}
+
+export interface UploadFileOptions extends TransferOptions {
   /** Object key. Required unless `file` is a `File` (its `.name` is used as a fallback). */
   key?: string;
   contentType?: string;
@@ -133,18 +148,25 @@ export class StorageService extends BaseService {
 
   /** List objects in a bucket. */
   async listObjects(bucketName: string, options?: ListOptions): Promise<ListObjectsResult> {
-    const queryString = options ? this.buildQueryString(options) : "";
     return this.request<ListObjectsResult>({
       method: "GET",
-      url: `/b/storage/api/buckets/${encodeURIComponent(bucketName)}/objects${queryString ? `?${queryString}` : ""}`,
+      url: `/b/storage/api/buckets/${encodeURIComponent(bucketName)}/objects`,
+      params: options as Record<string, unknown> | undefined,
     });
   }
 
-  /** Download an object's raw bytes. */
-  async downloadFile(bucketName: string, key: string): Promise<Blob> {
-    return this.requestBlob(
-      `/b/storage/api/buckets/${encodeURIComponent(bucketName)}/objects/${encodeObjectKey(key)}`,
-    );
+  /**
+   * Download an object's raw bytes. Runs with no timeout unless
+   * `options.timeout` sets one — see `TransferOptions`.
+   */
+  async downloadFile(bucketName: string, key: string, options?: TransferOptions): Promise<Blob> {
+    return this.request<Blob>({
+      method: "GET",
+      url: `/b/storage/api/buckets/${encodeURIComponent(bucketName)}/objects/${encodeObjectKey(key)}`,
+      responseType: "blob",
+      timeout: options?.timeout ?? NO_TIMEOUT,
+      signal: options?.signal,
+    });
   }
 
   /** Direct URL for downloading an object (e.g. for `<img src>` / `<a href>`). */
@@ -156,6 +178,9 @@ export class StorageService extends BaseService {
    * Upload a file to a bucket. `options.key` is required unless `file` is a
    * `File` (browser), whose `.name` is used as a fallback — mirrors the
    * server's multipart handling in `handle_upload_object`.
+   *
+   * Runs with no timeout unless `options.timeout` sets one — see
+   * `TransferOptions`.
    */
   async uploadFile(
     bucketName: string,
@@ -171,14 +196,20 @@ export class StorageService extends BaseService {
     } else if (typeof Buffer !== "undefined" && Buffer.isBuffer(file)) {
       formData.append("file", new Blob([new Uint8Array(file)]), options?.key ?? "file");
     } else {
-      throw new Error("Invalid file type");
+      throw new ImpresspressError(
+        "invalid_file_type",
+        "Invalid file type: expected a File, Blob, or Buffer",
+      );
     }
 
-    const keyQuery = options?.key ? `?key=${encodeURIComponent(options.key)}` : "";
-    return this.requestFormData(
-      `/b/storage/api/buckets/${encodeURIComponent(bucketName)}/objects${keyQuery}`,
-      formData,
-    );
+    return this.request({
+      method: "POST",
+      url: `/b/storage/api/buckets/${encodeURIComponent(bucketName)}/objects`,
+      data: formData,
+      params: options?.key ? { key: options.key } : undefined,
+      timeout: options?.timeout ?? NO_TIMEOUT,
+      signal: options?.signal,
+    });
   }
 
   /** Delete an object. */
@@ -204,12 +235,12 @@ export class StorageService extends BaseService {
     query: string,
     options?: { page?: number; page_size?: number },
   ): Promise<SearchResult> {
-    const params = { q: query, ...options };
     const result = await this.request<
       RecordListWire<Omit<FileMetadataRecord, "id">>
     >({
       method: "GET",
-      url: `/b/storage/api/search?${this.buildQueryString(params)}`,
+      url: "/b/storage/api/search",
+      params: { q: query, ...options },
     });
     return flattenRecordList(result);
   }
