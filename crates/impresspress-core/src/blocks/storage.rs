@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use wafer_block::{codec, stream::StreamEvent, wire::storage as wire};
+use wafer_block::{codec, stream::StreamEvent, wire::storage as wire, ServiceOp};
 use wafer_core::{clients::database as db, interfaces::storage::service::StorageService};
 use wafer_run::{
     context::Context, Block, BlockInfo, ErrorCode, InputStream, LifecycleEvent, Message,
@@ -97,6 +97,7 @@ fn is_safe_block_name(name: &str) -> bool {
 }
 
 /// Result of resolving a storage path.
+#[derive(Debug)]
 struct ResolvedPath {
     /// The actual storage path after resolution.
     path: String,
@@ -130,7 +131,18 @@ fn resolve_folder(caller: &str, folder: &str) -> ResolvedPath {
 /// Determine access type from the storage operation kind.
 fn access_type_for_op(kind: &str) -> &'static str {
     match kind {
-        "storage.get" | "storage.list" | "storage.list_folders" => "read",
+        // `get_streaming` is the streaming form of `get` — the same read of
+        // `{folder}/{key}`, so it is classified as a read here too. Left out,
+        // it fell through to "write" and a cross-block download would have
+        // been checked against a WRITE grant.
+        ServiceOp::STORAGE_GET
+        | ServiceOp::STORAGE_GET_STREAMING
+        | ServiceOp::STORAGE_LIST
+        | ServiceOp::STORAGE_LIST_FOLDERS => "read",
+        // Everything else — including any op added upstream after this was
+        // written — is classified as a write, which is the fail-closed answer:
+        // it demands the stricter grant rather than silently admitting a
+        // mutation under a read grant.
         _ => "write",
     }
 }
@@ -194,8 +206,9 @@ impl PathRewrite for wire::DeleteFolderRequest {
 /// SEC-003 `wrap_resource` (object ops include the object key; folder/list ops
 /// keep `wrap_resource = path`), re-encode, and return the rewritten bytes.
 ///
-/// One generic body shared by all six path-carrying ops — keeps the per-op
-/// `wrap_resource` rule in exactly one place.
+/// One generic body shared by every path-carrying op — keeps the per-op
+/// `wrap_resource` rule in exactly one place. (Deliberately uncounted: an arm
+/// added to [`rewrite_request_body`] must not be able to re-stale this line.)
 fn rewrite_op<T: PathRewrite>(
     body: &[u8],
     caller: &str,
@@ -220,6 +233,34 @@ fn rewrite_op<T: PathRewrite>(
     Ok((bytes, resolved))
 }
 
+/// Answer to `storage.put_streaming`: recognised, and deliberately not served.
+///
+/// `wafer_core::clients::storage::put_stream` frames its request as a
+/// `PutStreamingHeader` chunk (folder / key / content_type) followed by the
+/// raw body chunks. This shim buffers its whole input
+/// (`input.collect_to_bytes()`) and rewrites ONE decoded request struct, so
+/// arming `put_streaming` as another [`rewrite_op`] arm would do two wrong
+/// things at once: decode the header-plus-body concatenation as a single
+/// `wire::` request (garbage), and buffer the very upload the caller chose the
+/// streaming op to avoid buffering. Forwarding it needs frame-preserving
+/// rewriting this shim does not have.
+///
+/// So it is refused by name. A caller that reaches for it gets a message that
+/// says what happened and what to do instead, rather than the
+/// [`UNKNOWN_OP`] fallthrough that made `storage.get_streaming` look like a
+/// backend fault for 60 PRs.
+const PUT_STREAMING_UNSUPPORTED: &str = "storage.put_streaming is not served by the impresspress \
+     storage shim: the shim buffers a request body to rewrite its folder into the caller's \
+     namespace, and a streaming upload's PutStreamingHeader framing needs frame-preserving \
+     support it does not have. Use storage.put (wafer_core::clients::storage::put) until this \
+     shim can forward frames.";
+
+/// Answer to a `storage.*` op this shim does not know at all, prefixed onto
+/// the op name. Named because the enumeration guard
+/// (`shim_answers_every_upstream_storage_op`) recognises the fallthrough by
+/// it rather than by a re-typed literal.
+const UNKNOWN_OP: &str = "unknown storage op: ";
+
 /// Rewrite the folder/name field in the request body bytes.
 ///
 /// Returns the rewritten body bytes plus the resolved path info.
@@ -239,7 +280,7 @@ fn rewrite_request_body(
         // No folder field to rewrite — handled by filtering results.
         // list_folders has no `wrap.resource` cross-check in the wafer-core
         // handler, so wrap_resource is unused; populate it for consistency.
-        "storage.list_folders" => Ok((
+        ServiceOp::STORAGE_LIST_FOLDERS => Ok((
             body.to_vec(),
             ResolvedPath {
                 wrap_resource: caller.to_string(),
@@ -247,15 +288,39 @@ fn rewrite_request_body(
                 cross_block: false,
             },
         )),
-        "storage.create_folder" => rewrite_op::<wire::CreateFolderRequest>(body, caller),
-        "storage.delete_folder" => rewrite_op::<wire::DeleteFolderRequest>(body, caller),
-        "storage.put" => rewrite_op::<wire::PutRequest>(body, caller),
-        "storage.get" => rewrite_op::<wire::GetRequest>(body, caller),
-        "storage.delete" => rewrite_op::<wire::DeleteRequest>(body, caller),
-        "storage.list" => rewrite_op::<wire::ListRequest>(body, caller),
+        ServiceOp::STORAGE_CREATE_FOLDER => rewrite_op::<wire::CreateFolderRequest>(body, caller),
+        ServiceOp::STORAGE_DELETE_FOLDER => rewrite_op::<wire::DeleteFolderRequest>(body, caller),
+        ServiceOp::STORAGE_PUT => rewrite_op::<wire::PutRequest>(body, caller),
+        ServiceOp::STORAGE_GET => rewrite_op::<wire::GetRequest>(body, caller),
+        // `storage.get_streaming` is `storage.get`'s streaming twin, not a
+        // separate capability: `wafer-core`'s handler decodes it as the SAME
+        // `wire::GetRequest` and authorizes the SAME `{folder}/{key}` read
+        // (`interfaces/storage/handler.rs`, `ServiceOp::STORAGE_GET_STREAMING`),
+        // and `StorageService::get_streaming` has a default that calls `get`
+        // and wraps the buffered body as a single-chunk stream — so every
+        // backend answers it. The folder rewriting therefore applies
+        // unchanged.
+        //
+        // Omitting it made this shim answer `unknown storage op` to the only
+        // op the block's two download paths issue (`store::get_stream`, from
+        // `blocks/files/storage/objects.rs` and `blocks/files/share.rs`), so
+        // EVERY object download and every share link 500'd on the native
+        // backend. The callers stream deliberately — a multi-GB object must
+        // not be buffered into the isolate — so the missing arm is the bug,
+        // not the streaming.
+        ServiceOp::STORAGE_GET_STREAMING => rewrite_op::<wire::GetRequest>(body, caller),
+        // `storage.put_streaming` is the one upstream op with no rewrite: see
+        // [`PUT_STREAMING_UNSUPPORTED`] for why arming it here would be worse
+        // than refusing it.
+        ServiceOp::STORAGE_PUT_STREAMING => Err(WaferError::new(
+            ErrorCode::Unimplemented,
+            PUT_STREAMING_UNSUPPORTED,
+        )),
+        ServiceOp::STORAGE_DELETE => rewrite_op::<wire::DeleteRequest>(body, caller),
+        ServiceOp::STORAGE_LIST => rewrite_op::<wire::ListRequest>(body, caller),
         other => Err(WaferError::new(
             ErrorCode::InvalidArgument,
-            format!("unknown storage op: {other}"),
+            format!("{UNKNOWN_OP}{other}"),
         )),
     }
 }
@@ -524,6 +589,9 @@ mod tests {
     #[test]
     fn test_access_type_for_op() {
         assert_eq!(access_type_for_op("storage.get"), "read");
+        // The streaming download is a read, like its buffered twin —
+        // otherwise a cross-block download is checked against a WRITE grant.
+        assert_eq!(access_type_for_op("storage.get_streaming"), "read");
         assert_eq!(access_type_for_op("storage.list"), "read");
         assert_eq!(access_type_for_op("storage.list_folders"), "read");
         assert_eq!(access_type_for_op("storage.put"), "write");
@@ -564,6 +632,33 @@ mod tests {
 
         let req: wire::GetRequest = codec::decode(&rewritten).unwrap();
         assert_eq!(req.folder, "wafer-run/web/public");
+    }
+
+    /// `storage.get_streaming` carries the same `wire::GetRequest` as
+    /// `storage.get` and must be namespaced identically. Before the fix this
+    /// arm was absent, so the shim answered `unknown storage op` and every
+    /// object download / share link 500'd.
+    #[test]
+    fn test_rewrite_request_body_get_streaming() {
+        let body = codec::encode(&wire::GetRequest {
+            folder: "uploads".into(),
+            key: "photo.jpg".into(),
+        })
+        .unwrap();
+
+        let (rewritten, resolved) =
+            rewrite_request_body("storage.get_streaming", &body, "impresspress/files")
+                .expect("the streaming download must be a known op");
+
+        assert_eq!(resolved.path, "impresspress/files/uploads");
+        assert_eq!(
+            resolved.wrap_resource,
+            "impresspress/files/uploads/photo.jpg"
+        );
+        assert!(!resolved.cross_block);
+        let req: wire::GetRequest = codec::decode(&rewritten).unwrap();
+        assert_eq!(req.folder, "impresspress/files/uploads");
+        assert_eq!(req.key, "photo.jpg");
     }
 
     #[test]
@@ -625,5 +720,76 @@ mod tests {
         let (_, resolved) =
             rewrite_request_body("storage.list_folders", &[], "impresspress/files").unwrap();
         assert_eq!(resolved.wrap_resource, "impresspress/files");
+    }
+
+    /// THE GUARD. Every `storage.*` op the upstream client can emit must get a
+    /// deliberate answer from this shim — either a namespace rewrite, or a
+    /// refusal this file wrote on purpose. Falling through to
+    /// [`UNKNOWN_OP`] is not an answer; it is the shape of the outage this PR
+    /// fixes.
+    ///
+    /// `storage.get_streaming` sat in that fallthrough while both of the files
+    /// block's download paths issued it, so every object download and every
+    /// share link 500'd through 60 green PRs. Nothing in the suite enumerated
+    /// the op set, so nothing could see it.
+    ///
+    /// The enumeration is [`ServiceOp::STORAGE_OPS`] itself — the same list
+    /// upstream builds its `storage@v1` action catalog from — so an op added
+    /// to the client fails here instead of reaching a user as a 500.
+    #[test]
+    fn shim_answers_every_upstream_storage_op() {
+        for op in ServiceOp::STORAGE_OPS {
+            // The body is empty on purpose: what is pinned here is DISPATCH,
+            // not decoding. A recognised op may rewrite (`list_folders`
+            // ignores the body), may fail to decode an empty body, or may
+            // refuse by name — the one answer it must never give is the
+            // unknown-op fallthrough.
+            if let Err(e) = rewrite_request_body(op, &[], "impresspress/files") {
+                assert!(
+                    !e.message.starts_with(UNKNOWN_OP),
+                    "{op} falls through to the unknown-op arm ({}); \
+                     every op in ServiceOp::STORAGE_OPS needs an arm — a \
+                     rewrite, or a deliberate refusal that says why",
+                    e.message,
+                );
+            }
+        }
+    }
+
+    /// `storage.put_streaming` is the deliberate refusal the guard above
+    /// accepts. Pinned by name and code so nobody "fixes" it into a
+    /// [`rewrite_op`] arm, which would decode the header-plus-body framing as
+    /// one request and buffer the upload the caller chose not to buffer.
+    #[test]
+    fn put_streaming_is_refused_deliberately_not_as_an_unknown_op() {
+        let err = rewrite_request_body(ServiceOp::STORAGE_PUT_STREAMING, &[], "impresspress/files")
+            .expect_err("the shim cannot forward a framed streaming upload");
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert_eq!(err.message, PUT_STREAMING_UNSUPPORTED);
+        assert!(
+            !err.message.starts_with(UNKNOWN_OP),
+            "the refusal must not read as a fallthrough",
+        );
+    }
+
+    /// A streaming upload is a WRITE, like its buffered twin — the fail-closed
+    /// default, and the classification the refusal above is logged under.
+    #[test]
+    fn put_streaming_is_classified_as_a_write() {
+        assert_eq!(
+            access_type_for_op(ServiceOp::STORAGE_PUT_STREAMING),
+            "write"
+        );
+    }
+
+    /// Negative control for [`shim_answers_every_upstream_storage_op`]: the
+    /// fallthrough still exists, so that test cannot pass by the arm having
+    /// been deleted.
+    #[test]
+    fn an_op_outside_the_upstream_set_is_still_refused() {
+        let err = rewrite_request_body("storage.teleport", &[], "impresspress/files")
+            .expect_err("an op no upstream client emits must be refused");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.message, format!("{UNKNOWN_OP}storage.teleport"));
     }
 }

@@ -340,6 +340,76 @@ mod integration_tests {
         test_support::{auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext},
     };
 
+    /// Collect the body bytes a download `OutputStream` carried, failing with
+    /// the stream's error message when it errored instead of serving.
+    async fn download_body(out: OutputStream) -> Vec<u8> {
+        use futures::StreamExt;
+        use wafer_block::stream::StreamEvent;
+
+        let mut body = Vec::new();
+        let mut events = out;
+        while let Some(evt) = events.next().await {
+            match evt {
+                StreamEvent::Chunk(bytes) => body.extend_from_slice(&bytes),
+                StreamEvent::Error(e) => {
+                    panic!("download errored instead of serving bytes: {}", e.message)
+                }
+                _ => {}
+            }
+        }
+        body
+    }
+
+    /// CRUX regression (found by driving the live app, and the outage the
+    /// whole suite was blind to): upload an object through the real upload
+    /// handler, then download it through the real download handler and assert
+    /// the bytes come back.
+    ///
+    /// Nothing in 60 merged PRs did this. The existing download tests seeded
+    /// the object with `store::put` and read it back with `store::get` — both
+    /// buffered ops — while `handle_get_object` issues `storage.get_streaming`
+    /// (`store::get_stream`). That op was missing from
+    /// `blocks::storage::rewrite_request_body`'s match, so the namespacing
+    /// shim answered `InvalidArgument: unknown storage op:
+    /// storage.get_streaming` and every `GET
+    /// /b/storage/api/buckets/{b}/objects/{k}` was a 500 on the live server.
+    ///
+    /// Asserting "not an error" would not have been enough either: the bytes
+    /// are the contract, so they are what this asserts.
+    #[tokio::test]
+    async fn uploaded_object_downloads_back_the_same_bytes() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let file_bytes: &[u8] = b"the exact bytes a user uploaded\x00\x01\x02\xff";
+        let upload = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "report.bin", "application/octet-stream"),
+            InputStream::from_bytes(file_bytes.to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(upload).await["uploaded"],
+            serde_json::json!(true),
+            "the upload half of the round trip must succeed"
+        );
+
+        let mut download_msg = auth_msg(
+            "retrieve",
+            "/b/storage/api/buckets/assets/objects/report.bin",
+            "alice",
+        );
+        download_msg.set_meta("req.param.name", "assets");
+        download_msg.set_meta("req.param.key", "report.bin");
+
+        let body = download_body(handle_get_object(&ctx, &download_msg).await).await;
+
+        assert_eq!(
+            body, file_bytes,
+            "the download must return the uploaded bytes"
+        );
+    }
+
     /// A download served via `handle_get_object` must take the STREAMING
     /// response shape: the `resp.stream` opt-in marker and the object's real
     /// content-type are emitted as **leading `Meta`** events (before the first

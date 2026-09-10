@@ -346,7 +346,23 @@ impl TestContext {
         ctx
     }
 
-    /// Build a `TestContext` with admin + auth + files migrations applied.
+    /// Build a `TestContext` with admin + auth + files migrations applied,
+    /// **acting as `impresspress/files`** — on the same two `call_block` gates
+    /// production applies to that block.
+    ///
+    /// The identity is not decoration. A bare fixture leaves `caller_requires`
+    /// empty, which production reads as "declares no `requires`" —
+    /// unrestricted — so it certifies calls the runtime refuses. That is
+    /// exactly how the share path shipped calling `wafer-run/crypto` without
+    /// declaring it: every test that created a share passed, and the live
+    /// server answered `PermissionDenied: block 'wafer-run/crypto' not in
+    /// requires list`. Wrapping only the two fixtures that hit the bug would
+    /// have left the same blind spot under every other files-block test, so
+    /// the gate goes on the constructor they all share.
+    ///
+    /// Both lists come off the declarations the runtime reads (see
+    /// [`crate::blocks::files::test_wrap::as_files_block`]); nothing is
+    /// re-typed here.
     #[cfg(feature = "block-files")]
     pub async fn with_files() -> Self {
         let ctx = Self::with_auth().await;
@@ -356,7 +372,7 @@ impl TestContext {
             crate::blocks::files::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        crate::blocks::files::test_wrap::as_files_block(ctx)
     }
 
     /// Build a `TestContext` with admin + auth + userportal migrations applied.

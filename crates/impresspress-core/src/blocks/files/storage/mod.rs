@@ -51,12 +51,9 @@ mod test_helpers {
 
     use async_trait::async_trait;
     use serde_json::json;
-    use wafer_core::{
-        interfaces::storage::service::{
-            FolderInfo, ListOptions as StoreListOptions, ObjectInfo, ObjectList, StorageError,
-            StorageService,
-        },
-        service_blocks::storage::StorageBlock,
+    use wafer_core::interfaces::storage::service::{
+        FolderInfo, ListOptions as StoreListOptions, ObjectInfo, ObjectList, StorageError,
+        StorageService,
     };
 
     use crate::{blocks::files::repo, test_support::TestContext};
@@ -186,13 +183,31 @@ mod test_helpers {
         }
     }
 
-    /// [`TestContext::with_files`] plus a real `wafer-run/storage` block over
-    /// [`MemStorage`], so handlers can complete their `store::*` calls.
+    /// [`TestContext::with_files`] plus the **production** `wafer-run/storage`
+    /// wiring over [`MemStorage`], so handlers can complete their `store::*`
+    /// calls against the same stack the server runs.
+    ///
+    /// "Production wiring" is load-bearing, and it is what this fixture used
+    /// to get wrong. It registered the bare `wafer-core` `StorageBlock`, so
+    /// every storage call in this module's tests skipped
+    /// [`crate::blocks::storage::ImpresspressStorageBlock`] — the namespacing
+    /// shim the runtime actually registers under that name
+    /// (`builder::registration`). A call the shim rejects therefore passed
+    /// here and 500'd on the wire: `storage.get_streaming` (every object
+    /// download) was missing from its op match, and 60 merged PRs of green CI
+    /// never saw it. It also left `caller_requires` empty, so a `call_block`
+    /// to a block the files block never declared was admitted here and denied
+    /// in production.
+    ///
+    /// Both gates are now live: the shim is the registered block, and
+    /// [`TestContext::with_files`] itself installs the files block's OWN
+    /// declared `requires` plus the deployment's grants (sourced from the
+    /// admin block's declaration, which is where they live in production).
     pub(super) async fn ctx_with_storage() -> TestContext {
         let mut ctx = TestContext::with_files().await;
         ctx.register_block(
             "wafer-run/storage",
-            Arc::new(StorageBlock::new(Arc::new(MemStorage::default()))),
+            crate::blocks::files::test_wrap::storage_block(Arc::new(MemStorage::default())),
         );
         ctx
     }
