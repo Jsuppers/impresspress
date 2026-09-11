@@ -979,3 +979,65 @@ mod wrap_denial_tests {
         );
     }
 }
+
+/// CFG-01 reproduction. Kept in its own module so the fixture it needs — a
+/// config service seeded from the table the way boot seeds it — cannot leak
+/// into the tests above, which deliberately seed their own values.
+#[cfg(test)]
+mod config_store_reproduction {
+    use super::*;
+    use crate::test_support::TestContext;
+
+    /// A setting changed through the documented admin API must reach the
+    /// config readers blocks actually use.
+    ///
+    /// `PATCH /b/admin/api/settings/{key}` persists through
+    /// `ops::update_variable` → `variables::upsert_by_key`, which writes the
+    /// `variables` table and stops there. Every block instead reads through
+    /// `wafer_core::clients::config::get_default`, served by an
+    /// `EnvConfigService` that `cli/server.rs` seeds from that table exactly
+    /// once at boot. Nothing rejoins the two surfaces, so an admin who
+    /// changes the site's primary colour through the documented endpoint
+    /// keeps seeing the old one until the process restarts.
+    ///
+    /// Confirmed live on 2026-09-10: restarting a native server against the
+    /// same database made the page render the new colour.
+    #[tokio::test]
+    async fn patch_settings_reaches_config_readers_without_a_restart() {
+        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        // Boot once, the way the native server does, before any admin write.
+        ctx.boot_config_service().await;
+
+        let mut msg = crate::test_support::admin_msg("update", "/b/admin/api/settings");
+        msg.set_meta("req.param.key", KEY);
+        let body = serde_json::to_vec(&serde_json::json!({ "value": "#ff0000" }))
+            .expect("serialize request body");
+        let status = crate::test_support::output_status(
+            handle_set(&ctx, &msg, InputStream::from_bytes(body)).await,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the documented admin endpoint accepted the change"
+        );
+
+        // The durable half works: the row is there.
+        let row = variables::get_by_key(&ctx, KEY)
+            .await
+            .expect("read the variable back")
+            .expect("the admin write created a row");
+        assert_eq!(row.value, "#ff0000");
+
+        // The half that decides what a visitor sees does not.
+        let seen = wafer_core::clients::config::get_default(&ctx, KEY, "unset").await;
+        assert_eq!(
+            seen, "#ff0000",
+            "a saved admin setting must be visible to config readers without a restart"
+        );
+    }
+}

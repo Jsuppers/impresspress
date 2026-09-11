@@ -719,6 +719,48 @@ impl TestContext {
             .await
     }
 
+    /// The platform `DatabaseService` behind this fixture.
+    ///
+    /// Exposed so a test can hand the same database the block clients write
+    /// through to a production loader that takes a raw service rather than a
+    /// `Context` — [`crate::platform_state::variables::seed_and_load`] being
+    /// the one that matters, since re-implementing what boot does is how a
+    /// test ends up certifying a path production never takes.
+    pub fn db_service(
+        &self,
+    ) -> &Arc<dyn wafer_core::interfaces::database::service::DatabaseService> {
+        &self.db_service
+    }
+
+    /// Install a `wafer-run/config` service block seeded the way a real boot
+    /// seeds one: run the production `seed_and_load` loader over the
+    /// `variables` table, then fill an `EnvConfigService` through
+    /// [`crate::builder::fill_config_service`] and publish the same map to
+    /// the synchronous `config_get` snapshot. That pair is exactly what
+    /// `impresspress/src/cli/server.rs` runs at startup.
+    ///
+    /// Unlike [`Self::set_config`], nothing is seeded by the test: the
+    /// service holds precisely what the table held when this was called.
+    /// Calling it a second time models a process restart against the same
+    /// database.
+    ///
+    /// PRECONDITION: admin migrations have run, so the `variables` table
+    /// exists — `seed_and_load` documents the same requirement.
+    pub async fn boot_config_service(&mut self) {
+        let vars = crate::platform_state::variables::seed_and_load(&self.db_service, &[])
+            .await
+            .expect("seed and load variables at boot");
+
+        let svc: Arc<dyn wafer_core::interfaces::config::service::ConfigService> =
+            Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());
+        let svc = crate::builder::fill_config_service(svc, vars.clone());
+
+        self.config = Arc::new(vars);
+        let block: Arc<dyn Block> =
+            Arc::new(wafer_core::service_blocks::config::ConfigBlock::new(svc));
+        self.register_block("wafer-run/config", block);
+    }
+
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
     /// will route to this block's `handle()`.
     ///
