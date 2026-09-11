@@ -325,6 +325,28 @@ pub(super) async fn delete_role(
 
 /// Create a config variable, writing an audit-log row. Validates `_URL` keys
 /// against [`validate_url_value`] (SSRF). `key` must be non-empty.
+/// Refuse a key the runtime owns rather than storing an inert row.
+///
+/// `blocks::config` never serves infrastructure keys (`IMPRESSPRESS_*` without
+/// `__`) or internal adapter keys (`__…__`) from the variables table — the
+/// browser's `__IMPRESSPRESS_RUNTIME_KIND__ = "browser"` marker is what keeps
+/// Stripe secret-key operations off in a visitor's browser. A row under one of
+/// those keys is therefore a setting the admin can see and edit and that no
+/// reader will ever honour, which is the silent no-op this program keeps
+/// removing. Both write surfaces funnel through here.
+///
+/// The JWT secret is deliberately NOT refused: it is a legitimate table row
+/// that `seed_jwt_secret` writes on native. Reads prefer the boot map for it,
+/// but the row itself belongs in the table.
+fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
+    if crate::config_vars::is_infrastructure_key(key) || crate::config_vars::is_internal_key(key) {
+        return Err(err_bad_request(&format!(
+            "{key} is set by the runtime, not stored configuration; it cannot be created or edited here"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn create_variable(
     ctx: &dyn Context,
     msg: &Message,
@@ -337,6 +359,7 @@ pub(super) async fn create_variable(
     if key.is_empty() {
         return Err(err_bad_request("Key is required"));
     }
+    reject_runtime_owned_key(key)?;
     let admin_id = msg.user_id().to_string();
 
     // Validate URL-type keys (SSRF) on both surfaces.
@@ -397,6 +420,7 @@ pub(super) async fn update_variable(
     if key.is_empty() {
         return Err(err_bad_request("Missing setting key"));
     }
+    reject_runtime_owned_key(key)?;
     let admin_id = msg.user_id().to_string();
 
     if let Some(value) = update.value {
@@ -859,5 +883,104 @@ mod tests {
             1,
             "an integer disabled flag must still count as touching the flag"
         );
+    }
+}
+
+/// The admin variables surface must refuse keys the runtime owns.
+#[cfg(test)]
+mod runtime_key_guard_tests {
+    use super::*;
+    use crate::test_support::{admin_msg, TestContext};
+
+    async fn admin_ctx() -> TestContext {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx
+    }
+
+    /// An internal adapter key cannot be created through the admin API.
+    ///
+    /// `blocks::config` never serves `__…__` keys from the variables table —
+    /// the browser's `__IMPRESSPRESS_RUNTIME_KIND__ = "browser"` marker is what
+    /// keeps Stripe secret-key operations off in a visitor's browser. Storing
+    /// one therefore produces a settings row that no reader will ever honour:
+    /// the admin sees a value that does nothing, which is the silent no-op this
+    /// work exists to remove. Refuse it at the write instead.
+    #[tokio::test]
+    async fn create_refuses_an_internal_runtime_key() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/settings");
+
+        let result = create_variable(
+            &ctx,
+            &msg,
+            "__IMPRESSPRESS_RUNTIME_KIND__",
+            "server",
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an internal runtime key must be refused, not stored as a dead row"
+        );
+        assert!(
+            variables::get_by_key(&ctx, "__IMPRESSPRESS_RUNTIME_KIND__")
+                .await
+                .expect("read back")
+                .is_none(),
+            "a refused create must leave no row"
+        );
+    }
+
+    /// Same rule on the update surface, for an infrastructure key.
+    ///
+    /// `IMPRESSPRESS_*` without `__` is infrastructure and never in the
+    /// database by the repo's naming convention.
+    #[tokio::test]
+    async fn update_refuses_an_infrastructure_key() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+
+        let result = update_variable(
+            &ctx,
+            &msg,
+            crate::migration_helper::RUN_MIGRATIONS_KEY,
+            VariableUpdate {
+                value: Some("1"),
+                description: None,
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an infrastructure key must be refused on the update surface too"
+        );
+    }
+
+    /// Ordinary admin-editable keys are untouched by the guard.
+    #[tokio::test]
+    async fn an_ordinary_shared_key_is_still_accepted() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+
+        let row = update_variable(
+            &ctx,
+            &msg,
+            "WAFER_RUN_SHARED__APP_NAME",
+            VariableUpdate {
+                value: Some("Acme"),
+                description: None,
+            },
+        )
+        .await
+        // `OutputStream` has no `Debug`, so `expect` is unavailable here.
+        .unwrap_or_else(|_| panic!("a shared key must still be writable"));
+        assert_eq!(row.value, "Acme");
     }
 }
