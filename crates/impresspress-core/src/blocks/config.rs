@@ -50,7 +50,7 @@ use std::{
 };
 
 use wafer_block::{codec, wire::config as wire, ServiceOp};
-use wafer_core::interfaces::config::service::ConfigService;
+use wafer_core::interfaces::{config::service::ConfigService, database::service::DatabaseService};
 use wafer_run::{
     context::Context, Block, BlockInfo, ErrorCode, InputStream, Message, OutputStream,
     ResourceType, WaferError,
@@ -58,7 +58,7 @@ use wafer_run::{
 
 use crate::{
     config_generation::config_write_generation,
-    platform_state::variables::{self, VariablePatch},
+    platform_state::variables,
     util::{is_sensitive_key, validate_url_value},
 };
 
@@ -83,6 +83,22 @@ pub struct VariablesConfigBlock {
     /// Boot-seeded map: env/worker bindings, builder-time vars, block
     /// settings JSON, and the boot copy of every table row.
     boot: Arc<dyn ConfigService>,
+    /// The platform database, held as the raw service rather than reached
+    /// through `ctx`.
+    ///
+    /// `impresspress__admin__variables` belongs to the ADMIN block, and
+    /// `db::list_all` sends the collection as a WRAP resource, so reaching it
+    /// through `ctx` is a cross-block read that WRAP denies by default. This
+    /// block would then fall back to the boot map and serve compiled-in
+    /// defaults on every page — which is exactly what a live Cloudflare
+    /// deploy did before this field existed.
+    ///
+    /// Reading the platform's own config store through the raw service is the
+    /// established shape, not a workaround: `variables`' boot-flavour API is
+    /// documented as "over `DatabaseService`, before WRAP", and
+    /// `D1ConfigSource` reads the same table the same way for the same
+    /// reason.
+    db: Arc<dyn DatabaseService>,
     /// The `variables` table, memoized alongside the config-write generation
     /// it was read at. See [`Self::snapshot`].
     snapshot: CachedRows,
@@ -91,13 +107,14 @@ pub struct VariablesConfigBlock {
 impl VariablesConfigBlock {
     /// Wrap wafer-core's config block over the same boot-seeded service the
     /// builder already constructed.
-    pub fn new(boot: Arc<dyn ConfigService>) -> Self {
+    pub fn new(boot: Arc<dyn ConfigService>, db: Arc<dyn DatabaseService>) -> Self {
         let inner: Arc<dyn Block> = Arc::new(wafer_core::service_blocks::config::ConfigBlock::new(
             boot.clone(),
         ));
         Self {
             inner,
             boot,
+            db,
             snapshot: RwLock::new(None),
         }
     }
@@ -135,7 +152,7 @@ impl VariablesConfigBlock {
     ///
     /// No lock is held across the `await` — the guard is dropped before the
     /// fetch and re-taken after — so a hard-stopped request cannot strand one.
-    async fn snapshot(&self, ctx: &dyn Context) -> Option<ConfigRows> {
+    async fn snapshot(&self) -> Option<ConfigRows> {
         let generation = config_write_generation();
         {
             let cached = self
@@ -150,7 +167,7 @@ impl VariablesConfigBlock {
             }
         }
 
-        let rows = match variables::list_all(ctx).await {
+        let rows = match variables::load_all(&self.db).await {
             Ok(rows) => rows,
             Err(e) => {
                 // Reported rather than propagated: a config read that cannot
@@ -164,10 +181,11 @@ impl VariablesConfigBlock {
                 return None;
             }
         };
+        // `load_all` already returns a key/value map; an empty value falls
+        // through to the boot map rather than masking it (see the module docs).
         let map: HashMap<String, String> = rows
             .into_iter()
-            .filter(|row| !row.value.is_empty())
-            .map(|row| (row.key, row.value))
+            .filter(|(_, value)| !value.is_empty())
             .collect();
         let map = Arc::new(map);
 
@@ -180,28 +198,32 @@ impl VariablesConfigBlock {
 
     /// The stored value for `key`, or `None` when no row holds a non-empty
     /// one.
-    async fn stored_value(&self, ctx: &dyn Context, key: &str) -> Option<String> {
-        self.snapshot(ctx).await?.get(key).cloned()
+    async fn stored_value(&self, key: &str) -> Option<String> {
+        self.snapshot().await?.get(key).cloned()
     }
 
     /// Persist `key` and let cached readers know the store moved.
-    async fn write(ctx: &dyn Context, key: &str, value: &str) -> Result<(), OutputStream> {
+    ///
+    /// Writes through the raw service for the same reason reads do: a
+    /// `ctx`-routed write to the admin block's table is a cross-block write
+    /// WRAP denies.
+    async fn write(&self, key: &str, value: &str) -> Result<(), OutputStream> {
         // The same two guards `blocks::admin::ops::update_variable` applies,
         // so the two write surfaces cannot accept divergent input. The
         // sensitive-empty guard reads the stored flag exactly as that path
         // does; a missing row has no stored secret to wipe, so only the
         // suffix rule applies there.
+        let existing = match variables::find_by_key(&self.db, key).await {
+            Ok(row) => row,
+            Err(e) => {
+                return Err(OutputStream::error(WaferError::new(
+                    ErrorCode::Internal,
+                    format!("config.set could not read {key}: {e}"),
+                )))
+            }
+        };
         if value.is_empty() {
-            let stored_flag = match variables::get_by_key(ctx, key).await {
-                Ok(Some(row)) => i64::from(row.sensitive),
-                Ok(None) => 0,
-                Err(e) => {
-                    return Err(OutputStream::error(WaferError::new(
-                        ErrorCode::Internal,
-                        format!("config.set could not read {key}: {e}"),
-                    )))
-                }
-            };
+            let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
             if is_sensitive_key(key, stored_flag) {
                 return Err(OutputStream::error(WaferError::new(
                     ErrorCode::InvalidArgument,
@@ -218,11 +240,13 @@ impl VariablesConfigBlock {
             }
         }
 
-        let patch = VariablePatch {
-            value: Some(value.to_string()),
-            ..Default::default()
-        };
-        if let Err(e) = variables::upsert_by_key(ctx, key, patch).await {
+        // `sensitive` is only consulted when the row has to be created; an
+        // existing row keeps its stored flag. The suffix rule is the same one
+        // `update_variable` applies to a key it is creating.
+        let sensitive = existing
+            .as_ref()
+            .map_or_else(|| is_sensitive_key(key, 0), |row| row.sensitive);
+        if let Err(e) = variables::set(&self.db, key, value, "", "", sensitive).await {
             return Err(OutputStream::error(WaferError::new(
                 ErrorCode::Internal,
                 format!("config.set could not write {key}: {e}"),
@@ -259,7 +283,7 @@ impl Block for VariablesConfigBlock {
                 let value = if PROTECTED_KEYS.contains(&key.as_str()) {
                     self.boot.get(&key)
                 } else {
-                    match self.stored_value(ctx, &key).await {
+                    match self.stored_value(&key).await {
                         Some(value) => Some(value),
                         None => self.boot.get(&key),
                     }
@@ -292,7 +316,7 @@ impl Block for VariablesConfigBlock {
                 if let Err(e) = ctx.check_resource_access(&req.key, ResourceType::Config, true) {
                     return OutputStream::error(e);
                 }
-                match Self::write(ctx, &req.key, &req.value).await {
+                match self.write(&req.key, &req.value).await {
                     Ok(()) => OutputStream::respond(vec![]),
                     Err(out) => out,
                 }
@@ -309,8 +333,9 @@ impl Block for VariablesConfigBlock {
 pub fn register_with(
     wafer: &mut wafer_run::Wafer,
     boot: Arc<dyn ConfigService>,
+    db: Arc<dyn DatabaseService>,
 ) -> Result<(), wafer_run::RuntimeError> {
-    let block: Arc<dyn Block> = Arc::new(VariablesConfigBlock::new(boot));
+    let block: Arc<dyn Block> = Arc::new(VariablesConfigBlock::new(boot, db));
     wafer.register_block("wafer-run/config", block)?;
     Ok(())
 }
@@ -318,7 +343,10 @@ pub fn register_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{unique_config_value, TestContext};
+    use crate::{
+        platform_state::variables::VariablePatch,
+        test_support::{unique_config_value, TestContext},
+    };
 
     /// An admin write must be visible to a reader whose snapshot is ALREADY
     /// warm.
@@ -428,6 +456,60 @@ mod tests {
             site.primary_color, saved,
             "the auth pages must render the brand colour an admin saved, not \
              the one that happened to be in the table when the process booted"
+        );
+    }
+
+    /// The config block must be able to read the variables table under WRAP.
+    ///
+    /// Found by deploying to a live Cloudflare Worker, not by any test here.
+    /// `impresspress__admin__variables` belongs to the ADMIN block, and
+    /// `db::list_all` sends the collection as a WRAP resource
+    /// (`svc!(.., Some(collection), .., Some("db"))`). A cross-block read is
+    /// denied by default, so on a runtime that enforces WRAP this block's
+    /// table read failed, it fell back to the boot map, and every page served
+    /// the compiled-in default — the exact defect the fix was meant to remove,
+    /// still live, with a green test suite behind it.
+    ///
+    /// The suite was green because `TestContext` leaves WRAP off unless a test
+    /// opts in, which is the same blind spot that let the files block ship a
+    /// `wafer-run/crypto` call it had not declared. This test opts in.
+    #[tokio::test]
+    async fn the_config_block_reads_the_variables_table_under_wrap() {
+        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx.boot_config_service().await;
+
+        let saved = unique_config_value();
+        variables::upsert_by_key(
+            &ctx,
+            KEY,
+            VariablePatch {
+                value: Some(saved.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the value");
+
+        // Act as the config block itself, on the same gates production
+        // applies: no grants, and the admin block owns the table.
+        let ctx = ctx.with_wrap(
+            "wafer-run/config",
+            Vec::new(),
+            Vec::new(),
+            crate::blocks::admin::ADMIN_BLOCK_ID,
+        );
+
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            saved,
+            "the config block must read the variables table under WRAP; if it \
+             cannot it falls back to the boot map and every page serves the \
+             compiled-in default while the admin's saved value sits in the table"
         );
     }
 }

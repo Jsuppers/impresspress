@@ -127,6 +127,7 @@ impl ImpresspressBuilder {
         wafer.set_admin_block(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         // 4. Register service blocks
+        let config_db = database.clone();
         wafer_core::service_blocks::database::register_with(&mut wafer, database)?;
         wafer
             .add_alias("db", "wafer-run/database")
@@ -144,7 +145,7 @@ impl ImpresspressBuilder {
         // impresspress owns this block: the `variables` table is the config
         // store, so an admin write is visible to the next read instead of after
         // the next restart. See `blocks::config`.
-        crate::blocks::config::register_with(&mut wafer, config)?;
+        crate::blocks::config::register_with(&mut wafer, config, config_db)?;
         wafer_core::service_blocks::crypto::register_with(&mut wafer, crypto)?;
 
         wafer_core::service_blocks::network::register_with(&mut wafer, network)?;

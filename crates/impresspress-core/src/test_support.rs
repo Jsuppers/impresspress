@@ -764,7 +764,10 @@ impl TestContext {
         // fixture that wired up a different config block would certify a path
         // production does not take, which is how the config-store defect
         // survived a green suite in the first place.
-        let block: Arc<dyn Block> = Arc::new(crate::blocks::config::VariablesConfigBlock::new(svc));
+        let block: Arc<dyn Block> = Arc::new(crate::blocks::config::VariablesConfigBlock::new(
+            svc,
+            self.db_service.clone(),
+        ));
         self.register_block("wafer-run/config", block);
     }
 

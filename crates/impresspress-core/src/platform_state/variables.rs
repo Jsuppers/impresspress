@@ -217,7 +217,7 @@ fn decode_error(e: String) -> WaferError {
 ///
 /// `DatabaseService::list` tolerates a missing table (it returns empty), so
 /// on a fresh database this is a clean "absent" rather than an error.
-async fn find_by_key(
+pub async fn find_by_key(
     db: &Arc<dyn DatabaseService>,
     key: &str,
 ) -> Result<Option<VariableRow>, String> {
