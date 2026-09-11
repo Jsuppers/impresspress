@@ -254,13 +254,15 @@ pub(crate) fn take_pending_version_retry() -> Option<String> {
 /// Mint and persist a fresh config-version stamp unconditionally.
 /// Deploy-init calls this once after the funnel (per-write bumps are
 /// suppressed during it — see [`CacheMode::bump_on_write`]).
-pub(crate) async fn force_bump_config_version(kv: &dyn KvBackend) -> Result<(), String> {
+pub(crate) async fn force_bump_config_version(kv: &dyn KvBackend) -> Result<String, String> {
     // The isolate handling `/_deploy/init` may also hold a pre-deploy
     // cached runtime from earlier ordinary requests; mark it dirty so this
     // isolate rebuilds on its next ordinary request instead of serving
     // stale (pre-migration/pre-reseed) state for up to the probe window.
     crate::runtime_cache::mark_dirty();
-    put_version_stamp_with_retry(kv, &new_version_stamp()).await
+    let stamp = new_version_stamp();
+    put_version_stamp_with_retry(kv, &stamp).await?;
+    Ok(stamp)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]

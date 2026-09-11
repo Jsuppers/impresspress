@@ -108,6 +108,14 @@ impl Route {
             router_final: true,
         }
     }
+
+    /// Whether the prefix declaration is the complete authorization decision.
+    ///
+    /// Exposed within the crate so deployment-plan export can preserve the
+    /// exact route policy without making this implementation detail public.
+    pub(crate) const fn is_router_final(&self) -> bool {
+        self.router_final
+    }
 }
 
 /// Access tier for a route.

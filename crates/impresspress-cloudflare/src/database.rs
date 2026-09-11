@@ -672,12 +672,16 @@ fn first_scalar(row: serde_json::Value) -> Option<serde_json::Value> {
 }
 
 /// Convert a D1 result row (as JSON) into a Record.
+///
+/// `id` is copied into [`Record::id`] and retained in [`Record::data`],
+/// matching the native SQLite and browser adapters. Auth repositories and
+/// other row decoders consume the complete row map from `data`.
 fn json_to_record(val: serde_json::Value) -> Record {
-    if let serde_json::Value::Object(mut map) = val {
+    if let serde_json::Value::Object(map) = val {
         let id = map
-            .remove("id")
+            .get("id")
             .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::String(s) => Some(s.clone()),
                 serde_json::Value::Number(n) => Some(n.to_string()),
                 _ => None,
             })

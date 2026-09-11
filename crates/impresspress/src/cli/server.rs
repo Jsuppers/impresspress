@@ -275,7 +275,7 @@ struct NativeBootHooks;
 
 #[wafer_block::wafer_async_trait]
 impl builder::BootHooks for NativeBootHooks {
-    async fn seed_after_admin_init(&self, _wafer: &wafer_run::Wafer) -> Result<(), String> {
+    async fn seed_after_admin_init(&self, _wafer: &mut wafer_run::Wafer) -> Result<(), String> {
         Ok(())
     }
 }

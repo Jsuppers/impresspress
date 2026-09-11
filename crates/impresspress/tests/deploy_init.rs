@@ -28,7 +28,7 @@ struct NoopBootHooks;
 
 #[wafer_block::wafer_async_trait]
 impl BootHooks for NoopBootHooks {
-    async fn seed_after_admin_init(&self, _wafer: &Wafer) -> Result<(), String> {
+    async fn seed_after_admin_init(&self, _wafer: &mut Wafer) -> Result<(), String> {
         Ok(())
     }
 }
@@ -210,7 +210,7 @@ struct FailingBootHooks;
 
 #[wafer_block::wafer_async_trait]
 impl BootHooks for FailingBootHooks {
-    async fn seed_after_admin_init(&self, _wafer: &Wafer) -> Result<(), String> {
+    async fn seed_after_admin_init(&self, _wafer: &mut Wafer) -> Result<(), String> {
         Err("boom".to_string())
     }
 }

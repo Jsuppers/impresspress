@@ -134,9 +134,8 @@ pub(crate) fn build_records(rows: Vec<serde_json::Value>) -> Result<Vec<Record>,
 }
 
 /// The first scalar value of a single-column aggregate row, regardless of its
-/// alias (the shared builders alias `COUNT`/`SUM` columns). `id` is stripped
-/// into `Record.id` by `build_records`; a pure scalar query never names a
-/// column `id`, so the remaining-data map carries the value.
+/// alias (the shared builders alias `COUNT`/`SUM` columns). A pure scalar
+/// query never names a column `id`, so the data map carries the value.
 pub(crate) fn first_scalar(records: Vec<Record>) -> Option<serde_json::Value> {
     records
         .into_iter()
@@ -187,6 +186,7 @@ mod tests {
         let recs = build_records(rows).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].id, "abc");
+        assert_eq!(recs[0].data.get("id").unwrap(), &serde_json::json!("abc"));
         assert_eq!(recs[0].data.get("name").unwrap(), &serde_json::json!("Bob"));
         assert_eq!(recs[0].data.get("age").unwrap(), &serde_json::json!(3));
     }

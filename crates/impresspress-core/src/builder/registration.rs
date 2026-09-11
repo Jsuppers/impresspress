@@ -330,6 +330,7 @@ impl ImpresspressBuilder {
         {
             use std::sync::Arc;
 
+            use wafer_block::Block;
             use wafer_run::{
                 discovery::{discover_flows, discover_wasm_blocks},
                 wasm::WasmiBlock,
@@ -387,6 +388,21 @@ impl ImpresspressBuilder {
         // 12. Register site-main flow, configuring its wafer-run/cors and
         // security-headers steps from the shared config read at step 2.
         crate::flows::register_site_main(&mut wafer, &cors_allowed_origins, &csp_directives)?;
+
+        // Consumer-declared final overrides intentionally run after
+        // `register_site_main`, which may replace earlier router/web configs.
+        for (name, config) in self.final_block_configs {
+            wafer.add_block_config(&name, config);
+        }
+
+        // Deployment-owned grants must be installed before the caller seals
+        // the runtime. In prepared mode these come from the immutable plan;
+        // native/dynamic callers may set them directly on the builder.
+        let mut external_grants = self.wrap_grants;
+        external_grants.extend(self.deployment_wrap_grants);
+        if !external_grants.is_empty() {
+            wafer.add_wrap_grants(external_grants);
+        }
 
         Ok((wafer, storage_block))
     }

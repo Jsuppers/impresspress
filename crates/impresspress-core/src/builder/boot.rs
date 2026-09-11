@@ -10,6 +10,42 @@ use wafer_run::{RuntimeError, Wafer};
 
 use crate::blocks::storage::ImpresspressStorageBlock;
 
+/// Eagerly initialize every registered block in deterministic order and fail
+/// on the first error.
+///
+/// This is stricter than [`Wafer::init_all_blocks`], which deliberately logs
+/// and tolerates failures. Stateless runtimes use this before publishing a
+/// shared runtime handle: publishing an empty or failed lazy-init slot would
+/// let concurrent requests wait on one another's init future, which is not a
+/// valid execution model for request-isolated platforms such as Cloudflare
+/// Workers.
+///
+/// The admin block runs first when present, matching the normal boot/deploy
+/// ordering. Remaining registration names are already sorted by
+/// [`Wafer::block_names`].
+pub async fn strict_init_all_blocks(wafer: &Wafer) -> Result<(), String> {
+    let admin = crate::blocks::admin::ADMIN_BLOCK_ID;
+    let names = wafer.block_names();
+
+    if names.iter().any(|name| name == admin) {
+        wafer
+            .init_block(admin)
+            .await
+            .map_err(|error| format!("block `{admin}` Init failed: {error}"))?;
+    }
+
+    for name in names {
+        if name == admin {
+            continue;
+        }
+        wafer
+            .init_block(&name)
+            .await
+            .map_err(|error| format!("block `{name}` Init failed: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Call after `wafer.start()` or `wafer.seal()` to inject
 /// collected WRAP grants into the storage block for cross-block access control.
 pub fn post_start(wafer: &Wafer, storage_block: &ImpresspressStorageBlock) {
@@ -39,11 +75,14 @@ pub trait BootHooks {
     /// publish the results into the shared `ConfigService` / `BlockSettings`
     /// handle / crypto secret the runtime already holds.
     ///
-    /// Errors abort the boot — return `Err` only for a genuinely fatal
-    /// condition (e.g. the JWT secret can't be read on a target that needs it
-    /// before any request). Best-effort per-key seed failures should be logged
-    /// and swallowed inside the impl.
-    async fn seed_after_admin_init(&self, wafer: &Wafer) -> Result<(), String>;
+    /// Errors abort the boot — return `Err` for a genuinely fatal condition
+    /// (for example, structural settings could not be persisted consistently,
+    /// or a required secret cannot be read). Optional best-effort per-key
+    /// seeds should still log and continue inside the implementation.
+    /// Receives `&mut Wafer` so a target that could not know its settings
+    /// before admin migration (browser/Cloudflare first deploy) can publish the
+    /// seeded values into the config snapshot before any other block initializes.
+    async fn seed_after_admin_init(&self, wafer: &mut Wafer) -> Result<(), String>;
 }
 
 /// Target-agnostic boot orchestrator owning the invariant post-build lifecycle
@@ -71,7 +110,8 @@ pub trait BootHooks {
 /// `wafer.run`). Native still seeds pre-wafer — its immutable
 /// `Argon2JwtCryptoService` and config snapshot need the variables before
 /// `build()` — so its `seed_after_admin_init` is a no-op, mirroring how
-/// Cloudflare reads its config pre-build and only runs the auto-gen pass here.
+/// Cloudflare reads a non-mutating settings snapshot pre-build, then seeds and
+/// republishes structural defaults here after admin migration.
 pub async fn boot(
     wafer: &mut Wafer,
     storage_block: &ImpresspressStorageBlock,
@@ -154,4 +194,134 @@ pub(super) fn register_vector_block(
     };
 
     wafer_core::service_blocks::vector::register_with(wafer, vec_svc, emb_svc)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use wafer_block::{
+        core_types::{ErrorCode, LifecycleEvent, LifecycleType, Message, WaferError},
+        streams::{input::InputStream, output::OutputStream},
+        Block, BlockInfo,
+    };
+    use wafer_run::{StaticConfigSource, Wafer};
+
+    use super::strict_init_all_blocks;
+
+    struct InitProbeBlock {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for InitProbeBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new(self.name, "0.1.0", "test/init@v1", "test")
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn wafer_block::context::Context,
+            event: LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            if event.event_type == LifecycleType::Init {
+                self.order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(self.name);
+                if self.fail {
+                    return Err(WaferError::new(
+                        ErrorCode::Unknown,
+                        "deliberate Init failure",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn wafer_block::context::Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            OutputStream::respond(Vec::new())
+        }
+    }
+
+    fn register_probe(
+        wafer: &mut Wafer,
+        name: &'static str,
+        order: &Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    ) {
+        wafer
+            .register_block(
+                name,
+                Arc::new(InitProbeBlock {
+                    name,
+                    order: order.clone(),
+                    fail,
+                }),
+            )
+            .unwrap();
+    }
+
+    fn empty_wafer() -> Wafer {
+        let config: Arc<dyn wafer_run::ConfigSource> = Arc::new(StaticConfigSource::default());
+        Wafer::new(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn strict_init_is_admin_first_deterministic_and_once_only() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut wafer = empty_wafer();
+        register_probe(&mut wafer, "test/zeta", &order, false);
+        register_probe(
+            &mut wafer,
+            crate::blocks::admin::ADMIN_BLOCK_ID,
+            &order,
+            false,
+        );
+        register_probe(&mut wafer, "test/alpha", &order, false);
+
+        strict_init_all_blocks(&wafer).await.unwrap();
+        strict_init_all_blocks(&wafer).await.unwrap();
+
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                crate::blocks::admin::ADMIN_BLOCK_ID,
+                "test/alpha",
+                "test/zeta"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_init_fails_closed_without_initializing_later_blocks() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut wafer = empty_wafer();
+        register_probe(
+            &mut wafer,
+            crate::blocks::admin::ADMIN_BLOCK_ID,
+            &order,
+            false,
+        );
+        register_probe(&mut wafer, "test/alpha-fails", &order, true);
+        register_probe(&mut wafer, "test/zeta-never", &order, false);
+
+        let error = strict_init_all_blocks(&wafer).await.unwrap_err();
+        assert!(error.contains("test/alpha-fails"), "{error}");
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![crate::blocks::admin::ADMIN_BLOCK_ID, "test/alpha-fails"]
+        );
+    }
 }

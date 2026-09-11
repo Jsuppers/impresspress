@@ -176,7 +176,7 @@ struct BrowserBootHooks {
 
 #[wafer_block::wafer_async_trait]
 impl builder::BootHooks for BrowserBootHooks {
-    async fn seed_after_admin_init(&self, _wafer: &wafer_run::Wafer) -> Result<(), String> {
+    async fn seed_after_admin_init(&self, wafer: &mut wafer_run::Wafer) -> Result<(), String> {
         let vars = config::seed_and_load_variables(&self.db).await?;
         web_sys::console::log_1(
             &format!(
@@ -203,6 +203,23 @@ impl builder::BootHooks for BrowserBootHooks {
             impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
             &features.to_config_json(),
         );
+
+        // `ctx.config_get` reads Wafer's synchronous snapshot, not the config
+        // service block. Publish the same post-migration values there before
+        // `init_all_blocks()` so migration/feature gates observe the seeded
+        // browser state rather than the empty pre-admin snapshot.
+        let mut snapshot = (**wafer.config_snapshot()).clone();
+        snapshot.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+        snapshot.insert(
+            impresspress_core::blocks::products::RUNTIME_KIND_CONFIG_KEY.to_string(),
+            "browser".to_string(),
+        );
+        snapshot.insert(
+            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY.to_string(),
+            features.to_config_json(),
+        );
+        wafer.set_config_snapshot(snapshot);
+
         *self
             .block_settings_handle
             .write()
