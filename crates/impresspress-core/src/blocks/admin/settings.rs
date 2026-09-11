@@ -986,9 +986,7 @@ mod wrap_denial_tests {
 #[cfg(test)]
 mod config_store_reproduction {
     use super::*;
-    use crate::test_support::TestContext;
-
-    use crate::test_support::unique_config_value;
+    use crate::test_support::{unique_config_value, TestContext};
 
     /// A setting changed through the documented admin API must reach the
     /// config readers blocks actually use.
