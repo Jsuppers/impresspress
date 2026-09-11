@@ -36,19 +36,39 @@ pub(super) async fn site_config(ctx: &dyn Context) -> SiteConfig {
 ///   the provider is encoded in the signed `state` JWT)
 ///
 /// These match what `oauth.rs` actually reads when building the auth_url.
-pub(super) fn oauth_provider_configured(ctx: &dyn Context, provider: &str) -> bool {
+///
+/// Read through the config client, not `ctx.config_get`. These three are
+/// admin-editable rows in the variables table, and that snapshot is frozen at
+/// boot: an operator who pasted OAuth credentials into the admin UI got no
+/// OAuth buttons until the process restarted, and on Cloudflare never, since
+/// no D1 row reaches that surface. Same defect as the branding reads, on a
+/// page where the symptom is a missing sign-in button rather than a wrong
+/// colour.
+pub(super) async fn oauth_provider_configured(ctx: &dyn Context, provider: &str) -> bool {
+    use wafer_core::clients::config;
+
     let up = provider.to_ascii_uppercase();
-    !ctx.config_get(&format!("IMPRESSPRESS__AUTH_UI__OAUTH_{up}_CLIENT_ID"))
-        .unwrap_or("")
+    let client_id = config::get_default(
+        ctx,
+        &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{up}_CLIENT_ID"),
+        "",
+    )
+    .await;
+    if client_id.is_empty() {
+        return false;
+    }
+    let client_secret = config::get_default(
+        ctx,
+        &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{up}_CLIENT_SECRET"),
+        "",
+    )
+    .await;
+    if client_secret.is_empty() {
+        return false;
+    }
+    !config::get_default(ctx, "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI", "")
+        .await
         .is_empty()
-        && !ctx
-            .config_get(&format!("IMPRESSPRESS__AUTH_UI__OAUTH_{up}_CLIENT_SECRET"))
-            .unwrap_or("")
-            .is_empty()
-        && !ctx
-            .config_get("IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI")
-            .unwrap_or("")
-            .is_empty()
 }
 
 /// Display label for an OAuth provider button.
@@ -389,7 +409,7 @@ mod tests {
             "secret",
         );
         assert!(
-            !oauth_provider_configured(&ctx, "github"),
+            !oauth_provider_configured(&ctx, "github").await,
             "should be false without REDIRECT_URI"
         );
 
@@ -398,7 +418,7 @@ mod tests {
             "https://example.com/cb",
         );
         assert!(
-            oauth_provider_configured(&ctx, "github"),
+            oauth_provider_configured(&ctx, "github").await,
             "should be true once all three are set"
         );
     }
@@ -406,8 +426,8 @@ mod tests {
     #[tokio::test]
     async fn oauth_provider_configured_false_when_missing_any_key() {
         let ctx = TestContext::new().await;
-        assert!(!oauth_provider_configured(&ctx, "github"));
-        assert!(!oauth_provider_configured(&ctx, "google"));
-        assert!(!oauth_provider_configured(&ctx, "microsoft"));
+        assert!(!oauth_provider_configured(&ctx, "github").await);
+        assert!(!oauth_provider_configured(&ctx, "google").await);
+        assert!(!oauth_provider_configured(&ctx, "microsoft").await);
     }
 }
