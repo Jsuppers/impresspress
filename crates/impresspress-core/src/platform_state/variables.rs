@@ -331,6 +331,7 @@ pub async fn set(
         db.create(TABLE, row.to_data())
             .await
             .map_err(|e| format!("insert variable `{key}`: {e}"))?;
+        crate::config_generation::note_config_write();
         return Ok(true);
     };
     if existing.value == value {
@@ -343,6 +344,7 @@ pub async fn set(
     db.update(TABLE, &existing.id, patch.to_update_data())
         .await
         .map_err(|e| format!("update variable `{key}`: {e}"))?;
+    crate::config_generation::note_config_write();
     Ok(true)
 }
 
@@ -551,6 +553,7 @@ pub async fn get_by_key(ctx: &dyn Context, key: &str) -> Result<Option<VariableR
 pub async fn insert(ctx: &dyn Context, new: NewVariable) -> Result<VariableRow, WaferError> {
     let row = new.into_row();
     let rec = db::create(ctx, TABLE, row.to_data()).await?;
+    crate::config_generation::note_config_write();
     VariableRow::from_record(&rec.id, &rec.data).map_err(decode_error)
 }
 
@@ -571,21 +574,27 @@ pub async fn upsert_by_key(
     match get_by_key(ctx, key).await? {
         Some(existing) => {
             let rec = db::update(ctx, TABLE, &existing.id, patch.to_update_data()).await?;
+            crate::config_generation::note_config_write();
             VariableRow::from_record(&rec.id, &rec.data).map_err(decode_error)
         }
+        // `insert` notes the write itself.
         None => insert(ctx, patch.into_new(key)).await,
     }
 }
 
 /// Delete the row with `id`. `NotFound` when there is none.
 pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
-    db::delete(ctx, TABLE, id).await
+    db::delete(ctx, TABLE, id).await?;
+    crate::config_generation::note_config_write();
+    Ok(())
 }
 
 /// Delete the row for `key`, if any. Deleting an absent key affects nothing
 /// and is not an error, which is what makes this callable unconditionally.
 pub async fn delete_by_key(ctx: &dyn Context, key: &str) -> Result<(), WaferError> {
-    db::delete_by_filters(ctx, TABLE, vec![key_filter(key)]).await
+    db::delete_by_filters(ctx, TABLE, vec![key_filter(key)]).await?;
+    crate::config_generation::note_config_write();
+    Ok(())
 }
 #[cfg(test)]
 mod tests {

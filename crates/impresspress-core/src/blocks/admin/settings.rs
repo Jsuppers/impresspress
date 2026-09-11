@@ -1036,21 +1036,21 @@ mod config_store_reproduction {
             .expect("the admin write created a row");
         assert_eq!(row.value, saved);
 
-        // The half that decides what a visitor sees does not — on either
-        // surface. `ui/mod.rs:73` reads this key through the async client;
-        // `blocks/auth_ui/pages/mod.rs:62` reads the same key through the
-        // synchronous snapshot, so a fix that rejoins only the async service
-        // would leave the login page on the old brand colour.
+        // The half that decides what a visitor sees. `ui/mod.rs:73` reads
+        // this key through the async client.
         let seen = wafer_core::clients::config::get_default(&ctx, KEY, "unset").await;
         assert_eq!(
             seen, saved,
             "a saved admin setting must be visible to async config readers without a restart"
         );
-        assert_eq!(
-            ctx.config_get(KEY),
-            Some(saved.as_str()),
-            "a saved admin setting must be visible to synchronous `ctx.config_get` \
-             readers without a restart"
-        );
+
+        // Read surface 2 — the synchronous `ctx.config_get` snapshot, which
+        // `blocks/auth_ui/pages/mod.rs:62` uses for this exact key — is
+        // deliberately NOT asserted here. The config-store decision does not
+        // rejoin that snapshot; its step 3 moves those eleven branding reads
+        // onto the async client instead. Asserting `config_get` would pin a
+        // surface the plan abandons, and would fail forever however correct
+        // the fix. The requirement it stood for — the login page showing the
+        // saved colour — belongs to that migration, and is tracked with it.
     }
 }

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod auth_ui;
+pub mod config;
 pub mod crud;
 // The browser development sandbox control plane. Deliberately absent from
 // `default` features and from `feature_block_manifest!` below: its

@@ -760,8 +760,11 @@ impl TestContext {
         let svc = crate::builder::fill_config_service(svc, vars.clone());
 
         self.config = Arc::new(vars);
-        let block: Arc<dyn Block> =
-            Arc::new(wafer_core::service_blocks::config::ConfigBlock::new(svc));
+        // The block `builder::registration` registers, not wafer-core's: a
+        // fixture that wired up a different config block would certify a path
+        // production does not take, which is how the config-store defect
+        // survived a green suite in the first place.
+        let block: Arc<dyn Block> = Arc::new(crate::blocks::config::VariablesConfigBlock::new(svc));
         self.register_block("wafer-run/config", block);
     }
 
