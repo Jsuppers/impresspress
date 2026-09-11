@@ -802,8 +802,16 @@ mod tests {
         assert_eq!(cfg.get("KEY"), Some("secret"));
     }
 
-    /// CFG-01 reproduction, read surface 1: a shared setting an admin saved
-    /// must be readable on Cloudflare.
+    /// CFG-01 reproduction, read surface **3** (`ConfigSource`): a shared
+    /// setting an admin saved is discarded before any block can see it.
+    ///
+    /// Scope, stated precisely because an earlier commit message got this
+    /// wrong: this pins Read 3 only. It is NOT the decision's Read 1 — that
+    /// is `config::get_default` served by `HashMapConfigService`, which holds
+    /// no D1 row at all, and which has no reproduction here (see the PR's
+    /// "Not covered"). A fix could satisfy Read 1 and leave this red, or
+    /// green this and leave Workers serving default branding; the two are
+    /// independent.
     ///
     /// `WAFER_RUN_SHARED__*` keys carry no `{ORG}__{BLOCK}__` prefix, so
     /// `variables::block_for_key` stores them with a NULL `block` column, and
@@ -828,8 +836,15 @@ mod tests {
     /// that the row stops being discarded.
     #[wasm_bindgen_test]
     async fn a_shared_variables_row_is_readable_on_cloudflare() {
-        // Exactly the shape `block_for_key` writes for a shared key: no block.
-        let db = CountingDb::new(vec![("", "WAFER_RUN_SHARED__PRIMARY_COLOR", "#ff0000")]);
+        // A migrated table: one block-scoped row alongside the shared one.
+        // A table holding ONLY the NULL-block row is byte-identical to the
+        // pre-migration-002 shape that `snapshot` special-cases below
+        // (warns, refuses to cache), so a single-row fixture would exercise
+        // that branch rather than the ordinary path this defect lives on.
+        let db = CountingDb::new(vec![
+            ("WAFER_RUN__AUTH", "WAFER_RUN__AUTH__A", "auth-value"),
+            ("", "WAFER_RUN_SHARED__PRIMARY_COLOR", "#ff0000"),
+        ]);
         let src = D1ConfigSource::new(db.clone() as Arc<dyn DatabaseService>);
 
         let config = src

@@ -745,9 +745,10 @@ mod config_store_reproduction {
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
 
+        let saved = crate::test_support::unique_config_value();
         let allowed = [crate::config_vars::shared_var(KEY)];
-        let body = serde_json::to_vec(&serde_json::json!({ KEY: "#00ff00" }))
-            .expect("serialize request body");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ KEY: saved })).expect("serialize request body");
         let status = crate::test_support::output_status(
             save_settings(&ctx, InputStream::from_bytes(body), &allowed, "branding").await,
         )
@@ -757,7 +758,7 @@ mod config_store_reproduction {
         // Live reads see it, which is why this looks like it works.
         assert_eq!(
             wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
-            "#00ff00"
+            saved
         );
 
         // Restart: a fresh process seeds its config service from the table.
@@ -765,7 +766,7 @@ mod config_store_reproduction {
 
         assert_eq!(
             wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
-            "#00ff00",
+            saved,
             "a setting saved through an admin form must outlive the process that saved it"
         );
     }

@@ -988,6 +988,8 @@ mod config_store_reproduction {
     use super::*;
     use crate::test_support::TestContext;
 
+    use crate::test_support::unique_config_value;
+
     /// A setting changed through the documented admin API must reach the
     /// config readers blocks actually use.
     ///
@@ -1013,9 +1015,10 @@ mod config_store_reproduction {
         // Boot once, the way the native server does, before any admin write.
         ctx.boot_config_service().await;
 
+        let saved = unique_config_value();
         let mut msg = crate::test_support::admin_msg("update", "/b/admin/api/settings");
         msg.set_meta("req.param.key", KEY);
-        let body = serde_json::to_vec(&serde_json::json!({ "value": "#ff0000" }))
+        let body = serde_json::to_vec(&serde_json::json!({ "value": saved }))
             .expect("serialize request body");
         let status = crate::test_support::output_status(
             handle_set(&ctx, &msg, InputStream::from_bytes(body)).await,
@@ -1031,13 +1034,23 @@ mod config_store_reproduction {
             .await
             .expect("read the variable back")
             .expect("the admin write created a row");
-        assert_eq!(row.value, "#ff0000");
+        assert_eq!(row.value, saved);
 
-        // The half that decides what a visitor sees does not.
+        // The half that decides what a visitor sees does not — on either
+        // surface. `ui/mod.rs:73` reads this key through the async client;
+        // `blocks/auth_ui/pages/mod.rs:62` reads the same key through the
+        // synchronous snapshot, so a fix that rejoins only the async service
+        // would leave the login page on the old brand colour.
         let seen = wafer_core::clients::config::get_default(&ctx, KEY, "unset").await;
         assert_eq!(
-            seen, "#ff0000",
-            "a saved admin setting must be visible to config readers without a restart"
+            seen, saved,
+            "a saved admin setting must be visible to async config readers without a restart"
+        );
+        assert_eq!(
+            ctx.config_get(KEY),
+            Some(saved.as_str()),
+            "a saved admin setting must be visible to synchronous `ctx.config_get` \
+             readers without a restart"
         );
     }
 }
