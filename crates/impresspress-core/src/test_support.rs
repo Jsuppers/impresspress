@@ -751,9 +751,25 @@ impl TestContext {
     /// PRECONDITION: admin migrations have run, so the `variables` table
     /// exists — `seed_and_load` documents the same requirement.
     pub async fn boot_config_service(&mut self) {
-        let vars = crate::platform_state::variables::seed_and_load(&self.db_service, &[])
+        self.boot_config_service_with(&[]).await;
+    }
+
+    /// [`Self::boot_config_service`], then layer `adapter_values` onto BOTH
+    /// config surfaces the way a target's boot hook does after seeding — the
+    /// browser adapter's `RuntimeConfig::republish` of
+    /// `__IMPRESSPRESS_RUNTIME_KIND__ = "browser"`, say.
+    ///
+    /// Exists so a test can put a value in the boot map that the variables
+    /// table does NOT hold, which is the only way to check precedence between
+    /// the two: a fixture that can only seed from the table cannot express an
+    /// adapter-injected value at all.
+    pub async fn boot_config_service_with(&mut self, adapter_values: &[(&str, &str)]) {
+        let mut vars = crate::platform_state::variables::seed_and_load(&self.db_service, &[])
             .await
             .expect("seed and load variables at boot");
+        for (key, value) in adapter_values {
+            vars.insert((*key).to_string(), (*value).to_string());
+        }
 
         let svc: Arc<dyn wafer_core::interfaces::config::service::ConfigService> =
             Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());

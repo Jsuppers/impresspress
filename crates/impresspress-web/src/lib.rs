@@ -177,18 +177,22 @@ impl builder::BootHooks for BrowserBootHooks {
         // is the half the remaining blocks' Init actually consults.
         self.config_source.publish(vars.clone());
 
-        // Both config surfaces, published together. `ctx.config_get` reads
-        // Wafer's synchronous snapshot and the config client reads the async
-        // service block; a value seeded here that reached only one of them
-        // would be visible to half the runtime.
+        // Both config surfaces, published together — but only the values
+        // something has to read SYNCHRONOUSLY or that the runtime owns, not a
+        // copy of the variables table. The config block serves every stored
+        // variable from the table itself (`impresspress_core::blocks::config`),
+        // and now learns of this seeding through the config-write generation
+        // `variables::insert_if_absent` bumps. A table copy here would only put
+        // admin-editable keys onto the boot-frozen `ctx.config_get` snapshot,
+        // where the first synchronous reader of one silently gets a stale
+        // value — the defect class the config-store work removed.
         let mut published = builder::RuntimeConfig::new();
         published
-            .extend_both(vars.clone())
-            // This adapter executes inside an end user's browser. Set the
-            // marker after persisted variables so a database/admin value
-            // cannot accidentally enable Stripe secret-key operations locally.
-            // Static pages may still use a remote trusted commerce API or
-            // pre-created Payment Links.
+            // This adapter executes inside an end user's browser. The config
+            // block treats `__…__` keys as runtime-owned and never serves them
+            // from the table, so a database/admin value cannot enable Stripe
+            // secret-key operations locally. Static pages may still use a
+            // remote trusted commerce API or pre-created Payment Links.
             .both(
                 impresspress_core::blocks::products::RUNTIME_KIND_CONFIG_KEY,
                 "browser",
@@ -197,6 +201,14 @@ impl builder::BootHooks for BrowserBootHooks {
                 impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
                 features.to_config_json(),
             );
+        // `csrf` and `auth::service` read the secret per request off the
+        // synchronous snapshot; seeding just generated it if it was absent.
+        if let Some(secret) = vars.get(impresspress_core::blocks::auth::JWT_SECRET_KEY) {
+            published.both(
+                impresspress_core::blocks::auth::JWT_SECRET_KEY,
+                secret.clone(),
+            );
+        }
         published.republish(wafer, &self.config_svc);
 
         *self
