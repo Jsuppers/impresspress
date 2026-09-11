@@ -58,6 +58,7 @@ use wafer_run::{
 
 use crate::{
     config_generation::config_write_generation,
+    // audit-allow: this block never reaches the table under WRAP — it reads and writes through `variables`' boot-flavour API (`load_all`, `find_by_key`, `set`) over the raw `DatabaseService` that `builder::registration` hands it, the same way `D1ConfigSource` reads this table, so no grant applies (a `ctx`-routed read IS denied: see `the_config_block_reads_the_variables_table_under_wrap`); the audit also derives the caller `impresspress/config` from the file path, while the block registers as `wafer-run/config`
     platform_state::variables,
     util::{is_sensitive_key, validate_url_value},
 };
