@@ -182,8 +182,11 @@ thread_local! {
     /// block_settings / wrap_grants) in THIS isolate. Forces the next
     /// `get_or_build` call to probe (and rebuild) regardless of the
     /// jittered deadline below — a request that just wrote new config must
-    /// not keep serving the pre-write runtime for up to a minute just
-    /// because the deadline hasn't elapsed yet. Consumed (cleared) by the
+    /// not keep serving the pre-write runtime for the rest of its 5–10 minute
+    /// probe window (`PROBE_INTERVAL_FLOOR_MS` + `PROBE_INTERVAL_JITTER_MS`)
+    /// just because the deadline hasn't elapsed yet. This covers the writing
+    /// isolate only: every other warm isolate still converges on its own
+    /// probe, up to that same window later. Consumed (cleared) by the
     /// next `get_or_build` call, whether or not that call ends up
     /// rebuilding.
     static DIRTY: Cell<bool> = const { Cell::new(false) };

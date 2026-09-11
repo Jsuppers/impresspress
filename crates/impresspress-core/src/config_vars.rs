@@ -388,6 +388,27 @@ pub fn key_block_prefix(key: &str) -> String {
     }
 }
 
+/// Whether `key` names infrastructure configuration: `IMPRESSPRESS_*` with no
+/// `__` separator (`IMPRESSPRESS_RUN_MIGRATIONS`, `IMPRESSPRESS_DEPLOY_TOKEN`).
+///
+/// By the repo's naming rule these are infrastructure and never live in the
+/// variables table — `impresspress-native`'s env collection deliberately never
+/// seeds them. Contrast `IMPRESSPRESS__PRODUCTS__*`, which carries `__` and is
+/// block-scoped config that does.
+pub fn is_infrastructure_key(key: &str) -> bool {
+    key.starts_with("IMPRESSPRESS_") && !key.contains("__")
+}
+
+/// Whether `key` is an internal, adapter-injected runtime key: bracketed in
+/// double underscores, like `__IMPRESSPRESS_RUNTIME_KIND__` and
+/// `__IMPRESSPRESS_BLOCK_SETTINGS_JSON__`.
+///
+/// A target's boot code sets these directly; they are never set from env or
+/// the variables table, which is why they carry no admin-writable prefix.
+pub fn is_internal_key(key: &str) -> bool {
+    key.len() > 4 && key.starts_with("__") && key.ends_with("__")
+}
+
 #[cfg(test)]
 mod shared_vars_tests {
     use super::{

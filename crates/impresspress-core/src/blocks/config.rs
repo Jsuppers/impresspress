@@ -24,12 +24,15 @@
 //!
 //! ## Read order
 //!
-//! 1. `PROTECTED_KEYS` always come from the boot map. The JWT secret is a
-//!    worker secret on Cloudflare and never lives in D1; on native
-//!    `seed_jwt_secret` does put it in the table, but the boot map already
-//!    holds that same value. Letting a table row win would also let an admin
-//!    edit rotate the signing key out from under a running process
-//!    mid-request, which is not a config change but an outage.
+//! 1. Runtime-owned keys always come from the boot map — see
+//!    `served_only_from_boot_map`. Infrastructure keys (`IMPRESSPRESS_*`
+//!    without `__`) and internal adapter-injected keys (`__…__`) are never
+//!    variables-table config by the repo's naming rules, so a row carrying one
+//!    must not be served: the browser's `__IMPRESSPRESS_RUNTIME_KIND__` marker
+//!    is what keeps Stripe secret-key operations off in a visitor's browser.
+//!    The JWT secret is the named exception — a table row on native, but the
+//!    boot map already holds that value, and a row must not rotate the signing
+//!    key out from under a running process. `CONFIG_SET` refuses all of them.
 //! 2. Otherwise the `variables` row wins when it holds a non-empty value.
 //!    This is the actual fix: an admin write lands in the table and the very
 //!    next read sees it.
@@ -63,9 +66,26 @@ use crate::{
     util::{is_sensitive_key, validate_url_value},
 };
 
-/// Keys the boot map always answers, whatever the table holds. See the read
-/// order in the module docs.
-const PROTECTED_KEYS: &[&str] = &[crate::blocks::auth::JWT_SECRET_KEY];
+/// Keys the boot map always answers, whatever the variables table holds — and
+/// that `CONFIG_SET` refuses, since a stored row for one would never be served.
+///
+/// Derived from the repo's key-naming conventions rather than listed:
+/// infrastructure keys ([`crate::config_vars::is_infrastructure_key`]) and
+/// internal adapter-injected keys ([`crate::config_vars::is_internal_key`]) are
+/// by definition never variables-table config, so a row carrying one is a
+/// mistake or a forgery. That matters: the browser adapter's
+/// `__IMPRESSPRESS_RUNTIME_KIND__ = "browser"` is what keeps Stripe secret-key
+/// operations off inside a visitor's browser, and a table-first read let a
+/// `server` row switch them back on.
+///
+/// The JWT secret is the one named exception. It IS a table row on native, but
+/// the boot map already holds that same value, and a row must not rotate the
+/// signing key out from under a running process.
+fn served_only_from_boot_map(key: &str) -> bool {
+    key == crate::blocks::auth::JWT_SECRET_KEY
+        || crate::config_vars::is_infrastructure_key(key)
+        || crate::config_vars::is_internal_key(key)
+}
 
 /// The `variables` table as a key/value map, shared by every reader holding
 /// the snapshot it was built for.
@@ -81,8 +101,11 @@ pub struct VariablesConfigBlock {
     /// wafer-core's block, kept for `info()` and any operation this one does
     /// not claim, so a new config op added upstream keeps working here.
     inner: Arc<dyn Block>,
-    /// Boot-seeded map: env/worker bindings, builder-time vars, block
-    /// settings JSON, and the boot copy of every table row.
+    /// The target's boot map: what the table cannot hold, or must not be
+    /// trusted for. Env and worker bindings, builder-time vars (CORS, CSP,
+    /// STRICT_SCHEMA), the block-settings JSON, runtime markers, and the JWT
+    /// secret. Native and the browser no longer copy the variables table into
+    /// it — this block serves stored variables from the table itself.
     boot: Arc<dyn ConfigService>,
     /// The platform database, held as the raw service rather than reached
     /// through `ctx`.
@@ -281,7 +304,7 @@ impl Block for VariablesConfigBlock {
                     return OutputStream::error(e);
                 }
 
-                let value = if PROTECTED_KEYS.contains(&key.as_str()) {
+                let value = if served_only_from_boot_map(&key) {
                     self.boot.get(&key)
                 } else {
                     match self.stored_value(&key).await {
@@ -316,6 +339,18 @@ impl Block for VariablesConfigBlock {
                 };
                 if let Err(e) = ctx.check_resource_access(&req.key, ResourceType::Config, true) {
                     return OutputStream::error(e);
+                }
+                // A runtime-owned key is never served from the table, so
+                // storing one would report success for a value no reader can
+                // ever see. Refuse it instead of writing an unservable row.
+                if served_only_from_boot_map(&req.key) {
+                    return OutputStream::error(WaferError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "{} is set by the runtime, not stored config; it cannot be written",
+                            req.key
+                        ),
+                    ));
                 }
                 match self.write(&req.key, &req.value).await {
                     Ok(()) => OutputStream::respond(vec![]),
@@ -511,6 +546,120 @@ mod tests {
             "the config block must read the variables table under WRAP; if it \
              cannot it falls back to the boot map and every page serves the \
              compiled-in default while the admin's saved value sits in the table"
+        );
+    }
+}
+
+/// Keys the runtime sets must not be overridable from the variables table.
+#[cfg(test)]
+mod boot_owned_key_tests {
+    use super::*;
+    use crate::{platform_state::variables::NewVariable, test_support::TestContext};
+
+    async fn booted_with(adapter_values: &[(&str, &str)]) -> TestContext {
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx.boot_config_service_with(adapter_values).await;
+        ctx
+    }
+
+    async fn store_row(ctx: &TestContext, key: &str, value: &str) {
+        variables::insert(
+            ctx,
+            NewVariable {
+                key: key.to_string(),
+                value: value.to_string(),
+                name: String::new(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: String::new(),
+                block: variables::block_for_key(key),
+            },
+        )
+        .await
+        .expect("store the row");
+    }
+
+    /// The browser adapter's runtime marker must beat a variables row.
+    ///
+    /// `products::RUNTIME_KIND_CONFIG_KEY` is documented as set by the browser
+    /// adapter "after loading persisted variables, so an admin database value
+    /// cannot accidentally turn a public browser runtime into a trusted
+    /// secret holder", and `products::stripe_secret_operations_allowed` reads
+    /// it through the config client. When this block started answering
+    /// table-first, a row holding `server` under that key would have switched
+    /// Stripe secret-key operations on inside a visitor's browser — a row that
+    /// the admin variables API accepts for any key, and that a dev-sandbox data
+    /// import can carry.
+    #[cfg(feature = "block-products")]
+    #[tokio::test]
+    async fn a_table_row_cannot_override_an_internal_adapter_key() {
+        let key = crate::blocks::products::RUNTIME_KIND_CONFIG_KEY;
+        let ctx = booted_with(&[(key, "browser")]).await;
+        store_row(&ctx, key, "server").await;
+
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, key, "server").await,
+            "browser",
+            "an adapter-injected internal key must come from the boot map, never the variables table"
+        );
+    }
+
+    /// Infrastructure keys follow the same rule: `IMPRESSPRESS_*` without a
+    /// `__` separator is "infrastructure, never in DB" by the repo's naming
+    /// convention, so a row carrying one must not be what a reader sees.
+    #[tokio::test]
+    async fn a_table_row_cannot_override_an_infrastructure_key() {
+        let key = crate::migration_helper::RUN_MIGRATIONS_KEY;
+        let ctx = booted_with(&[(key, "1")]).await;
+        store_row(&ctx, key, "0").await;
+
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, key, "unset").await,
+            "1",
+            "an infrastructure key must come from the boot map, never the variables table"
+        );
+    }
+
+    /// A write to a runtime-owned key is refused, not silently stored.
+    ///
+    /// The read side never serves such a row, so accepting the write would
+    /// report success for a value no reader can ever see — the silent no-op
+    /// this block exists to remove.
+    #[tokio::test]
+    async fn config_set_refuses_a_runtime_owned_key() {
+        let key = crate::features::BLOCK_SETTINGS_CONFIG_KEY;
+        let ctx = booted_with(&[(key, "{}")]).await;
+
+        let result = wafer_core::clients::config::set(&ctx, key, r#"{"forged":true}"#).await;
+        assert!(
+            result.is_err(),
+            "CONFIG_SET of a runtime-owned key must fail rather than store an unservable row"
+        );
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .is_none(),
+            "a refused write must not leave a row behind"
+        );
+    }
+
+    /// Ordinary shared keys are unaffected: the table still wins.
+    #[tokio::test]
+    async fn a_shared_key_is_still_served_from_the_table() {
+        const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+        let ctx = booted_with(&[(KEY, "boot-value")]).await;
+        let saved = crate::test_support::unique_config_value();
+        store_row(&ctx, KEY, &saved).await;
+
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            saved,
+            "an admin-editable shared key must still come from the variables table"
         );
     }
 }

@@ -253,6 +253,11 @@ async fn insert_if_absent(db: &Arc<dyn DatabaseService>, row: VariableRow) -> Re
     db.create(TABLE, row.to_data())
         .await
         .map_err(|e| format!("insert variable `{}`: {e}", row.key))?;
+    // Every boot seeder funnels through here. A config reader that memoized
+    // the table before this row existed must see that it moved — the browser
+    // seeds after admin's Init through the raw service, with no KV-cached
+    // wrapper to record the write on its behalf.
+    crate::config_generation::note_config_write();
     Ok(true)
 }
 
@@ -850,6 +855,43 @@ mod boot_tests {
         assert_eq!(row.value, "true");
         assert_eq!(row.name, "Probe");
         assert_eq!(row.block.as_deref(), Some("WAFER_RUN__AUTH"));
+    }
+
+    /// Seeding a row is a config write, and has to say so.
+    ///
+    /// `insert_if_absent` is the one create path every boot seeder shares —
+    /// `seed_if_absent`, `seed_one_secret`, `seed_jwt_secret`, and the env
+    /// seeding in `seed_and_load`. The config block memoizes the variables
+    /// table against the config-write generation, so a row seeded after that
+    /// snapshot was filled stays invisible unless this bumps it. The browser
+    /// seeds after the admin block initializes, through the raw service
+    /// (no KV-cached wrapper to bump on its behalf), which is exactly that
+    /// case.
+    ///
+    /// Deterministic despite parallel tests: the generation is `thread_local`.
+    #[tokio::test]
+    async fn seeding_a_row_bumps_the_config_write_generation_and_a_no_op_does_not() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN__AUTH__SEED_PROBE";
+
+        let before = crate::config_generation::config_write_generation();
+        assert!(seed_if_absent(&db, key, "v", "Probe", "d", false)
+            .await
+            .expect("seed"));
+        let after_insert = crate::config_generation::config_write_generation();
+        assert_ne!(
+            before, after_insert,
+            "a seeded row must bump the config-write generation"
+        );
+
+        assert!(!seed_if_absent(&db, key, "other", "Probe", "d", false)
+            .await
+            .expect("re-seed"));
+        assert_eq!(
+            after_insert,
+            crate::config_generation::config_write_generation(),
+            "a seed that found an existing row wrote nothing and must not bump"
+        );
     }
 
     /// An operator's edit to the *description* survives a forced value write:
