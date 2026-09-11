@@ -14,22 +14,14 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let logo_url = ctx
-        .config_get("WAFER_RUN_SHARED__AUTH_LOGO_URL")
-        .unwrap_or("")
-        .to_string();
-    let app_name = ctx
-        .config_get("WAFER_RUN_SHARED__APP_NAME")
-        .unwrap_or("Impresspress")
-        .to_string();
-    let auth_headline = ctx
-        .config_get("WAFER_RUN_SHARED__AUTH_HEADLINE")
-        .unwrap_or(crate::config_vars::DEFAULT_AUTH_HEADLINE)
-        .to_string();
-    let auth_tagline = ctx
-        .config_get("WAFER_RUN_SHARED__AUTH_TAGLINE")
-        .unwrap_or(crate::config_vars::DEFAULT_AUTH_TAGLINE)
-        .to_string();
+    // Through the async loader, not `ctx.config_get`: that snapshot is frozen
+    // at boot, so an admin's saved branding never reached this page without a
+    // restart, and on Cloudflare never reached it at all.
+    let site = ui::SiteConfig::load_for_auth(ctx).await;
+    let logo_url = site.logo_url.clone();
+    let app_name = site.app_name.clone();
+    let auth_headline = site.auth_headline.clone();
+    let auth_tagline = site.auth_tagline.clone();
 
     // Token comes from query param or body
     let token = {

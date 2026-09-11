@@ -360,7 +360,8 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
             tables: &tables,
             source_verdicts: &source_verdicts,
         },
-    );
+    )
+    .await;
 
     let mut entries = Vec::with_capacity(shell.len() + seed_entries.len() + 3);
     entries.push(Entry {
@@ -518,32 +519,46 @@ fn short_id(generation_id: &str) -> String {
 /// exact thing `two_exports_of_the_same_generation_are_identical` exists to
 /// deny. The generation's own creation time is also the more useful fact: it
 /// is when the site being exported came to be.
-fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
-    // The literal, as every other reader of this shared variable spells it
-    // (`blocks::auth_ui::pages`, `pipeline`): `config_vars` declares it in
+async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
+    use wafer_core::clients::config;
+
+    // Through the config client, not `ctx.config_get`: that snapshot is
+    // frozen at boot, so an export made after an admin renamed the site still
+    // carried the old name, and on Cloudflare carried the default whatever
+    // the name was. The literal is spelled as every other reader spells it
+    // (`ui::SiteConfig`, `pipeline`): `config_vars` declares it in
     // `shared_config_vars()` without exporting a constant for the key.
-    let title = ctx
-        .config_get("WAFER_RUN_SHARED__APP_NAME")
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Your ImpressPress site");
-    let admin_email = ctx
-        .config_get(crate::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY)
-        .filter(|email| !email.is_empty())
-        .unwrap_or("the account you signed in with");
+    let title = config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "").await;
+    let title = if title.is_empty() {
+        "Your ImpressPress site".to_string()
+    } else {
+        title
+    };
+    let admin_email = config::get_default(
+        ctx,
+        crate::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY,
+        "",
+    )
+    .await;
+    let admin_email = if admin_email.is_empty() {
+        "the account you signed in with".to_string()
+    } else {
+        admin_email
+    };
     let rows: usize = facts.tables.values().sum();
     // A plain textual substitution, not a template engine: every value is a
     // number or a short string this function produced, and
     // `export_zip_contains_shell_seed_sources_and_data_with_dev_off` asserts
     // no `{{` survives.
     README_TEMPLATE
-        .replace("{{TITLE}}", title)
+        .replace("{{TITLE}}", &title)
         .replace("{{DATE}}", facts.created_at)
         .replace("{{GENERATION_ID}}", facts.generation_id)
         .replace("{{SHELL_FILES}}", &facts.shell_files.to_string())
         .replace("{{SITE_FILES}}", &facts.site_files.to_string())
         .replace("{{BLOCKS}}", &facts.blocks.to_string())
         .replace("{{TABLE_ROWS}}", &rows.to_string())
-        .replace("{{ADMIN_EMAIL}}", admin_email)
+        .replace("{{ADMIN_EMAIL}}", &admin_email)
         .replace(
             "{{BLOCK_SOURCES}}",
             &render_source_verdicts(facts.source_verdicts),

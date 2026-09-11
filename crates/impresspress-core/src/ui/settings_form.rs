@@ -714,3 +714,60 @@ mod tests {
         );
     }
 }
+
+/// CFG-01 reproduction for the second write surface. Separate module so the
+/// boot-seeded config fixture stays out of the tests above.
+#[cfg(test)]
+mod config_store_reproduction {
+    use super::*;
+    use crate::test_support::TestContext;
+
+    /// A setting saved through an admin settings form must survive a restart.
+    ///
+    /// `save_settings` is the write path behind five admin forms (products,
+    /// legalpages, userportal, email, auth-ui). It calls `config::set`, which
+    /// on native writes the `EnvConfigService`'s in-memory override map and
+    /// nothing else — the `variables` table, the only durable store, never
+    /// sees the value. The save therefore takes effect immediately and is
+    /// gone on the next boot, the exact mirror of the `update_variable`
+    /// defect: two write paths, neither syncing to the other.
+    ///
+    /// The restart is modelled by seeding a second config service from the
+    /// same database through the production loader, which is all a fresh
+    /// process does.
+    #[tokio::test]
+    async fn settings_form_save_survives_a_restart() {
+        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx.boot_config_service().await;
+
+        let saved = crate::test_support::unique_config_value();
+        let allowed = [crate::config_vars::shared_var(KEY)];
+        let body =
+            serde_json::to_vec(&serde_json::json!({ KEY: saved })).expect("serialize request body");
+        let status = crate::test_support::output_status(
+            save_settings(&ctx, InputStream::from_bytes(body), &allowed, "branding").await,
+        )
+        .await;
+        assert_eq!(status, 200, "the settings form reported the save succeeded");
+
+        // Live reads see it, which is why this looks like it works.
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            saved
+        );
+
+        // Restart: a fresh process seeds its config service from the table.
+        ctx.boot_config_service().await;
+
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            saved,
+            "a setting saved through an admin form must outlive the process that saved it"
+        );
+    }
+}

@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = site_config(ctx);
+    let config = site_config(ctx).await;
     let allow_signup =
         crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await;
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
@@ -50,15 +50,16 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // would 4xx as soon as it's clicked.
     let oauth_enabled =
         crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", false).await;
-    let oauth_providers: Vec<&'static str> = if oauth_enabled {
-        ["github", "google", "microsoft"]
-            .iter()
-            .copied()
-            .filter(|p| oauth_provider_configured(ctx, p))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // A loop rather than `.filter()`: the predicate reads config through the
+    // async client now, and an async predicate has no place in `Iterator`.
+    let mut oauth_providers: Vec<&'static str> = Vec::new();
+    if oauth_enabled {
+        for provider in ["github", "google", "microsoft"] {
+            if oauth_provider_configured(ctx, provider).await {
+                oauth_providers.push(provider);
+            }
+        }
+    }
 
     let markup = ui::layout::page(
         "Sign In",

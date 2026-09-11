@@ -719,6 +719,58 @@ impl TestContext {
             .await
     }
 
+    /// Install a `wafer-run/config` service block seeded the way a real boot
+    /// seeds one: run the production `seed_and_load` loader over the
+    /// `variables` table, then fill an `EnvConfigService` through
+    /// [`crate::builder::fill_config_service`] and publish the same map to
+    /// the synchronous `config_get` snapshot.
+    ///
+    /// Unlike [`Self::set_config`], nothing is seeded by the test: the
+    /// service holds precisely what the table held when this was called.
+    /// Calling it a second time models a process restart against the same
+    /// database.
+    ///
+    /// NOT a full boot. `cli/server.rs` additionally publishes
+    /// `BLOCK_SETTINGS_CONFIG_KEY`, `RUN_MIGRATIONS_KEY` and
+    /// `STRICT_SCHEMA_CONFIG_KEY` to both surfaces, passes the declared-key
+    /// filtered process environment into `seed_and_load` rather than `&[]`,
+    /// installs a `ConfigSource`, and registers the config block through
+    /// `ImpresspressBuilder::build()` rather than by hand. A test that needs
+    /// any of those — block settings in particular — wants
+    /// `impresspress/tests/boot_lifecycle.rs`'s `build_native_runtime`
+    /// harness, which drives the factory the binary itself uses.
+    ///
+    /// CLOBBERS the synchronous snapshot rather than merging into it, which
+    /// is deliberate: a restart genuinely drops in-memory state, and merging
+    /// would let a pre-restart value survive and make a
+    /// `config_get`-after-restart assertion lie. The cost is that anything
+    /// [`Self::set_config`] put there is discarded — notably the
+    /// `TEST_JWT_SECRET` recipe below — so seed through the `variables` table
+    /// if a value must survive this call.
+    ///
+    /// PRECONDITION: admin migrations have run, so the `variables` table
+    /// exists — `seed_and_load` documents the same requirement.
+    pub async fn boot_config_service(&mut self) {
+        let vars = crate::platform_state::variables::seed_and_load(&self.db_service, &[])
+            .await
+            .expect("seed and load variables at boot");
+
+        let svc: Arc<dyn wafer_core::interfaces::config::service::ConfigService> =
+            Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());
+        let svc = crate::builder::fill_config_service(svc, vars.clone());
+
+        self.config = Arc::new(vars);
+        // The block `builder::registration` registers, not wafer-core's: a
+        // fixture that wired up a different config block would certify a path
+        // production does not take, which is how the config-store defect
+        // survived a green suite in the first place.
+        let block: Arc<dyn Block> = Arc::new(crate::blocks::config::VariablesConfigBlock::new(
+            svc,
+            self.db_service.clone(),
+        ));
+        self.register_block("wafer-run/config", block);
+    }
+
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
     /// will route to this block's `handle()`.
     ///
@@ -1641,6 +1693,25 @@ pub fn auth_msg(action: &str, path: &str, user_id: &str) -> Message {
 }
 
 /// Build an admin request `Message` (user_id `"admin_1"`, role `admin`).
+/// A config value no process environment can be holding.
+///
+/// `EnvConfigService::get` falls through to `std::env::var` when it has no
+/// override, so a test asserting on a fixed literal like `#ff0000` PASSES for
+/// anyone whose shell exports that key. On a reproduction test — one whose
+/// whole job is to fail while the defect is live — that is a silent false
+/// green, demonstrated with
+/// `WAFER_RUN_SHARED__PRIMARY_COLOR='#ff0000' cargo test ...`.
+pub fn unique_config_value() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!(
+        "#repro-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after the epoch")
+            .as_nanos()
+    )
+}
+
 pub fn admin_msg(action: &str, path: &str) -> Message {
     let mut m = auth_msg(action, path, "admin_1");
     m.set_meta("auth.user_roles", "admin");

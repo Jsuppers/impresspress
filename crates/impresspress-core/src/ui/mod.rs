@@ -91,6 +91,28 @@ impl SiteConfig {
             .await,
         }
     }
+
+    /// [`Self::load`] with the auth pages' one difference: they prefer
+    /// `WAFER_RUN_SHARED__AUTH_LOGO_URL` when it is set, so a deployment can
+    /// show a different wordmark on login/signup than in the app chrome, and
+    /// fall back to the ordinary logo when it is not.
+    ///
+    /// This replaces `blocks::auth_ui::pages::site_config`, a synchronous
+    /// near-copy of `load` that read the boot-time `ctx.config_get` snapshot.
+    /// That snapshot is frozen at startup, so every branding value an admin
+    /// saved was invisible to the login page until the process restarted —
+    /// and on Cloudflare it never arrived at all, because no D1 variables row
+    /// reaches that surface. One async loader means the auth pages cannot
+    /// drift from the rest of the site again.
+    pub async fn load_for_auth(ctx: &dyn wafer_run::context::Context) -> Self {
+        use wafer_core::clients::config;
+        let mut config = Self::load(ctx).await;
+        let auth_logo = config::get_default(ctx, "WAFER_RUN_SHARED__AUTH_LOGO_URL", "").await;
+        if !auth_logo.is_empty() {
+            config.logo_url = auth_logo;
+        }
+        config
+    }
 }
 
 /// User info available during rendering (extracted from auth metadata).

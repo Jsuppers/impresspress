@@ -233,7 +233,36 @@ pub async fn build_native_runtime(
     // Native has no divergence: every key below is `both`.
     let mut runtime_config = builder::RuntimeConfig::new();
     runtime_config
-        .extend_both(vars.clone())
+        // Exactly the three keys something must read SYNCHRONOUSLY, not a copy
+        // of the variables table. `builder::registration` reads all three
+        // during `build()`, before a runtime exists to await anything, and
+        // `csrf`/`auth::service` read the secret per request off the snapshot.
+        //
+        // Copying the whole table here is what step 1 made redundant — and
+        // worse than redundant: every admin-editable key sitting on a
+        // boot-frozen surface is a stale read waiting for its first caller,
+        // which is how the branding and OAuth defects happened. With only
+        // these three present, a future `ctx.config_get` of an admin key finds
+        // nothing rather than something out of date. `blocks::config` serves
+        // the rest from the table.
+        .both(
+            impresspress_core::blocks::auth::JWT_SECRET_KEY,
+            jwt_secret.clone(),
+        )
+        .both(
+            impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
+            vars.get(impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY)
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .both(
+            impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
+            vars.get(impresspress_core::config_vars::CSP_DIRECTIVES_KEY)
+                .cloned()
+                .unwrap_or_else(|| {
+                    impresspress_core::config_vars::DEFAULT_CSP_DIRECTIVES.to_string()
+                }),
+        )
         // Fan-out block_settings so consumer blocks (e.g. userportal) can read
         // enablement state via `ctx.config_get` without re-querying the
         // `block_settings` table per request.
