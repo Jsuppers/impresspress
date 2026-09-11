@@ -43,7 +43,6 @@ impl ConfigService for HashMapConfigService {
 mod config_store_reproduction {
     use std::collections::HashMap;
 
-    use wafer_core::interfaces::config::service::ConfigService;
     use wasm_bindgen_test::*;
 
     /// A config write on Cloudflare must not be silently dropped.
