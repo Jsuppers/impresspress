@@ -14,7 +14,7 @@ use super::site_config;
 use crate::ui::{self, components::auth_panel, templates::auth_split};
 
 pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = site_config(ctx);
+    let config = site_config(ctx).await;
 
     // Optional convenience: if the holder shared a `?token=...` link, pre-fill
     // the field. The value is rendered as an attribute (maud HTML-escapes it).

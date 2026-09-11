@@ -16,63 +16,15 @@ use wafer_run::context::Context;
 
 use crate::ui::{self, SiteConfig};
 
-/// Build SiteConfig directly from `ctx.config_get(...)`.
+/// The auth pages' site config.
 ///
-/// Values come from the cached config snapshot — on cloudflare, populated
-/// once per isolate by `impresspress-cloudflare::config_cache::get_or_load`;
-/// on native, populated at boot by `seed_and_load_variables` in
-/// `impresspress::cli::server`. No D1 / SQLite read happens here.
-pub(super) fn site_config(ctx: &dyn Context) -> SiteConfig {
-    let auth_logo = ctx
-        .config_get("WAFER_RUN_SHARED__AUTH_LOGO_URL")
-        .unwrap_or("");
-    // Blank = no wordmark image; the pages render the pixel-art icon and the
-    // app name as text (see `ui::templates::brand_lockup`).
-    let logo_url = if auth_logo.is_empty() {
-        ctx.config_get("WAFER_RUN_SHARED__LOGO_URL")
-            .unwrap_or("")
-            .to_string()
-    } else {
-        auth_logo.to_string()
-    };
-
-    let embedded_scripts = ctx
-        .config_get("WAFER_RUN_SHARED__EMBEDDED_SCRIPTS")
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    SiteConfig {
-        app_name: ctx
-            .config_get("WAFER_RUN_SHARED__APP_NAME")
-            .unwrap_or("Impresspress")
-            .to_string(),
-        logo_url,
-        logo_icon_url: ctx
-            .config_get("WAFER_RUN_SHARED__LOGO_ICON_URL")
-            .map(str::to_string)
-            .unwrap_or_else(ui::assets::logo_icon_url),
-        favicon_url: ctx
-            .config_get("WAFER_RUN_SHARED__FAVICON_URL")
-            .map(str::to_string)
-            .unwrap_or_else(ui::assets::favicon_url),
-        primary_color: ctx
-            .config_get("WAFER_RUN_SHARED__PRIMARY_COLOR")
-            .unwrap_or("")
-            .to_string(),
-        embedded_scripts,
-        auth_headline: ctx
-            .config_get("WAFER_RUN_SHARED__AUTH_HEADLINE")
-            .unwrap_or(crate::config_vars::DEFAULT_AUTH_HEADLINE)
-            .to_string(),
-        auth_tagline: ctx
-            .config_get("WAFER_RUN_SHARED__AUTH_TAGLINE")
-            .unwrap_or(crate::config_vars::DEFAULT_AUTH_TAGLINE)
-            .to_string(),
-    }
+/// Was a synchronous near-copy of [`SiteConfig::load`] reading
+/// `ctx.config_get`, which serves the boot-time snapshot: an admin's saved
+/// branding did not reach the login page until the process restarted, and on
+/// Cloudflare never reached it at all. Delegates to the one async loader now,
+/// so these pages cannot drift from the rest of the site.
+pub(super) async fn site_config(ctx: &dyn Context) -> SiteConfig {
+    SiteConfig::load_for_auth(ctx).await
 }
 
 /// True if the provider has all three credentials needed for the modern
@@ -370,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn site_config_reads_from_ctx_config_get_with_defaults() {
         let ctx = TestContext::new().await;
-        let cfg = site_config(&ctx);
+        let cfg = site_config(&ctx).await;
 
         assert_eq!(cfg.app_name, "Impresspress");
         assert_eq!(cfg.logo_url, "", "no wordmark image by default");
@@ -388,7 +340,7 @@ mod tests {
         );
         ctx.set_config("WAFER_RUN_SHARED__LOGO_URL", "https://example.com/main.png");
 
-        let cfg = site_config(&ctx);
+        let cfg = site_config(&ctx).await;
         assert_eq!(cfg.logo_url, "https://example.com/auth.png");
     }
 
@@ -397,7 +349,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.set_config("WAFER_RUN_SHARED__LOGO_URL", "https://example.com/main.png");
 
-        let cfg = site_config(&ctx);
+        let cfg = site_config(&ctx).await;
         assert_eq!(cfg.logo_url, "https://example.com/main.png");
     }
 
@@ -406,7 +358,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
 
-        let cfg = site_config(&ctx);
+        let cfg = site_config(&ctx).await;
         assert_eq!(cfg.app_name, "MyApp");
     }
 
@@ -418,7 +370,7 @@ mod tests {
             "https://a.example.com/a.js, https://b.example.com/b.js,",
         );
 
-        let cfg = site_config(&ctx);
+        let cfg = site_config(&ctx).await;
         assert_eq!(
             cfg.embedded_scripts,
             vec![

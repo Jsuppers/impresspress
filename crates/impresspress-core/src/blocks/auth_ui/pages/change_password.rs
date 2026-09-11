@@ -7,7 +7,7 @@ use super::{pw_field, site_config};
 use crate::ui::{self, components::auth_panel, templates::auth_split};
 
 pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
-    let config = site_config(ctx);
+    let config = site_config(ctx).await;
 
     let markup = ui::layout::page(
         "Change Password",

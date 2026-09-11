@@ -386,4 +386,48 @@ mod tests {
              change stays invisible for the life of the process"
         );
     }
+
+    /// The login page shows branding an admin saved, without a restart.
+    ///
+    /// This is the requirement read surface 2 stood for. It could not be
+    /// asserted while `blocks::auth_ui::pages::site_config` read
+    /// `ctx.config_get`: that snapshot is filled at boot and never refilled,
+    /// so the assertion would have failed however correct the config store
+    /// was. Step 3 of the decision moved those reads onto the async client,
+    /// which is what makes this expressible at all.
+    ///
+    /// Asserted through `SiteConfig::load_for_auth` — what the login, signup,
+    /// bootstrap, change-password, reset-password and verify pages all build
+    /// their chrome from — rather than by rendering one page, so it covers
+    /// every one of them.
+    #[tokio::test]
+    async fn the_auth_pages_show_branding_saved_after_boot() {
+        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx.boot_config_service().await;
+
+        // Boot is over; the snapshot the auth pages used to read is now fixed.
+        let saved = unique_config_value();
+        variables::upsert_by_key(
+            &ctx,
+            KEY,
+            VariablePatch {
+                value: Some(saved.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the admin write lands in the table");
+
+        let site = crate::ui::SiteConfig::load_for_auth(&ctx).await;
+        assert_eq!(
+            site.primary_color, saved,
+            "the auth pages must render the brand colour an admin saved, not \
+             the one that happened to be in the table when the process booted"
+        );
+    }
 }

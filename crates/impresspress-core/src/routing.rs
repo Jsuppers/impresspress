@@ -594,13 +594,24 @@ pub async fn route_to_block(
     // and Cloudflare (no filesystem probe, which is meaningless on Workers and
     // CWD-relative on native).
     if path == "/" {
-        // Read from the context snapshot rather than the config client:
-        // the root route is served on every anonymous request, and this is
-        // the only reader of the key, so there is no second surface to
-        // disagree with — only the truth table had to be shared.
+        // Read through the config client, not the context snapshot. That
+        // snapshot is frozen at boot, so an admin who set this key kept
+        // getting the old routing until the process restarted — and on
+        // Cloudflare the D1 row never reached that surface at all. Being the
+        // only reader made the two surfaces impossible to catch disagreeing,
+        // not impossible for them to disagree.
+        //
+        // The cost on this hot path is bounded: `blocks::config` serves reads
+        // from a snapshot of the variables table memoized against the
+        // config-write generation, so this is one query per write, not one
+        // per request to `/`.
         let has_landing_page = crate::config_vars::is_truthy(
-            ctx.config_get("WAFER_RUN_SHARED__HAS_LANDING_PAGE")
-                .unwrap_or("false"),
+            &wafer_core::clients::config::get_default(
+                ctx,
+                "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+                "false",
+            )
+            .await,
         );
         if has_landing_page {
             return ctx.call_block("wafer-run/web", msg, input).await;
