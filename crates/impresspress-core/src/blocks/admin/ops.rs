@@ -323,8 +323,6 @@ pub(super) async fn delete_role(
 // Variable mutations
 // ---------------------------------------------------------------------------
 
-/// Create a config variable, writing an audit-log row. Validates `_URL` keys
-/// against [`validate_url_value`] (SSRF). `key` must be non-empty.
 /// Refuse a key the runtime owns rather than storing an inert row.
 ///
 /// `blocks::config` never serves infrastructure keys (`IMPRESSPRESS_*` without
@@ -335,9 +333,28 @@ pub(super) async fn delete_role(
 /// reader will ever honour, which is the silent no-op this program keeps
 /// removing. Both write surfaces funnel through here.
 ///
-/// The JWT secret is deliberately NOT refused: it is a legitimate table row
-/// that `seed_jwt_secret` writes on native. Reads prefer the boot map for it,
-/// but the row itself belongs in the table.
+/// The JWT secret is deliberately NOT refused, and the asymmetry is worth
+/// stating because it is target-dependent:
+///
+/// - on native, `seed_and_load` runs `seed_jwt_secret` and `cli/server.rs`
+///   takes the boot map's secret from the loaded vars, so this row IS the next
+///   boot's signing key. Editing it is a real operator action — the row even
+///   carries "Rotating this secret invalidates every issued session" — and
+///   refusing it here would delete a working capability;
+/// - on Cloudflare the secret is a worker binding (`PROTECTED_ENV_KEYS`,
+///   consumed by `runtime_build`), and `CfDeployBootHooks::seed_and_load` runs
+///   only `seed_auto_generated`, which never covers this key. The row is
+///   therefore inert there: an edit is accepted and never takes effect.
+///
+/// That Cloudflare inertness predates this guard and is not something a
+/// target-agnostic write surface can decide. Refusing the key everywhere would
+/// trade a real native capability for it. Surfacing it to the operator — a
+/// warning on the Variables page for a deployment whose secret comes from the
+/// environment — is the fix, and is not attempted here.
+///
+/// `ui::settings_form`'s `CONFIG_SET` path does refuse this key, because no
+/// caller there legitimately writes it: it saves declared block and shared
+/// vars only. See the note in `blocks::config::write`.
 fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
     if crate::config_vars::is_infrastructure_key(key) || crate::config_vars::is_internal_key(key) {
         return Err(err_bad_request(&format!(
@@ -347,6 +364,9 @@ fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
     Ok(())
 }
 
+/// Create a config variable, writing an audit-log row. Validates `_URL` keys
+/// against [`validate_url_value`] (SSRF). `key` must be non-empty, and must
+/// not name a key the runtime owns ([`reject_runtime_owned_key`]).
 pub(super) async fn create_variable(
     ctx: &dyn Context,
     msg: &Message,
