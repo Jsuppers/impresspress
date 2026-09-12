@@ -409,6 +409,44 @@ pub fn is_internal_key(key: &str) -> bool {
     key.len() > 4 && key.starts_with("__") && key.ends_with("__")
 }
 
+/// Whether `key` names something the RUNTIME owns rather than stored
+/// configuration: infrastructure ([`is_infrastructure_key`]) or internal,
+/// adapter-injected ([`is_internal_key`]).
+///
+/// Neither class is ever variables-table config, so a row carrying one is a
+/// mistake or a forgery. Named once here because three surfaces have to agree
+/// on it and would otherwise each carry their own copy of the pair:
+/// `admin::ops::reject_runtime_owned_key` (the admin write path),
+/// `blocks::config`'s `served_only_from_boot_map` (the read path, which
+/// answers these from the boot map whatever the table holds), and
+/// `dev::data_snapshot::import` (the seed-bundle write path).
+pub fn is_runtime_owned_key(key: &str) -> bool {
+    is_infrastructure_key(key) || is_internal_key(key)
+}
+
+/// Whether `key`'s value must come from THIS instance rather than from stored
+/// or imported data: everything [`is_runtime_owned_key`] names, plus the JWT
+/// signing secret.
+///
+/// The secret is the one key that is legitimately a variables-table row — an
+/// operator rotating it is a real action, which is why
+/// `admin::ops::reject_runtime_owned_key` deliberately does NOT refuse it —
+/// and which must nevertheless never arrive from somewhere else.
+/// `platform_state::variables::seed_jwt_secret` writes through
+/// `insert_if_absent`, so a row that is already present wins and
+/// auto-generation never fires; boot then signs every session JWT and CSRF
+/// token with whatever that row holds. A seed bundle shared between instances
+/// would hand each of them one signing secret its author knows.
+///
+/// That is also why this is a wider set than [`is_runtime_owned_key`] and not
+/// a replacement for it: the admin write path wants the narrow one, while
+/// `blocks::config`'s `served_only_from_boot_map` (a row must not rotate the
+/// key under a running process) and `dev::data_snapshot` (a bundle must not
+/// carry it in either direction) want this one.
+pub fn is_instance_owned_key(key: &str) -> bool {
+    key == crate::blocks::auth::JWT_SECRET_KEY || is_runtime_owned_key(key)
+}
+
 #[cfg(test)]
 mod shared_vars_tests {
     use super::{

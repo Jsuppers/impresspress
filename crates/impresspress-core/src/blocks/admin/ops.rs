@@ -356,7 +356,7 @@ pub(super) async fn delete_role(
 /// caller there legitimately writes it: it saves declared block and shared
 /// vars only. See the note in `blocks::config::write`.
 fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
-    if crate::config_vars::is_infrastructure_key(key) || crate::config_vars::is_internal_key(key) {
+    if crate::config_vars::is_runtime_owned_key(key) {
         return Err(err_bad_request(&format!(
             "{key} is set by the runtime, not stored configuration; it cannot be created or edited here"
         )));

@@ -292,7 +292,19 @@ pub fn variable_is_exportable(row: &serde_json::Map<String, Value>) -> bool {
     if crate::util::is_sensitive_key(key, 0) {
         return false;
     }
-    !key.starts_with("IMPRESSPRESS_")
+    // Exactly the set [`import`] refuses, stated independently of the prefix
+    // rule below it. The two exist for different reasons — the prefix rule is
+    // about instance-specificity and also holds back block-scoped
+    // `IMPRESSPRESS__{BLOCK}__*` — so if it were ever narrowed to let that
+    // config travel, the infrastructure half would silently stop being
+    // filtered here while the importer still refused it, and this exporter
+    // would produce bundles its own importer rejects.
+    //
+    // It catches what the prefix rule cannot in any case: an internal key like
+    // `__IMPRESSPRESS_RUNTIME_KIND__` starts with `__`, so it clears
+    // `starts_with("IMPRESSPRESS_")`, and ends with `__` rather than a
+    // `_SECRET`/`_KEY` suffix, so it clears `is_sensitive_key` too.
+    !crate::config_vars::is_instance_owned_key(key) && !key.starts_with("IMPRESSPRESS_")
 }
 
 #[cfg(test)]
@@ -364,6 +376,32 @@ mod variable_is_exportable_tests {
             "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
             "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN",
             crate::blocks::dev::seed::SEED_ERROR_KEY,
+        ] {
+            assert!(
+                !variable_is_exportable(&row(serde_json::json!({
+                    "key": key,
+                    "sensitive": false,
+                }))),
+                "{key} must not travel into another instance's bundle"
+            );
+        }
+    }
+
+    /// The INTERNAL, adapter-injected class (`__…__`), which the prefix rule
+    /// above misses entirely: `__IMPRESSPRESS_RUNTIME_KIND__` starts with `__`,
+    /// not `IMPRESSPRESS_`, and ends with `__` rather than a `_SECRET`/`_KEY`
+    /// suffix, so it clears both existing checks.
+    ///
+    /// These are never variables-table config at all — a target's boot code
+    /// sets them directly — so a row carrying one is a mistake or a forgery,
+    /// and re-exporting it would carry that forgery into the next instance.
+    /// `__IMPRESSPRESS_RUNTIME_KIND__` is the one that matters: it is what
+    /// keeps Stripe secret-key operations off inside a visitor's browser.
+    #[test]
+    fn internal_runtime_keys_never_export() {
+        for key in [
+            "__IMPRESSPRESS_RUNTIME_KIND__",
+            "__IMPRESSPRESS_BLOCK_SETTINGS_JSON__",
         ] {
             assert!(
                 !variable_is_exportable(&row(serde_json::json!({
@@ -711,6 +749,50 @@ pub async fn import(
                      allowlist"
                 ),
             ));
+        }
+    }
+
+    // Third pre-flight pass, for the same reason as the two above: refuse
+    // before writing anything, so a bundle naming one forged key imports none
+    // of its rows rather than most of them and failing partway.
+    //
+    // `variables::TABLE` is the one allowlisted table whose rows carry a NAME
+    // the runtime reserves. `admin::ops::reject_runtime_owned_key` refuses
+    // these on the admin write path and `ui::settings_form`'s `CONFIG_SET`
+    // refuses them too; this import reaches the same table through
+    // `db::upsert`, so without this pass it is the one way in.
+    //
+    // The set is `is_instance_owned_key`, not the narrower
+    // `is_runtime_owned_key`, and the difference is the dangerous case. A
+    // planted INFRASTRUCTURE or INTERNAL row is inert for reads —
+    // `blocks::config`'s `served_only_from_boot_map` answers those from the
+    // boot map whatever the table holds (PR #65) — so it is only a forgery
+    // that shows on the admin Variables page and travels into the next
+    // export. The JWT SECRET is not inert: `seed_jwt_secret` writes through
+    // `insert_if_absent`, so a row already present wins and auto-generation
+    // never fires, and boot signs every session JWT and CSRF token with it.
+    // A bundle shared between instances would give each one a signing secret
+    // its author knows. Nothing legitimate carries either class — the secret
+    // is unexportable twice over (`_SECRET` suffix, and the `sensitive` flag
+    // the seeder sets) — so refusing them costs no real bundle.
+    //
+    // A row with no `key`, or a non-string one, is not judged here: no such
+    // value can spell a reserved name, and the upsert's `["key"]` conflict
+    // target is what refuses it.
+    if let Some(rows) = snapshot.tables.get(variables::TABLE) {
+        for row in rows {
+            let Some(key) = row.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            if crate::config_vars::is_instance_owned_key(key) {
+                return Err(WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "the data snapshot carries the variable {key:?}, whose value this \
+                         instance owns; a seed bundle may not set it"
+                    ),
+                ));
+            }
         }
     }
 

@@ -82,9 +82,7 @@ use crate::{
 /// the boot map already holds that same value, and a row must not rotate the
 /// signing key out from under a running process.
 fn served_only_from_boot_map(key: &str) -> bool {
-    key == crate::blocks::auth::JWT_SECRET_KEY
-        || crate::config_vars::is_infrastructure_key(key)
-        || crate::config_vars::is_internal_key(key)
+    crate::config_vars::is_instance_owned_key(key)
 }
 
 /// The `variables` table as a key/value map, shared by every reader holding
