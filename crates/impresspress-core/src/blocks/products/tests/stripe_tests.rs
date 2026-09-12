@@ -3138,7 +3138,11 @@ async fn webhook_rejects_missing_secret_config() {
     let (msg, input) = webhook_msg(&event, "anything");
 
     let out = stripe::handle_webhook(&ctx, &msg, input).await;
-    assert!(output_is_error(out, ErrorCode::Internal).await);
+    // Unavailable, not Internal: the secret being unset means webhook
+    // processing is switched off, not that this deployment is broken. (It
+    // does not change redelivery — Stripe retries on any non-2xx.) See
+    // `err_unavailable` in `stripe.rs`.
+    assert!(output_is_error(out, ErrorCode::Unavailable).await);
 }
 
 #[tokio::test]
@@ -3230,7 +3234,9 @@ async fn checkout_rejects_when_stripe_not_configured() {
     );
 
     let out = stripe::handle_checkout(&ctx, &msg, input).await;
-    assert!(output_is_error(out, ErrorCode::Internal).await);
+    // Unavailable, not Internal: checkout is a PUBLIC endpoint on a default
+    // install with no Stripe keys, and "not configured" is not a fault.
+    assert!(output_is_error(out, ErrorCode::Unavailable).await);
 }
 
 #[tokio::test]

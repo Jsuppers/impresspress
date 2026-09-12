@@ -303,6 +303,15 @@ pub(super) struct StubLlmServiceBlock {
     /// provider's own count: asserting the handler's status says nothing
     /// about whether a paid backend was already called.
     pub(super) chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// A classified refusal to answer every op with, instead of the canned
+    /// success above.
+    ///
+    /// The real service block maps each `LlmError` onto a code before it
+    /// crosses the block boundary (`wafer-core`'s llm handler:
+    /// `ModelNotFound` → `NotFound`, `InvalidRequest` → `InvalidArgument`,
+    /// `NotSupported` → `Unimplemented`). A route test can only show that a
+    /// handler preserves that classification if the stub can produce one.
+    pub(super) error: Option<(ErrorCode, String)>,
 }
 
 impl Default for StubLlmServiceBlock {
@@ -312,6 +321,7 @@ impl Default for StubLlmServiceBlock {
             status: ModelStatus::ready(),
             chat_chunks: Vec::new(),
             chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            error: None,
         }
     }
 }
@@ -329,6 +339,12 @@ impl Block for StubLlmServiceBlock {
     }
 
     async fn handle(&self, _ctx: &dyn Context, msg: Message, _input: InputStream) -> OutputStream {
+        // A scripted refusal answers every op, carrying the code the real
+        // service block would have assigned. Checked before the canned
+        // successes so a test can script the error for any op.
+        if let Some((code, message)) = &self.error {
+            return OutputStream::error(WaferError::new(*code, message.clone()));
+        }
         match msg.kind.as_str() {
             ServiceOp::LLM_LIST_MODELS => OutputStream::respond(
                 wafer_block::codec::encode(&self.models).expect("encode models"),
