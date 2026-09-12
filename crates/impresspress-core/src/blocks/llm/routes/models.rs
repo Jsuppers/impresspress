@@ -12,14 +12,17 @@ use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use super::streaming::sse_json_response;
 use crate::{
-    blocks::llm::{
-        contracts::{
-            ModelInfoView, ModelListResponse, ModelStatusResponse, ModelStatusView,
-            ModelUnloadResponse,
+    blocks::{
+        crud,
+        llm::{
+            contracts::{
+                ModelInfoView, ModelListResponse, ModelStatusResponse, ModelStatusView,
+                ModelUnloadResponse,
+            },
+            LlmBlock,
         },
-        LlmBlock,
     },
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_internal, ok_json},
 };
 
 /// `(backend_id, model_id)` as bound by the block's route table for
@@ -52,31 +55,34 @@ pub(in crate::blocks::llm) async fn list_models(
 /// `wafer-core`'s llm handler maps each `LlmError` onto a code before it
 /// crosses the block boundary: `InvalidRequest` → `InvalidArgument` (what
 /// `providers::service::status` answers for an unknown backend),
-/// `ModelNotFound` → `NotFound`, `NotSupported` → `Unimplemented`,
-/// `RateLimited` → `Unavailable`, `Unauthorized` → `Unauthenticated`. Both
-/// handlers below used to discard all of it with a blanket `err_internal`, so
-/// a caller naming a backend that does not exist was told the site had failed
-/// — which the 2026-09-10 live run recorded as 500s on non-existent ids.
+/// `ModelNotFound` → `NotFound`, `NotSupported` → `Unimplemented`. All three
+/// handlers below used to discard that with a blanket `err_internal`, so a
+/// caller naming a backend that does not exist was told the site had failed —
+/// what the 2026-09-10 live run recorded as 500s on non-existent ids.
 ///
-/// The tail stays `err_internal`: a `BackendError` or a network fault is a
-/// real internal failure and is still sanitized and logged, never echoed.
-/// Same shape as `products::handlers::provider::provider_error`.
+/// Everything except the caller-actionable `InvalidArgument` goes through
+/// `crud::db_error`, which is the only place in `blocks/` allowed to map an
+/// error by hand (`tests/error_door.rs` enforces that). It is also what makes
+/// the rest correct rather than merely classified:
+///
+/// - a `NotFound` answers with OUR label, so the runtime's
+///   `"block not found: wafer-run/llm"` — what a deployment missing the llm
+///   service block produces — is never echoed to a caller;
+/// - a `PermissionDenied` is sanitized to `"Access denied"` and logged, rather
+///   than publishing which `ResourceGrant` and table were refused;
+/// - a `BackendError`, a network fault, or a provider-credential failure stays
+///   an internal error: sanitized, logged, with a correlation id. A wrong
+///   provider API key is an operator's problem, and answering the caller 401
+///   would read as their own session expiring.
 fn llm_service_error(context: &str, error: WaferError) -> OutputStream {
     match error.code {
         ErrorCode::InvalidArgument | ErrorCode::FailedPrecondition => {
             err_bad_request(&error.message)
         }
-        ErrorCode::NotFound => err_not_found(&error.message),
-        ErrorCode::PermissionDenied => err_forbidden(&error.message),
-        ErrorCode::Unimplemented | ErrorCode::Unavailable | ErrorCode::Unauthenticated => {
-            OutputStream::error(error)
-        }
-        _ => err_internal(context, error.message),
+        _ => crud::db_error(error, "Model not found", context),
     }
 }
 
-/// `GET /b/llm/api/models/:backend_id/:model_id/status` — per-(backend, model)
-/// status. Authenticated.
 pub(in crate::blocks::llm) async fn model_status(
     _block: &LlmBlock,
     ctx: &dyn Context,
@@ -115,7 +121,7 @@ pub(in crate::blocks::llm) async fn load_model(
     };
     let stream = match llm_client::load_model_stream(ctx, &req).await {
         Ok(s) => s,
-        Err(e) => return err_internal("llm load_model failed", e.message),
+        Err(e) => return llm_service_error("llm load_model failed", e),
     };
 
     sse_json_response(stream)

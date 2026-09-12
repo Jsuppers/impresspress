@@ -535,12 +535,15 @@ pub(crate) async fn replay_webhook_event(
 
 /// A capability that is not configured is unavailable, not broken.
 ///
-/// `503` tells the caller — and Stripe's webhook retry logic — that this site
-/// is fine and this endpoint is switched off. `500` says the opposite: that
-/// something failed, which invites redelivery and reads as a fault in the
-/// deployment. `POST /b/products/checkout` and `POST /b/products/webhooks`
-/// are both PUBLIC and reachable on a default install where no Stripe keys
-/// are set, which is how the 2026-09-10 live run recorded them as 500s.
+/// `POST /b/products/checkout` and `POST /b/products/webhooks` are both PUBLIC
+/// and reachable on a default install where no Stripe keys are set, which is
+/// how the 2026-09-10 live run recorded them as 500s. `500` claims this
+/// deployment failed; `503` says it is fine and this capability is switched
+/// off, which is what actually happened.
+///
+/// It does NOT stop Stripe redelivering: Stripe retries on any non-2xx, 503
+/// included, and no `Retry-After` is set here. The gain is an honest status —
+/// for the operator reading logs and for a human caller — not fewer retries.
 fn err_unavailable(message: &str) -> OutputStream {
     OutputStream::error(WaferError::new(ErrorCode::Unavailable, message.to_string()))
 }

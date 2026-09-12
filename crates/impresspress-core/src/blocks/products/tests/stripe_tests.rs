@@ -3139,9 +3139,9 @@ async fn webhook_rejects_missing_secret_config() {
 
     let out = stripe::handle_webhook(&ctx, &msg, input).await;
     // Unavailable, not Internal: the secret being unset means webhook
-    // processing is switched off, not that this deployment is broken. A 500
-    // invites Stripe to redeliver against an endpoint that can never accept
-    // the event. See `err_unavailable` in `stripe.rs`.
+    // processing is switched off, not that this deployment is broken. (It
+    // does not change redelivery — Stripe retries on any non-2xx.) See
+    // `err_unavailable` in `stripe.rs`.
     assert!(output_is_error(out, ErrorCode::Unavailable).await);
 }
 
