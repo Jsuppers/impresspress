@@ -292,7 +292,13 @@ pub fn variable_is_exportable(row: &serde_json::Map<String, Value>) -> bool {
     if crate::util::is_sensitive_key(key, 0) {
         return false;
     }
-    !key.starts_with("IMPRESSPRESS_")
+    // Two classes the runtime owns, and the prefix rule only catches one of
+    // them: an internal key like `__IMPRESSPRESS_RUNTIME_KIND__` starts with
+    // `__`, so it clears `starts_with("IMPRESSPRESS_")`, and ends with `__`
+    // rather than a `_SECRET`/`_KEY` suffix, so it clears `is_sensitive_key`
+    // too. It is never table config at all, so a row carrying one is a
+    // mistake or a forgery and must not travel.
+    !key.starts_with("IMPRESSPRESS_") && !crate::config_vars::is_internal_key(key)
 }
 
 #[cfg(test)]
@@ -364,6 +370,32 @@ mod variable_is_exportable_tests {
             "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
             "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN",
             crate::blocks::dev::seed::SEED_ERROR_KEY,
+        ] {
+            assert!(
+                !variable_is_exportable(&row(serde_json::json!({
+                    "key": key,
+                    "sensitive": false,
+                }))),
+                "{key} must not travel into another instance's bundle"
+            );
+        }
+    }
+
+    /// The INTERNAL, adapter-injected class (`__…__`), which the prefix rule
+    /// above misses entirely: `__IMPRESSPRESS_RUNTIME_KIND__` starts with `__`,
+    /// not `IMPRESSPRESS_`, and ends with `__` rather than a `_SECRET`/`_KEY`
+    /// suffix, so it clears both existing checks.
+    ///
+    /// These are never variables-table config at all — a target's boot code
+    /// sets them directly — so a row carrying one is a mistake or a forgery,
+    /// and re-exporting it would carry that forgery into the next instance.
+    /// `__IMPRESSPRESS_RUNTIME_KIND__` is the one that matters: it is what
+    /// keeps Stripe secret-key operations off inside a visitor's browser.
+    #[test]
+    fn internal_runtime_keys_never_export() {
+        for key in [
+            "__IMPRESSPRESS_RUNTIME_KIND__",
+            "__IMPRESSPRESS_BLOCK_SETTINGS_JSON__",
         ] {
             assert!(
                 !variable_is_exportable(&row(serde_json::json!({
@@ -711,6 +743,41 @@ pub async fn import(
                      allowlist"
                 ),
             ));
+        }
+    }
+
+    // Third pre-flight pass, for the same reason as the two above: refuse
+    // before writing anything, so a bundle naming one forged key imports none
+    // of its rows rather than most of them and failing partway.
+    //
+    // `variables::TABLE` is the one allowlisted table whose rows carry a NAME
+    // the runtime reserves. `admin::ops::reject_runtime_owned_key` refuses
+    // these on the admin write path and `ui::settings_form`'s `CONFIG_SET`
+    // refuses them too; this import reaches the same table through
+    // `db::upsert`, so without this pass it is the one way in.
+    //
+    // A planted row is inert for READS — `blocks::config`'s
+    // `served_only_from_boot_map` answers these keys from the boot map
+    // whatever the table holds (PR #65) — but it shows on the admin Variables
+    // page and travels on into the next export, so it must not land.
+    //
+    // A row with no `key`, or a non-string one, is not judged here: no such
+    // value can spell a reserved name, and the upsert's `["key"]` conflict
+    // target is what refuses it.
+    if let Some(rows) = snapshot.tables.get(variables::TABLE) {
+        for row in rows {
+            let Some(key) = row.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            if crate::config_vars::is_runtime_owned_key(key) {
+                return Err(WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "the data snapshot carries the variable {key:?}, which the runtime owns \
+                         and never reads from the variables table"
+                    ),
+                ));
+            }
         }
     }
 

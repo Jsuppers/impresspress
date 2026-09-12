@@ -570,6 +570,126 @@ async fn import_refuses_a_schema_version_this_build_does_not_read() {
     assert_eq!(err.code, wafer_run::ErrorCode::InvalidArgument);
 }
 
+/// A snapshot carries ordinary site config — that is what an export is FOR —
+/// but never a key the runtime owns.
+///
+/// `admin::ops::reject_runtime_owned_key` refuses these on the admin write
+/// path, and `ui::settings_form`'s `CONFIG_SET` refuses them too. This import
+/// writes the same table through `db::upsert` and passed neither, so a bundle
+/// could plant `__IMPRESSPRESS_RUNTIME_KIND__` or `IMPRESSPRESS_DEPLOY_TOKEN`
+/// in the variables table of every instance that seeds from it.
+///
+/// The planted row is INERT FOR READS — `blocks::config`'s
+/// `served_only_from_boot_map` answers those keys from the boot map whatever
+/// the table holds, which is what PR #65 fixed — so this is a forged row that
+/// shows up on the admin Variables page and travels on into the next export,
+/// not a config override. It still must not land.
+#[tokio::test]
+async fn import_refuses_a_runtime_owned_variable_key() {
+    for key in [
+        // internal, adapter-injected (`__…__`)
+        "__IMPRESSPRESS_RUNTIME_KIND__",
+        "__IMPRESSPRESS_BLOCK_SETTINGS_JSON__",
+        // infrastructure (`IMPRESSPRESS_*` with no `__`)
+        "IMPRESSPRESS_DEPLOY_TOKEN",
+    ] {
+        let ctx = TestContext::with_products().await;
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert(
+            variables::TABLE.to_string(),
+            vec![json_map(json!({
+                "id": "var_forged",
+                "key": key,
+                "value": "browser",
+                "sensitive": false,
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect()],
+        );
+        let snap = DataSnapshot {
+            schema_version: data_snapshot::SCHEMA_VERSION,
+            tables,
+        };
+
+        let err = data_snapshot::import(&ctx, &snap).await.unwrap_err();
+        assert_eq!(err.code, wafer_run::ErrorCode::InvalidArgument, "{key}");
+
+        // Refused in PRE-FLIGHT, like the allowlist and schema-version checks
+        // above: a bundle that names one forged key writes none of its rows,
+        // rather than importing most of them and failing partway.
+        let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            !vars.iter().any(|v| v.data["key"] == json!(key)),
+            "a refused import must not have written {key}: {vars:?}",
+        );
+    }
+}
+
+/// The other side of that boundary: the guard refuses only what the RUNTIME
+/// owns, not everything with a prefix.
+///
+/// `WAFER_RUN_SHARED__*` is the half an export exists to carry, and
+/// `IMPRESSPRESS__{BLOCK}__*` is ordinary database-backed block config —
+/// `variable_is_exportable` holds the latter back at export time because it
+/// describes the exporting instance, but a bundle that legitimately carries
+/// one (hand-authored, or from a build whose filter differs) must still
+/// import rather than being refused as a forgery.
+#[tokio::test]
+async fn import_accepts_ordinary_config_keys() {
+    let ctx = TestContext::with_products().await;
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        variables::TABLE.to_string(),
+        vec![
+            json_map(json!({
+                "id": "var_shared",
+                "key": "WAFER_RUN_SHARED__APP_NAME",
+                "value": "The print shop",
+                "sensitive": false,
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect(),
+            json_map(json!({
+                "id": "var_block_scoped",
+                "key": "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
+                "value": "NZ",
+                "sensitive": false,
+                "created_at": STAMP,
+                "updated_at": STAMP,
+            }))
+            .into_iter()
+            .collect(),
+        ],
+    );
+    let snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snap)
+        .await
+        .expect("ordinary config must still import");
+
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
+        .await
+        .unwrap();
+    for key in [
+        "WAFER_RUN_SHARED__APP_NAME",
+        "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
+    ] {
+        assert!(
+            vars.iter().any(|v| v.data["key"] == json!(key)),
+            "{key} must have imported: {vars:?}",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // seed::import wiring
 // ---------------------------------------------------------------------------
