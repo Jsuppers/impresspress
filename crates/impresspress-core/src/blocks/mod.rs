@@ -114,6 +114,16 @@ macro_rules! feature_block_manifest {
                 infos.push(<$ctor>::new().info());
             )+
 
+            // `impresspress/admin` is registered separately (its ctor takes
+            // the runtime's live `BlockSettings` handle — see
+            // [`register_admin`]), but its declarative `info()` belongs in the
+            // discovery set exactly as it did when it sat in the manifest:
+            // this set feeds `collect_all_config_vars()`, the inspector route
+            // table and the routing/auth policy, none of which care about the
+            // handle. The unwired `new()` is therefore the right constructor
+            // here, and the wrong one for registration.
+            infos.push(admin::AdminBlock::new().info());
+
             // `impresspress/llm` is registered separately (its ctor takes
             // `Arc<dyn ProviderAdmin>`), but its declarative `info()` belongs
             // in the discovery set. A no-op provider-admin handle suffices.
@@ -150,7 +160,6 @@ macro_rules! feature_block_manifest {
 }
 
 feature_block_manifest! {
-    admin::AdminBlock,
     auth_ui::AuthUiBlock,
     email::EmailBlock,
     system::SystemBlock,
@@ -253,6 +262,31 @@ fn enabled_defaults_from(infos: &[wafer_run::BlockInfo]) -> Vec<(String, bool)> 
         .filter(|i| i.can_disable)
         .map(|i| (i.name.clone(), i.default_enabled))
         .collect()
+}
+
+/// Register the admin feature block with the WAFER runtime.
+///
+/// `AdminBlock` is not in the feature-block manifest because its production
+/// constructor takes the runtime's live enablement snapshot — the same
+/// `Arc<RwLock<BlockSettings>>` the builder hands the router as its
+/// `Arc<dyn FeatureConfig>`. Call this from `ImpresspressBuilder::build()` in
+/// place of a manifest entry.
+///
+/// That handle is what makes the block toggle take effect without a restart.
+/// `routing::route_to_block` reads the snapshot on every request, so the
+/// toggle updates it after persisting the row; the manifest's zero-arg
+/// `AdminBlock::new()` would leave the field at `Default` — a private
+/// snapshot nothing reads — and the toggle would reach the table and stop
+/// there. `tests/autoreg_smoke.rs` pins that admin is NOT in the manifest so
+/// that cannot regress silently.
+pub fn register_admin(
+    w: &mut wafer_run::Wafer,
+    block_settings: std::sync::Arc<std::sync::RwLock<crate::features::BlockSettings>>,
+) -> Result<(), wafer_run::RuntimeError> {
+    w.register_block(
+        admin::ADMIN_BLOCK_ID.to_string(),
+        std::sync::Arc::new(admin::AdminBlock::with_block_settings(block_settings)),
+    )
 }
 
 /// Register the LLM feature block with the WAFER runtime.

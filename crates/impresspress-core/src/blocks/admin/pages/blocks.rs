@@ -1,8 +1,11 @@
+use std::sync::{Arc, RwLock};
+
 use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
 use crate::{
+    features::BlockSettings,
     platform_state::block_settings,
     ui::{
         self,
@@ -257,7 +260,11 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// `POST /b/admin/blocks/{name}/toggle` -- toggle a block's enabled state.
 /// `{name}` is the `--`-encoded block name, read only as the route table
 /// bound it.
-pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputStream {
+pub async fn handle_toggle_feature(
+    ctx: &dyn Context,
+    msg: &Message,
+    block_settings_handle: &Arc<RwLock<BlockSettings>>,
+) -> OutputStream {
     let block_name = decode_block_name(msg.var("name"));
     let block_name = block_name.as_str();
     // One read answers both questions below: whether this name exists at all,
@@ -314,6 +321,38 @@ pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputSt
     // state.
     if let Err(e) = block_settings::set_enabled(ctx, block_name, new_enabled).await {
         return crate::http::err_internal("Failed to persist block setting", e);
+    }
+
+    // Then the LIVE snapshot, in that order. `routing::route_to_block` gates
+    // every route on the router's `Arc<dyn FeatureConfig>` — this same
+    // `Arc<RwLock<BlockSettings>>` — and reads it per request, so without
+    // this the toggle reached the table and stopped there. On native nothing
+    // re-reads that table after `build()` (`NativeBootHooks::seed_after_admin_init`
+    // is empty), so the router kept serving a disabled block until the
+    // process restarted, while the blocks page — which reads the table —
+    // showed it off.
+    //
+    // After the persist, never before: a failed write must not leave the
+    // snapshot claiming a state the database does not hold, which is the
+    // same ordering the audit row below already follows.
+    //
+    // Cloudflare and the browser reach the same place by their own routes
+    // (a config-version bump rebuilds the writing isolate; the browser
+    // republishes at boot), so this is one update that is correct on every
+    // target rather than a native special case.
+    match block_settings_handle.write() {
+        Ok(mut settings) => settings.set_block_enabled(block_name, new_enabled),
+        // Poisoned only if another holder panicked mid-write, which would
+        // leave enablement indeterminate. The database row is already
+        // correct, so the toggle is reported as the success it was; the
+        // stale snapshot is corrected on the next boot.
+        Err(e) => {
+            tracing::error!(
+                block = %block_name,
+                error = %e,
+                "block settings snapshot poisoned; the live gate keeps its old value until restart"
+            );
+        }
     }
 
     let admin_id = msg.user_id().to_string();
@@ -628,6 +667,17 @@ mod toggle_feature_tests {
         ctx
     }
 
+    /// An enablement snapshot nothing else reads.
+    ///
+    /// These tests assert the DATABASE effect of a toggle. The live-snapshot
+    /// effect — the handle the router reads per request — has its own test
+    /// against a wired `AdminBlock`
+    /// (`a_toggle_updates_the_live_enablement_snapshot`), because it is the
+    /// block, not this handler, that owns the wiring.
+    fn unwired_handle() -> Arc<RwLock<BlockSettings>> {
+        Arc::new(RwLock::new(BlockSettings::default()))
+    }
+
     async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
         db::list_all(
             ctx,
@@ -654,7 +704,7 @@ mod toggle_feature_tests {
             "no row yet ⇒ defaults enabled"
         );
 
-        let _ = handle_toggle_feature(&ctx, &toggle_files_msg())
+        let _ = handle_toggle_feature(&ctx, &toggle_files_msg(), &unwired_handle())
             .await
             .collect_buffered()
             .await
@@ -677,7 +727,7 @@ mod toggle_feature_tests {
         let ctx = ctx_with_files_registered().await;
         let failing =
             FailingDbOpContext::new(ctx.clone(), vec![("database.list", block_settings::TABLE)]);
-        let out = handle_toggle_feature(&failing, &toggle_files_msg()).await;
+        let out = handle_toggle_feature(&failing, &toggle_files_msg(), &unwired_handle()).await;
 
         assert!(
             output_is_error(out, "Internal").await,
@@ -703,7 +753,7 @@ mod toggle_feature_tests {
     async fn toggle_persist_failure_returns_error_without_audit() {
         let ctx = ctx_with_files_registered().await.break_writes();
 
-        let out = handle_toggle_feature(&ctx, &toggle_files_msg()).await;
+        let out = handle_toggle_feature(&ctx, &toggle_files_msg(), &unwired_handle()).await;
         assert!(
             crate::test_support::output_is_error(out, "Internal").await,
             "a genuine persistence failure must surface as an error, not a fabricated success"
@@ -734,7 +784,7 @@ mod toggle_feature_tests {
             "/b/admin/blocks/impresspress--fyles/toggle",
         ));
 
-        let out = handle_toggle_feature(&ctx, &msg).await;
+        let out = handle_toggle_feature(&ctx, &msg, &unwired_handle()).await;
         assert!(
             output_is_error(out, "NotFound").await,
             "an unknown block name must be refused, not written",
@@ -775,7 +825,7 @@ mod toggle_feature_tests {
             "/b/admin/blocks/impresspress--admin/toggle",
         ));
 
-        let out = handle_toggle_feature(&ctx, &msg).await;
+        let out = handle_toggle_feature(&ctx, &msg, &unwired_handle()).await;
         assert!(
             output_is_error(out, "NotFound").await,
             "a block that cannot be disabled must not be toggleable",
@@ -815,7 +865,7 @@ mod toggle_feature_tests {
             "create",
             "/b/admin/blocks/impresspress--unloaded/toggle",
         ));
-        let _ = handle_toggle_feature(&ctx, &msg)
+        let _ = handle_toggle_feature(&ctx, &msg, &unwired_handle())
             .await
             .collect_buffered()
             .await
