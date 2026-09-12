@@ -695,11 +695,18 @@ fn handle_extensions(ctx: &dyn Context) -> OutputStream {
             version: b.version.clone(),
             interface: b.interface.clone(),
             summary: b.summary.clone(),
-            // Through `feature_gate_name` for the reason the router uses it:
-            // the inspector's `BlockInfo` is named `wafer-run/inspector`
-            // while it is gated as `impresspress/inspector`, and an unmapped
-            // lookup would hit the default-enabled branch and ignore the
-            // admin toggle entirely.
+            // Through `feature_gate_name` so this answers the question the
+            // router answers: it gates on `route.block`, which for the
+            // inspector is `impresspress/inspector` even though its
+            // `BlockInfo` is named `wafer-run/inspector`.
+            //
+            // It does NOT make an admin toggle for the inspector work: every
+            // writer keys rows by `BlockInfo::name` (`set_enabled` from the
+            // blocks page, `block_enabled_defaults` from the seed), so a row
+            // would be keyed `wafer-run/inspector` and this read would miss
+            // it. Moot in practice — `can_disable` defaults to false and the
+            // inspector never declares otherwise, so it is seeded no row and
+            // rendered no toggle.
             enabled: features.is_block_enabled(crate::routing::feature_gate_name(&b.name)),
         })
         .collect();

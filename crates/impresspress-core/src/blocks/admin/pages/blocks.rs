@@ -271,13 +271,34 @@ pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputSt
     let row = rows.iter().find(|r| r.block_name == block_name);
 
     // `decode_block_name` only swaps `--` for `/`, so the name is entirely
-    // caller-controlled, and `set_enabled` upserts — a typo would mint a row
-    // nothing ever reaps, which `blocks_page` then lists forever as an
-    // unloaded block. Registration alone is too strict a test: that page
-    // deliberately offers a toggle for a block holding a row without being
-    // registered ("restart to load"), so the name is legitimate if it is
-    // either registered or already stored.
-    if row.is_none() && !ctx.registered_blocks().iter().any(|b| b.name == block_name) {
+    // caller-controlled and `set_enabled` upserts. An unchecked name both
+    // mints rows nothing ever reaps and writes rows that must never exist.
+    //
+    // A REGISTERED block is toggleable only if it declares `can_disable`.
+    // `BlockInfo::new` defaults that to `false` and `blocks::block_enabled_defaults`
+    // filters the seed on it, so `impresspress/admin`, `impresspress/system`,
+    // `impresspress/email`, `auth-ui` and the `wafer-run/*` middleware hold no
+    // row at all — `blocks/mod.rs` records that "nothing can create one", and
+    // the detail fragment renders them no toggle (see the `can_disable` gate
+    // below). Admin is the dangerous one: `/b/admin/` is gated on
+    // `impresspress/admin` (`routing.rs`), so a row at `enabled = 0` 404s
+    // every admin route from the next boot, and `set_enabled` would also
+    // stamp `USER_EDITED_SENTINEL` over the `seed_defaults_hash` column that
+    // `admin::settings::seed_defaults` owns in a different format. The panel
+    // that could undo it is the panel that just disappeared.
+    //
+    // NOT registered is still legitimate when a row already exists:
+    // `blocks_page` deliberately lists those as unloaded ("restart to load")
+    // and renders them a toggle from a placeholder declaring `can_disable(true)`.
+    let toggleable = match ctx
+        .registered_blocks()
+        .iter()
+        .find(|b| b.name == block_name)
+    {
+        Some(info) => info.can_disable,
+        None => row.is_some(),
+    };
+    if !toggleable {
         return crate::http::err_not_found("Unknown block");
     }
 
@@ -593,11 +614,16 @@ mod toggle_feature_tests {
     /// a fixture toggling an unregistered, row-less name models a request the
     /// product cannot produce. Registering the `BlockInfo` puts these tests
     /// back on the path the page actually drives.
+    /// `can_disable(true)` is not decoration: `BlockInfo::new` defaults it to
+    /// `false`, and the handler refuses to toggle a block that does not
+    /// declare it. The real `impresspress/files` declares it, so a fixture
+    /// that left it off would model a block the product does not have.
     async fn ctx_with_files_registered() -> TestContext {
         let mut ctx = TestContext::with_admin().await;
         ctx.register_block_info(
             "impresspress/files",
-            wafer_run::BlockInfo::new("impresspress/files", "1.0.0", "http.handler", "files"),
+            wafer_run::BlockInfo::new("impresspress/files", "1.0.0", "http.handler", "files")
+                .can_disable(true),
         );
         ctx
     }
@@ -719,6 +745,50 @@ mod toggle_feature_tests {
         assert!(
             !names.contains(&"impresspress/fyles"),
             "a typo must not leave a permanent phantom row: {names:?}",
+        );
+        assert_eq!(audit_count(&ctx, "block.disable").await, 0);
+    }
+
+    /// Registration is not enough on its own either: a registered block is
+    /// toggleable only if it declares `can_disable`.
+    ///
+    /// `BlockInfo::new` defaults that to `false`, so admin, system, email,
+    /// auth-ui and the `wafer-run/*` middleware all pass a registration-only
+    /// check. Admin is the one that bites: `/b/admin/` is gated on
+    /// `impresspress/admin`, so persisting `enabled = 0` for it 404s every
+    /// admin route from the next boot — including the page that would undo
+    /// the toggle — and stamps `USER_EDITED_SENTINEL` over a
+    /// `seed_defaults_hash` column owned by `seed_defaults` in another
+    /// format, which the seed then refuses to repair because the sentinel
+    /// marks the row user-owned.
+    #[tokio::test]
+    async fn toggle_refuses_a_block_that_cannot_be_disabled() {
+        let mut ctx = TestContext::with_admin().await;
+        // `BlockInfo::new` leaves `can_disable` false — the same shape the
+        // real admin block registers with.
+        ctx.register_block_info(
+            "impresspress/admin",
+            wafer_run::BlockInfo::new("impresspress/admin", "1.0.0", "http.handler", "admin"),
+        );
+        let msg = routed(admin_msg(
+            "create",
+            "/b/admin/blocks/impresspress--admin/toggle",
+        ));
+
+        let out = handle_toggle_feature(&ctx, &msg).await;
+        assert!(
+            output_is_error(out, "NotFound").await,
+            "a block that cannot be disabled must not be toggleable",
+        );
+
+        // `with_admin` already stamps admin's own migration row, so the
+        // assertion is that its enablement is untouched, not that no row
+        // exists.
+        assert!(
+            block_settings::is_enabled(&ctx, "impresspress/admin")
+                .await
+                .expect("read block setting"),
+            "admin must not have been disabled",
         );
         assert_eq!(audit_count(&ctx, "block.disable").await, 0);
     }
