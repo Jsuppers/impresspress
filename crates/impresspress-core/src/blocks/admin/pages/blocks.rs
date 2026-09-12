@@ -260,14 +260,29 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 pub async fn handle_toggle_feature(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let block_name = decode_block_name(msg.var("name"));
     let block_name = block_name.as_str();
-    // Read current state and toggle via shared helper (audit finding #12).
-    // An unreadable state is an error, not "enabled": the write below is
-    // derived from it, so a guess here would flip the block off the back of
-    // an outage.
-    let current_enabled = match block_settings::is_enabled(ctx, block_name).await {
-        Ok(enabled) => enabled,
+    // One read answers both questions below: whether this name exists at all,
+    // and what it is set to now. An unreadable state is an error, not
+    // "enabled": the write below is derived from it, so a guess here would
+    // flip the block off the back of an outage (audit finding #12).
+    let rows = match block_settings::list_all(ctx).await {
+        Ok(rows) => rows,
         Err(e) => return crate::http::err_internal("Failed to read block setting", e),
     };
+    let row = rows.iter().find(|r| r.block_name == block_name);
+
+    // `decode_block_name` only swaps `--` for `/`, so the name is entirely
+    // caller-controlled, and `set_enabled` upserts — a typo would mint a row
+    // nothing ever reaps, which `blocks_page` then lists forever as an
+    // unloaded block. Registration alone is too strict a test: that page
+    // deliberately offers a toggle for a block holding a row without being
+    // registered ("restart to load"), so the name is legitimate if it is
+    // either registered or already stored.
+    if row.is_none() && !ctx.registered_blocks().iter().any(|b| b.name == block_name) {
+        return crate::http::err_not_found("Unknown block");
+    }
+
+    // No row ⇒ enabled, matching what `is_enabled` reports for a missing row.
+    let current_enabled = row.is_none_or(|r| r.enabled);
     let new_enabled = !current_enabled;
 
     // Persist first. Only write the audit event — and only re-render the
@@ -573,6 +588,20 @@ mod toggle_feature_tests {
         ))
     }
 
+    /// `with_admin` registers no blocks, but [`blocks_page`] only ever offers
+    /// a toggle for a block that is registered or already carries a row — so
+    /// a fixture toggling an unregistered, row-less name models a request the
+    /// product cannot produce. Registering the `BlockInfo` puts these tests
+    /// back on the path the page actually drives.
+    async fn ctx_with_files_registered() -> TestContext {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.register_block_info(
+            "impresspress/files",
+            wafer_run::BlockInfo::new("impresspress/files", "1.0.0", "http.handler", "files"),
+        );
+        ctx
+    }
+
     async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
         db::list_all(
             ctx,
@@ -590,7 +619,7 @@ mod toggle_feature_tests {
 
     #[tokio::test]
     async fn toggle_success_persists_and_audits() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = ctx_with_files_registered().await;
 
         assert!(
             block_settings::is_enabled(&ctx, "impresspress/files")
@@ -619,7 +648,7 @@ mod toggle_feature_tests {
     /// and write "disabled": no row changes, no audit event claims it did.
     #[tokio::test]
     async fn toggle_refuses_when_current_state_cannot_be_read() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = ctx_with_files_registered().await;
         let failing =
             FailingDbOpContext::new(ctx.clone(), vec![("database.list", block_settings::TABLE)]);
         let out = handle_toggle_feature(&failing, &toggle_files_msg()).await;
@@ -646,7 +675,7 @@ mod toggle_feature_tests {
     /// as if the toggle had taken effect.
     #[tokio::test]
     async fn toggle_persist_failure_returns_error_without_audit() {
-        let ctx = TestContext::with_admin().await.break_writes();
+        let ctx = ctx_with_files_registered().await.break_writes();
 
         let out = handle_toggle_feature(&ctx, &toggle_files_msg()).await;
         assert!(
@@ -663,6 +692,70 @@ mod toggle_feature_tests {
             audit_count(&ctx, "block.enable").await,
             0,
             "a failed persist must not write a success audit row"
+        );
+    }
+
+    /// A name matching no registered block and no existing row is a typo —
+    /// and `upsert_fields` mints a row for whatever it is handed, forever,
+    /// since nothing ever reaps them. `blocks_page` then lists that phantom
+    /// as an unloaded block on every visit. `decode_block_name` does nothing
+    /// but swap `--` for `/`, so the name is entirely caller-controlled.
+    #[tokio::test]
+    async fn toggle_rejects_an_unknown_block_and_mints_no_row() {
+        let ctx = ctx_with_files_registered().await;
+        let msg = routed(admin_msg(
+            "create",
+            "/b/admin/blocks/impresspress--fyles/toggle",
+        ));
+
+        let out = handle_toggle_feature(&ctx, &msg).await;
+        assert!(
+            output_is_error(out, "NotFound").await,
+            "an unknown block name must be refused, not written",
+        );
+
+        let rows = block_settings::list_all(&ctx).await.expect("list rows");
+        let names: Vec<&str> = rows.iter().map(|r| r.block_name.as_str()).collect();
+        assert!(
+            !names.contains(&"impresspress/fyles"),
+            "a typo must not leave a permanent phantom row: {names:?}",
+        );
+        assert_eq!(audit_count(&ctx, "block.disable").await, 0);
+    }
+
+    /// Validation cannot be registration alone. [`blocks_page`] deliberately
+    /// lists blocks that hold a row but are not registered ("(disabled —
+    /// restart to load)") and leaves them toggleable, so an operator must
+    /// still be able to re-enable one.
+    #[tokio::test]
+    async fn toggle_still_works_for_an_unloaded_block_with_a_row() {
+        let ctx = ctx_with_files_registered().await;
+        block_settings::upsert_fields(
+            &ctx,
+            "impresspress/unloaded",
+            block_settings::BlockSettingsPatch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed an unloaded block's row");
+
+        let msg = routed(admin_msg(
+            "create",
+            "/b/admin/blocks/impresspress--unloaded/toggle",
+        ));
+        let _ = handle_toggle_feature(&ctx, &msg)
+            .await
+            .collect_buffered()
+            .await
+            .expect("an unloaded block with a row stays toggleable");
+
+        assert!(
+            block_settings::is_enabled(&ctx, "impresspress/unloaded")
+                .await
+                .expect("read block setting"),
+            "the toggle must have re-enabled the unloaded block",
         );
     }
 }

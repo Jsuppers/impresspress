@@ -673,7 +673,20 @@ crate::impresspress_feature_block! {
 
 /// `GET /b/admin/api/extensions`: every registered block, as the SDK's
 /// extensions service lists them.
+///
+/// `enabled` comes from the boot block-settings snapshot, the same source
+/// `routing::route_to_block`'s feature gate reads, so this listing and the
+/// router agree about which blocks will actually serve. It was a hardcoded
+/// `true` before, which advertised `impresspress/tickets` — shipped
+/// `default_enabled(false)` — as enabled on every default install while the
+/// router 404'd all of its routes.
 fn handle_extensions(ctx: &dyn Context) -> OutputStream {
+    use crate::features::FeatureConfig;
+
+    let features = crate::features::BlockSettings::from_config_json(
+        ctx.config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
+            .unwrap_or("{}"),
+    );
     let blocks: Vec<contracts::AdminExtensionView> = ctx
         .registered_blocks()
         .iter()
@@ -682,7 +695,12 @@ fn handle_extensions(ctx: &dyn Context) -> OutputStream {
             version: b.version.clone(),
             interface: b.interface.clone(),
             summary: b.summary.clone(),
-            enabled: true,
+            // Through `feature_gate_name` for the reason the router uses it:
+            // the inspector's `BlockInfo` is named `wafer-run/inspector`
+            // while it is gated as `impresspress/inspector`, and an unmapped
+            // lookup would hit the default-enabled branch and ignore the
+            // admin toggle entirely.
+            enabled: features.is_block_enabled(crate::routing::feature_gate_name(&b.name)),
         })
         .collect();
     ok_json(&blocks)
@@ -817,6 +835,63 @@ mod tests {
             .unwrap_or("");
         assert_eq!(status, "308");
         assert_eq!(location, "/b/admin/settings/email");
+    }
+
+    /// `enabled` must report the block's actual enablement, not a literal.
+    ///
+    /// The field shipped hardcoded `true` while `routing::route_to_block`
+    /// feature-gates every route on that same enablement and answers
+    /// `err_not_found("endpoint not found")` when it is off. So this endpoint
+    /// advertised a block as enabled while the router 404'd every one of its
+    /// routes — and `impresspress/tickets` ships `default_enabled(false)`,
+    /// making that the state of a default install, not a corner case.
+    #[tokio::test]
+    async fn extensions_reports_a_disabled_block_as_disabled() {
+        use crate::test_support::{output_json, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block_info(
+            "impresspress/tickets",
+            wafer_run::BlockInfo::new("impresspress/tickets", "1.0.0", "http.handler", "tickets"),
+        );
+        // Synthetic on purpose: this entry exists only to pin the
+        // "no stored row ⇒ enabled" branch, and naming a real block here
+        // would both imply something about that block and hand
+        // `tests/repo_door.rs` the qualifier half of a door match (its
+        // `products_variables` door pairs the substring `products` with the
+        // `variables::TABLE` const this file already carries).
+        ctx.register_block_info(
+            "example/widget",
+            wafer_run::BlockInfo::new("example/widget", "1.0.0", "http.handler", "widget"),
+        );
+        ctx.set_config(
+            crate::features::BLOCK_SETTINGS_CONFIG_KEY,
+            &serde_json::json!({ "impresspress/tickets": { "enabled": false } }).to_string(),
+        );
+
+        let body = output_json(handle_extensions(&ctx)).await;
+        let by_name: std::collections::HashMap<&str, bool> = body
+            .as_array()
+            .expect("extensions responds with a JSON array")
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().expect("every entry carries a name"),
+                    e["enabled"].as_bool().expect("every entry carries enabled"),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            by_name.get("impresspress/tickets"),
+            Some(&false),
+            "a disabled block must not be advertised as enabled",
+        );
+        assert_eq!(
+            by_name.get("example/widget"),
+            Some(&true),
+            "a block with no stored row defaults to enabled",
+        );
     }
 
     /// The four admin JSON reads are the block's whole agent surface.

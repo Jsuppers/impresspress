@@ -16,7 +16,8 @@ fn item(label: &str, href: &str, icon: fn() -> Markup) -> NavItem {
 }
 
 /// A nav item backed by an optional (feature-gated) block. The item only
-/// renders when its block is registered — see [`retain_registered`].
+/// renders when its block is registered AND enabled — see
+/// [`retain_reachable`].
 fn block_item(label: &str, href: &str, icon: fn() -> Markup, block: &'static str) -> NavItem {
     NavItem {
         block: Some(block),
@@ -24,16 +25,42 @@ fn block_item(label: &str, href: &str, icon: fn() -> Markup, block: &'static str
     }
 }
 
-/// Drop nav items whose backing block isn't registered in this deployment,
-/// then drop groups left empty. Which blocks exist varies per target
-/// (`impresspress/vector` isn't compiled into every wasm build; Cloudflare
-/// ships without `impresspress/llm`) — a static nav that ignores that links
-/// straight into "block not found". Called by `ui::shell_page` with
-/// `ctx.registered_blocks()`.
-pub fn retain_registered(groups: &mut Vec<NavGroup>, registered: &std::collections::HashSet<&str>) {
+/// Drop nav items whose backing block won't serve in this deployment, then
+/// drop groups left empty.
+///
+/// Two separate reasons a link would land on "block not found", and the
+/// router applies both:
+///
+/// - NOT REGISTERED. Which blocks exist varies per target
+///   (`impresspress/vector` isn't compiled into every wasm build; Cloudflare
+///   ships without `impresspress/llm`).
+/// - REGISTERED BUT DISABLED. `routing::route_to_block` feature-gates every
+///   route on `FeatureConfig::is_block_enabled` and answers
+///   `err_not_found("endpoint not found")` when it is off. Filtering on
+///   registration alone left a live link to every such block —
+///   `impresspress/tickets` ships `default_enabled(false)`, so its sidebar
+///   entry 404'd on a default install.
+///
+/// Enablement is read through [`crate::routing::feature_gate_name`] for the
+/// same reason the router reads it that way: the inspector's `BlockInfo` is
+/// named `wafer-run/inspector` while it is gated as
+/// `impresspress/inspector`, and an unmapped lookup would hit
+/// `BlockSettings`' default-enabled branch and ignore the admin toggle.
+///
+/// Called by [`super::shell_document`] with `ctx.registered_blocks()` and the
+/// boot config snapshot — the same source the router's gate consults.
+pub fn retain_reachable(
+    groups: &mut Vec<NavGroup>,
+    registered: &std::collections::HashSet<&str>,
+    features: &dyn crate::features::FeatureConfig,
+) {
     for g in groups.iter_mut() {
-        g.items
-            .retain(|i| i.block.is_none_or(|b| registered.contains(b)));
+        g.items.retain(|i| {
+            i.block.is_none_or(|b| {
+                registered.contains(b)
+                    && features.is_block_enabled(crate::routing::feature_gate_name(b))
+            })
+        });
     }
     groups.retain(|g| !g.items.is_empty());
 }
@@ -284,15 +311,61 @@ mod tests {
         assert_eq!(shares.href, "/b/cloudstorage/");
     }
 
+    /// Every block enabled — the state an untouched deployment is in, and
+    /// what `BlockSettings` reports for any block with no row.
+    fn all_enabled() -> crate::features::BlockSettings {
+        crate::features::BlockSettings::default()
+    }
+
+    /// One block explicitly disabled; every other name defaults to enabled.
+    fn with_disabled(name: &str) -> crate::features::BlockSettings {
+        crate::features::BlockSettings::from_map(std::collections::HashMap::from([(
+            name.to_string(),
+            false,
+        )]))
+    }
+
+    /// A registered block whose enablement is off still fails the router's
+    /// feature gate, which answers `err_not_found("endpoint not found")` —
+    /// so its sidebar entry is a link to a 404. `impresspress/tickets` is
+    /// the shipped instance: it declares `default_enabled(false)`, so a
+    /// default install seeds it disabled and the Communication group offered
+    /// a dead "Tickets" link on every admin page.
     #[test]
-    fn retain_registered_drops_unregistered_blocks_and_empty_groups() {
+    fn retain_reachable_drops_a_registered_but_disabled_block() {
+        let mut groups = admin();
+        let registered: std::collections::HashSet<&str> =
+            ["impresspress/tickets", "impresspress/messages"].into();
+        retain_reachable(
+            &mut groups,
+            &registered,
+            &with_disabled("impresspress/tickets"),
+        );
+
+        let labels: Vec<&str> = groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .map(|i| i.label.as_str())
+            .collect();
+        assert!(
+            !labels.contains(&"Tickets"),
+            "a disabled block's route 404s — its nav link must not render",
+        );
+        assert!(
+            labels.contains(&"Messages"),
+            "a registered, enabled block keeps its link",
+        );
+    }
+
+    #[test]
+    fn retain_reachable_drops_unregistered_blocks_and_empty_groups() {
         // A deployment without vector/llm/messages (e.g. Cloudflare) must not
         // show nav links into "block not found" — and the Communication group,
         // left empty, must disappear entirely.
         let mut groups = admin();
         let registered: std::collections::HashSet<&str> =
             ["impresspress/admin", "impresspress/files"].into();
-        retain_registered(&mut groups, &registered);
+        retain_reachable(&mut groups, &registered, &all_enabled());
 
         let labels: Vec<&str> = groups
             .iter()
@@ -314,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn retain_registered_keeps_everything_when_all_blocks_present() {
+    fn retain_reachable_keeps_everything_when_all_blocks_present() {
         let mut groups = admin();
         let registered: std::collections::HashSet<&str> = [
             "impresspress/vector",
@@ -325,7 +398,7 @@ mod tests {
         ]
         .into();
         let before: usize = groups.iter().map(|g| g.items.len()).sum();
-        retain_registered(&mut groups, &registered);
+        retain_reachable(&mut groups, &registered, &all_enabled());
         let after: usize = groups.iter().map(|g| g.items.len()).sum();
         assert_eq!(before, after, "fully-featured deployment keeps every item");
     }

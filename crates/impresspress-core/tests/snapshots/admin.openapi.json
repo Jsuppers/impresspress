@@ -10,7 +10,7 @@
                   "description": "One row of `GET /b/admin/api/extensions`: a registered block, projected\noff wafer-run's `BlockInfo`.\n\nA closed field list for the same reason every view in this module is one\n— `BlockInfo` carries config keys, collection schemas, endpoint tables and\ncapability grants that this endpoint has never published and must not\nstart publishing because upstream grew a field.",
                   "properties": {
                     "enabled": {
-                      "description": "Always `true`. A registered block is by definition enabled; there is\nno server-side enable/disable lifecycle behind this field.",
+                      "description": "Whether the block is enabled.\n\nRead from the boot block-settings snapshot — the same source\n`routing::route_to_block`'s feature gate consults — so `false` means\nthe router answers \"endpoint not found\" for every one of this block's\nroutes. A block with no stored row reports `true`.",
                       "type": "boolean"
                     },
                     "interface": {
