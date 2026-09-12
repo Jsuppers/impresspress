@@ -100,6 +100,27 @@ impl BlockSettings {
             .collect()
     }
 
+    /// Flip one block's `enabled` flag in place, leaving every other column of
+    /// its [`BlockState`] alone and creating the entry when absent.
+    ///
+    /// The only mutator on this type, and it exists for exactly one caller:
+    /// the admin block toggle, which writes the `block_settings` row and then
+    /// updates the live snapshot the router reads through its
+    /// `Arc<dyn FeatureConfig>`. Without it the toggle only reached the table,
+    /// and on native — where nothing re-reads that table after `build()` —
+    /// the router kept gating on the boot-time snapshot until the process
+    /// restarted.
+    ///
+    /// Migration state is deliberately preserved: `migration_helper` owns
+    /// those columns, and an operator disabling a block must not look like a
+    /// block that has never run its migrations.
+    pub fn set_block_enabled(&mut self, full_name: &str, enabled: bool) {
+        self.blocks
+            .entry(full_name.to_string())
+            .or_default()
+            .enabled = enabled;
+    }
+
     /// Look up the full `BlockState` for a block by full name.
     /// Returns a default (enabled + empty migration state) when the block has
     /// no row in `block_settings` yet.
@@ -308,6 +329,67 @@ pub struct AllEnabled;
 impl FeatureConfig for AllEnabled {
     fn is_block_enabled(&self, _: &str) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod block_settings_tests {
+    use super::*;
+
+    /// Creating the entry when absent is the common case: most blocks hold no
+    /// `block_settings` row until someone toggles them, and the toggle has to
+    /// work the first time.
+    #[test]
+    fn set_block_enabled_creates_an_absent_entry() {
+        let mut settings = BlockSettings::default();
+        assert!(
+            settings.is_block_enabled("impresspress/files"),
+            "a block with no entry defaults to enabled",
+        );
+
+        settings.set_block_enabled("impresspress/files", false);
+        assert!(!settings.is_block_enabled("impresspress/files"));
+
+        settings.set_block_enabled("impresspress/files", true);
+        assert!(settings.is_block_enabled("impresspress/files"));
+    }
+
+    /// Migration state belongs to `migration_helper`, not to the toggle: an
+    /// operator disabling a block must not leave it looking like one that has
+    /// never run its migrations.
+    #[test]
+    fn set_block_enabled_preserves_every_other_column() {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            "impresspress/files".to_string(),
+            BlockState {
+                enabled: true,
+                migration: MigrationState {
+                    current_hash: "cur".to_string(),
+                    blessed_hash: "bless".to_string(),
+                },
+                seed_defaults_hash: "seed:abc".to_string(),
+            },
+        );
+        let mut settings = BlockSettings::from_blocks(blocks);
+
+        settings.set_block_enabled("impresspress/files", false);
+
+        let state = settings.state("impresspress/files");
+        assert!(!state.enabled);
+        assert_eq!(state.migration.current_hash, "cur");
+        assert_eq!(state.migration.blessed_hash, "bless");
+        assert_eq!(state.seed_defaults_hash, "seed:abc");
+    }
+
+    #[test]
+    fn set_block_enabled_touches_only_its_own_entry() {
+        let mut settings = BlockSettings::default();
+        settings.set_block_enabled("impresspress/files", false);
+        assert!(
+            settings.is_block_enabled("impresspress/tickets"),
+            "an unrelated block keeps its default",
+        );
     }
 }
 

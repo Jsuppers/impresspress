@@ -19,12 +19,15 @@ pub(crate) use logs::{AUDIT_LOGS_TABLE, STORAGE_ACCESS_LOGS_TABLE};
 /// have run before the runner seeds `auto_generate` secrets).
 pub const ADMIN_BLOCK_ID: &str = "impresspress/admin";
 
+use std::sync::{Arc, RwLock};
+
 use wafer_run::{
     context::Context, BlockInfo, HttpMethod, InputStream, InstanceMode, Message, OutputStream,
 };
 
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
+    features::BlockSettings,
     http::{err_bad_request, err_internal, err_not_found, ok_json},
     platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
@@ -492,6 +495,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
 crate::impresspress_feature_block! {
     /// Admin panel: users, database, IAM, logs, settings (`impresspress/admin`).
     pub struct AdminBlock;
+    fields: { block_settings_handle: Arc<RwLock<BlockSettings>> },
     name: "impresspress/admin",
     info: |_this| {
         use wafer_run::CollectionSchema;
@@ -566,7 +570,7 @@ crate::impresspress_feature_block! {
             .description("Administration panel for managing users, roles, variables, blocks, and logs. Provides SSR dashboard with stats, user management with role assignment, IAM (roles and API keys), environment variables editor, block management with feature toggles, and system/audit log viewer.")
             .endpoints(endpoint_match::declare(ROUTES))
     },
-    handle: |_this, ctx, msg, input| {
+    handle: |this, ctx, msg, input| {
         // Auth is enforced centrally by `route_to_block` from the `Admin`
         // prefix tier and each row's declared level (both `Admin`). The
         // matcher binds `{id}`, `{key}` and `{name}` into `req.param.*` for
@@ -620,7 +624,9 @@ crate::impresspress_feature_block! {
             Route::CreateRole => pages::handle_create_role(ctx, &msg, input).await,
             Route::DeleteRole => pages::handle_delete_role(ctx, &msg).await,
             Route::BlockDetail => pages::handle_block_detail(ctx, &msg).await,
-            Route::BlockToggle => pages::handle_toggle_feature(ctx, &msg).await,
+            Route::BlockToggle => {
+                pages::handle_toggle_feature(ctx, &msg, &this.block_settings_handle).await
+            }
             Route::CreateVariable => pages::handle_create_variable(ctx, &msg, input).await,
             Route::EditVariableForm => pages::handle_edit_variable_form(ctx, &msg).await,
             Route::UpdateVariable => pages::handle_update_variable(ctx, &msg, input).await,
@@ -711,6 +717,27 @@ fn handle_extensions(ctx: &dyn Context) -> OutputStream {
         })
         .collect();
     ok_json(&blocks)
+}
+
+impl AdminBlock {
+    /// Construct an admin block wired to the runtime's LIVE enablement
+    /// snapshot — the same `Arc<RwLock<BlockSettings>>` the builder hands the
+    /// router as its `Arc<dyn FeatureConfig>` (`builder::registration`), and
+    /// which `routing::route_to_block` reads on every request.
+    ///
+    /// This is what makes a block toggle take effect without a restart. The
+    /// macro-generated [`Self::new`] leaves the field at `Default`, i.e. a
+    /// private snapshot nothing else reads: correct for the declarative
+    /// `info()` callers (grant and endpoint assertions, `all_block_infos`),
+    /// and inert for the toggle. Production therefore registers through
+    /// [`crate::blocks::register_admin`], and `tests/autoreg_smoke.rs` pins
+    /// that admin is NOT in the zero-arg manifest, so an unwired instance
+    /// cannot reach a runtime by accident.
+    pub fn with_block_settings(block_settings_handle: Arc<RwLock<BlockSettings>>) -> Self {
+        Self {
+            block_settings_handle,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +925,63 @@ mod tests {
             by_name.get("example/widget"),
             Some(&true),
             "a block with no stored row defaults to enabled",
+        );
+    }
+
+    /// A toggle must take effect without a restart.
+    ///
+    /// `routing::route_to_block` gates every route on the router's
+    /// `Arc<dyn FeatureConfig>` — the same `Arc<RwLock<BlockSettings>>` the
+    /// builder hands it (`builder::registration`) — and reads it on EVERY
+    /// request. Nothing connected the admin toggle to that snapshot: the
+    /// write landed in the `block_settings` table and stopped there.
+    ///
+    /// On native that meant the toggle did nothing until the process
+    /// restarted, because `NativeBootHooks::seed_after_admin_init` is empty
+    /// and nothing else re-reads the table — so the blocks page (which reads
+    /// the table) said "disabled" while the router (which reads the snapshot)
+    /// kept serving it. Cloudflare hid the defect: a write bumps
+    /// `cfg:v1:config_version`, so the writing isolate rebuilds almost at
+    /// once and the rest converge on their probe.
+    #[tokio::test]
+    async fn a_toggle_updates_the_live_enablement_snapshot() {
+        use crate::{
+            features::FeatureConfig,
+            test_support::{admin_msg, TestContext},
+        };
+
+        let mut ctx = TestContext::with_admin().await;
+        // The toggle refuses a name that is neither registered nor stored,
+        // and refuses a registered block that cannot be disabled — so the
+        // fixture has to look like the real files block.
+        ctx.register_block_info(
+            "impresspress/files",
+            wafer_run::BlockInfo::new("impresspress/files", "1.0.0", "http.handler", "files")
+                .can_disable(true),
+        );
+
+        let handle: Arc<RwLock<BlockSettings>> = Arc::new(RwLock::new(BlockSettings::default()));
+        let block = AdminBlock::with_block_settings(handle.clone());
+
+        assert!(
+            handle.is_block_enabled("impresspress/files"),
+            "a block with no stored row starts enabled",
+        );
+
+        let _ = block
+            .handle(
+                &ctx,
+                admin_msg("create", "/b/admin/blocks/impresspress--files/toggle"),
+                InputStream::empty(),
+            )
+            .await
+            .collect_buffered()
+            .await
+            .expect("a toggle against a healthy database must succeed");
+
+        assert!(
+            !handle.is_block_enabled("impresspress/files"),
+            "the snapshot the router reads per request must show it disabled",
         );
     }
 
