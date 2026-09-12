@@ -232,8 +232,15 @@ impl VariablesConfigBlock {
     /// `ctx`-routed write to the admin block's table is a cross-block write
     /// WRAP denies.
     async fn write(&self, key: &str, value: &str) -> Result<(), OutputStream> {
-        // The same two guards `blocks::admin::ops::update_variable` applies,
-        // so the two write surfaces cannot accept divergent input. The
+        // The same sensitive-empty and `_URL` guards
+        // `blocks::admin::ops::update_variable` applies, so neither write
+        // surface accepts input the other refuses on those two rules. The
+        // runtime-owned refusal below is deliberately NOT symmetric: this
+        // surface refuses the JWT secret (no caller legitimately writes it
+        // here — `ui::settings_form` writes declared block and shared vars
+        // only), while the admin variables API accepts it, because on native
+        // that row IS the next boot's secret. See
+        // `blocks::admin::ops::reject_runtime_owned_key`. The
         // sensitive-empty guard reads the stored flag exactly as that path
         // does; a missing row has no stored secret to wipe, so only the
         // suffix rule applies there.
