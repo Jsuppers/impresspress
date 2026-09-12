@@ -629,6 +629,58 @@ async fn import_refuses_a_runtime_owned_variable_key() {
     }
 }
 
+/// The one reserved key the first version of this guard missed.
+///
+/// `WAFER_RUN__AUTH__JWT_SECRET` carries no `IMPRESSPRESS_` prefix and is not
+/// `__…__`-bracketed, so `is_runtime_owned_key` does not name it — but
+/// `blocks::config`'s `served_only_from_boot_map` DOES reserve it, precisely
+/// so a stored row cannot rotate the signing key under a running process.
+///
+/// Unlike every key the guard already refuses, a planted one here is NOT
+/// inert. `seed_jwt_secret` writes through `insert_if_absent`, so a row that
+/// is already present wins and auto-generation never fires, and
+/// `cli/server.rs` hands that value to boot as the HMAC key for every session
+/// JWT and CSRF token. A bundle shared between instances would give each of
+/// them one signing secret its author knows — exactly what per-instance
+/// auto-generation exists to prevent.
+///
+/// Nothing legitimate carries such a row: the `_SECRET` suffix makes it
+/// unexportable, so this can only be hand-authored.
+#[tokio::test]
+async fn import_refuses_a_planted_jwt_secret() {
+    let ctx = TestContext::with_products().await;
+    let key = impresspress_core::blocks::auth::JWT_SECRET_KEY;
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        variables::TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "var_forged_jwt",
+            "key": key,
+            "value": "00000000000000000000000000000000",
+            "sensitive": true,
+            "created_at": STAMP,
+            "updated_at": STAMP,
+        }))
+        .into_iter()
+        .collect()],
+    );
+    let snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    let err = data_snapshot::import(&ctx, &snap).await.unwrap_err();
+    assert_eq!(err.code, wafer_run::ErrorCode::InvalidArgument);
+
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        !vars.iter().any(|v| v.data["key"] == json!(key)),
+        "a refused import must not have planted a signing secret: {vars:?}",
+    );
+}
+
 /// The other side of that boundary: the guard refuses only what the RUNTIME
 /// owns, not everything with a prefix.
 ///
