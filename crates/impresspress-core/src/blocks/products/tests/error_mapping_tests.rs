@@ -317,3 +317,54 @@ async fn a_granted_read_of_a_present_product_is_200() {
         200
     );
 }
+
+/// An unconfigured Stripe is a 503, not a 500.
+///
+/// `POST /b/products/checkout` is PUBLIC and reachable on a default install,
+/// where no `IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY` is set. It answered
+/// `err_internal_no_cause("Stripe is not configured")` — a 500, which says
+/// the site is broken and invites a retry. The site is fine; this capability
+/// is not turned on, which is what 503 says. The 2026-09-10 live run recorded
+/// both this and the webhook as 500s on a default install.
+///
+/// `ctx_with(&[])` is the default install: `STRIPE_CONFIG` is deliberately
+/// not applied.
+#[tokio::test]
+async fn checkout_without_stripe_configured_is_service_unavailable() {
+    let ctx = ctx_with(&[]).await;
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({"offer_id": "offer_absent"}),
+    );
+    assert_eq!(
+        output_http_status(stripe::handle_checkout(&ctx, &msg, input).await).await,
+        503,
+        "an unconfigured capability is unavailable, not an internal fault"
+    );
+}
+
+/// An unconfigured webhook secret is a 503, not a 500.
+///
+/// `POST /b/products/webhooks` is PUBLIC and reachable on a default install,
+/// where no `IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET` is set. It
+/// answered `err_internal_no_cause(...)` — a 500, which tells Stripe the
+/// endpoint is broken and invites redelivery. Nothing is broken: webhook
+/// processing is not enabled, which is what 503 says.
+///
+/// The unconfigured check runs before signature validation, so a message with
+/// no `Stripe-Signature` still reaches it.
+#[tokio::test]
+async fn webhook_without_a_configured_secret_is_service_unavailable() {
+    let ctx = ctx_with(&[]).await;
+    let (msg, input) = create_msg(
+        "/b/products/webhooks",
+        "",
+        serde_json::json!({"id": "evt_test", "type": "checkout.session.completed"}),
+    );
+    assert_eq!(
+        output_http_status(stripe::handle_webhook(&ctx, &msg, input).await).await,
+        503,
+        "an unconfigured capability is unavailable, not an internal fault"
+    );
+}

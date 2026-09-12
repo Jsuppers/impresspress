@@ -333,7 +333,10 @@ pub async fn handle_update_button(ctx: &dyn Context, input: InputStream, id: &st
 
 pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
     if let Err(e) = db::delete(ctx, TABLE, id).await {
-        return err_internal("Failed to delete button", e.message);
+        // `DbExec::delete` answers `NotFound` when no row matched, so a stale
+        // id in the caller's own page is their 404 — not this site reporting
+        // an internal fault and inviting a retry.
+        return crud::db_error(e, "Button not found", "Failed to delete button");
     }
 
     buttons_table_response(ctx).await
@@ -455,6 +458,26 @@ mod tests {
         assert!(
             output_is_error(out, "Internal").await,
             "a failed row read must not answer 404"
+        );
+    }
+
+    /// Deleting a button that does not exist is a 404, not a 500.
+    ///
+    /// `db::delete` returns `DatabaseError::NotFound` when zero rows match
+    /// (`wafer-core`'s `DbExec::delete`), and this handler turned every error
+    /// — that one included — into `err_internal`. A caller asking to remove an
+    /// already-removed button got "Internal server error", which reads as a
+    /// fault in the site rather than a stale id in their own page. Found in
+    /// the 2026-09-10 live endpoint run.
+    #[tokio::test]
+    async fn deleting_a_missing_button_is_not_found_not_internal() {
+        let ctx = ctx_with_userportal().await;
+
+        let out = handle_delete_button(&ctx, "btn_does_not_exist").await;
+
+        assert!(
+            output_is_error(out, "NotFound").await,
+            "a missing button must answer NotFound, not an internal error"
         );
     }
 }

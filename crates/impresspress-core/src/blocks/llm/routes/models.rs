@@ -8,7 +8,7 @@
 use wafer_core::clients::llm::{
     self as llm_client, LoadModelRequest, StatusRequest, UnloadModelRequest,
 };
-use wafer_run::{context::Context, Message, OutputStream};
+use wafer_run::{context::Context, ErrorCode, Message, OutputStream, WaferError};
 
 use super::streaming::sse_json_response;
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
         },
         LlmBlock,
     },
-    http::{err_bad_request, err_internal, ok_json},
+    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
 };
 
 /// `(backend_id, model_id)` as bound by the block's route table for
@@ -47,6 +47,34 @@ pub(in crate::blocks::llm) async fn list_models(
     }
 }
 
+/// Answer a service refusal with the classification it already carries.
+///
+/// `wafer-core`'s llm handler maps each `LlmError` onto a code before it
+/// crosses the block boundary: `InvalidRequest` → `InvalidArgument` (what
+/// `providers::service::status` answers for an unknown backend),
+/// `ModelNotFound` → `NotFound`, `NotSupported` → `Unimplemented`,
+/// `RateLimited` → `Unavailable`, `Unauthorized` → `Unauthenticated`. Both
+/// handlers below used to discard all of it with a blanket `err_internal`, so
+/// a caller naming a backend that does not exist was told the site had failed
+/// — which the 2026-09-10 live run recorded as 500s on non-existent ids.
+///
+/// The tail stays `err_internal`: a `BackendError` or a network fault is a
+/// real internal failure and is still sanitized and logged, never echoed.
+/// Same shape as `products::handlers::provider::provider_error`.
+fn llm_service_error(context: &str, error: WaferError) -> OutputStream {
+    match error.code {
+        ErrorCode::InvalidArgument | ErrorCode::FailedPrecondition => {
+            err_bad_request(&error.message)
+        }
+        ErrorCode::NotFound => err_not_found(&error.message),
+        ErrorCode::PermissionDenied => err_forbidden(&error.message),
+        ErrorCode::Unimplemented | ErrorCode::Unavailable | ErrorCode::Unauthenticated => {
+            OutputStream::error(error)
+        }
+        _ => err_internal(context, error.message),
+    }
+}
+
 /// `GET /b/llm/api/models/:backend_id/:model_id/status` — per-(backend, model)
 /// status. Authenticated.
 pub(in crate::blocks::llm) async fn model_status(
@@ -66,7 +94,7 @@ pub(in crate::blocks::llm) async fn model_status(
         Ok(status) => ok_json(&ModelStatusResponse {
             status: ModelStatusView::from(status),
         }),
-        Err(e) => err_internal("llm status failed", e.message),
+        Err(e) => llm_service_error("llm status failed", e),
     }
 }
 
@@ -110,7 +138,7 @@ pub(in crate::blocks::llm) async fn unload_model(
     };
     match llm_client::unload_model(ctx, &req).await {
         Ok(()) => ok_json(&ModelUnloadResponse { unloaded: true }),
-        Err(e) => err_internal("llm unload_model failed", e.message),
+        Err(e) => llm_service_error("llm unload_model failed", e),
     }
 }
 
@@ -126,7 +154,7 @@ mod tests {
         blocks::llm::routes::test_support::{
             admin_msg, routed, stub_block, user_msg, PanicCtx, StubLlmServiceBlock,
         },
-        test_support::{output_json, TestContext},
+        test_support::{output_is_error, output_json, TestContext},
     };
 
     async fn ctx_with(stub: StubLlmServiceBlock) -> TestContext {
@@ -328,5 +356,94 @@ mod tests {
         let mut m3 = admin_msg("create", "/b/llm/api/models/openai/");
         assert!(crate::endpoint_match::dispatch(&mut m3, crate::blocks::llm::ROUTES).is_none());
         assert_eq!(extract_model_path(&m3), (String::new(), String::new()));
+    }
+
+    /// A classified service refusal keeps its classification.
+    ///
+    /// `wafer-core`'s llm handler maps every `LlmError` onto a code before it
+    /// crosses the block boundary — `InvalidRequest` → `InvalidArgument`
+    /// (which is what `providers::service::status` answers for an unknown
+    /// backend), `ModelNotFound` → `NotFound`, `NotSupported` →
+    /// `Unimplemented`. This handler then discarded all of it with a blanket
+    /// `err_internal`, so a caller naming a backend that does not exist was
+    /// told the site had failed. The 2026-09-10 live run recorded these as
+    /// 500s on a non-existent id; the cause is the flattening, not a missing
+    /// 404.
+    #[tokio::test]
+    async fn model_status_keeps_a_classified_refusal() {
+        let ctx = ctx_with(StubLlmServiceBlock {
+            error: Some((ErrorCode::InvalidArgument, "unknown backend: nope".into())),
+            ..Default::default()
+        })
+        .await;
+
+        let out = model_status(
+            &stub_block(),
+            &ctx,
+            &routed(user_msg("retrieve", "/b/llm/api/models/nope/gpt-4o/status")),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "an unknown backend must keep the InvalidArgument the service assigned"
+        );
+    }
+
+    /// A `NotFound` from the service reaches the caller as `NotFound`, on the
+    /// unload surface too.
+    #[tokio::test]
+    async fn unload_model_keeps_a_classified_refusal() {
+        let ctx = ctx_with(StubLlmServiceBlock {
+            error: Some((ErrorCode::NotFound, "model not found: ghost".into())),
+            ..Default::default()
+        })
+        .await;
+
+        let out = unload_model(
+            &stub_block(),
+            &ctx,
+            // `POST .../{backend_id}/{model_id}/unload` — "create" is this
+            // codebase's POST action, and the route is admin-level.
+            &routed(admin_msg(
+                "create",
+                "/b/llm/api/models/openai-main/ghost/unload",
+            )),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "NotFound").await,
+            "a missing model must answer NotFound, not an internal error"
+        );
+    }
+
+    /// An unclassified backend failure is still an internal error.
+    ///
+    /// The mapping must not turn every refusal into a client error: a
+    /// `BackendError` (the service's own `Internal`) is a real fault and has
+    /// to stay a 500, sanitized, the way `err_internal` reports it.
+    #[tokio::test]
+    async fn a_backend_failure_is_still_internal() {
+        let ctx = ctx_with(StubLlmServiceBlock {
+            error: Some((ErrorCode::Internal, "upstream exploded".into())),
+            ..Default::default()
+        })
+        .await;
+
+        let out = model_status(
+            &stub_block(),
+            &ctx,
+            &routed(user_msg(
+                "retrieve",
+                "/b/llm/api/models/openai-main/gpt-4o/status",
+            )),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a backend fault must remain an internal error"
+        );
     }
 }
