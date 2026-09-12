@@ -342,10 +342,13 @@ pub async fn handle_toggle_feature(
     // target rather than a native special case.
     match block_settings_handle.write() {
         Ok(mut settings) => settings.set_block_enabled(block_name, new_enabled),
-        // Poisoned only if another holder panicked mid-write, which would
-        // leave enablement indeterminate. The database row is already
-        // correct, so the toggle is reported as the success it was; the
-        // stale snapshot is corrected on the next boot.
+        // Poisoned only if another holder panicked mid-write. That is already
+        // terminal for routing, not a degraded mode: `impl FeatureConfig for
+        // RwLock<BlockSettings>` reads with `.expect("BlockSettings RwLock
+        // poisoned")`, so every routed request panics from here on, whatever
+        // this handler does. Panicking again here would add nothing and lose
+        // the one useful fact — the row IS written — so the toggle reports
+        // the database success it actually achieved and says so in the log.
         Err(e) => {
             tracing::error!(
                 block = %block_name,

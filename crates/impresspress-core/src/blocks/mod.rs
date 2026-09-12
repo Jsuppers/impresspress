@@ -94,7 +94,10 @@ pub mod vector;
 macro_rules! feature_block_manifest {
     ( $( $(#[$cfg:meta])? $ctor:path ),+ $(,)? ) => {
         /// `BlockInfo` for every zero-arg impresspress feature block, plus the
-        /// `impresspress/llm` block (constructed with a `NoopProviderAdmin`).
+        /// two registered outside the manifest whose declarative `info()`
+        /// still belongs in the discovery set: `impresspress/admin`
+        /// (constructed unwired — see [`register_admin`]) and
+        /// `impresspress/llm` (constructed with a `NoopProviderAdmin`).
         ///
         /// Used by `collect_all_config_vars()` to discover declared config
         /// variables, by the inspector route table, and by the routing/auth

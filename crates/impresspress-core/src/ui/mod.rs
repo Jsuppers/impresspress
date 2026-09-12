@@ -351,19 +351,26 @@ pub async fn shell_document(
     // Hide nav items whose backing block won't serve on this target: either
     // it isn't registered (feature-gated blocks vary per deployment — see
     // NavItem::block), or it is registered and disabled, which the router
-    // answers with "endpoint not found". Enablement is read from the boot
-    // config snapshot — the same source `routing::route_to_block`'s own
-    // feature gate consults, so the sidebar and the router agree by
-    // construction.
+    // answers with "endpoint not found".
+    //
+    // Enablement is the gate decision the ROUTER published for this request
+    // (`routing::gate_from_request`), not the boot config snapshot and not a
+    // read of our own. The snapshot is frozen at `build()`, so once the admin
+    // toggle moves the router's live gate a snapshot-backed sidebar renders
+    // links the router has already begun 404ing; and a database read here
+    // would put one in the shared chrome path of every SSR page, which
+    // `llm::pages`' boundary test rightly forbids ("the page must issue no
+    // database call of its own").
+    //
+    // Reading the router's own answer makes agreement structural rather than
+    // argued: the sidebar cannot show a link this request's router would
+    // refuse, on any target.
     let registered: std::collections::HashSet<&str> = ctx
         .registered_blocks()
         .iter()
         .map(|b| b.name.as_str())
         .collect();
-    let features = crate::features::BlockSettings::from_config_json(
-        ctx.config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
-            .unwrap_or("{}"),
-    );
+    let features = crate::routing::gate_from_request(ctx, msg);
     nav_groups::retain_reachable(&mut groups, &registered, &features);
     let path = msg.path().to_string();
     Page {

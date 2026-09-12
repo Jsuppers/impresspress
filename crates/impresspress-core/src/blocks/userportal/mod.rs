@@ -158,7 +158,7 @@ crate::impresspress_feature_block! {
             Route::Sessions => pages::sessions::sessions_page(ctx, &msg).await,
             Route::RevokeSession => pages::sessions::handle_revoke(ctx, &msg).await,
             Route::Security => pages::security::security_page(ctx, &msg).await,
-            Route::Config => this.handle_config(ctx).await,
+            Route::Config => this.handle_config(ctx, &msg).await,
             Route::AdminSettingsPage => admin_settings_page(ctx, &msg).await,
             Route::AdminSaveSettings => handle_save_settings(ctx, input).await,
             Route::AdminButtonsPage => pages::admin_buttons::admin_buttons_page(ctx, &msg).await,
@@ -187,11 +187,14 @@ crate::impresspress_feature_block! {
 }
 
 impl UserPortalBlock {
-    async fn handle_config(&self, ctx: &dyn Context) -> OutputStream {
-        let settings = ctx
-            .config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
-            .map(crate::features::BlockSettings::from_config_json)
-            .unwrap_or_else(|| crate::features::BlockSettings::from_map(Default::default()));
+    async fn handle_config(&self, ctx: &dyn Context, msg: &Message) -> OutputStream {
+        // The gate the ROUTER published for this request, not the boot config
+        // snapshot: the snapshot is frozen at `build()`
+        // (`RuntimeConfig::republish` needs `&mut Wafer`), so after an admin
+        // toggle this JSON would keep telling the portal that Files is on
+        // while the router answers `/b/storage/` with "endpoint not found" —
+        // a tab that renders and then 404s. See `routing::gate_from_request`.
+        let settings = crate::routing::gate_from_request(ctx, msg);
 
         let is_enabled = |name: &str| -> bool {
             use crate::features::FeatureConfig;

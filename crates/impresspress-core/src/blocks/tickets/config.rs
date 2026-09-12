@@ -121,6 +121,18 @@ pub struct SecurityReadiness {
 
 impl SecurityReadiness {
     pub async fn load(ctx: &dyn Context) -> Self {
+        // The boot snapshot, deliberately, where the sidebar and the portal's
+        // feature list read `routing::gate_from_request` instead.
+        //
+        // This value can go stale against the router after an admin toggle,
+        // and that staleness is unobservable: every surface that reads a
+        // `SecurityReadiness` — the admin readiness panel, the public submit
+        // form — is itself a `/b/tickets` route, so a disabled tickets block
+        // means the router refuses the page before the flag can be rendered.
+        // The one caller that is not a route (`maintenance`, a scheduled
+        // sweep) has no routed message to read a gate from at all. Threading
+        // one through it to correct a discrepancy nothing can see would buy
+        // nothing.
         let block_enabled = ctx
             .config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
             .map(|value| {

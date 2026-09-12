@@ -606,7 +606,7 @@ crate::impresspress_feature_block! {
             Route::SetSettingApi => settings::handle_set(ctx, &msg, input).await,
             Route::CreateSettingApi => settings::handle_create(ctx, &msg, input).await,
             Route::DeleteSettingApi => settings::handle_delete(ctx, &msg).await,
-            Route::ExtensionsApi => handle_extensions(ctx),
+            Route::ExtensionsApi => handle_extensions(ctx, &this.block_settings_handle),
 
             // ── Consolidated settings pages ──
             Route::SettingsRedirect => redirect_308("/b/admin/settings/email"),
@@ -686,13 +686,17 @@ crate::impresspress_feature_block! {
 /// `true` before, which advertised `impresspress/tickets` — shipped
 /// `default_enabled(false)` — as enabled on every default install while the
 /// router 404'd all of its routes.
-fn handle_extensions(ctx: &dyn Context) -> OutputStream {
+fn handle_extensions(ctx: &dyn Context, features: &Arc<RwLock<BlockSettings>>) -> OutputStream {
     use crate::features::FeatureConfig;
 
-    let features = crate::features::BlockSettings::from_config_json(
-        ctx.config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
-            .unwrap_or("{}"),
-    );
+    // Straight off the router's own handle — this block holds the same `Arc`
+    // the router gates on, so no snapshot, no request meta and no read stand
+    // between this answer and the one the router will give. Other blocks need
+    // `routing::gate_from_request` precisely because they cannot reach this.
+    let features = features
+        .read()
+        .map(|settings| settings.clone())
+        .unwrap_or_default();
     let blocks: Vec<contracts::AdminExtensionView> = ctx
         .registered_blocks()
         .iter()
@@ -883,7 +887,7 @@ mod tests {
     async fn extensions_reports_a_disabled_block_as_disabled() {
         use crate::test_support::{output_json, TestContext};
 
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::with_admin().await;
         ctx.register_block_info(
             "impresspress/tickets",
             wafer_run::BlockInfo::new("impresspress/tickets", "1.0.0", "http.handler", "tickets"),
@@ -898,12 +902,16 @@ mod tests {
             "example/widget",
             wafer_run::BlockInfo::new("example/widget", "1.0.0", "http.handler", "widget"),
         );
-        ctx.set_config(
-            crate::features::BLOCK_SETTINGS_CONFIG_KEY,
-            &serde_json::json!({ "impresspress/tickets": { "enabled": false } }).to_string(),
-        );
+        // Staged in the router's own handle, which is what this endpoint
+        // reads: the admin block holds the same `Arc` the router gates on, so
+        // no snapshot and no table read stands between the two answers.
+        let handle: Arc<RwLock<BlockSettings>> = Arc::new(RwLock::new(BlockSettings::default()));
+        handle
+            .write()
+            .expect("stage the gate")
+            .set_block_enabled("impresspress/tickets", false);
 
-        let body = output_json(handle_extensions(&ctx)).await;
+        let body = output_json(handle_extensions(&ctx, &handle)).await;
         let by_name: std::collections::HashMap<&str, bool> = body
             .as_array()
             .expect("extensions responds with a JSON array")
