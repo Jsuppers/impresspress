@@ -36,8 +36,12 @@ export interface paths {
                     content: {
                         "application/json": {
                             /**
-                             * @description Always `true`. A registered block is by definition enabled; there is
-                             *     no server-side enable/disable lifecycle behind this field.
+                             * @description Whether the block is enabled.
+                             *
+                             *     Read from the boot block-settings snapshot — the same source
+                             *     `routing::route_to_block`'s feature gate consults — so `false` means
+                             *     the router answers "endpoint not found" for every one of this block's
+                             *     routes. A block with no stored row reports `true`.
                              */
                             enabled: boolean;
                             /** @description Interface identifier, e.g. `"http-handler@v1"`. */

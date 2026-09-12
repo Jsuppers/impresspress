@@ -348,14 +348,23 @@ pub async fn shell_document(
     let config = SiteConfig::load(ctx).await;
     let user = UserInfo::from_message(msg);
     let mut groups = shell.nav.groups();
-    // Hide nav items whose backing block isn't registered on this target
-    // (feature-gated blocks vary per deployment — see NavItem::block).
+    // Hide nav items whose backing block won't serve on this target: either
+    // it isn't registered (feature-gated blocks vary per deployment — see
+    // NavItem::block), or it is registered and disabled, which the router
+    // answers with "endpoint not found". Enablement is read from the boot
+    // config snapshot — the same source `routing::route_to_block`'s own
+    // feature gate consults, so the sidebar and the router agree by
+    // construction.
     let registered: std::collections::HashSet<&str> = ctx
         .registered_blocks()
         .iter()
         .map(|b| b.name.as_str())
         .collect();
-    nav_groups::retain_registered(&mut groups, &registered);
+    let features = crate::features::BlockSettings::from_config_json(
+        ctx.config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
+            .unwrap_or("{}"),
+    );
+    nav_groups::retain_reachable(&mut groups, &registered, &features);
     let path = msg.path().to_string();
     Page {
         config: &config,
