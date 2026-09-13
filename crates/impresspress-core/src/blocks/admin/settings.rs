@@ -126,6 +126,9 @@ pub(super) async fn handle_set(
     #[derive(serde::Deserialize)]
     struct Req {
         value: serde_json::Value,
+        /// Optional: absent leaves the stored masking flag alone.
+        #[serde(default)]
+        sensitive: Option<bool>,
     }
     let raw = input.collect_to_bytes().await;
     let body: Req = match serde_json::from_slice(&raw) {
@@ -150,6 +153,7 @@ pub(super) async fn handle_set(
         ops::VariableUpdate {
             value: Some(&value),
             description: None,
+            sensitive: body.sensitive,
         },
     )
     .await
@@ -746,115 +750,6 @@ mod tests {
             );
         }
     }
-
-    /// Stamp the declared-vars hash into the config snapshot, so
-    /// `seed_defaults` short-circuits exactly as it does on every settled
-    /// deployment. Without this a test runs against a state production reaches
-    /// only on the boot after a declaration changes.
-    fn stamp_current_hash(ctx: &mut TestContext) {
-        let hash = seed_payload_hash(&crate::config_vars::shared_config_vars());
-        let snapshot = serde_json::json!({
-            ADMIN_BLOCK_NAME: { "enabled": true, "seed_defaults_hash": hash }
-        })
-        .to_string();
-        ctx.set_config(crate::features::BLOCK_SETTINGS_CONFIG_KEY, &snapshot);
-    }
-
-    /// An accidental `sensitive` flag on a declared non-secret must be
-    /// recoverable ON A DEPLOYED INSTANCE — one whose declared-vars hash is
-    /// already stamped, which is every deployment until some release changes a
-    /// declaration.
-    ///
-    /// `handle_create` reads an omitted `sensitive` as "absent means
-    /// sensitive", and `create_variable` does not refuse `WAFER_RUN_SHARED__*`,
-    /// so one POST can flag a declared non-secret. The row is then unclearable
-    /// (the sensitive-empty guard) and undeletable (`delete_variable` refuses
-    /// declared shared vars), so a repair that does not run is no repair.
-    ///
-    /// This is why the reconciliation lives in `repair_sensitive_flags` and not
-    /// in `seed_defaults`: the assertion below that `seed_defaults` changes
-    /// nothing is the whole point.
-    #[tokio::test]
-    async fn an_accidental_flag_is_cleared_on_an_already_stamped_deployment() {
-        let key = crate::config_vars::CORS_ALLOWED_ORIGINS_KEY;
-        assert!(
-            !crate::config_vars::is_sensitive_var(&crate::config_vars::shared_var(key)),
-            "this test needs a declared var the storage rule does NOT flag"
-        );
-
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-        seed_var(&ctx, key, "https://shop.example", true).await;
-        stamp_current_hash(&mut ctx);
-
-        // The gate holds, so this cannot be where the repair lives.
-        seed_defaults(&ctx).await;
-        assert!(
-            variables::get_by_key(&ctx, key)
-                .await
-                .expect("get")
-                .expect("row")
-                .sensitive,
-            "seed_defaults must short-circuit here — that is the state every \
-             settled deployment is in"
-        );
-
-        // The un-gated boot pass is what actually recovers it.
-        ctx.repair_sensitive_flags().await;
-        assert!(
-            !variables::get_by_key(&ctx, key)
-                .await
-                .expect("get")
-                .expect("row")
-                .sensitive,
-            "a declared non-secret must be recoverable from an accidental flag"
-        );
-    }
-
-    /// The lowering is narrow in two ways, both asserted against the same
-    /// un-gated pass: a key the `_SECRET`/`_KEY` suffix rule catches is never
-    /// lowered, and neither is an UNDECLARED ad hoc row an admin flagged by
-    /// hand.
-    #[tokio::test]
-    async fn the_repair_pass_never_lowers_a_suffix_sensitive_or_ad_hoc_row() {
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
-            .await
-            .expect("apply admin migrations");
-        stamp_current_hash(&mut ctx);
-
-        seed_var(&ctx, "WAFER_RUN_SHARED__PROBE_SECRET", "s3cr3t", true).await;
-        seed_var(&ctx, "MY_SERVICE_TOKEN", "tok", true).await;
-
-        ctx.repair_sensitive_flags().await;
-
-        assert!(
-            variables::get_by_key(&ctx, "WAFER_RUN_SHARED__PROBE_SECRET")
-                .await
-                .expect("get")
-                .expect("row")
-                .sensitive,
-            "a suffix-sensitive key must never be lowered"
-        );
-        assert!(
-            variables::get_by_key(&ctx, "MY_SERVICE_TOKEN")
-                .await
-                .expect("get")
-                .expect("row")
-                .sensitive,
-            "an undeclared ad hoc row an admin flagged is not this code's to unflag"
-        );
-    }
-
-    // The raise direction deliberately has no test here: `seed_defaults` no
-    // longer writes `sensitive` at all. It is covered where it now lives —
-    // `platform_state::variables::boot_tests`, over a row inserted straight
-    // into the table so `NewVariable::into_row` cannot pre-empt the assertion.
-    // A `seed_defaults` test for it would have been vacuous, because this
-    // module's own `seed_var` helper writes through `into_row` and so arrives
-    // already flagged.
 
     /// Read one variable row's `value` column.
     async fn stored_value(ctx: &dyn Context, key: &str) -> Option<String> {

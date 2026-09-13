@@ -476,6 +476,48 @@ fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
     Ok(())
 }
 
+/// Whether `key` is a provisioning credential that has already been SPENT, and
+/// so may be cleared through the admin surface.
+///
+/// The bootstrap password is spent the moment provisioning succeeds:
+/// `auth::bootstrap::run` early-returns once `wafer_run__auth__users` is
+/// non-empty, and the password survives as an argon2 hash in
+/// `local_credentials`, so the stored plaintext is a dead copy.
+///
+/// The bootstrap TOKEN is the case the static
+/// [`crate::config_vars::is_provisioning_only_key`] cannot answer, and the same
+/// trap the password exemption exists to avoid was still set for it. Its
+/// branch of `bootstrap::run` creates NO user, so while `users` is empty every
+/// boot re-reads the plaintext and mints a fresh 24h `bootstrap_tokens` row —
+/// clearing it then strands the deployment with no admin path, and Cloudflare
+/// has no process environment to re-seed from. Once an admin user exists the
+/// token is redeemed and inert, and `into_row` flags it while
+/// `delete_variable` and `key_is_deletable` both refuse a declared
+/// `WAFER_RUN_SHARED__*` row — so without this it could never be cleared or
+/// deleted by any route. "Has the token been redeemed" is a checkable
+/// condition, not an unknowable one, so it is checked.
+///
+/// A read failure answers `false`: not knowing whether the token is still live
+/// keeps the guard on, which costs an operator one refused clear rather than a
+/// lockout.
+///
+/// The token is handled HERE rather than widened into
+/// `is_provisioning_only_key` because that predicate is also consulted by
+/// `blocks::config`'s `CONFIG_SET`, which runs over the raw `DatabaseService`
+/// with no `Context` to count users through. Widening it there would have
+/// exempted an UNREDEEMED token on a surface that cannot check — the narrower
+/// static rule keeps that path refusing, which is the safe answer.
+async fn is_clearable_provisioning_credential(ctx: &dyn Context, key: &str) -> bool {
+    if crate::config_vars::is_provisioning_only_key(key) {
+        return true;
+    }
+    if key != crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY {
+        return false;
+    }
+    // Redeemed exactly when an admin user exists.
+    matches!(crate::blocks::auth::repo::users::count(ctx).await, Ok(n) if n > 0)
+}
+
 /// Delete a config variable, writing an audit-log row.
 ///
 /// Shared by the JSON surface (`settings::handle_delete`) and the Variables
@@ -642,6 +684,18 @@ pub(super) async fn create_variable(
 pub(super) struct VariableUpdate<'a> {
     pub value: Option<&'a str>,
     pub description: Option<&'a str>,
+    /// The masking flag, when the surface offers it. `None` leaves the stored
+    /// flag alone.
+    ///
+    /// This is the ONLY way the flag moves downward. The boot repair pass
+    /// raises but never lowers, deliberately, so a mis-flag has to be fixable
+    /// by the admin who made it rather than by a boot that silently unmasks a
+    /// value — which is the trade `repair_sensitive_flags_in` spells out. A
+    /// key the DECLARATION or the `_SECRET`/`_KEY` suffix requires to be
+    /// sensitive cannot be unflagged here either; `into_row` and the repair
+    /// would only raise it again, so the write is refused rather than accepted
+    /// and reverted.
+    pub sensitive: Option<bool>,
 }
 
 /// Update a config variable identified by `key` (upsert on the `key` column),
@@ -689,7 +743,7 @@ pub(super) async fn update_variable(
         // equally safe: bootstrap then declines to auto-create an admin, which
         // is a documented path (`"no bootstrap admin configured"`) and
         // re-settable, not a lockout.
-        if value.is_empty() && !crate::config_vars::is_provisioning_only_key(key) {
+        if value.is_empty() && !is_clearable_provisioning_credential(ctx, key).await {
             let stored_flag = match variables::get_by_key(ctx, key).await {
                 Ok(Some(row)) => i64::from(row.sensitive),
                 Ok(None) => 0,
@@ -727,9 +781,20 @@ pub(super) async fn update_variable(
     //     stored it unflagged and the next GET published it, while the same
     //     key through POST was protected by `handle_create`'s "absent means
     //     sensitive" rule. The two surfaces now agree.
+    // Refuse an unflag the storage rule would immediately undo: `into_row` and
+    // the boot repair pass both raise from the declaration and the
+    // `_SECRET`/`_KEY` suffix, so accepting it would report success for a
+    // change the next write or boot reverses.
+    if update.sensitive == Some(false) && crate::config_vars::is_sensitive_for_storage(key) {
+        return Err(err_bad_request(&format!(
+            "Cannot un-mark {key} as sensitive: its declaration (or its \
+             _SECRET/_KEY suffix) requires it"
+        )));
+    }
     let patch = VariablePatch {
         value: update.value.map(str::to_string),
         description: update.description.map(str::to_string),
+        sensitive: update.sensitive,
         updated_by: Some(msg.user_id().to_string()),
         ..Default::default()
     };
@@ -1003,6 +1068,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("Acme Two"),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1067,6 +1133,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("tok-2"),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1213,6 +1280,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("Acme Two"),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1238,6 +1306,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("Hello"),
                     description: Some("a fresh key"),
+                    sensitive: None,
                 },
             )
             .await,
@@ -1264,6 +1333,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("Goodbye"),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1305,6 +1375,7 @@ mod tests {
             VariableUpdate {
                 value: Some("https://192.168.1.1"),
                 description: None,
+                sensitive: None,
             },
         )
         .await
@@ -1336,6 +1407,7 @@ mod tests {
             VariableUpdate {
                 value: Some(""),
                 description: None,
+                sensitive: None,
             },
         )
         .await
@@ -1407,6 +1479,7 @@ mod tests {
                 VariableUpdate {
                     value: Some(""),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1467,6 +1540,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("tok_live_abc"),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1490,6 +1564,7 @@ mod tests {
                 VariableUpdate {
                     value: Some("Acme"),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1501,6 +1576,115 @@ mod tests {
                 .expect("row")
                 .sensitive,
             "a declared non-secret var must not be masked just because it was PUT"
+        );
+    }
+
+    /// An admin can clear a flag they set by mistake, and cannot clear one the
+    /// storage rule requires.
+    ///
+    /// This is the recovery route the boot repair pass deliberately does NOT
+    /// provide: it raises only, so nothing un-masks a value behind an
+    /// operator's back. That only works if the person who mis-flagged a row
+    /// can fix it, which before this needed delete-and-recreate —
+    /// `VariableUpdate` carried no `sensitive`, the edit modal rendered only
+    /// value and description, and `create_variable` 409s on an existing key.
+    #[tokio::test]
+    async fn an_admin_can_clear_a_mistaken_flag_but_not_a_required_one() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+
+        // Mis-flagged by the Add Variable modal's default tick.
+        let key = "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS";
+        expect_ok(create_variable(&ctx, &msg, key, "/analytics.js", None, None, true).await);
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                key,
+                VariableUpdate {
+                    value: None,
+                    description: None,
+                    sensitive: Some(false),
+                },
+            )
+            .await,
+        );
+        assert!(
+            !variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "an admin must be able to undo their own mis-flag"
+        );
+
+        // And a key the declaration requires cannot be unflagged, because the
+        // funnel and the repair pass would only raise it again.
+        let required = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        expect_ok(create_variable(&ctx, &msg, required, "hunter2", None, None, true).await);
+        assert!(
+            update_variable(
+                &ctx,
+                &msg,
+                required,
+                VariableUpdate {
+                    value: None,
+                    description: None,
+                    sensitive: Some(false),
+                },
+            )
+            .await
+            .is_err(),
+            "accepting this would report success for a change the next boot reverses"
+        );
+    }
+
+    /// Try to clear the bootstrap token through the real admin update path.
+    async fn try_clear_token(ctx: &TestContext, msg: &Message) -> bool {
+        update_variable(
+            ctx,
+            msg,
+            crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY,
+            VariableUpdate {
+                value: Some(""),
+                description: None,
+                sensitive: None,
+            },
+        )
+        .await
+        .is_ok()
+    }
+
+    /// The token exemption turns on whether the token has been REDEEMED.
+    ///
+    /// Unredeemed (`users` empty) it is a live credential: every boot re-reads
+    /// the plaintext and mints a fresh 24h `bootstrap_tokens` row, so clearing
+    /// it strands the deployment with no admin path. Redeemed, it is inert —
+    /// and since `into_row` now flags it and `delete_variable` refuses a
+    /// declared `WAFER_RUN_SHARED__*` row, refusing the clear too would leave
+    /// a plaintext credential removable by no route at all, which is the exact
+    /// trap the password exemption exists to avoid.
+    #[tokio::test]
+    async fn the_bootstrap_token_is_clearable_only_once_it_has_been_redeemed() {
+        use crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY as KEY;
+
+        // Unredeemed: no users yet.
+        let ctx = TestContext::with_admin().await.with_auth_added().await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(create_variable(&ctx, &msg, KEY, "tok", None, None, true).await);
+        assert!(
+            !try_clear_token(&ctx, &msg).await,
+            "an unredeemed token is live; clearing it would be a lockout"
+        );
+
+        // Redeemed: an admin user exists.
+        let ctx = TestContext::with_admin().await.with_auth_added().await;
+        ctx.seed_auth_user("admin_1").await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(create_variable(&ctx, &msg, KEY, "tok", None, None, true).await);
+        assert!(
+            try_clear_token(&ctx, &msg).await,
+            "a redeemed token is inert and must be removable"
         );
     }
 
@@ -1534,6 +1718,7 @@ mod tests {
                     VariableUpdate {
                         value: Some(""),
                         description: None,
+                        sensitive: None,
                     },
                 )
                 .await
@@ -1598,6 +1783,7 @@ mod tests {
                 VariableUpdate {
                     value: Some(""),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await
@@ -1646,6 +1832,7 @@ mod tests {
             VariableUpdate {
                 value: Some(""),
                 description: None,
+                sensitive: None,
             },
         )
         .await
@@ -1672,6 +1859,7 @@ mod tests {
                 VariableUpdate {
                     value: Some(""),
                     description: None,
+                    sensitive: None,
                 },
             )
             .await,
@@ -1896,6 +2084,7 @@ mod runtime_key_guard_tests {
             VariableUpdate {
                 value: Some("1"),
                 description: None,
+                sensitive: None,
             },
         )
         .await;
@@ -1919,6 +2108,7 @@ mod runtime_key_guard_tests {
             VariableUpdate {
                 value: Some("Acme"),
                 description: None,
+                sensitive: None,
             },
         )
         .await

@@ -596,14 +596,17 @@ pub fn is_internal_key(key: &str) -> bool {
 /// adapter-injected ([`is_internal_key`]).
 ///
 /// Neither class is ever variables-table config, so a row carrying one is a
-/// mistake or a forgery. Named once here because four surfaces have to agree
+/// mistake or a forgery. Named once here because three surfaces have to agree
 /// on it and would otherwise each carry their own copy of the pair:
 /// `admin::ops::reject_runtime_owned_key` (the admin write path),
 /// `blocks::config`'s `served_only_from_boot_map` (the read path, which
-/// answers these from the boot map whatever the table holds),
-/// `dev::data_snapshot::import` (the seed-bundle write path), and
-/// `platform_state::variables::seed_and_load` (the process-environment write
-/// path).
+/// answers these from the boot map whatever the table holds), and
+/// `dev::data_snapshot::import` (the seed-bundle write path).
+///
+/// The process-environment path is NOT one of them: `cli::server_config::
+/// filter_to_declared_keys` drops every undeclared key before
+/// `seed_and_load` sees it, and no runtime-owned key is declared, so the
+/// refusal happens upstream rather than here.
 pub fn is_runtime_owned_key(key: &str) -> bool {
     is_infrastructure_key(key) || is_internal_key(key)
 }

@@ -294,10 +294,10 @@ pub async fn find_by_key(
 /// exists. A pre-existing row (a prior boot's seed, an admin-UI edit) always
 /// wins — seeding never clobbers a stored value.
 ///
-/// This is the right shape for a *default* and the wrong one for an
-/// instruction. [`seed_and_load`] used it for the process environment and that
-/// is precisely the bug it now documents: an env var is not a default, so it
-/// goes through [`set`] instead.
+/// This is the shape [`seed_and_load`] applies to the process environment: an
+/// env var seeds a key that has no row yet and never overwrites one that does.
+/// Whether that is the right precedence is a separate question, open at the
+/// time of writing and not settled by this module.
 ///
 /// Returns `Ok(true)` when a row was inserted, `Ok(false)` when one already
 /// existed. Errors bubble up so the caller can decide whether a failed seed
@@ -452,9 +452,8 @@ pub enum Wrote {
     /// and the caller knows the value is sensitive, so only the flag was
     /// raised. A repair, not a config change.
     FlagRaised,
-    /// Nothing a config reader can observe changed: the row already held this
-    /// value and its flag was already right. (An admin-ownership stamp may
-    /// still have been recorded — that is bookkeeping, not configuration.)
+    /// Nothing was written: the row already held this value and its flag was
+    /// already right.
     Unchanged,
 }
 
@@ -638,17 +637,17 @@ async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<LoadedRow>, Stri
     for record in listed.records {
         match VariableRow::from_record(&record.id, &record.data) {
             Ok(row) => {
-                // Whether the stored flag is the canonical integer the column
-                // is declared as (`INTEGER NOT NULL DEFAULT 0` on both
-                // backends) rather than one of the shapes `util::flag_is_set`
-                // tolerates on read. The repair pass normalises the rest.
-                let canonical_flag = record
-                    .data
-                    .get("sensitive")
-                    .is_some_and(|v| matches!(v, Value::Number(n) if n.as_i64() == Some(0) || n.as_i64() == Some(1)));
+                // Compared against the canonical value directly. A shape test
+                // on `Value::Number` was false for every backend that returns
+                // this INTEGER column as a string or a float — the shapes this
+                // change set exists because they occur — so the repair rewrote
+                // every required-sensitive row on every boot, each one bumping
+                // the config-write generation and invalidating warm snapshots.
+                let flag_is_canonical_one =
+                    record.data.get("sensitive") == Some(&serde_json::json!(1));
                 rows.push(LoadedRow {
                     row,
-                    canonical_flag,
+                    flag_is_canonical_one,
                 });
             }
             Err(e) => tracing::warn!(error = %e, "variables table contains an undecodable row"),
@@ -660,10 +659,11 @@ async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<LoadedRow>, Stri
 /// A decoded row plus how its `sensitive` column was actually spelled on disk.
 struct LoadedRow {
     row: VariableRow,
-    /// `false` when the flag came back as a JSON bool or a string — readable
-    /// (see [`crate::util::flag_is_set`]) but not the integer the schema
-    /// declares, so the repair pass rewrites it.
-    canonical_flag: bool,
+    /// `true` only when the column came back as exactly the integer `1`.
+    /// Any other spelling a backend or bundle can produce — a bool, a string,
+    /// a float, `2` — is readable (see [`crate::util::flag_is_set`]) but not
+    /// what the schema declares, so the repair pass rewrites it.
+    flag_is_canonical_one: bool,
 }
 
 /// Reconcile every stored row's `sensitive` flag with what its key requires,
@@ -716,57 +716,30 @@ async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[Loaded
     for loaded in rows {
         let row = &loaded.row;
         let required = crate::config_vars::is_sensitive_for_storage(&row.key);
-        // LOWER a DECLARED key the declaration does not call for. Narrow on
-        // purpose: only a declared key, never against the suffix rule (which
-        // `is_sensitive_for_storage` unions in), so an ad hoc row an admin
-        // flagged by hand is never touched.
+
+        // RAISE ONLY. The pass used to also clear the flag on a declared key
+        // whose declaration did not call for one, so a mis-flag was
+        // recoverable. That was the wrong trade and is gone: the Add Variable
+        // modal ticks Sensitive by default, and a declared var with an empty
+        // default has no row until an admin makes one — so
+        // `WAFER_RUN_SHARED__EMBEDDED_SCRIPTS`, which carries operator-supplied
+        // script text that routinely embeds an analytics or API key, could be
+        // created flagged and then silently unflagged by the next boot,
+        // rendered in clear on the Variables page and made exportable into
+        // another deployment's seed bundle. Permanent masking is an annoyance;
+        // auto-unmasking a secret-bearing value and then exporting it is a
+        // leak, and the two do not weigh the same. A mis-flag is now fixed by
+        // the admin who made it, through the edit form's Sensitive control.
         //
-        // It lives here rather than in `admin::settings::seed_defaults`, which
-        // is where it was first written, because that function returns at its
-        // declared-vars hash gate on every deployment whose stamp still
-        // matches — and the stamp DOES still match, since no declared shared
-        // var carries a `_SECRET`/`_KEY` suffix and the hash therefore did not
-        // move when the rule changed. Gated, the repair would have waited for
-        // an unrelated future release. This pass is un-gated on all three
-        // targets, which is the property the fix needs.
-        //
-        // Recoverability is the point: nothing else can lower this flag
-        // (`update_variable` never patches it, `create_variable` fails on an
-        // existing key), so without this an admin who POSTs a declared var
-        // with no `sensitive` field — `handle_create` reads that as "absent
-        // means sensitive" — masks it permanently, the row being also
-        // unclearable and undeletable.
-        if row.sensitive && !required && crate::config_vars::is_declared_key(&row.key) {
-            let patch = VariablePatch {
-                sensitive: Some(false),
-                ..Default::default()
-            };
-            match db.update(TABLE, &row.id, patch.to_update_data()).await {
-                Ok(_) => {
-                    crate::config_generation::note_config_write();
-                    tracing::info!(
-                        key = %row.key,
-                        "cleared the stored `sensitive` flag for this config key; its \
-                         declaration does not call for one, and a flag set by mistake \
-                         would otherwise mask it permanently"
-                    );
-                }
-                Err(e) => tracing::warn!(
-                    key = %row.key,
-                    error = %e,
-                    "failed to clear a config key's `sensitive` flag"
-                ),
-            }
+        // Rewrite when the flag is not the canonical `1`: a row whose column
+        // holds `2`, `true` or `"true"` reads as flagged, so a `row.sensitive`
+        // skip would leave it in a shape the schema does not declare — and,
+        // before the readers were reconciled, one the settings API and the KV
+        // cache both read as UNflagged.
+        if !required || loaded.flag_is_canonical_one {
             continue;
         }
-        // Rewrite when the flag is missing OR merely readable rather than
-        // canonical. A row whose column holds `2`, `true` or `"true"` reads as
-        // flagged, so the old `row.sensitive` skip left it in a shape the
-        // schema does not declare — and, before the readers were reconciled,
-        // one that the settings API and the KV cache both read as UNflagged.
-        if !required || (row.sensitive && loaded.canonical_flag) {
-            continue;
-        }
+
         // Whether the clear flag actually exposed anything, which decides how
         // loudly this is reported. Only a DECLARED `Password` var was exposed:
         // the read path (`util::is_sensitive_key`) and the edge cache
@@ -1667,6 +1640,43 @@ mod boot_tests {
         }
     }
 
+    /// The repair pass NEVER clears a flag, only raises it.
+    ///
+    /// It used to clear one on any declared key the declaration did not call
+    /// for, so a mis-flag was recoverable. The Add Variable modal ticks
+    /// Sensitive by default and a declared var with an empty default has no
+    /// row until an admin makes one — so
+    /// `WAFER_RUN_SHARED__EMBEDDED_SCRIPTS`, which carries operator-supplied
+    /// script text that routinely embeds an analytics or API key, could be
+    /// created flagged and silently unflagged by the next boot, then rendered
+    /// in clear and allowed into a seed bundle. Recovery from a mis-flag is
+    /// the edit form's job now.
+    #[tokio::test]
+    async fn the_repair_pass_never_clears_a_flag_an_admin_set() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS";
+        assert!(
+            !crate::config_vars::is_sensitive_for_storage(key),
+            "the declaration does not call for a flag here — that is the case under test"
+        );
+
+        // What the Add Variable modal produces with its default tick.
+        seed_if_absent(&db, key, "/analytics.js?token=abc123", "", "", true)
+            .await
+            .expect("admin creates it flagged");
+
+        repair_sensitive_flags(&db).await;
+
+        assert!(
+            find_by_key(&db, key)
+                .await
+                .expect("list")
+                .expect("row")
+                .sensitive,
+            "a boot must never unmask a value an admin chose to mask"
+        );
+    }
+
     /// A row that is legitimately not sensitive is left alone by the repair
     /// pass — it raises flags, it does not set them everywhere.
     #[tokio::test]
@@ -1686,8 +1696,8 @@ mod boot_tests {
     }
 
     /// A boot that re-asserts the same environment writes nothing at all —
-    /// the property that keeps env-wins from issuing an UPDATE per declared
-    /// key on every cold start.
+    /// the property that keeps a boot from issuing an UPDATE per declared key
+    /// on every cold start.
     #[tokio::test]
     async fn re_applying_the_same_environment_writes_nothing() {
         let db = migrated_db().await;

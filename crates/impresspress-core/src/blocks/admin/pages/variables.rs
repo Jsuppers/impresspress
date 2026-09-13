@@ -670,6 +670,9 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
     let value = row.value;
     let description = row.description;
     let warning = row.warning;
+    // A key the storage rule requires cannot be unflagged; show the control as
+    // set-and-locked rather than offering a change that would be refused.
+    let required_sensitive = crate::config_vars::is_sensitive_for_storage(&key);
 
     let markup = html! {
         div .modal-header {
@@ -710,6 +713,23 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                     label .form-label for="edit-desc" { "Description" }
                     input .form-input type="text" #edit-desc name="description" value=(description);
                 }
+                div .form-group {
+                    input type="hidden" name="sensitive_present" value="1";
+                    label .form-checkbox {
+                        @if sensitive {
+                            input type="checkbox" name="sensitive" value="1" checked disabled[required_sensitive];
+                        } @else {
+                            input type="checkbox" name="sensitive" value="1" disabled[required_sensitive];
+                        }
+                        span { "Sensitive — mask this value in listings and keep it out of exports" }
+                    }
+                    @if required_sensitive {
+                        p .form-hint {
+                            "This variable is always sensitive: its declaration, or its \
+                             _SECRET/_KEY name, requires it."
+                        }
+                    }
+                }
                 @if !warning.is_empty() {
                     div .var-warning-banner {
                         (ui::icons::triangle_alert()) (warning)
@@ -743,6 +763,13 @@ pub async fn handle_update_variable(
     let update = ops::VariableUpdate {
         value: body.get("value").map(|s| s.as_str()),
         description: body.get("description").map(|s| s.as_str()),
+        // An HTML checkbox posts nothing when unticked, so the form carries a
+        // hidden `sensitive_present` marker: with it, the checkbox's state is
+        // a deliberate answer; without it the field is not being edited at all
+        // and the stored flag is left alone.
+        sensitive: body
+            .get("sensitive_present")
+            .map(|_| crate::config_vars::form_bool(&body, "sensitive")),
     };
     if let Err(out) = ops::update_variable(ctx, msg, var_key, update).await {
         return out;
