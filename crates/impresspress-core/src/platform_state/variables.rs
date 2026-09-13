@@ -708,9 +708,10 @@ struct LoadedRow {
 /// reading the table to find the ones that disagree.
 ///
 /// Raises a flag the declaration or the `_SECRET`/`_KEY` suffix calls for, and
-/// clears one on a DECLARED key that calls for neither. The asymmetry is
-/// deliberate: an undeclared ad hoc row is never lowered, because an admin
-/// flagging one by hand is a decision this code has no standing to reverse.
+/// never clears one. See the RAISE ONLY note in the body: lowering was the
+/// wrong trade — a mis-flagged row is a cosmetic annoyance, an unflagged
+/// credential is a leak — and an admin flagging an ad hoc row by hand is a
+/// decision this code has no standing to reverse either.
 ///
 /// The write paths settle this at creation now ([`NewVariable::into_row`]), but
 /// a row an EARLIER build wrote is already in the database with the flag clear,

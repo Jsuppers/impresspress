@@ -247,8 +247,15 @@ impl VariablesConfigBlock {
         // operation runs over the raw `DatabaseService` with no `Context` to
         // count through. Widening it here would exempt an UNREDEEMED token on
         // the one surface that cannot check, and clearing a live token is a
-        // lockout with no way back on Cloudflare. No practical divergence
-        // today in any case: no `settings_form` renders the bootstrap keys.
+        // lockout with no way back on Cloudflare.
+        //
+        // The divergence is not reachable today, though NOT because the
+        // bootstrap keys are unrendered — `auth_ui::pages::settings` puts both
+        // of them in its "Admin" section. It is unreachable because
+        // `settings_form::save_settings` short-circuits an empty-or-
+        // `MASKED_VALUE` submission for a sensitive var before calling
+        // `config::set`, so an empty value never reaches the guard below from
+        // the one caller that could produce it.
         //
         // KNOWN GAP, recorded rather than fixed: the parity stops at the
         // create path. `variables::set`'s create branch builds its own
@@ -314,8 +321,8 @@ impl VariablesConfigBlock {
         // `variables::set` and `NewVariable::into_row` settle themselves: an
         // existing row's stored flag, so an ad hoc row an admin marked
         // sensitive in the UI stays that way. Deriving it here from the key's
-        // spelling instead (`is_sensitive_key(key, 0)`, the suffix rule alone)
-        // is what let a `Password`-typed declared var with no row yet —
+        // spelling alone is what let a `Password`-typed declared var with no
+        // row yet —
         // `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD`, spelled neither
         // `_SECRET` nor `_KEY` — land unflagged, after which the settings API
         // served it verbatim and `cache_key::row_is_sensitive` judged it

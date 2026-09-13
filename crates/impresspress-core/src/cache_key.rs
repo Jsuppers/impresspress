@@ -258,12 +258,13 @@ fn sensitive_check_columns(table: CachedTable) -> Option<(&'static str, &'static
 /// judged cacheable and a plaintext admin password was copied into a globally
 /// replicated store.
 ///
-/// Uses [`crate::util::json_as_i64`] (not a bare `v.as_i64()`) for the
+/// Uses [`crate::util::flag_is_set`] (not a bare `v.as_i64()`) for the
 /// `sensitive` column so this stays in exact parity with the display-masking
 /// path: the SQLite service can round-trip a lazily-added column as a TEXT
-/// `"1"` string, and a flag-only-sensitive row stored that way must still be
-/// treated as sensitive here, or it would leak into KV while the display
-/// path correctly masks it.
+/// `"1"` string, a bool, or a float, and a flag-only-sensitive row stored any
+/// of those ways must still be treated as sensitive here, or it would leak
+/// into KV while the display path correctly masks it. See the note in the
+/// body on why `json_as_i64` was the wrong decoder for exactly this.
 pub fn row_is_sensitive(table: CachedTable, row: &HashMap<String, serde_json::Value>) -> bool {
     let Some((key_col, sensitive_col)) = sensitive_check_columns(table) else {
         return false;
@@ -731,7 +732,7 @@ mod tests {
     fn row_is_sensitive_true_when_flag_set_as_string() {
         // A lazily-added column can round-trip as TEXT ("1") rather than a
         // JSON number. `row_is_sensitive` must accept that the same way the
-        // display-masking path (`crate::util::json_as_i64`) does, or a
+        // display-masking path (`crate::util::flag_is_set`) does, or a
         // string-stored sensitive flag would leak into the KV cache while
         // still being masked on display — see the parity note on
         // `row_is_sensitive`.

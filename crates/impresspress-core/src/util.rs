@@ -1426,13 +1426,21 @@ mod tests {
     }
 
     #[test]
-    fn is_sensitive_key_honors_flag_and_suffix() {
+    fn is_sensitive_key_honors_flag_suffix_and_declaration() {
         // Flag set → sensitive regardless of name.
         assert!(is_sensitive_key("PLAIN", 1));
         // SEC-060: suffix makes it sensitive even when the flag is clear.
         assert!(is_sensitive_key("STRIPE_SECRET", 0));
         assert!(is_sensitive_key("JWT_KEY", 0));
-        // Neither flag nor suffix → not sensitive.
+        // The DECLARATION makes it sensitive even with neither flag nor
+        // suffix. This key is spelled neither `_SECRET` nor `_KEY`, so before
+        // the read path consulted the declaration a row written by an older
+        // build sat here unflagged and was served in the clear.
+        assert!(is_sensitive_key(
+            "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD",
+            0
+        ));
+        // None of the three → not sensitive.
         assert!(!is_sensitive_key("SITE_NAME", 0));
     }
 }
