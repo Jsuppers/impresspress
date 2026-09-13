@@ -232,9 +232,23 @@ impl VariablesConfigBlock {
     /// `ctx`-routed write to the admin block's table is a cross-block write
     /// WRAP denies.
     async fn write(&self, key: &str, value: &str) -> Result<(), OutputStream> {
-        // The same sensitive-empty (with the same provisioning-only exemption)
-        // and `_URL` guards `blocks::admin::ops::update_variable` applies, so
-        // neither write surface accepts input the other refuses on those rules.
+        // The same sensitive-empty and `_URL` guards
+        // `blocks::admin::ops::update_variable` applies, spelled from the same
+        // helpers, so the two write surfaces agree on the RULES.
+        //
+        // They do not agree on the whole of the sensitive-empty EXEMPTION, and
+        // deliberately: this surface exempts only the static
+        // `config_vars::is_provisioning_only_key` (the bootstrap password),
+        // while the admin PUT calls `ops::is_clearable_provisioning_credential`,
+        // which additionally exempts a bootstrap TOKEN that has already been
+        // redeemed. So `CONFIG_SET` refuses a clear the admin PUT accepts. The
+        // narrower rule is the correct one here and `ops.rs` says why: "is the
+        // token redeemed" is answered by counting admin users, and this
+        // operation runs over the raw `DatabaseService` with no `Context` to
+        // count through. Widening it here would exempt an UNREDEEMED token on
+        // the one surface that cannot check, and clearing a live token is a
+        // lockout with no way back on Cloudflare. No practical divergence
+        // today in any case: no `settings_form` renders the bootstrap keys.
         //
         // KNOWN GAP, recorded rather than fixed: the parity stops at the
         // create path. `variables::set`'s create branch builds its own
@@ -260,8 +274,9 @@ impl VariablesConfigBlock {
         // that row IS the next boot's secret. See
         // `blocks::admin::ops::reject_runtime_owned_key`. The
         // sensitive-empty guard reads the stored flag exactly as that path
-        // does; a missing row has no stored secret to wipe, so only the
-        // suffix rule applies there.
+        // does; a missing row contributes no flag, so for it the guard rests
+        // on `is_sensitive_key`'s key half alone — the key's declaration or
+        // its `_SECRET`/`_KEY` spelling.
         let existing = match variables::find_by_key(&self.db, key).await {
             Ok(row) => row,
             Err(e) => {
@@ -271,10 +286,12 @@ impl VariablesConfigBlock {
                 )))
             }
         };
-        // The provisioning-only exemption comes with it, for the same reason
-        // the rest of this guard is shared: the comment above promises neither
-        // surface refuses what the other accepts, and a spent bootstrap
-        // credential has to stay clearable because nothing can delete it.
+        // The static provisioning-only exemption — the narrower of the two, per
+        // the note above. It has to be here at all for the reason it exists on
+        // the admin path: a spent bootstrap password must stay clearable
+        // because `delete_variable` and `key_is_deletable` both refuse to
+        // delete a declared `WAFER_RUN_SHARED__*` row, so without it the
+        // deployment keeps a plaintext admin password by every route.
         if value.is_empty() && !crate::config_vars::is_provisioning_only_key(key) {
             let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
             if is_sensitive_key(key, stored_flag) {
