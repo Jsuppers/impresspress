@@ -902,6 +902,31 @@ mod create_tests {
         collect_or_panic(out).await;
     }
 
+    /// `POST /b/admin/api/settings` with a key that is already stored answers
+    /// **409**, not the 500 the 2026-09-10 live-server audit found. The
+    /// classification lives in `ops::create_variable`; this pins that the JSON
+    /// surface publishes it rather than reshaping it on the way out.
+    #[tokio::test]
+    async fn creating_an_existing_key_answers_conflict() {
+        let ctx = admin_ctx().await;
+        create(
+            &ctx,
+            serde_json::json!({"key": "SITE_MOTTO", "value": "one"}),
+        )
+        .await;
+
+        let out = handle_create(
+            &ctx,
+            &admin_msg("create", "/b/admin/api/settings"),
+            InputStream::from_bytes(
+                serde_json::to_vec(&serde_json::json!({"key": "SITE_MOTTO", "value": "two"}))
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+    }
+
     /// An ad hoc variable created without saying whether it is sensitive is
     /// stored as sensitive. Masking an innocuous value costs the operator one
     /// click to undo; publishing a secret in plain text — which is what the

@@ -892,6 +892,25 @@ mod create_form_tests {
         collect_or_panic(out).await;
     }
 
+    /// The Variables page's create form answers the SAME 409 the JSON API
+    /// does for a key that is already stored. Both surfaces drive
+    /// `ops::create_variable`, and this is the half of that claim that would
+    /// notice if the page started reshaping the refusal into a re-render (an
+    /// htmx swap of the full page would read as "created" to the operator).
+    #[tokio::test]
+    async fn form_post_with_an_existing_key_answers_conflict() {
+        let ctx = admin_ctx().await;
+        post_form(&ctx, "key=SITE_MOTTO&value=one").await;
+
+        let out = handle_create_variable(
+            &ctx,
+            &admin_msg("create", "/admin/variables"),
+            InputStream::from_bytes(b"key=SITE_MOTTO&value=two".to_vec()),
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+    }
+
     /// A form post that says nothing about sensitivity — a curl'd or
     /// hand-built post, or a form that lost its checkbox — fails safe.
     #[tokio::test]
