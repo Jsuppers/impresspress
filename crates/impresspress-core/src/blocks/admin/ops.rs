@@ -635,6 +635,32 @@ pub(super) async fn create_variable(
     reject_runtime_owned_key(key)?;
     let admin_id = msg.user_id().to_string();
 
+    // A key something MASKS may not be created holding nothing. This path had
+    // no empty guard at all — only [`update_variable`] did — so
+    // `POST /b/admin/api/settings {"key": "…BOOTSTRAP_ADMIN_TOKEN", "value": ""}`
+    // stored a blank row, and that row is both permanent and load-bearing:
+    // `seed_and_load` seeds through `insert_if_absent`, which skips any key
+    // that already has a row, and `delete_variable` refuses a declared
+    // `WAFER_RUN_SHARED__*` row. The deployment is then wedged with no
+    // bootstrap path and no way to remove the row that took it away.
+    //
+    // Judged on the KEY alone (`is_sensitive_key(key, 0)` — there is no stored
+    // row to carry a flag), deliberately NOT on the `sensitive` argument. What
+    // makes a blank row a trap rather than a nuisance is that the boot seeder
+    // owns the key and `delete_variable` protects it, and both of those follow
+    // from the key's declaration or its `_SECRET`/`_KEY` spelling. An ad hoc
+    // key the caller merely asks to mask is deletable, and the Add Variable
+    // modal checks that box by DEFAULT — gating on the argument would refuse
+    // every empty variable an operator creates through the UI.
+    if value.is_empty()
+        && !is_clearable_provisioning_credential(ctx, key).await
+        && is_sensitive_key(key, 0)
+    {
+        return Err(err_bad_request(&format!(
+            "Cannot create {key} with an empty value"
+        )));
+    }
+
     // Validate URL-type keys (SSRF) on both surfaces.
     if key.ends_with("_URL") {
         if let Err(e) = validate_url_value(value) {
@@ -797,11 +823,13 @@ pub(super) async fn update_variable(
         // surfaces whose widget renders a masked field blank
         // (`pages::variables::handle_update_variable` and
         // `ui::settings_form::save_settings`, which both drop it before calling
-        // a writer). That is not a disagreement about the mask — both of them
-        // send a literal `MASKED_VALUE` straight here to be refused — it is the
-        // widget speaking: a blank masked field is the only thing a browser can
-        // post for "I did not touch this", whereas an empty value arriving on
-        // the JSON API was typed by a caller that had something else to say.
+        // a writer). That is not a disagreement about the mask — the variables
+        // modal sends a literal `MASKED_VALUE` straight here to be refused, and
+        // `save_settings`, whose writer is `config::set` rather than this
+        // function, raises the identical refusal itself. It is the widget
+        // speaking: a blank masked field is the only thing a browser can post
+        // for "I did not touch this", whereas an empty value arriving on the
+        // JSON API was typed by a caller that had something else to say.
         if value.is_empty()
             && !is_clearable_provisioning_credential(ctx, key).await
             && is_sensitive_key(key, stored_sensitive_flag(ctx, key).await?)
@@ -816,6 +844,29 @@ pub(super) async fn update_variable(
                 return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
             }
         }
+    } else if variables::get_by_key(ctx, key)
+        .await
+        .map_err(|e| db_error_internal(e, "Database error"))?
+        .is_none()
+    {
+        // No value supplied AND no row stored. This function upserts, so the
+        // write below would take the create branch and store `value: ""` —
+        // sailing past the empty guard above, which only runs when a value was
+        // supplied at all. While `value` was a required request field that was
+        // unreachable; making it optional (so a caller can change the
+        // `sensitive` flag of a key whose value it cannot read) opened it, and
+        // the row it produces is the permanent, undeletable, seeder-blocking
+        // blank `create_variable`'s guard above describes.
+        //
+        // Refused for every key, not just the masked ones: a create that
+        // carries no value has nothing to create the row FROM. "Update the
+        // other fields of a variable that exists" and "bring a variable into
+        // existence" are different requests, and only the second needs a value
+        // — so the second is the one that has to supply it.
+        return Err(err_bad_request(&format!(
+            "Cannot create {key} without a value: a request that changes only other fields \
+             updates a variable that already exists, it does not create one."
+        )));
     }
 
     // A PUT to a not-yet-present key takes `upsert_by_key`'s create branch,

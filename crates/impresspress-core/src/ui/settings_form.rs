@@ -351,17 +351,39 @@ pub async fn save_settings(
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid request: {e}")),
     };
-    // Validate every URL-typed value up front so one bad URL can't leave a
+    // Validate every refusable value up front so one bad field can't leave a
     // half-applied save. `is_url()` (InputType::Url) is the declared rule, and
     // `validate_url_value` is the same SSRF check the admin variables page runs —
     // shared so the two write surfaces can't accept divergent inputs.
+    //
+    // The mask refusal belongs to the SAME pre-pass and for the same reason: a
+    // 400 raised from inside the write loop below would go out after
+    // `config::set` had already run for every var ahead of it in the allowlist,
+    // which is precisely the half-applied save this pass exists to prevent. It
+    // is not something this form can post — the field renders blank, and a
+    // placeholder is not submitted — so a client that sends it round-tripped a
+    // read, and storing it would replace the secret with eight asterisks.
+    // Refused rather than skipped, and refused identically by the admin
+    // variable surfaces (`blocks::admin::ops::update_variable`) and by
+    // `CONFIG_SET` itself: a caller told "Settings saved" for a write that was
+    // discarded can never find out, because the next read hands it the same
+    // mask back. See `util::is_masked_submission`.
     for var in allowed {
+        let Some(value) = body.get(&var.key) else {
+            continue;
+        };
         if var.is_url() {
-            if let Some(value) = body.get(&var.key) {
-                if let Err(e) = validate_url_value(value) {
-                    return err_bad_request(&format!("{}: {e}", var.key));
-                }
+            if let Err(e) = validate_url_value(value) {
+                return err_bad_request(&format!("{}: {e}", var.key));
             }
+        }
+        if crate::util::is_masked_submission(&var.key, var.is_sensitive() as i64, value) {
+            return err_bad_request(&format!(
+                "{}: {MASKED_VALUE} is the mask this value reads back as, not the value \
+                 itself. Type the real value to change it, or leave the field blank to keep \
+                 the stored one.",
+                var.key
+            ));
         }
     }
     for var in allowed {
@@ -377,26 +399,12 @@ pub async fn save_settings(
         // reaches `config::set`. Uses the same single-sourced
         // `is_sensitive_key` rule as the render path so the two can't disagree
         // on which fields this applies to.
+        // The mask is a different case with a different answer, and it was
+        // already refused by the pre-pass above — only an empty field reaches
+        // here as "unchanged".
         let is_sensitive = is_sensitive_key(&var.key, var.is_sensitive() as i64);
         if is_sensitive && value.is_empty() {
             continue;
-        }
-        // The mask itself is a different case and gets a different answer. It
-        // is not something this form can post — the field is blank, and a
-        // placeholder is not submitted — so a client that sends it round-tripped
-        // a read, and storing it would replace the secret with eight asterisks.
-        // Refused rather than skipped, and refused identically by the admin
-        // variable surfaces (`blocks::admin::ops::update_variable`): a caller
-        // told "Settings saved" for a write that was discarded can never find
-        // out, because the next read hands it the same mask back. See
-        // `util::is_masked_submission`.
-        if crate::util::is_masked_submission(&var.key, var.is_sensitive() as i64, value) {
-            return err_bad_request(&format!(
-                "{}: {MASKED_VALUE} is the mask this value reads back as, not the value \
-                 itself. Type the real value to change it, or leave the field blank to keep \
-                 the stored one.",
-                var.key
-            ));
         }
         // Surface the first write failure instead of reporting a false
         // "saved" — htmx clients branch on the status, not a 200 body.
@@ -731,6 +739,43 @@ mod tests {
             config::get_default(&ctx, "X__API_SECRET", "").await,
             "original-secret",
             "and the stored secret must survive the refusal"
+        );
+    }
+
+    /// The refusal must not leave a half-applied save.
+    ///
+    /// URL validation is deliberately a PRE-PASS for exactly this reason —
+    /// "one bad URL can't leave a half-applied save" — and a mask refusal
+    /// raised from inside the write loop had the same defect it was hoisted to
+    /// avoid: the vars before it in the allowlist were already written when the
+    /// 400 went out, so the admin got an error for a form that had partly
+    /// saved.
+    #[tokio::test]
+    async fn a_refused_mask_writes_nothing_at_all() {
+        let mut ctx = TestContext::new().await;
+        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
+        ctx.set_config("X__API_SECRET", "original-secret");
+        // App name first, so it would already be written by the time the mask
+        // is reached if the check lived in the write loop.
+        let allowed = [
+            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var("X__API_SECRET", "API Secret", InputType::Password),
+        ];
+
+        let out = run_save(
+            &ctx,
+            &allowed,
+            serde_json::json!({
+                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                "X__API_SECRET": MASKED_VALUE,
+            }),
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(out).await, 400);
+        assert_eq!(
+            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            "MyApp",
+            "a refused save must not have written the fields before the refusal"
         );
     }
 

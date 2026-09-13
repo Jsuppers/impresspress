@@ -232,7 +232,7 @@ impl VariablesConfigBlock {
     /// `ctx`-routed write to the admin block's table is a cross-block write
     /// WRAP denies.
     async fn write(&self, key: &str, value: &str) -> Result<(), OutputStream> {
-        // The same sensitive-empty and `_URL` guards
+        // The same masked-submission, sensitive-empty and `_URL` guards
         // `blocks::admin::ops::update_variable` applies, spelled from the same
         // helpers, so the two write surfaces agree on the RULES.
         //
@@ -252,10 +252,13 @@ impl VariablesConfigBlock {
         // The divergence is not reachable today, though NOT because the
         // bootstrap keys are unrendered — `auth_ui::pages::settings` puts both
         // of them in its "Admin" section. It is unreachable because
-        // `settings_form::save_settings` short-circuits an empty-or-
-        // `MASKED_VALUE` submission for a sensitive var before calling
-        // `config::set`, so an empty value never reaches the guard below from
-        // the one caller that could produce it.
+        // `settings_form::save_settings` short-circuits an EMPTY submission for
+        // a sensitive var before calling `config::set`, so an empty value never
+        // reaches the guard below from the one caller that could produce it.
+        // (A `MASKED_VALUE` submission is a separate case there and gets the
+        // opposite treatment — a 400, not a short-circuit — for the reason
+        // `util::is_masked_submission` gives; either way it does not arrive
+        // here.)
         //
         // KNOWN GAP, recorded rather than fixed: the parity stops at the
         // create path. `variables::set`'s create branch builds its own
@@ -299,14 +302,36 @@ impl VariablesConfigBlock {
         // because `delete_variable` and `key_is_deletable` both refuse to
         // delete a declared `WAFER_RUN_SHARED__*` row, so without it the
         // deployment keeps a plaintext admin password by every route.
-        if value.is_empty() && !crate::config_vars::is_provisioning_only_key(key) {
-            let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
-            if is_sensitive_key(key, stored_flag) {
-                return Err(OutputStream::error(WaferError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("Cannot set {key} to an empty value"),
-                )));
-            }
+        let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
+        // The mask is never a value, on this surface as on the admin ones.
+        //
+        // This operation is reachable by ANY block through
+        // `wafer_core::clients::config::set`, so without the guard here the
+        // rule held only because the three surfaces that exist today each
+        // enforce it themselves — an invariant that breaks silently the day a
+        // block adds a call. Nothing stops it being enforced here: the stored
+        // row is already in hand for the empty guard below, which is the only
+        // thing the mask check needs. (Contrast the provisioning EXEMPTION
+        // discussed above, which genuinely cannot be mirrored here because it
+        // asks a question only a `Context` can answer.)
+        if crate::util::is_masked_submission(key, stored_flag, value) {
+            return Err(OutputStream::error(WaferError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "{} is the mask {key} reads back as, not its value: storing it would \
+                     destroy the secret",
+                    crate::util::MASKED_VALUE
+                ),
+            )));
+        }
+        if value.is_empty()
+            && !crate::config_vars::is_provisioning_only_key(key)
+            && is_sensitive_key(key, stored_flag)
+        {
+            return Err(OutputStream::error(WaferError::new(
+                ErrorCode::InvalidArgument,
+                format!("Cannot set {key} to an empty value"),
+            )));
         }
         if key.ends_with("_URL") {
             if let Err(e) = validate_url_value(value) {
@@ -703,6 +728,37 @@ mod boot_owned_key_tests {
                 .expect("read back")
                 .is_none(),
             "a refused write must not leave a row behind"
+        );
+    }
+
+    /// `CONFIG_SET` refuses the mask, like every other write surface.
+    ///
+    /// This is the FOURTH writer into the `variables` table — any block can
+    /// reach it through `wafer_core::clients::config::set` — and it is the one
+    /// that makes the claim in `util::is_masked_submission` true by
+    /// construction rather than by accident of who happens to call what today.
+    /// Without it the guard held only because the two admin surfaces and
+    /// `ui::settings_form` all enforce it themselves, which is the kind of
+    /// invariant that breaks silently the day a block adds a call.
+    #[tokio::test]
+    async fn config_set_refuses_the_mask_for_a_sensitive_key() {
+        const KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
+        let ctx = booted_with(&[]).await;
+        store_row(&ctx, KEY, "real-client-secret").await;
+
+        let result = wafer_core::clients::config::set(&ctx, KEY, crate::util::MASKED_VALUE).await;
+        assert!(
+            result.is_err(),
+            "storing the mask over a secret must fail, not report success"
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row is still there")
+                .value,
+            "real-client-secret",
+            "and the stored secret must survive the refusal"
         );
     }
 

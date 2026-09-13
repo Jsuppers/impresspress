@@ -647,6 +647,13 @@ pub(crate) const MASKED_VALUE: &str = "********";
 /// value the table beside it rendered in clear is exactly the drift this
 /// closes.
 ///
+/// That list is the surfaces that ASK, not every surface that can publish a
+/// stored value. The admin SQL explorer (`POST /b/admin/api/database/query`)
+/// is outside it by construction — its job is to return what the query asked
+/// for, so `SELECT value FROM …__variables` answers in plaintext. Recorded
+/// under Security in `NICE_TO_HAVE.md` rather than closed here, so this
+/// enumeration is not read as exhaustive.
+///
 /// It is deliberately the same key predicate the WRITE path applies when it
 /// decides what the stored flag gets ([`crate::config_vars::is_sensitive_for_storage`],
 /// at `platform_state::variables::NewVariable::into_row`). Reader and writer

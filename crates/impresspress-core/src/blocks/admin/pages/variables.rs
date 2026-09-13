@@ -840,10 +840,17 @@ pub async fn handle_update_variable(
     // operator flagged sensitive is masked by it while the key alone says
     // nothing. Reading the widget back off a narrower rule than the one that
     // rendered it is exactly how the two drift.
+    //
+    // Through `crud::db_error_internal` rather than `err_internal`, for the
+    // reason `ops::stored_sensitive_flag`'s sibling read gives: this read names
+    // its own table, so a `NotFound` really is a 500 — but a WRAP refusal is a
+    // 403 and a quota a 429, and flattening those into "Internal server error"
+    // is the drift `tests/error_door.rs` exists to stop (it cannot catch this
+    // one; its own doc names the no-`NotFound`-arm blind spot).
     let stored_flag = match variables::get_by_key(ctx, var_key).await {
         Ok(Some(row)) => i64::from(row.sensitive),
         Ok(None) => 0,
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crate::blocks::crud::db_error_internal(e, "Database error"),
     };
     let field_was_masked = ops::is_sensitive_key(var_key, stored_flag);
 
@@ -1299,6 +1306,47 @@ mod tests {
                 .value,
             "sk-live-rotated",
         );
+    }
+
+    /// A row the OPERATOR flagged sensitive, whose key says nothing, behaves
+    /// like a declared one — masked on render, and read back as masked.
+    ///
+    /// This is the case that pins where `field_was_masked` comes from. Both
+    /// other modal fixtures are decided by the KEY (`MAILER_API_KEY`'s suffix,
+    /// `SITE_MOTTO`'s absence of one), so swapping the handler's stored-row read
+    /// for `config_vars::is_sensitive_for_storage(key)` passes them both. It
+    /// cannot pass this one: the key half answers false here, the render masks
+    /// off the stored flag anyway, and a handler reading the widget back off the
+    /// narrower rule would forward the blank field to the sensitive-empty guard
+    /// and drop the admin's edit with a 400.
+    #[tokio::test]
+    async fn an_operator_flagged_row_is_masked_and_read_back_as_masked() {
+        let ctx = TestContext::with_admin().await;
+        let key = "MY_SERVICE_HANDLE";
+        assert!(
+            !crate::config_vars::is_sensitive_for_storage(key),
+            "the point of this test is a key the declaration/suffix rule cannot catch"
+        );
+        let html = sensitive_row_modal(&ctx, key, "acme-prod-secret").await;
+
+        assert!(
+            !html.contains("acme-prod-secret"),
+            "a row the operator flagged sensitive must be masked too: {html}"
+        );
+
+        let mut fields = serialize_form(&html);
+        fields.insert("description".to_string(), "after".to_string());
+        assert_eq!(submit_edit(&ctx, key, &fields).await, 200);
+
+        let row = variables::get_by_key(&ctx, key)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.value, "acme-prod-secret",
+            "the secret survives the save"
+        );
+        assert_eq!(row.description, "after", "and the edit lands");
     }
 
     /// A NON-sensitive variable keeps the editor it always had: its value is
