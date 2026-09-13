@@ -927,6 +927,30 @@ fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
     row.insert("sensitive".to_string(), serde_json::json!(1));
 }
 
+/// Drop an imported variables row's `updated_by`.
+///
+/// That column is this instance's admin-ownership marker
+/// ([`crate::platform_state::variables::is_admin_owned`]): a non-empty value
+/// means an admin HERE edited the row, which is what makes it outrank the
+/// process environment. A bundle carries the exporting instance's column, and
+/// an admin over there is not an admin over here — importing it verbatim would
+/// let a seed bundle silently pin keys against this deployment's own `.env`,
+/// with the boot log blaming an admin edit that never happened on this
+/// instance.
+///
+/// Cleared rather than preserved, so an imported row is seeder-owned and the
+/// local environment can still seed it. A bundle is provisioning data; the
+/// operator's environment is the deployment's own instruction.
+fn clear_imported_owner(row: &mut serde_json::Map<String, Value>) {
+    if row
+        .get("updated_by")
+        .and_then(Value::as_str)
+        .is_some_and(|who| !who.is_empty())
+    {
+        row.insert("updated_by".to_string(), serde_json::json!(""));
+    }
+}
+
 /// Write one row into `table` under `mode`. Split out of [`import`] because
 /// the two modes' typed calls take different shapes (`create`'s owned
 /// `HashMap` vs. `upsert`'s ordered pair list) that don't share a body.
@@ -942,6 +966,8 @@ async fn import_row(
     let row = if table == variables::TABLE {
         let mut copy = row.clone();
         raise_imported_sensitive_flag(&mut copy);
+        clear_imported_owner(&mut copy);
+
         owned = copy;
         &owned
     } else {

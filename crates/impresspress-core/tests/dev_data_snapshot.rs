@@ -626,6 +626,55 @@ async fn import_raises_a_sensitive_flag_the_bundle_understated() {
     );
 }
 
+/// An imported row must not arrive claiming to be an admin edit of THIS
+/// instance.
+///
+/// `updated_by` is the admin-ownership marker that makes a row outrank the
+/// process environment. A bundle carries the EXPORTING instance's column, and
+/// an admin over there is not an admin over here — importing it verbatim would
+/// let a seed bundle silently pin keys against this deployment's own `.env`,
+/// and the boot log would blame an admin edit that never happened here.
+#[tokio::test]
+async fn import_clears_another_instances_admin_ownership_marker() {
+    let key = "WAFER_RUN_SHARED__APP_NAME";
+    let ctx = TestContext::with_products().await;
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        variables::TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "var_imported",
+            "key": key,
+            "value": "FromBundle",
+            "sensitive": false,
+            "updated_by": "admin_on_another_instance",
+            "created_at": STAMP,
+            "updated_at": STAMP,
+        }))
+        .into_iter()
+        .collect()],
+    );
+    let snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snap).await.expect("import");
+
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
+        .await
+        .unwrap();
+    let row = vars
+        .iter()
+        .find(|v| v.data["key"] == json!(key))
+        .expect("the row was imported");
+    assert_eq!(
+        row.data["updated_by"],
+        json!(""),
+        "an imported row must be seeder-owned here, so this deployment's own \
+         environment can still seed it: {row:?}"
+    );
+}
+
 /// A snapshot carries ordinary site config — that is what an export is FOR —
 /// but never a key the runtime owns.
 ///

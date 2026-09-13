@@ -1750,6 +1750,49 @@ mod tests {
         );
     }
 
+    /// Review finding 5, as a test: clearing the spent bootstrap password
+    /// through the admin API must STAY cleared across the next boot.
+    ///
+    /// Under env-wins it did not — the next `seed_and_load` re-applied the
+    /// still-present export and handed the plaintext credential back. It falls
+    /// out of admin-wins for free: `update_variable` stamps `updated_by`, so
+    /// the row is admin-owned and the export is inert for it.
+    #[tokio::test]
+    async fn a_cleared_bootstrap_password_stays_cleared_across_the_next_boot() {
+        use crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY as KEY;
+
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
+
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                KEY,
+                VariableUpdate {
+                    value: Some(""),
+                    description: None,
+                    sensitive: None,
+                },
+            )
+            .await,
+        );
+
+        // The operator has not removed the export yet — the realistic state.
+        ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
+
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "",
+            "a credential an admin cleared must not come back on the next boot"
+        );
+    }
+
     /// Try to clear the bootstrap token through the real admin update path.
     async fn try_clear_token(ctx: &TestContext, msg: &Message) -> bool {
         update_variable(
