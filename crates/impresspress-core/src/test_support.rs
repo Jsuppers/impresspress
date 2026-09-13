@@ -1681,35 +1681,44 @@ impl Context for FailingDbOpContext {
 }
 
 /// Wraps a [`TestContext`] and strips the COLUMNS off every record a
-/// `database.create` answers with, leaving the `{id, data}` envelope's `data`
-/// empty. The write still lands in the real in-memory SQLite underneath —
-/// only the echo is thinned.
+/// `database.create` or `database.update` answers with, leaving the
+/// `{id, data}` envelope's `data` empty. The write still lands in the real
+/// in-memory SQLite underneath — only the echo is thinned.
 ///
 /// This is the backend a repository function has to survive and cannot
-/// simulate any other way: `DatabaseService::create` is free to return the row
-/// it stored or an acknowledgement, and a repo that DECODES the echo and
-/// reports a decode failure as an error is telling its caller the write failed
-/// when the row is sitting in the table. `platform_state::variables::insert` is
-/// where that mattered — `admin::ops::create_variable` classifies a failed
-/// insert by re-reading the key, so the row this very request created came back
-/// as "that key is already taken".
+/// simulate any other way: `DatabaseService::create`/`update` are free to
+/// return the row they stored or a bare acknowledgement, and a repo that
+/// DECODES the echo and reports a decode failure as an error is telling its
+/// caller the write failed when the change is already committed.
+/// `platform_state::variables` is where that mattered, differently on each
+/// side: `insert`'s error was classified by re-reading the key, so the row the
+/// request had just created came back as "that key is already taken", and
+/// `upsert_by_key`'s error returned from `admin::ops::update_variable` before
+/// its `audit_log` call, so an edit that landed went unrecorded.
 ///
 /// The real in-memory SQLite echoes the row, which is why no existing test
-/// reached this branch.
+/// reached those branches.
+/// It wraps any [`Context`], not just a [`TestContext`], so it composes with
+/// [`FailingDbOpContext`] — a write that is REFUSED must keep the refusal's own
+/// code on its way back out through this wrapper, and the only way to say that
+/// in a test is to put a refusing context underneath it.
 #[derive(Clone)]
-pub struct EcholessCreateContext {
-    inner: TestContext,
+pub struct EcholessWriteContext {
+    inner: Arc<dyn Context>,
 }
 
-impl EcholessCreateContext {
-    /// Wrap `inner`. Every op but `database.create` passes through untouched.
-    pub fn new(inner: TestContext) -> Self {
-        Self { inner }
+impl EcholessWriteContext {
+    /// Wrap `inner`. Every op but `database.create`/`database.update` passes
+    /// through untouched.
+    pub fn new(inner: impl Context + 'static) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl Context for EcholessCreateContext {
+impl Context for EcholessWriteContext {
     fn check_resource_access(
         &self,
         resource: &str,
@@ -1721,18 +1730,25 @@ impl Context for EcholessCreateContext {
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
-        if name != "wafer-run/database" || msg.action() != "database.create" {
+        let thins_the_echo = name == "wafer-run/database"
+            && matches!(msg.action(), "database.create" | "database.update");
+        if !thins_the_echo {
             return self.inner.call_block(name, msg, input).await;
         }
         let out = self.inner.call_block(name, msg, input).await;
-        let Ok(buf) = out.collect_buffered().await else {
-            // The create itself failed; that answer is not this wrapper's to
-            // rewrite, and the wrapper has no business inventing a different
-            // one.
-            return OutputStream::error(WaferError::new(
-                ErrorCode::Internal,
-                "simulated database outage",
-            ));
+        let buf = match out.collect_buffered().await {
+            Ok(buf) => buf,
+            // The write itself failed, and that answer is not this wrapper's
+            // to rewrite: substituting an `Internal` here would make a test
+            // that paired this wrapper with a denied context assert 403 and
+            // silently receive 500. The inner error is forwarded as it stands.
+            Err(TerminalNotResponse::Error(e)) => return OutputStream::error(e),
+            Err(other) => {
+                return OutputStream::error(WaferError::new(
+                    ErrorCode::Internal,
+                    format!("echoless-write wrapper saw a non-response terminal: {other:?}"),
+                ))
+            }
         };
         // The service wire format is the codec's, not JSON — decode and
         // re-encode through it so the client sees a well-formed record that

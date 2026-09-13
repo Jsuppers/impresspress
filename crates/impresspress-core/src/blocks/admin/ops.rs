@@ -923,7 +923,7 @@ mod tests {
     /// say so.
     #[tokio::test]
     async fn a_create_whose_echo_is_empty_is_a_create_not_a_conflict() {
-        let ctx = crate::test_support::EcholessCreateContext::new(admin_ctx().await);
+        let ctx = crate::test_support::EcholessWriteContext::new(admin_ctx().await);
         let msg = admin_msg("create", "/admin/settings");
 
         let row =
@@ -944,6 +944,59 @@ mod tests {
             .expect("read back")
             .expect("the row really is in the table");
         assert_eq!(stored.value, "Acme");
+    }
+
+    /// An UPDATE whose row landed is audited, however thin the backend's echo
+    /// is.
+    ///
+    /// The other half of the same rule, with a different consequence.
+    /// `update_variable` runs no duplicate-key probe, so a decode failure after
+    /// a committed `db::update` was "only" a 500 — but it returned BEFORE
+    /// `audit_log`, so the edit happened and nothing recorded it. An audit
+    /// trail that is missing a change it should contain cannot be told apart
+    /// from the change never having been made, which is worse than either the
+    /// 500 or the false 409.
+    #[tokio::test]
+    async fn an_update_whose_echo_is_empty_is_audited_and_returns_the_new_value() {
+        let seeded = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(create_variable(&seeded, &msg, "SITE_NAME", "Acme", None, None, false).await);
+
+        let ctx = crate::test_support::EcholessWriteContext::new(seeded);
+        let row = expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                "SITE_NAME",
+                VariableUpdate {
+                    value: Some("Acme Two"),
+                    description: None,
+                },
+            )
+            .await,
+        );
+
+        assert_eq!(
+            row.value, "Acme Two",
+            "the columns just written win over the row that was read",
+        );
+        assert_eq!(
+            row.key, "SITE_NAME",
+            "and every column the update did not touch is carried over",
+        );
+        assert_eq!(
+            audit_count(&ctx, "variable.update").await,
+            1,
+            "an edit that landed must not go unrecorded",
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, "SITE_NAME")
+                .await
+                .expect("read back")
+                .expect("still there")
+                .value,
+            "Acme Two",
+        );
     }
 
     /// The same fact for roles: `roles.name` is UNIQUE too, and the identical

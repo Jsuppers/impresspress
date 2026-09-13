@@ -611,9 +611,45 @@ pub async fn upsert_by_key(
 ) -> Result<VariableRow, WaferError> {
     match get_by_key(ctx, key).await? {
         Some(existing) => {
-            let rec = db::update(ctx, TABLE, &existing.id, patch.to_update_data()).await?;
+            let written = patch.to_update_data();
+            let rec = db::update(ctx, TABLE, &existing.id, written.clone()).await?;
             crate::config_generation::note_config_write();
-            VariableRow::from_record(&rec.id, &rec.data).map_err(decode_error)
+            // Past this line the change IS committed, and nothing here may
+            // report a failure — the same rule, and the same reason, as
+            // [`insert`]. The consequence differs: an update carries no
+            // duplicate-key probe, so a decode failure here came back as a 500
+            // rather than a false conflict — but `admin::ops::update_variable`
+            // returns on that `Err` BEFORE its `audit_log` call, so an edit
+            // that actually landed went unrecorded. A missing audit row for a
+            // change that happened is the worst of the three outcomes,
+            // because nothing downstream can tell it apart from the change
+            // never having been made.
+            //
+            // The row as it now stands is the row that was READ, overwritten
+            // by the columns this update just WROTE — the two maps, merged, in
+            // that order. Deriving it from `written` rather than restating the
+            // patch's field list keeps one description of what an update
+            // changes, and `updated_at` comes along because `to_update_data`
+            // mints it there. The id is `existing.id`: unlike a create, an
+            // update addressed a row the caller already identified, so the
+            // echo has no say in which row this is.
+            Ok(
+                VariableRow::from_record(&rec.id, &rec.data).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        id = %existing.id,
+                        "variables update landed but the echoed record did not decode; \
+                         reporting the row as written",
+                    );
+                    let mut merged = existing.to_data();
+                    merged.extend(written);
+                    // `merged` carries `key` over from the row that was read,
+                    // which is the only column `from_record` insists on, so
+                    // this cannot fail; `existing` is the honest answer if it
+                    // somehow does.
+                    VariableRow::from_record(&existing.id, &merged).unwrap_or(existing)
+                }),
+            )
         }
         // `insert` notes the write itself.
         None => insert(ctx, patch.into_new(key)).await,
@@ -650,6 +686,30 @@ mod tests {
             updated_by: "admin_1".to_string(),
             block: block_for_key(key),
         }
+    }
+
+    /// A write the database REFUSES still reaches the caller as the refusal it
+    /// was, through the echo-thinning wrapper the two tests above it use.
+    ///
+    /// This pins the test wrapper rather than this module, and it is worth
+    /// pinning here, where the table constant lives: the wrapper used to
+    /// substitute an `Internal` for whatever the inner context answered, so a
+    /// test written against a denied write would have asserted a 403 and
+    /// quietly received a 500 — proving nothing while looking like it proved
+    /// something.
+    #[tokio::test]
+    async fn a_refused_write_keeps_its_code_through_the_echo_thinning_wrapper() {
+        let denied = crate::test_support::FailingDbOpContext::failing_with(
+            TestContext::with_admin().await,
+            vec![("database.create", TABLE)],
+            WaferError::new(ErrorCode::PermissionDenied, "denied"),
+        );
+        let ctx = crate::test_support::EcholessWriteContext::new(denied);
+
+        let error = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
+            .await
+            .expect_err("the write is refused, so the insert must fail");
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
     }
 
     /// The codec is the whole point: every column written by `to_data` comes
