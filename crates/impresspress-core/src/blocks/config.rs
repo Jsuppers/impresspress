@@ -241,10 +241,18 @@ impl VariablesConfigBlock {
         // `NewVariable` and so bypasses `VariablePatch::into_new`, which is
         // where `is_sensitive_by_default_when_created` protects an undeclared,
         // suffix-less ad hoc key. A `config.set` creating one therefore stores
-        // it unflagged where the admin PUT would flag it. Unreachable today —
-        // `ui::settings_form`, this operation's only caller, writes declared
-        // vars only, and a declared key is settled by `into_row` — so it is a
-        // latent divergence rather than a live one. The
+        // it unflagged where the admin PUT would flag it.
+        //
+        // Not reachable through THIS operation's only caller: every var
+        // `ui::settings_form` renders comes from a `ConfigVar` allowlist, and a
+        // declared key is settled by `into_row`. Note that "declared" has to
+        // mean what `config_vars::collect_all_config_vars` says it means —
+        // `auth_ui::pages::settings` renders
+        // `auth::config::auth_identity_config_vars`, which belongs to no
+        // `BlockInfo`, and an earlier version of that collector missed them and
+        // so called two ordinary admin toggles ad hoc. The gap is latent
+        // because of the allowlist, not because nothing undeclared can reach a
+        // settings form. The
         // runtime-owned refusal below is deliberately NOT symmetric: this
         // surface refuses the JWT secret (no caller legitimately writes it
         // here — `ui::settings_form` writes declared block and shared vars

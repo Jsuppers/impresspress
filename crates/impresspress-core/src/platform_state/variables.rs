@@ -570,7 +570,10 @@ pub async fn seed_and_load(
     //    flag disagrees with what its key requires while passing over it.
     let rows = load_rows(db).await?;
     repair_sensitive_flags_in(db, &rows).await;
-    Ok(rows.into_iter().map(|row| (row.key, row.value)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|loaded| (loaded.row.key, loaded.row.value))
+        .collect())
 }
 
 /// JWT_SECRET is not declared as an `auto_generate: true` `ConfigVar` by the
@@ -614,13 +617,13 @@ pub async fn load_all(db: &Arc<dyn DatabaseService>) -> Result<HashMap<String, S
     Ok(load_rows(db)
         .await?
         .into_iter()
-        .map(|row| (row.key, row.value))
+        .map(|loaded| (loaded.row.key, loaded.row.value))
         .collect())
 }
 
 /// Every decodable row. The shared body of [`load_all`] and the boot-time
 /// sensitive-flag repair, which needs the whole row rather than the value.
-async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<VariableRow>, String> {
+async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<LoadedRow>, String> {
     let opts = ListOptions {
         offset: 0,
         limit: 100_000,
@@ -634,11 +637,33 @@ async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<VariableRow>, St
     let mut rows = Vec::with_capacity(listed.records.len());
     for record in listed.records {
         match VariableRow::from_record(&record.id, &record.data) {
-            Ok(row) => rows.push(row),
+            Ok(row) => {
+                // Whether the stored flag is the canonical integer the column
+                // is declared as (`INTEGER NOT NULL DEFAULT 0` on both
+                // backends) rather than one of the shapes `util::flag_is_set`
+                // tolerates on read. The repair pass normalises the rest.
+                let canonical_flag = record
+                    .data
+                    .get("sensitive")
+                    .is_some_and(|v| matches!(v, Value::Number(n) if n.as_i64() == Some(0) || n.as_i64() == Some(1)));
+                rows.push(LoadedRow {
+                    row,
+                    canonical_flag,
+                });
+            }
             Err(e) => tracing::warn!(error = %e, "variables table contains an undecodable row"),
         }
     }
     Ok(rows)
+}
+
+/// A decoded row plus how its `sensitive` column was actually spelled on disk.
+struct LoadedRow {
+    row: VariableRow,
+    /// `false` when the flag came back as a JSON bool or a string — readable
+    /// (see [`crate::util::flag_is_set`]) but not the integer the schema
+    /// declares, so the repair pass rewrites it.
+    canonical_flag: bool,
 }
 
 /// Reconcile every stored row's `sensitive` flag with what its key requires,
@@ -687,8 +712,9 @@ pub async fn repair_sensitive_flags(db: &Arc<dyn DatabaseService>) {
 
 /// [`repair_sensitive_flags`] over rows the caller already has, so
 /// [`seed_and_load`] does not list the table twice.
-async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[VariableRow]) {
-    for row in rows {
+async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[LoadedRow]) {
+    for loaded in rows {
+        let row = &loaded.row;
         let required = crate::config_vars::is_sensitive_for_storage(&row.key);
         // LOWER a DECLARED key the declaration does not call for. Narrow on
         // purpose: only a declared key, never against the suffix rule (which
@@ -733,7 +759,12 @@ async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[Variab
             }
             continue;
         }
-        if row.sensitive || !required {
+        // Rewrite when the flag is missing OR merely readable rather than
+        // canonical. A row whose column holds `2`, `true` or `"true"` reads as
+        // flagged, so the old `row.sensitive` skip left it in a shape the
+        // schema does not declare — and, before the readers were reconciled,
+        // one that the settings API and the KV cache both read as UNflagged.
+        if !required || (row.sensitive && loaded.canonical_flag) {
             continue;
         }
         // Whether the clear flag actually exposed anything, which decides how
@@ -1555,6 +1586,85 @@ mod boot_tests {
         let row = find_by_key(&db, key).await.expect("list").expect("row");
         assert!(row.sensitive);
         assert_eq!(row.value, "hunter2", "a repair must not move the value");
+    }
+
+    /// A flag stored in a shape the schema does not declare is normalised,
+    /// not skipped.
+    ///
+    /// `2`, `true` and `"true"` all read as flagged by `RecordExt::bool_field`
+    /// — so the repair pass used to `continue` past them as "already fine" —
+    /// while `util::is_sensitive_key` wanted exactly `1` and
+    /// `cache_key::row_is_sensitive` converted with `json_as_i64`, which
+    /// answers `None` for a bool and for `"true"`. The row was therefore
+    /// served in the clear and judged KV-cacheable at the same time as being
+    /// "already flagged". Both halves are asserted: every shape reads as
+    /// sensitive on the two read paths, and the repair rewrites it to the
+    /// canonical integer.
+    #[tokio::test]
+    async fn a_non_canonical_sensitive_flag_is_read_as_set_and_normalised() {
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        for shape in [
+            serde_json::json!(2),
+            serde_json::json!(true),
+            serde_json::json!("true"),
+        ] {
+            // The read paths must already agree that this is sensitive, with
+            // no boot required.
+            assert!(
+                crate::util::flag_is_set(&shape),
+                "{shape} must read as a set flag"
+            );
+            let mut row_map = HashMap::new();
+            row_map.insert("key".to_string(), serde_json::json!(key));
+            row_map.insert("sensitive".to_string(), shape.clone());
+            assert!(
+                crate::cache_key::row_is_sensitive(
+                    crate::cache_key::CachedTable::Variables,
+                    &row_map
+                ),
+                "{shape} must keep the row out of the KV cache"
+            );
+
+            // And the repair normalises it to the declared integer.
+            let db = migrated_db().await;
+            let now = crate::util::now_rfc3339();
+            let mut data = VariableRow {
+                id: format!("var_{}", uuid::Uuid::new_v4()),
+                key: key.to_string(),
+                value: "hunter2".to_string(),
+                name: String::new(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: true,
+                block: block_for_key(key),
+                updated_by: String::new(),
+                created_at: now.clone(),
+                updated_at: now,
+            }
+            .to_data();
+            data.insert("sensitive".to_string(), shape.clone());
+            db.create(TABLE, data).await.expect("raw create");
+
+            repair_sensitive_flags(&db).await;
+
+            let stored = db
+                .list(
+                    TABLE,
+                    &ListOptions {
+                        limit: 10,
+                        skip_count: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("list")
+                .records;
+            assert_eq!(
+                stored[0].data.get("sensitive"),
+                Some(&serde_json::json!(1)),
+                "{shape} must be normalised to the canonical integer"
+            );
+        }
     }
 
     /// A row that is legitimately not sensitive is left alone by the repair

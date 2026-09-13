@@ -324,12 +324,30 @@ pub fn form_bool(form: &std::collections::HashMap<String, String>, key: &str) ->
     form.get(key).is_some_and(|value| is_truthy(value))
 }
 
-/// Collect all known config variables: shared + all block-declared.
+/// Collect all known config variables: shared, block-declared, and the
+/// declared vars that belong to no `BlockInfo`.
+///
+/// That last group is not a corner. `auth::config::auth_identity_config_vars`
+/// is `ConfigVar`-declared and rendered by `auth_ui::pages::settings` through
+/// `ui::settings_form`, but deliberately contributed to no `BlockInfo` —
+/// there is no standalone `wafer-run/auth` block, `auth/` being a library
+/// module. Iterating `block_infos` alone therefore called
+/// `WAFER_RUN__AUTH__REQUIRE_VERIFICATION` and `..._ALLOWED_EMAIL_DOMAINS`
+/// undeclared, and every rule keyed on [`is_declared_key`] treated two
+/// ordinary admin toggles as ad hoc keys: stored sensitive by
+/// [`is_sensitive_by_default_when_created`], masked on all three read
+/// surfaces, unclearable behind the sensitive-empty guard, dropped from every
+/// seed bundle, and never lowered again, since the repair pass only lowers a
+/// DECLARED key. Recovery was delete-and-recreate.
+///
+/// So "declared" means declared, wherever the declaration lives. A new group
+/// of `ConfigVar`s with no `BlockInfo` belongs in this function.
 pub fn collect_all_config_vars(block_infos: &[wafer_run::BlockInfo]) -> Vec<ConfigVar> {
     let mut all = shared_config_vars();
     for info in block_infos {
         all.extend(info.config_keys.iter().cloned());
     }
+    all.extend(crate::blocks::auth::config::auth_identity_config_vars());
     all
 }
 
@@ -408,24 +426,7 @@ pub fn has_sensitive_suffix(key: &str) -> bool {
 /// it constructs every block — far too expensive to repeat per row written,
 /// and `seed_defaults` writes one row per declared shared var on a fresh boot.
 fn declared_sensitive_keys() -> &'static std::collections::HashSet<String> {
-    static KEYS: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
-    KEYS.get_or_init(|| {
-        collect_all_config_vars(&crate::blocks::all_block_infos())
-            .into_iter()
-            // `auto_generate` counts too. `variables::seed_one_secret`
-            // hard-codes `sensitive: true` for every such var — it mints a
-            // random secret, so of course it does — and without that here the
-            // boot repair pass would read the declaration, see no `Password`
-            // type and no `_SECRET`/`_KEY` suffix, and LOWER the flag it just
-            // raised, publishing a generated secret and making it
-            // KV-cacheable. Latent today (the only `auto_generate` var is both
-            // `Password`-typed and `_SECRET`-suffixed) and armed for the first
-            // one declared without either marker.
-            .filter(|v| v.is_sensitive() || v.auto_generate)
-            .map(|v| v.key)
-            .collect()
-    })
+    &declared_key_sets().sensitive
 }
 
 /// Every config key some `ConfigVar` declares — shared or block-owned.
@@ -433,13 +434,40 @@ fn declared_sensitive_keys() -> &'static std::collections::HashSet<String> {
 /// Memoized for the same reason as [`declared_sensitive_keys`]: fixed for the
 /// process, expensive to build.
 fn declared_keys() -> &'static std::collections::HashSet<String> {
-    static KEYS: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
-    KEYS.get_or_init(|| {
-        collect_all_config_vars(&crate::blocks::all_block_infos())
-            .into_iter()
-            .map(|v| v.key)
-            .collect()
+    &declared_key_sets().all
+}
+
+/// The declared-key sets, built once.
+///
+/// One memo rather than two: both sets come from the same
+/// `collect_all_config_vars(&all_block_infos())`, and building that constructs
+/// every block — far too expensive to do twice, and a second copy is a second
+/// thing to keep in step.
+struct DeclaredKeys {
+    /// Every declared config key.
+    all: std::collections::HashSet<String>,
+    /// Those whose declaration says they hold a secret — `InputType::Password`
+    /// or `auto_generate`. `auto_generate` counts because
+    /// `variables::seed_one_secret` hard-codes `sensitive: true` for such a
+    /// var (it mints a random secret), and without it here the boot repair
+    /// pass would read the declaration, see no `Password` type and no
+    /// `_SECRET`/`_KEY` suffix, and LOWER the flag that seeder had just
+    /// raised — publishing a generated secret and making it KV-cacheable.
+    sensitive: std::collections::HashSet<String>,
+}
+
+fn declared_key_sets() -> &'static DeclaredKeys {
+    static SETS: std::sync::OnceLock<DeclaredKeys> = std::sync::OnceLock::new();
+    SETS.get_or_init(|| {
+        let vars = collect_all_config_vars(&crate::blocks::all_block_infos());
+        DeclaredKeys {
+            sensitive: vars
+                .iter()
+                .filter(|v| v.is_sensitive() || v.auto_generate)
+                .map(|v| v.key.clone())
+                .collect(),
+            all: vars.into_iter().map(|v| v.key).collect(),
+        }
     })
 }
 
@@ -779,6 +807,31 @@ mod sensitivity_tests {
         assert!(!is_sensitive_for_storage("WAFER_RUN_SHARED__APP_NAME"));
         // Undeclared and not a secret.
         assert!(!is_sensitive_for_storage("SITE_TAGLINE"));
+    }
+
+    /// A `ConfigVar` attached to no `BlockInfo` is still DECLARED.
+    ///
+    /// `auth::config::auth_identity_config_vars` is rendered by
+    /// `auth_ui::pages::settings` but deliberately contributed to no
+    /// `BlockInfo`, so a collector that walked `block_infos` alone called these
+    /// two ordinary admin toggles ad hoc. Every rule keyed on
+    /// `is_declared_key` then treated them as unknown keys: stored sensitive by
+    /// default, masked everywhere, unclearable, dropped from seed bundles, and
+    /// never lowered, since the repair pass only lowers a declared key.
+    #[test]
+    fn a_config_var_with_no_block_info_is_still_declared() {
+        for var in crate::blocks::auth::config::auth_identity_config_vars() {
+            assert!(
+                super::is_declared_key(&var.key),
+                "{} is ConfigVar-declared and must not read as an ad hoc key",
+                var.key
+            );
+            assert!(
+                !super::is_sensitive_by_default_when_created(&var.key),
+                "{} is a plain toggle; treating it as an unknown key would mask it forever",
+                var.key
+            );
+        }
     }
 
     /// Every declared var the storage rule calls sensitive must also read as

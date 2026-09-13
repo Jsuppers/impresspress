@@ -72,7 +72,6 @@ use crate::{
     },
     // audit-allow: names the platform tables for the export allowlist/exclusion bookkeeping below — the two it reads (`variables`, `user_roles`) are granted by `dev::wrap_grants()`, which maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)` and which the runtime honours from its flat grant list, and the audit attributes grants to the declaring file's block and cannot see it
     platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
-    util::RecordExt,
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -887,15 +886,19 @@ fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
     if !crate::config_vars::is_sensitive_for_storage(key) {
         return;
     }
-    let as_map: HashMap<String, Value> = row.clone().into_iter().collect();
-    if as_map.bool_field("sensitive") {
-        return;
+    // Write the canonical `1` UNCONDITIONALLY rather than returning early on a
+    // truthy-looking value. The early return used `RecordExt::bool_field`,
+    // which accepts `2`, `true` and `"true"` — shapes a bundle can carry and
+    // the declared `INTEGER` column does not use — so such a row imported
+    // unchanged. This is the one write path that accepts foreign data, so it
+    // is the one that must not trust the sender's spelling.
+    if row.get("sensitive") != Some(&serde_json::json!(1)) {
+        tracing::warn!(
+            key = %key,
+            "the imported data snapshot did not mark this config key sensitive in the \
+             canonical form; storing it sensitive, as its declaration requires"
+        );
     }
-    tracing::warn!(
-        key = %key,
-        "the imported data snapshot marked this config key as not sensitive; storing it \
-         sensitive, as its declaration requires"
-    );
     row.insert("sensitive".to_string(), serde_json::json!(1));
 }
 

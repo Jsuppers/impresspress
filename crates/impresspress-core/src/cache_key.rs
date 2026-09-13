@@ -264,10 +264,13 @@ pub fn row_is_sensitive(table: CachedTable, row: &HashMap<String, serde_json::Va
         return false;
     };
     let key = row.get(key_col).and_then(|v| v.as_str()).unwrap_or("");
-    let sensitive_flag = row
-        .get(sensitive_col)
-        .and_then(crate::util::json_as_i64)
-        .unwrap_or(0);
+    // `flag_is_set`, not `json_as_i64`: that conversion answers `None` for a
+    // JSON bool and for the string `"true"`, so a row stored in either shape
+    // read as UNFLAGGED here while `RecordExt::bool_field` — which the repair
+    // pass and the row codec use — read it as flagged. The row was therefore
+    // skipped as "already fine" and cached as "not sensitive" at the same
+    // time. One truth table for the column, shared with both.
+    let sensitive_flag = i64::from(row.get(sensitive_col).is_some_and(crate::util::flag_is_set));
     crate::util::is_sensitive_key(key, sensitive_flag)
 }
 

@@ -48,6 +48,35 @@ pub fn json_as_u64(v: &serde_json::Value) -> Option<u64> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
+/// Whether a stored BOOLEAN-ish column is set, for every shape a backend or a
+/// fixture can hand back: a JSON bool, any non-zero number, or the strings
+/// `"true"` / `"1"`.
+///
+/// THE truth table for such a column, and the reason it is a free function
+/// rather than only a [`RecordExt`] method: three readers of
+/// `impresspress__admin__variables.sensitive` each had their own, and they
+/// disagreed exactly where it mattered. `RecordExt::bool_field` accepted all
+/// the shapes above; [`is_sensitive_key`] compared an `i64` to `1`; and
+/// `cache_key::row_is_sensitive` converted with [`json_as_i64`], which yields
+/// `None` for a JSON bool and for `"true"`. So a row whose flag held `2`,
+/// `true` or `"true"` read as flagged by the repair pass — which therefore
+/// skipped it — while the settings API served it in the clear and the KV cache
+/// judged it cacheable. One predicate, used by every reader, is what stops
+/// that class of disagreement rather than the one instance of it.
+///
+/// The canonical stored form is still the integer `1`: the column is
+/// `INTEGER NOT NULL DEFAULT 0` on both backends and
+/// `VariableRow::to_data` writes `i64::from(bool)`. This predicate exists to
+/// read what is already there, not to license new spellings.
+pub fn flag_is_set(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        serde_json::Value::String(s) => s == "true" || s == "1",
+        _ => false,
+    }
+}
+
 /// Extension trait for convenient field access on database Records.
 ///
 /// The numeric accessors accept both JSON numbers and numeric strings
@@ -140,12 +169,7 @@ impl RecordExt for HashMap<String, serde_json::Value> {
     }
 
     fn bool_field(&self, key: &str) -> bool {
-        match self.get(key) {
-            Some(serde_json::Value::Bool(b)) => *b,
-            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
-            Some(serde_json::Value::String(s)) => s == "true" || s == "1",
-            _ => false,
-        }
+        self.get(key).is_some_and(flag_is_set)
     }
 
     fn opt_str_field(&self, key: &str) -> Option<String> {

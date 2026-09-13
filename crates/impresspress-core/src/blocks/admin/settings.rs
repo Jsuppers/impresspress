@@ -237,9 +237,15 @@ const ADMIN_BLOCK_NAME: &str = "impresspress/admin";
 /// description, default, warning, sensitive flag) feeds the hash; sort by
 /// key so map ordering can't make two equivalent inputs hash differently.
 ///
-/// `var.auto_generate` / `var.optional` don't affect what `seed_defaults`
-/// writes — they're consumed by `seed_auto_generated` (CF runner) and the
-/// startup validator respectively — so they're intentionally omitted.
+/// `var.optional` does not affect what `seed_defaults` writes — it is consumed
+/// by the startup validator — so it is intentionally omitted.
+///
+/// `var.auto_generate` IS folded in, through the `sensitive` term:
+/// `config_vars::is_sensitive_var` unions it (an auto-generated secret is a
+/// secret, whatever its `input_type` says), so flipping `auto_generate` on a
+/// declared var moves this hash. That is deliberate — it changes the flag a
+/// fresh row is created with — and it is why the term is `is_sensitive_var(v)`
+/// rather than `input_type == Password`.
 fn seed_payload_hash(vars: &[ConfigVar]) -> String {
     use std::fmt::Write as _;
     let mut keys: Vec<&ConfigVar> = vars.iter().collect();
