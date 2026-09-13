@@ -249,27 +249,27 @@ impl VariablesConfigBlock {
         // the one surface that cannot check, and clearing a live token is a
         // lockout with no way back on Cloudflare.
         //
-        // The divergence is not reachable today, though NOT because the
-        // bootstrap keys are unrendered — `auth_ui::pages::settings` puts both
-        // of them in its "Admin" section. It is unreachable because the two
-        // key the exemption differs on — `BOOTSTRAP_ADMIN_TOKEN`, which the
-        // admin path exempts once redeemed and this one never does — is named
-        // by `is_sensitive_key`'s KEY half: `auth::config` declares it
-        // `InputType::Password`, as it does the password beside it. So
-        // `settings_form::save_settings` sees both as sensitive from the
-        // declared `ConfigVar` alone and short-circuits an empty submission for
-        // them before calling `config::set`.
+        // The divergence is not reachable today, and the reason is simpler than
+        // it looks. It concerns exactly one key — `BOOTSTRAP_ADMIN_TOKEN`,
+        // which the admin path exempts once redeemed and this one never does —
+        // and that key is in no `save_settings` allowlist at all. The only
+        // settings form carrying bootstrap keys is `auth_ui::pages::settings`,
+        // whose "Admin" section is the bootstrap EMAIL and PASSWORD; nothing
+        // renders the token. So this caller cannot submit a value for it,
+        // empty or otherwise.
         //
-        // Note the narrowness: that argument covers THESE keys, not empty
-        // submissions in general. `save_settings` decides sensitivity from the
-        // declared var and this function decides it from the stored row, so a
-        // declared-plain key whose row an operator flagged sensitive DOES reach
-        // the guard below with an empty value and is refused here — which is
-        // correct, and which `save_settings` now forwards as the 400 it is
-        // rather than a 500. A `MASKED_VALUE` submission never arrives from
-        // that caller at all: its pre-pass refuses the mask for every
-        // allowlisted var, deliberately a superset of this guard, because it
-        // cannot read the flag this one reads.
+        // Note the narrowness: that is an argument about ONE key, not about
+        // empty submissions in general. `save_settings` decides sensitivity
+        // from the declared var and this function decides it from the stored
+        // row, so a declared-plain key whose row an operator flagged sensitive
+        // DOES reach the guard below with an empty value and is refused here —
+        // which is correct, and which `save_settings` now forwards as the 400
+        // it is rather than the 500 it used to flatten it into. A
+        // `MASKED_VALUE` submission is handled before it can get here: that
+        // caller's pre-pass refuses a mask that would replace a value, for
+        // every allowlisted var and not just the ones it can see are sensitive,
+        // deliberately covering more than this guard does because it cannot
+        // read the flag this one reads.
         //
         // KNOWN GAP, recorded rather than fixed: the parity stops at the
         // create path. `variables::set`'s create branch builds its own
@@ -322,7 +322,18 @@ impl VariablesConfigBlock {
         // thing the mask check needs. (Contrast the provisioning EXEMPTION
         // discussed above, which genuinely cannot be mirrored here because it
         // asks a question only a `Context` can answer.)
-        if crate::util::is_masked_submission(key, stored_flag, value) {
+        //
+        // Narrowed to a mask that would REPLACE something, for the reason
+        // `ui::settings_form`'s pre-pass is: a write that changes nothing
+        // destroys nothing, and refusing it only strands whoever is holding a
+        // row whose value already is those eight characters. Compared against
+        // the row in hand rather than against the read order — the pre-pass
+        // compares against `config::get_default`, which falls back to the boot
+        // map, so wherever the two could differ the pre-pass is the stricter
+        // one and this guard is never reached laxer than it.
+        if crate::util::is_masked_submission(key, stored_flag, value)
+            && existing.as_ref().map_or("", |row| row.value.as_str()) != value
+        {
             return Err(OutputStream::error(WaferError::new(
                 ErrorCode::InvalidArgument,
                 format!(

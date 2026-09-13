@@ -121,7 +121,8 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
 /// one leaves its column alone. `value` in particular, because a sensitive key
 /// reads back as `MASKED_VALUE` and [`ops::update_variable`] refuses to store
 /// that mask — leaving it out is how a caller says "keep the secret I cannot
-/// see". The echoed row is masked the same way [`handle_get`]'s is.
+/// see", and the echoed record then carries no `value` field at all. When a
+/// value WAS supplied, the echo masks it the same way [`handle_get`] does.
 pub(super) async fn handle_set(
     ctx: &dyn Context,
     msg: &Message,
@@ -192,11 +193,10 @@ pub(super) async fn handle_set(
         // Echoed in the `{id, data}` record envelope this endpoint has
         // always published; declared without a schema until it is typed.
         //
-        // Masked on the way out, exactly as `handle_get` masks. The echo is the
-        // row as STORED, and a request that leaves `value` out never carried
-        // that value in — so without this a `PATCH {"sensitive": true}` would
-        // answer with the plaintext secret, turning the writer into the reader
-        // the masking exists to prevent.
+        // The stored value is never handed back to a request that did not send
+        // it: the echo is the row AS STORED, so without this a
+        // `PATCH {"sensitive": true}` would answer with the plaintext secret,
+        // turning the writer into the reader the masking exists to prevent.
         //
         // Two different situations, and they get two different answers, because
         // masking is the wrong way to spell "this field was not returned".
