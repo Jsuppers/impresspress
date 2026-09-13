@@ -256,7 +256,51 @@ pub(super) async fn handle_create_permission(
     crate::util::stamp_created(&mut data);
     match db::create(ctx, PERMISSIONS_TABLE, data).await {
         Ok(record) => ok_json(&record),
-        Err(e) => err_internal("Database error", e),
+        // `permissions.name` is UNIQUE: a second permission of the same name is
+        // a 409, not a 500 — the same classification `ops::create_variable` and
+        // `ops::create_role` make, through the same helper. It also stops this
+        // line flattening a WRAP refusal to 500, which is what
+        // `crud::db_error_internal` inside the helper takes care of.
+        Err(e) => {
+            super::ops::taken_key_or_db_error(
+                e,
+                permission_name_taken(ctx, &body.name),
+                &format!(
+                    "A permission named \"{}\" already exists. Edit that permission, or pick \
+                     another name.",
+                    body.name
+                ),
+            )
+            .await
+        }
+    }
+}
+
+/// Whether a permission called `name` exists. The probe
+/// [`handle_create_permission`] hands to [`super::ops::taken_key_or_db_error`];
+/// `permissions.name` is UNIQUE, so one row is all there can be and a
+/// `NotFound` from the lookup is the "free" answer rather than a failure.
+///
+/// It lives here rather than beside `ops::role_name_taken` so the table name
+/// reaching `db::get_by_field` stays the module's own `PERMISSIONS_TABLE`
+/// constant — `scripts/audit-wrap-grants.sh` resolves the `(caller, table)`
+/// pair statically, and a table passed in as a `&str` becomes
+/// `<unresolved:table>` and needs a pragma instead of a real grant check.
+async fn permission_name_taken(
+    ctx: &dyn Context,
+    name: &str,
+) -> Result<bool, wafer_run::WaferError> {
+    match db::get_by_field(
+        ctx,
+        PERMISSIONS_TABLE,
+        "name",
+        serde_json::Value::String(name.to_string()),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.code == wafer_run::ErrorCode::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -860,6 +904,29 @@ mod tests {
         assert_eq!(role["name"], serde_json::json!("editor"));
         assert_eq!(role["permissions"], serde_json::json!(["posts.write"]));
         assert_eq!(role["is_system"], serde_json::json!(false));
+    }
+
+    /// `POST /b/admin/api/iam/permissions` with a name that is already stored
+    /// answers **409**, not a 500.
+    ///
+    /// `permissions.name` is `TEXT NOT NULL UNIQUE` with a matching unique
+    /// index, so the third instance of the shape `ops::create_variable` and
+    /// `ops::create_role` carried lived here: the same
+    /// `err_internal("Database error", e)` tail, the same 500 for a request
+    /// that named a permission which already exists.
+    #[tokio::test]
+    async fn creating_a_permission_whose_name_is_taken_is_a_conflict() {
+        let ctx = TestContext::with_admin().await;
+        let permission =
+            serde_json::json!({"name": "posts.write", "resource": "posts", "actions": ["write"]});
+        output_json(handle_create_permission(&ctx, body_input(permission.clone())).await).await;
+
+        let out = handle_create_permission(&ctx, body_input(permission)).await;
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            409,
+            "a taken permission name is a conflict, not an internal error",
+        );
     }
 
     /// `PATCH` publishes the same projection, and a `permissions` value the

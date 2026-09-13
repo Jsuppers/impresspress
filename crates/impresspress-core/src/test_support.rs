@@ -1841,6 +1841,23 @@ pub async fn output_json(out: OutputStream) -> serde_json::Value {
     serde_json::from_slice(&buf.body).unwrap_or(serde_json::Value::Null)
 }
 
+/// The JSON body an adapter would SEND for `out`, error terminals included.
+///
+/// [`output_json`] reads a success body, and panics on an error terminal
+/// because a handler under test erroring is normally a bug. An error terminal
+/// carries no body at all until `wafer_block::http_codec` renders one — the
+/// `{"error": "<Code>", "message": "<text>"}` envelope — so a test that wants
+/// to assert on what a *browser* receives from a refusal has to run that
+/// render. This runs it, through the same `collect_http_response` the real
+/// adapters use, so the assertion cannot drift from the bytes on the wire.
+///
+/// The pairing is [`output_http_status`]: status and body from the one
+/// rendering, rather than from a second description of it.
+pub async fn output_http_json(out: OutputStream) -> serde_json::Value {
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    serde_json::from_slice(&parts.body).unwrap_or(serde_json::Value::Null)
+}
+
 /// True if the OutputStream terminated with an error matching `code`.
 /// The code string should match the ErrorCode debug format (e.g., "NotFound", "Internal").
 pub async fn output_is_error(out: OutputStream, code: &str) -> bool {

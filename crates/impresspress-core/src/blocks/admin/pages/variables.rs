@@ -893,22 +893,43 @@ mod create_form_tests {
     }
 
     /// The Variables page's create form answers the SAME 409 the JSON API
-    /// does for a key that is already stored. Both surfaces drive
-    /// `ops::create_variable`, and this is the half of that claim that would
-    /// notice if the page started reshaping the refusal into a re-render (an
-    /// htmx swap of the full page would read as "created" to the operator).
+    /// does for a key that is already stored, AND the operator learns why.
+    ///
+    /// Both halves matter. Both surfaces drive `ops::create_variable`, so the
+    /// status is the half that would notice if this page started reshaping the
+    /// refusal into a re-render (an htmx swap of the full page reads as
+    /// "created"). The body is the half that makes the 409 worth having: htmx
+    /// does not swap a 4xx, so the only thing the operator can see is what the
+    /// global `htmx:responseError` listener in `ui/assets/chrome.js` raises as
+    /// a toast — and that listener reads `message` out of exactly this
+    /// envelope. A 409 whose body said nothing useful would look, to the person
+    /// in front of the modal, precisely like the 500 this all started as.
+    /// `ui/assets/test/chrome_error_toast.test.mjs` is the listener's half.
     #[tokio::test]
     async fn form_post_with_an_existing_key_answers_conflict() {
         let ctx = admin_ctx().await;
         post_form(&ctx, "key=SITE_MOTTO&value=one").await;
 
-        let out = handle_create_variable(
-            &ctx,
-            &admin_msg("create", "/admin/variables"),
-            InputStream::from_bytes(b"key=SITE_MOTTO&value=two".to_vec()),
-        )
-        .await;
-        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+        let msg = admin_msg("create", "/admin/variables");
+        let refused = || {
+            handle_create_variable(
+                &ctx,
+                &msg,
+                InputStream::from_bytes(b"key=SITE_MOTTO&value=two".to_vec()),
+            )
+        };
+        assert_eq!(
+            crate::test_support::output_http_status(refused().await).await,
+            409,
+        );
+
+        let body = crate::test_support::output_http_json(refused().await).await;
+        assert_eq!(body["error"], serde_json::json!("AlreadyExists"));
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("SITE_MOTTO") && message.contains("already exists"),
+            "the toast has only this to show the operator: {message:?}",
+        );
     }
 
     /// A form post that says nothing about sensitivity — a curl'd or

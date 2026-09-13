@@ -239,7 +239,7 @@ pub(super) async fn update_user_fields(
 // ---------------------------------------------------------------------------
 
 /// What a failed `create` against a table with a UNIQUE natural key —
-/// `variables.key`, `roles.name` — actually means.
+/// `variables.key`, `roles.name`, `permissions.name` — actually means.
 ///
 /// Both of those inserts are refused by the database when the key is already
 /// taken, and that refusal used to ship as `err_internal("Database error", e)`:
@@ -275,7 +275,7 @@ pub(super) async fn update_user_fields(
 /// a genuine fault, and a probe that could not run is **not** "free" — "could
 /// not tell" keeps the write's own failure, so a transient read outage cannot
 /// turn a 500 into a wrong 409 or vice versa.
-async fn taken_key_or_db_error(
+pub(super) async fn taken_key_or_db_error(
     error: wafer_run::WaferError,
     probe: impl std::future::Future<Output = Result<bool, wafer_run::WaferError>>,
     conflict: &str,

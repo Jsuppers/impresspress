@@ -228,6 +228,50 @@ document.body.addEventListener("showToast", function(e) {
     setTimeout(function() { t.remove(); }, 4000);
 });
 
+// A refused htmx request must not be SILENT.
+//
+// htmx 2.0.4's default `responseHandling` is
+// `[{code:"204",swap:false},{code:"[23]..",swap:true},{code:"[45]..",swap:false,error:true}]`:
+// a 4xx/5xx is deliberately not swapped, and htmx raises `htmx:responseError`
+// instead. Nothing in this tree listened for it, so every refusal on every
+// shelled page rendered as nothing happening at all — no swap, no message, the
+// modal sitting open unchanged. To the operator that is indistinguishable from
+// the request having worked, or from the 500 a refusal used to be, which is
+// exactly what the 2026-09-10 audit of the live server was about: a duplicate
+// variable key now answers a correct 409, and without this listener the correct
+// 409 would look the same as the wrong 500 did.
+//
+// One listener, not one per form. Invisible 4xx is a property of the whole
+// admin SSR surface, so the fix belongs on the shared channel rather than in an
+// `hx-on--after-request` attribute copied onto each control — which is what
+// `blocks/products/pages.rs` had to do before this existed.
+//
+// The body is the `{"error": "<Code>", "message": "<text>"}` envelope
+// `wafer_block::http_codec` renders for every error terminal, and `message` is
+// the sentence written for the operator. Everything else is a fallback, ending
+// in one that at least names the status: an empty toast is the same silence
+// this listener exists to remove.
+document.body.addEventListener("htmx:responseError", function(e) {
+    var xhr = (e.detail && e.detail.xhr) || {};
+    var text = typeof xhr.responseText === "string" ? xhr.responseText : "";
+    var message = "";
+    // Parsed only when the body LOOKS like that envelope. A refusal rendered as
+    // an HTML error page is also a 4xx, and putting a whole document through
+    // `textContent` into a toast is worse than not toasting at all.
+    if (text.replace(/^\s+/, "").charAt(0) === "{") {
+        try {
+            var body = JSON.parse(text);
+            if (body && typeof body.message === "string") { message = body.message; }
+        } catch (err) { /* not the envelope after all; fall through */ }
+    }
+    if (!message) {
+        message = xhr.status ? "Request failed (" + xhr.status + ")" : "Request failed";
+    }
+    document.body.dispatchEvent(new CustomEvent("showToast", {
+        detail: { type: "error", message: message }
+    }));
+});
+
 // --- 4. modals, and the shared delegated-action listener ---
 //
 // Everything a modal does lives in this one IIFE, so `openModal`/`closeModal`

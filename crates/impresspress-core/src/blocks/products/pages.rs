@@ -460,7 +460,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         button .btn .btn--secondary .btn--sm type="button"
                                             hx-post=(restore_url)
                                             hx-swap="none"
-                                            hx-on--after-request=(reload_or_toast("Restore failed"))
+                                            hx-on--after-request=(reload_on_success())
                                         { "Restore" }
                                     }
                                 },
@@ -512,18 +512,20 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 /// The `hx-on--after-request` body shared by every one-shot action button on
-/// these pages: reload on success, and on failure raise the message the API
-/// sent on the shared `showToast` channel `ui/assets/chrome.js`'s toast section listens on.
+/// these pages: reload the page once the action lands. `hx-swap="none"` means a
+/// 2xx changes nothing on its own, so the reload is what shows the result.
 ///
-/// Without the failure half a refused action renders as nothing happening at
-/// all — no reload, no message — which is the worst outcome on a page whose
-/// buttons are the only way to undo a delete or shut a money surface down.
-fn reload_or_toast(failure_label: &str) -> String {
-    format!(
-        "if(event.detail.successful){{location.reload()}}else{{var m='{failure_label}';\
-         try{{m=JSON.parse(event.detail.xhr.responseText).message||m}}catch(err){{}}\
-         document.body.dispatchEvent(new CustomEvent('showToast',{{detail:{{type:'error',message:m}}}}))}}"
-    )
+/// It used to carry a failure half as well — parse the API's `message` out of
+/// the response and raise it on the `showToast` channel — because without one a
+/// refused action rendered as nothing happening at all, which is the worst
+/// outcome on a page whose buttons are the only way to undo a delete or shut a
+/// money surface down. That half is gone because it stopped being this page's
+/// problem: `ui/assets/chrome.js`'s toast section now carries a global
+/// `htmx:responseError` listener that raises the same `message` for EVERY
+/// refused htmx request on every shelled page. Keeping the copy here would
+/// toast the same refusal twice.
+fn reload_on_success() -> String {
+    "if(event.detail.successful){location.reload()}".to_string()
 }
 
 /// Close-only manager for a soft-deleted product: archive its offers,
@@ -655,7 +657,7 @@ pub async fn deleted_product_close(
                             button .btn .btn--secondary .btn--sm type="button"
                                 hx-delete=(offer_url)
                                 hx-swap="none"
-                                hx-on--after-request=(reload_or_toast("Could not archive this offer"))
+                                hx-on--after-request=(reload_on_success())
                             { "Archive offer" }
                         }
                     }
@@ -677,7 +679,7 @@ pub async fn deleted_product_close(
                                             button .btn .btn--secondary .btn--sm type="button"
                                                 hx-delete=(link_url)
                                                 hx-swap="none"
-                                                hx-on--after-request=(reload_or_toast("Could not deactivate this payment link"))
+                                                hx-on--after-request=(reload_on_success())
                                             { "Deactivate" }
                                         }
                                     }
@@ -3035,7 +3037,7 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         button .btn .btn--secondary .btn--sm type="button"
                                             hx-post=(restore_url)
                                             hx-swap="none"
-                                            hx-on--after-request=(reload_or_toast("Restore failed"))
+                                            hx-on--after-request=(reload_on_success())
                                         { "Restore" }
                                     }
                                 },
