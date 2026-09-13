@@ -48,9 +48,12 @@ After that boot the rule is simply: the environment sets a key until an admin
 edits it in the UI.
 
 **What this does not protect.** The upgrade boot can only resolve conflicts it
-can actually see. A change you made in the UI before upgrading is kept **only
-if, on that boot, your deployment config exported that same key with a
-non-empty value that differed from the stored one.** If any of those is not
+can actually see. This applies to changes made on a **block settings page**
+(Products, Legal pages, User portal, Email, Auth) — a change made on **Admin →
+Variables** records who made it and is protected outright, whatever your
+deployment config says. Such a settings-page change is kept **only if, on that
+boot, your deployment config exported that same key with a non-empty value that
+differed from the stored one.** If any of those is not
 true — the key is not in your config, or it is set to an empty value, or it is
 set to the value already stored — the boot passes over it silently and the key
 is ordinary from then on. **A later change to your deployment config then wins,
@@ -95,8 +98,8 @@ whose corrected values are in the deployment config. The upgrade boot keeps the
 stored pair, and `auth::bootstrap` creates the first admin from **those** — so
 signing in to fix it needs the credentials you were replacing.
 
-Release a key without logging in by clearing its marker directly in the database
-(`impresspress__admin__variables`), then restarting:
+Release a key without logging in by writing the released marker directly in the
+database (`impresspress__admin__variables`), then restarting:
 
 ```sql
 UPDATE impresspress__admin__variables

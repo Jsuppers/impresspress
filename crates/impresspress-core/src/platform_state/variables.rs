@@ -829,10 +829,16 @@ async fn seed_one_secret(
 /// wrong twice — each time more generously than the branch condition above.
 /// The condition IS the promise, so here it is in words:
 ///
-/// > A pre-upgrade edit survives if and only if, on the boot that records the
-/// > gate (the first one whose declared batch is non-empty), the environment
-/// > exported THAT key, with a non-empty value, that value differed from the
-/// > stored one, and the row was readable.
+/// > An UNSTAMPED pre-upgrade edit — the settings-form path described above —
+/// > survives if and only if, on the boot that records the gate (the first one
+/// > whose declared batch is non-empty AND whose [`record_transition`]
+/// > succeeds), the environment exported THAT key, with a non-empty value,
+/// > that value differed from the stored one, and the row was readable.
+///
+/// The "unstamped" is load-bearing: an edit made through Admin → Variables was
+/// already stamped with the editing admin's id before this PR existed, so it is
+/// [`Pin::AdminEdit`], [`is_unclaimed`] is false, the transition passes over it
+/// and the export is inert forever — none of the clauses below apply to it.
 ///
 /// Every clause is load-bearing, and dropping any of them leaves the row
 /// unclaimed and the gate recorded, so a LATER export wins over the pre-upgrade
@@ -847,11 +853,19 @@ async fn seed_one_secret(
 /// - it is exported with the value already stored — the admin had already
 ///   aligned the two, and there is no conflict to see.
 ///
-/// (A fourth exists and is not reachable from a test with the fixtures here: a
-/// per-key read that fails is skipped, and the gate is still recorded at the end
-/// of the loop. A read failure that takes out the whole table cannot cause it —
-/// [`transition_has_run`] fails closed, so the transition does not run and the
-/// gate is not recorded either.)
+/// (Two more exist, neither reachable from a test with the fixtures here,
+/// because `break_reads` / `break_writes` are all-or-nothing and each also
+/// disables the gate write.
+///
+/// - A per-key READ that fails is skipped, and the gate is still recorded at
+///   the end of the loop. A read failure that takes out the whole table cannot
+///   cause it — [`transition_has_run`] fails closed, so the transition does not
+///   run and the gate is not recorded either.
+/// - A per-key PIN WRITE that fails: [`pin_at_upgrade`] returns `false`, the
+///   loop continues, and the gate is recorded regardless — pin outcomes are not
+///   consulted at the recording site. Unlike the three reachable cases this one
+///   is LOUD: the `Err` arm warns that the process environment may overwrite
+///   the row on the next boot.)
 ///
 /// A boot whose batch is EMPTY records no gate at all, so a deployment that
 /// exports nothing yet keeps the transition armed for the first boot that does
@@ -1406,7 +1420,8 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 ///   which is the predicate that mirrors. A caller assembling its own batch
 ///   (the case this module's runtime-owned guard is documented for, and what
 ///   its unit tests do) can get a count here for a key the page would offer no
-///   control for — a summary that over-counts by one on a path production does
+///   control for — a summary that over-counts by one per such key on a path
+///   production does
 ///   not take, which is not worth a second per-key pass to avoid.
 fn warn_how_to_undo_a_pin(count: usize) {
     tracing::warn!(
@@ -2582,9 +2597,12 @@ mod boot_tests {
                 0,
                 "nothing is reported when {why} — which is what makes this silent"
             );
-            assert_eq!(
-                pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
-                None,
+            // `is_unclaimed`, not `pin_of(..) == None`: this module spent a
+            // commit establishing that the two differ (a released row is
+            // unpinned but claimed), and it is the stronger one that makes the
+            // later export win below.
+            assert!(
+                is_unclaimed(&find_by_key(&db, key).await.expect("l").expect("r")),
                 "the row is left unclaimed when {why}"
             );
 
