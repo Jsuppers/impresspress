@@ -157,6 +157,32 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .tags(&["signal"]),
 ];
 
+/// Per-IP budget for the whole block (category `signal`; checked before
+/// dispatch, so a flood never reaches the store at all). Operators tune it
+/// with `WAFER_RUN_SHARED__RATE_LIMIT_SIGNAL` like every other category
+/// (`RateLimit::resolve` formats `WAFER_RUN_SHARED__RATE_LIMIT_{NAME}` from
+/// the category name passed to `check_rate_limit`).
+///
+/// 180 a minute, not 60: `UserRateLimiter::check` is a fixed window (a
+/// bucket resets `window` seconds after its *own* first request, not a
+/// rolling count), so the budget has to cover everything one identity can
+/// throw at it inside a single 60-second window, not "a handshake" averaged
+/// over time. The host's own `GET .../answer` poll alone already spends 60
+/// of those — once a second for the full 60-second wait — and the client
+/// retries that same poll for another 60 seconds after "Nobody joined"
+/// before giving up, so one host can burn 120 in a single window before the
+/// guest (who often shares the host's IP: two players on one home network,
+/// or one machine testing with two tabs) sends a single byte. Add the
+/// guest's own offer read, its answer post, and both sides' `GET
+/// /b/signal/config` read — a handful, well under 20 — and ~140 is the
+/// realistic ceiling per window; 180 leaves real headroom above that without
+/// opening the door to actual abuse. (This is what 429'd two tabs on one
+/// machine around the sixtieth second, before this budget existed.)
+const SIGNAL_LIMIT: RateLimit = RateLimit {
+    max_requests: 180,
+    window: Duration::from_secs(60),
+};
+
 crate::impresspress_feature_block! {
     /// WebRTC signalling rooms for blockfarming's online play
     /// (`impresspress/signal`).
@@ -192,15 +218,7 @@ crate::impresspress_feature_block! {
         // Public and unauthenticated by necessity — the game has no account
         // — so the bucket is the remote address rather than a user, and it
         // is checked before dispatch so a flood cannot reach the store at
-        // all. 60 a minute is a handshake plus its polling with room to
-        // spare; operators tune it with WAFER_RUN_SHARED__RATE_LIMIT_SIGNAL
-        // like every other category (`RateLimit::resolve` formats
-        // `WAFER_RUN_SHARED__RATE_LIMIT_{NAME}` from the category name
-        // passed to `check_rate_limit` below).
-        const SIGNAL_LIMIT: RateLimit = RateLimit {
-            max_requests: 60,
-            window: Duration::from_secs(60),
-        };
+        // all. See `SIGNAL_LIMIT` for the budget's arithmetic.
         if let RateLimitOutcome::Limited(out) =
             check_rate_limit(&this.limiter, ctx, &ip_identity(&msg), "signal", SIGNAL_LIMIT).await
         {
@@ -264,5 +282,111 @@ mod tests {
         assert!(keys.contains(&service::TTL_KEY));
         assert!(keys.contains(&service::MAX_SDP_KEY));
         assert!(keys.contains(&service::STUN_KEY));
+    }
+
+    /// Send one request through the real block, from `ip`, the way the HTTP
+    /// boundary would build it (`anon_msg` plus the client-IP meta
+    /// `ip_identity` reads) — sharing `block`'s single `UserRateLimiter`
+    /// across every call, the same way one running server instance does.
+    async fn call_from(
+        block: &SignalBlock,
+        ctx: &crate::test_support::TestContext,
+        ip: &str,
+        action: &str,
+        path: &str,
+        body: &str,
+    ) -> wafer_run::OutputStream {
+        let mut msg = crate::test_support::anon_msg(action, path);
+        msg.set_meta("req.client.ip", ip);
+        block
+            .handle(
+                ctx,
+                msg,
+                wafer_run::InputStream::from_bytes(body.as_bytes().to_vec()),
+            )
+            .await
+    }
+
+    /// Regression for the live incident: the host's own 60-second poll loop
+    /// is capacity enough by itself to starve a guest sharing its IP (two
+    /// players on one home network, or one machine testing with two tabs).
+    /// A host's sixty `GET .../answer` polls plus a guest's offer read and
+    /// answer post — all from the one identity, all in the one window — must
+    /// every one of them be served; and the budget must still run out
+    /// somewhere, so a real flood is still refused.
+    #[tokio::test]
+    async fn a_hosts_own_polling_leaves_room_for_the_guest_on_the_same_ip() {
+        let ctx = crate::test_support::TestContext::with_signal().await;
+        let block = SignalBlock::new();
+        let ip = "203.0.113.7";
+        let code = "AB2CD3";
+        let offer_path = format!("/b/signal/rooms/{code}/offer");
+        let answer_path = format!("/b/signal/rooms/{code}/answer");
+
+        // The host opens the room.
+        assert_eq!(
+            crate::test_support::output_http_status(
+                call_from(&block, &ctx, ip, "create", &offer_path, r#"{"sdp":"v=0"}"#).await
+            )
+            .await,
+            200,
+            "the host's own create must not be rate-limited"
+        );
+
+        // The host polls for the answer once a second for a full 60-second
+        // wait. Nobody has joined yet, so every one of these sixty is a 200
+        // with a null sdp — exactly the load that exhausted the old 60/min
+        // budget by itself.
+        for i in 0..60 {
+            assert_eq!(
+                crate::test_support::output_http_status(
+                    call_from(&block, &ctx, ip, "retrieve", &answer_path, "").await
+                )
+                .await,
+                200,
+                "the host's own poll #{i} must not 429 the host"
+            );
+        }
+
+        // The guest, behind the same IP, reads the offer and posts its
+        // answer — the exact pair that 429'd in production once the host's
+        // own polling had spent the old budget.
+        assert_eq!(
+            crate::test_support::output_http_status(
+                call_from(&block, &ctx, ip, "retrieve", &offer_path, "").await
+            )
+            .await,
+            200,
+            "the guest's offer read must not be starved by the host's own polling"
+        );
+        assert_eq!(
+            crate::test_support::output_http_status(
+                call_from(&block, &ctx, ip, "create", &answer_path, r#"{"sdp":"v=1"}"#).await
+            )
+            .await,
+            200,
+            "the guest's answer post must not be starved by the host's own polling"
+        );
+
+        // The limit still exists: enough further requests from the same
+        // identity in the same window eventually hit 429. `/config` is
+        // stateless (no room to keep alive), so it spends the rest of the
+        // bucket cleanly.
+        let mut saw_429 = false;
+        for _ in 0..(SIGNAL_LIMIT.max_requests as usize) {
+            let status = crate::test_support::output_http_status(
+                call_from(&block, &ctx, ip, "retrieve", "/b/signal/config", "").await,
+            )
+            .await;
+            if status == 429 {
+                saw_429 = true;
+                break;
+            }
+            assert_eq!(status, 200);
+        }
+        assert!(
+            saw_429,
+            "the budget must still run out once it is spent — the limit must still exist"
+        );
     }
 }
