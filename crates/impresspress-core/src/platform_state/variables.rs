@@ -420,6 +420,20 @@ pub async fn set_by_admin(
 /// ("pinned at upgrade") instead of a plausible-sounding false one.
 pub const PRE_UPGRADE_SENTINEL: &str = "pre-upgrade";
 
+/// The `updated_by` marker [`reset_to_environment`] writes.
+///
+/// NOT an empty string, which is what it used to write, and the difference is
+/// load-bearing. Empty means "no surface has ever spoken for this row", which is
+/// precisely the condition the upgrade transition acts on — so a reset that
+/// wrote empty could be undone by a later transition, on a deployment whose
+/// first boots carried no exports at all and therefore never recorded the gate.
+/// The operator's reset is a decision; it says "the environment owns this", not
+/// "nobody has considered this".
+///
+/// It reads as UNPINNED ([`pin_of`] answers `None`), so the environment sets the
+/// key on every boot — which is the whole point of the control.
+pub const RELEASED_TO_ENV_SENTINEL: &str = "released-to-environment";
+
 /// The row whose presence records that [`seed_and_load`]'s one-time
 /// env-precedence transition has already run.
 ///
@@ -490,12 +504,23 @@ pub enum Pin {
 /// claimed it and [`seed_and_load`] may seed it.
 pub fn pin_of(row: &VariableRow) -> Option<Pin> {
     match row.updated_by.as_str() {
-        "" => None,
+        "" | RELEASED_TO_ENV_SENTINEL => None,
         PRE_UPGRADE_SENTINEL => Some(Pin::PreUpgrade),
         // A user id, or `features::USER_EDITED_SENTINEL` from the settings
         // forms, which cannot learn the admin's id.
         _ => Some(Pin::AdminEdit),
     }
+}
+
+/// Whether NOTHING has ever spoken for this row — no admin surface, no upgrade
+/// transition, no operator reset.
+///
+/// The condition the one-time upgrade transition acts on, and deliberately
+/// narrower than `pin_of(row).is_none()`: a row an operator RELEASED reads as
+/// unpinned, because the environment is meant to set it, but it is not
+/// unconsidered and the transition must leave it alone.
+fn is_unclaimed(row: &VariableRow) -> bool {
+    row.updated_by.is_empty()
 }
 
 /// Whether anything has claimed `row` from the process environment — either
@@ -513,13 +538,20 @@ pub fn is_pinned(row: &VariableRow) -> bool {
 /// row, and `update_variable` stamps `updated_by` on every write, so clearing
 /// the value re-pinned the row it was meant to release.
 ///
-/// Only the marker is cleared — the stored value stays until the next boot
-/// actually re-seeds it. That keeps the action reversible in the window before
-/// a restart, and means a key with no export simply keeps the value it has
-/// rather than silently reverting to a declared default.
+/// Only the marker moves — the stored value stays until the next boot actually
+/// re-seeds it. That keeps the action reversible in the window before a
+/// restart, and means a key with no export simply keeps the value it has rather
+/// than silently reverting to a declared default.
+///
+/// It writes [`RELEASED_TO_ENV_SENTINEL`] rather than emptying the column.
+/// Empty is what an untouched row carries, and the upgrade transition acts on
+/// exactly that — so on a deployment whose early boots carried no exports, and
+/// which therefore has not recorded the transition gate yet, an emptied row
+/// would be pinned straight back by the first boot that did carry one. See
+/// [`is_unclaimed`].
 pub async fn reset_to_environment(ctx: &dyn Context, key: &str) -> Result<(), WaferError> {
     let patch = VariablePatch {
-        updated_by: Some(String::new()),
+        updated_by: Some(RELEASED_TO_ENV_SENTINEL.to_string()),
         ..Default::default()
     };
     upsert_by_key(ctx, key, patch).await.map(|_| ())
@@ -934,9 +966,12 @@ pub async fn seed_and_load(
                 }
                 continue;
             }
-            // The one-time upgrade transition: an unmarked row that disagrees
-            // with the export predates edit tracking, so keep it and say so.
-            if !transition_done && row.value != *value {
+            // The one-time upgrade transition: a row NOTHING has spoken for,
+            // disagreeing with the export, predates edit tracking — so keep it
+            // and say so. A row an operator released reads as unpinned but is
+            // not unclaimed, and must not be re-pinned here: that reset is the
+            // operator saying the environment owns the key.
+            if !transition_done && is_unclaimed(row) && row.value != *value {
                 pin_at_upgrade(db, row).await;
                 continue;
             }
@@ -2466,42 +2501,73 @@ mod boot_tests {
     /// must stay reset, or the reset route would not work at all.
     #[tokio::test]
     async fn the_upgrade_transition_does_not_reclaim_a_key_after_a_reset() {
-        let db = migrated_db().await;
+        let ctx = crate::test_support::TestContext::with_admin().await;
         let key = "WAFER_RUN_SHARED__APP_NAME";
-        raw_insert_unowned(&db, key, "EditedLongAgo").await;
+        seed_row_with_owner(&ctx, key, "EditedLongAgo", "").await;
 
-        seed_and_load(&db, &[(key.to_string(), "FromEnv".to_string())])
-            .await
-            .expect("upgrade boot");
+        ctx.seed_env_vars(&[(key, "FromEnv")]).await;
         assert_eq!(
-            pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
+            pin_of(&get_by_key(&ctx, key).await.expect("g").expect("r")),
             Some(Pin::PreUpgrade)
         );
         assert!(
-            find_by_key(&db, ENV_PRECEDENCE_TRANSITION_KEY)
+            get_by_key(&ctx, ENV_PRECEDENCE_TRANSITION_KEY)
                 .await
-                .expect("l")
+                .expect("g")
                 .is_some(),
             "the gate has to be recorded, or 'one-time' is not one-time"
         );
 
-        // The operator says "that was the environment, not me".
-        let patch = VariablePatch {
-            updated_by: Some(String::new()),
-            ..Default::default()
-        };
-        let row = find_by_key(&db, key).await.expect("l").expect("r");
-        db.update(TABLE, &row.id, patch.to_update_data())
-            .await
-            .expect("reset");
+        // The operator says "that was the environment, not me", through the
+        // real control rather than a hand-written column write.
+        reset_to_environment(&ctx, key).await.expect("reset");
 
-        let vars = seed_and_load(&db, &[(key.to_string(), "FromEnv".to_string())])
-            .await
-            .expect("next boot");
+        ctx.seed_env_vars(&[(key, "FromEnv")]).await;
         assert_eq!(
-            vars.get(key).map(String::as_str),
-            Some("FromEnv"),
+            get_by_key(&ctx, key).await.expect("g").expect("r").value,
+            "FromEnv",
             "a reset key must follow the environment again, not be re-claimed"
+        );
+    }
+
+    /// A reset survives a deployment whose transition has NOT yet run.
+    ///
+    /// The gate is only recorded by a boot that had an environment to
+    /// transition against, so a deployment that starts with no exports at all
+    /// reaches the admin UI with the transition still armed. If
+    /// [`reset_to_environment`] wrote an empty marker, the first boot that DID
+    /// carry an export would read the released row as never-considered and pin
+    /// it straight back — the reset control silently not working, on the one
+    /// path the boot WARN sends operators down.
+    #[tokio::test]
+    async fn a_reset_is_not_undone_by_a_transition_that_has_not_run_yet() {
+        let ctx = crate::test_support::TestContext::with_admin().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+
+        // No exports at all, so no gate is recorded.
+        ctx.seed_env_vars(&[]).await;
+        assert!(
+            get_by_key(&ctx, ENV_PRECEDENCE_TRANSITION_KEY)
+                .await
+                .expect("g")
+                .is_none(),
+            "the premise: the transition is still armed"
+        );
+
+        // An admin sets it — the shape `set_by_admin` writes — then hands it
+        // back.
+        seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
+        reset_to_environment(&ctx, key).await.expect("reset");
+        assert!(!is_pinned(
+            &get_by_key(&ctx, key).await.expect("g").expect("r")
+        ));
+
+        // The operator adds the export they wanted all along.
+        ctx.seed_env_vars(&[(key, "FromEnv")]).await;
+        assert_eq!(
+            get_by_key(&ctx, key).await.expect("g").expect("r").value,
+            "FromEnv",
+            "the reset has to hold against the transition, not just against later boots"
         );
     }
 
