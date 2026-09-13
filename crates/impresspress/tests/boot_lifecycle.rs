@@ -409,9 +409,15 @@ async fn the_native_build_fills_the_synchronous_config_surface() {
 /// It used to be discarded from the second boot on — env vars were seeded with
 /// `INSERT OR IGNORE`, so they only ever landed on a virgin database. This
 /// drives two boots over the *same* sqlite file with two different values to
-/// cover exactly that, and shapes the batch with `filter_to_declared_keys`,
-/// the filter `run()` applies, so an infrastructure key's exclusion is pinned
-/// on the real path rather than on a hand-made list.
+/// cover exactly that, and shapes the batch with `filter_to_declared_keys`, so
+/// what reaches the seeder is what reaches it in production.
+///
+/// The `IMPRESSPRESS_DEPLOY_TOKEN` assertion below pins that FILTER, not
+/// `seed_and_load`'s own `is_runtime_owned_key` guard: an infrastructure key
+/// carries no `__`, so `collect_app_env_vars` and `filter_to_declared_keys`
+/// both drop it long before the seeder runs, and this assertion would pass
+/// with that guard deleted. The guard's own coverage is a unit test in
+/// `platform_state::variables`, which is the only place able to reach it.
 #[tokio::test]
 async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -468,7 +474,7 @@ async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
     assert_eq!(
         stored(&db2, impresspress_core::config_vars::DEPLOY_TOKEN_KEY).await,
         None,
-        "an infrastructure key must never be stored as config"
+        "`filter_to_declared_keys` must keep an infrastructure key out of the batch"
     );
 }
 

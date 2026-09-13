@@ -574,14 +574,29 @@ async fn seed_one_secret(
 /// [`crate::blocks::auth::config::AuthConfig::from_map`].
 ///
 /// Keys the runtime owns ([`crate::config_vars::is_runtime_owned_key`] —
-/// infrastructure `IMPRESSPRESS_*` and internal `__…__` keys) are refused: they
-/// are never variables-table config, and `blocks::config` would not serve such
-/// a row anyway. The JWT secret is deliberately NOT refused — it is a real
-/// variables-table row, and pinning it from the deployment environment is
-/// exactly how an operator keeps sessions valid across a rebuild. (That is the
-/// difference between `is_runtime_owned_key` and
-/// [`crate::config_vars::is_instance_owned_key`], which guards *imported* data
-/// instead.)
+/// infrastructure `IMPRESSPRESS_*` and internal `__…__` keys) are refused here:
+/// they are never variables-table config, and `blocks::config` would not serve
+/// such a row anyway. On native they are already gone before this runs —
+/// `collect_app_env_vars` drops every key without `__`, and
+/// `cli::server_config::filter_to_declared_keys` drops every undeclared key —
+/// so this guard is defence in depth for a caller that assembles its own
+/// batch, not the thing standing between the process environment and the
+/// table. Its coverage lives in this module's unit tests, because nothing on
+/// the native path can reach it.
+///
+/// This path does **not** carry the JWT signing secret, even though
+/// [`crate::config_vars::is_instance_owned_key`] names it as the one
+/// stored-config key beyond the runtime-owned set.
+/// `WAFER_RUN__AUTH__JWT_SECRET` is declared by no `ConfigVar` (the gap
+/// [`seed_jwt_secret`] exists to paper over), so `filter_to_declared_keys`
+/// removes it from the native batch before `seed_and_load` ever sees it:
+/// exporting it changes nothing, and [`seed_jwt_secret`] auto-generates one
+/// instead. The supported way to pin the secret is the admin surface, which
+/// `admin::ops::reject_runtime_owned_key` deliberately exempts from its
+/// refusal for exactly that reason. Making the env var work would mean
+/// declaring the key — which pulls it into the admin config tables,
+/// `seed_defaults` and the auto-generate loop — and is a design decision of
+/// its own rather than part of this path.
 ///
 /// PRECONDITION: the table must already exist — either because the admin
 /// block's `lifecycle(Init)` has run (browser, Cloudflare), or because the
@@ -608,10 +623,15 @@ pub async fn seed_and_load(
         // key's declaration and the `_SECRET`/`_KEY` suffix; `false` here
         // asserts nothing extra.
         match set(db, key, value, "", "", false).await {
+            // What is known is that a different value was stored; `set` cannot
+            // tell who stored it — the declared default `seed_defaults` wrote,
+            // an earlier boot's environment, or an admin's edit are
+            // indistinguishable by the time we get here. So the line says that
+            // and no more.
             Ok(Wrote::Replaced) => tracing::warn!(
                 key = %key,
-                "the process environment replaced the stored value for this \
-                 config key; an admin edit to it is reverted on every boot \
+                "the process environment replaced a previously stored value \
+                 for this config key, and overrides it again on every boot \
                  until the environment variable is removed"
             ),
             Ok(Wrote::Created | Wrote::FlagRaised | Wrote::Unchanged) => {}
@@ -1907,6 +1927,12 @@ mod boot_tests {
     /// holds — so a row for one is at best dead weight and at worst a forgery
     /// (`__IMPRESSPRESS_RUNTIME_KIND__` is what keeps Stripe secret-key
     /// operations off in a visitor's browser).
+    ///
+    /// This is the ONLY coverage of that guard, and deliberately calls
+    /// `seed_and_load` directly: on native both classes are already filtered
+    /// out upstream (`collect_app_env_vars` + `filter_to_declared_keys`), so no
+    /// test driving the production path can reach the branch. The guard is
+    /// defence in depth for a future caller that assembles its own batch.
     #[tokio::test]
     async fn a_runtime_owned_key_is_never_written_from_the_environment() {
         let db = migrated_db().await;
