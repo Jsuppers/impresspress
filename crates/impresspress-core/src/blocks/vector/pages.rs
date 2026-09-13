@@ -58,7 +58,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_internal, err_internal_no_cause, ok_json},
+    http::{err_bad_request, err_internal, err_internal_no_cause, err_unavailable, ok_json},
 };
 
 // Per-route dispatch now lives in `VectorBlock::handle` via the shared
@@ -83,11 +83,12 @@ use crate::{
 /// UI page uses to render its "backend not available" callout) disambiguates
 /// them and lets every handler degrade the same way instead of a handful
 /// misreporting "index not found" and the rest 500ing.
+///
+/// The status itself is [`crate::http::err_unavailable`]'s case verbatim — a
+/// capability that is not configured is unavailable, not broken. This wrapper
+/// exists on top of it only to name the one message its six call sites share.
 fn err_vector_backend_unavailable() -> OutputStream {
-    OutputStream::error(WaferError::new(
-        ErrorCode::Unavailable,
-        "vector backend (wafer-run/vector) is not available on this deployment",
-    ))
+    err_unavailable("vector backend (wafer-run/vector) is not available on this deployment")
 }
 
 // ---------------------------------------------------------------------------

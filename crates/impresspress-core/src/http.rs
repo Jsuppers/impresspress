@@ -7,15 +7,16 @@
 //! single import path (`crate::http::*`) without carrying a behaviourally
 //! identical local copy (a local copy of an upstream surface is a shim).
 //!
-//! The only impresspress-specific addition is [`redirect`], a thin convenience over
+//! The impresspress-specific additions are [`redirect`], a thin convenience over
 //! [`ResponseBuilder`] for the redirect response shape (status + `Location` +
-//! empty `text/plain` body) used by page handlers.
+//! empty `text/plain` body) used by page handlers, and [`err_unavailable`],
+//! the `503` constructor `wafer_block::response` does not (yet) carry.
 
 pub use wafer_block::{
     err_bad_request, err_conflict, err_forbidden, err_internal, err_internal_no_cause,
     err_not_found, err_unauthorized, ok_empty, ok_json, ResponseBuilder,
 };
-use wafer_run::OutputStream;
+use wafer_run::{ErrorCode, OutputStream, WaferError};
 
 /// The row, or the 404 its absence turns into.
 ///
@@ -37,6 +38,30 @@ use wafer_run::OutputStream;
 /// do with the generic-table helpers.
 pub fn require_row<T>(row: Option<T>, not_found: &str) -> Result<T, OutputStream> {
     row.ok_or_else(|| err_not_found(not_found))
+}
+
+/// `503` — a capability that is not configured is unavailable, not broken.
+///
+/// The sibling of the `err_*` constructors re-exported above, which
+/// `wafer_block::response` has no 503 for. Reach for it when the request
+/// arrived at a handler that works, on a deployment that is fine, but the
+/// capability behind it is switched off — no keys set, no backend registered.
+/// `500` claims this deployment failed; `503` says it did not and this one
+/// feature is not turned on, which is the honest answer for the operator
+/// reading logs and for the human caller. When the deployment really is
+/// broken, `err_internal`/`err_internal_no_cause` remain the right answers.
+///
+/// The two PUBLIC Stripe endpoints — `POST /b/products/checkout` and
+/// `POST /b/products/webhooks` — are the case that motivated it: both are
+/// reachable on a default install where no Stripe keys are set, which is how
+/// the 2026-09-10 live run recorded them as 500s.
+///
+/// It does NOT stop Stripe redelivering: Stripe retries on ANY non-2xx, 503
+/// included, and no `Retry-After` is set here. The gain is an accurate
+/// status, not fewer retries — an earlier version of this comment claimed
+/// otherwise and was wrong.
+pub fn err_unavailable(message: &str) -> OutputStream {
+    OutputStream::error(WaferError::new(ErrorCode::Unavailable, message.to_string()))
 }
 
 /// Build a redirect `OutputStream` with the given status (302, 303, …) and
@@ -189,6 +214,20 @@ mod tests {
     use wafer_run::{MetaGet, META_RESP_STATUS};
 
     use super::*;
+
+    /// The whole point of the helper: `503`, not `500`, carrying the caller's
+    /// message verbatim.
+    #[tokio::test]
+    async fn err_unavailable_is_a_503_carrying_the_message() {
+        let out = err_unavailable("Stripe is not configured");
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                assert_eq!(wafer_block::http_codec::resolve_error_status(&e), 503);
+                assert_eq!(e.message, "Stripe is not configured");
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn redirect_sets_status_and_location() {
