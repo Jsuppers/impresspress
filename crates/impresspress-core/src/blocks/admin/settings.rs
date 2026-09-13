@@ -292,10 +292,10 @@ pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStr
 
 /// `POST /b/admin/api/settings/{key}/reset-to-environment`.
 ///
-/// Clears the row's admin-ownership marker so the next boot seeds the key from
-/// the process environment again. The supported way out of a key an admin edit
-/// has pinned — see [`ops::reset_variable_to_environment`] for why neither
-/// delete nor an empty update is that way.
+/// Releases the row's pin so the next boot seeds the key from the process
+/// environment again. The supported way out of a pinned key — see
+/// [`ops::reset_variable_to_environment`] for why neither delete nor an empty
+/// update is that way.
 pub(super) async fn handle_reset_to_environment(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let key = match crud::path_var(msg, "key", "Missing setting key") {
         Ok(value) => value,

@@ -799,14 +799,20 @@ async fn seed_one_secret(
 ///
 /// So the transition is **pin on conflict**, run once:
 ///
-/// - An unmarked row whose value DIFFERS from a present export is kept, stamped
+/// - An UNCLAIMED row ([`is_unclaimed`] — nothing has ever spoken for it) whose
+///   value DIFFERS from a present export is kept, stamped
 ///   [`PRE_UPGRADE_SENTINEL`], and named in a WARN.
-/// - An unmarked row that already EQUALS its export is left alone, silently:
+/// - An unclaimed row that already EQUALS its export is left alone, silently:
 ///   there is no conflict to resolve and nothing to tell anybody.
 /// - Once [`ENV_PRECEDENCE_TRANSITION_KEY`] exists, rules 1 and 2 apply as
-///   written and the transition never runs again — without that gate, a key an
-///   operator reset would be re-pinned on the very next boot and
-///   [`reset_to_environment`] would not work at all.
+///   written and the transition never runs again.
+///
+/// Two things keep an operator's [`reset_to_environment`] from being undone,
+/// and both are needed. The gate stops the transition re-running at all, and
+/// [`RELEASED_TO_ENV_SENTINEL`] stops a released row looking unclaimed — which
+/// matters because the gate is only recorded by a boot that HAD an environment,
+/// so a deployment whose early boots carried no exports reaches the admin UI
+/// with the transition still armed.
 ///
 /// It lives INSIDE the env loop rather than in a pass of its own, which is what
 /// makes it cover every declared key — block-scoped secrets like

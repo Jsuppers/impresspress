@@ -520,26 +520,8 @@ async fn is_clearable_provisioning_credential(ctx: &dyn Context, key: &str) -> b
     matches!(crate::blocks::auth::repo::users::count(ctx).await, Ok(n) if n > 0)
 }
 
-/// Delete a config variable, writing an audit-log row.
-///
-/// Shared by the JSON surface (`settings::handle_delete`) and the Variables
-/// page's row control, so the two refuse the same keys and leave the same
-/// trail. The JSON path wrote no audit row at all before this: variable
-/// creation and update were audited, deletion was not.
-///
-/// `WAFER_RUN_SHARED__*` is refused, as it always was on the JSON path: those
-/// are declared centrally in `config_vars::shared_config_vars()` and re-seeded
-/// on the next boot, so deleting one is a no-op that looks like a change.
-///
-/// Deliberately NOT gated on [`reject_runtime_owned_key`]. Creating or editing
-/// a runtime-owned row is refused because the runtime owns that value — but a
-/// row that already exists (a legacy write, or a seed bundle from before
-/// `dev::data_snapshot::import` learned to refuse them) is exactly what an
-/// operator needs to be able to remove. Refusing it here would leave the row
-/// permanent, which is the gap this function closes.
-/// Hand a config key back to the process environment: clear its
-/// admin-ownership marker so the next boot seeds it from the environment
-/// again, and write an audit-log row.
+/// Hand a config key back to the process environment: release its pin so the
+/// next boot seeds it from the environment again, and write an audit-log row.
 ///
 /// The supported exit from a pinned key, and the reason admin-wins is not a
 /// one-way door. The two routes that look like they should work do not:
@@ -555,6 +537,11 @@ async fn is_clearable_provisioning_credential(ctx: &dyn Context, key: &str) -> b
 /// also reverts the value even when there is no export to take over. This
 /// clears exactly the marker, leaves the value in place until a boot actually
 /// re-seeds it, and so is reversible right up to the restart.
+///
+/// "Release" rather than "clear": `variables::reset_to_environment` records
+/// `RELEASED_TO_ENV_SENTINEL`, because an emptied marker is indistinguishable
+/// from a row nothing has ever spoken for — which is exactly what the one-time
+/// upgrade transition acts on, and would undo this.
 pub(super) async fn reset_variable_to_environment(
     ctx: &dyn Context,
     msg: &Message,
@@ -582,6 +569,23 @@ pub(super) async fn reset_variable_to_environment(
     Ok(())
 }
 
+/// Delete a config variable, writing an audit-log row.
+///
+/// Shared by the JSON surface (`settings::handle_delete`) and the Variables
+/// page's row control, so the two refuse the same keys and leave the same
+/// trail. The JSON path wrote no audit row at all before this: variable
+/// creation and update were audited, deletion was not.
+///
+/// `WAFER_RUN_SHARED__*` is refused, as it always was on the JSON path: those
+/// are declared centrally in `config_vars::shared_config_vars()` and re-seeded
+/// on the next boot, so deleting one is a no-op that looks like a change.
+///
+/// Deliberately NOT gated on [`reject_runtime_owned_key`]. Creating or editing
+/// a runtime-owned row is refused because the runtime owns that value — but a
+/// row that already exists (a legacy write, or a seed bundle from before
+/// `dev::data_snapshot::import` learned to refuse them) is exactly what an
+/// operator needs to be able to remove. Refusing it here would leave the row
+/// permanent, which is the gap this function closes.
 pub(super) async fn delete_variable(
     ctx: &dyn Context,
     msg: &Message,
