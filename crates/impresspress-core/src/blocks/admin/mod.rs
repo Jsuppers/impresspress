@@ -1879,9 +1879,11 @@ mod page_link_tests {
     /// the control is conditional rather than rendered for everything.
     ///
     /// A DECLARED shared var, not an ad hoc key. `key_can_be_seeded_from_env`
-    /// mirrors `filter_to_declared_keys`, so the control only renders for a key
-    /// the process environment can actually set — and an ad hoc fixture would
-    /// have proved the control exists on a row where pressing it does nothing.
+    /// mirrors the two refusals between the process environment and the
+    /// variables table — `filter_to_declared_keys` and `seed_and_load`'s own
+    /// runtime-owned guard — so the control only renders for a key the
+    /// environment can actually set. An ad hoc fixture would have proved the
+    /// control exists on a row where pressing it does nothing.
     const PINNED_VARIABLE: &str = "WAFER_RUN_SHARED__APP_NAME";
 
     /// The two blocks an admin page may link to, by the router prefix each

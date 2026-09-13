@@ -48,14 +48,23 @@ After that boot the rule is simply: the environment sets a key until an admin
 edits it in the UI.
 
 **What this does not protect.** The upgrade boot can only resolve conflicts it
-can see, which means keys you were *already exporting*. A key your deployment
-config does **not** export is not considered at all. So: **adding an export for a
-key you were not already setting takes effect, including over a change you made
-in the admin UI before upgrading.** If you closed signup or disabled OAuth in the
-UI and later add `WAFER_RUN_SHARED__ALLOW_SIGNUP` / `..._ENABLE_OAUTH` to your
-deployment config, the config wins. Re-apply the setting in the UI once after
-upgrading and it is recorded for good — an admin edit made *after* the upgrade is
-always safe.
+can actually see. A change you made in the UI before upgrading is kept **only
+if, on that boot, your deployment config exported that same key with a
+non-empty value that differed from the stored one.** If any of those is not
+true — the key is not in your config, or it is set to an empty value, or it is
+set to the value already stored — the boot passes over it silently and the key
+is ordinary from then on. **A later change to your deployment config then wins,
+including over that pre-upgrade UI change.**
+
+Concretely: you disabled OAuth in the UI, your compose file said nothing about
+it at upgrade time, and months later you add
+`WAFER_RUN_SHARED__ENABLE_OAUTH=true`. OAuth comes back on. Same for
+`WAFER_RUN_SHARED__ALLOW_SIGNUP`.
+
+The remedy is one action, and it is worth doing now rather than later:
+**re-apply in the admin UI any setting you care about that you changed there
+before upgrading.** That records it for good — an admin edit made *after* the
+upgrade is always safe, whatever your deployment config says.
 
 **Keys worth checking first**, because they decide who can get in:
 
@@ -91,14 +100,21 @@ Release a key without logging in by clearing its marker directly in the database
 
 ```sql
 UPDATE impresspress__admin__variables
-   SET updated_by = ''
+   SET updated_by = 'released-to-environment'
  WHERE key = 'WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL';
 ```
 
-`updated_by` is the whole mechanism: empty means nothing has claimed the row, so
-the next boot seeds it from your environment again. Only native deployments can
-be in this position — Cloudflare and the browser never seed from a process
-environment, so nothing there is ever pinned against one.
+`updated_by` is the whole mechanism, and `released-to-environment` is exactly
+what the **Reset to environment** button writes. **Do not blank the column
+instead.** An empty `updated_by` means "nothing has ever claimed this row",
+which is the state the one-time upgrade pass looks for — so on a deployment that
+has not recorded that pass yet, blanking the column can get the key pinned
+straight back on the next boot, with no UI to tell you. The sentinel above reads
+as "the environment owns this" and is correct either way.
+
+Only native deployments can be in this position — Cloudflare and the browser
+never seed from a process environment, so nothing there is ever pinned against
+one.
 
 **No migration.** Nothing to opt into, and the transition runs once per database
 whether or not you pass `--run-migrations`. Cloudflare and browser deployments

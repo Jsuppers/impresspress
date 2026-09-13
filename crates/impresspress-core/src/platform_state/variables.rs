@@ -823,29 +823,46 @@ async fn seed_one_secret(
 /// so a deployment whose early boots carried no exports reaches the admin UI
 /// with the transition still armed.
 ///
-/// ### What the transition does NOT promise
+/// ### Exactly what the transition promises
 ///
-/// It only ever visits keys the environment exports on the boot it runs, and
-/// that is the right rule — the comparison is against the export, and a key
-/// with no export has nothing to compare against and no conflict to resolve.
-/// But it makes the guarantee narrower than "your pre-upgrade edits are safe",
-/// and the difference is invisible unless it is written down:
+/// Stated positively, because the negative version of it has been written
+/// wrong twice — each time more generously than the branch condition above.
+/// The condition IS the promise, so here it is in words:
 ///
-/// > An admin disables `WAFER_RUN_SHARED__ENABLE_OAUTH` before upgrading. The
-/// > deployment config does not export that key, so the upgrade boot does not
-/// > consider it and the gate is recorded. Months later the operator adds
-/// > `WAFER_RUN_SHARED__ENABLE_OAUTH=true`. The row is still unstamped — no
-/// > admin surface has written it since the upgrade — so rule 1 applies and
-/// > OAuth comes back on.
+/// > A pre-upgrade edit survives if and only if, on the boot that records the
+/// > gate (the first one whose declared batch is non-empty), the environment
+/// > exported THAT key, with a non-empty value, that value differed from the
+/// > stored one, and the row was readable.
 ///
-/// Stamping un-exported rows at the transition would close it and is the wrong
-/// trade: it re-breaks the headline bug for every key an operator has been
-/// waiting to set, on the boot that ships the fix. The honest statement is
-/// that the transition resolves the conflicts it can SEE, and that from then on
-/// **adding an export for a key you were not already setting takes effect,
-/// including over a change made in the admin UI before the upgrade.** An admin
-/// edit made after the upgrade is stamped and safe; that is the line.
-/// `after_the_transition_an_unmarked_row_follows_the_environment` pins it, and
+/// Every clause is load-bearing, and dropping any of them leaves the row
+/// unclaimed and the gate recorded, so a LATER export wins over the pre-upgrade
+/// edit — silently, because a key the transition passes over is a key it says
+/// nothing about. `a_pre_upgrade_edit_is_unprotected_unless_the_export_differed`
+/// drives the three reachable ways to drop one:
+///
+/// - the key is absent from that batch (`WAFER_RUN_SHARED__ENABLE_OAUTH` is not
+///   in the compose file on the upgrade boot; the operator adds it months later
+///   and OAuth comes back on);
+/// - it is exported EMPTY, which this module treats as unset;
+/// - it is exported with the value already stored — the admin had already
+///   aligned the two, and there is no conflict to see.
+///
+/// (A fourth exists and is not reachable from a test with the fixtures here: a
+/// per-key read that fails is skipped, and the gate is still recorded at the end
+/// of the loop. A read failure that takes out the whole table cannot cause it —
+/// [`transition_has_run`] fails closed, so the transition does not run and the
+/// gate is not recorded either.)
+///
+/// A boot whose batch is EMPTY records no gate at all, so a deployment that
+/// exports nothing yet keeps the transition armed for the first boot that does
+/// — see `a_boot_with_no_environment_records_no_transition_and_writes_nothing`.
+///
+/// None of this is closed by stamping the rows the transition passes over. A row
+/// that AGREES with its export is most rows on most deployments, and pinning
+/// those re-breaks the headline bug for every key an operator has been waiting
+/// to set. The remedy is the operator's and it is one action: re-apply the
+/// setting in the admin UI once after upgrading, which stamps it for good. An
+/// admin edit made AFTER the upgrade is always safe; that is the line, and
 /// `RELEASE.md` tells operators the same thing in their own terms.
 ///
 /// It lives INSIDE the env loop rather than in a pass of its own, which is what
@@ -1331,10 +1348,12 @@ async fn record_transition(db: &Arc<dyn DatabaseService>) {
 /// admin edited the key, it is the claim that nobody can tell which, and the log
 /// line and the Variables page both have to be able to say so.
 ///
-/// Reached only for a key the environment is exporting on this boot — see "What
-/// the transition does NOT promise" on [`seed_and_load`]. A pre-upgrade UI
-/// change to a key the deployment config does not export is not protected by
-/// this, and adding that export later will take effect.
+/// Reached only for a key the environment exports on this boot, with a
+/// non-empty value that DIFFERS from the stored one — see "Exactly what the
+/// transition promises" on [`seed_and_load`]. A pre-upgrade UI change that
+/// misses any of those (not in the batch, exported empty, or exported with the
+/// value already stored) is not protected by this, and a later export for it
+/// will take effect.
 async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> bool {
     let patch = VariablePatch {
         updated_by: Some(PRE_UPGRADE_SENTINEL.to_string()),
@@ -1347,7 +1366,7 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
                 key = %row.key,
                 "this environment variable has NO EFFECT from now on — the stored value \
                  differs from it and predates edit tracking, so this build cannot tell \
-                 whether an admin set it and keeps it{}",
+                 whether an admin set it, and keeps it{}.",
                 secrecy_note(&row.key),
             );
             true
@@ -1373,14 +1392,22 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 /// are what gets buried. The per-key lines are short and carry the structured
 /// `key` field; this says what to do about all of them.
 ///
-/// The page control it names renders only where there IS a process environment
-/// to hand a key back to (`admin::pages::variables::key_can_be_seeded_from_env`
-/// and [`deployment_seeds_from_process_env`]), and that is the same condition
-/// under which this line can be emitted at all: it is reached only from
-/// [`seed_and_load`]'s env loop, whose body does not run when `env_vars` is
-/// empty — and it is empty on exactly the targets that hide the control. Every
-/// key it can count is one the loop saw, so one `filter_to_declared_keys` let
-/// through.
+/// The page control it names is gated on two independent things, and this line
+/// is safe to print because of the first one only:
+///
+/// - PER DEPLOYMENT, [`deployment_seeds_from_process_env`] — and that is the
+///   same condition under which this line can be emitted at all, since it is
+///   reached only from [`seed_and_load`]'s env loop, whose body does not run
+///   when `env_vars` is empty, and it is empty on exactly the targets that hide
+///   the control.
+/// - PER KEY, `admin::pages::variables::key_can_be_seeded_from_env`. This line
+///   does not check it, and on the native path it does not have to: every key
+///   the loop saw came through `cli::server_config::filter_to_declared_keys`,
+///   which is the predicate that mirrors. A caller assembling its own batch
+///   (the case this module's runtime-owned guard is documented for, and what
+///   its unit tests do) can get a count here for a key the page would offer no
+///   control for — a summary that over-counts by one on a path production does
+///   not take, which is not worth a second per-key pass to avoid.
 fn warn_how_to_undo_a_pin(count: usize) {
     tracing::warn!(
         inert_exports = count,
@@ -1410,7 +1437,7 @@ fn warn_export_is_inert(key: &str, pin: Pin) {
     tracing::warn!(
         key = %key,
         "this environment variable is set but has NO EFFECT — {reason}; the stored value \
-         is what boots{}",
+         is what boots{}.",
         secrecy_note(key),
     );
 }
@@ -2299,11 +2326,20 @@ mod boot_tests {
     /// failure, and passed on an unrelated path.
     ///
     /// Driven through `break_list_reads`, so `find_by_key`'s `list` fails while
-    /// writes still land — which is what lets the fixture stage the row first
-    /// and what would let the seeder overwrite it if the branch were removed.
+    /// writes still land — which is what lets the fixture stage the row first.
     /// `seed_and_load` itself returns `Err` (its final table read fails too),
-    /// so the assertions are on the log line and on the write generation:
-    /// reading the row back is exactly what this fixture has made impossible.
+    /// so the assertions are on the log: reading the row back is exactly what
+    /// this fixture has made impossible.
+    ///
+    /// What the branch buys is that no write is ATTEMPTED, and that is what the
+    /// third assertion pins. Without it this test is weaker than it looks:
+    /// mutate the branch to `Err(_) => None` and `set_with_row` sees no existing
+    /// row, so it can only take its CREATE path — which the `key` column's
+    /// UNIQUE index rejects. Nothing would be overwritten and no config write
+    /// would be recorded, so both of the other assertions would still pass, on
+    /// a guarantee the schema is providing rather than this branch. The seeder
+    /// would simply log a failed write per key, which is what the third
+    /// assertion refuses.
     #[tokio::test]
     async fn a_row_whose_pin_state_cannot_be_read_is_not_overwritten() {
         let key = "WAFER_RUN_SHARED__APP_NAME";
@@ -2330,6 +2366,12 @@ mod boot_tests {
             before,
             crate::config_generation::config_write_generation(),
             "an unreadable row must not be written"
+        );
+        assert_eq!(
+            capture.count_containing("failed to seed env variable"),
+            0,
+            "and no write must be ATTEMPTED — that, not the outcome, is what this \
+             branch buys; the unique index would refuse the write anyway"
         );
     }
 
@@ -2475,6 +2517,87 @@ mod boot_tests {
             .await
             .expect("later boot");
         assert_eq!(vars.get(key).map(String::as_str), Some("false"));
+    }
+
+    /// THE BOUNDARY OF THE TRANSITION, as three executable cases.
+    ///
+    /// A pre-upgrade edit is protected only when, on the upgrade boot, ALL of
+    /// this held: the environment exported the key, with a non-empty value, and
+    /// that value differed from the stored one. Each case below breaks exactly
+    /// one of those and shows the same outcome — the row is left unclaimed, the
+    /// gate is recorded anyway, and a LATER export therefore wins.
+    ///
+    /// Stated positively and pinned here because the prose version of it has now
+    /// been wrong twice, each time by being more generous than
+    /// `seed_and_load`'s actual branch condition. A test cannot be more generous
+    /// than the code.
+    ///
+    /// None of these is a defect to fix by stamping: the rule compares against
+    /// the export, and stamping a row that AGREES with its export would pin
+    /// most keys on most deployments and re-break the headline bug. They are
+    /// the cost of that rule, and the operator's remedy is the same in all
+    /// three — re-apply the setting in the UI once after upgrading, which
+    /// stamps it for good.
+    #[tokio::test]
+    async fn a_pre_upgrade_edit_is_unprotected_unless_the_export_differed() {
+        let key = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+        // Every case exports SOMETHING, so the gate is recorded on the upgrade
+        // boot. That is load-bearing: a boot carrying no exports at all records
+        // no gate and leaves the transition armed for the next one, so the key
+        // would still be protected — see
+        // `a_boot_with_no_environment_records_no_transition_and_writes_nothing`.
+        let filler = ("WAFER_RUN_SHARED__APP_NAME".to_string(), "Shop".to_string());
+        // (what the upgrade boot exports for `key`, why the transition passes it over)
+        let cases = [
+            (None, "the key is not in the exported batch"),
+            (
+                Some(String::new()),
+                "it is exported empty, which is 'unset' by this repo's convention",
+            ),
+            (
+                Some("false".to_string()),
+                "it is exported, but with the value already stored",
+            ),
+        ];
+
+        for (exported, why) in cases {
+            let db = migrated_db().await;
+            let mut upgrade_env = vec![filler.clone()];
+            if let Some(value) = exported {
+                upgrade_env.push((key.to_string(), value));
+            }
+            // The pre-upgrade world: an admin closed signup through a settings
+            // form, which left no marker.
+            raw_insert_unowned(&db, key, "false").await;
+
+            let capture = crate::test_support::MessageCapture::default();
+            {
+                let _guard = tracing::subscriber::set_default(capture.clone());
+                seed_and_load(&db, &upgrade_env)
+                    .await
+                    .expect("upgrade boot");
+            }
+            assert_eq!(
+                capture.count_containing("NO EFFECT"),
+                0,
+                "nothing is reported when {why} — which is what makes this silent"
+            );
+            assert_eq!(
+                pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
+                None,
+                "the row is left unclaimed when {why}"
+            );
+
+            // The operator adds (or changes) the export afterwards.
+            let vars = seed_and_load(&db, &[(key.to_string(), "true".to_string())])
+                .await
+                .expect("later boot");
+            assert_eq!(
+                vars.get(key).map(String::as_str),
+                Some("true"),
+                "a later export wins because {why}"
+            );
+        }
     }
 
     /// A block-scoped credential rotated through the admin UI, with the old one
@@ -2692,11 +2815,14 @@ mod boot_tests {
     ///
     /// It is also the boundary of what the transition promises, and the reason
     /// that boundary is written down rather than discovered: the same rule
-    /// means a key the deployment config did NOT export on the upgrade boot was
-    /// never considered, so adding that export later takes effect even over a
-    /// change an admin made in the UI before upgrading. Closing that would mean
-    /// stamping un-exported rows, which re-breaks the headline bug for every
-    /// key an operator has been waiting to set.
+    /// means any key the transition PASSED OVER on the gate-recording boot —
+    /// absent from the batch, exported empty, or exported with the value
+    /// already stored — is ordinary from then on, so a later export for it
+    /// takes effect even over a change an admin made in the UI before
+    /// upgrading. `a_pre_upgrade_edit_is_unprotected_unless_the_export_differed`
+    /// drives all three. Closing it would mean stamping rows that agree with
+    /// their export, which is most rows, and re-breaks the headline bug for
+    /// every key an operator has been waiting to set.
     #[tokio::test]
     async fn after_the_transition_an_unmarked_row_follows_the_environment() {
         let db = migrated_db().await;
