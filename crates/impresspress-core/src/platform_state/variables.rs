@@ -1467,11 +1467,20 @@ mod boot_tests {
 
     /// Write a row the way an OLDER BUILD did — straight to the table,
     /// bypassing [`NewVariable::into_row`], which now settles the flag — so
-    /// the repair paths have something to repair. No supported API can
-    /// produce this row any more, which is the point of the funnel.
-    async fn raw_insert_unflagged(db: &Arc<dyn DatabaseService>, key: &str, value: &str) {
+    /// the repair paths have something to repair. No supported API can produce
+    /// this row any more, which is the point of the funnel.
+    ///
+    /// `flag` is written into the `sensitive` column verbatim, so a test can
+    /// stage the shapes the schema does not declare (`2`, `true`, `"true"`,
+    /// `1.0`) as well as a plain clear flag.
+    async fn raw_insert_with_flag(
+        db: &Arc<dyn DatabaseService>,
+        key: &str,
+        value: &str,
+        flag: Value,
+    ) {
         let now = crate::util::now_rfc3339();
-        let row = VariableRow {
+        let mut data = VariableRow {
             id: format!("var_{}", uuid::Uuid::new_v4()),
             key: key.to_string(),
             value: value.to_string(),
@@ -1483,8 +1492,15 @@ mod boot_tests {
             updated_by: String::new(),
             created_at: now.clone(),
             updated_at: now,
-        };
-        db.create(TABLE, row.to_data()).await.expect("raw create");
+        }
+        .to_data();
+        data.insert("sensitive".to_string(), flag);
+        db.create(TABLE, data).await.expect("raw create");
+    }
+
+    /// [`raw_insert_with_flag`] with the clear flag an older build wrote.
+    async fn raw_insert_unflagged(db: &Arc<dyn DatabaseService>, key: &str, value: &str) {
+        raw_insert_with_flag(db, key, value, json!(0)).await;
     }
 
     /// Every create funnels through `NewVariable::into_row`, so a caller that
@@ -1663,23 +1679,7 @@ mod boot_tests {
 
             // And the repair normalises it to the declared integer.
             let db = migrated_db().await;
-            let now = crate::util::now_rfc3339();
-            let mut data = VariableRow {
-                id: format!("var_{}", uuid::Uuid::new_v4()),
-                key: key.to_string(),
-                value: "hunter2".to_string(),
-                name: String::new(),
-                description: String::new(),
-                warning: String::new(),
-                sensitive: true,
-                block: block_for_key(key),
-                updated_by: String::new(),
-                created_at: now.clone(),
-                updated_at: now,
-            }
-            .to_data();
-            data.insert("sensitive".to_string(), shape.clone());
-            db.create(TABLE, data).await.expect("raw create");
+            raw_insert_with_flag(&db, key, "hunter2", shape.clone()).await;
 
             repair_sensitive_flags(&db).await;
 
@@ -1701,33 +1701,6 @@ mod boot_tests {
                 "{shape} must be normalised to the canonical integer"
             );
         }
-    }
-
-    /// Write a row with an arbitrary `sensitive` column shape, the way an older
-    /// build or a foreign bundle could leave one.
-    async fn raw_insert_with_flag(
-        db: &Arc<dyn DatabaseService>,
-        key: &str,
-        value: &str,
-        flag: Value,
-    ) {
-        let now = crate::util::now_rfc3339();
-        let mut data = VariableRow {
-            id: format!("var_{}", uuid::Uuid::new_v4()),
-            key: key.to_string(),
-            value: value.to_string(),
-            name: String::new(),
-            description: String::new(),
-            warning: String::new(),
-            sensitive: false,
-            block: block_for_key(key),
-            updated_by: String::new(),
-            created_at: now.clone(),
-            updated_at: now,
-        }
-        .to_data();
-        data.insert("sensitive".to_string(), flag);
-        db.create(TABLE, data).await.expect("raw create");
     }
 
     /// A non-canonical but TRUTHY flag is a shape defect, not a breach.
