@@ -570,6 +570,62 @@ async fn import_refuses_a_schema_version_this_build_does_not_read() {
     assert_eq!(err.code, wafer_run::ErrorCode::InvalidArgument);
 }
 
+/// Import is the ONE write to the variables table that does not pass through
+/// `NewVariable::into_row`: it upserts the bundle's own columns straight
+/// through `db::upsert`, and its pre-flight refuses only
+/// `is_instance_owned_key`. So a bundle understating a `sensitive` column
+/// re-creates exactly the row the flag work exists to prevent — served in the
+/// clear by `GET /b/admin/api/settings/{key}` and KV-cacheable — until some
+/// later boot happens to run the repair pass.
+///
+/// Corrected rather than refused: an understated flag is far more likely a
+/// bundle built by an older build than an attack, and refusing the whole
+/// import would make every such bundle unusable.
+#[tokio::test]
+async fn import_raises_a_sensitive_flag_the_bundle_understated() {
+    // A declared `InputType::Password` var, spelled with neither `_SECRET` nor
+    // `_KEY` — so only its declaration knows it holds a credential, and only
+    // the stored `sensitive` flag can carry that to the read path.
+    let key = "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD";
+    let ctx = TestContext::with_products().await;
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        variables::TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "var_imported",
+            "key": key,
+            "value": "hunter2",
+            "sensitive": false,
+            "created_at": STAMP,
+            "updated_at": STAMP,
+        }))
+        .into_iter()
+        .collect()],
+    );
+    let snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snap)
+        .await
+        .expect("an understated flag is corrected, not refused");
+
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
+        .await
+        .unwrap();
+    let row = vars
+        .iter()
+        .find(|v| v.data["key"] == json!(key))
+        .expect("the row was imported");
+    assert_eq!(
+        row.data["sensitive"],
+        json!(1),
+        "import is the one write that bypasses `NewVariable::into_row`, so it has to \
+         apply the same rule itself: {row:?}"
+    );
+}
+
 /// A snapshot carries ordinary site config — that is what an export is FOR —
 /// but never a key the runtime owns.
 ///

@@ -72,6 +72,7 @@ use crate::{
     },
     // audit-allow: names the platform tables for the export allowlist/exclusion bookkeeping below — the two it reads (`variables`, `user_roles`) are granted by `dev::wrap_grants()`, which maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)` and which the runtime honours from its flat grant list, and the audit attributes grants to the declaring file's block and cannot see it
     platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
+    util::RecordExt,
 };
 
 /// Schema version this build's [`DataSnapshot`] reads and writes.
@@ -481,7 +482,33 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
             // The one table with a per-row export decision — see
             // `variable_is_exportable`'s docs for why the check lives there
             // and not as a second `Mode`.
-            .filter(|row| table != variables::TABLE || variable_is_exportable(row))
+            //
+            // An excluded row is ANNOUNCED. Ad hoc keys are stored sensitive by
+            // default (`config_vars::is_sensitive_by_default_when_created`:
+            // nothing here knows what an undeclared key holds), and a sensitive
+            // row is not exportable — so a bundle legitimately leaves them
+            // behind, and an operator who is not told will find out only when
+            // the imported site is missing config. Saying which keys did not
+            // travel costs one line and is the difference between a decision
+            // and a surprise.
+            .filter(|row| {
+                if table == variables::TABLE && !variable_is_exportable(row) {
+                    // Bound outside the macro: `tracing`'s field syntax
+                    // resolves `Value` to its own trait, not `serde_json`'s.
+                    let key = row
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<no key>");
+                    tracing::info!(
+                        key = %key,
+                        "not exporting this config variable: it is sensitive, or names \
+                         instance-scoped infrastructure. The imported site will need it set \
+                         there"
+                    );
+                    return false;
+                }
+                true
+            })
             .filter(|row| owner_was_exported(table, row, &exported))
             .collect();
         if OWNED_TABLES.iter().any(|(_, _, owner)| *owner == table) {
@@ -837,6 +864,41 @@ pub async fn import(
     Ok(report)
 }
 
+/// Raise an imported `impresspress__admin__variables` row's `sensitive` column
+/// to what its key requires, exactly as
+/// [`crate::platform_state::variables::NewVariable::into_row`] does for every
+/// row this instance creates itself.
+///
+/// Import is the one write to this table that does NOT go through that funnel —
+/// it upserts the bundle's own columns straight through `db::upsert` — and its
+/// pre-flight refuses only [`crate::config_vars::is_instance_owned_key`]. So a
+/// bundle carrying `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` with
+/// `sensitive: 0` would re-create exactly the row this masking work exists to
+/// prevent: served in the clear by `GET /b/admin/api/settings/{key}` and
+/// KV-cacheable, until the next `/_deploy/init` or native boot happened to run
+/// the repair pass.
+///
+/// Raise-only, like the funnel: a bundle may mark a row sensitive that this
+/// build does not know to be, and that stands.
+fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
+    let Some(key) = row.get("key").and_then(Value::as_str) else {
+        return;
+    };
+    if !crate::config_vars::is_sensitive_for_storage(key) {
+        return;
+    }
+    let as_map: HashMap<String, Value> = row.clone().into_iter().collect();
+    if as_map.bool_field("sensitive") {
+        return;
+    }
+    tracing::warn!(
+        key = %key,
+        "the imported data snapshot marked this config key as not sensitive; storing it \
+         sensitive, as its declaration requires"
+    );
+    row.insert("sensitive".to_string(), serde_json::json!(1));
+}
+
 /// Write one row into `table` under `mode`. Split out of [`import`] because
 /// the two modes' typed calls take different shapes (`create`'s owned
 /// `HashMap` vs. `upsert`'s ordered pair list) that don't share a body.
@@ -846,6 +908,17 @@ async fn import_row(
     mode: Mode,
     row: &serde_json::Map<String, Value>,
 ) -> Result<(), WaferError> {
+    // The variables table is the one whose columns carry a security decision,
+    // and the one import writes without passing through `NewVariable::into_row`.
+    let owned;
+    let row = if table == variables::TABLE {
+        let mut copy = row.clone();
+        raise_imported_sensitive_flag(&mut copy);
+        owned = copy;
+        &owned
+    } else {
+        row
+    };
     match mode {
         Mode::Replace => {
             let data: HashMap<String, Value> = row.clone().into_iter().collect();

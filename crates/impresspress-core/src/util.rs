@@ -599,8 +599,12 @@ pub(crate) const MASKED_VALUE: &str = "********";
 /// admin Variables page (`blocks::admin::ops`, re-exported from here) and
 /// the generic ConfigVar-driven settings form (`ui::settings_form`) so the
 /// two admin surfaces can't disagree on what gets redacted.
+/// The suffix half is [`crate::config_vars::has_sensitive_suffix`], shared
+/// with the write path that decides what the stored flag gets
+/// ([`crate::config_vars::is_sensitive_for_storage`]) — the two halves of this
+/// union have to be the same rule on both sides.
 pub(crate) fn is_sensitive_key(key: &str, sensitive_flag: i64) -> bool {
-    sensitive_flag == 1 || key.ends_with("_SECRET") || key.ends_with("_KEY")
+    sensitive_flag == 1 || crate::config_vars::has_sensitive_suffix(key)
 }
 
 /// Percent-encode a string for use as an OAuth / `application/x-www-form-urlencoded`

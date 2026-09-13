@@ -57,6 +57,22 @@ impl CfDeployBootHooks {
     async fn seed_and_load(&self) -> Result<impresspress_core::features::BlockSettings, String> {
         impresspress_core::platform_state::variables::seed_auto_generated(&self.db).await;
 
+        // The hosted target's only call site for the sensitive-flag repair.
+        // Cloudflare never runs `variables::seed_and_load` — it has no process
+        // environment to seed from, so this hook is the whole of its variables
+        // seeding — and the repair therefore has to be named here rather than
+        // inherited. Without it a row an older build stored unflagged (a
+        // bootstrap credential is the likely one) keeps being served in the
+        // clear by `GET /b/admin/api/settings/{key}` and stays eligible for the
+        // KV cache via `cache_key::row_is_sensitive`.
+        //
+        // Here and not in `CfRequestBootHooks`: that hook is write-free by
+        // invariant (see its doc — a write there self-invalidates the fleet's
+        // config version and races concurrent isolates). The rows this repairs
+        // are legacy, so `/_deploy/init` time is both sufficient and the only
+        // safe slot.
+        impresspress_core::platform_state::variables::repair_sensitive_flags(&self.db).await;
+
         impresspress_core::platform_state::block_settings::load_and_seed(
             &self.db,
             &self.seed_defaults,
@@ -235,11 +251,24 @@ mod boot_hook_tests {
     #[derive(Default)]
     struct RecordingDb {
         writes: RefCell<Vec<String>>,
+        /// Rows `list` answers with, per collection. Empty by default, which
+        /// is the first-ever-deploy state every other test here wants.
+        rows: RefCell<HashMap<String, Vec<Record>>>,
     }
 
     impl RecordingDb {
         fn note(&self, write: String) {
             self.writes.borrow_mut().push(write);
+        }
+
+        /// Put one row in `collection` for `list` to return.
+        fn with_row(self, collection: &str, record: Record) -> Self {
+            self.rows
+                .borrow_mut()
+                .entry(collection.to_string())
+                .or_default()
+                .push(record);
+            self
         }
     }
 
@@ -251,12 +280,34 @@ mod boot_hook_tests {
 
         async fn list(
             &self,
-            _collection: &str,
-            _opts: &ListOptions,
+            collection: &str,
+            opts: &ListOptions,
         ) -> Result<RecordList, DatabaseError> {
+            // Equality filters are honoured, which is not decoration: every
+            // `variables::find_by_key` is a `list` with one `key` equality
+            // filter, so a fixture that ignored them answered EVERY lookup
+            // with the single seeded row. `seed_auto_generated` then believed
+            // each declared secret already existed and wrote nothing — the
+            // fixture quietly disabling most of the hook it exists to
+            // exercise.
+            let records: Vec<Record> = self
+                .rows
+                .borrow()
+                .get(collection)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|record| {
+                    opts.filters.iter().all(|filter| {
+                        !matches!(filter.operator, wafer_block::db::FilterOp::Equal)
+                            || record.data.get(&filter.field) == Some(&filter.value)
+                    })
+                })
+                .collect();
+            let total_count = i64::try_from(records.len()).unwrap_or(i64::MAX);
             Ok(RecordList {
-                records: Vec::new(),
-                total_count: 0,
+                records,
+                total_count,
                 page: 1,
                 page_size: 500,
             })
@@ -429,6 +480,71 @@ mod boot_hook_tests {
     /// to do with the property under test.
     fn seed_defaults_fixture() -> Vec<(String, bool)> {
         vec![("impresspress/fixture".to_string(), true)]
+    }
+
+    /// **The deploy hook repairs a mis-flagged `sensitive` row, and the
+    /// request hook does not.**
+    ///
+    /// The hosted target never runs `variables::seed_and_load` — this hook is
+    /// the whole of its variables seeding — so the repair pass has to be named
+    /// in it explicitly. Without that, a row an older build stored with the
+    /// flag clear (a bootstrap credential is the likely one) keeps being
+    /// served in the clear by `GET /b/admin/api/settings/{key}` on Cloudflare
+    /// and stays eligible for the KV cache.
+    ///
+    /// Asserted as the `update` the repair issues against the variables table,
+    /// not as "the function was called", so it keeps holding if the repair
+    /// moves. The request-path half is the invariant control: that hook must
+    /// stay write-free even for a repair.
+    #[wasm_bindgen_test]
+    async fn the_deploy_hook_repairs_a_mis_flagged_row_and_the_request_hook_does_not() {
+        use impresspress_core::platform_state::variables;
+
+        // A row an older build wrote: a declared `Password` var, flag clear.
+        let unflagged = || {
+            let mut data = HashMap::new();
+            data.insert(
+                "key".to_string(),
+                serde_json::json!(
+                    impresspress_core::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY
+                ),
+            );
+            data.insert("value".to_string(), serde_json::json!("hunter2"));
+            data.insert("sensitive".to_string(), serde_json::json!(0));
+            Record {
+                id: "var_legacy".to_string(),
+                data,
+            }
+        };
+        let repair_write = format!("update {}/var_legacy", variables::TABLE);
+
+        let db = Arc::new(RecordingDb::default().with_row(variables::TABLE, unflagged()));
+        let deploy = CfDeployBootHooks {
+            db: db.clone(),
+            block_settings_handle: settings_handle(),
+            config: request_services::config_proxy(),
+            seed_defaults: seed_defaults_fixture(),
+        };
+        deploy.seed_and_load().await.expect("deploy seed");
+        assert!(
+            db.writes.borrow().iter().any(|w| *w == repair_write),
+            "the deploy hook must repair a mis-flagged row; it wrote {:?}",
+            db.writes.borrow(),
+        );
+
+        // Same fixture, request path: still write-free.
+        let db = Arc::new(RecordingDb::default().with_row(variables::TABLE, unflagged()));
+        let request = CfRequestBootHooks {
+            db: db.clone(),
+            block_settings_handle: settings_handle(),
+            config: request_services::config_proxy(),
+        };
+        request.load().await.expect("request load");
+        assert!(
+            db.writes.borrow().is_empty(),
+            "the request path must stay write-free even for a repair; it wrote {:?}",
+            db.writes.borrow(),
+        );
     }
 
     /// **The request path is physically write-free.** On the empty table a

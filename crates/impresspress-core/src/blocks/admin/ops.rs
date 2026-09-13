@@ -648,7 +648,9 @@ pub(super) struct VariableUpdate<'a> {
 /// writing an audit-log row. Enforces the sensitive-empty guard (a sensitive
 /// value can't be cleared — see [`is_sensitive_key`]: the `_SECRET`/`_KEY`
 /// suffix rule unioned with the row's stored `sensitive` flag, which covers
-/// Password-typed declared vars like `BOOTSTRAP_ADMIN_PASSWORD`) and the
+/// Password-typed declared vars; the exception is a provisioning-only
+/// credential, which [`crate::config_vars::is_provisioning_only_key`] names and
+/// which must stay clearable because nothing can delete it either) and the
 /// `_URL` SSRF validation on both surfaces.
 ///
 /// Returns the upserted row.
@@ -673,7 +675,21 @@ pub(super) async fn update_variable(
         // and ad hoc rows flagged in the UI. The row lookup only happens on
         // the empty-value path; a missing row (upsert-create branch) has no
         // stored secret to wipe, so only the suffix rule applies there.
-        if value.is_empty() {
+        // A provisioning-only credential is the exception, and it has to be,
+        // because this guard and the delete path would otherwise trap it
+        // between them: `delete_variable` and the Variables page's
+        // `key_is_deletable` both refuse a declared `WAFER_RUN_SHARED__*` row,
+        // so refusing the clear too leaves a bootstrapped deployment holding a
+        // plaintext admin password it no longer needs and cannot remove by any
+        // route. The guard's own reasoning — clearing it "would break auth" —
+        // does not reach these: `auth::bootstrap::run` is their only reader and
+        // early-returns once the `users` table is non-empty, by which point the
+        // password is an argon2 hash in `local_credentials` and the token a
+        // sha256 in `bootstrap_tokens`. Clearing it before provisioning is
+        // equally safe: bootstrap then declines to auto-create an admin, which
+        // is a documented path (`"no bootstrap admin configured"`) and
+        // re-settable, not a lockout.
+        if value.is_empty() && !crate::config_vars::is_provisioning_only_key(key) {
             let stored_flag = match variables::get_by_key(ctx, key).await {
                 Ok(Some(row)) => i64::from(row.sensitive),
                 Ok(None) => 0,
@@ -695,6 +711,22 @@ pub(super) async fn update_variable(
 
     // A PUT to a not-yet-present key takes `upsert_by_key`'s create branch,
     // which derives the row's `block` and synthesises its id and timestamps.
+    //
+    // The patch leaves `sensitive` unset, and both halves of what settles it
+    // live elsewhere — neither of them here, which is why this says which:
+    //
+    //   * a DECLARED key (or a `_SECRET`/`_KEY` suffix) is raised by
+    //     `NewVariable::into_row`, the funnel every row creation passes
+    //     through. That is what stopped a PUT creating
+    //     `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_TOKEN` unflagged.
+    //   * an UNDECLARED ad hoc key is not something that funnel can speak to —
+    //     it raises from the declaration, and there is none — so
+    //     `VariablePatch::into_new` defaults it through
+    //     `config_vars::is_sensitive_by_default_when_created`. Without that,
+    //     `PATCH /b/admin/api/settings/MY_SERVICE_TOKEN` on a key with no row
+    //     stored it unflagged and the next GET published it, while the same
+    //     key through POST was protected by `handle_create`'s "absent means
+    //     sensitive" rule. The two surfaces now agree.
     let patch = VariablePatch {
         value: update.value.map(str::to_string),
         description: update.description.map(str::to_string),
@@ -1308,6 +1340,319 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    /// A bootstrapped deployment must be able to CLEAR the plaintext admin
+    /// credential it no longer needs, and logging in must keep working after
+    /// it does.
+    ///
+    /// Flagging `BOOTSTRAP_ADMIN_PASSWORD` sensitive (it is declared
+    /// `InputType::Password`) brought it under the sensitive-empty guard, while
+    /// `delete_variable` and the Variables page's `key_is_deletable` already
+    /// refuse to delete a declared `WAFER_RUN_SHARED__*` row. Together those
+    /// left the credential unremovable by any route — the masking and the
+    /// removal path fighting each other over the very row
+    /// `repair_sensitive_flags` exists for.
+    ///
+    /// Drives the real chain: the env seeder writes the row, `bootstrap::run`
+    /// consumes it, `update_variable` clears it, and the real login handler
+    /// proves auth is untouched — because the password's surviving form is the
+    /// argon2 hash in `local_credentials`, not this row.
+    #[tokio::test]
+    async fn a_bootstrapped_admin_credential_can_be_cleared_and_login_still_works() {
+        use crate::blocks::auth::config::{
+            BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY,
+        };
+
+        const EMAIL: &str = "admin@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // The operator's `.env`, through the production seeder.
+        ctx.seed_env_vars(&[
+            (BOOTSTRAP_ADMIN_EMAIL_KEY, EMAIL),
+            (BOOTSTRAP_ADMIN_PASSWORD_KEY, PASSWORD),
+        ])
+        .await;
+        assert!(
+            variables::get_by_key(&ctx, BOOTSTRAP_ADMIN_PASSWORD_KEY)
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "the credential is stored flagged — that is what brings it under the guard"
+        );
+
+        // First run: the credential is consumed into `local_credentials`.
+        let cfg = crate::blocks::auth::config::AuthConfig::from_env_for_test(&[
+            (BOOTSTRAP_ADMIN_EMAIL_KEY, EMAIL),
+            (BOOTSTRAP_ADMIN_PASSWORD_KEY, PASSWORD),
+        ]);
+        crate::blocks::auth::bootstrap::run(&ctx, &cfg)
+            .await
+            .expect("bootstrap the admin user");
+
+        // The operator removes the export and clears the stored plaintext
+        // through the admin API. This 400'd before the exemption.
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                BOOTSTRAP_ADMIN_PASSWORD_KEY,
+                VariableUpdate {
+                    value: Some(""),
+                    description: None,
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, BOOTSTRAP_ADMIN_PASSWORD_KEY)
+                .await
+                .expect("get")
+                .expect("the row survives, emptied")
+                .value,
+            "",
+            "the plaintext credential must actually be gone"
+        );
+
+        // And the bootstrapped admin can still log in.
+        let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
+        let resp = crate::test_support::output_json(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(body.into_bytes()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            resp["user"]["email"],
+            serde_json::json!(EMAIL),
+            "clearing the spent provisioning copy must not affect authentication: {resp}"
+        );
+    }
+
+    /// A PUT that CREATES an undeclared ad hoc key must protect it the same
+    /// way a POST does.
+    ///
+    /// `update_variable`'s patch never sets `sensitive`, so the create branch
+    /// runs `VariablePatch::into_new`. That defaulted to `false`, and
+    /// `NewVariable::into_row`'s funnel cannot save it — the funnel raises from
+    /// the declaration or the `_SECRET`/`_KEY` suffix, and an ad hoc key is
+    /// neither. So `MY_SERVICE_TOKEN` was stored unflagged and published by the
+    /// next GET, while the identical key through POST was flagged by
+    /// `handle_create`'s "absent means sensitive" rule.
+    #[tokio::test]
+    async fn a_put_created_ad_hoc_key_is_protected_like_a_post_created_one() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        const KEY: &str = "MY_SERVICE_TOKEN";
+        assert!(
+            !crate::config_vars::is_declared_key(KEY)
+                && !crate::config_vars::has_sensitive_suffix(KEY),
+            "the point of this test is a key neither the declaration nor the suffix catches"
+        );
+
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                KEY,
+                VariableUpdate {
+                    value: Some("tok_live_abc"),
+                    description: None,
+                },
+            )
+            .await,
+        );
+        assert!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "a PUT-created ad hoc key must be stored sensitive, as POST would"
+        );
+
+        // A declared var is NOT swept up by that default: the build knows what
+        // it is, so the declaration answers.
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                "WAFER_RUN_SHARED__APP_NAME",
+                VariableUpdate {
+                    value: Some("Acme"),
+                    description: None,
+                },
+            )
+            .await,
+        );
+        assert!(
+            !variables::get_by_key(&ctx, "WAFER_RUN_SHARED__APP_NAME")
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "a declared non-secret var must not be masked just because it was PUT"
+        );
+    }
+
+    /// Review finding 5, as a test: clearing the spent bootstrap password
+    /// through the admin API must STAY cleared across the next boot.
+    ///
+    /// Under env-wins it did not — the next `seed_and_load` re-applied the
+    /// still-present export and handed the plaintext credential back. It falls
+    /// out of admin-wins for free: `update_variable` stamps `updated_by`, so
+    /// the row is admin-owned and the export is inert for it.
+    #[tokio::test]
+    async fn a_cleared_bootstrap_password_stays_cleared_across_the_next_boot() {
+        use crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY as KEY;
+
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
+
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                KEY,
+                VariableUpdate {
+                    value: Some(""),
+                    description: None,
+                },
+            )
+            .await,
+        );
+
+        // The operator has not removed the export yet — the realistic state.
+        ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
+
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "",
+            "a credential an admin cleared must not come back on the next boot"
+        );
+    }
+
+    /// The bootstrap TOKEN must stay unclearable, unlike the password.
+    ///
+    /// The difference is which branch of `auth::bootstrap::run` populates
+    /// `wafer_run__auth__users`: the email+password branch inserts a user, so
+    /// from the next boot `run` early-returns and the password is spent. The
+    /// token branch inserts only into `bootstrap_tokens` and creates NO user,
+    /// so `users` stays empty, `run` re-runs on every boot (it is called from
+    /// `AuthServiceImpl::init`), and the plaintext row keeps minting fresh 24h
+    /// tokens. Clearing it on a deployment with no admin yet lets the
+    /// outstanding token expire with nothing to regenerate it and no admin path
+    /// left — and Cloudflare has no process environment to re-seed from.
+    #[tokio::test]
+    async fn the_bootstrap_token_cannot_be_cleared_but_the_password_can() {
+        use crate::blocks::auth::config::{
+            BOOTSTRAP_ADMIN_PASSWORD_KEY, BOOTSTRAP_ADMIN_TOKEN_KEY,
+        };
+
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        let clear = |key: &'static str| {
+            let ctx = &ctx;
+            let msg = &msg;
+            async move {
+                update_variable(
+                    ctx,
+                    msg,
+                    key,
+                    VariableUpdate {
+                        value: Some(""),
+                        description: None,
+                    },
+                )
+                .await
+            }
+        };
+
+        expect_ok(
+            create_variable(
+                &ctx,
+                &msg,
+                BOOTSTRAP_ADMIN_TOKEN_KEY,
+                "tok",
+                None,
+                None,
+                true,
+            )
+            .await,
+        );
+        assert!(
+            clear(BOOTSTRAP_ADMIN_TOKEN_KEY).await.is_err(),
+            "the token is re-read on every boot and reissued; clearing it is a lockout"
+        );
+
+        expect_ok(
+            create_variable(
+                &ctx,
+                &msg,
+                BOOTSTRAP_ADMIN_PASSWORD_KEY,
+                "hunter2",
+                None,
+                None,
+                true,
+            )
+            .await,
+        );
+        expect_ok(clear(BOOTSTRAP_ADMIN_PASSWORD_KEY).await);
+    }
+
+    /// The exemption is exactly one key wide. A live secret still cannot be
+    /// cleared, which is what the guard is for.
+    #[tokio::test]
+    async fn clearing_a_live_secret_is_still_refused() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(
+            create_variable(
+                &ctx,
+                &msg,
+                "X__Y__STRIPE_SECRET",
+                "sk_live",
+                None,
+                None,
+                true,
+            )
+            .await,
+        );
+        assert!(
+            update_variable(
+                &ctx,
+                &msg,
+                "X__Y__STRIPE_SECRET",
+                VariableUpdate {
+                    value: Some(""),
+                    description: None,
+                },
+            )
+            .await
+            .is_err(),
+            "a live secret must still be unclearable"
+        );
+        assert!(
+            !crate::config_vars::is_provisioning_only_key(
+                crate::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY
+            ),
+            "the bootstrap EMAIL stays live after provisioning (ensure_admin_role reads it \
+             on every token mint), so it is not provisioning-only"
+        );
     }
 
     /// The sensitive-empty guard must honor the row's stored `sensitive`

@@ -388,6 +388,160 @@ pub fn key_block_prefix(key: &str) -> String {
     }
 }
 
+/// The SEC-060 naming convention: a key ending `_SECRET` or `_KEY` holds a
+/// secret whatever else is known about it.
+///
+/// Spelled once because the write path ([`is_sensitive_for_storage`], deciding
+/// what the `sensitive` column gets) and the read path
+/// (`util::is_sensitive_key`, deciding what gets masked) have to apply the
+/// identical rule. They disagreed once already and a password was served in
+/// clear for it.
+pub fn has_sensitive_suffix(key: &str) -> bool {
+    key.ends_with("_SECRET") || key.ends_with("_KEY")
+}
+
+/// Every declared config key whose `ConfigVar` says it holds a secret
+/// (`ConfigVar::is_sensitive()`, i.e. `InputType::Password`).
+///
+/// Memoized: the declared set is fixed for the life of the process (it is
+/// assembled from compile-time `BlockInfo`s and cargo features), while building
+/// it constructs every block — far too expensive to repeat per row written,
+/// and `seed_defaults` writes one row per declared shared var on a fresh boot.
+fn declared_sensitive_keys() -> &'static std::collections::HashSet<String> {
+    static KEYS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        collect_all_config_vars(&crate::blocks::all_block_infos())
+            .into_iter()
+            // `auto_generate` counts too. `variables::seed_one_secret`
+            // hard-codes `sensitive: true` for every such var — it mints a
+            // random secret, so of course it does — and without that here the
+            // boot repair pass would read the declaration, see no `Password`
+            // type and no `_SECRET`/`_KEY` suffix, and LOWER the flag it just
+            // raised, publishing a generated secret and making it
+            // KV-cacheable. Latent today (the only `auto_generate` var is both
+            // `Password`-typed and `_SECRET`-suffixed) and armed for the first
+            // one declared without either marker.
+            .filter(|v| v.is_sensitive() || v.auto_generate)
+            .map(|v| v.key)
+            .collect()
+    })
+}
+
+/// Every config key some `ConfigVar` declares — shared or block-owned.
+///
+/// Memoized for the same reason as [`declared_sensitive_keys`]: fixed for the
+/// process, expensive to build.
+fn declared_keys() -> &'static std::collections::HashSet<String> {
+    static KEYS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        collect_all_config_vars(&crate::blocks::all_block_infos())
+            .into_iter()
+            .map(|v| v.key)
+            .collect()
+    })
+}
+
+/// Whether any block or the shared set declares `key`.
+///
+/// The complement is an **ad hoc** key: a row an operator created by hand,
+/// about which this build knows nothing — not its type, not whether it holds a
+/// secret. That ignorance is the whole reason
+/// [`is_sensitive_by_default_when_created`] answers the way it does.
+pub fn is_declared_key(key: &str) -> bool {
+    declared_keys().contains(key)
+}
+
+/// The `sensitive` flag to store for a NEWLY created row whose creator did not
+/// say — the default behind `VariablePatch::into_new`.
+///
+/// A declared key takes what its declaration implies
+/// ([`is_sensitive_for_storage`]): the build knows what the var is, so guessing
+/// would only ever contradict it. An **undeclared** key is stored sensitive,
+/// because nothing here knows what it holds, and the cost of being wrong runs
+/// one way — a masked value an admin can unmask is a nuisance, a published
+/// secret is not.
+///
+/// This is the rule `admin::settings::handle_create` already applies to a POST
+/// that omits the field ("Absent means sensitive. A caller that does not say is
+/// protected"). It lives here so the PUT path gets it too: a
+/// `PATCH /b/admin/api/settings/MY_SERVICE_TOKEN` on a key with no row takes
+/// `upsert_by_key`'s create branch, whose patch carries no `sensitive`, and
+/// used to store the row unflagged — so the same ad hoc key was protected
+/// through POST and published through PUT.
+///
+/// ## The cost, weighed and accepted
+///
+/// A sensitive row is not exportable (`dev::data_snapshot::variable_is_exportable`
+/// requires a clean `0`), so ad hoc keys default to being left out of a seed
+/// bundle. Parity with POST wins over exportability: the export filter is
+/// deliberately fail-closed, publishing an unknown value into a bundle that
+/// travels to another deployment is the irreversible mistake, and an operator
+/// who wants an ad hoc row to travel can clear its sensitive flag in the admin
+/// UI — a deliberate act, which is exactly the signal the export filter is
+/// looking for. What the export must NOT do is drop such rows in silence, so it
+/// logs each one it leaves behind.
+///
+/// This is also narrower than it looks: POST has defaulted to sensitive since
+/// before this rule existed, so ad hoc rows created through the admin UI were
+/// already non-exportable. Only the PUT-created ones change, and they change to
+/// match.
+pub fn is_sensitive_by_default_when_created(key: &str) -> bool {
+    is_sensitive_for_storage(key) || !is_declared_key(key)
+}
+
+/// The `sensitive` column a variables-table row for `key` must be written
+/// with.
+///
+/// A **declared** var answers for itself — `ConfigVar::is_sensitive()`, i.e.
+/// `InputType::Password` — because the declaration is the only thing that
+/// knows `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` holds a password
+/// despite ending in neither `_SECRET` nor `_KEY`. The suffix convention
+/// applies on top, so an undeclared key that SPELLS itself a secret is caught,
+/// and so is a declared `*_SECRET` var whose `input_type` was left `Text`.
+///
+/// An undeclared key that does neither — `MY_SERVICE_TOKEN` — is false here,
+/// and deliberately: this answers "what does the build know this key to be",
+/// and about that key it knows nothing. Protecting it is a different question,
+/// answered at creation by [`is_sensitive_by_default_when_created`].
+///
+/// It is deliberately a union rather than "ask the declaration, else the
+/// suffix": every disagreement between the two resolves to *more* masking,
+/// which is the only safe direction for a flag whose whole job is to keep a
+/// value out of an API response.
+///
+/// This must stay consistent with `util::is_sensitive_key`, the read path's
+/// union of the stored flag and [`has_sensitive_suffix`]: that reader can
+/// only recover a Password-typed declared var's sensitivity from the stored
+/// flag, so a writer that gets the flag wrong leaks the value and no reader
+/// can tell. It is applied at `platform_state::variables::NewVariable::into_row`,
+/// the funnel every row creation passes through, rather than at each call site,
+/// because a call site that forgets is invisible until somebody reads the value
+/// back out of an API response.
+pub fn is_sensitive_for_storage(key: &str) -> bool {
+    has_sensitive_suffix(key) || declared_sensitive_keys().contains(key)
+}
+
+/// [`is_sensitive_for_storage`] for a caller that already holds the
+/// declaration, taking it from the `ConfigVar` in hand rather than looking the
+/// key up in the memoized set.
+///
+/// The same three-way union, term for term: `Password`-typed, `auto_generate`,
+/// or a `_SECRET`/`_KEY` suffix. It must be, or the two would disagree about
+/// an `auto_generate` var that carries neither of the other markers, and
+/// `seed_defaults` (which uses this) would write a flag the boot repair pass
+/// (which uses the other) then changed back on the same data.
+///
+/// Read from the `ConfigVar` in hand rather than looked up by key, because
+/// that is the right source for a caller reasoning about a declaration as
+/// data: `seed_defaults` hashes declared metadata to decide whether the
+/// declarations changed since the last seed, and a key-only rule would stop
+/// that hash noticing when a var BECOMES a password.
+pub fn is_sensitive_var(var: &ConfigVar) -> bool {
+    var.is_sensitive() || var.auto_generate || has_sensitive_suffix(&var.key)
+}
+
 /// Whether `key` names infrastructure configuration: `IMPRESSPRESS_*` with no
 /// `__` separator (`IMPRESSPRESS_RUN_MIGRATIONS`, `IMPRESSPRESS_DEPLOY_TOKEN`).
 ///
@@ -414,12 +568,14 @@ pub fn is_internal_key(key: &str) -> bool {
 /// adapter-injected ([`is_internal_key`]).
 ///
 /// Neither class is ever variables-table config, so a row carrying one is a
-/// mistake or a forgery. Named once here because three surfaces have to agree
+/// mistake or a forgery. Named once here because four surfaces have to agree
 /// on it and would otherwise each carry their own copy of the pair:
 /// `admin::ops::reject_runtime_owned_key` (the admin write path),
 /// `blocks::config`'s `served_only_from_boot_map` (the read path, which
-/// answers these from the boot map whatever the table holds), and
-/// `dev::data_snapshot::import` (the seed-bundle write path).
+/// answers these from the boot map whatever the table holds),
+/// `dev::data_snapshot::import` (the seed-bundle write path), and
+/// `platform_state::variables::seed_and_load` (the process-environment write
+/// path).
 pub fn is_runtime_owned_key(key: &str) -> bool {
     is_infrastructure_key(key) || is_internal_key(key)
 }
@@ -445,6 +601,53 @@ pub fn is_runtime_owned_key(key: &str) -> bool {
 /// carry it in either direction) want this one.
 pub fn is_instance_owned_key(key: &str) -> bool {
     key == crate::blocks::auth::JWT_SECRET_KEY || is_runtime_owned_key(key)
+}
+
+/// Whether `key` holds a credential that is consumed ONCE at provisioning and
+/// is inert afterwards, so clearing it cannot break anything that is running.
+///
+/// **Exactly one key: the bootstrap admin password.** The distinction is not
+/// about who reads these values but about which branch inside
+/// `auth::bootstrap::run` populates `wafer_run__auth__users`, because that
+/// table is the early-return that makes a value spent. `run` is called from
+/// `AuthServiceImpl::init` on EVERY boot, and it has three branches:
+///
+/// 1. email + password → `bootstrap_with_email_password` inserts a `users` row
+///    and a `local_credentials` row. From the next boot on, `run` returns
+///    early and never reads the password again: it survives as an argon2 hash,
+///    and the plaintext row is a spent copy no login consults. Clearable.
+/// 2. token only → `bootstrap_with_token` inserts into `bootstrap_tokens` and
+///    **creates no user at all**. `users` stays empty, so every subsequent boot
+///    re-runs this branch, re-reads the plaintext token, and mints a fresh 24h
+///    row from it. The stored value is a LIVE credential that is continuously
+///    reissued, not a spent copy.
+/// 3. neither → nothing.
+///
+/// So `BOOTSTRAP_ADMIN_TOKEN` is deliberately NOT here. Exempting it from the
+/// sensitive-empty guard is a lockout: on a deployment provisioned by token
+/// with no admin user yet, clearing the row lets the outstanding
+/// `bootstrap_tokens` row expire within 24h with nothing to regenerate it and
+/// no admin path left — and on Cloudflare there is no process environment to
+/// re-seed from, so there is no route back at all. A token that has already
+/// been redeemed into an admin user is inert, but nothing in the row says
+/// whether it has, and guessing wrong one way is an inconvenience while
+/// guessing wrong the other locks the operator out of their own deployment.
+///
+/// `BOOTSTRAP_ADMIN_EMAIL` is not here either, for a different reason: it stays
+/// live after provisioning — `auth::service::ensure_admin_role` and
+/// `initial_role_for` read it on every signup and token mint to decide who is
+/// admin — so it is ordinary config, and not sensitive.
+///
+/// Exists because `admin::ops::update_variable` refuses to clear a sensitive
+/// value ("would break auth"), and that reasoning does not reach a spent
+/// password. Once `is_sensitive_for_storage` started flagging it — it is
+/// declared `InputType::Password` — the guard began refusing the clear, while
+/// `delete_variable` and the Variables page's `key_is_deletable` already refuse
+/// to delete a declared `WAFER_RUN_SHARED__*` row. A bootstrapped deployment
+/// would have been left holding a plaintext admin password it no longer needs
+/// and cannot remove by any route.
+pub fn is_provisioning_only_key(key: &str) -> bool {
+    key == crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY
 }
 
 #[cfg(test)]
@@ -546,6 +749,70 @@ mod truth_table_tests {
         assert!(form_bool(&form, "explicit"));
         assert!(!form_bool(&form, "blank"));
         assert!(!form_bool(&form, "absent"));
+    }
+}
+
+#[cfg(test)]
+mod sensitivity_tests {
+    use super::{has_sensitive_suffix, is_sensitive_for_storage, shared_config_vars};
+
+    /// The declaration is what knows a suffix-less key holds a password, and
+    /// the suffix rule still catches an undeclared ad hoc key. Both halves,
+    /// against the real declared set.
+    #[test]
+    fn the_declaration_and_the_suffix_rule_are_both_consulted() {
+        let password_key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !has_sensitive_suffix(password_key),
+            "this key must be one the suffix rule cannot catch, or the test proves nothing"
+        );
+        assert!(is_sensitive_for_storage(password_key));
+        assert!(is_sensitive_for_storage(
+            crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY
+        ));
+
+        // Undeclared, caught by the suffix rule alone.
+        assert!(is_sensitive_for_storage("X__Y__STRIPE_SECRET"));
+        assert!(is_sensitive_for_storage("X__Y__MAILGUN_API_KEY"));
+
+        // Declared and plainly not a secret.
+        assert!(!is_sensitive_for_storage("WAFER_RUN_SHARED__APP_NAME"));
+        // Undeclared and not a secret.
+        assert!(!is_sensitive_for_storage("SITE_TAGLINE"));
+    }
+
+    /// Every declared var the storage rule calls sensitive must also read as
+    /// sensitive through `util::is_sensitive_key` once stored with that flag —
+    /// the write path and the read path are a pair, and a var that only one of
+    /// them recognises is the defect this rule exists to close.
+    #[test]
+    fn what_the_write_path_flags_the_read_path_masks() {
+        let declared = shared_config_vars();
+        for var in &declared {
+            let stored = is_sensitive_for_storage(&var.key);
+            if stored {
+                assert!(
+                    crate::util::is_sensitive_key(&var.key, 1),
+                    "{} is stored sensitive but would not be masked",
+                    var.key
+                );
+            }
+            // And the key-only rule and the ConfigVar-in-hand rule must agree
+            // term for term, or `seed_defaults` and the boot repair pass would
+            // write different flags for the same declaration.
+            assert_eq!(
+                stored,
+                super::is_sensitive_var(var),
+                "the two spellings of the storage rule must agree: {}",
+                var.key
+            );
+            assert_eq!(
+                stored,
+                var.is_sensitive() || var.auto_generate || has_sensitive_suffix(&var.key),
+                "the storage rule must be exactly declaration OR auto-generate OR suffix: {}",
+                var.key
+            );
+        }
     }
 }
 

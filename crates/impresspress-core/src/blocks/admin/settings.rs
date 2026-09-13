@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ConfigVar, InputStream, InputType, Message, OutputStream};
+use wafer_run::{context::Context, ConfigVar, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{AdminSettingView, AdminSettingsResponse},
@@ -246,11 +246,14 @@ fn seed_payload_hash(vars: &[ConfigVar]) -> String {
     keys.sort_by(|a, b| a.key.cmp(&b.key));
     let mut buf = String::with_capacity(vars.len() * 128);
     for v in keys {
-        let sensitive = if v.input_type == InputType::Password {
-            1
-        } else {
-            0
-        };
+        // The same rule the seed loop below writes with, so the hash and the
+        // write cannot disagree about what a var's flag should be — and so a
+        // build that changes a var's sensitivity invalidates the gate and
+        // re-seeds instead of leaving the stored flag stale. Read from the var
+        // in hand (`is_sensitive_var`), not looked up by key: this hash exists
+        // to notice a DECLARATION change, including a var that just became a
+        // password.
+        let sensitive = i32::from(crate::config_vars::is_sensitive_var(v));
         // Fixed shape per var: `key\x1fname\x1fdescription\x1fdefault\x1fwarning\x1fsensitive\x1e`.
         // ASCII unit-separator (0x1f) + record-separator (0x1e) bracket
         // each field so embedded newlines / colons in description text
@@ -300,7 +303,9 @@ pub async fn seed_defaults(ctx: &dyn Context) {
         .collect();
 
     for var in &vars {
-        let sensitive = var.input_type == InputType::Password;
+        // What the DECLARATION requires. Not what gets written unconditionally:
+        // see the existing-row branch, which may only raise.
+        let sensitive = crate::config_vars::is_sensitive_var(var);
         let name = if var.name.is_empty() {
             &var.key
         } else {
@@ -337,15 +342,22 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 let same_name = row.name == *name;
                 let same_desc = row.description == var.description;
                 let same_warn = row.warning == var.warning;
-                let same_sens = row.sensitive == sensitive;
-                if same_name && same_desc && same_warn && same_sens && !stale_builtin_asset {
+                // `sensitive` is deliberately NOT patched here, in either
+                // direction. This branch is behind the declared-vars hash gate
+                // above, which every settled deployment passes — so anything
+                // written here waits for a release that changes a declaration,
+                // and a security flag cannot be on that schedule.
+                // `platform_state::variables::repair_sensitive_flags` owns the
+                // reconciliation instead: same rule, un-gated, on all three
+                // targets. This loop keeps only the descriptive metadata, which
+                // is exactly what the gate is appropriate for.
+                if same_name && same_desc && same_warn && !stale_builtin_asset {
                     continue;
                 }
                 let mut patch = VariablePatch {
                     name: Some(name.clone()),
                     description: Some(var.description.clone()),
                     warning: Some(var.warning.clone()),
-                    sensitive: Some(sensitive),
                     ..Default::default()
                 };
                 if stale_builtin_asset {
@@ -411,6 +423,8 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
 #[cfg(test)]
 mod tests {
+    use wafer_run::InputType;
+
     use super::*;
     use crate::test_support::TestContext;
 
@@ -672,6 +686,169 @@ mod tests {
             "a *_SECRET value must be masked even with the sensitive flag unset"
         );
     }
+
+    /// A `Password`-typed declared var supplied through the process
+    /// environment must come back MASKED from the settings read path.
+    ///
+    /// The boot seeder derived the row's `sensitive` flag from the
+    /// `_SECRET`/`_KEY` suffix alone, so
+    /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` — declared
+    /// `InputType::Password`, ending in neither suffix — landed with
+    /// `sensitive = 0`. `is_sensitive_key` is a union of the stored flag and
+    /// the suffix, and this key satisfies neither, so `GET
+    /// /b/admin/api/settings/{key}` returned the bootstrap password in clear.
+    /// `seed_defaults` never repairs it: the declared-vars hash gate
+    /// short-circuits once stamped.
+    ///
+    /// Drives the real write path (`seed_and_load`) into the real read paths,
+    /// not the stored integer, because the integer is only interesting for
+    /// what the reader does with it.
+    #[tokio::test]
+    async fn an_env_supplied_password_var_is_masked_by_the_settings_read_path() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        ctx.seed_env_vars(&[(key, "hunter2")]).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let body = output_json(handle_get(&ctx, &msg).await).await;
+        assert_eq!(
+            body.get("data")
+                .and_then(|d| d.get("value"))
+                .and_then(|v| v.as_str()),
+            Some(MASKED_VALUE),
+            "an env-supplied bootstrap password must not be readable through the settings API"
+        );
+
+        // The listings publish it too, and both must agree.
+        for listing in [
+            output_json(handle_list(&ctx).await).await,
+            output_json(handle_list_full(&ctx).await).await,
+        ] {
+            let raw = listing.to_string();
+            assert!(
+                !raw.contains("hunter2"),
+                "a settings listing leaked the bootstrap password: {raw}"
+            );
+        }
+    }
+
+    /// Stamp the declared-vars hash into the config snapshot, so
+    /// `seed_defaults` short-circuits exactly as it does on every settled
+    /// deployment. Without this a test runs against a state production reaches
+    /// only on the boot after a declaration changes.
+    fn stamp_current_hash(ctx: &mut TestContext) {
+        let hash = seed_payload_hash(&crate::config_vars::shared_config_vars());
+        let snapshot = serde_json::json!({
+            ADMIN_BLOCK_NAME: { "enabled": true, "seed_defaults_hash": hash }
+        })
+        .to_string();
+        ctx.set_config(crate::features::BLOCK_SETTINGS_CONFIG_KEY, &snapshot);
+    }
+
+    /// An accidental `sensitive` flag on a declared non-secret must be
+    /// recoverable ON A DEPLOYED INSTANCE — one whose declared-vars hash is
+    /// already stamped, which is every deployment until some release changes a
+    /// declaration.
+    ///
+    /// `handle_create` reads an omitted `sensitive` as "absent means
+    /// sensitive", and `create_variable` does not refuse `WAFER_RUN_SHARED__*`,
+    /// so one POST can flag a declared non-secret. The row is then unclearable
+    /// (the sensitive-empty guard) and undeletable (`delete_variable` refuses
+    /// declared shared vars), so a repair that does not run is no repair.
+    ///
+    /// This is why the reconciliation lives in `repair_sensitive_flags` and not
+    /// in `seed_defaults`: the assertion below that `seed_defaults` changes
+    /// nothing is the whole point.
+    #[tokio::test]
+    async fn an_accidental_flag_is_cleared_on_an_already_stamped_deployment() {
+        let key = crate::config_vars::CORS_ALLOWED_ORIGINS_KEY;
+        assert!(
+            !crate::config_vars::is_sensitive_var(&crate::config_vars::shared_var(key)),
+            "this test needs a declared var the storage rule does NOT flag"
+        );
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        seed_var(&ctx, key, "https://shop.example", true).await;
+        stamp_current_hash(&mut ctx);
+
+        // The gate holds, so this cannot be where the repair lives.
+        seed_defaults(&ctx).await;
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "seed_defaults must short-circuit here — that is the state every \
+             settled deployment is in"
+        );
+
+        // The un-gated boot pass is what actually recovers it.
+        ctx.repair_sensitive_flags().await;
+        assert!(
+            !variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "a declared non-secret must be recoverable from an accidental flag"
+        );
+    }
+
+    /// The lowering is narrow in two ways, both asserted against the same
+    /// un-gated pass: a key the `_SECRET`/`_KEY` suffix rule catches is never
+    /// lowered, and neither is an UNDECLARED ad hoc row an admin flagged by
+    /// hand.
+    #[tokio::test]
+    async fn the_repair_pass_never_lowers_a_suffix_sensitive_or_ad_hoc_row() {
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        stamp_current_hash(&mut ctx);
+
+        seed_var(&ctx, "WAFER_RUN_SHARED__PROBE_SECRET", "s3cr3t", true).await;
+        seed_var(&ctx, "MY_SERVICE_TOKEN", "tok", true).await;
+
+        ctx.repair_sensitive_flags().await;
+
+        assert!(
+            variables::get_by_key(&ctx, "WAFER_RUN_SHARED__PROBE_SECRET")
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "a suffix-sensitive key must never be lowered"
+        );
+        assert!(
+            variables::get_by_key(&ctx, "MY_SERVICE_TOKEN")
+                .await
+                .expect("get")
+                .expect("row")
+                .sensitive,
+            "an undeclared ad hoc row an admin flagged is not this code's to unflag"
+        );
+    }
+
+    // The raise direction deliberately has no test here: `seed_defaults` no
+    // longer writes `sensitive` at all. It is covered where it now lives —
+    // `platform_state::variables::boot_tests`, over a row inserted straight
+    // into the table so `NewVariable::into_row` cannot pre-empt the assertion.
+    // A `seed_defaults` test for it would have been vacuous, because this
+    // module's own `seed_var` helper writes through `into_row` and so arrives
+    // already flagged.
 
     /// Read one variable row's `value` column.
     async fn stored_value(ctx: &dyn Context, key: &str) -> Option<String> {
