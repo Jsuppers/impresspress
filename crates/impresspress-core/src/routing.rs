@@ -308,6 +308,14 @@ pub const ROUTES: &[Route] = &[
     // level refines it. The inspector sources endpoint granularity from the
     // same `info().endpoints` (see [`routes_config`]).
     Route::new("/b/vector/", RouteAccess::Public, "impresspress/vector"),
+    // Signal — WebRTC room-code handshake for blockfarming's online play.
+    // ONE public prefix, same reasoning as vector's: every declared endpoint
+    // is `AuthLevel::Public` (the game has no account), enforced from
+    // `SignalBlock::info().endpoints` via `declared_access`, and a guard
+    // test (`signal::tests::every_signal_endpoint_is_public`) keeps it that
+    // way. Abuse is bounded by per-IP rate limiting inside the block itself,
+    // not by this route's tier.
+    Route::new("/b/signal/", RouteAccess::Public, "impresspress/signal"),
 ];
 
 /// Generate the routing table as JSON config (same format as wafer-run/router).

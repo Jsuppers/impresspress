@@ -468,6 +468,25 @@ impl TestContext {
         ctx
     }
 
+    /// Build a `TestContext` with admin + signal migrations applied.
+    ///
+    /// No auth: the signal block has no user and never reads one — every
+    /// endpoint is public, so admin-only is enough to let its own
+    /// `lifecycle(Init)`-equivalent (`apply_block_migrations`) upsert its
+    /// `impresspress__admin__block_settings` tracking row, the same
+    /// prerequisite `with_llm` and `with_products` rely on.
+    #[cfg(feature = "block-signal")]
+    pub async fn with_signal() -> Self {
+        let ctx = Self::with_admin().await;
+        ctx.apply_block_migrations(
+            "impresspress/signal",
+            crate::blocks::signal::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::signal::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        ctx
+    }
+
     /// Build a `TestContext` with admin + dev-sandbox migrations applied, the
     /// `impresspress/dev` block registered over `control`, and the `/b/dev`
     /// `Admin` extra route added the way `ImpresspressBuilder::add_route`

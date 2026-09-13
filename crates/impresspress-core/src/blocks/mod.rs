@@ -44,6 +44,8 @@ pub mod messages;
 pub mod products;
 pub mod rate_limit;
 pub mod router;
+#[cfg(feature = "block-signal")]
+pub mod signal;
 pub mod storage;
 pub mod system;
 // Not gated on a target. The block is a thin wrapper over an injected
@@ -180,6 +182,8 @@ feature_block_manifest! {
     userportal::UserPortalBlock,
     #[cfg(feature = "block-vector")]
     vector::VectorBlock,
+    #[cfg(feature = "block-signal")]
+    signal::SignalBlock,
     // Native-only: fastembed pulls ONNX Runtime; `block-fastembed` is never
     // enabled on wasm32, so this gate doubles as "not wasm32".
     #[cfg(feature = "block-fastembed")]

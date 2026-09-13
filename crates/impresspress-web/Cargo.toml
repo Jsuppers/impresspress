@@ -112,6 +112,10 @@ impresspress-core = { path = "../impresspress-core", default-features = false, f
     # transformers-embed), so the page is fully functional in the demo. The old
     # exclusion predates the LlmService refactor that made this wasm32-clean.
     "block-vector",
+    # `block-signal`: WebRTC signalling rooms (`impresspress/signal`). Typed
+    # `db::*` client only — no native HTTP client, no crypto beyond what's
+    # already pulled in — so it is wasm32-clean with nothing extra to wire.
+    "block-signal",
 ] }
 
 # Config service (needed for EnvConfigService::new() and ConfigService::set())

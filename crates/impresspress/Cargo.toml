@@ -31,6 +31,7 @@ default = [
     "block-tickets",
     "block-userportal",
     "block-products",
+    "block-signal",
     "embed-assets",
 ]
 sqlite = ["impresspress-core/sqlite"]
@@ -66,6 +67,7 @@ block-legalpages = ["impresspress-core/block-legalpages"]
 block-tickets = ["impresspress-core/block-tickets"]
 block-userportal = ["impresspress-core/block-userportal"]
 block-products = ["impresspress-core/block-products"]
+block-signal = ["impresspress-core/block-signal"]
 block-fastembed = ["impresspress-core/block-fastembed"]
 
 [dependencies]

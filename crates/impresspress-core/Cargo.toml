@@ -29,6 +29,7 @@ default = [
     "block-tickets",
     "block-userportal",
     "block-products",
+    "block-signal",
     "embed-assets",
 ]
 sqlite = []
@@ -118,6 +119,9 @@ block-legalpages = ["dep:pulldown-cmark"]
 block-tickets = []
 block-userportal = []
 block-products = []
+# WebRTC signalling rooms for blockfarming's online play (`impresspress/signal`).
+# No sub-dependencies of its own: typed `db::*` client, no crypto, no HTTP client.
+block-signal = []
 # Browser development sandbox control plane (`impresspress/dev`).
 #
 # Deliberately OFF in `default`: the block is the sandbox's own control
