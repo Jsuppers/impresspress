@@ -60,6 +60,30 @@ class StubCustomEvent {
   }
 }
 
+/**
+ * The half of htmx's `responseInfo` the error listeners read.
+ *
+ * `requestConfig.triggeringEvent` is what separates a request a PERSON made
+ * from one the page made for itself: htmx passes the DOM event through for a
+ * click or a submit, and the browser marks those `isTrusted`; `hx-trigger="load"`
+ * and polling issue their request with no event at all, and htmx's own
+ * synthetic triggers carry one it constructed, which is untrusted.
+ * `requestConfig.elt` is the element that made the request, which is where
+ * `data-error-label` is read from.
+ */
+function responseDetail(xhr, { user = false, label = null, noConfig = false } = {}) {
+  if (noConfig) return { xhr };
+  const elt = fakeElement('button');
+  if (label !== null) elt.setAttribute('data-error-label', label);
+  return {
+    xhr,
+    requestConfig: {
+      elt,
+      triggeringEvent: user ? { type: 'click', isTrusted: true } : undefined
+    }
+  };
+}
+
 /** An element with only what the toast section touches. */
 function fakeElement(tag) {
   return {
@@ -83,6 +107,12 @@ function fakeElement(tag) {
     addEventListener() {},
     remove() {
       this.removed = true;
+    },
+    // The stub has no tree, so the nearest labelled ancestor is the element
+    // itself or nothing — which is how the real buttons carry the attribute.
+    closest(selector) {
+      const attribute = selector.replace(/^\[|\]$/g, '');
+      return attribute in this.attributes ? this : null;
     }
   };
 }
@@ -158,9 +188,21 @@ export function loadChrome({ toastContainer = true } = {}) {
         kind: String(toast.className).replace('toast toast-', ''),
         text: toast.children.length ? String(toast.children[0].textContent) : ''
       })),
-    /** Fire one `htmx:responseError`, as htmx does for a 4xx/5xx answer. */
-    respondWithError(xhr) {
-      body.dispatchEvent(new StubCustomEvent('htmx:responseError', { detail: { xhr } }));
+    /**
+     * Fire one `htmx:responseError`, as htmx does for a 4xx/5xx answer.
+     *
+     * `from` models the half of htmx's `responseInfo` the listener reads:
+     * `{ user: true }` for a click or a submit (the browser marks such an
+     * event `isTrusted`), the default for a request the page issued itself
+     * (`hx-trigger="load"` and polling call the issuer with no event at all,
+     * so `triggeringEvent` is `undefined`), and `label` for a control carrying
+     * `data-error-label`. `noConfig` drops `requestConfig` entirely, which is
+     * the "htmx did not say" case.
+     */
+    respondWithError(xhr, from = {}) {
+      body.dispatchEvent(
+        new StubCustomEvent('htmx:responseError', { detail: responseDetail(xhr, from) })
+      );
     },
     /**
      * Fire one of the events htmx raises when the request never got a
@@ -169,8 +211,8 @@ export function loadChrome({ toastContainer = true } = {}) {
      * request's `responseInfo`, which at that point has no status, no body and
      * no `successful` — that field is assigned only in `handleAjaxResponse`.
      */
-    fireTransportEvent(type) {
-      body.dispatchEvent(new StubCustomEvent(type, { detail: { xhr: {} } }));
+    fireTransportEvent(type, from = {}) {
+      body.dispatchEvent(new StubCustomEvent(type, { detail: responseDetail({}, from) }));
     },
     /** Move the clock the error listeners read, in milliseconds. */
     advance(ms) {

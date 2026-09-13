@@ -3126,8 +3126,13 @@ async fn manage_products_deleted_view_reports_a_failed_restore() {
     );
     assert!(
         !html.contains("new CustomEvent('showToast'"),
-        "the per-button toast is the global htmx:responseError listener's job \
-         now; a second copy would toast one refusal twice: {html}"
+        "the per-button toast is the global htmx error listeners' job now; a \
+         second copy would toast one refusal twice: {html}"
+    );
+    assert!(
+        html.contains(r#"data-error-label="Could not restore this product""#),
+        "but the button must still name ITSELF, or a refusal with no message \
+         of its own says only `Request failed (502)`: {html}"
     );
 }
 

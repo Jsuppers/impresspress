@@ -460,6 +460,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         button .btn .btn--secondary .btn--sm type="button"
                                             hx-post=(restore_url)
                                             hx-swap="none"
+                                            data-error-label="Could not restore this product"
                                             hx-on--after-request=(reload_on_success())
                                         { "Restore" }
                                     }
@@ -520,10 +521,17 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// refused action rendered as nothing happening at all, which is the worst
 /// outcome on a page whose buttons are the only way to undo a delete or shut a
 /// money surface down. That half is gone because it stopped being this page's
-/// problem: `ui/assets/chrome.js`'s toast section now carries a global
-/// `htmx:responseError` listener that raises the same `message` for EVERY
-/// refused htmx request on every shelled page. Keeping the copy here would
-/// toast the same refusal twice.
+/// problem: `ui/assets/chrome.js`'s toast section now carries global
+/// `htmx:responseError` / `htmx:sendError` / `htmx:timeout` listeners that
+/// raise the same `message` for EVERY failed htmx request on every shelled
+/// page. Keeping the copy here would toast the same refusal twice.
+///
+/// What the copy did carry that the generic listener cannot infer is WHICH
+/// control failed — `"Could not archive this offer"` rather than
+/// `"Request failed (502)"`, which matters on a payment-link row holding an
+/// Archive and a Deactivate button. That did not go away with it: each button
+/// declares its own `data-error-label`, and the listener uses it whenever the
+/// response carries no message of its own.
 fn reload_on_success() -> String {
     "if(event.detail.successful){location.reload()}".to_string()
 }
@@ -657,6 +665,7 @@ pub async fn deleted_product_close(
                             button .btn .btn--secondary .btn--sm type="button"
                                 hx-delete=(offer_url)
                                 hx-swap="none"
+                                data-error-label="Could not archive this offer"
                                 hx-on--after-request=(reload_on_success())
                             { "Archive offer" }
                         }
@@ -679,6 +688,7 @@ pub async fn deleted_product_close(
                                             button .btn .btn--secondary .btn--sm type="button"
                                                 hx-delete=(link_url)
                                                 hx-swap="none"
+                                                data-error-label="Could not deactivate this payment link"
                                                 hx-on--after-request=(reload_on_success())
                                             { "Deactivate" }
                                         }
@@ -3037,6 +3047,7 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         button .btn .btn--secondary .btn--sm type="button"
                                             hx-post=(restore_url)
                                             hx-swap="none"
+                                            data-error-label="Could not restore this product"
                                             hx-on--after-request=(reload_on_success())
                                         { "Restore" }
                                     }
