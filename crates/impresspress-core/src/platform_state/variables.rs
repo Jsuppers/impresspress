@@ -294,10 +294,10 @@ pub async fn find_by_key(
 /// exists. A pre-existing row (a prior boot's seed, an admin-UI edit) always
 /// wins — seeding never clobbers a stored value.
 ///
-/// This is the shape [`seed_and_load`] applies to the process environment: an
-/// env var seeds a key that has no row yet and never overwrites one that does.
-/// Whether that is the right precedence is a separate question, open at the
-/// time of writing and not settled by this module.
+/// This is the right shape for a *default* and the wrong one for an
+/// instruction. [`seed_and_load`] used it for the process environment and that
+/// is precisely the bug it now documents: an env var is not a default, so it
+/// goes through [`set`] instead.
 ///
 /// Returns `Ok(true)` when a row was inserted, `Ok(false)` when one already
 /// existed. Errors bubble up so the caller can decide whether a failed seed
@@ -528,13 +528,60 @@ async fn seed_one_secret(
     insert_if_absent(db, row).await
 }
 
-/// Seed `env_vars` into the table (`INSERT OR IGNORE`), auto-generate any
-/// `auto_generate` secrets, reconcile every row's `sensitive` flag, and return
-/// the full key→value map currently stored.
+/// Write `env_vars` into the table, auto-generate any `auto_generate` secrets,
+/// reconcile every row's `sensitive` flag, and return the full key→value map
+/// currently stored.
 ///
 /// `env_vars` is empty for the browser and Cloudflare targets (their config
 /// lives in the platform store, not process env) and carries the
 /// declared-key-filtered process environment on native.
+///
+/// ## Precedence: the process environment wins over the stored row
+///
+/// An env var is an **operator's instruction for this boot**, so it is
+/// written with [`set`] and overwrites whatever the row holds. It used to be
+/// seeded with `insert_if_absent`, which meant it only ever landed on the very
+/// first boot of a fresh database: from the second boot on, a row existed and
+/// every `WAFER_RUN_SHARED__*` export was silently discarded. An operator who
+/// set `WAFER_RUN_SHARED__APP_NAME=Foo` on a running deployment saw nothing
+/// change and got no log line saying why.
+///
+/// The bootstrap-admin pair looked like it still worked, which is what hid the
+/// defect: their declared default is `""`, so their row is empty, and
+/// [`crate::blocks::config`]'s read order falls an empty row through to the
+/// boot map — whose `EnvConfigService` reads `std::env` directly. Only keys
+/// with a non-empty default were affected, and only after the first boot.
+///
+/// Env-wins is the choice that keeps the operator and the admin from *silently*
+/// fighting. Whichever way it went, one of them loses; the difference is
+/// whether anybody can see it:
+///
+/// - Row-wins (the old behaviour) leaves the env var permanently inert with no
+///   surface that shows it: the admin UI displays the row, the env says
+///   something else, and neither side is told.
+/// - Env-wins makes the loss observable. The value that is actually in effect
+///   is the one stored in the table, so the admin UI shows the truth the moment
+///   the process comes back, and each override that changed a stored value logs
+///   a warning naming the key. An admin edit to an env-pinned key survives
+///   until the next restart and is then visibly reverted — the operator's
+///   deployment config is the thing they can only change by editing the
+///   deployment, and it is the thing that reasserts itself.
+///
+/// An **empty** env value is treated as unset and skipped, so `FOO=` in a
+/// shell or `.env` cannot blank out a meaningful stored value. That is the
+/// convention already used by
+/// [`crate::blocks::admin::settings::seed_defaults`] and
+/// [`crate::blocks::auth::config::AuthConfig::from_map`].
+///
+/// Keys the runtime owns ([`crate::config_vars::is_runtime_owned_key`] —
+/// infrastructure `IMPRESSPRESS_*` and internal `__…__` keys) are refused: they
+/// are never variables-table config, and `blocks::config` would not serve such
+/// a row anyway. The JWT secret is deliberately NOT refused — it is a real
+/// variables-table row, and pinning it from the deployment environment is
+/// exactly how an operator keeps sessions valid across a rebuild. (That is the
+/// difference between `is_runtime_owned_key` and
+/// [`crate::config_vars::is_instance_owned_key`], which guards *imported* data
+/// instead.)
 ///
 /// PRECONDITION: the table must already exist — either because the admin
 /// block's `lifecycle(Init)` has run (browser, Cloudflare), or because the
@@ -544,24 +591,31 @@ pub async fn seed_and_load(
     db: &Arc<dyn DatabaseService>,
     env_vars: &[(String, String)],
 ) -> Result<HashMap<String, String>, String> {
-    // 1. Seed env-provided values (existing rows win).
+    // 1. Apply env-provided values (the environment wins — see above).
     for (key, value) in env_vars {
-        // `sensitive` is settled by `NewVariable::into_row` from the key's
-        // declaration and the `_SECRET`/`_KEY` suffix; `false` here asserts
-        // nothing extra.
-        let row = NewVariable {
-            key: key.clone(),
-            value: value.clone(),
-            name: String::new(),
-            description: String::new(),
-            warning: String::new(),
-            sensitive: false,
-            updated_by: String::new(),
-            block: block_for_key(key),
+        if crate::config_vars::is_runtime_owned_key(key) {
+            tracing::warn!(
+                key = %key,
+                "refusing to store a runtime-owned key from the environment; \
+                 infrastructure and adapter-injected keys are never variables-table config"
+            );
+            continue;
         }
-        .into_row();
-        if let Err(e) = insert_if_absent(db, row).await {
-            tracing::warn!(key = %key, error = %e, "failed to seed env variable");
+        if value.is_empty() {
+            continue;
+        }
+        // `sensitive` is settled by `NewVariable::into_row` and `set` from the
+        // key's declaration and the `_SECRET`/`_KEY` suffix; `false` here
+        // asserts nothing extra.
+        match set(db, key, value, "", "", false).await {
+            Ok(Wrote::Replaced) => tracing::warn!(
+                key = %key,
+                "the process environment replaced the stored value for this \
+                 config key; an admin edit to it is reverted on every boot \
+                 until the environment variable is removed"
+            ),
+            Ok(Wrote::Created | Wrote::FlagRaised | Wrote::Unchanged) => {}
+            Err(e) => tracing::warn!(key = %key, error = %e, "failed to seed env variable"),
         }
     }
 
@@ -1424,6 +1478,37 @@ mod boot_tests {
         assert_eq!(row.name, "Has Landing Page");
     }
 
+    /// The audit finding, stated as a test: an operator exports
+    /// `WAFER_RUN_SHARED__APP_NAME=Foo` on a deployment whose database already
+    /// carries a row for that key (every boot after the first does), and the
+    /// value they set has to be the one that boots.
+    #[tokio::test]
+    async fn an_env_var_beats_the_row_already_in_the_table() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        seed_if_absent(&db, key, "Impresspress", "App Name", "declared", false)
+            .await
+            .expect("the declared default lands on the first boot");
+
+        let vars = seed_and_load(&db, &[(key.to_string(), "Foo".to_string())])
+            .await
+            .expect("seed and load");
+        assert_eq!(
+            vars.get(key).map(String::as_str),
+            Some("Foo"),
+            "the process environment is the operator's instruction for this boot"
+        );
+        assert_eq!(
+            find_by_key(&db, key)
+                .await
+                .expect("list")
+                .expect("row")
+                .value,
+            "Foo",
+            "and it must be stored, so the admin UI shows the value in effect"
+        );
+    }
+
     /// `FOO=` in a shell or a `.env` file is "unset", not "set to blank": an
     /// empty env value must not wipe a meaningful stored one. Same convention
     /// as `admin::settings::seed_defaults` and `AuthConfig::from_map`.
@@ -1815,9 +1900,41 @@ mod boot_tests {
         );
     }
 
+    /// An env var must never write a key the RUNTIME owns. Infrastructure
+    /// (`IMPRESSPRESS_*` with no `__`) and internal adapter-injected (`__…__`)
+    /// keys are not variables-table config by the repo's naming rules, and
+    /// `blocks::config` answers them from the boot map whatever the table
+    /// holds — so a row for one is at best dead weight and at worst a forgery
+    /// (`__IMPRESSPRESS_RUNTIME_KIND__` is what keeps Stripe secret-key
+    /// operations off in a visitor's browser).
+    #[tokio::test]
+    async fn a_runtime_owned_key_is_never_written_from_the_environment() {
+        let db = migrated_db().await;
+        let env = [
+            (
+                crate::config_vars::DEPLOY_TOKEN_KEY.to_string(),
+                "tok".to_string(),
+            ),
+            (
+                "__IMPRESSPRESS_RUNTIME_KIND__".to_string(),
+                "server".to_string(),
+            ),
+            ("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string()),
+        ];
+        let vars = seed_and_load(&db, &env).await.expect("seed and load");
+
+        assert_eq!(vars.get(crate::config_vars::DEPLOY_TOKEN_KEY), None);
+        assert_eq!(vars.get("__IMPRESSPRESS_RUNTIME_KIND__"), None);
+        assert_eq!(
+            vars.get("WAFER_RUN_SHARED__APP_NAME").map(String::as_str),
+            Some("Foo"),
+            "a legitimate shared key in the same batch still lands"
+        );
+    }
+
     /// A boot that re-asserts the same environment writes nothing at all —
-    /// the property that keeps a boot from issuing an UPDATE per declared key
-    /// on every cold start.
+    /// the property that keeps env-wins from issuing an UPDATE per declared
+    /// key on every cold start.
     #[tokio::test]
     async fn re_applying_the_same_environment_writes_nothing() {
         let db = migrated_db().await;
