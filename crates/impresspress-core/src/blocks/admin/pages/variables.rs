@@ -894,6 +894,30 @@ pub async fn handle_update_variable(
 /// [`handle_update_variable`] does: the control targets `closest tr` with
 /// `outerHTML`, so an empty body is what removes the row. Re-rendering the
 /// whole page into a `<tr>` would nest a document inside a table row.
+/// `POST /b/admin/variables/{key}/reset-to-environment` — the Variables page's
+/// row control for handing a key back to the process environment.
+///
+/// The UI half of the recovery route the boot WARN names. Neither of the
+/// controls already on this page can do it: delete refuses a declared shared
+/// var, and an edit re-stamps ownership.
+pub async fn handle_reset_variable_to_environment(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
+    let key = msg.var("key");
+    if let Err(out) = ops::reset_variable_to_environment(ctx, msg, key).await {
+        return out;
+    }
+    // The stored value is deliberately left in place; only the next boot
+    // re-seeds it from the environment. Saying so avoids the obvious
+    // misreading of a control called "reset".
+    ui::html_response_with_toast(
+        html! {},
+        "Handed back to the environment — the stored value is replaced on the next restart",
+        "success",
+    )
+}
+
 pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let key = msg.var("key");
     if let Err(out) = ops::delete_variable(ctx, msg, key).await {

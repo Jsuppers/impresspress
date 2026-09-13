@@ -290,6 +290,23 @@ pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStr
     ok_json(&serde_json::json!({"deleted": key}))
 }
 
+/// `POST /b/admin/api/settings/{key}/reset-to-environment`.
+///
+/// Clears the row's admin-ownership marker so the next boot seeds the key from
+/// the process environment again. The supported way out of a key an admin edit
+/// has pinned — see [`ops::reset_variable_to_environment`] for why neither
+/// delete nor an empty update is that way.
+pub(super) async fn handle_reset_to_environment(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let key = match crud::path_var(msg, "key", "Missing setting key") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = ops::reset_variable_to_environment(ctx, msg, key).await {
+        return response;
+    }
+    ok_json(&serde_json::json!({"reset_to_environment": key}))
+}
+
 /// Full block name of the admin block — the `block_settings` row whose
 /// `seed_defaults_hash` column gates this function.
 const ADMIN_BLOCK_NAME: &str = "impresspress/admin";

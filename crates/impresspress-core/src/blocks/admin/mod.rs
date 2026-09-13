@@ -81,6 +81,7 @@ enum Route {
     SetSettingApi,
     CreateSettingApi,
     DeleteSettingApi,
+    ResetSettingToEnvironmentApi,
     ExtensionsApi,
     // ── Consolidated settings pages, `/b/admin/settings/...` ──
     SettingsRedirect,
@@ -100,6 +101,7 @@ enum Route {
     EditVariableForm,
     UpdateVariable,
     DeleteVariable,
+    ResetVariableToEnvironment,
     NetworkInboundDetail,
     CreateWrapGrant,
     DeleteWrapGrant,
@@ -338,6 +340,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Delete variable API"),
     EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/admin/api/settings/{key}/reset-to-environment",
+        Route::ResetSettingToEnvironmentApi,
+    )
+    .summary("Hand a variable back to the process environment"),
+    EndpointRoute::admin(
         HttpMethod::Get,
         "/b/admin/api/extensions",
         Route::ExtensionsApi,
@@ -441,6 +449,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         Route::DeleteVariable,
     )
     .summary("Delete variable (row control)"),
+    EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/admin/variables/{key}/reset-to-environment",
+        Route::ResetVariableToEnvironment,
+    )
+    .summary("Reset variable to environment (row control)"),
     EndpointRoute::admin(
         HttpMethod::Get,
         "/b/admin/network/detail/inbound",
@@ -613,6 +627,9 @@ crate::impresspress_feature_block! {
             Route::SetSettingApi => settings::handle_set(ctx, &msg, input).await,
             Route::CreateSettingApi => settings::handle_create(ctx, &msg, input).await,
             Route::DeleteSettingApi => settings::handle_delete(ctx, &msg).await,
+            Route::ResetSettingToEnvironmentApi => {
+                settings::handle_reset_to_environment(ctx, &msg).await
+            }
             Route::ExtensionsApi => handle_extensions(ctx, &this.block_settings_handle),
 
             // ── Consolidated settings pages ──
@@ -638,6 +655,9 @@ crate::impresspress_feature_block! {
             Route::EditVariableForm => pages::handle_edit_variable_form(ctx, &msg).await,
             Route::UpdateVariable => pages::handle_update_variable(ctx, &msg, input).await,
             Route::DeleteVariable => pages::handle_delete_variable(ctx, &msg).await,
+            Route::ResetVariableToEnvironment => {
+                pages::handle_reset_variable_to_environment(ctx, &msg).await
+            }
             Route::NetworkInboundDetail => pages::network_inbound_detail(ctx, &msg).await,
             Route::CreateWrapGrant => handle_create_wrap_grant(ctx, msg, input).await,
             Route::DeleteWrapGrant => handle_delete_wrap_grant(ctx, msg).await,
@@ -1529,6 +1549,12 @@ mod table_tests {
                 &[("key", "MY_SETTING")],
             ),
             (
+                "create",
+                "/b/admin/api/settings/MY_SETTING/reset-to-environment",
+                Route::ResetSettingToEnvironmentApi,
+                &[("key", "MY_SETTING")],
+            ),
+            (
                 "retrieve",
                 "/b/admin/api/extensions",
                 Route::ExtensionsApi,
@@ -1621,6 +1647,12 @@ mod table_tests {
                 "/b/admin/variables/LEGACY_THING",
                 Route::DeleteVariable,
                 &[("key", "LEGACY_THING")],
+            ),
+            (
+                "create",
+                "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME/reset-to-environment",
+                Route::ResetVariableToEnvironment,
+                &[("key", "WAFER_RUN_SHARED__APP_NAME")],
             ),
             (
                 "update",

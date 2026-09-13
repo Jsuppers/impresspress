@@ -537,6 +537,51 @@ async fn is_clearable_provisioning_credential(ctx: &dyn Context, key: &str) -> b
 /// `dev::data_snapshot::import` learned to refuse them) is exactly what an
 /// operator needs to be able to remove. Refusing it here would leave the row
 /// permanent, which is the gap this function closes.
+/// Hand a config key back to the process environment: clear its
+/// admin-ownership marker so the next boot seeds it from the environment
+/// again, and write an audit-log row.
+///
+/// The supported exit from a pinned key, and the reason admin-wins is not a
+/// one-way door. The two routes that look like they should work do not:
+/// [`delete_variable`] refuses every declared `WAFER_RUN_SHARED__*` row (PR
+/// #71, and left alone — see below), and [`update_variable`] stamps
+/// `updated_by` on every write, so clearing the value re-pins the row it was
+/// meant to release.
+///
+/// Chosen over relaxing `delete_variable`'s refusal because the two do
+/// different things and only this one says what the operator means. Deleting a
+/// declared shared var throws the metadata away and leaves the next boot to
+/// re-create the row from the declared default — a bigger, lossier action that
+/// also reverts the value even when there is no export to take over. This
+/// clears exactly the marker, leaves the value in place until a boot actually
+/// re-seeds it, and so is reversible right up to the restart.
+pub(super) async fn reset_variable_to_environment(
+    ctx: &dyn Context,
+    msg: &Message,
+    key: &str,
+) -> Result<(), OutputStream> {
+    if key.is_empty() {
+        return Err(err_bad_request("Missing setting key"));
+    }
+    match variables::get_by_key(ctx, key).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(crate::http::err_not_found("Setting not found")),
+        Err(e) => return Err(err_internal("Database error", e)),
+    }
+    if let Err(e) = variables::reset_to_environment(ctx, key).await {
+        return Err(err_internal("Database error", e));
+    }
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "variable.reset_to_environment",
+        &format!("variables/{key}"),
+        msg.remote_addr(),
+    )
+    .await;
+    Ok(())
+}
+
 pub(super) async fn delete_variable(
     ctx: &dyn Context,
     msg: &Message,
@@ -1840,6 +1885,75 @@ mod tests {
             try_clear_token(&ctx, &msg).await,
             "a redeemed token is inert and must be removable"
         );
+    }
+
+    /// A pinned key must have a way out, and the two routes the WARN used to
+    /// name are not it.
+    ///
+    /// `delete_variable` refuses every declared `WAFER_RUN_SHARED__*` row —
+    /// which is every key that reaches the env loop — and `update_variable`
+    /// stamps `updated_by` on every write, so clearing the value re-pins the
+    /// row it was meant to release. Both are asserted here, so the message and
+    /// the code cannot drift apart again.
+    #[tokio::test]
+    async fn reset_to_environment_is_the_only_route_out_of_a_pinned_key() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+
+        expect_ok(create_variable(&ctx, &msg, key, "AdminChoice", None, None, false).await);
+        assert!(
+            variables::is_admin_owned(
+                &variables::get_by_key(&ctx, key)
+                    .await
+                    .expect("get")
+                    .expect("row")
+            ),
+            "an admin create pins the key"
+        );
+
+        // Route one, as the old message advised: refused.
+        assert!(
+            delete_variable(&ctx, &msg, key).await.is_err(),
+            "a declared shared var cannot be deleted, so 'delete the row' was bad advice"
+        );
+
+        // Route two, as the old message advised: leaves it pinned.
+        expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                key,
+                VariableUpdate {
+                    value: Some("something else"),
+                    description: None,
+                    sensitive: None,
+                },
+            )
+            .await,
+        );
+        assert!(
+            variables::is_admin_owned(
+                &variables::get_by_key(&ctx, key)
+                    .await
+                    .expect("get")
+                    .expect("row")
+            ),
+            "an update re-stamps ownership, so clearing could never release the key"
+        );
+
+        // The route that exists.
+        expect_ok(reset_variable_to_environment(&ctx, &msg, key).await);
+        let row = variables::get_by_key(&ctx, key)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(!variables::is_admin_owned(&row), "the key is released");
+        assert_eq!(
+            row.value, "something else",
+            "and the value stays until a boot re-seeds it"
+        );
+        assert_eq!(audit_count(&ctx, "variable.reset_to_environment").await, 1);
     }
 
     /// The bootstrap TOKEN must stay unclearable, unlike the password.

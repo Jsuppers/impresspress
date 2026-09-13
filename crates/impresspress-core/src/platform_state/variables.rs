@@ -434,6 +434,27 @@ pub fn is_admin_owned(row: &VariableRow) -> bool {
     !row.updated_by.is_empty()
 }
 
+/// Hand a key back to the process environment: clear its admin-ownership
+/// marker so [`seed_and_load`] seeds it again on the next boot.
+///
+/// The counterpart to [`set_by_admin`], and the reason admin-wins is not a
+/// one-way door. Without it a pinned key had no supported exit:
+/// `admin::ops::delete_variable` refuses any declared `WAFER_RUN_SHARED__*`
+/// row, and `update_variable` stamps `updated_by` on every write, so clearing
+/// the value re-pinned the row it was meant to release.
+///
+/// Only the marker is cleared — the stored value stays until the next boot
+/// actually re-seeds it. That keeps the action reversible in the window before
+/// a restart, and means a key with no export simply keeps the value it has
+/// rather than silently reverting to a declared default.
+pub async fn reset_to_environment(ctx: &dyn Context, key: &str) -> Result<(), WaferError> {
+    let patch = VariablePatch {
+        updated_by: Some(String::new()),
+        ..Default::default()
+    };
+    upsert_by_key(ctx, key, patch).await.map(|_| ())
+}
+
 async fn set_with_owner(
     db: &Arc<dyn DatabaseService>,
     key: &str,
@@ -443,7 +464,38 @@ async fn set_with_owner(
     sensitive: bool,
     updated_by: Option<&str>,
 ) -> Result<Wrote, String> {
-    let Some(existing) = find_by_key(db, key).await? else {
+    let existing = find_by_key(db, key).await?;
+    set_with_row(
+        db,
+        key,
+        value,
+        name,
+        description,
+        sensitive,
+        updated_by,
+        existing,
+    )
+    .await
+}
+
+/// [`set_with_owner`] for a caller that has ALREADY read the row.
+///
+/// `seed_and_load`'s env loop reads each row to check ownership before
+/// deciding to write; without this it would then pay a second `list` per key
+/// inside the write — 40-160 extra round trips on a native cold start, for
+/// rows it is holding already.
+#[allow(clippy::too_many_arguments)]
+async fn set_with_row(
+    db: &Arc<dyn DatabaseService>,
+    key: &str,
+    value: &str,
+    name: &str,
+    description: &str,
+    sensitive: bool,
+    updated_by: Option<&str>,
+    existing: Option<VariableRow>,
+) -> Result<Wrote, String> {
+    let Some(existing) = existing else {
         let row = NewVariable {
             key: key.to_string(),
             value: value.to_string(),
@@ -478,10 +530,20 @@ async fn set_with_owner(
     let sensitive = sensitive || crate::config_vars::is_sensitive_for_storage(key);
     let raise_sensitive = sensitive && !existing.sensitive;
     let value_changed = existing.value != value;
-    // An admin surface re-stamps ownership even when it re-asserts the value it
-    // already sees: what it is recording is "a human decided this", which is
-    // true whether or not the bytes moved.
-    let stamp_owner = updated_by.is_some_and(|who| who != existing.updated_by);
+    // Ownership is stamped ONLY when the value actually moved.
+    //
+    // It used to stamp on any admin-surface write, on the reasoning that
+    // saving a form is a human decision. That is false per key:
+    // `ui::settings_form::save_settings` calls `config::set` for every field
+    // the form posts, and the form posts every named input — so changing one
+    // colour on an admin settings page pinned `APP_NAME`, every logo URL and
+    // the favicon too, silently making their exports inert forever. Requiring
+    // a real change keeps the claim honest: the admin edited THIS key.
+    //
+    // The narrow cost is that an admin cannot pin a key by re-saving the value
+    // the environment already supplies — but there is nothing to pin then, the
+    // two agree, and any later divergence is a real edit that stamps.
+    let stamp_owner = value_changed && updated_by.is_some_and(|who| who != existing.updated_by);
     if !value_changed && !raise_sensitive && !stamp_owner {
         return Ok(Wrote::Unchanged);
     }
@@ -684,7 +746,12 @@ pub async fn seed_and_load(
     db: &Arc<dyn DatabaseService>,
     env_vars: &[(String, String)],
 ) -> Result<HashMap<String, String>, String> {
-    // 1. Apply env-provided values (the environment wins — see above).
+    // 0. One-time upgrade step, BEFORE the env loop: rows edited through a
+    //    settings form before this release carry no marker, and the loop below
+    //    would overwrite them on this very boot.
+    backfill_admin_ownership(db).await;
+
+    // 1. Apply env-provided values to keys no admin owns (see above).
     for (key, value) in env_vars {
         if crate::config_vars::is_runtime_owned_key(key) {
             tracing::warn!(
@@ -721,19 +788,22 @@ pub async fn seed_and_load(
         // failure for another. The operator is told which key, that the stored
         // admin edit is what boots, and how to hand the key back to the
         // environment.
-        match find_by_key(db, key).await {
+        // Read once, and hand the row to the write below rather than letting
+        // it list the table a second time for the same key.
+        let existing = match find_by_key(db, key).await {
             Ok(Some(row)) if is_admin_owned(&row) => {
                 tracing::warn!(
                     key = %key,
                     "this environment variable is set but has NO EFFECT: an admin edited \
                      this setting through the admin UI, and a stored admin edit takes \
                      precedence over the environment. The stored value is what boots. To \
-                     hand this key back to the environment, delete the row on the admin \
-                     Variables page (or clear it through the settings API) and restart"
+                     hand this key back to the environment, use \"Reset to environment\" \
+                     on the admin Variables page (or POST \
+                     /b/admin/api/settings/{key}/reset-to-environment) and restart"
                 );
                 continue;
             }
-            Ok(_) => {}
+            Ok(row) => row,
             // A read failure is not a licence to overwrite: it means we cannot
             // tell whether an admin owns this row, and the contract says the
             // admin's edit survives. Skip and say so.
@@ -746,11 +816,11 @@ pub async fn seed_and_load(
                 );
                 continue;
             }
-        }
-        // `sensitive` is settled by `NewVariable::into_row` and `set` from the
-        // key's declaration and the `_SECRET`/`_KEY` suffix; `false` here
-        // asserts nothing extra.
-        match set(db, key, value, "", "", false).await {
+        };
+        // `sensitive` is settled by `NewVariable::into_row` and `set_with_row`
+        // from the key's declaration and the `_SECRET`/`_KEY` suffix; `false`
+        // here asserts nothing extra.
+        match set_with_row(db, key, value, "", "", false, None, existing).await {
             // Reached only for a row no admin has claimed, so the previous
             // value was a seeder's: a declared default, or an earlier boot's
             // environment.
@@ -947,6 +1017,120 @@ pub async fn repair_sensitive_flags(db: &Arc<dyn DatabaseService>) {
             error = %e,
             "could not read the variables table to repair `sensitive` flags"
         ),
+    }
+}
+
+/// The row whose presence records that [`backfill_admin_ownership`] has run.
+///
+/// A block-scoped key, so it is ordinary storable config rather than a
+/// runtime-owned one — the same shape `dev::seed`'s `IMPRESSPRESS__DEV__SEED_ERROR`
+/// diagnostic row already uses.
+pub const OWNERSHIP_BACKFILL_KEY: &str = "IMPRESSPRESS__ADMIN__ENV_OWNERSHIP_BACKFILL";
+
+/// One-time upgrade step: claim for the admin every row that has been changed
+/// away from its declared default but carries no ownership marker.
+///
+/// The settings forms never stamped `updated_by` before this release, so on the
+/// first boot after upgrading, every edit ever made through one of them looks
+/// seeder-owned — and a still-present export would overwrite it. That is
+/// precisely the harm admin-wins was chosen to prevent
+/// (`WAFER_RUN_SHARED__ALLOW_SIGNUP=true` reopening signup an admin closed),
+/// arriving once, at the worst possible moment, on the boot that ships the fix.
+///
+/// "Changed away from the declared default" is the only evidence available: no
+/// marker survives from before this release to say who wrote a row. It cannot
+/// distinguish an admin's settings-form edit from a value an earlier boot's
+/// ENVIRONMENT seeded, so it claims both. That asymmetry is deliberate — the
+/// two mistakes are not equal. Wrongly claiming an env-seeded row costs the
+/// operator an export that stops applying, announced every boot by the WARN in
+/// [`seed_and_load`] and undone by one "Reset to environment" click. Wrongly
+/// leaving an admin's row unclaimed silently reverts a deliberate
+/// configuration change, which is the failure the contract exists to stop.
+///
+/// STRICTLY ONE-TIME, gated on [`OWNERSHIP_BACKFILL_KEY`] rather than on "has
+/// no marker yet": without that gate a key an operator later reset would be
+/// re-claimed on the very next boot, and the reset route would not work at all.
+async fn backfill_admin_ownership(db: &Arc<dyn DatabaseService>) {
+    // The gate first, as a single indexed lookup: every boot after the first
+    // stops here without listing the table.
+    match find_by_key(db, OWNERSHIP_BACKFILL_KEY).await {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not check whether the ownership backfill has run; skipping it rather \
+                 than risk claiming keys twice"
+            );
+            return;
+        }
+    }
+    let rows = match load_rows(db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the variables table to backfill ownership");
+            return;
+        }
+    };
+    let vars = crate::config_vars::shared_config_vars();
+    let declared: HashMap<&str, &str> = vars
+        .iter()
+        .map(|var| (var.key.as_str(), var.default.as_str()))
+        .collect();
+
+    for loaded in &rows {
+        let row = &loaded.row;
+        if is_admin_owned(row) {
+            continue;
+        }
+        // Only declared shared vars: those are the ones the settings forms
+        // write, and the only ones with a declared default to compare against.
+        let Some(default) = declared.get(row.key.as_str()) else {
+            continue;
+        };
+        if row.value == *default {
+            continue;
+        }
+        let patch = VariablePatch {
+            updated_by: Some(crate::features::USER_EDITED_SENTINEL.to_string()),
+            ..Default::default()
+        };
+        match db.update(TABLE, &row.id, patch.to_update_data()).await {
+            Ok(_) => {
+                crate::config_generation::note_config_write();
+                tracing::warn!(
+                    key = %row.key,
+                    "claiming this config key for the admin UI: it differs from its declared \
+                     default and this release is the first that records who edited a \
+                     setting. If the value came from the environment rather than an admin, \
+                     use \"Reset to environment\" on the Variables page to hand it back"
+                );
+            }
+            Err(e) => tracing::warn!(
+                key = %row.key,
+                error = %e,
+                "failed to claim a config key during the one-time ownership backfill"
+            ),
+        }
+    }
+
+    // Stamp the gate last, so a boot that dies partway retries rather than
+    // recording a backfill that only half happened.
+    if let Err(e) = seed_if_absent(
+        db,
+        OWNERSHIP_BACKFILL_KEY,
+        "done",
+        "Env ownership backfill",
+        "Records that the one-time admin-ownership backfill has run. Deleting this row \
+         makes the next boot re-run it.",
+        false,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            "could not record that the ownership backfill ran; the next boot will repeat it"
+        );
     }
 }
 
@@ -1772,6 +1956,170 @@ mod boot_tests {
         );
     }
 
+    /// One "Save settings" click must pin only the field that changed.
+    ///
+    /// `ui::settings_form::save_settings` calls `config::set` for EVERY key the
+    /// form posts, and the form posts every named input — so stamping on any
+    /// admin-surface write pinned a whole page of variables at once, silently
+    /// making their exports inert forever. This drives the same shape: one
+    /// changed key among several re-asserted ones.
+    #[tokio::test]
+    async fn saving_a_settings_form_pins_only_the_field_that_changed() {
+        let db = migrated_db().await;
+        let changed = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        let untouched = [
+            "WAFER_RUN_SHARED__APP_NAME",
+            crate::config_vars::LOGO_URL_KEY,
+            "WAFER_RUN_SHARED__FAVICON_URL",
+        ];
+
+        // What the environment seeded on an earlier boot.
+        let env: Vec<(String, String)> = std::iter::once(changed)
+            .chain(untouched)
+            .map(|k| (k.to_string(), format!("env-{k}")))
+            .collect();
+        seed_and_load(&db, &env).await.expect("seeded boot");
+
+        // The admin opens the page, changes one colour, and saves. Every
+        // field on the form is posted, including the ones they did not touch
+        // (and, for a blank field, an empty value the form skips).
+        let admin = crate::features::USER_EDITED_SENTINEL;
+        set_by_admin(&db, changed, "#ff0000", false, admin)
+            .await
+            .expect("the changed field");
+        for key in untouched {
+            set_by_admin(&db, key, &format!("env-{key}"), false, admin)
+                .await
+                .expect("a re-asserted field");
+        }
+
+        assert!(
+            is_admin_owned(&find_by_key(&db, changed).await.expect("l").expect("r")),
+            "the field the admin actually changed is theirs"
+        );
+        for key in untouched {
+            let row = find_by_key(&db, key).await.expect("l").expect("r");
+            assert!(
+                !is_admin_owned(&row),
+                "{key} was only re-posted unchanged and must stay seeder-owned"
+            );
+        }
+
+        // And the environment still governs the untouched keys on the next boot.
+        let next: Vec<(String, String)> = std::iter::once(changed)
+            .chain(untouched)
+            .map(|k| (k.to_string(), format!("next-{k}")))
+            .collect();
+        let vars = seed_and_load(&db, &next).await.expect("next boot");
+        assert_eq!(
+            vars.get(changed).map(String::as_str),
+            Some("#ff0000"),
+            "the pinned key keeps the admin's value"
+        );
+        for key in untouched {
+            assert_eq!(
+                vars.get(key).map(String::as_str),
+                Some(format!("next-{key}").as_str()),
+                "{key} must still follow the environment"
+            );
+        }
+    }
+
+    /// The way out of a pinned key. Without it, admin-wins is a one-way door:
+    /// `delete_variable` refuses declared shared vars and `update_variable`
+    /// re-stamps ownership on every write.
+    #[tokio::test]
+    async fn reset_to_environment_hands_a_pinned_key_back() {
+        let ctx = crate::test_support::TestContext::with_admin().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+
+        insert(
+            &ctx,
+            NewVariable {
+                key: key.to_string(),
+                value: "AdminChoice".to_string(),
+                name: String::new(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: "admin_1".to_string(),
+                block: block_for_key(key),
+            },
+        )
+        .await
+        .expect("a pinned row");
+
+        reset_to_environment(&ctx, key).await.expect("reset");
+
+        let row = get_by_key(&ctx, key).await.expect("get").expect("row");
+        assert!(!is_admin_owned(&row), "the marker is cleared");
+        assert_eq!(
+            row.value, "AdminChoice",
+            "only the marker is cleared; the value stays until a boot re-seeds it"
+        );
+    }
+
+    /// The upgrade boot: a row a settings form edited BEFORE this release
+    /// carries no marker, and a still-present export would revert it. The
+    /// one-time backfill claims it first.
+    #[tokio::test]
+    async fn the_upgrade_backfill_protects_a_pre_existing_settings_form_edit() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+
+        // The pre-upgrade world: an admin closed signup through a settings
+        // form, which left no marker, and the compose file still says `true`.
+        raw_insert_unowned(&db, key, "false").await;
+
+        let vars = seed_and_load(&db, &[(key.to_string(), "true".to_string())])
+            .await
+            .expect("the boot that ships the fix");
+        assert_eq!(
+            vars.get(key).map(String::as_str),
+            Some("false"),
+            "the upgrade boot must not reopen signup an admin closed"
+        );
+        assert!(
+            is_admin_owned(&find_by_key(&db, key).await.expect("l").expect("r")),
+            "and the row is claimed, so later boots leave it alone too"
+        );
+    }
+
+    /// The backfill is strictly one-time: a key an operator RESETS after it
+    /// must stay reset, or the reset route would not work at all.
+    #[tokio::test]
+    async fn the_upgrade_backfill_does_not_reclaim_a_key_after_a_reset() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        raw_insert_unowned(&db, key, "EditedLongAgo").await;
+
+        seed_and_load(&db, &[(key.to_string(), "FromEnv".to_string())])
+            .await
+            .expect("upgrade boot");
+        assert!(is_admin_owned(
+            &find_by_key(&db, key).await.expect("l").expect("r")
+        ));
+
+        // The operator says "that was the environment, not me".
+        let patch = VariablePatch {
+            updated_by: Some(String::new()),
+            ..Default::default()
+        };
+        let row = find_by_key(&db, key).await.expect("l").expect("r");
+        db.update(TABLE, &row.id, patch.to_update_data())
+            .await
+            .expect("reset");
+
+        let vars = seed_and_load(&db, &[(key.to_string(), "FromEnv".to_string())])
+            .await
+            .expect("next boot");
+        assert_eq!(
+            vars.get(key).map(String::as_str),
+            Some("FromEnv"),
+            "a reset key must follow the environment again, not be re-claimed"
+        );
+    }
+
     /// `FOO=` in a shell or a `.env` file is "unset", not "set to blank": an
     /// empty env value must not wipe a meaningful stored one. Same convention
     /// as `admin::settings::seed_defaults` and `AuthConfig::from_map`.
@@ -1849,6 +2197,15 @@ mod boot_tests {
 
     /// [`raw_insert_with_flag`] with the clear flag an older build wrote.
     async fn raw_insert_unflagged(db: &Arc<dyn DatabaseService>, key: &str, value: &str) {
+        raw_insert_with_flag(db, key, value, json!(0)).await;
+    }
+
+    /// A row as it looked BEFORE this release recorded ownership: a real value
+    /// and an empty `updated_by`. Physically the same shape as
+    /// [`raw_insert_unflagged`] — a pre-upgrade row is both unowned and
+    /// unflagged — named for the property the precedence tests are about, so a
+    /// test that is not about masking does not read as though it were.
+    async fn raw_insert_unowned(db: &Arc<dyn DatabaseService>, key: &str, value: &str) {
         raw_insert_with_flag(db, key, value, json!(0)).await;
     }
 

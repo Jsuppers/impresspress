@@ -49,6 +49,7 @@
   "POST /b/admin/api/iam/roles admin",
   "POST /b/admin/api/iam/user-roles admin",
   "POST /b/admin/api/settings admin",
+  "POST /b/admin/api/settings/{key}/reset-to-environment admin",
   "POST /b/admin/blocks/{name}/toggle admin",
   "POST /b/admin/database/query admin",
   "POST /b/admin/email admin",
@@ -56,5 +57,6 @@
   "POST /b/admin/iam/roles admin",
   "POST /b/admin/users/{id}/disable admin",
   "POST /b/admin/users/{id}/enable admin",
-  "POST /b/admin/variables admin"
+  "POST /b/admin/variables admin",
+  "POST /b/admin/variables/{key}/reset-to-environment admin"
 ]

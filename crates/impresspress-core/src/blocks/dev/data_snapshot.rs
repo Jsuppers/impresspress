@@ -927,28 +927,29 @@ fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
     row.insert("sensitive".to_string(), serde_json::json!(1));
 }
 
-/// Drop an imported variables row's `updated_by`.
+/// Neutralise an imported variables row's `updated_by` on INSERT, without ever
+/// writing it over a row this instance already has.
 ///
-/// That column is this instance's admin-ownership marker
-/// ([`crate::platform_state::variables::is_admin_owned`]): a non-empty value
-/// means an admin HERE edited the row, which is what makes it outrank the
-/// process environment. A bundle carries the exporting instance's column, and
-/// an admin over there is not an admin over here — importing it verbatim would
-/// let a seed bundle silently pin keys against this deployment's own `.env`,
-/// with the boot log blaming an admin edit that never happened on this
-/// instance.
+/// That column is the local admin-ownership marker
+/// ([`crate::platform_state::variables::is_admin_owned`]): non-empty means an
+/// admin HERE edited the row, which is what makes it outrank the process
+/// environment. It has to be protected from a bundle in BOTH directions, and
+/// blanking the value alone only covered one of them:
 ///
-/// Cleared rather than preserved, so an imported row is seeder-owned and the
-/// local environment can still seed it. A bundle is provisioning data; the
-/// operator's environment is the deployment's own instruction.
-fn clear_imported_owner(row: &mut serde_json::Map<String, Value>) {
-    if row
-        .get("updated_by")
-        .and_then(Value::as_str)
-        .is_some_and(|who| !who.is_empty())
-    {
-        row.insert("updated_by".to_string(), serde_json::json!(""));
-    }
+/// - A bundle must not CLAIM ownership here. An admin on the exporting
+///   instance is not an admin on this one, and a verbatim copy would let a seed
+///   bundle silently pin keys against this deployment's own `.env` while the
+///   boot log blamed an edit that never happened here. Blanking the value in
+///   the row handles this: a newly inserted row arrives seeder-owned, so the
+///   local environment can still seed it.
+/// - A bundle must not REVOKE ownership here either — the case the first
+///   version of this missed. On `Mode::Upsert` the bundle's columns are written
+///   over the destination's, so a blank would erase a marker a local admin had
+///   set and hand their key back to the local `.env`. That is why
+///   `updated_by` is dropped from the update column set in [`import_row`]
+///   rather than merely blanked: on a conflict the destination keeps its own.
+fn neutralise_imported_owner(row: &mut serde_json::Map<String, Value>) {
+    row.insert("updated_by".to_string(), serde_json::json!(""));
 }
 
 /// Write one row into `table` under `mode`. Split out of [`import`] because
@@ -966,8 +967,7 @@ async fn import_row(
     let row = if table == variables::TABLE {
         let mut copy = row.clone();
         raise_imported_sensitive_flag(&mut copy);
-        clear_imported_owner(&mut copy);
-
+        neutralise_imported_owner(&mut copy);
         owned = copy;
         &owned
     } else {
@@ -986,9 +986,18 @@ async fn import_row(
             // import that rewrote it would break every row already pointing
             // at it — a `user_roles.role_id`, say — to graft on an id whose
             // only merit is that another instance happened to mint it.
+            //
+            // `variables.updated_by` is excluded for a related reason: it is
+            // the DESTINATION's admin-ownership marker, so writing the
+            // bundle's over it on a conflict would revoke a local admin's
+            // claim and hand their key back to the local `.env`. Excluded
+            // rather than blanked — a blank is still a write — so a row this
+            // instance already has keeps whatever it had. See
+            // `neutralise_imported_owner`, which covers the insert direction.
             let update_columns: Vec<String> = row
                 .keys()
                 .filter(|key| key.as_str() != "id" && !conflict.contains(&key.as_str()))
+                .filter(|key| !(table == variables::TABLE && key.as_str() == "updated_by"))
                 .cloned()
                 .collect();
             let conflict: Vec<String> = conflict.iter().map(|c| (*c).to_string()).collect();
