@@ -99,6 +99,7 @@ enum Route {
     CreateVariable,
     EditVariableForm,
     UpdateVariable,
+    DeleteVariable,
     NetworkInboundDetail,
     CreateWrapGrant,
     DeleteWrapGrant,
@@ -435,6 +436,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Update variable (form)"),
     EndpointRoute::admin(
+        HttpMethod::Delete,
+        "/b/admin/variables/{key}",
+        Route::DeleteVariable,
+    )
+    .summary("Delete variable (row control)"),
+    EndpointRoute::admin(
         HttpMethod::Get,
         "/b/admin/network/detail/inbound",
         Route::NetworkInboundDetail,
@@ -630,6 +637,7 @@ crate::impresspress_feature_block! {
             Route::CreateVariable => pages::handle_create_variable(ctx, &msg, input).await,
             Route::EditVariableForm => pages::handle_edit_variable_form(ctx, &msg).await,
             Route::UpdateVariable => pages::handle_update_variable(ctx, &msg, input).await,
+            Route::DeleteVariable => pages::handle_delete_variable(ctx, &msg).await,
             Route::NetworkInboundDetail => pages::network_inbound_detail(ctx, &msg).await,
             Route::CreateWrapGrant => handle_create_wrap_grant(ctx, msg, input).await,
             Route::DeleteWrapGrant => handle_delete_wrap_grant(ctx, msg).await,
@@ -1607,6 +1615,12 @@ mod table_tests {
                 "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME/edit",
                 Route::EditVariableForm,
                 &[("key", "WAFER_RUN_SHARED__APP_NAME")],
+            ),
+            (
+                "delete",
+                "/b/admin/variables/LEGACY_THING",
+                Route::DeleteVariable,
+                &[("key", "LEGACY_THING")],
             ),
             (
                 "update",

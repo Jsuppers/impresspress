@@ -7,6 +7,7 @@
   "DELETE /b/admin/grants/rules/{id} admin",
   "DELETE /b/admin/iam/roles/{id} admin",
   "DELETE /b/admin/users/{id} admin",
+  "DELETE /b/admin/variables/{key} admin",
   "GET /b/admin/ admin",
   "GET /b/admin/api/database/info admin",
   "GET /b/admin/api/database/tables admin",

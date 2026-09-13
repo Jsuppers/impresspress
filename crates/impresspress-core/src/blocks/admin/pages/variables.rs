@@ -146,6 +146,16 @@ struct VarRow<'a> {
     warning: &'a str,
     /// Whether to render the "Default" column cell (block-config tables).
     show_default: bool,
+    /// Whether this row offers the delete control.
+    ///
+    /// Explicit rather than derived from [`ValueState`], because only the
+    /// caller knows whether a stored row exists: an unowned variable always
+    /// has one, a declared `ConfigVar` only when someone has overridden it,
+    /// and a declared var with no override has nothing to delete. Shared
+    /// (`WAFER_RUN_SHARED__*`) keys are never deletable —
+    /// `ops::delete_variable` refuses them, so a button there would only ever
+    /// produce an error.
+    deletable: bool,
 }
 
 /// Build one variable table row's cells, in column order: key (+ optional
@@ -198,14 +208,32 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
             }
         }
     });
+    // Both controls share the final cell: the cells are columns against
+    // `VAR_COLUMNS`, so a conditional extra cell would misalign every row
+    // that has no delete control against every row that does.
     cells.push(html! {
-        button .btn .btn--sm .btn--ghost
-            hx-get={"/b/admin/variables/" (row.key) "/edit"}
-            hx-target="#edit-var-modal"
-            hx-swap="innerHTML"
-            title="Edit"
-            aria-label=(format!("Edit {}", row.key))
-        { (icons::edit()) }
+        div .flex .gap-1 {
+            button .btn .btn--sm .btn--ghost
+                hx-get={"/b/admin/variables/" (row.key) "/edit"}
+                hx-target="#edit-var-modal"
+                hx-swap="innerHTML"
+                title="Edit"
+                aria-label=(format!("Edit {}", row.key))
+            { (icons::edit()) }
+            @if row.deletable {
+                // `closest tr` rather than a row id: these tables render
+                // through `components::TableRow` without one. An empty
+                // response body then removes the row.
+                button .btn .btn--sm .btn--danger
+                    hx-delete={"/b/admin/variables/" (row.key)}
+                    hx-target="closest tr"
+                    hx-swap="outerHTML"
+                    hx-confirm={"Delete " (row.key) "? This cannot be undone."}
+                    title="Delete"
+                    aria-label=(format!("Delete {}", row.key))
+                { (icons::trash()) }
+            }
+        }
     });
     cells
 }
@@ -231,6 +259,9 @@ fn config_var_row(
         description: &var.description,
         warning: &var.warning,
         show_default: true,
+        // Only when an override is actually stored: a declared var showing
+        // its default has no row to delete.
+        deletable: var_map.contains_key(&var.key) && !var.key.starts_with("WAFER_RUN_SHARED__"),
     })
 }
 
@@ -529,6 +560,11 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                         description: &row.description,
                         warning: "",
                         show_default: false,
+                        // Every row in this table exists in the database by
+                        // definition — that is what "unowned" means here — so
+                        // these are exactly the rows an operator needs to be
+                        // able to remove.
+                        deletable: !key.starts_with("WAFER_RUN_SHARED__"),
                     })
                 }).collect(),
             ))
@@ -663,6 +699,28 @@ pub async fn handle_update_variable(
     variables_page(ctx, msg).await
 }
 
+/// `DELETE /b/admin/variables/{key}` — the Variables page's row control.
+///
+/// The page had no delete affordance at all before this: a variable could only
+/// be removed by calling `DELETE /b/admin/api/settings/{key}` by hand, which
+/// is not a thing an operator can be expected to discover.
+///
+/// The shared-key guard, the delete and the audit row live in
+/// `ops::delete_variable`, shared with that JSON surface, so the two cannot
+/// drift on what they refuse.
+///
+/// Returns EMPTY markup rather than re-rendering the page the way
+/// [`handle_update_variable`] does: the control targets `closest tr` with
+/// `outerHTML`, so an empty body is what removes the row. Re-rendering the
+/// whole page into a `<tr>` would nest a document inside a table row.
+pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let key = msg.var("key");
+    if let Err(out) = ops::delete_variable(ctx, msg, key).await {
+        return out;
+    }
+    ui::html_response_with_toast(html! {}, "Variable deleted", "success")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +739,7 @@ mod tests {
             description: "App name",
             warning: "",
             show_default: false,
+            deletable: false,
         });
         let s = components::TableRow::new(cells)
             .render(&VAR_COLUMNS, None)
@@ -689,6 +748,142 @@ mod tests {
             s.contains(r#"aria-label="Edit WAFER_RUN_SHARED__APP_NAME""#),
             "edit button must expose an aria-label with the row key: {s}"
         );
+    }
+
+    fn row_html(key: &str, deletable: bool) -> String {
+        let cells = var_row(&VarRow {
+            key,
+            name: None,
+            value: ValueState::Plain("v".to_string()),
+            default: None,
+            auto_generate: false,
+            description: "d",
+            warning: "",
+            show_default: false,
+            deletable,
+        });
+        components::TableRow::new(cells)
+            .render(&VAR_COLUMNS, None)
+            .into_string()
+    }
+
+    /// A stored row offers a delete control, and it carries an accessible
+    /// name for the same reason the edit button does.
+    #[test]
+    fn a_deletable_row_offers_a_labelled_delete_control() {
+        let s = row_html("LEGACY_THING", true);
+        assert!(
+            s.contains(r#"hx-delete="/b/admin/variables/LEGACY_THING""#),
+            "delete control must post to the row's own key: {s}"
+        );
+        assert!(
+            s.contains(r#"aria-label="Delete LEGACY_THING""#),
+            "icon-only delete button must expose an aria-label: {s}"
+        );
+    }
+
+    /// A declared var showing its default has no stored row to delete, and a
+    /// shared key is refused server-side — neither may render a control that
+    /// could only fail.
+    #[test]
+    fn a_non_deletable_row_offers_no_delete_control() {
+        let s = row_html("WAFER_RUN_SHARED__APP_NAME", false);
+        assert!(
+            !s.contains("hx-delete"),
+            "a non-deletable row must render no delete control: {s}"
+        );
+        assert!(s.contains("hx-get"), "the edit control is unaffected: {s}");
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use crate::{
+        blocks::admin::{test_support::routed, AUDIT_LOGS_TABLE},
+        test_support::{admin_msg, output_is_error, TestContext},
+    };
+
+    async fn seed(ctx: &TestContext, key: &str) {
+        let msg = admin_msg("create", "/b/admin/variables");
+        // `OutputStream` is not `Debug`, so the error arm cannot be unwrapped.
+        if ops::create_variable(ctx, &msg, key, "v", None, None, false)
+            .await
+            .is_err()
+        {
+            panic!("seeding {key} must succeed");
+        }
+    }
+
+    async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
+        wafer_core::clients::database::list_all(
+            ctx,
+            AUDIT_LOGS_TABLE,
+            vec![wafer_block::db::Filter {
+                field: "action".to_string(),
+                operator: wafer_block::db::FilterOp::Equal,
+                value: serde_json::Value::String(action.to_string()),
+            }],
+        )
+        .await
+        .map(|rows| rows.len())
+        .unwrap_or(0)
+    }
+
+    /// The gap this closes: the page offered no way to remove a variable, so
+    /// a row written by a legacy path — or by a seed bundle from before
+    /// `dev::data_snapshot::import` refused runtime-owned keys — was
+    /// permanent unless an operator hand-called the JSON API.
+    #[tokio::test]
+    async fn deleting_a_variable_removes_the_row_and_audits() {
+        let ctx = TestContext::with_admin().await;
+        seed(&ctx, "LEGACY_THING").await;
+
+        let msg = routed(admin_msg("delete", "/b/admin/variables/LEGACY_THING"));
+        let _ = handle_delete_variable(&ctx, &msg)
+            .await
+            .collect_buffered()
+            .await
+            .expect("a delete against a healthy database must succeed");
+
+        assert!(
+            variables::get_by_key(&ctx, "LEGACY_THING")
+                .await
+                .expect("read back")
+                .is_none(),
+            "the row must be gone",
+        );
+        assert_eq!(
+            audit_count(&ctx, "variable.delete").await,
+            1,
+            "deleting a variable must leave an audit trail, as create and update do",
+        );
+    }
+
+    /// Shared vars are declared centrally and re-seeded on the next boot, so
+    /// deleting one is a no-op dressed as a change. Refused on both surfaces
+    /// because both go through `ops::delete_variable`.
+    #[tokio::test]
+    async fn deleting_a_shared_system_variable_is_refused() {
+        let ctx = TestContext::with_admin().await;
+        seed(&ctx, "WAFER_RUN_SHARED__APP_NAME").await;
+
+        let msg = routed(admin_msg(
+            "delete",
+            "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME",
+        ));
+        assert!(
+            output_is_error(handle_delete_variable(&ctx, &msg).await, "InvalidArgument").await,
+            "a shared system variable must be refused",
+        );
+        assert!(
+            variables::get_by_key(&ctx, "WAFER_RUN_SHARED__APP_NAME")
+                .await
+                .expect("read back")
+                .is_some(),
+            "the refused row must still be there",
+        );
+        assert_eq!(audit_count(&ctx, "variable.delete").await, 0);
     }
 }
 

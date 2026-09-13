@@ -364,6 +364,73 @@ fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
     Ok(())
 }
 
+/// Delete a config variable, writing an audit-log row.
+///
+/// Shared by the JSON surface (`settings::handle_delete`) and the Variables
+/// page's row control, so the two refuse the same keys and leave the same
+/// trail. The JSON path wrote no audit row at all before this: variable
+/// creation and update were audited, deletion was not.
+///
+/// `WAFER_RUN_SHARED__*` is refused, as it always was on the JSON path: those
+/// are declared centrally in `config_vars::shared_config_vars()` and re-seeded
+/// on the next boot, so deleting one is a no-op that looks like a change.
+///
+/// Deliberately NOT gated on [`reject_runtime_owned_key`]. Creating or editing
+/// a runtime-owned row is refused because the runtime owns that value — but a
+/// row that already exists (a legacy write, or a seed bundle from before
+/// `dev::data_snapshot::import` learned to refuse them) is exactly what an
+/// operator needs to be able to remove. Refusing it here would leave the row
+/// permanent, which is the gap this function closes.
+pub(super) async fn delete_variable(
+    ctx: &dyn Context,
+    msg: &Message,
+    key: &str,
+) -> Result<(), OutputStream> {
+    if key.is_empty() {
+        return Err(err_bad_request("Missing setting key"));
+    }
+    if key.starts_with("WAFER_RUN_SHARED__") {
+        return Err(err_bad_request(&format!(
+            "Cannot delete shared system variable: {key}"
+        )));
+    }
+
+    // Through `crud::db_error`, not `err_internal`: it is the one classifier
+    // allowed to map a database error by hand, and it preserves the
+    // distinctions a caller can act on — a WRAP denial stays a sanitized 403
+    // rather than flattening to "Internal server error". The JSON surface
+    // mapped errors this way before the guard moved here, and
+    // `a_denied_settings_delete_is_403` pins it.
+    let row = match variables::get_by_key(ctx, key).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(crate::http::err_not_found("Setting not found")),
+        Err(e) => {
+            return Err(crate::blocks::crud::db_error(
+                e,
+                "Setting not found",
+                "Database error",
+            ))
+        }
+    };
+    if let Err(e) = variables::delete(ctx, &row.id).await {
+        return Err(crate::blocks::crud::db_error(
+            e,
+            "Setting not found",
+            "Database error",
+        ));
+    }
+
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "variable.delete",
+        &format!("variables/{key}"),
+        msg.remote_addr(),
+    )
+    .await;
+    Ok(())
+}
+
 /// Create a config variable, writing an audit-log row. Validates `_URL` keys
 /// against [`validate_url_value`] (SSRF). `key` must be non-empty, and must
 /// not name a key the runtime owns ([`reject_runtime_owned_key`]).
