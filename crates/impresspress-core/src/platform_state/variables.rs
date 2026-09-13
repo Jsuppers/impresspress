@@ -364,10 +364,12 @@ pub async fn seed_if_absent(
 /// is sensitive and the stored flag is clear, raises `sensitive` — never
 /// lowers it. `name` and `description` describe the variable rather than the
 /// deployment, so an operator's wording survives; `sensitive` is different in
-/// kind, because it is the only thing the read path
-/// (`util::is_sensitive_key`) can use to know that a suffix-less declared var
-/// holds a password, and a row carrying it wrongly is a value served in the
-/// clear. The metadata arguments are otherwise used only when the row has to
+/// kind, because it is the only thing that carries an AD HOC row's
+/// sensitivity — one the build declares no `ConfigVar` for, so
+/// `util::is_sensitive_key`'s key half has nothing to say about it — and
+/// because a row stored unflagged for a key that should be flagged is a
+/// disagreement between the column and the declaration, which the boot repair
+/// pass then has to reconcile. The metadata arguments are otherwise used only when the row has to
 /// be created — the same shape [`seed_if_absent`] takes, so the two read alike
 /// at a call site.
 ///
@@ -403,11 +405,13 @@ pub async fn set(
     // The `sensitive` flag is the one piece of metadata a forced write DOES
     // touch, and only ever upward. `name`/`description` describe the variable
     // and an operator's wording survives; `sensitive` decides whether the
-    // value reaches an API response at all, and `util::is_sensitive_key` can
-    // recover a Password-typed declared var's sensitivity from nowhere else.
-    // A row stored with the flag clear when the caller knows better is a live
-    // leak, so it is repaired in place. Never lowered: the read path's union
-    // means every disagreement must resolve towards more masking.
+    // value reaches an API response at all, and for an AD HOC key — one no
+    // `ConfigVar` declares — it is the only thing that can say so, because
+    // `util::is_sensitive_key`'s key half asks the declaration and there is
+    // none. A row stored with the flag clear when the caller knows better is
+    // a column that contradicts the declaration, so it is repaired in place.
+    // Never lowered: the read path's union means every disagreement must
+    // resolve towards more masking.
     // The declaration has the final say on the update path too, not just at
     // the create funnel: `blocks::config`'s `CONFIG_SET` passes the row's OWN
     // stored flag for an existing row, so a row already stored unflagged would
@@ -774,15 +778,31 @@ async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[Loaded
             continue;
         }
 
-        // Whether the clear flag actually exposed anything, which decides how
-        // loudly this is reported. Only a DECLARED `Password` var was exposed:
-        // the read path (`util::is_sensitive_key`) and the edge cache
-        // (`cache_key::row_is_sensitive`) are both unions with
-        // `has_sensitive_suffix`, so a `*_SECRET`/`*_KEY` row was masked and
-        // cache-excluded all along whatever its flag said — telling an operator
-        // their Stripe key "was being served unmasked" would be a false breach
-        // report, and a false alarm has its own cost.
-        let was_exposed = !crate::config_vars::has_sensitive_suffix(&row.key);
+        // Whether the clear flag ever exposed anything, which decides how
+        // loudly this is reported. Two kinds of row reach here without having
+        // been readable, and calling either a breach is a false alarm with its
+        // own cost:
+        //
+        //   * a `*_SECRET`/`*_KEY` row. The key half of `util::is_sensitive_key`
+        //     has always covered the suffix, so the read path and the edge
+        //     cache (`cache_key::row_is_sensitive`) masked and excluded it all
+        //     along whatever its flag said — telling an operator their Stripe
+        //     key "was being served unmasked" is simply untrue.
+        //   * a row whose column holds `2`, `true`, `"true"` or `1.0`. That is
+        //     the OTHER reason this branch is reached (`!flag_is_canonical_one`
+        //     rather than a clear flag), and `VariableRow::from_record` decodes
+        //     it through `flag_is_set`, so `row.sensitive` is true and every
+        //     reader masked it on the flag alone. What is wrong with such a row
+        //     is its SHAPE, which is what the rewrite below fixes — nothing was
+        //     published, so nothing needs rotating.
+        //
+        // What is left is a DECLARED `Password`/`auto_generate` key whose
+        // column really is clear. Today's build masks it anyway — the key half
+        // of `is_sensitive_key` asks the declaration now — but the build that
+        // wrote this row did not, and served it in the clear for the row's
+        // whole life up to this upgrade. That is a credential to rotate, and
+        // this is the one moment an operator gets told.
+        let was_exposed = !row.sensitive && !crate::config_vars::has_sensitive_suffix(&row.key);
         let patch = VariablePatch {
             sensitive: Some(true),
             ..Default::default()
@@ -795,22 +815,24 @@ async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[Loaded
                         key = %row.key,
                         "repaired the stored `sensitive` flag for this config key; it was \
                          written before the flag was derived from the variable's declaration, \
-                         and its value WAS being served unmasked"
+                         so an EARLIER BUILD of this deployment served its value unmasked — \
+                         treat the credential as exposed and rotate it"
                     );
                 } else {
                     tracing::info!(
                         key = %row.key,
-                        "tidied the stored `sensitive` flag for this config key; the \
-                         `_SECRET`/`_KEY` suffix rule was already masking its value, so \
-                         nothing was exposed"
+                        "tidied the stored `sensitive` flag for this config key; it was \
+                         already reading as sensitive (its `_SECRET`/`_KEY` name, or a \
+                         non-canonical but truthy column), so nothing was exposed"
                     );
                 }
             }
             Err(e) => tracing::warn!(
                 key = %row.key,
                 error = %e,
-                "failed to repair a config key's `sensitive` flag; its value is still \
-                 served unmasked"
+                "failed to repair a config key's `sensitive` flag; the value stays masked \
+                 (`util::is_sensitive_key` reads the declaration, not just this column), \
+                 but the row keeps a shape the schema does not declare"
             ),
         }
     }
@@ -1420,10 +1442,12 @@ mod boot_tests {
 
     /// An env-written row for a `Password`-typed declared var must carry
     /// `sensitive = 1`, even though its key ends in neither `_SECRET` nor
-    /// `_KEY`. The read path's union (`util::is_sensitive_key`) can learn that
-    /// from nothing but this flag, so getting it wrong serves the bootstrap
-    /// password through the settings API. The masking itself is asserted in
-    /// `blocks::admin::settings`; this pins the column the reader depends on.
+    /// `_KEY`. The read path's union (`util::is_sensitive_key`) asks the
+    /// declaration too now, so a wrong column no longer publishes the value —
+    /// but it still decides what the admin UI's Sensitive control reads back,
+    /// and leaving it wrong means every boot re-runs the repair pass and every
+    /// repair re-reports a breach. The masking itself is asserted in
+    /// `blocks::admin::settings`; this pins the column beside it.
     #[tokio::test]
     async fn an_env_written_password_var_is_stored_sensitive() {
         let db = migrated_db().await;
@@ -1677,6 +1701,89 @@ mod boot_tests {
                 "{shape} must be normalised to the canonical integer"
             );
         }
+    }
+
+    /// Write a row with an arbitrary `sensitive` column shape, the way an older
+    /// build or a foreign bundle could leave one.
+    async fn raw_insert_with_flag(
+        db: &Arc<dyn DatabaseService>,
+        key: &str,
+        value: &str,
+        flag: Value,
+    ) {
+        let now = crate::util::now_rfc3339();
+        let mut data = VariableRow {
+            id: format!("var_{}", uuid::Uuid::new_v4()),
+            key: key.to_string(),
+            value: value.to_string(),
+            name: String::new(),
+            description: String::new(),
+            warning: String::new(),
+            sensitive: false,
+            block: block_for_key(key),
+            updated_by: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+        .to_data();
+        data.insert("sensitive".to_string(), flag);
+        db.create(TABLE, data).await.expect("raw create");
+    }
+
+    /// A non-canonical but TRUTHY flag is a shape defect, not a breach.
+    ///
+    /// `2`, `true`, `"true"` and `1.0` all decode through `flag_is_set`, so
+    /// `VariableRow::sensitive` is true and every read path masked the value on
+    /// the flag alone. The repair still rewrites the column — that is what the
+    /// test above pins — but reporting "an EARLIER BUILD … served its value
+    /// unmasked" for such a row sends an operator to rotate a credential that
+    /// was never published. The pass already refuses that false alarm for the
+    /// `_SECRET`/`_KEY` case; the argument is the same here.
+    ///
+    /// The clear-flag row is the positive control in the same test, so a
+    /// `was_exposed` that simply answered `false` everywhere could not pass it.
+    #[tokio::test]
+    async fn only_a_row_that_was_really_readable_is_reported_as_exposed() {
+        /// A fragment unique to the breach WARN.
+        const BREACH: &str = "rotate it";
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "a suffix key is already exempt for a different reason; this needs the other kind"
+        );
+
+        for shape in [json!(2), json!(true), json!("true"), json!(1.0)] {
+            let db = migrated_db().await;
+            raw_insert_with_flag(&db, key, "hunter2", shape.clone()).await;
+
+            let capture = crate::test_support::MessageCapture::default();
+            {
+                let _guard = tracing::subscriber::set_default(capture.clone());
+                repair_sensitive_flags(&db).await;
+            }
+            assert_eq!(
+                capture.count_containing(BREACH),
+                0,
+                "{shape} read as a set flag, so the value was masked all along — \
+                 reporting it as exposed is a false breach report"
+            );
+        }
+
+        // Positive control: a genuinely clear flag on the same key WAS served
+        // unmasked by the build that wrote it, and must still be reported.
+        let db = migrated_db().await;
+        raw_insert_unflagged(&db, key, "hunter2").await;
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            repair_sensitive_flags(&db).await;
+        }
+        assert_eq!(
+            capture.count_containing(BREACH),
+            1,
+            "a declaration-only-sensitive row stored with a clear flag really was \
+             published by the build that wrote it, and the operator has to be told"
+        );
     }
 
     /// The repair pass NEVER clears a flag, only raises it.
