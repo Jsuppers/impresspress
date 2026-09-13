@@ -923,6 +923,23 @@ impl TestContext {
         ));
         self
     }
+
+    /// Toggle `STRICT_SCHEMA` directly on the backing `DatabaseService`, the
+    /// same flag production sets from `WAFER_RUN__DATABASE__STRICT_SCHEMA`
+    /// at the database block's own `lifecycle(Init)`
+    /// (`wafer_core::interfaces::database::handler::handle_lifecycle`).
+    /// `TestContext` never boots that lifecycle event (migrations are
+    /// applied directly via [`Self::apply_block_migrations`], not through
+    /// it), so there is no config value to flip here — this reaches the
+    /// service's own `set_strict_schema` directly instead, after whatever
+    /// migrations already ran (this only changes how *future* writes are
+    /// validated: no schema introspection, no lazy `ALTER TABLE ADD
+    /// COLUMN`), so a test can call this once its fixture's migrations are
+    /// in place and then exercise writes exactly as a strict-schema
+    /// production deployment (Cloudflare/D1) would.
+    pub fn set_strict_schema(&self, enabled: bool) {
+        self.db_service.set_strict_schema(enabled);
+    }
 }
 
 /// `DatabaseService` decorator used by [`TestContext::break_reads`] and

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ConfigVar, InputType};
+use wafer_run::{context::Context, ConfigVar, ErrorCode, InputType, WaferError};
 
 pub const TABLE: &str = "impresspress__signal__rooms";
 
@@ -112,6 +112,22 @@ fn code_filter(code: &str) -> Vec<Filter> {
     }]
 }
 
+/// [`code_filter`] plus a compare-and-swap condition: only a row whose
+/// `answer_sdp` is still empty matches. This is what makes `answer_room`'s
+/// write a real CAS rather than an unconditional update keyed on `code`
+/// alone — a `code`-only filter matches (and overwrites) the row whether or
+/// not another write already set the answer, since `code` is the primary
+/// key and therefore always matches exactly one row while the room exists.
+fn answer_cas_filter(code: &str) -> Vec<Filter> {
+    let mut filters = code_filter(code);
+    filters.push(Filter {
+        field: "answer_sdp".into(),
+        operator: FilterOp::Equal,
+        value: json!(""),
+    });
+    filters
+}
+
 /// Whether `code` is exactly `CODE_LEN` characters of `CODE_ALPHABET`.
 pub fn valid_code(code: &str) -> bool {
     code.chars().count() == CODE_LEN && code.chars().all(|c| CODE_ALPHABET.contains(c))
@@ -147,6 +163,60 @@ async fn fetch_live(ctx: &dyn Context, code: &str) -> Result<RoomRow, RoomError>
     })
 }
 
+/// What a failed [`create_row`] against `code`'s uniqueness actually means.
+///
+/// No `DatabaseService` backend classifies a constraint violation today —
+/// `wafer_core`'s shared `create` surfaces a PK collision as
+/// `ErrorCode::Internal` (or, on a future backend that does classify it,
+/// `ErrorCode::AlreadyExists` directly) — so there is nothing in the error
+/// itself to match on beyond that. The same reasoning and the same
+/// probe-after-the-write shape is already written out at
+/// `admin::ops::taken_key_or_db_error`, which this mirrors for this block's
+/// own error type: probing *after* the failed write, not before, is what
+/// closes the two-hosts-roll-the-same-code race — a pre-check that found
+/// the code free leaves a gap a competing create can still land in, and the
+/// loser of that race is exactly the request that would otherwise surface
+/// as a raw `Db` (500) instead of the documented `Taken` (409).
+async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> RoomError {
+    match error.code {
+        // Already classified by the backend — nothing left to find out.
+        ErrorCode::AlreadyExists => return RoomError::Taken,
+        // The two shapes a constraint violation can arrive as unclassified.
+        ErrorCode::Internal | ErrorCode::Aborted => {}
+        // Anything else (WRAP refusal, quota, ...) is not a code collision.
+        _ => return RoomError::Db(error.message),
+    }
+    match db::list_all(ctx, TABLE, code_filter(code)).await {
+        Ok(rows) if !rows.is_empty() => RoomError::Taken,
+        _ => RoomError::Db(error.message),
+    }
+}
+
+/// The write half of [`open_room`]: build the row and insert it
+/// unconditionally — no "is this code already live" check. `open_room` runs
+/// that check first; this is its own function so a genuine two-hosts-
+/// same-code race (both passing the check before either creates) is
+/// provable directly: call this twice with the same code, bypassing the
+/// check entirely, and the second call is what exercises the real
+/// primary-key collision `taken_or_db_error` maps to `Taken`.
+async fn create_row(
+    ctx: &dyn Context,
+    code: &str,
+    sdp: &str,
+    ttl_secs: i64,
+) -> Result<(), RoomError> {
+    let mut data: HashMap<String, Value> = HashMap::new();
+    data.insert("code".into(), json!(code));
+    data.insert("offer_sdp".into(), json!(sdp));
+    data.insert("answer_sdp".into(), json!(""));
+    data.insert("created_at".into(), json!(now_iso()));
+    data.insert("expires_at".into(), json!(iso_plus_seconds(ttl_secs)));
+    match db::create(ctx, TABLE, data).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(taken_or_db_error(ctx, code, e).await),
+    }
+}
+
 /// Put the host's offer up under `code`, which also creates the room.
 /// Sweeps rows past their expiry first, so an abandoned room never holds a
 /// code hostage and there is no background job to own.
@@ -159,24 +229,18 @@ pub async fn open_room(
     if !valid_code(code) {
         return Err(RoomError::BadCode);
     }
-    let now = now_iso();
-    sweep(ctx, &now).await?;
+    sweep(ctx, &now_iso()).await?;
     // The sweep above has already dropped anything expired, so a row still
-    // here for this code is live.
+    // here for this code is live. This check narrows the race window but
+    // does not close it — `create_row`'s own error mapping is what closes
+    // it, for the two concurrent callers that both pass this check.
     let existing = db::list_all(ctx, TABLE, code_filter(code))
         .await
         .map_err(db_err)?;
     if !existing.is_empty() {
         return Err(RoomError::Taken);
     }
-    let mut data: HashMap<String, Value> = HashMap::new();
-    data.insert("code".into(), json!(code));
-    data.insert("offer_sdp".into(), json!(sdp));
-    data.insert("answer_sdp".into(), json!(""));
-    data.insert("created_at".into(), json!(now));
-    data.insert("expires_at".into(), json!(iso_plus_seconds(ttl_secs)));
-    db::create(ctx, TABLE, data).await.map_err(db_err)?;
-    Ok(())
+    create_row(ctx, code, sdp, ttl_secs).await
 }
 
 /// The host's offer. `Gone` when the code is unknown or expired.
@@ -184,10 +248,29 @@ pub async fn offer_for(ctx: &dyn Context, code: &str) -> Result<String, RoomErro
     Ok(fetch_live(ctx, code).await?.offer_sdp)
 }
 
+/// The write half of `answer_room`: set `answer_sdp` only if it is still
+/// empty (the [`answer_cas_filter`] condition), and report how many rows
+/// that compare-and-swap actually touched. `0` means the row no longer
+/// matches — either a racing write already set a non-empty `answer_sdp`, or
+/// the room expired/was swept — between whatever the caller read and this
+/// call; `answer_room` re-reads to tell those two cases apart. Split out so
+/// a test can call it directly a second time, bypassing `answer_room`'s own
+/// front-door "already answered" check, to force the exact race the CAS
+/// filter exists to resolve.
+async fn write_answer_if_empty(ctx: &dyn Context, code: &str, sdp: &str) -> Result<i64, RoomError> {
+    let mut data: HashMap<String, Value> = HashMap::new();
+    data.insert("answer_sdp".into(), json!(sdp));
+    db::update_by_filters_count(ctx, TABLE, answer_cas_filter(code), data)
+        .await
+        .map_err(db_err)
+}
+
 /// Write the guest's answer into an unanswered room. `Gone` if the row was
 /// deleted (expiry, or a concurrent `take_answer`) between the read that
-/// found it live and the write — `update_by_filters_count`'s returned count
-/// is what tells the two apart from a normal success.
+/// found it live and the write; `Answered` if a second guest's write landed
+/// first. Both are the `count == 0` case of the CAS in
+/// [`write_answer_if_empty`] — a re-read is what tells them apart, since the
+/// count alone doesn't say which happened.
 pub async fn answer_room(ctx: &dyn Context, code: &str, sdp: &str) -> Result<(), RoomError> {
     if !valid_code(code) {
         return Err(RoomError::BadCode);
@@ -196,13 +279,15 @@ pub async fn answer_room(ctx: &dyn Context, code: &str, sdp: &str) -> Result<(),
     if !row.answer_sdp.is_empty() {
         return Err(RoomError::Answered);
     }
-    let mut data: HashMap<String, Value> = HashMap::new();
-    data.insert("answer_sdp".into(), json!(sdp));
-    let count = db::update_by_filters_count(ctx, TABLE, code_filter(code), data)
-        .await
-        .map_err(db_err)?;
+    let count = write_answer_if_empty(ctx, code, sdp).await?;
     if count == 0 {
-        return Err(RoomError::Gone);
+        return Err(match fetch_live(ctx, code).await {
+            // Present (and live) means someone else's answer is what's
+            // there now — the room itself didn't vanish.
+            Ok(_) => RoomError::Answered,
+            // Absent or expired: the room is what's gone, not the answer.
+            Err(e) => e,
+        });
     }
     Ok(())
 }
@@ -257,7 +342,7 @@ pub async fn sweep(ctx: &dyn Context, cutoff: &str) -> Result<u64, RoomError> {
     )
     .await
     .map_err(db_err)?;
-    Ok(n.max(0) as u64)
+    Ok(n as u64)
 }
 
 #[cfg(test)]
@@ -345,5 +430,79 @@ mod tests {
         assert!(!valid_code("AB2CD0")); // a zero reads as an O
         assert!(!valid_code("ab2cd3")); // the alphabet is upper case
         assert!(!valid_code("AB2CD/")); // and it is not a path
+    }
+
+    /// `create_row` is `open_room`'s write half with the "already live"
+    /// check skipped entirely — calling it twice, directly, with the same
+    /// code is exactly the race two hosts rolling the same code produce
+    /// (both pass the check, then both create): the primary-key collision
+    /// on the second insert must map to `Taken`, not surface as a raw `Db`.
+    #[tokio::test]
+    async fn a_create_after_a_create_with_the_same_code_bypassing_the_check_is_taken() {
+        let ctx = TestContext::with_signal().await;
+        create_row(&ctx, "AB2CD3", &sdp(1), 600)
+            .await
+            .expect("first create");
+        assert!(matches!(
+            create_row(&ctx, "AB2CD3", &sdp(2), 600).await,
+            Err(RoomError::Taken)
+        ));
+    }
+
+    /// `answer_room`'s own "already answered" check is sequential — it
+    /// can't catch two truly concurrent writers, only two writes that fully
+    /// `.await` one after another. The CAS filter in
+    /// [`write_answer_if_empty`] is what actually has to refuse a second
+    /// writer, so this calls it directly (bypassing `answer_room`'s
+    /// front-door check, which a genuine race would also bypass) to prove
+    /// the store itself — not just the application-level ordering — is what
+    /// keeps the first answer.
+    #[tokio::test]
+    async fn a_racing_second_write_cannot_overwrite_the_first_answer() {
+        let ctx = TestContext::with_signal().await;
+        open_room(&ctx, "AB2CD3", &sdp(1), 600).await.expect("open");
+        answer_room(&ctx, "AB2CD3", &sdp(2))
+            .await
+            .expect("first answer");
+        let count = write_answer_if_empty(&ctx, "AB2CD3", &sdp(3))
+            .await
+            .expect("racing write");
+        assert_eq!(
+            count, 0,
+            "the CAS must refuse a write once an answer already stands"
+        );
+        assert_eq!(
+            take_answer(&ctx, "AB2CD3").await.expect("take"),
+            Some(sdp(2)),
+            "the first answer must survive the racing write"
+        );
+    }
+
+    /// Production Cloudflare/D1 runs with `WAFER_RUN__DATABASE__STRICT_SCHEMA`
+    /// on (see `impresspress-cloudflare/src/database.rs`), where the shared
+    /// `db::create`/`db::update_by_filters_count` defaults' lazy
+    /// `ALTER TABLE ADD COLUMN` for the synthesized `id` and stamped
+    /// `updated_at` columns is switched off — a write against an undeclared
+    /// column fails loudly instead. This is the regression test for that:
+    /// every default (non-strict) unit test above would still pass even if
+    /// the migration forgot `id`/`updated_at`, because lazy column-add
+    /// papers over the gap. This one can't, because
+    /// `TestContext::set_strict_schema` disables that lazy path the same
+    /// way production's config flag does.
+    #[tokio::test]
+    async fn a_room_can_be_opened_and_answered_under_strict_schema() {
+        let ctx = TestContext::with_signal().await;
+        ctx.set_strict_schema(true);
+        open_room(&ctx, "AB2CD3", &sdp(1), 600)
+            .await
+            .expect("open under strict schema");
+        assert_eq!(offer_for(&ctx, "AB2CD3").await.expect("offer"), sdp(1));
+        answer_room(&ctx, "AB2CD3", &sdp(2))
+            .await
+            .expect("answer under strict schema");
+        assert_eq!(
+            take_answer(&ctx, "AB2CD3").await.expect("take"),
+            Some(sdp(2))
+        );
     }
 }
