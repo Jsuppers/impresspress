@@ -157,6 +157,21 @@ struct VarRow<'a> {
     /// `ops::delete_variable` refuses them, so a button there would only ever
     /// produce an error.
     deletable: bool,
+    /// Why this row outranks the process environment, when it does.
+    ///
+    /// Rendered as a badge whatever the target, because a pin is a real
+    /// property of the row: it is what `variables::set_by_admin` records and
+    /// what the boot log reports.
+    pin: Option<variables::Pin>,
+    /// Whether THIS DEPLOYMENT has a process environment to hand a key back to.
+    ///
+    /// Separate from [`Self::pin`], and per-render rather than per-row, because
+    /// the two answer different questions: the pin says the row is claimed, this
+    /// says whether un-claiming it means anything here. Cloudflare never runs
+    /// `variables::seed_and_load` and the browser runs it with an empty batch,
+    /// so on those targets the control's own toast — "replaced on the next
+    /// restart" — would be false.
+    offer_reset: bool,
 }
 
 /// Build one variable table row's cells, in column order: key (+ optional
@@ -202,6 +217,9 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
     cells.push(html! {
         span .text-xs {
             (row.description)
+            @if let Some(pin) = row.pin {
+                div .mt-1 { (pin_badge(pin)) }
+            }
             @if !row.warning.is_empty() {
                 div .var-warning-note {
                     "Warning: " (row.warning)
@@ -209,7 +227,7 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
             }
         }
     });
-    // Both controls share the final cell: the cells are columns against
+    // All three controls share the final cell: the cells are columns against
     // `VAR_COLUMNS`, so a conditional extra cell would misalign every row
     // that has no delete control against every row that does.
     cells.push(html! {
@@ -221,6 +239,9 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
                 title="Edit"
                 aria-label=(format!("Edit {}", row.key))
             { (icons::edit()) }
+            @if row.pin.is_some() && row.offer_reset {
+                (reset_to_environment_button(row.key))
+            }
             @if row.deletable {
                 (delete_button(row.key))
             }
@@ -229,19 +250,37 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
     cells
 }
 
+/// What the per-block tables need from a stored row: the columns they render
+/// that the `ConfigVar` declaration cannot supply.
+///
+/// A named struct rather than a wider tuple because the third member is not
+/// obvious from its type — `Option<Pin>` beside a `String` and an `i64` reads
+/// as nothing in particular at the call site, while `pin` reads as itself.
+struct StoredVar {
+    value: String,
+    /// Kept as the `i64` `ops::is_sensitive_key` takes, so the SEC-060 key rule
+    /// — the `_SECRET`/`_KEY` suffix or the key's own declaration — is applied
+    /// at render time rather than trusted from the column.
+    sensitive_flag: i64,
+    pin: Option<variables::Pin>,
+}
+
 /// Build and render one row for a declared [`ConfigVar`] (the shared + per-block
 /// tables): pulls the stored value + sensitive flag from `var_map`, falling
 /// back to the var's declared sensitivity when no DB row exists, and shows the
 /// declared default / auto-generate badge.
 fn config_var_row(
     var: &wafer_run::ConfigVar,
-    var_map: &std::collections::HashMap<String, (String, i64)>,
+    var_map: &std::collections::HashMap<String, StoredVar>,
+    offer_reset: bool,
 ) -> Vec<Markup> {
-    let (db_value, sensitive_flag) = var_map
-        .get(&var.key)
-        .map(|(v, s)| (v.as_str(), *s))
+    let stored = var_map.get(&var.key);
+    let (db_value, sensitive_flag) = stored
+        .map(|s| (s.value.as_str(), s.sensitive_flag))
         .unwrap_or(("", var.is_sensitive() as i64));
     var_row(&VarRow {
+        pin: stored.and_then(|s| s.pin),
+        offer_reset,
         key: &var.key,
         name: Some(&var.name),
         value: ValueState::resolve(&var.key, db_value, sensitive_flag, true),
@@ -370,6 +409,66 @@ fn delete_button(key: &str) -> Markup {
     }
 }
 
+/// The control that hands one key back to the process environment, shared by
+/// every table that offers one so the affordance and its confirm text cannot
+/// drift between them.
+///
+/// The UI half of the recovery route [`variables::seed_and_load`]'s boot WARN
+/// names. It is the ONLY route out of a pinned key: `ops::delete_variable`
+/// refuses every declared `WAFER_RUN_SHARED__*` row, and `ops::update_variable`
+/// re-stamps ownership on every write, so clearing the value would re-pin the
+/// row it was meant to release.
+///
+/// `hx-swap="none"`, unlike [`delete_button`]'s `closest tr` / `outerHTML`:
+/// nothing is removed and no row's identity changes, so the response body is
+/// empty and the toast its `HX-Trigger` carries is the whole result. The pin
+/// badge beside it goes stale until the next render, which is the honest cost
+/// of not re-rendering a table from a row control — the change this reports
+/// does not take effect until a restart either.
+fn reset_to_environment_button(key: &str) -> Markup {
+    html! {
+        button .btn .btn--sm .btn--ghost type="button"
+            hx-post={"/b/admin/variables/" (key) "/reset-to-environment"}
+            hx-swap="none"
+            hx-confirm={
+                "Hand " (key) " back to the environment? The stored value stops taking \
+                 precedence, and the next restart seeds this key from the process \
+                 environment again."
+            }
+            data-error-label="Could not hand this variable back to the environment"
+            title="Reset to environment"
+            aria-label=(format!("Reset {key} to environment"))
+        { (icons::refresh_cw()) }
+    }
+}
+
+/// The badge that says WHY a row outranks the process environment.
+///
+/// Two wordings, because they are two different claims and only one of them is
+/// about a person: an admin edit is a decision somebody made and this build
+/// recorded, while an upgrade pin is this build saying it cannot tell. Calling
+/// the second one an admin edit would be the same class of untruth the boot
+/// WARN exists to avoid.
+fn pin_badge(pin: variables::Pin) -> Markup {
+    let (label, title) = match pin {
+        variables::Pin::AdminEdit => (
+            "Edited here",
+            "An admin edited this through the admin UI, so the process environment no \
+             longer sets it.",
+        ),
+        variables::Pin::PreUpgrade => (
+            "Pinned at upgrade",
+            "Kept when this deployment upgraded: the stored value predates edit tracking \
+             and differed from the environment, so no admin edit can be proved either way.",
+        ),
+    };
+    html! {
+        span title=(title) {
+            (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { (label) }))
+        }
+    }
+}
+
 /// Whether the page offers a delete control for `key`, given the set of
 /// shared vars this build still declares.
 ///
@@ -394,6 +493,8 @@ fn declared_shared_keys() -> std::collections::HashSet<String> {
 async fn config_all_tab(ctx: &dyn Context) -> Markup {
     let settings = variables::list_all(ctx).await;
     let declared_shared = declared_shared_keys();
+    // One read per render, not per row — see `VarRow::offer_reset`.
+    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
 
     html! {
         @match &settings {
@@ -418,6 +519,9 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                             @if !description.is_empty() {
                                 span .text-muted { (description) }
                             }
+                            @if let Some(pin) = variables::pin_of(row) {
+                                div .mt-1 { (pin_badge(pin)) }
+                            }
                             @if !warning.is_empty() {
                                 div .text-warning-strong .text-xs .mt-1 {
                                     (ui::icons::triangle_alert()) (warning)
@@ -433,6 +537,14 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                                     title="Edit"
                                     aria-label=(format!("Edit {key}"))
                                 { (icons::edit()) }
+                                // Same reasoning as the delete control below:
+                                // the flat listing is where an operator sent
+                                // here by a boot WARN naming one key actually
+                                // looks for it, so it must offer what the By
+                                // Block tables offer.
+                                @if offer_reset && variables::pin_of(row).is_some() {
+                                    (reset_to_environment_button(key))
+                                }
                                 // The flat listing offers the same control as
                                 // the Unowned table: this is where an operator
                                 // scanning for a legacy key actually looks, and
@@ -467,19 +579,23 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
     // Load all variables from DB
     let all_vars = variables::list_all(ctx).await.unwrap_or_default();
 
-    // Build a map of key -> (value, sensitive-flag). The flag is kept as the
-    // `i64` `ops::is_sensitive_key` takes so the SEC-060 key rule — the
-    // `_SECRET`/`_KEY` suffix or the key's own declaration — can be applied at
-    // render time.
-    let var_map: std::collections::HashMap<String, (String, i64)> = all_vars
+    let var_map: std::collections::HashMap<String, StoredVar> = all_vars
         .iter()
         .map(|row| {
             (
                 row.key.clone(),
-                (row.value.clone(), i64::from(row.sensitive)),
+                StoredVar {
+                    value: row.value.clone(),
+                    sensitive_flag: i64::from(row.sensitive),
+                    pin: variables::pin_of(row),
+                },
             )
         })
         .collect();
+
+    // One read per render, not per row: whether handing a key back to a process
+    // environment means anything on this target.
+    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
 
     // Collect blocks that have config_keys
     let blocks_with_config: Vec<_> = blocks
@@ -529,7 +645,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                     }
                 },
                 true,
-                shared_vars.iter().map(|var| config_var_row(var, &var_map)).collect(),
+                shared_vars.iter().map(|var| config_var_row(var, &var_map, offer_reset)).collect(),
             ))
         }
 
@@ -567,7 +683,7 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                     }
                 },
                 true,
-                block.config_keys.iter().map(|var| config_var_row(var, &var_map)).collect(),
+                block.config_keys.iter().map(|var| config_var_row(var, &var_map, offer_reset)).collect(),
             ))
         }
 
@@ -619,6 +735,8 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                         // `WAFER_RUN_SHARED__*` row appearing here is stale by
                         // construction and removable — which is the point.
                         deletable: key != crate::blocks::auth::JWT_SECRET_KEY,
+                        pin: variables::pin_of(row),
+                        offer_reset,
                     })
                 }).collect(),
             ))
@@ -890,10 +1008,6 @@ pub async fn handle_update_variable(
 /// `ops::delete_variable`, shared with that JSON surface, so the two cannot
 /// drift on what they refuse.
 ///
-/// Returns EMPTY markup rather than re-rendering the page the way
-/// [`handle_update_variable`] does: the control targets `closest tr` with
-/// `outerHTML`, so an empty body is what removes the row. Re-rendering the
-/// whole page into a `<tr>` would nest a document inside a table row.
 /// `POST /b/admin/variables/{key}/reset-to-environment` — the Variables page's
 /// row control for handing a key back to the process environment.
 ///
@@ -918,6 +1032,12 @@ pub async fn handle_reset_variable_to_environment(
     )
 }
 
+/// `DELETE /b/admin/variables/{key}` — the Variables page's delete row control.
+///
+/// Returns EMPTY markup rather than re-rendering the page the way
+/// [`handle_update_variable`] does: the control targets `closest tr` with
+/// `outerHTML`, so an empty body is what removes the row. Re-rendering the
+/// whole page into a `<tr>` would nest a document inside a table row.
 pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let key = msg.var("key");
     if let Err(out) = ops::delete_variable(ctx, msg, key).await {
@@ -1141,6 +1261,152 @@ mod tests {
         );
     }
 
+    /// Render the Variables page the way `Route::SettingsVariablesPage`
+    /// dispatches it, over a context that does or does not claim a process
+    /// environment.
+    ///
+    /// `settings_page(ctx, msg, "variables")` is verbatim what `mod.rs`'s
+    /// dispatch arm calls, which is the point: a helper that emits a control
+    /// proves nothing about whether the page ever calls that helper, and the
+    /// missing markup this test exists for was exactly that gap.
+    async fn variables_page_html(ctx: &TestContext, tab: &str) -> String {
+        let mut msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            "/b/admin/settings/variables",
+        ));
+        if !tab.is_empty() {
+            msg.set_meta("req.query.tab", tab);
+        }
+        output_html(
+            crate::blocks::admin::pages::settings::settings_page(ctx, &msg, "variables").await,
+        )
+        .await
+    }
+
+    /// An admin context on a deployment that boots from a process environment,
+    /// holding one pinned declared key.
+    async fn ctx_with_a_pinned_key(key: &str, has_process_env: bool) -> TestContext {
+        let mut ctx = TestContext::with_admin().await;
+        if has_process_env {
+            ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+        }
+        // Through the real admin surface, which is what stamps the pin.
+        let msg = admin_msg("update", "/admin/settings");
+        assert!(
+            ops::create_variable(&ctx, &msg, key, "AdminChoice", None, None, false)
+                .await
+                .is_ok(),
+            "the fixture's admin create must land"
+        );
+        assert!(
+            variables::is_pinned(
+                &variables::get_by_key(&ctx, key)
+                    .await
+                    .expect("get")
+                    .expect("row")
+            ),
+            "the fixture has to leave the row pinned or the test proves nothing"
+        );
+        ctx
+    }
+
+    /// THE MISSING AFFORDANCE. The boot WARN and the reset toast both tell an
+    /// operator to use "Reset to environment" on the admin Variables page —
+    /// and no markup rendered it. The handler, both routes and their route-table
+    /// tests all existed; the button did not.
+    ///
+    /// Asserted on the page the operator actually lands on
+    /// (`/b/admin/settings/variables`, whose default tab is "By Block"), for a
+    /// declared shared key, because that is where a pinned
+    /// `WAFER_RUN_SHARED__*` row is shown.
+    #[tokio::test]
+    async fn the_variables_page_offers_the_reset_control_for_a_pinned_key() {
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let ctx = ctx_with_a_pinned_key(key, true).await;
+
+        for tab in ["", "all"] {
+            let html = variables_page_html(&ctx, tab).await;
+            assert!(
+                html.contains(key),
+                "the row must be on the {tab:?} tab at all, or this proves nothing: {html}"
+            );
+            assert!(
+                html.contains(&format!(
+                    r#"hx-post="/b/admin/variables/{key}/reset-to-environment""#
+                )),
+                "the {tab:?} tab must offer the control the boot WARN names: {html}"
+            );
+            assert!(
+                html.contains(&format!(r#"aria-label="Reset {key} to environment""#)),
+                "an icon-only control must expose an accessible name: {html}"
+            );
+        }
+    }
+
+    /// A row nothing has pinned takes the environment already, so offering to
+    /// hand it back would be an action with no effect.
+    #[tokio::test]
+    async fn an_unpinned_row_offers_no_reset_control() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+        variables::seed_row_with_flag(&ctx, "WAFER_RUN_SHARED__APP_NAME", "Seeded", 0).await;
+
+        let html = variables_page_html(&ctx, "all").await;
+        assert!(
+            html.contains("WAFER_RUN_SHARED__APP_NAME"),
+            "the row must be on the page: {html}"
+        );
+        assert!(
+            !html.contains("reset-to-environment"),
+            "an unpinned row must offer no reset control: {html}"
+        );
+    }
+
+    /// On a target with no process environment there is nothing to hand a key
+    /// back TO.
+    ///
+    /// Cloudflare never calls `variables::seed_and_load` and the browser calls
+    /// it with an empty batch, so the control's toast ("replaced on the next
+    /// restart") would be a plain lie there. Absent marker means absent
+    /// control — see `variables::HAS_PROCESS_ENV_CONFIG_KEY` for why the
+    /// default is the safe side.
+    #[tokio::test]
+    async fn a_target_without_a_process_environment_offers_no_reset_control() {
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let ctx = ctx_with_a_pinned_key(key, false).await;
+
+        for tab in ["", "all"] {
+            let html = variables_page_html(&ctx, tab).await;
+            assert!(html.contains(key), "the row must be on the page: {html}");
+            assert!(
+                !html.contains("reset-to-environment"),
+                "the {tab:?} tab must not offer to hand a key back to an environment this \
+                 deployment does not have: {html}"
+            );
+        }
+    }
+
+    /// The page has to say WHICH claim pins a row, because the two are not the
+    /// same claim and only one of them is about a person.
+    #[tokio::test]
+    async fn the_page_distinguishes_an_admin_edit_from_an_upgrade_pin() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        variables::seed_row_with_owner(&ctx, key, "KeptAtUpgrade", variables::PRE_UPGRADE_SENTINEL)
+            .await;
+
+        let html = variables_page_html(&ctx, "all").await;
+        assert!(
+            html.contains("Pinned at upgrade"),
+            "an upgrade pin must not read as an admin edit: {html}"
+        );
+        assert!(
+            !html.contains("Edited here"),
+            "and must not claim a person made a decision nobody recorded: {html}"
+        );
+    }
+
     /// The icon-only edit button must carry an accessible name derived from
     /// the row key (2026-07-11 review: 49 unlabeled icon buttons on the
     /// Variables page alone).
@@ -1156,6 +1422,8 @@ mod tests {
             warning: "",
             show_default: false,
             deletable: false,
+            pin: None,
+            offer_reset: false,
         });
         let s = components::TableRow::new(cells)
             .render(&VAR_COLUMNS, None)
@@ -1177,6 +1445,8 @@ mod tests {
             warning: "",
             show_default: false,
             deletable,
+            pin: None,
+            offer_reset: false,
         });
         components::TableRow::new(cells)
             .render(&VAR_COLUMNS, None)

@@ -1873,6 +1873,12 @@ mod page_link_tests {
     const PROBE_BLOCK: &str = "impresspress/probe";
     const PROBE_VARIABLE: &str = "PROBE_SETTING";
 
+    /// A variables row an admin surface has PINNED, so the pages render the
+    /// "Reset to environment" control for it. Separate from [`PROBE_VARIABLE`]
+    /// because that one has to stay unpinned: an unpinned row is what proves
+    /// the control is conditional rather than rendered for everything.
+    const PINNED_VARIABLE: &str = "PINNED_SETTING";
+
     /// The two blocks an admin page may link to, by the router prefix each
     /// owns (`routing.rs`); a link anywhere else is a new decision.
     const ADMIN_PREFIX: &str = "/b/admin/";
@@ -1938,6 +1944,26 @@ mod page_link_tests {
         )
         .await
         .expect("seed variable");
+        // A PINNED variable, and a target that claims a process environment, so
+        // the Variables page renders the "Reset to environment" control. Without
+        // both, the control is correctly absent and the expectation below could
+        // pass with the markup deleted.
+        variables::insert(
+            &ctx,
+            variables::NewVariable {
+                key: PINNED_VARIABLE.to_string(),
+                value: "kept".to_string(),
+                name: PINNED_VARIABLE.to_string(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: crate::features::USER_EDITED_SENTINEL.to_string(),
+                block: variables::block_for_key(PINNED_VARIABLE),
+            },
+        )
+        .await
+        .expect("seed pinned variable");
+        ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         let grant = wrap_grants::create(
             &ctx,
             wrap_grants::NewWrapGrant {
@@ -2136,6 +2162,14 @@ mod page_link_tests {
             // it renders in the unowned and flat tables, both of which offer
             // one — a change that drops the button from either fails here.
             ("delete", format!("/b/admin/variables/{PROBE_VARIABLE}")),
+            // The reset-to-environment control, for the PINNED row. Both the
+            // boot WARN and the reset toast tell an operator to use it, and for
+            // a long while nothing rendered it at all; this is what stops that
+            // recurring.
+            (
+                "create",
+                format!("/b/admin/variables/{PINNED_VARIABLE}/reset-to-environment"),
+            ),
             ("create", "/b/admin/grants/rules".to_string()),
             (
                 "delete",

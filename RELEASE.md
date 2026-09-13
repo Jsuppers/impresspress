@@ -17,6 +17,62 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Config: your `.env` applies again, and one boot decides the ties
+
+**What changes.** A `WAFER_RUN_SHARED__*` / `{ORG}__{BLOCK}__*` environment
+variable used to be silently ignored from the second boot onward. It was seeded
+with `INSERT OR IGNORE`, so it only ever landed on a virgin database; afterwards
+a row existed, the insert was discarded, and nothing said so. From this release
+the environment sets a key on every boot — **unless an admin has edited that key
+through the admin UI**, in which case the stored row wins permanently and the
+boot log says which key and why.
+
+**The one-time upgrade boot.** Rows written before this release carry no record
+of who wrote them, so an admin's settings-form edit and an earlier boot's env
+seed look identical. On the first boot after upgrading, any key whose stored
+value **differs** from a value you export is **kept as it is**, pinned, and
+named in a WARN. Nothing is reverted, and no export is lost — it simply does not
+apply until you say so. A key whose stored value already matches its export is
+left alone silently.
+
+**What to do.** Read the boot log. For each `NO EFFECT` line, decide which value
+you want:
+
+- *the environment's* — open **Admin → Settings → Variables**, find the key, and
+  use **Reset to environment** (or `POST
+  /b/admin/api/settings/{key}/reset-to-environment`), then restart. The export
+  applies from then on, with no further intervention.
+- *the stored one* — do nothing. The line stops once you remove the export.
+
+After that boot the rule is simply: the environment sets a key until an admin
+edits it in the UI.
+
+**Keys worth checking first**, because they decide who can get in:
+
+- `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` — **every** signup with this
+  address is granted admin, not just the first one (`auth::initial_role_for`),
+  so a stale value here is a standing back door. Clear it once you have your
+  admin account.
+- `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` and
+  `..._BOOTSTRAP_ADMIN_TOKEN` — plaintext credentials; a cleared one now stays
+  cleared across a restart even with the export still present.
+- `WAFER_RUN_SHARED__ALLOW_SIGNUP` and `WAFER_RUN_SHARED__ENABLE_OAUTH` — if you
+  turned either off in the UI during an incident, it stays off.
+- `WAFER_RUN_SHARED__ENVIRONMENT` — if this deployment first booted as
+  `development` and your deployment config later said `production`, the stored
+  value is the **less secure** one (session cookies without `Secure`, and a
+  wildcard `Access-Control-Allow-Origin` on discovery documents). Reset this key
+  to the environment before anything else.
+- Block-scoped credentials such as `IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY` —
+  if you rotated one in the UI and your deployment config still carries the old
+  one, the rotated value is what is kept. Neither value is printed in the log;
+  compare the stored one where you issued it.
+
+**No migration.** Nothing to opt into, and the transition runs once per database
+whether or not you pass `--run-migrations`. Cloudflare and browser deployments
+are unaffected: neither seeds from a process environment, so neither has a tie
+to break, and the **Reset to environment** control does not render there.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one

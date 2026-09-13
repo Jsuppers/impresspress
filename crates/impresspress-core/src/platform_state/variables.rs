@@ -409,36 +409,106 @@ pub async fn set_by_admin(
     set_with_owner(db, key, value, "", "", sensitive, Some(admin_id)).await
 }
 
-/// Whether an admin of THIS instance has written this row through an admin
-/// surface, which is what makes the row win over the process environment.
+/// The `updated_by` marker [`seed_and_load`]'s one-time upgrade transition
+/// writes onto a row it keeps.
 ///
-/// The signal is `updated_by`, which already carried exactly this meaning:
-/// `admin::ops::{create_variable, update_variable}` stamp the acting admin's
-/// id, and every seeder — the env loop, `seed_if_absent`, `seed_one_secret`,
-/// `seed_jwt_secret`, `seed_defaults`' create branch — leaves it empty.
-/// [`set_by_admin`] closes the one admin surface that did not stamp it.
+/// Deliberately NOT [`crate::features::USER_EDITED_SENTINEL`]. That sentinel
+/// asserts a human made a decision, and the transition cannot know that — the
+/// row predates edit tracking, so "an admin edited this" and "an earlier boot's
+/// environment wrote this" are indistinguishable. A separate marker is what
+/// lets the steady-state WARN and the Variables page say the true thing
+/// ("pinned at upgrade") instead of a plausible-sounding false one.
+pub const PRE_UPGRADE_SENTINEL: &str = "pre-upgrade";
+
+/// The row whose presence records that [`seed_and_load`]'s one-time
+/// env-precedence transition has already run.
 ///
-/// Empty therefore means "no admin has touched this row", NOT "unknown". That
-/// is the opposite reading to `plan_seed_decisions`, where an empty hash means
-/// legacy-and-preserve — and deliberately so: there, an empty hash is rare
-/// legacy state, while here it is what every seeded row carries, so treating it
-/// as admin-owned would stop the environment seeding anything at all and undo
-/// the bug this PR exists to fix.
+/// A block-scoped key, so it is ordinary storable config rather than a
+/// runtime-owned one — the same shape `dev::seed`'s
+/// `IMPRESSPRESS__DEV__SEED_ERROR` diagnostic row already uses.
+pub const ENV_PRECEDENCE_TRANSITION_KEY: &str = "IMPRESSPRESS__ADMIN__ENV_PRECEDENCE_TRANSITION";
+
+/// Internal, adapter-injected key: `"1"` when this deployment boots from a
+/// process environment, absent otherwise.
 ///
-/// The cost of that choice is one documented case: a row whose only admin edit
-/// came through a settings form BEFORE this stamp existed looks seeder-owned,
-/// so an env export for it wins once more, on the first boot after the upgrade,
-/// and is announced in the boot log like any other override. The next admin
-/// edit marks it for good.
-pub fn is_admin_owned(row: &VariableRow) -> bool {
-    !row.updated_by.is_empty()
+/// Published by the NATIVE runtime only (`cli::server::build_native_runtime`),
+/// which is the only target that hands [`seed_and_load`] a non-empty
+/// `env_vars`: Cloudflare never calls it at all, and the browser calls it with
+/// `&[]`. Every pin this module records exists to resist a process environment,
+/// so a surface that offers to hand a key BACK to one has to know whether there
+/// is one — see [`deployment_seeds_from_process_env`].
+///
+/// Bracketed in double underscores, so it is an internal key by
+/// [`crate::config_vars::is_internal_key`]: served only from the boot map, never
+/// stored in this table, and refused by every write surface. Same shape as
+/// `products::RUNTIME_KIND_CONFIG_KEY`.
+///
+/// FAIL-CLOSED, and that is the whole reason it is a new key rather than a third
+/// value for `RUNTIME_KIND_CONFIG_KEY`: that one defaults to `"server"`, so a
+/// Cloudflare boot path that forgot to publish `"cloudflare"` would claim a
+/// process environment it does not have. Absent here means "no", so the failure
+/// mode of forgetting to publish it is a control that does not render — which
+/// leaves the documented API route working — rather than one that lies.
+pub const HAS_PROCESS_ENV_CONFIG_KEY: &str = "__IMPRESSPRESS_HAS_PROCESS_ENV__";
+
+/// Whether this deployment boots from a process environment, and so whether
+/// handing a key back to one means anything here.
+///
+/// See [`HAS_PROCESS_ENV_CONFIG_KEY`] for why absent means "no".
+pub async fn deployment_seeds_from_process_env(ctx: &dyn Context) -> bool {
+    wafer_core::clients::config::get_default(ctx, HAS_PROCESS_ENV_CONFIG_KEY, "").await == "1"
 }
 
-/// Hand a key back to the process environment: clear its admin-ownership
-/// marker so [`seed_and_load`] seeds it again on the next boot.
+/// Why a stored row outranks the process environment, when it does.
 ///
-/// The counterpart to [`set_by_admin`], and the reason admin-wins is not a
-/// one-way door. Without it a pinned key had no supported exit:
+/// The signal is `updated_by`, which already carried the admin half of this
+/// meaning: `admin::ops::{create_variable, update_variable}` stamp the acting
+/// admin's id, and every seeder — the env loop, [`seed_if_absent`],
+/// [`seed_one_secret`], [`seed_jwt_secret`], `seed_defaults`' create branch —
+/// leaves it empty. [`set_by_admin`] closes the one admin surface that did not
+/// stamp it.
+///
+/// Empty therefore means "nothing has claimed this row", NOT "unknown". That is
+/// the opposite reading to `plan_seed_decisions`, where an empty hash means
+/// legacy-and-preserve — and deliberately so: there, an empty hash is rare
+/// legacy state, while here it is what every seeded row carries, so treating it
+/// as claimed would stop the environment seeding anything at all and undo the
+/// bug this PR exists to fix. The rows that really are legacy are handled once,
+/// by the upgrade transition in [`seed_and_load`], rather than by reading every
+/// empty marker as a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin {
+    /// An admin of THIS instance wrote the row through an admin surface.
+    AdminEdit,
+    /// The one-time upgrade transition kept the row: it predates edit tracking
+    /// and its value differed from the export present at the time, so this
+    /// build could not tell whether an admin had set it.
+    PreUpgrade,
+}
+
+/// Why `row` outranks the process environment, or `None` when nothing has
+/// claimed it and [`seed_and_load`] may seed it.
+pub fn pin_of(row: &VariableRow) -> Option<Pin> {
+    match row.updated_by.as_str() {
+        "" => None,
+        PRE_UPGRADE_SENTINEL => Some(Pin::PreUpgrade),
+        // A user id, or `features::USER_EDITED_SENTINEL` from the settings
+        // forms, which cannot learn the admin's id.
+        _ => Some(Pin::AdminEdit),
+    }
+}
+
+/// Whether anything has claimed `row` from the process environment — either
+/// kind of [`Pin`].
+pub fn is_pinned(row: &VariableRow) -> bool {
+    pin_of(row).is_some()
+}
+
+/// Hand a key back to the process environment: clear its pin so
+/// [`seed_and_load`] seeds it again on the next boot.
+///
+/// The counterpart to [`set_by_admin`], and the reason a pin is not a one-way
+/// door. Without it a pinned key had no supported exit:
 /// `admin::ops::delete_variable` refuses any declared `WAFER_RUN_SHARED__*`
 /// row, and `update_variable` stamps `updated_by` on every write, so clearing
 /// the value re-pinned the row it was meant to release.
@@ -675,8 +745,47 @@ async fn seed_one_secret(
 ///    boot. That is the original bug fixed — a fresh deployment honours its
 ///    `.env`, and so does an existing one whose admin has left the key alone.
 /// 2. Once an admin has written the row through an admin surface
-///    ([`is_admin_owned`]), the ROW wins permanently and the export is inert
+///    ([`Pin::AdminEdit`]), the ROW wins permanently and the export is inert
 ///    for that key.
+///
+/// ## The upgrade transition: pin on conflict, once
+///
+/// Rows written before this release carry no marker, so on the first boot after
+/// upgrading, an admin's settings-form edit and an earlier boot's env seed look
+/// identical. Rule 1 applied to them would revert the edit.
+///
+/// That is not a hypothetical. `variables::set`'s create branch writes
+/// `updated_by: String::new()`, and `ui::settings_form::save_settings` →
+/// `config::set` → `CONFIG_SET` was the write path for the auth-ui settings
+/// form, which carries `WAFER_RUN_SHARED__ALLOW_SIGNUP`,
+/// `WAFER_RUN_SHARED__ENABLE_OAUTH` and both `BOOTSTRAP_ADMIN_*` keys. An admin
+/// who closed signup during an abuse incident left no provenance at all, so
+/// "let the environment win once, loudly" would reopen signup on the upgrade
+/// boot — exactly the harm rule 2 exists to prevent — and there is nothing to
+/// restore the old value from afterwards: [`reset_to_environment`] clears a pin,
+/// it does not remember a value, and the audit log stores no previous value.
+///
+/// So the transition is **pin on conflict**, run once:
+///
+/// - An unmarked row whose value DIFFERS from a present export is kept, stamped
+///   [`PRE_UPGRADE_SENTINEL`], and named in a WARN.
+/// - An unmarked row that already EQUALS its export is left alone, silently:
+///   there is no conflict to resolve and nothing to tell anybody.
+/// - Once [`ENV_PRECEDENCE_TRANSITION_KEY`] exists, rules 1 and 2 apply as
+///   written and the transition never runs again — without that gate, a key an
+///   operator reset would be re-pinned on the very next boot and
+///   [`reset_to_environment`] would not work at all.
+///
+/// It lives INSIDE the env loop rather than in a pass of its own, which is what
+/// makes it cover every declared key — block-scoped secrets like
+/// `IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY` included, where reverting to a
+/// rotated-out credential is the costly failure — rather than only the keys
+/// `config_vars::shared_config_vars` names. It also means the comparison is
+/// against the export actually present, not against a declared default: a
+/// default is no evidence of anything, and two of them
+/// (`WAFER_RUN_SHARED__FAVICON_URL`, `WAFER_RUN_SHARED__LOGO_ICON_URL`) are
+/// content-hashed asset URLs that move whenever those bytes change, so any row
+/// would look edited after an unrelated release.
 ///
 /// The seeding half used to be missing entirely: env values were written with
 /// `insert_if_absent`, so they only ever landed on the very first boot of a
@@ -704,8 +813,10 @@ async fn seed_one_secret(
 /// [`crate::features::plan_seed_decisions`], which skips any row stamped
 /// [`crate::features::USER_EDITED_SENTINEL`]. This mirrors that convention
 /// rather than inventing a second one: the marker lives in `updated_by`
-/// (see [`is_admin_owned`]), and the settings-form surface writes that same
-/// sentinel.
+/// (see [`pin_of`]), and the settings-form surface writes that same sentinel.
+/// The upgrade transition is the one thing that writes a DIFFERENT marker,
+/// because it is making a weaker claim and the log lines have to be able to say
+/// so.
 ///
 /// An **empty** env value is treated as unset and skipped, so `FOO=` in a
 /// shell or `.env` cannot blank out a meaningful stored value. That is the
@@ -746,12 +857,18 @@ pub async fn seed_and_load(
     db: &Arc<dyn DatabaseService>,
     env_vars: &[(String, String)],
 ) -> Result<HashMap<String, String>, String> {
-    // 0. One-time upgrade step, BEFORE the env loop: rows edited through a
-    //    settings form before this release carry no marker, and the loop below
-    //    would overwrite them on this very boot.
-    backfill_admin_ownership(db).await;
+    // 0. Has the one-time upgrade transition already run? One indexed lookup,
+    //    outside the loop, rather than per key.
+    //
+    //    It is read even when `env_vars` is empty so the answer is available to
+    //    the loop without a second branch, but the GATE ROW is only written when
+    //    the loop had something to decide (below). A target with no process
+    //    environment — Cloudflare's deploy hook, the browser's
+    //    `config::seed_and_load_variables` — must not record a transition it
+    //    never performed, and must not bump the config-write generation for it.
+    let transition_done = transition_has_run(db).await;
 
-    // 1. Apply env-provided values to keys no admin owns (see above).
+    // 1. Apply env-provided values to keys nothing has pinned (see above).
     for (key, value) in env_vars {
         if crate::config_vars::is_runtime_owned_key(key) {
             tracing::warn!(
@@ -779,34 +896,17 @@ pub async fn seed_and_load(
         // instead. An operator who can set an env var can already point this
         // deployment anywhere.
         //
-        // ADMIN EDITS WIN. A row an admin has written through an admin surface
-        // owns its key from then on, and this export is inert for it.
+        // A PIN WINS. A row an admin has written through an admin surface, or
+        // one the upgrade transition kept, owns its key from then on, and this
+        // export is inert for it.
         //
-        // Announced at WARN, never silently: the defect this whole path exists
-        // to fix was an env var being ignored without a word, and an
-        // admin-wins rule that said nothing would have traded one silent
-        // failure for another. The operator is told which key, that the stored
-        // admin edit is what boots, and how to hand the key back to the
-        // environment.
         // Read once, and hand the row to the write below rather than letting
         // it list the table a second time for the same key.
         let existing = match find_by_key(db, key).await {
-            Ok(Some(row)) if is_admin_owned(&row) => {
-                tracing::warn!(
-                    key = %key,
-                    "this environment variable is set but has NO EFFECT: an admin edited \
-                     this setting through the admin UI, and a stored admin edit takes \
-                     precedence over the environment. The stored value is what boots. To \
-                     hand this key back to the environment, use \"Reset to environment\" \
-                     on the admin Variables page (or POST \
-                     /b/admin/api/settings/{key}/reset-to-environment) and restart"
-                );
-                continue;
-            }
             Ok(row) => row,
             // A read failure is not a licence to overwrite: it means we cannot
-            // tell whether an admin owns this row, and the contract says the
-            // admin's edit survives. Skip and say so.
+            // tell whether the row is pinned, and the contract says the pinned
+            // value survives. Skip and say so.
             Err(e) => {
                 tracing::warn!(
                     key = %key,
@@ -817,12 +917,36 @@ pub async fn seed_and_load(
                 continue;
             }
         };
+        if let Some(row) = &existing {
+            // Announced at WARN, never silently: the defect this whole path
+            // exists to fix was an env var being ignored without a word, and a
+            // pin-wins rule that said nothing would have traded one silent
+            // failure for another.
+            //
+            // Gated on the values actually DIFFERING. A pinned row that already
+            // holds what the export says is not a conflict — nothing is being
+            // ignored and the operator has nothing to do — and a WARN on every
+            // boot for the common case is how an operator learns to skip the
+            // one that matters.
+            if let Some(pin) = pin_of(row) {
+                if row.value != *value {
+                    warn_export_is_inert(key, pin);
+                }
+                continue;
+            }
+            // The one-time upgrade transition: an unmarked row that disagrees
+            // with the export predates edit tracking, so keep it and say so.
+            if !transition_done && row.value != *value {
+                pin_at_upgrade(db, row).await;
+                continue;
+            }
+        }
         // `sensitive` is settled by `NewVariable::into_row` and `set_with_row`
         // from the key's declaration and the `_SECRET`/`_KEY` suffix; `false`
         // here asserts nothing extra.
         match set_with_row(db, key, value, "", "", false, None, existing).await {
-            // Reached only for a row no admin has claimed, so the previous
-            // value was a seeder's: a declared default, or an earlier boot's
+            // Reached only for a row nothing has pinned, so the previous value
+            // was a seeder's: a declared default, or an earlier boot's
             // environment.
             Ok(Wrote::Replaced) => tracing::warn!(
                 key = %key,
@@ -834,6 +958,13 @@ pub async fn seed_and_load(
             Ok(Wrote::Created | Wrote::FlagRaised | Wrote::Unchanged) => {}
             Err(e) => tracing::warn!(key = %key, error = %e, "failed to seed env variable"),
         }
+    }
+
+    // 1b. Record that the transition has run — LAST, so a boot that dies
+    //     partway retries rather than recording a pass that only half happened,
+    //     and only when there was an environment to transition against.
+    if !transition_done && !env_vars.is_empty() {
+        record_transition(db).await;
     }
 
     // 2. Auto-generate declared secrets (incl. the auth JWT secret).
@@ -916,6 +1047,41 @@ pub(crate) async fn seed_row_with_flag(ctx: &dyn Context, key: &str, value: &str
     db::create(ctx, TABLE, data)
         .await
         .expect("seed a variables row");
+}
+
+/// Seed one row carrying an explicit `updated_by` marker.
+///
+/// TEST FIXTURE, here for the same reason as [`seed_row_with_flag`]: this
+/// module owns the table, and a block file naming `TABLE` to build the row
+/// itself trips `tests/repo_door.rs`.
+///
+/// It exists because the two markers come from two places no test can reach
+/// together — an admin surface stamps an id or
+/// [`crate::features::USER_EDITED_SENTINEL`], and only the boot path's upgrade
+/// transition writes [`PRE_UPGRADE_SENTINEL`] — so a surface that has to
+/// distinguish them needs a fixture that can stage either.
+#[cfg(test)]
+pub(crate) async fn seed_row_with_owner(
+    ctx: &dyn Context,
+    key: &str,
+    value: &str,
+    updated_by: &str,
+) {
+    insert(
+        ctx,
+        NewVariable {
+            key: key.to_string(),
+            value: value.to_string(),
+            name: String::new(),
+            description: String::new(),
+            warning: String::new(),
+            sensitive: false,
+            updated_by: updated_by.to_string(),
+            block: block_for_key(key),
+        },
+    )
+    .await
+    .expect("seed a variables row");
 }
 
 /// Read every row into a key→value map. A row that does not decode (an empty
@@ -1020,117 +1186,142 @@ pub async fn repair_sensitive_flags(db: &Arc<dyn DatabaseService>) {
     }
 }
 
-/// The row whose presence records that [`backfill_admin_ownership`] has run.
+/// Whether [`seed_and_load`]'s one-time env-precedence transition has already
+/// run on this database.
 ///
-/// A block-scoped key, so it is ordinary storable config rather than a
-/// runtime-owned one — the same shape `dev::seed`'s `IMPRESSPRESS__DEV__SEED_ERROR`
-/// diagnostic row already uses.
-pub const OWNERSHIP_BACKFILL_KEY: &str = "IMPRESSPRESS__ADMIN__ENV_OWNERSHIP_BACKFILL";
-
-/// One-time upgrade step: claim for the admin every row that has been changed
-/// away from its declared default but carries no ownership marker.
+/// A single indexed lookup on [`ENV_PRECEDENCE_TRANSITION_KEY`], done once per
+/// boot rather than per key.
 ///
-/// The settings forms never stamped `updated_by` before this release, so on the
-/// first boot after upgrading, every edit ever made through one of them looks
-/// seeder-owned — and a still-present export would overwrite it. That is
-/// precisely the harm admin-wins was chosen to prevent
-/// (`WAFER_RUN_SHARED__ALLOW_SIGNUP=true` reopening signup an admin closed),
-/// arriving once, at the worst possible moment, on the boot that ships the fix.
-///
-/// "Changed away from the declared default" is the only evidence available: no
-/// marker survives from before this release to say who wrote a row. It cannot
-/// distinguish an admin's settings-form edit from a value an earlier boot's
-/// ENVIRONMENT seeded, so it claims both. That asymmetry is deliberate — the
-/// two mistakes are not equal. Wrongly claiming an env-seeded row costs the
-/// operator an export that stops applying, announced every boot by the WARN in
-/// [`seed_and_load`] and undone by one "Reset to environment" click. Wrongly
-/// leaving an admin's row unclaimed silently reverts a deliberate
-/// configuration change, which is the failure the contract exists to stop.
-///
-/// STRICTLY ONE-TIME, gated on [`OWNERSHIP_BACKFILL_KEY`] rather than on "has
-/// no marker yet": without that gate a key an operator later reset would be
-/// re-claimed on the very next boot, and the reset route would not work at all.
-async fn backfill_admin_ownership(db: &Arc<dyn DatabaseService>) {
-    // The gate first, as a single indexed lookup: every boot after the first
-    // stops here without listing the table.
-    match find_by_key(db, OWNERSHIP_BACKFILL_KEY).await {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
+/// A read failure answers "yes". Not knowing is not a licence to run a one-time
+/// pass a second time — that would re-pin every key an operator had reset,
+/// which is the one thing the gate exists to prevent. A database this call
+/// cannot read is one the per-key reads below cannot read either, so nothing is
+/// overwritten in the meantime.
+async fn transition_has_run(db: &Arc<dyn DatabaseService>) -> bool {
+    match find_by_key(db, ENV_PRECEDENCE_TRANSITION_KEY).await {
+        Ok(row) => row.is_some(),
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "could not check whether the ownership backfill has run; skipping it rather \
-                 than risk claiming keys twice"
+                "could not check whether the env-precedence upgrade transition has run; \
+                 treating it as done rather than risk pinning keys an operator has reset"
             );
-            return;
+            true
         }
     }
-    let rows = match load_rows(db).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not read the variables table to backfill ownership");
-            return;
-        }
-    };
-    let vars = crate::config_vars::shared_config_vars();
-    let declared: HashMap<&str, &str> = vars
-        .iter()
-        .map(|var| (var.key.as_str(), var.default.as_str()))
-        .collect();
+}
 
-    for loaded in &rows {
-        let row = &loaded.row;
-        if is_admin_owned(row) {
-            continue;
-        }
-        // Only declared shared vars: those are the ones the settings forms
-        // write, and the only ones with a declared default to compare against.
-        let Some(default) = declared.get(row.key.as_str()) else {
-            continue;
-        };
-        if row.value == *default {
-            continue;
-        }
-        let patch = VariablePatch {
-            updated_by: Some(crate::features::USER_EDITED_SENTINEL.to_string()),
-            ..Default::default()
-        };
-        match db.update(TABLE, &row.id, patch.to_update_data()).await {
-            Ok(_) => {
-                crate::config_generation::note_config_write();
-                tracing::warn!(
-                    key = %row.key,
-                    "claiming this config key for the admin UI: it differs from its declared \
-                     default and this release is the first that records who edited a \
-                     setting. If the value came from the environment rather than an admin, \
-                     use \"Reset to environment\" on the Variables page to hand it back"
-                );
-            }
-            Err(e) => tracing::warn!(
-                key = %row.key,
-                error = %e,
-                "failed to claim a config key during the one-time ownership backfill"
-            ),
-        }
-    }
-
-    // Stamp the gate last, so a boot that dies partway retries rather than
-    // recording a backfill that only half happened.
+/// Record that the one-time env-precedence transition has run.
+///
+/// [`seed_if_absent`], so a concurrent second boot cannot duplicate the row, and
+/// a failure is logged rather than fatal: the cost of not recording it is that
+/// the next boot repeats a pass which is, by construction, a no-op for every key
+/// it already pinned.
+async fn record_transition(db: &Arc<dyn DatabaseService>) {
     if let Err(e) = seed_if_absent(
         db,
-        OWNERSHIP_BACKFILL_KEY,
+        ENV_PRECEDENCE_TRANSITION_KEY,
         "done",
-        "Env ownership backfill",
-        "Records that the one-time admin-ownership backfill has run. Deleting this row \
-         makes the next boot re-run it.",
+        "Env precedence transition",
+        "Records that the one-time env-precedence upgrade transition has run. Deleting this \
+         row makes the next boot re-run it.",
         false,
     )
     .await
     {
         tracing::warn!(
             error = %e,
-            "could not record that the ownership backfill ran; the next boot will repeat it"
+            "could not record that the env-precedence transition ran; the next boot will \
+             repeat it"
         );
+    }
+}
+
+/// Keep `row` against a disagreeing export, because it predates edit tracking.
+///
+/// Stamped [`PRE_UPGRADE_SENTINEL`] rather than
+/// [`crate::features::USER_EDITED_SENTINEL`]: this is not the claim that an
+/// admin edited the key, it is the claim that nobody can tell which, and the log
+/// line and the Variables page both have to be able to say so.
+async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) {
+    let patch = VariablePatch {
+        updated_by: Some(PRE_UPGRADE_SENTINEL.to_string()),
+        ..Default::default()
+    };
+    match db.update(TABLE, &row.id, patch.to_update_data()).await {
+        Ok(_) => {
+            crate::config_generation::note_config_write();
+            tracing::warn!(
+                key = %row.key,
+                "this environment variable is set but has NO EFFECT from now on: the stored \
+                 value differs from it and predates this release, which is the first that \
+                 records who edited a setting — so this build cannot tell whether an admin \
+                 set it, and keeps it rather than risk reverting a deliberate change. \
+                 {}{RESET_ADVICE}",
+                secrecy_note(&row.key),
+            );
+        }
+        Err(e) => tracing::warn!(
+            key = %row.key,
+            error = %e,
+            "failed to pin a config key during the one-time env-precedence transition; the \
+             process environment may overwrite it on the next boot"
+        ),
+    }
+}
+
+/// How an operator undoes a pin, named identically by every line that reports
+/// one so the message and the affordance cannot drift apart.
+///
+/// The page control it names renders only where there IS a process environment
+/// to hand a key back to — see
+/// `admin::pages::variables::target_seeds_from_process_env`. That is the same
+/// condition under which any of these lines can be emitted at all: every one of
+/// them is reached from [`seed_and_load`]'s env loop, whose body does not run
+/// when `env_vars` is empty, and it is empty on exactly the targets that hide
+/// the control.
+const RESET_ADVICE: &str = "To hand this key back to the environment, use \"Reset to \
+                            environment\" on the admin Variables page (or POST \
+                            /b/admin/api/settings/{key}/reset-to-environment) and restart";
+
+/// The steady-state WARN for an export that a pinned row outranks.
+///
+/// Only ever called when the two values actually DIFFER — a pinned row already
+/// holding what the export says is not a conflict, and warning about it on every
+/// boot is how an operator learns to ignore the line that matters.
+fn warn_export_is_inert(key: &str, pin: Pin) {
+    match pin {
+        Pin::AdminEdit => tracing::warn!(
+            key = %key,
+            "this environment variable is set but has NO EFFECT: an admin edited this \
+             setting through the admin UI, and a stored admin edit takes precedence over \
+             the environment. The stored value is what boots. {}{RESET_ADVICE}",
+            secrecy_note(key),
+        ),
+        Pin::PreUpgrade => tracing::warn!(
+            key = %key,
+            "this environment variable is set but has NO EFFECT: this key was pinned when \
+             the deployment upgraded, because its stored value predates edit tracking and \
+             differed from the environment, so no admin edit can be proved either way. The \
+             stored value is what boots. {}{RESET_ADVICE}",
+            secrecy_note(key),
+        ),
+    }
+}
+
+/// The clause that stands in for "the two values are X and Y" on a key whose
+/// value is a credential.
+///
+/// No line here prints either value for any key, secret or not: a boot log is
+/// harder to redact than a table, and the operator can read the stored value on
+/// the Variables page. For a credential the page masks it too, so this says
+/// where to compare instead — the place that issued it.
+fn secrecy_note(key: &str) -> &'static str {
+    if crate::config_vars::is_sensitive_for_storage(key) {
+        "Neither value is shown here, because this key holds a credential — compare the \
+         stored value against the one issued where you manage that credential. "
+    } else {
+        ""
     }
 }
 
@@ -1813,6 +2004,14 @@ mod boot_tests {
     /// `WAFER_RUN_SHARED__APP_NAME=Foo` on a deployment whose database already
     /// carries a row for that key (every boot after the first does), and the
     /// value they set has to be the one that boots.
+    ///
+    /// The upgrade transition is the ONE boot on which that is not true, and
+    /// this drives both halves so the cost is written down rather than
+    /// discovered. On the upgrade boot the disagreement is kept and named —
+    /// this build cannot tell a stale seeded default from an admin's edit, and
+    /// reverting the second is worse than deferring the first. From the next
+    /// boot on, and for the whole life of the deployment after, the export is
+    /// what boots.
     #[tokio::test]
     async fn an_env_var_beats_the_row_already_in_the_table() {
         let db = migrated_db().await;
@@ -1820,10 +2019,35 @@ mod boot_tests {
         seed_if_absent(&db, key, "Impresspress", "App Name", "declared", false)
             .await
             .expect("the declared default lands on the first boot");
+        let env = [(key.to_string(), "Foo".to_string())];
 
-        let vars = seed_and_load(&db, &[(key.to_string(), "Foo".to_string())])
-            .await
-            .expect("seed and load");
+        // The upgrade boot defers to the row and says so.
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            seed_and_load(&db, &env).await.expect("upgrade boot");
+        }
+        assert_eq!(
+            capture.count_containing("NO EFFECT"),
+            1,
+            "the one boot that ignores the export has to name the key"
+        );
+
+        // The operator clicks "Reset to environment" on the Variables page.
+        let row = find_by_key(&db, key).await.expect("list").expect("row");
+        db.update(
+            TABLE,
+            &row.id,
+            VariablePatch {
+                updated_by: Some(String::new()),
+                ..Default::default()
+            }
+            .to_update_data(),
+        )
+        .await
+        .expect("reset");
+
+        let vars = seed_and_load(&db, &env).await.expect("next boot");
         assert_eq!(
             vars.get(key).map(String::as_str),
             Some("Foo"),
@@ -1838,6 +2062,12 @@ mod boot_tests {
             "Foo",
             "and it must be stored, so the admin UI shows the value in effect"
         );
+
+        // And it keeps applying, with no further intervention.
+        let vars = seed_and_load(&db, &[(key.to_string(), "Bar".to_string())])
+            .await
+            .expect("later boot");
+        assert_eq!(vars.get(key).map(String::as_str), Some("Bar"));
     }
 
     /// THE CONTRACT, both halves. The environment seeds a key no admin has
@@ -1861,7 +2091,7 @@ mod boot_tests {
         set_by_admin(&db, key, "AdminChoice", false, "admin_1")
             .await
             .expect("admin edit");
-        assert!(is_admin_owned(
+        assert!(is_pinned(
             &find_by_key(&db, key).await.expect("list").expect("row")
         ));
 
@@ -1939,7 +2169,7 @@ mod boot_tests {
         .await
         .expect("admin saves");
         assert!(
-            is_admin_owned(&find_by_key(&db, key).await.expect("list").expect("row")),
+            is_pinned(&find_by_key(&db, key).await.expect("list").expect("row")),
             "saving an unchanged value is still an admin claiming the key"
         );
 
@@ -1994,13 +2224,13 @@ mod boot_tests {
         }
 
         assert!(
-            is_admin_owned(&find_by_key(&db, changed).await.expect("l").expect("r")),
+            is_pinned(&find_by_key(&db, changed).await.expect("l").expect("r")),
             "the field the admin actually changed is theirs"
         );
         for key in untouched {
             let row = find_by_key(&db, key).await.expect("l").expect("r");
             assert!(
-                !is_admin_owned(&row),
+                !is_pinned(&row),
                 "{key} was only re-posted unchanged and must stay seeder-owned"
             );
         }
@@ -2052,23 +2282,31 @@ mod boot_tests {
         reset_to_environment(&ctx, key).await.expect("reset");
 
         let row = get_by_key(&ctx, key).await.expect("get").expect("row");
-        assert!(!is_admin_owned(&row), "the marker is cleared");
+        assert!(!is_pinned(&row), "the marker is cleared");
         assert_eq!(
             row.value, "AdminChoice",
             "only the marker is cleared; the value stays until a boot re-seeds it"
         );
     }
 
-    /// The upgrade boot: a row a settings form edited BEFORE this release
-    /// carries no marker, and a still-present export would revert it. The
-    /// one-time backfill claims it first.
+    /// THE UPGRADE BOOT, and the case it exists for: a row a settings form
+    /// edited BEFORE this release carries no marker, and a still-present export
+    /// would revert it.
+    ///
+    /// `WAFER_RUN_SHARED__ALLOW_SIGNUP` is the concrete harm.
+    /// `ui::settings_form::save_settings` -> `config::set` -> `CONFIG_SET` ->
+    /// `variables::set` was the write path for the auth-ui settings form that
+    /// carries it, and `set`'s create branch writes `updated_by: String::new()`
+    /// — so an admin who closed signup during an abuse incident left no
+    /// provenance at all, and there is nothing to restore the old value from
+    /// afterwards.
     #[tokio::test]
-    async fn the_upgrade_backfill_protects_a_pre_existing_settings_form_edit() {
+    async fn the_upgrade_boot_keeps_a_pre_existing_settings_form_edit() {
         let db = migrated_db().await;
         let key = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
 
-        // The pre-upgrade world: an admin closed signup through a settings
-        // form, which left no marker, and the compose file still says `true`.
+        // The pre-upgrade world: signup closed through a settings form, which
+        // left no marker, and the compose file still says `true`.
         raw_insert_unowned(&db, key, "false").await;
 
         let vars = seed_and_load(&db, &[(key.to_string(), "true".to_string())])
@@ -2079,16 +2317,155 @@ mod boot_tests {
             Some("false"),
             "the upgrade boot must not reopen signup an admin closed"
         );
+        assert_eq!(
+            pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
+            Some(Pin::PreUpgrade),
+            "and it is pinned as what it is — a row nobody can attribute — not as an admin edit"
+        );
+
+        // Every later boot leaves it alone too.
+        let vars = seed_and_load(&db, &[(key.to_string(), "true".to_string())])
+            .await
+            .expect("later boot");
+        assert_eq!(vars.get(key).map(String::as_str), Some("false"));
+    }
+
+    /// A block-scoped credential rotated through the admin UI, with the old one
+    /// still in the compose file.
+    ///
+    /// The transition lives inside the env loop precisely so this is covered:
+    /// a pass over `config_vars::shared_config_vars()` would not see
+    /// `IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY` at all, and reverting to a
+    /// revoked key is the expensive version of this mistake.
+    #[tokio::test]
+    async fn the_upgrade_boot_keeps_a_rotated_block_scoped_secret() {
+        let db = migrated_db().await;
+        let key = "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY";
         assert!(
-            is_admin_owned(&find_by_key(&db, key).await.expect("l").expect("r")),
-            "and the row is claimed, so later boots leave it alone too"
+            crate::config_vars::is_sensitive_for_storage(key),
+            "the point of this case is a credential"
+        );
+        raw_insert_unowned(&db, key, "sk_live_rotated").await;
+
+        let vars = seed_and_load(&db, &[(key.to_string(), "sk_live_revoked".to_string())])
+            .await
+            .expect("upgrade boot");
+        assert_eq!(
+            vars.get(key).map(String::as_str),
+            Some("sk_live_rotated"),
+            "a rotated credential must not be replaced by the revoked one still in the \
+             environment"
         );
     }
 
-    /// The backfill is strictly one-time: a key an operator RESETS after it
+    /// An unmarked row that already AGREES with its export is not a conflict:
+    /// nothing is pinned and nothing is said.
+    ///
+    /// This is the common case on every upgrading deployment — the environment
+    /// seeded the row and has not changed since — so pinning it would freeze a
+    /// key the operator still controls, and warning about it would bury the
+    /// lines that matter.
+    #[tokio::test]
+    async fn the_upgrade_boot_leaves_a_row_that_matches_its_export_alone() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        raw_insert_unowned(&db, key, "Foo").await;
+
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            seed_and_load(&db, &[(key.to_string(), "Foo".to_string())])
+                .await
+                .expect("upgrade boot");
+        }
+
+        let row = find_by_key(&db, key).await.expect("l").expect("r");
+        assert_eq!(pin_of(&row), None, "agreement is not a claim");
+        assert_eq!(
+            capture.count_containing("NO EFFECT"),
+            0,
+            "a row that already holds what the export says has nothing to report"
+        );
+
+        // And the environment still governs it on the next boot, gate or no gate.
+        let vars = seed_and_load(&db, &[(key.to_string(), "Bar".to_string())])
+            .await
+            .expect("next boot");
+        assert_eq!(vars.get(key).map(String::as_str), Some("Bar"));
+    }
+
+    /// A declared default that MOVES between releases must not read as an edit.
+    ///
+    /// `WAFER_RUN_SHARED__FAVICON_URL` and `WAFER_RUN_SHARED__LOGO_ICON_URL`
+    /// default to content-hashed asset URLs (`ui::assets`), so a release that
+    /// changes those bytes changes the default. Comparing a stored row against
+    /// its declared default — which is what the withdrawn backfill did — would
+    /// have claimed every such row on the next unrelated release. The
+    /// comparison is against the EXPORT, so a key with no export is not
+    /// considered at all.
+    #[tokio::test]
+    async fn a_moved_declared_default_is_not_mistaken_for_an_edit() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__FAVICON_URL";
+        // What an earlier release's default was: a hash this build no longer
+        // produces, so it differs from today's declared default.
+        raw_insert_unowned(&db, key, "/b/static/favicon-deadbeef.ico").await;
+        assert_ne!(
+            crate::ui::assets::favicon_url(),
+            "/b/static/favicon-deadbeef.ico",
+            "the fixture has to be a default this build has moved away from"
+        );
+
+        // A boot with no export for that key at all — the ordinary case.
+        seed_and_load(
+            &db,
+            &[("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string())],
+        )
+        .await
+        .expect("upgrade boot");
+
+        assert_eq!(
+            pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
+            None,
+            "a row the environment says nothing about must not be pinned by an unrelated \
+             release moving its default"
+        );
+    }
+
+    /// An admin who REVERTED a key to its declared default during an incident
+    /// is protected too.
+    ///
+    /// `WAFER_RUN_SHARED__ENABLE_OAUTH` declares `false`; a compose file says
+    /// `true`; the admin turns OAuth off. Stored now EQUALS the declared
+    /// default, so the withdrawn value-differs-from-default backfill would have
+    /// passed straight over it and the environment would have switched OAuth
+    /// back on. Comparing against the export catches it.
+    #[tokio::test]
+    async fn the_upgrade_boot_keeps_an_edit_that_reverted_to_the_declared_default() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__ENABLE_OAUTH";
+        let declared = crate::config_vars::shared_config_vars()
+            .into_iter()
+            .find(|var| var.key == key)
+            .expect("declared")
+            .default;
+        assert_eq!(declared, "false", "the fixture depends on this declaration");
+
+        raw_insert_unowned(&db, key, "false").await;
+        let vars = seed_and_load(&db, &[(key.to_string(), "true".to_string())])
+            .await
+            .expect("upgrade boot");
+        assert_eq!(
+            vars.get(key).map(String::as_str),
+            Some("false"),
+            "an admin's revert-to-default is still an admin decision"
+        );
+    }
+
+    /// The transition is strictly one-time: a key an operator RESETS after it
     /// must stay reset, or the reset route would not work at all.
     #[tokio::test]
-    async fn the_upgrade_backfill_does_not_reclaim_a_key_after_a_reset() {
+    async fn the_upgrade_transition_does_not_reclaim_a_key_after_a_reset() {
         let db = migrated_db().await;
         let key = "WAFER_RUN_SHARED__APP_NAME";
         raw_insert_unowned(&db, key, "EditedLongAgo").await;
@@ -2096,9 +2473,17 @@ mod boot_tests {
         seed_and_load(&db, &[(key.to_string(), "FromEnv".to_string())])
             .await
             .expect("upgrade boot");
-        assert!(is_admin_owned(
-            &find_by_key(&db, key).await.expect("l").expect("r")
-        ));
+        assert_eq!(
+            pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
+            Some(Pin::PreUpgrade)
+        );
+        assert!(
+            find_by_key(&db, ENV_PRECEDENCE_TRANSITION_KEY)
+                .await
+                .expect("l")
+                .is_some(),
+            "the gate has to be recorded, or 'one-time' is not one-time"
+        );
 
         // The operator says "that was the environment, not me".
         let patch = VariablePatch {
@@ -2118,6 +2503,147 @@ mod boot_tests {
             Some("FromEnv"),
             "a reset key must follow the environment again, not be re-claimed"
         );
+    }
+
+    /// Once the gate exists, an unmarked row is ordinary: the environment wins.
+    ///
+    /// The half of the contract the whole branch exists for. A row written
+    /// AFTER the transition — by a later boot's environment, or by a
+    /// `seed_if_absent` default — carries no marker and must not inherit the
+    /// transition's protection.
+    #[tokio::test]
+    async fn after_the_transition_an_unmarked_row_follows_the_environment() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+
+        // Boot 1 runs the transition over an empty table and records the gate.
+        seed_and_load(&db, &[(key.to_string(), "First".to_string())])
+            .await
+            .expect("boot 1");
+
+        // A row that looks exactly like the pre-upgrade case, but arrived after
+        // the transition.
+        let other = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        raw_insert_unowned(&db, other, "#000000").await;
+
+        let vars = seed_and_load(&db, &[(other.to_string(), "#ff0000".to_string())])
+            .await
+            .expect("boot 2");
+        assert_eq!(
+            vars.get(other).map(String::as_str),
+            Some("#ff0000"),
+            "past the gate, an unmarked row is the environment's to set"
+        );
+    }
+
+    /// A target with NO process environment must record nothing.
+    ///
+    /// Cloudflare never calls this at all and the browser calls it with `&[]`
+    /// (`impresspress-web`'s `config::seed_and_load_variables`), so the gate row
+    /// must not be written there: it would claim a transition that never ran,
+    /// and it would bump the config-write generation — invalidating every
+    /// memoized config reader — for nothing.
+    #[tokio::test]
+    async fn a_boot_with_no_environment_records_no_transition_and_writes_nothing() {
+        let db = migrated_db().await;
+        raw_insert_unowned(&db, "WAFER_RUN_SHARED__APP_NAME", "Stored").await;
+
+        seed_and_load(&db, &[]).await.expect("first boot");
+        let before = crate::config_generation::config_write_generation();
+        seed_and_load(&db, &[]).await.expect("second boot");
+
+        assert!(
+            find_by_key(&db, ENV_PRECEDENCE_TRANSITION_KEY)
+                .await
+                .expect("l")
+                .is_none(),
+            "a boot with no environment has nothing to transition"
+        );
+        assert_eq!(
+            before,
+            crate::config_generation::config_write_generation(),
+            "and must not write at all"
+        );
+    }
+
+    /// The steady-state WARN fires only on a real disagreement.
+    ///
+    /// A pinned row that already holds what the export says is not a conflict;
+    /// a line about it on every boot is how an operator learns to skip the line
+    /// that matters. The disagreeing case is the positive control in the same
+    /// test, so a `warn_export_is_inert` that simply never fired could not pass.
+    #[tokio::test]
+    async fn the_inert_export_warning_fires_only_when_the_values_differ() {
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+
+        for (stored, exported, expected) in [("Same", "Same", 0), ("Stored", "Exported", 1)] {
+            let db = migrated_db().await;
+            set_by_admin(&db, key, stored, false, "admin_1")
+                .await
+                .expect("admin edit");
+
+            let capture = crate::test_support::MessageCapture::default();
+            {
+                let _guard = tracing::subscriber::set_default(capture.clone());
+                seed_and_load(&db, &[(key.to_string(), exported.to_string())])
+                    .await
+                    .expect("boot");
+            }
+            assert_eq!(
+                capture.count_containing("NO EFFECT"),
+                expected,
+                "stored={stored} exported={exported}"
+            );
+        }
+    }
+
+    /// No boot line ever prints the value of a credential, on either side of a
+    /// pin.
+    ///
+    /// A log file is harder to redact than a table, and an operator sent to
+    /// compare a Stripe key can read the stored one where they manage it. This
+    /// drives both reporting paths — the upgrade pin and the steady-state
+    /// inert-export line — because they are two different call sites and only
+    /// one of them existed first.
+    #[tokio::test]
+    async fn no_boot_line_prints_a_credential() {
+        let key = "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY";
+        const STORED: &str = "sk_live_stored_secret";
+        const EXPORTED: &str = "sk_live_exported_secret";
+
+        // The upgrade pin.
+        let db = migrated_db().await;
+        raw_insert_unowned(&db, key, STORED).await;
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            seed_and_load(&db, &[(key.to_string(), EXPORTED.to_string())])
+                .await
+                .expect("upgrade boot");
+        }
+        assert_eq!(capture.count_containing(STORED), 0, "the stored credential");
+        assert_eq!(
+            capture.count_containing(EXPORTED),
+            0,
+            "the exported credential"
+        );
+        assert_eq!(
+            capture.count_containing("compare the stored value"),
+            1,
+            "and the operator is told where to compare instead"
+        );
+
+        // The steady-state line, on the next boot over the now-pinned row.
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            seed_and_load(&db, &[(key.to_string(), EXPORTED.to_string())])
+                .await
+                .expect("later boot");
+        }
+        assert_eq!(capture.count_containing(STORED), 0);
+        assert_eq!(capture.count_containing(EXPORTED), 0);
+        assert_eq!(capture.count_containing("compare the stored value"), 1);
     }
 
     /// `FOO=` in a shell or a `.env` file is "unset", not "set to blank": an

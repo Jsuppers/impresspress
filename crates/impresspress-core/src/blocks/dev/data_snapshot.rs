@@ -931,7 +931,7 @@ fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
 /// writing it over a row this instance already has.
 ///
 /// That column is the local admin-ownership marker
-/// ([`crate::platform_state::variables::is_admin_owned`]): non-empty means an
+/// ([`crate::platform_state::variables::is_pinned`]): non-empty means an
 /// admin HERE edited the row, which is what makes it outrank the process
 /// environment. It has to be protected from a bundle in BOTH directions, and
 /// blanking the value alone only covered one of them:

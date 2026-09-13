@@ -1795,21 +1795,30 @@ mod tests {
         );
     }
 
-    /// Review finding 5, as a test: clearing the spent bootstrap password
-    /// through the admin API must STAY cleared across the next boot.
+    /// Review finding 5, as a test: clearing the spent bootstrap password must
+    /// STAY cleared across the next boot, with the export still present.
     ///
     /// Under env-wins it did not — the next `seed_and_load` re-applied the
-    /// still-present export and handed the plaintext credential back. It falls
-    /// out of admin-wins for free: `update_variable` stamps `updated_by`, so
-    /// the row is admin-owned and the export is inert for it.
+    /// still-present export and handed the plaintext credential back.
+    ///
+    /// Both provenances, because the two surfaces that can clear it leave
+    /// different traces and only one of them is new. `update_variable` (this
+    /// module) has always stamped `updated_by`, so a row it cleared is pinned as
+    /// an admin edit. The auth-ui settings form clears the same key through
+    /// `ui::settings_form` -> `config::set` -> `CONFIG_SET`, which reached
+    /// `variables::set` and stamped NOTHING before this release — so on an
+    /// upgrading deployment the cleared row is indistinguishable from a seeded
+    /// one, and it is the upgrade transition, not the stamp, that has to keep
+    /// it cleared. A test that drove only the stamping path would pass with the
+    /// transition deleted.
     #[tokio::test]
     async fn a_cleared_bootstrap_password_stays_cleared_across_the_next_boot() {
         use crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY as KEY;
 
+        // 1. Cleared through this module's API, which stamps.
         let ctx = admin_ctx().await;
         let msg = admin_msg("update", "/admin/settings");
         ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
-
         expect_ok(
             update_variable(
                 &ctx,
@@ -1823,10 +1832,8 @@ mod tests {
             )
             .await,
         );
-
         // The operator has not removed the export yet — the realistic state.
         ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
-
         assert_eq!(
             variables::get_by_key(&ctx, KEY)
                 .await
@@ -1835,6 +1842,32 @@ mod tests {
                 .value,
             "",
             "a credential an admin cleared must not come back on the next boot"
+        );
+
+        // 2. Cleared through the settings form BEFORE this release, which left
+        //    no marker at all. Nothing has booted this database since, so the
+        //    upgrade transition has not run either.
+        let ctx = admin_ctx().await;
+        variables::seed_row_with_owner(&ctx, KEY, "", "").await;
+        assert!(
+            !variables::is_pinned(
+                &variables::get_by_key(&ctx, KEY)
+                    .await
+                    .expect("get")
+                    .expect("row")
+            ),
+            "the pre-upgrade row carries no provenance — that is the case under test"
+        );
+
+        ctx.seed_env_vars(&[(KEY, "hunter2")]).await;
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "",
+            "the upgrade boot must not hand a spent plaintext credential back"
         );
     }
 
@@ -1903,7 +1936,7 @@ mod tests {
 
         expect_ok(create_variable(&ctx, &msg, key, "AdminChoice", None, None, false).await);
         assert!(
-            variables::is_admin_owned(
+            variables::is_pinned(
                 &variables::get_by_key(&ctx, key)
                     .await
                     .expect("get")
@@ -1933,7 +1966,7 @@ mod tests {
             .await,
         );
         assert!(
-            variables::is_admin_owned(
+            variables::is_pinned(
                 &variables::get_by_key(&ctx, key)
                     .await
                     .expect("get")
@@ -1948,7 +1981,7 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        assert!(!variables::is_admin_owned(&row), "the key is released");
+        assert!(!variables::is_pinned(&row), "the key is released");
         assert_eq!(
             row.value, "something else",
             "and the value stays until a boot re-seeds it"

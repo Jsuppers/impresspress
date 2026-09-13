@@ -400,6 +400,21 @@ async fn the_native_build_fills_the_synchronous_config_surface() {
         "seeded variables must reach the synchronous surface: {:?}",
         snapshot.keys().collect::<Vec<_>>()
     );
+    // The marker that says this target boots from a process environment.
+    //
+    // Native is the ONLY publisher — the key fails closed, so nothing catches a
+    // build that stops publishing it except an assertion here. Without it the
+    // admin Variables page renders no "Reset to environment" control, and the
+    // boot WARN that names that control is pointing at nothing: exactly the
+    // defect this branch shipped the markup to fix, reintroduced silently.
+    assert_eq!(
+        snapshot
+            .get(impresspress_core::platform_state::variables::HAS_PROCESS_ENV_CONFIG_KEY)
+            .map(String::as_str),
+        Some("1"),
+        "the native build must declare that it has a process environment: {:?}",
+        snapshot.keys().collect::<Vec<_>>()
+    );
 }
 
 /// The 2026-09-10 live-server finding, end to end over the binary's own boot
@@ -411,6 +426,12 @@ async fn the_native_build_fills_the_synchronous_config_surface() {
 /// drives two boots over the *same* sqlite file with two different values to
 /// cover exactly that, and shapes the batch with `filter_to_declared_keys`, so
 /// what reaches the seeder is what reaches it in production.
+///
+/// Both boots here are a FRESH database's, so the first one creates the row and
+/// records the one-time upgrade transition, and the second is the steady state.
+/// The upgrade boot of a database that predates edit tracking is a different
+/// case — it keeps a disagreeing row and says so — and is covered by
+/// `platform_state::variables`' own tests, which can stage an unmarked row.
 ///
 /// The `IMPRESSPRESS_DEPLOY_TOKEN` assertion below pins that FILTER, not
 /// `seed_and_load`'s own `is_runtime_owned_key` guard: an infrastructure key
