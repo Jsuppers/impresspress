@@ -97,9 +97,12 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
         Ok(row) => row,
         Err(response) => return response,
     };
-    // SEC-060: mask on the row flag OR the `_SECRET` / `_KEY` suffix — the
-    // single-key getter previously masked on the flag alone, so a `*_SECRET`
-    // key with the flag unset leaked its value here.
+    // SEC-060: mask on the row flag OR what the KEY says — the `_SECRET` /
+    // `_KEY` suffix, or a declaration that calls the var a password. The
+    // single-key getter masked on the flag alone once, so a `*_SECRET` key with
+    // the flag unset leaked its value here; it then masked on flag-or-suffix,
+    // so an unrepaired `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` row
+    // leaked instead.
     if ops::is_sensitive_key(key, i64::from(row.sensitive)) {
         row.value = MASKED_VALUE.to_string();
     }
@@ -461,9 +464,10 @@ mod tests {
     ///
     /// The endpoint's OpenAPI description promises exactly this, and the
     /// promise rests on two independent halves of `is_sensitive_key`: the
-    /// row's `sensitive` flag, and the `_SECRET` / `_KEY` suffix convention.
-    /// A key needs only one of them. Nothing tested this before the endpoint
-    /// was documented, which is the worst order to do it in.
+    /// row's `sensitive` flag, and what the KEY says — the `_SECRET` / `_KEY`
+    /// suffix convention, or a declaration that calls the var a password. A
+    /// key needs only one of them. Nothing tested this before the endpoint was
+    /// documented, which is the worst order to do it in.
     #[tokio::test]
     async fn list_masks_every_sensitive_value() {
         let ctx = TestContext::new().await;
@@ -704,11 +708,14 @@ mod tests {
     /// `_SECRET`/`_KEY` suffix alone, so
     /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` — declared
     /// `InputType::Password`, ending in neither suffix — landed with
-    /// `sensitive = 0`. `is_sensitive_key` is a union of the stored flag and
-    /// the suffix, and this key satisfies neither, so `GET
+    /// `sensitive = 0`. `is_sensitive_key` was then a union of the stored flag
+    /// and the suffix alone, and this key satisfies neither, so `GET
     /// /b/admin/api/settings/{key}` returned the bootstrap password in clear.
     /// `seed_defaults` never repairs it: the declared-vars hash gate
-    /// short-circuits once stamped.
+    /// short-circuits once stamped. Both halves are closed now and this test
+    /// pins the WRITE one — the reader's own declaration half is pinned by
+    /// `a_legacy_unflagged_declared_password_row_is_masked_by_every_read_path`,
+    /// which stages the row the writer can no longer produce.
     ///
     /// Drives the real write path (`seed_and_load`) into the real read paths,
     /// not the stored integer, because the integer is only interesting for
@@ -747,6 +754,69 @@ mod tests {
             assert!(
                 !raw.contains("hunter2"),
                 "a settings listing leaked the bootstrap password: {raw}"
+            );
+        }
+    }
+
+    /// A row an OLDER build stored UNFLAGGED for a declaration-only-sensitive
+    /// key must still be masked by every settings read path.
+    ///
+    /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` is declared
+    /// `InputType::Password` and spelled with neither `_SECRET` nor `_KEY`, so
+    /// the stored flag was the only thing the readers consulted — and on a
+    /// deployment that has not yet run `repair_sensitive_flags` (on Cloudflare,
+    /// one with no `/_deploy/init` since the upgrade) that flag is still `0`.
+    /// The edit modal already masks such a row off the DECLARATION
+    /// (`handle_edit_variable_form`'s `show_sensitive`); these three endpoints
+    /// published the password verbatim in the same window. The modal's source
+    /// and the read paths' have to be the same source.
+    ///
+    /// Stages the row in the variables TABLE, not the boot snapshot, and drives
+    /// the three real handlers.
+    #[tokio::test]
+    async fn a_legacy_unflagged_declared_password_row_is_masked_by_every_read_path() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+        assert!(
+            crate::config_vars::is_sensitive_for_storage(key),
+            "and one the declaration does call sensitive"
+        );
+
+        // `variables::insert` would raise the flag on the way in — this is the
+        // row an older build left behind, so it goes in unflagged.
+        variables::seed_row_with_flag(&ctx, key, "hunter2", 0).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let body = output_json(handle_get(&ctx, &msg).await).await;
+        assert_eq!(
+            body.get("data")
+                .and_then(|d| d.get("value"))
+                .and_then(|v| v.as_str()),
+            Some(MASKED_VALUE),
+            "an unrepaired bootstrap-password row must not be readable through the settings API"
+        );
+
+        for listing in [
+            output_json(handle_list(&ctx).await).await,
+            output_json(handle_list_full(&ctx).await).await,
+        ] {
+            let raw = listing.to_string();
+            assert!(
+                !raw.contains("hunter2"),
+                "a settings listing leaked an unrepaired bootstrap password: {raw}"
             );
         }
     }

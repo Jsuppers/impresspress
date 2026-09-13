@@ -36,10 +36,12 @@ pub(super) use crate::util::validate_url_value;
 /// [`crate::util`] so the generic ConfigVar-driven settings form
 /// (`ui::settings_form`) can share it too — masking on a DB `sensitive` flag
 /// (or `InputType::Password`) alone leaked a `*_SECRET`/`*_KEY` value
-/// whenever a var/row wasn't explicitly marked. Both surfaces (JSON
-/// `handle_list*`, the SSR variable tables, and the shared settings form)
-/// must agree on this rule; re-exported here so existing `ops::`-qualified
-/// call sites in this module tree keep working.
+/// whenever a var/row wasn't explicitly marked, and masking on the flag plus
+/// the suffix alone leaked a declared password var that spells neither.
+/// Every surface (JSON `handle_list*`, the SSR variable tables and the edit
+/// modal, the shared settings form, the edge-cache exclusion and the export
+/// filter) must agree on this rule; re-exported here so existing
+/// `ops::`-qualified call sites in this module tree keep working.
 pub(super) use crate::util::{is_sensitive_key, MASKED_VALUE};
 use crate::{
     blocks::{
@@ -700,12 +702,12 @@ pub(super) struct VariableUpdate<'a> {
 
 /// Update a config variable identified by `key` (upsert on the `key` column),
 /// writing an audit-log row. Enforces the sensitive-empty guard (a sensitive
-/// value can't be cleared — see [`is_sensitive_key`]: the `_SECRET`/`_KEY`
-/// suffix rule unioned with the row's stored `sensitive` flag, which covers
-/// Password-typed declared vars; the exception is a provisioning-only
-/// credential, which [`crate::config_vars::is_provisioning_only_key`] names and
-/// which must stay clearable because nothing can delete it either) and the
-/// `_URL` SSRF validation on both surfaces.
+/// value can't be cleared — see [`is_sensitive_key`]: the row's stored
+/// `sensitive` flag unioned with what the key's own spelling or declaration
+/// says, which is what covers Password-typed declared vars; the exception is a
+/// SPENT provisioning credential, which [`is_clearable_provisioning_credential`]
+/// names and which must stay clearable because nothing can delete it either)
+/// and the `_URL` SSRF validation on both surfaces.
 ///
 /// Returns the upserted row.
 pub(super) async fn update_variable(
@@ -723,12 +725,14 @@ pub(super) async fn update_variable(
     if let Some(value) = update.value {
         // Prevent clearing a sensitive value (would break auth). Sensitivity
         // is the same union the read/masking paths use ([`is_sensitive_key`]):
-        // the SEC-060 `_SECRET`/`_KEY` suffix rule OR the row's stored
-        // `sensitive` flag — the flag is what marks Password-typed declared
-        // vars without the suffix (e.g. `BOOTSTRAP_ADMIN_PASSWORD`, `*_TOKEN`)
-        // and ad hoc rows flagged in the UI. The row lookup only happens on
-        // the empty-value path; a missing row (upsert-create branch) has no
-        // stored secret to wipe, so only the suffix rule applies there.
+        // the row's stored `sensitive` flag OR what the key itself says — the
+        // SEC-060 `_SECRET`/`_KEY` suffix, or a declaration that is
+        // `InputType::Password`/`auto_generate`, which is what names
+        // `BOOTSTRAP_ADMIN_PASSWORD` and `*_TOKEN`. The stored flag still adds
+        // the ad hoc rows an admin marked in the UI, about which the
+        // declaration knows nothing. The row lookup only happens on the
+        // empty-value path; a missing row (upsert-create branch) has no stored
+        // secret to wipe, so for it the key half decides alone.
         // A provisioning-only credential is the exception, and it has to be,
         // because this guard and the delete path would otherwise trap it
         // between them: `delete_variable` and the Variables page's

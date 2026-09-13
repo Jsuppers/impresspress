@@ -116,7 +116,8 @@ enum ValueState {
 
 impl ValueState {
     /// Resolve the value cell from a key + raw value + sensitive flag, applying
-    /// the SEC-060 suffix rule via `ops::is_sensitive_key`. `track_unset`
+    /// the SEC-060 key rule (suffix OR declaration) via
+    /// `ops::is_sensitive_key`. `track_unset`
     /// controls whether an empty value renders as `(not set)` (block-config
     /// tables) or as an empty `code` cell (flat DB-record tables).
     fn resolve(key: &str, value: &str, sensitive_flag: i64, track_unset: bool) -> Self {
@@ -467,8 +468,9 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
     let all_vars = variables::list_all(ctx).await.unwrap_or_default();
 
     // Build a map of key -> (value, sensitive-flag). The flag is kept as the
-    // `i64` `ops::is_sensitive_key` takes so the SEC-060 suffix rule can be
-    // applied at render time.
+    // `i64` `ops::is_sensitive_key` takes so the SEC-060 key rule — the
+    // `_SECRET`/`_KEY` suffix or the key's own declaration — can be applied at
+    // render time.
     let var_map: std::collections::HashMap<String, (String, i64)> = all_vars
         .iter()
         .map(|row| {
@@ -1006,6 +1008,42 @@ mod tests {
         assert!(
             html.contains(r#"type="checkbox" name="sensitive" value="1" checked disabled"#),
             "and the control must read as set-and-locked, not unchecked: {html}"
+        );
+    }
+
+    /// The Variables PAGE must mask the same unrepaired row the edit modal
+    /// masks.
+    ///
+    /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` is sensitive by
+    /// DECLARATION only — neither `_SECRET` nor `_KEY` — so a row an older
+    /// build stored unflagged was rendered in clear in the table while the edit
+    /// modal one click away rendered it masked. Whatever source settles the
+    /// modal has to settle the table.
+    #[tokio::test]
+    async fn an_unrepaired_declaration_only_row_is_masked_in_the_table() {
+        let ctx = TestContext::with_admin().await;
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+
+        variables::seed_row_with_flag(&ctx, key, "hunter2", 0).await;
+
+        let msg =
+            crate::blocks::admin::test_support::routed(admin_msg("retrieve", "/b/admin/variables"));
+        let html = output_html(
+            crate::blocks::admin::pages::settings::settings_page(&ctx, &msg, "variables").await,
+        )
+        .await;
+
+        assert!(
+            html.contains(key),
+            "the row must be on the page at all, or this test proves nothing: {html}"
+        );
+        assert!(
+            !html.contains("hunter2"),
+            "the Variables page rendered an unrepaired bootstrap password in clear: {html}"
         );
     }
 

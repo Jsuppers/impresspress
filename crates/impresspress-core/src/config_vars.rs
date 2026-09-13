@@ -539,14 +539,18 @@ pub fn is_sensitive_by_default_when_created(key: &str) -> bool {
 /// which is the only safe direction for a flag whose whole job is to keep a
 /// value out of an API response.
 ///
-/// This must stay consistent with `util::is_sensitive_key`, the read path's
-/// union of the stored flag and [`has_sensitive_suffix`]: that reader can
-/// only recover a Password-typed declared var's sensitivity from the stored
-/// flag, so a writer that gets the flag wrong leaks the value and no reader
-/// can tell. It is applied at `platform_state::variables::NewVariable::into_row`,
-/// the funnel every row creation passes through, rather than at each call site,
-/// because a call site that forgets is invisible until somebody reads the value
-/// back out of an API response.
+/// `util::is_sensitive_key`, the read path, is the stored flag unioned with
+/// THIS function — deliberately the same predicate, so the reader never
+/// depends on the writer having got the column right. It did once, and a
+/// legacy row written before this funnel existed served a bootstrap password
+/// in the clear until a boot repaired it. The column is now a cache of the
+/// answer rather than the only copy of it.
+///
+/// Still applied at `platform_state::variables::NewVariable::into_row`, the
+/// funnel every row creation passes through, rather than at each call site: the
+/// stored flag is what the admin UI's Sensitive control reads back, what
+/// `variables::set` preserves for an ad hoc row the declaration knows nothing
+/// about, and the only signal an EXPORT has to go on for such a row.
 pub fn is_sensitive_for_storage(key: &str) -> bool {
     has_sensitive_suffix(key) || declared_sensitive_keys().contains(key)
 }

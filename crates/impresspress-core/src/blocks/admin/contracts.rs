@@ -289,18 +289,26 @@ pub struct AdminRoleDeleteResponse {
 // Masking, in full, so a reviewer does not have to reconstruct it from three
 // files. Before a value reaches the map, the handler asks
 // `crate::util::is_sensitive_key(key, row.sensitive)`, which is true when
-// either the row's `sensitive` column is `1` or the key ends in `_SECRET` /
-// `_KEY`; a true answer substitutes `crate::util::MASKED_VALUE` ("********")
-// for the stored value. The `sensitive` column is not hand-maintained — it is
-// seeded from each declared `ConfigVar`'s `InputType::Password`
-// (`settings::seed_defaults`), which is what covers password-shaped keys that
-// carry neither suffix. The masked string is a fixed width, so it reveals
+// either the row's `sensitive` column is `1` or the KEY is one this build
+// knows to hold a secret — it ends in `_SECRET`/`_KEY`, or a declared
+// `ConfigVar` for it is `InputType::Password` or `auto_generate`
+// (`config_vars::is_sensitive_for_storage`). A true answer substitutes
+// `crate::util::MASKED_VALUE` ("********") for the stored value. The
+// `sensitive` column is therefore a cache of that answer, not the only copy of
+// it: a row an older build stored unflagged for a password-shaped key carrying
+// neither suffix — `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` — is
+// masked here before `platform_state::variables::repair_sensitive_flags` ever
+// gets to fix the column. The masked string is a fixed width, so it reveals
 // nothing about the real value's length either.
 //
-// The residual gap is an *ad hoc* variable, created through the admin UI with
-// a secret-ish name and the `sensitive` checkbox left clear: it matches neither
-// half of the rule and its value is published. That is a property of the
-// create form, not of this endpoint, and is unchanged by typing the response.
+// The residual gap is an *ad hoc* variable — one this build declares no
+// `ConfigVar` for — created through the admin UI with a secret-ish name and the
+// `sensitive` checkbox cleared: it matches neither half of the rule and its
+// value is published. Nothing here knows such a key holds a secret, which is
+// why the create path defaults it to sensitive
+// (`config_vars::is_sensitive_by_default_when_created`) and clearing the box is
+// a deliberate admin act. That is a property of the create form, not of this
+// endpoint, and is unchanged by typing the response.
 /// One configuration variable, as published by `GET /b/admin/api/settings`.
 ///
 /// `sensitive` is what makes the masking legible to a reader that is not a
@@ -319,7 +327,9 @@ pub struct AdminSettingView {
     /// as an array, one holding `on` reads back as a string.
     pub value: serde_json::Value,
     /// Whether `value` is masked. True when the row carries the sensitive
-    /// flag or the key ends in `_SECRET` or `_KEY`.
+    /// flag, or the key is one this build knows to hold a secret: it ends in
+    /// `_SECRET` or `_KEY`, or its declaration is a password-typed or
+    /// auto-generated variable.
     pub sensitive: bool,
 }
 
@@ -327,9 +337,10 @@ pub struct AdminSettingView {
 /// variable, sorted by key.
 ///
 /// **Sensitive values are never present.** A variable is treated as sensitive
-/// when it is flagged sensitive in the database or its key ends in `_SECRET` or
-/// `_KEY`, and its value is replaced with `"********"` before the response is
-/// built. Reading this endpoint cannot recover a secret, nor its length.
+/// when it is flagged sensitive in the database, or its key ends in `_SECRET`
+/// or `_KEY`, or its declaration is a password-typed or auto-generated
+/// variable; its value is then replaced with `"********"` before the response
+/// is built. Reading this endpoint cannot recover a secret, nor its length.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdminSettingsResponse {

@@ -247,11 +247,16 @@ pub const TABLE_EXCLUDED: &[&str] = &[
 ///
 /// Reuses [`crate::util::is_sensitive_key`] — the same SEC-060 rule the
 /// admin Variables page masks display values with (explicit `sensitive` flag
-/// **or** a `_SECRET`/`_KEY` suffix) — rather than checking the flag alone: a
-/// second, weaker sensitivity check here would be exactly the kind of
-/// disagreement that rule exists to prevent. Called with the flag already
-/// pinned to "clean false" (checked below), so it only evaluates the suffix
-/// half.
+/// **or** a key the build knows to hold a secret: the `_SECRET`/`_KEY` suffix,
+/// or a declared `Password`/`auto_generate` `ConfigVar`) — rather than checking
+/// the flag alone: a second, weaker sensitivity check here would be exactly the
+/// kind of disagreement that rule exists to prevent. Called with the flag
+/// already pinned to "clean false" (checked below), so it only evaluates the
+/// key half — which is the half that holds back a legacy
+/// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` row, still unflagged
+/// because this deployment has not run the repair pass. Export is the
+/// irreversible direction: a bundle that reaches another deployment cannot be
+/// recalled.
 ///
 /// The `IMPRESSPRESS_` prefix check is this module's own, additional rule,
 /// and it is deliberately the *broad* prefix — it matches both shapes
@@ -351,6 +356,26 @@ mod variable_is_exportable_tests {
         assert!(!variable_is_exportable(&row(serde_json::json!({
             "key": "JWT_KEY",
             "sensitive": 0,
+        }))));
+    }
+
+    /// The irreversible half of the same leak: a row sensitive by DECLARATION
+    /// only, stored unflagged by an older build, must not travel inside a seed
+    /// bundle to another deployment. Nothing downstream can un-send it.
+    #[test]
+    fn a_declared_password_key_never_exports_even_when_the_flag_is_clear() {
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": key,
+            "sensitive": 0,
+        }))));
+        assert!(!variable_is_exportable(&row(serde_json::json!({
+            "key": key,
+            "sensitive": false,
         }))));
     }
 

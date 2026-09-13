@@ -250,8 +250,13 @@ fn sensitive_check_columns(table: CachedTable) -> Option<(&'static str, &'static
 /// `ConfigVar`-driven settings form use to mask/redact secrets
 /// ([`crate::util::is_sensitive_key`]), so the cache-write policy can never
 /// drift from the display-masking policy: a row is sensitive when its
-/// `sensitive` flag is set OR its key follows the `_SECRET`/`_KEY` suffix
-/// convention.
+/// `sensitive` flag is set OR its key is one the build knows to hold a secret
+/// — the `_SECRET`/`_KEY` suffix convention, or a declared `ConfigVar` that is
+/// `InputType::Password` or `auto_generate`. The declaration half matters
+/// here specifically: `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD`
+/// carries neither suffix, so a legacy row with the flag still clear was
+/// judged cacheable and a plaintext admin password was copied into a globally
+/// replicated store.
 ///
 /// Uses [`crate::util::json_as_i64`] (not a bare `v.as_i64()`) for the
 /// `sensitive` column so this stays in exact parity with the display-masking
@@ -692,6 +697,25 @@ mod tests {
         assert!(row_is_sensitive(
             CachedTable::Variables,
             &variables_row("JWT_KEY", 0)
+        ));
+    }
+
+    #[test]
+    fn row_is_sensitive_true_for_a_declared_password_var_even_if_flag_unset() {
+        // `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` is declared
+        // `InputType::Password` and spelled with neither `_SECRET` nor `_KEY`,
+        // so a row an older build stored unflagged was judged KV-cacheable —
+        // copying a plaintext admin password into a globally replicated store
+        // for up to the 24h row TTL. The declaration is the only thing that
+        // knows, so the masking predicate has to ask it.
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+        assert!(row_is_sensitive(
+            CachedTable::Variables,
+            &variables_row(key, 0)
         ));
     }
 

@@ -572,7 +572,7 @@
             "application/json": {
               "schema": {
                 "additionalProperties": false,
-                "description": "Response body of `GET /b/admin/api/settings`: every configuration\nvariable, sorted by key.\n\n**Sensitive values are never present.** A variable is treated as sensitive\nwhen it is flagged sensitive in the database or its key ends in `_SECRET` or\n`_KEY`, and its value is replaced with `\"********\"` before the response is\nbuilt. Reading this endpoint cannot recover a secret, nor its length.",
+                "description": "Response body of `GET /b/admin/api/settings`: every configuration\nvariable, sorted by key.\n\n**Sensitive values are never present.** A variable is treated as sensitive\nwhen it is flagged sensitive in the database, or its key ends in `_SECRET`\nor `_KEY`, or its declaration is a password-typed or auto-generated\nvariable; its value is then replaced with `\"********\"` before the response\nis built. Reading this endpoint cannot recover a secret, nor its length.",
                 "properties": {
                   "settings": {
                     "items": {
@@ -583,7 +583,7 @@
                           "type": "string"
                         },
                         "sensitive": {
-                          "description": "Whether `value` is masked. True when the row carries the sensitive\nflag or the key ends in `_SECRET` or `_KEY`.",
+                          "description": "Whether `value` is masked. True when the row carries the sensitive\nflag, or the key is one this build knows to hold a secret: it ends in\n`_SECRET` or `_KEY`, or its declaration is a password-typed or\nauto-generated variable.",
                           "type": "boolean"
                         },
                         "value": {

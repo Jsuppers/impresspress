@@ -619,25 +619,42 @@ pub(crate) fn validate_url_value(value: &str) -> Result<(), String> {
 pub(crate) const MASKED_VALUE: &str = "********";
 
 /// SEC-060: a config value is sensitive when it's explicitly flagged
-/// sensitive **or** the key follows the `_SECRET` / `_KEY` suffix
-/// convention. "Explicitly flagged" means different things on each caller's
-/// substrate — the admin Variables table's DB `sensitive` column for ad hoc
-/// rows, or a declared [`ConfigVar`](wafer_run::ConfigVar)'s
-/// `InputType::Password` for the generic settings form — so callers pass
-/// their own flag in as `1`/`0`. The suffix half of the rule is what both
-/// sides share: masking on the flag alone leaked a `*_SECRET` value whenever
-/// a var/row wasn't explicitly marked.
+/// sensitive **or** the key's own spelling or DECLARATION says it holds a
+/// secret ([`crate::config_vars::is_sensitive_for_storage`]: the
+/// `_SECRET`/`_KEY` suffix convention, or a declared
+/// [`ConfigVar`](wafer_run::ConfigVar) that is `InputType::Password` or
+/// `auto_generate`).
 ///
-/// Single source of truth for "is this key sensitive", used by both the
-/// admin Variables page (`blocks::admin::ops`, re-exported from here) and
-/// the generic ConfigVar-driven settings form (`ui::settings_form`) so the
-/// two admin surfaces can't disagree on what gets redacted.
-/// The suffix half is [`crate::config_vars::has_sensitive_suffix`], shared
-/// with the write path that decides what the stored flag gets
-/// ([`crate::config_vars::is_sensitive_for_storage`]) — the two halves of this
-/// union have to be the same rule on both sides.
+/// "Explicitly flagged" means different things on each caller's substrate —
+/// the admin Variables table's DB `sensitive` column for ad hoc rows, or the
+/// `ConfigVar` in hand for the generic settings form — so callers pass their
+/// own flag in as `1`/`0`. The key half of the rule is what every caller
+/// shares, and it has to be the WHOLE key rule, not just the suffix: masking
+/// on the flag alone leaked a `*_SECRET` value whenever a var/row wasn't
+/// explicitly marked, and masking on the flag plus the suffix alone leaked
+/// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` — declared
+/// `InputType::Password`, spelled with neither suffix — for as long as a
+/// legacy row carried `sensitive = 0`, which on Cloudflare means until the
+/// next `/_deploy/init` ran [`crate::platform_state::variables::repair_sensitive_flags`].
+///
+/// Single source of truth for "is this key sensitive": the admin Variables
+/// page and its edit modal (`blocks::admin::ops`, re-exported from here), the
+/// settings JSON API (`blocks::admin::settings`), the generic
+/// ConfigVar-driven settings form (`ui::settings_form`), the edge-cache
+/// exclusion (`cache_key::row_is_sensitive`) and the export filter
+/// (`blocks::dev::data_snapshot::variable_is_exportable`) all ask this, so no
+/// two of them can disagree about what gets redacted — the modal masking a
+/// value the table beside it rendered in clear is exactly the drift this
+/// closes.
+///
+/// It is deliberately the same key predicate the WRITE path applies when it
+/// decides what the stored flag gets ([`crate::config_vars::is_sensitive_for_storage`],
+/// at `platform_state::variables::NewVariable::into_row`). Reader and writer
+/// asking one question means the stored flag is a cache of the answer, never
+/// the only copy of it — so a row written before the funnel existed, or by a
+/// build that did not know the key, is still masked.
 pub(crate) fn is_sensitive_key(key: &str, sensitive_flag: i64) -> bool {
-    sensitive_flag == 1 || crate::config_vars::has_sensitive_suffix(key)
+    sensitive_flag == 1 || crate::config_vars::is_sensitive_for_storage(key)
 }
 
 /// Percent-encode a string for use as an OAuth / `application/x-www-form-urlencoded`
