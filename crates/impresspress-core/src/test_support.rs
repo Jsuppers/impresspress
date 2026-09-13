@@ -1680,6 +1680,134 @@ impl Context for FailingDbOpContext {
     }
 }
 
+/// Wraps a [`TestContext`] and strips the COLUMNS off every record a
+/// `database.create` or `database.update` answers with, leaving the
+/// `{id, data}` envelope's `data` empty. The write still lands in the real
+/// in-memory SQLite underneath — only the echo is thinned.
+///
+/// This is the backend a repository function has to survive and cannot
+/// simulate any other way: `DatabaseService::create`/`update` are free to
+/// return the row they stored or a bare acknowledgement, and a repo that
+/// DECODES the echo and reports a decode failure as an error is telling its
+/// caller the write failed when the change is already committed.
+/// `platform_state::variables` is where that mattered, differently on each
+/// side: `insert`'s error was classified by re-reading the key, so the row the
+/// request had just created came back as "that key is already taken", and
+/// `upsert_by_key`'s error returned from `admin::ops::update_variable` before
+/// its `audit_log` call, so an edit that landed went unrecorded.
+///
+/// The real in-memory SQLite echoes the row, which is why no existing test
+/// reached those branches.
+/// It wraps any [`Context`], not just a [`TestContext`], so it composes with
+/// [`FailingDbOpContext`] — a write that is REFUSED must keep the refusal's own
+/// code on its way back out through this wrapper, and the only way to say that
+/// in a test is to put a refusing context underneath it.
+#[derive(Clone)]
+pub struct EcholessWriteContext {
+    inner: Arc<dyn Context>,
+    keep_columns: Vec<String>,
+    keep_id: bool,
+}
+
+impl EcholessWriteContext {
+    /// Wrap `inner`. Every op but `database.create`/`database.update` passes
+    /// through untouched; those keep their `id` and lose every column.
+    pub fn new(inner: impl Context + 'static) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            keep_columns: Vec::new(),
+            keep_id: true,
+        }
+    }
+
+    /// Echo the named columns and drop the rest — the PARTIAL echo, which is
+    /// the case a repo is most likely to get wrong: a record carrying `key` and
+    /// little else still decodes, so a repo that only falls back when decoding
+    /// FAILS hands its caller a row with the other columns silently defaulted.
+    pub fn keeping_columns(mut self, keep: &[&str]) -> Self {
+        self.keep_columns = keep.iter().map(|c| (*c).to_string()).collect();
+        self
+    }
+
+    /// Answer with an empty `id` as well. A backend that acknowledges a write
+    /// without naming the row is entitled to; a repo that publishes that empty
+    /// id as the row's identity is not.
+    pub fn without_the_id(mut self) -> Self {
+        self.keep_id = false;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl Context for EcholessWriteContext {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+        let thins_the_echo = name == "wafer-run/database"
+            && matches!(msg.action(), "database.create" | "database.update");
+        if !thins_the_echo {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let out = self.inner.call_block(name, msg, input).await;
+        let buf = match out.collect_buffered().await {
+            Ok(buf) => buf,
+            // The write itself failed, and that answer is not this wrapper's
+            // to rewrite: substituting an `Internal` here would make a test
+            // that paired this wrapper with a denied context assert 403 and
+            // silently receive 500. The inner error is forwarded as it stands.
+            Err(TerminalNotResponse::Error(e)) => return OutputStream::error(e),
+            Err(other) => {
+                return OutputStream::error(WaferError::new(
+                    ErrorCode::Internal,
+                    format!("echoless-write wrapper saw a non-response terminal: {other:?}"),
+                ))
+            }
+        };
+        // The service wire format is the codec's, not JSON — decode and
+        // re-encode through it so the client sees a well-formed record that
+        // simply carries no columns.
+        let mut record: wafer_block::wire::database::Record =
+            match wafer_block::codec::decode(&buf.body) {
+                Ok(record) => record,
+                Err(e) => return OutputStream::error(e),
+            };
+        record
+            .data
+            .retain(|column, _| self.keep_columns.iter().any(|k| k == column));
+        if !self.keep_id {
+            record.id = String::new();
+        }
+        match wafer_block::codec::encode(&record) {
+            Ok(bytes) => OutputStream::respond(bytes),
+            Err(e) => OutputStream::error(e),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
 impl TestContext {
     /// [`TestContext::with_auth`] plus a real `wafer-run/crypto` block, so
     /// handlers that mint or verify JWTs (login, signup, refresh) run end to
@@ -1839,6 +1967,23 @@ pub async fn output_body(out: OutputStream) -> Vec<u8> {
 pub async fn output_json(out: OutputStream) -> serde_json::Value {
     let buf = collect_or_panic(out).await;
     serde_json::from_slice(&buf.body).unwrap_or(serde_json::Value::Null)
+}
+
+/// The JSON body an adapter would SEND for `out`, error terminals included.
+///
+/// [`output_json`] reads a success body, and panics on an error terminal
+/// because a handler under test erroring is normally a bug. An error terminal
+/// carries no body at all until `wafer_block::http_codec` renders one — the
+/// `{"error": "<Code>", "message": "<text>"}` envelope — so a test that wants
+/// to assert on what a *browser* receives from a refusal has to run that
+/// render. This runs it, through the same `collect_http_response` the real
+/// adapters use, so the assertion cannot drift from the bytes on the wire.
+///
+/// The pairing is [`output_http_status`]: status and body from the one
+/// rendering, rather than from a second description of it.
+pub async fn output_http_json(out: OutputStream) -> serde_json::Value {
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    serde_json::from_slice(&parts.body).unwrap_or(serde_json::Value::Null)
 }
 
 /// True if the OutputStream terminated with an error matching `code`.

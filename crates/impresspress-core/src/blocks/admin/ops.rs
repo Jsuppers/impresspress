@@ -49,7 +49,7 @@ use crate::{
         },
         crud::{db_error, db_error_internal},
     },
-    http::{err_bad_request, err_forbidden, err_internal},
+    http::{err_bad_request, err_conflict, err_forbidden, err_internal},
     platform_state::{
         user_roles,
         variables::{self, NewVariable, VariablePatch, VariableRow},
@@ -235,8 +235,109 @@ pub(super) async fn update_user_fields(
 }
 
 // ---------------------------------------------------------------------------
+// Duplicate natural keys
+// ---------------------------------------------------------------------------
+
+/// What a failed `create` against a table with a UNIQUE natural key —
+/// `variables.key`, `roles.name`, `permissions.name` — actually means.
+///
+/// Both of those inserts are refused by the database when the key is already
+/// taken, and that refusal used to ship as `err_internal("Database error", e)`:
+/// a `500 Internal server error (ref: …)` for a request that is not a fault at
+/// all. An admin who re-types a key that exists was told the server broke, and
+/// an operator reading the log could not tell that request from a corrupt row
+/// or an outage. The honest answer is **409** — the key is taken, edit it or
+/// pick another — which is what [`ErrorCode::AlreadyExists`] resolves to in
+/// `wafer_block::http_codec::error_code_to_http_status`.
+///
+/// It has to be decided by re-reading rather than by the write's own error,
+/// because no `DatabaseService` backend classifies a constraint violation:
+/// `wafer_core`'s `db_error_to_wafer` has three arms (`NotFound`, `Internal`,
+/// `Other`) and the last two both become [`ErrorCode::Internal`] with the
+/// driver's text *sanitized* away unless it is one of a few preserved
+/// substrings. So there is nothing in the error to match on, and matching on
+/// driver message text would be both magic and backend-specific. The same
+/// reasoning, and the same probe-after-the-write shape, is already written out
+/// at `products::handlers::product::restore_slug_conflict`.
+///
+/// The forward path is [`ErrorCode::AlreadyExists`]: a backend that DOES
+/// classify the violation has already answered the question the probe exists to
+/// ask, so that code short-circuits straight to the 409 and no re-read happens
+/// at all. It is wired up now rather than when such a backend lands, because
+/// sending it to [`db_error_internal`] instead — which classifies only
+/// `NotFound`, `PermissionDenied` and `ResourceExhausted`, and folds everything
+/// else into a 500 — would re-introduce this exact bug on the day the backend
+/// improved, with every test still green because the in-memory SQLite these run
+/// against answers `Internal`.
+///
+/// [`ErrorCode::Aborted`] is a probe candidate alongside `Internal` for the same
+/// reason in reverse: `error_code_to_http_status` already renders it 409, and
+/// the "concurrency conflict" it names is precisely what a unique-index
+/// collision is. If the key turns out to be taken, that is this conflict; if it
+/// does not, the write's own failure is kept.
+///
+/// Probing **after** the failed write rather than before it is what closes the
+/// race: a pre-check that found the key free leaves a gap in which a competing
+/// create can claim it, and the loser of that race is exactly the request that
+/// would still have answered 500. Re-reading afterwards has no such gap — the
+/// insert has already been refused, and the row that refused it is there to be
+/// found. It also costs the successful create nothing, since the probe only
+/// runs on the error path.
+///
+/// `probe` is the "is this key taken now?" read, passed as its own future so it
+/// is only awaited here. Three answers, not two: taken is the conflict, free is
+/// a genuine fault, and a probe that could not run is **not** "free" — "could
+/// not tell" keeps the write's own failure, so a transient read outage cannot
+/// turn a 500 into a wrong 409 or vice versa.
+pub(super) async fn taken_key_or_db_error(
+    error: wafer_run::WaferError,
+    probe: impl std::future::Future<Output = Result<bool, wafer_run::WaferError>>,
+    conflict: &str,
+) -> OutputStream {
+    match error.code {
+        // Already classified by the backend — nothing left to find out.
+        ErrorCode::AlreadyExists => return err_conflict(conflict),
+        // The two codes a constraint violation can arrive as unclassified.
+        ErrorCode::Internal | ErrorCode::Aborted => {}
+        // A WRAP refusal (403) or a quota (429) is not a name collision and
+        // keeps the status `crud` gives it.
+        _ => return db_error_internal(error, "Database error"),
+    }
+    match probe.await {
+        Ok(true) => err_conflict(conflict),
+        Ok(false) => db_error_internal(error, "Database error"),
+        Err(probe_error) => {
+            tracing::warn!(
+                error = %probe_error,
+                "could not re-read the key a refused insert may have collided with",
+            );
+            db_error_internal(error, "Database error")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Role mutations
 // ---------------------------------------------------------------------------
+
+/// Whether a role called `name` exists. The probe [`create_role`] hands to
+/// [`taken_key_or_db_error`]; `roles.name` is UNIQUE, so one row is all there
+/// can be and a `NotFound` from the lookup is the "free" answer rather than a
+/// failure.
+async fn role_name_taken(ctx: &dyn Context, name: &str) -> Result<bool, wafer_run::WaferError> {
+    match db::get_by_field(
+        ctx,
+        ROLES_TABLE,
+        "name",
+        serde_json::Value::String(name.to_string()),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 
 /// Create a role with the given name and optional description, writing an
 /// audit-log row. `description` / `permissions` default to empty.
@@ -262,7 +363,18 @@ pub(super) async fn create_role(
 
     let record = match db::create(ctx, ROLES_TABLE, data).await {
         Ok(record) => record,
-        Err(e) => return Err(err_internal("Database error", e)),
+        // `roles.name` is UNIQUE: a second role of the same name is a 409, not
+        // a 500. See [`taken_key_or_db_error`].
+        Err(e) => {
+            return Err(taken_key_or_db_error(
+                e,
+                role_name_taken(ctx, name),
+                &format!(
+                    "A role named \"{name}\" already exists. Edit that role, or pick another name."
+                ),
+            )
+            .await)
+        }
     };
 
     audit_log(
@@ -498,7 +610,19 @@ pub(super) async fn create_variable(
     };
     let record = match variables::insert(ctx, new).await {
         Ok(row) => row,
-        Err(e) => return Err(err_internal("Database error", e)),
+        // `variables.key` is UNIQUE: creating a key that is already stored is a
+        // 409, not a 500. See [`taken_key_or_db_error`].
+        Err(e) => {
+            return Err(taken_key_or_db_error(
+                e,
+                async { variables::get_by_key(ctx, key).await.map(|r| r.is_some()) },
+                &format!(
+                    "A variable named \"{key}\" already exists. Edit that variable, or pick \
+                     another key."
+                ),
+            )
+            .await)
+        }
     };
 
     audit_log(
@@ -553,7 +677,7 @@ pub(super) async fn update_variable(
             let stored_flag = match variables::get_by_key(ctx, key).await {
                 Ok(Some(row)) => i64::from(row.sensitive),
                 Ok(None) => 0,
-                Err(e) => return Err(err_internal("Database error", e)),
+                Err(e) => return Err(db_error_internal(e, "Database error")),
             };
             if is_sensitive_key(key, stored_flag) {
                 return Err(err_bad_request(&format!(
@@ -579,7 +703,11 @@ pub(super) async fn update_variable(
     };
     let record = match variables::upsert_by_key(ctx, key, patch).await {
         Ok(row) => row,
-        Err(e) => return Err(err_internal("Database error", e)),
+        // `db_error_internal`, not a bare `err_internal`: an upsert names its
+        // own table, so a `NotFound` is a missing table and a 500 — but a WRAP
+        // refusal is a 403 and a quota a 429, and forwarding those as 500 is
+        // the drift `tests/error_door.rs` exists to stop.
+        Err(e) => return Err(db_error_internal(e, "Database error")),
     };
 
     audit_log(
@@ -743,6 +871,296 @@ mod tests {
             .await
             .expect("read back")
             .is_none());
+    }
+
+    /// Creating a variable whose key is already taken is a **409**, not a 500.
+    ///
+    /// The `key` column is `UNIQUE`, so the second insert is refused by the
+    /// database. No `DatabaseService` backend classifies a constraint
+    /// violation, so the refusal arrives as `ErrorCode::Internal` and used to
+    /// be forwarded as `err_internal("Database error", …)` — a `500 Internal
+    /// server error (ref: …)`, which tells an operator their request broke the
+    /// server when in fact the server is fine and the request named a key that
+    /// exists. The row must also be left exactly as it was.
+    #[tokio::test]
+    async fn creating_a_variable_whose_key_is_taken_is_a_conflict() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/settings");
+        expect_ok(create_variable(&ctx, &msg, "SITE_NAME", "Acme", None, None, false).await);
+
+        let Err(out) = create_variable(&ctx, &msg, "SITE_NAME", "Other", None, None, false).await
+        else {
+            panic!("the duplicate key must not be created");
+        };
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            409,
+            "a taken key is a conflict, not an internal error",
+        );
+
+        let row = variables::get_by_key(&ctx, "SITE_NAME")
+            .await
+            .expect("read back")
+            .expect("the first row must still be there");
+        assert_eq!(row.value, "Acme", "the refused write must change nothing");
+        assert_eq!(
+            audit_count(&ctx, "variable.create").await,
+            1,
+            "a refused create is not an audited create",
+        );
+    }
+
+    /// A create whose row LANDED is never reported as a conflict, however thin
+    /// the backend's echo is.
+    ///
+    /// `DatabaseService::create` may answer with the row it stored or with an
+    /// acknowledgement. `variables::insert` used to decode that echo and return
+    /// the decode failure as an error — and a failed insert is classified by
+    /// re-reading the key, which found the row this very request had just
+    /// written. The admin was told the key already existed, the
+    /// `variable.create` audit row was skipped, and the untracked row made
+    /// every retry conflict forever. The write succeeded, so the answer has to
+    /// say so.
+    #[tokio::test]
+    async fn a_create_whose_echo_is_empty_is_a_create_not_a_conflict() {
+        let ctx = crate::test_support::EcholessWriteContext::new(admin_ctx().await);
+        let msg = admin_msg("create", "/admin/settings");
+
+        let row =
+            expect_ok(create_variable(&ctx, &msg, "SITE_NAME", "Acme", None, None, false).await);
+        assert_eq!(
+            row.key, "SITE_NAME",
+            "the row as written is what the caller gets back",
+        );
+        assert_eq!(row.value, "Acme");
+
+        assert_eq!(
+            audit_count(&ctx, "variable.create").await,
+            1,
+            "a create that landed must not go untracked",
+        );
+        let stored = variables::get_by_key(&ctx, "SITE_NAME")
+            .await
+            .expect("read back")
+            .expect("the row really is in the table");
+        assert_eq!(stored.value, "Acme");
+    }
+
+    /// An UPDATE whose row landed is audited, however thin the backend's echo
+    /// is.
+    ///
+    /// The other half of the same rule, with a different consequence.
+    /// `update_variable` runs no duplicate-key probe, so a decode failure after
+    /// a committed `db::update` was "only" a 500 — but it returned BEFORE
+    /// `audit_log`, so the edit happened and nothing recorded it. An audit
+    /// trail that is missing a change it should contain cannot be told apart
+    /// from the change never having been made, which is worse than either the
+    /// 500 or the false 409.
+    #[tokio::test]
+    async fn an_update_whose_echo_is_empty_is_audited_and_returns_the_new_value() {
+        let seeded = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(create_variable(&seeded, &msg, "SITE_NAME", "Acme", None, None, false).await);
+
+        let ctx = crate::test_support::EcholessWriteContext::new(seeded);
+        let row = expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                "SITE_NAME",
+                VariableUpdate {
+                    value: Some("Acme Two"),
+                    description: None,
+                },
+            )
+            .await,
+        );
+
+        assert_eq!(
+            row.value, "Acme Two",
+            "the columns just written win over the row that was read",
+        );
+        assert_eq!(
+            row.key, "SITE_NAME",
+            "and every column the update did not touch is carried over",
+        );
+        assert_eq!(
+            audit_count(&ctx, "variable.update").await,
+            1,
+            "an edit that landed must not go unrecorded",
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, "SITE_NAME")
+                .await
+                .expect("read back")
+                .expect("still there")
+                .value,
+            "Acme Two",
+        );
+    }
+
+    /// A PARTIAL echo does not report a still-sensitive variable as no longer
+    /// sensitive.
+    ///
+    /// This is the user-visible half of the merge rule. `from_record` insists
+    /// on `key` alone, so a backend echoing `key` and `value` decodes fine —
+    /// and the row that came back had `sensitive: false` for a variable that is
+    /// still flagged. Both admin surfaces mask on that flag, so the refusal
+    /// path is the mild version; the row published back to the caller after an
+    /// edit was the loud one.
+    #[tokio::test]
+    async fn an_update_with_a_partial_echo_keeps_the_sensitive_flag() {
+        let seeded = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(
+            create_variable(
+                &seeded,
+                &msg,
+                "MAILER_TOKEN",
+                "tok-1",
+                Some("Mailer token"),
+                None,
+                true,
+            )
+            .await,
+        );
+
+        let ctx = crate::test_support::EcholessWriteContext::new(seeded)
+            .keeping_columns(&["key", "value"]);
+        let row = expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                "MAILER_TOKEN",
+                VariableUpdate {
+                    value: Some("tok-2"),
+                    description: None,
+                },
+            )
+            .await,
+        );
+
+        assert_eq!(row.value, "tok-2", "the column the update wrote");
+        assert!(
+            row.sensitive,
+            "a column the echo left out must come from the row, not from a default",
+        );
+        assert_eq!(row.name, "Mailer token");
+        assert!(!row.created_at.is_empty());
+    }
+
+    /// The same fact for roles: `roles.name` is UNIQUE too, and the identical
+    /// `err_internal` tail two functions above `create_variable` answered the
+    /// identical 500. Fixed together so the two copies cannot drift again.
+    #[tokio::test]
+    async fn creating_a_role_whose_name_is_taken_is_a_conflict() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/users");
+        expect_ok(create_role(&ctx, &msg, "editor", Some("first"), None).await);
+
+        let Err(out) = create_role(&ctx, &msg, "editor", Some("second"), None).await else {
+            panic!("the duplicate role name must not be created");
+        };
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            409,
+            "a taken role name is a conflict, not an internal error",
+        );
+        assert_eq!(
+            audit_count(&ctx, "role.create").await,
+            1,
+            "a refused create is not an audited create",
+        );
+    }
+
+    /// A backend that DOES classify the violation short-circuits: the 409 comes
+    /// straight off `AlreadyExists` and the probe is never run.
+    ///
+    /// This is the forward path the helper documents. Before it was wired up,
+    /// `AlreadyExists` fell through to `crud::db_error_internal`, which
+    /// classifies only `NotFound` / `PermissionDenied` / `ResourceExhausted`
+    /// and folds the rest into a 500 — so the day a backend started reporting
+    /// constraint violations properly, this bug would have come back, with
+    /// every other test still green because the in-memory SQLite these run
+    /// against answers `Internal`.
+    #[tokio::test]
+    async fn a_backend_classified_already_exists_is_the_conflict_without_a_probe() {
+        let probed = std::cell::Cell::new(false);
+        let out = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::AlreadyExists, "duplicate key"),
+            async {
+                probed.set(true);
+                Ok(false)
+            },
+            "TAKEN already exists",
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+        assert!(
+            !probed.get(),
+            "the backend already answered; do not re-read"
+        );
+    }
+
+    /// `Aborted` is a probe candidate alongside `Internal`: it renders as 409
+    /// too, and the "concurrency conflict" it names is what a unique-index
+    /// collision is. The re-read still decides, so a free key keeps the fault.
+    #[tokio::test]
+    async fn an_aborted_write_is_classified_by_the_probe_like_an_internal_one() {
+        let taken = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::Aborted, "write conflict"),
+            async { Ok(true) },
+            "TAKEN already exists",
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(taken).await, 409);
+
+        let free = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::Aborted, "write conflict"),
+            async { Ok(false) },
+            "TAKEN already exists",
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(free).await, 500);
+    }
+
+    /// A code that is neither is not a collision candidate at all — it keeps
+    /// the status `crud` gives it, and never reaches the probe.
+    #[tokio::test]
+    async fn a_wrap_refusal_keeps_its_403_and_is_never_probed() {
+        let probed = std::cell::Cell::new(false);
+        let out = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::PermissionDenied, "denied"),
+            async {
+                probed.set(true);
+                Ok(true)
+            },
+            "TAKEN already exists",
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 403);
+        assert!(!probed.get(), "a WRAP refusal is not a name collision");
+    }
+
+    /// A create that fails for a reason which is NOT a name collision keeps the
+    /// 500 — the re-read decides, so the classification cannot become "every
+    /// failed insert is a conflict".
+    #[tokio::test]
+    async fn a_create_that_fails_without_a_collision_is_still_internal() {
+        let ctx = admin_ctx().await.break_writes();
+        let msg = admin_msg("create", "/admin/settings");
+
+        let Err(out) = create_variable(&ctx, &msg, "SITE_NAME", "Acme", None, None, false).await
+        else {
+            panic!("the write is broken, so the create must fail");
+        };
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            500,
+            "no row holds the key, so the write's own failure is the answer",
+        );
     }
 
     /// SEC drift: the JSON variable path wrote zero audit rows. Both surfaces

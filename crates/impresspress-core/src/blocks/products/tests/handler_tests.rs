@@ -3093,12 +3093,19 @@ fn rendered_hx_post(html: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// The Restore button reloads the page on success. Without an explicit
-/// failure branch a refused restore — a slug collision is reachable, see
-/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — renders as
-/// nothing happening at all: no reload, no message, on the only door out of
-/// soft delete. Pin that the button feeds the failure into the shared toast
-/// channel `ui/assets/chrome.js`'s toast section already listens on.
+/// The Restore button reloads the page on success, and does NOT carry its own
+/// failure branch any more.
+///
+/// It used to: a refused restore — a slug collision is reachable, see
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — rendered as
+/// nothing happening at all, on the only door out of soft delete, so the button
+/// parsed the message out itself. `ui/assets/chrome.js` now carries a global
+/// `htmx:responseError` listener that does exactly that for every refused htmx
+/// request on every shelled page (`ui/assets/test/chrome_error_toast.test.mjs`
+/// is its test), so a copy here would toast the same refusal twice. What is
+/// pinned here is the half that is still this page's: the reload, guarded on
+/// success so a refusal does not silently reload the page and look like it
+/// worked.
 #[tokio::test]
 async fn manage_products_deleted_view_reports_a_failed_restore() {
     let ctx = ctx().await;
@@ -3113,12 +3120,19 @@ async fn manage_products_deleted_view_reports_a_failed_restore() {
     msg.set_meta("req.query.view", "deleted");
     let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
 
-    // `showToast` alone would match the page shell's own listener script,
-    // which every admin page carries — the assertion has to see the BUTTON
-    // raising the event.
     assert!(
-        html.contains("new CustomEvent('showToast'"),
-        "a failed restore must surface, not vanish: {html}"
+        html.contains("if(event.detail.successful){location.reload()}"),
+        "the restore button must reload only on success: {html}"
+    );
+    assert!(
+        !html.contains("new CustomEvent('showToast'"),
+        "the per-button toast is the global htmx error listeners' job now; a \
+         second copy would toast one refusal twice: {html}"
+    );
+    assert!(
+        html.contains(r#"data-error-label="Could not restore this product""#),
+        "but the button must still name ITSELF, or a refusal with no message \
+         of its own says only `Request failed (502)`: {html}"
     );
 }
 

@@ -12,9 +12,12 @@
 //   3. toasts           (was emitted by `ui::layout::page`)
 //   4. modals           (was emitted by `ui::layout::page`)
 //
-// Sections 1, 2 and 4 are IIFEs with their own idempotence guards. Section 3
-// is deliberately NOT wrapped: the toast listener binds `document.body`
-// directly and declares nothing. Section 4 was unwrapped too until the pages
+// Sections 1, 2 and 4 are IIFEs with their own idempotence guards. Section 3's
+// `showToast` listener is deliberately NOT wrapped: it binds `document.body`
+// directly and declares nothing. The htmx error listeners that follow it ARE
+// wrapped, because the three of them share one `toast()` helper and a shared
+// helper at the top level of this file would be a global. Section 4 was
+// unwrapped too until the pages
 // stopped calling `openModal`/`closeModal` from `onclick` attributes; it now
 // owns the shared delegated-action listener and exposes no globals. The rule
 // and the vocabulary are documented at the head of that section.
@@ -227,6 +230,198 @@ document.body.addEventListener("showToast", function(e) {
     c.appendChild(t);
     setTimeout(function() { t.remove(); }, 4000);
 });
+
+// A refused htmx request must not be SILENT.
+//
+// htmx 2.0.4's default `responseHandling` is
+// `[{code:"204",swap:false},{code:"[23]..",swap:true},{code:"[45]..",swap:false,error:true}]`:
+// a 4xx/5xx is deliberately not swapped, and htmx raises `htmx:responseError`
+// instead. Nothing in this tree listened for it, so every refusal on every
+// shelled page rendered as nothing happening at all — no swap, no message, the
+// modal sitting open unchanged. To the operator that is indistinguishable from
+// the request having worked, or from the 500 a refusal used to be, which is
+// exactly what the 2026-09-10 audit of the live server was about: a duplicate
+// variable key now answers a correct 409, and without this listener the correct
+// 409 would look the same as the wrong 500 did.
+//
+// One listener, not one per form. Invisible 4xx is a property of the whole
+// admin SSR surface, so the fix belongs on the shared channel rather than in an
+// `hx-on--after-request` attribute copied onto each control — which is what
+// `blocks/products/pages.rs` had to do before this existed.
+//
+// The body is the `{"error": "<Code>", "message": "<text>"}` envelope
+// `wafer_block::http_codec` renders for every error terminal, and `message` is
+// the sentence written for the operator. Everything else is a fallback, ending
+// in one that at least names the status: an empty toast is the same silence
+// this listener exists to remove.
+//
+// `htmx:responseError` covers only the half where a response ARRIVED — in
+// htmx 2.0.4 it is fired from `handleAjaxResponse` and nowhere else. A request
+// that never reached the server takes a different path entirely: `xhr.onerror`
+// fires `htmx:sendError` and `xhr.ontimeout` fires `htmx:timeout`, each after an
+// `htmx:afterRequest` whose `detail.successful` was never assigned (it is set
+// only inside `handleAjaxResponse`). Both are covered below, with their own
+// wording — there is no status and no body to report, and "request failed"
+// would not tell the operator the thing that matters, which is that nothing was
+// sent and retrying is the right move.
+//
+// `htmx:sendAbort` is deliberately NOT covered. An abort is the page's own
+// doing — `hx-sync` superseding an in-flight request, a navigation away — so
+// toasting it would manufacture noise on exactly the pages that abort most,
+// and nothing in this tree aborts a request a person is waiting on.
+//
+// One page can issue MANY requests without a person asking for any of them,
+// and when they all fail they all fail the same way. `blocks/llm/ui.rs` renders
+// a status badge per model with `hx-trigger="load"`, so an admin opening that
+// page with twenty configured models and an unreachable backend would get
+// twenty identical toasts stacked, each sitting for four seconds.
+//
+// So an AUTO-TRIGGERED repeat collapses, and a repeat a PERSON asked for never
+// does. Those are two different facts. Twenty badges loading themselves and
+// failing is one thing that went wrong, reported twenty times; an operator who
+// clicks a button, reads the toast, and clicks again is telling the page they
+// want another answer, and suppressing that is the "nothing happened" silence
+// this listener exists to remove.
+//
+// `detail.requestConfig.triggeringEvent` is the discriminator, and `isTrusted`
+// is what makes it readable without guessing at htmx's internals: only the
+// browser sets `isTrusted` on an event it dispatched because of a real user
+// action. `hx-trigger="load"` and `hx-trigger` polling issue their request with
+// no event at all (htmx's `loadImmediately`/`doPoll` call the issuer with just
+// the element), and htmx's own synthetic triggers — `intersect` for
+// `hx-trigger="revealed"`, `hx:poll:trigger` — carry an event it constructed,
+// which is untrusted. A missing `requestConfig` means htmx did not say, and
+// "could not tell" must not become "suppress": it shows.
+//
+// The key is NOT the message text. Every 500 in the tree is
+// `wafer_block::response::err_internal`, which mints a fresh 8-byte correlation
+// id per call and renders `Internal server error (ref: <hex>)` — so those
+// twenty badges produce twenty DIFFERENT strings and text-keyed suppression
+// does nothing for the exact case it was written for. The key is the status,
+// the envelope's `error` code, and the message with its trailing `(ref: …)`
+// removed; the ref still appears in the toast, because it is what an operator
+// quotes into a support ticket. `blocks/errors.rs`'s
+// `two_internal_errors_differ_only_by_the_correlation_ref` pins that shape from
+// a real rendered response.
+//
+// The window is a sliding one: an auto-triggered repeat resets it, so a page
+// polling a broken endpoint every two seconds toasts once and then stays quiet
+// while it goes on failing, rather than re-toasting forever. It is a little
+// longer than the toast's own four-second dismissal, so a duplicate cannot
+// arrive just as its twin disappears and read as a second, separate failure.
+//
+// `data-error-label` names the CONTROL. A generic "Request failed (502)" tells
+// an operator nothing about which of the Archive and Deactivate buttons on
+// `blocks/products/pages.rs`'s payment-link rows just failed, or whether
+// anything was written — which is what the per-button `hx-on--after-request`
+// this listener replaced used to say. A control that carries the attribute
+// lends its sentence to every failure it causes; the server's own message still
+// wins when there is one, because it is more specific than either.
+//
+// Wrapped, unlike the `showToast` listener above it, because the three
+// listeners share these helpers and the suppression state, and none of them may
+// become a global.
+(function () {
+    if (window.__htmxErrorToastInit) return;
+    window.__htmxErrorToastInit = true;
+
+    var DEDUPE_WINDOW_MS = 5000;
+    var lastShownAt = new Map();
+
+    // Whether a person asked for this request. See the note above on
+    // `isTrusted`; "could not tell" answers true, because silence is the
+    // failure mode worth avoiding.
+    function userInitiated(detail) {
+        var config = detail && detail.requestConfig;
+        if (!config) return true;
+        var event = config.triggeringEvent;
+        return !!event && event.isTrusted === true;
+    }
+
+    // The element that made the request, for `data-error-label`. htmx puts it
+    // on the request config; the bubbled event's target is the same element and
+    // is the fallback for a detail that carries no config.
+    function label(e) {
+        var config = e.detail && e.detail.requestConfig;
+        var element = (config && config.elt) || e.target;
+        if (!element || typeof element.closest !== "function") return "";
+        var labelled = element.closest("[data-error-label]");
+        return labelled ? labelled.getAttribute("data-error-label") || "" : "";
+    }
+
+    // `Internal server error (ref: a1b2…)` and the next one differ only in the
+    // ref, and for suppression they are the same failure.
+    function withoutRef(message) {
+        return message.replace(/\s*\(ref:[^)]*\)\s*$/, "");
+    }
+
+    function show(message, key, fromUser) {
+        var now = Date.now();
+        // Forget anything past the window first, so a long-lived page cannot
+        // accumulate one entry per distinct failure it has ever seen.
+        lastShownAt.forEach(function (at, seen) {
+            if (now - at > DEDUPE_WINDOW_MS) lastShownAt.delete(seen);
+        });
+        var suppressed = !fromUser && lastShownAt.has(key);
+        // Recorded either way: a toast a person asked for still starts the
+        // window, so the auto-triggered repeats behind it stay quiet.
+        lastShownAt.set(key, now);
+        if (suppressed) return;
+        document.body.dispatchEvent(new CustomEvent("showToast", {
+            detail: { type: "error", message: message }
+        }));
+    }
+
+    document.body.addEventListener("htmx:responseError", function(e) {
+        var xhr = (e.detail && e.detail.xhr) || {};
+        var text = typeof xhr.responseText === "string" ? xhr.responseText : "";
+        var status = xhr.status || 0;
+        var message = "";
+        var code = "";
+        // Parsed only when the body LOOKS like that envelope. A refusal
+        // rendered as an HTML error page is also a 4xx, and putting a whole
+        // document through `textContent` into a toast is worse than not
+        // toasting at all.
+        if (text.replace(/^\s+/, "").charAt(0) === "{") {
+            try {
+                var body = JSON.parse(text);
+                if (body && typeof body.message === "string") { message = body.message; }
+                if (body && typeof body.error === "string") { code = body.error; }
+            } catch (err) { /* not the envelope after all; fall through */ }
+        }
+        if (!message) {
+            // No usable message: name the control if it named itself, and the
+            // status either way, so the operator has both something to act on
+            // and something to report.
+            var control = label(e);
+            var subject = control || "Request failed";
+            message = status ? subject + " (" + status + ")" : subject;
+        }
+        show(message, status + "|" + code + "|" + withoutRef(message), userInitiated(e.detail));
+    });
+
+    document.body.addEventListener("htmx:sendError", function(e) {
+        var control = label(e);
+        show(
+            control
+                ? control + " — the server could not be reached."
+                : "Could not reach the server. Check your connection and try again.",
+            "sendError|" + control,
+            userInitiated(e.detail)
+        );
+    });
+
+    document.body.addEventListener("htmx:timeout", function(e) {
+        var control = label(e);
+        show(
+            control
+                ? control + " — the server did not answer in time."
+                : "The server did not answer in time. Try again.",
+            "timeout|" + control,
+            userInitiated(e.detail)
+        );
+    });
+})();
 
 // --- 4. modals, and the shared delegated-action listener ---
 //

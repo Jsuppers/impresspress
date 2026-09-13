@@ -246,6 +246,61 @@ mod tests {
         }
     }
 
+    /// Two 500s from the SAME failing call ship the same `error` code and the
+    /// same status, but DIFFERENT `message` text.
+    ///
+    /// `err_internal` mints a fresh 8-byte correlation id per call and renders
+    /// `Internal server error (ref: <hex>)`, so the message is unique per
+    /// response by design — it is what an operator quotes into a support
+    /// ticket. Every 500 in the tree goes through it.
+    ///
+    /// This is a contract the BROWSER depends on. `ui/assets/chrome.js`
+    /// collapses a burst of identical failures — twenty `hx-trigger="load"`
+    /// model badges against one unreachable backend — and keying that on the
+    /// message text does not work for exactly those twenty, because the ref
+    /// makes all twenty different. The key has to be the status, the code, and
+    /// the message with its trailing `(ref: …)` removed, and this test is why:
+    /// it reads the property off a real rendered response rather than off a
+    /// fixture written to match what the JS expects.
+    /// (`ui/assets/test/chrome_error_toast.test.mjs` is the other half.)
+    #[tokio::test]
+    async fn two_internal_errors_differ_only_by_the_correlation_ref() {
+        async fn rendered(context: &str) -> serde_json::Value {
+            crate::test_support::output_http_json(crate::http::err_internal(context, "boom")).await
+        }
+
+        let first = rendered("llm status failed").await;
+        let second = rendered("llm status failed").await;
+
+        assert_eq!(first["error"], serde_json::json!("Internal"));
+        assert_eq!(second["error"], first["error"]);
+
+        let (a, b) = (
+            first["message"].as_str().expect("message"),
+            second["message"].as_str().expect("message"),
+        );
+        assert!(
+            a.starts_with("Internal server error (ref: ") && a.ends_with(')'),
+            "the published 500 message is the sanitized one with a ref: {a:?}",
+        );
+        assert_ne!(a, b, "the ref is fresh per response, so the text differs");
+
+        // …and what the browser keys on is stable once the ref is removed,
+        // by the same rule `chrome.js` applies.
+        assert_eq!(strip_correlation_ref(a), "Internal server error");
+        assert_eq!(strip_correlation_ref(a), strip_correlation_ref(b));
+    }
+
+    /// The Rust twin of `chrome.js`'s `/\s*\(ref:[^)]*\)\s*$/` — written out
+    /// rather than pulled in as a dependency, since it exists only to assert
+    /// that the two halves agree on what the stable part of a 500 message is.
+    fn strip_correlation_ref(message: &str) -> &str {
+        match message.rfind("(ref:") {
+            Some(at) if message.ends_with(')') => message[..at].trim_end(),
+            _ => message,
+        }
+    }
+
     #[tokio::test]
     async fn quota_ships_as_429_not_the_413_the_deleted_table_claimed() {
         assert_eq!(shipped_status(ErrorCode::QuotaExceeded).await, 429);
