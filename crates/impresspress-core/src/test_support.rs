@@ -468,6 +468,25 @@ impl TestContext {
         ctx
     }
 
+    /// Build a `TestContext` with admin + signal migrations applied.
+    ///
+    /// No auth: the signal block has no user and never reads one — every
+    /// endpoint is public, so admin-only is enough to let its own
+    /// `lifecycle(Init)`-equivalent (`apply_block_migrations`) upsert its
+    /// `impresspress__admin__block_settings` tracking row, the same
+    /// prerequisite `with_llm` and `with_products` rely on.
+    #[cfg(feature = "block-signal")]
+    pub async fn with_signal() -> Self {
+        let ctx = Self::with_admin().await;
+        ctx.apply_block_migrations(
+            "impresspress/signal",
+            crate::blocks::signal::migrations::SQLITE_MIGRATIONS,
+            crate::blocks::signal::migrations::POSTGRES_MIGRATIONS,
+        )
+        .await;
+        ctx
+    }
+
     /// Build a `TestContext` with admin + dev-sandbox migrations applied, the
     /// `impresspress/dev` block registered over `control`, and the `/b/dev`
     /// `Admin` extra route added the way `ImpresspressBuilder::add_route`
@@ -903,6 +922,23 @@ impl TestContext {
             broken,
         ));
         self
+    }
+
+    /// Toggle `STRICT_SCHEMA` directly on the backing `DatabaseService`, the
+    /// same flag production sets from `WAFER_RUN__DATABASE__STRICT_SCHEMA`
+    /// at the database block's own `lifecycle(Init)`
+    /// (`wafer_core::interfaces::database::handler::handle_lifecycle`).
+    /// `TestContext` never boots that lifecycle event (migrations are
+    /// applied directly via [`Self::apply_block_migrations`], not through
+    /// it), so there is no config value to flip here — this reaches the
+    /// service's own `set_strict_schema` directly instead, after whatever
+    /// migrations already ran (this only changes how *future* writes are
+    /// validated: no schema introspection, no lazy `ALTER TABLE ADD
+    /// COLUMN`), so a test can call this once its fixture's migrations are
+    /// in place and then exercise writes exactly as a strict-schema
+    /// production deployment (Cloudflare/D1) would.
+    pub fn set_strict_schema(&self, enabled: bool) {
+        self.db_service.set_strict_schema(enabled);
     }
 }
 

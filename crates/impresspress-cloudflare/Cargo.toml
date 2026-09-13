@@ -35,6 +35,7 @@ full = [
     "block-messages",
     "block-products",
     "block-userportal",
+    "block-signal",
 ]
 # Passthrough block features → forwarded to `impresspress-core`. The block
 # register sites in impresspress-core are `#[cfg(feature = "block-X")]`-gated
@@ -52,6 +53,10 @@ block-tickets = ["impresspress-core/block-tickets"]
 block-messages = ["impresspress-core/block-messages"]
 block-products = ["impresspress-core/block-products"]
 block-userportal = ["impresspress-core/block-userportal"]
+# Signalling for blockfarming's WebRTC online play — typed `db::*` client
+# only, no crypto/HTTP deps, so it costs nothing extra beyond the block
+# itself and is safe to include in `full`.
+block-signal = ["impresspress-core/block-signal"]
 # `block-llm` (the feature block, NOT the `llm` native provider backend) and
 # `block-vector`. Both are wasm32-clean: the block holds a
 # `NoopProviderAdmin`, and `llm`/`native-embedding` — the features that pull
