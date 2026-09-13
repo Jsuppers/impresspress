@@ -326,22 +326,38 @@ impl VariablesConfigBlock {
         // Narrowed to a mask that would REPLACE something, for the reason
         // `ui::settings_form`'s pre-pass is: a write that changes nothing
         // destroys nothing, and refusing it only strands whoever is holding a
-        // row whose value already is those eight characters. Compared against
-        // the row in hand rather than against the read order — the pre-pass
-        // compares against `config::get_default`, which falls back to the boot
-        // map, so wherever the two could differ the pre-pass is the stricter
-        // one and this guard is never reached laxer than it.
-        if crate::util::is_masked_submission(key, stored_flag, value)
-            && existing.as_ref().map_or("", |row| row.value.as_str()) != value
-        {
-            return Err(OutputStream::error(WaferError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "{} is the mask {key} reads back as, not its value: storing it would \
-                     destroy the secret",
-                    crate::util::MASKED_VALUE
-                ),
-            )));
+        // value that already is those eight characters.
+        //
+        // "Already" has to mean what a READER would answer, which is this
+        // block's own read order — a non-empty row, else the boot map — and not
+        // the row alone. The pre-pass asks `config::get_default`, which is that
+        // order; comparing against `existing.value` here made the two disagree
+        // in exactly the case the row cannot speak for: absent or empty, where
+        // `CONFIG_GET` drops it and the boot map answers. For a key whose boot
+        // value is the mask the pre-pass then allowed and this guard refused,
+        // mid-loop, with the rest of the page already written — reachable from
+        // an env-seeded credential that is literally `********`, cleared on the
+        // Variables page and typed again on a settings form. One question,
+        // asked the same way on both sides, is what makes that impossible
+        // rather than merely unlikely.
+        if crate::util::is_masked_submission(key, stored_flag, value) {
+            let boot_value = self.boot.get(key);
+            let current = existing
+                .as_ref()
+                .map(|row| row.value.as_str())
+                .filter(|stored| !stored.is_empty())
+                .or(boot_value.as_deref())
+                .unwrap_or("");
+            if current != value {
+                return Err(OutputStream::error(WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "{} is the mask {key} reads back as, not its value: storing it would \
+                         destroy the secret",
+                        crate::util::MASKED_VALUE
+                    ),
+                )));
+            }
         }
         // The static provisioning-only exemption — the narrower of the two, per
         // the note above. It has to be here at all for the reason it exists on
@@ -784,6 +800,30 @@ mod boot_owned_key_tests {
                 .value,
             "real-client-secret",
             "and the stored secret must survive the refusal"
+        );
+    }
+
+    /// The mask refusal is for a mask that REPLACES something. A row already
+    /// holding those eight characters is a no-op write, and refusing it would
+    /// strand whoever holds such a row — and, since
+    /// `ui::settings_form`'s pre-pass allows a submission equal to the current
+    /// value, would do it mid-loop with part of the page already saved.
+    #[tokio::test]
+    async fn config_set_allows_the_mask_when_it_replaces_nothing() {
+        const KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
+        let ctx = booted_with(&[]).await;
+        store_row(&ctx, KEY, crate::util::MASKED_VALUE).await;
+
+        wafer_core::clients::config::set(&ctx, KEY, crate::util::MASKED_VALUE)
+            .await
+            .expect("a write that changes nothing must not be refused");
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row is still there")
+                .value,
+            crate::util::MASKED_VALUE,
         );
     }
 

@@ -398,6 +398,14 @@ pub async fn save_settings(
     // here is the one the browser's answer was formed from. Reading it from
     // anywhere else would reintroduce the drift this guard exists to close. It
     // costs a read only when a mask is actually submitted.
+    //
+    // `ConfigWrite::write` asks it the same way, against a non-empty row else
+    // the boot map, and that is load-bearing rather than tidy: it compared
+    // against the row alone once, so for a key with no row (or an empty one)
+    // whose BOOT value is the mask, this pre-pass allowed and the writer
+    // refused — mid-loop, page half saved. See
+    // `a_boot_map_value_equal_to_the_mask_is_not_a_half_applied_save`. The two
+    // sides ask one question; neither is left inferring the other's answer.
     for var in allowed {
         let Some(value) = body.get(&var.key) else {
             continue;
@@ -414,17 +422,25 @@ pub async fn save_settings(
             // and `save_settings` reads blank as "unchanged"; a plain field
             // renders its value and blank CLEARS it, so telling that operator
             // to blank the field would be telling them to destroy it.
+            //
+            // The plain branch names no other surface to go and do it on. It is
+            // chosen from the DECLARED var, and the case that makes this guard
+            // necessary at all is the declared-plain row an operator flagged —
+            // for which the admin Variables page reads the ROW's flag and
+            // refuses with the opposite explanation. Sending an operator there
+            // would be sending them to a dead end.
             let remedy = if is_sensitive_key(&var.key, var.is_sensitive() as i64) {
                 "Type the real value to change it, or leave the field blank to keep the \
                  stored one."
             } else {
-                "Type the value you want stored. If you really mean these eight characters, \
-                 set them on the admin Variables page, which can tell this variable is not \
-                 masked."
+                "Type the value you want stored — this form cannot store that literal \
+                 string."
             };
+            // No claim about what is stored now: this same refusal covers a key
+            // with nothing stored at all, where the write would be a create.
             return err_bad_request(&format!(
-                "{}: {MASKED_VALUE} is what a masked value reads back as, and storing it \
-                 here would replace the value this field currently holds. {remedy}",
+                "{}: {MASKED_VALUE} is what a masked value reads back as, not a value. \
+                 {remedy}",
                 var.key
             ));
         }
@@ -927,6 +943,91 @@ mod tests {
             config::get_default(&ctx, "X__PLAIN_NOTE", "").await,
             "operator-flagged-value",
         );
+    }
+
+    /// The two surfaces must agree when the BOOT MAP is what answers the read.
+    ///
+    /// `config::get_default` prefers a non-empty row and falls back to the boot
+    /// map, so when the row is absent or empty the boot map is the value the
+    /// form rendered and the pre-pass compares against. The writer compared
+    /// against the row alone, which is `""` — so for a key whose boot value is
+    /// the mask the pre-pass ALLOWED and the writer REFUSED, mid-loop, with
+    /// everything ahead of it in the allowlist already written. The pre-pass
+    /// being the stricter of the two was the claim; the fallback runs the other
+    /// way.
+    ///
+    /// Reachable without a doctored fixture: an env-seeded
+    /// `BOOTSTRAP_ADMIN_PASSWORD` of eight asterisks, cleared on the Variables
+    /// page (the provisioning exemption permits it, leaving an empty row), then
+    /// typed again on the auth settings form — a form with five vars ahead of
+    /// it.
+    #[tokio::test]
+    async fn a_boot_map_value_equal_to_the_mask_is_not_a_half_applied_save() {
+        use crate::platform_state::variables::{self, NewVariable};
+
+        const BOOT_ONLY: &str = "X__THING_SECRET";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        // No row for `BOOT_ONLY`; the boot map answers it, and with the mask.
+        ctx.boot_config_service_with(&[(BOOT_ONLY, MASKED_VALUE)])
+            .await;
+        variables::insert(
+            &ctx,
+            NewVariable {
+                key: "WAFER_RUN_SHARED__APP_NAME".to_string(),
+                value: "MyApp".to_string(),
+                name: String::new(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: String::new(),
+                block: None,
+            },
+        )
+        .await
+        .expect("seed the app name");
+
+        assert_eq!(
+            config::get_default(&ctx, BOOT_ONLY, "").await,
+            MASKED_VALUE,
+            "the fixture only means something if the boot map is what the form read"
+        );
+        assert!(
+            variables::get_by_key(&ctx, BOOT_ONLY)
+                .await
+                .expect("read back")
+                .is_none(),
+            "...and if no row is what the writer would have compared against"
+        );
+
+        let allowed = [
+            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var(BOOT_ONLY, "Thing Secret", InputType::Password),
+        ];
+        let out = run_save(
+            &ctx,
+            &allowed,
+            serde_json::json!({
+                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                BOOT_ONLY: MASKED_VALUE,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            200,
+            "submitting the value the form was shown must not be refused by the writer \
+             after the pre-pass allowed it"
+        );
+        assert_eq!(
+            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            "Renamed",
+        );
+        assert_eq!(config::get_default(&ctx, BOOT_ONLY, "").await, MASKED_VALUE);
     }
 
     /// A refusal raised by the WRITER is reported as the refusal it is.
