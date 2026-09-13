@@ -1705,15 +1705,36 @@ impl Context for FailingDbOpContext {
 #[derive(Clone)]
 pub struct EcholessWriteContext {
     inner: Arc<dyn Context>,
+    keep_columns: Vec<String>,
+    keep_id: bool,
 }
 
 impl EcholessWriteContext {
     /// Wrap `inner`. Every op but `database.create`/`database.update` passes
-    /// through untouched.
+    /// through untouched; those keep their `id` and lose every column.
     pub fn new(inner: impl Context + 'static) -> Self {
         Self {
             inner: Arc::new(inner),
+            keep_columns: Vec::new(),
+            keep_id: true,
         }
+    }
+
+    /// Echo the named columns and drop the rest — the PARTIAL echo, which is
+    /// the case a repo is most likely to get wrong: a record carrying `key` and
+    /// little else still decodes, so a repo that only falls back when decoding
+    /// FAILS hands its caller a row with the other columns silently defaulted.
+    pub fn keeping_columns(mut self, keep: &[&str]) -> Self {
+        self.keep_columns = keep.iter().map(|c| (*c).to_string()).collect();
+        self
+    }
+
+    /// Answer with an empty `id` as well. A backend that acknowledges a write
+    /// without naming the row is entitled to; a repo that publishes that empty
+    /// id as the row's identity is not.
+    pub fn without_the_id(mut self) -> Self {
+        self.keep_id = false;
+        self
     }
 }
 
@@ -1758,7 +1779,12 @@ impl Context for EcholessWriteContext {
                 Ok(record) => record,
                 Err(e) => return OutputStream::error(e),
             };
-        record.data = Default::default();
+        record
+            .data
+            .retain(|column, _| self.keep_columns.iter().any(|k| k == column));
+        if !self.keep_id {
+            record.id = String::new();
+        }
         match wafer_block::codec::encode(&record) {
             Ok(bytes) => OutputStream::respond(bytes),
             Err(e) => OutputStream::error(e),

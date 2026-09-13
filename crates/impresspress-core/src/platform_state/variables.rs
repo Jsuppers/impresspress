@@ -554,45 +554,84 @@ pub async fn get_by_key(ctx: &dyn Context, key: &str) -> Result<Option<VariableR
     }
 }
 
+/// The row as it now stands, for a write that has **already committed**.
+///
+/// Past a successful `db::create` / `db::update`, nothing may report a failure.
+/// The `?` on the write is the write failing; everything after it is this
+/// module reading back what it just wrote, and the two must not reach a caller
+/// as the same error — each write path had its own way of going wrong when they
+/// did:
+///
+/// * `admin::ops::create_variable` classifies a failed insert by RE-READING the
+///   key, so a decode failure came back as "that key is already taken" — the
+///   row this very request had created. The admin was told the key existed, the
+///   `variable.create` audit row was skipped, and the untracked row made every
+///   retry conflict forever.
+/// * `admin::ops::update_variable` returns on the error BEFORE its `audit_log`
+///   call, so an edit that committed went unrecorded — and a missing audit row
+///   cannot be told apart from the change never having been made.
+///
+/// So the echo is MERGED rather than trusted or distrusted wholesale: start
+/// from the row as it stood before the write (`as_read`), lay the columns this
+/// call WROTE over it, then lay whatever the backend ECHOED over that. Each
+/// layer is more authoritative than the last, and a backend that echoes
+/// nothing, a bare `key`, or every column all reach the right answer through
+/// the same expression.
+///
+/// Merging unconditionally — rather than only when the echo fails to decode —
+/// is what covers the middle case. [`VariableRow::from_record`] insists on
+/// `key` and nothing else, so an echo carrying `key` and little else decodes
+/// *successfully* into a row with an empty `name`, no `created_at` and
+/// `sensitive: false`. On the update path that is user-visible: it reports a
+/// variable that is still sensitive as no longer sensitive.
+///
+/// `id` is the caller's to decide, because the two writes learn it differently:
+/// an update addressed a row the caller already identified, so the echo has no
+/// say in which row it is, while a create may legitimately be told an id the
+/// backend minted.
+fn stored_row(
+    id: &str,
+    as_read: &VariableRow,
+    written: HashMap<String, Value>,
+    echoed: HashMap<String, Value>,
+) -> VariableRow {
+    let mut merged = as_read.to_data();
+    merged.extend(written);
+    merged.extend(echoed);
+    VariableRow::from_record(id, &merged).unwrap_or_else(|e| {
+        // Unreachable: `merged` starts from a row that already carries the
+        // `key` `from_record` insists on. `as_read` under the caller's id is
+        // the honest answer if it somehow is not.
+        tracing::warn!(
+            error = %e,
+            id = %id,
+            "variables write landed but the merged row did not decode; \
+             reporting the row as written",
+        );
+        VariableRow {
+            id: id.to_string(),
+            ..as_read.clone()
+        }
+    })
+}
+
 /// Insert a new row and return it as stored.
 pub async fn insert(ctx: &dyn Context, new: NewVariable) -> Result<VariableRow, WaferError> {
     let row = new.into_row();
-    let rec = db::create(ctx, TABLE, row.to_data()).await?;
+    let written = row.to_data();
+    let rec = db::create(ctx, TABLE, written.clone()).await?;
     crate::config_generation::note_config_write();
-    // Past this line the row IS stored, and NOTHING here may report a failure.
-    //
-    // The `?` above is the write failing; everything after it is this function
-    // reading back what it just wrote, and the two must not arrive at a caller
-    // as the same error. `admin::ops::create_variable` classifies a failed
-    // insert by re-reading the key — so a decode failure here came back as "the
-    // key is taken", which is the row this very request created: the admin was
-    // told their key already exists, the `variable.create` audit row was
-    // skipped, and the untracked row made every retry conflict forever. The old
-    // behaviour was a 500, which was unhelpful but at least not false.
-    //
-    // Decoding the echo is therefore a PREFERENCE, not a requirement, and
-    // nothing is lost by declining it: every column was synthesised here
-    // ([`NewVariable::into_row`] mints the id and both timestamps, `to_data`
-    // writes all of them), so the row that was sent is the row that is stored.
-    // A backend whose `create` does not echo the columns back —
-    // [`VariableRow::from_record`] refuses a record with no `key`, which is
-    // corruption on a READ and merely a thin echo here — changes what was
-    // written not at all. The id is taken from the record either way, since
-    // that is the one field a backend may legitimately mint itself.
-    Ok(
-        VariableRow::from_record(&rec.id, &rec.data).unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                id = %rec.id,
-                "variables insert landed but the echoed record did not decode; \
-                 reporting the row as written",
-            );
-            VariableRow {
-                id: rec.id.clone(),
-                ..row
-            }
-        }),
-    )
+    // The write has committed; see [`stored_row`] for why nothing past here
+    // reports a failure. A create may be told an id the backend minted, but an
+    // echo carrying NO id is not that: taking `rec.id` regardless would publish
+    // an empty id for a row stored under the `var_<uuid>`
+    // [`NewVariable::into_row`] synthesised and `to_data` wrote.
+    let id = if rec.id.is_empty() {
+        row.id.clone()
+    } else {
+        rec.id
+    };
+    Ok(stored_row(&id, &row, written, rec.data))
 }
 
 /// Update the row for `key`, or create it when absent, and return the row as
@@ -614,42 +653,13 @@ pub async fn upsert_by_key(
             let written = patch.to_update_data();
             let rec = db::update(ctx, TABLE, &existing.id, written.clone()).await?;
             crate::config_generation::note_config_write();
-            // Past this line the change IS committed, and nothing here may
-            // report a failure — the same rule, and the same reason, as
-            // [`insert`]. The consequence differs: an update carries no
-            // duplicate-key probe, so a decode failure here came back as a 500
-            // rather than a false conflict — but `admin::ops::update_variable`
-            // returns on that `Err` BEFORE its `audit_log` call, so an edit
-            // that actually landed went unrecorded. A missing audit row for a
-            // change that happened is the worst of the three outcomes,
-            // because nothing downstream can tell it apart from the change
-            // never having been made.
-            //
-            // The row as it now stands is the row that was READ, overwritten
-            // by the columns this update just WROTE — the two maps, merged, in
-            // that order. Deriving it from `written` rather than restating the
-            // patch's field list keeps one description of what an update
-            // changes, and `updated_at` comes along because `to_update_data`
-            // mints it there. The id is `existing.id`: unlike a create, an
-            // update addressed a row the caller already identified, so the
-            // echo has no say in which row this is.
-            Ok(
-                VariableRow::from_record(&rec.id, &rec.data).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        id = %existing.id,
-                        "variables update landed but the echoed record did not decode; \
-                         reporting the row as written",
-                    );
-                    let mut merged = existing.to_data();
-                    merged.extend(written);
-                    // `merged` carries `key` over from the row that was read,
-                    // which is the only column `from_record` insists on, so
-                    // this cannot fail; `existing` is the honest answer if it
-                    // somehow does.
-                    VariableRow::from_record(&existing.id, &merged).unwrap_or(existing)
-                }),
-            )
+            // The change has committed; see [`stored_row`] for why nothing past
+            // here reports a failure. Deriving the merge from `written` rather
+            // than restating the patch's field list keeps one description of
+            // what an update changes, and `updated_at` comes along because
+            // `to_update_data` mints it there. The id is `existing.id`: this
+            // update named the row itself.
+            Ok(stored_row(&existing.id, &existing, written, rec.data))
         }
         // `insert` notes the write itself.
         None => insert(ctx, patch.into_new(key)).await,
@@ -686,6 +696,64 @@ mod tests {
             updated_by: "admin_1".to_string(),
             block: block_for_key(key),
         }
+    }
+
+    /// A backend that acknowledges the create without naming the row leaves the
+    /// id [`NewVariable::into_row`] minted standing.
+    ///
+    /// Taking `rec.id` regardless published an EMPTY id — and
+    /// `admin::settings::handle_create` echoes that id straight to the client,
+    /// while the row is stored under the `var_<uuid>` that was actually
+    /// written. A create may legitimately be told an id the backend minted;
+    /// being told nothing is not that.
+    #[tokio::test]
+    async fn a_create_whose_echo_carries_no_id_keeps_the_id_that_was_written() {
+        let ctx = crate::test_support::EcholessWriteContext::new(TestContext::with_admin().await)
+            .without_the_id();
+
+        let row = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
+            .await
+            .expect("the write lands; only the echo is thin");
+        assert!(
+            row.id.starts_with("var_"),
+            "the caller must get the id the row is stored under, not `{}`",
+            row.id,
+        );
+        assert_eq!(
+            get_by_key(&ctx, "IMPRESSPRESS__EMAIL__FROM")
+                .await
+                .expect("read back")
+                .expect("stored")
+                .id,
+            row.id,
+            "and it must be the id the table really holds",
+        );
+    }
+
+    /// A PARTIAL echo — enough to decode, not enough to be the row — does not
+    /// silently default the columns it left out.
+    ///
+    /// `from_record` insists on `key` and nothing else, so this record decodes
+    /// successfully. A fallback that only ran when decoding FAILED never saw
+    /// this case, and the caller got `sensitive: false`, an empty `name` and no
+    /// `created_at` for a row that has all three.
+    #[tokio::test]
+    async fn a_partial_echo_does_not_default_the_columns_it_left_out() {
+        let ctx = crate::test_support::EcholessWriteContext::new(TestContext::with_admin().await)
+            .keeping_columns(&["key", "value"]);
+
+        let row = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
+            .await
+            .expect("the write lands; only the echo is partial");
+        assert_eq!(row.key, "IMPRESSPRESS__EMAIL__FROM");
+        assert_eq!(row.value, "noreply@example.com", "the echoed column");
+        assert!(row.sensitive, "and every column the echo omitted");
+        assert_eq!(row.name, "From address");
+        assert_eq!(row.description, "Sender of every outbound email");
+        assert_eq!(row.warning, "Changing this breaks DKIM");
+        assert_eq!(row.updated_by, "admin_1");
+        assert!(!row.created_at.is_empty());
+        assert_eq!(row.block, Some("IMPRESSPRESS__EMAIL".to_string()));
     }
 
     /// A write the database REFUSES still reaches the caller as the refusal it

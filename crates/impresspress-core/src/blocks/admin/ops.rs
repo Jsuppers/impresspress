@@ -999,6 +999,56 @@ mod tests {
         );
     }
 
+    /// A PARTIAL echo does not report a still-sensitive variable as no longer
+    /// sensitive.
+    ///
+    /// This is the user-visible half of the merge rule. `from_record` insists
+    /// on `key` alone, so a backend echoing `key` and `value` decodes fine —
+    /// and the row that came back had `sensitive: false` for a variable that is
+    /// still flagged. Both admin surfaces mask on that flag, so the refusal
+    /// path is the mild version; the row published back to the caller after an
+    /// edit was the loud one.
+    #[tokio::test]
+    async fn an_update_with_a_partial_echo_keeps_the_sensitive_flag() {
+        let seeded = admin_ctx().await;
+        let msg = admin_msg("update", "/admin/settings");
+        expect_ok(
+            create_variable(
+                &seeded,
+                &msg,
+                "MAILER_TOKEN",
+                "tok-1",
+                Some("Mailer token"),
+                None,
+                true,
+            )
+            .await,
+        );
+
+        let ctx = crate::test_support::EcholessWriteContext::new(seeded)
+            .keeping_columns(&["key", "value"]);
+        let row = expect_ok(
+            update_variable(
+                &ctx,
+                &msg,
+                "MAILER_TOKEN",
+                VariableUpdate {
+                    value: Some("tok-2"),
+                    description: None,
+                },
+            )
+            .await,
+        );
+
+        assert_eq!(row.value, "tok-2", "the column the update wrote");
+        assert!(
+            row.sensitive,
+            "a column the echo left out must come from the row, not from a default",
+        );
+        assert_eq!(row.name, "Mailer token");
+        assert!(!row.created_at.is_empty());
+    }
+
     /// The same fact for roles: `roles.name` is UNIQUE too, and the identical
     /// `err_internal` tail two functions above `create_variable` answered the
     /// identical 500. Fixed together so the two copies cannot drift again.

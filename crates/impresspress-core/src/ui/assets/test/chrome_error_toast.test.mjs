@@ -88,6 +88,63 @@ test('a request that failed before any response still toasts', () => {
   assert.deepEqual(page.toasts(), [{ kind: 'error', text: 'Request failed' }]);
 });
 
+test('a page that fans out auto-triggered requests gets ONE toast, not twenty', () => {
+  // `blocks/llm/ui.rs` renders a status badge per model with
+  // `hx-trigger="load"`, and `routes/models.rs` answers each with an error
+  // terminal when the backend is unreachable. Twenty models used to mean twenty
+  // identical toasts stacked four seconds deep.
+  const page = loadChrome();
+  const unreachable = envelope('Internal', 'llm status failed');
+  for (let i = 0; i < 20; i += 1) {
+    page.respondWithError({ status: 503, responseText: unreachable });
+  }
+
+  assert.deepEqual(page.toasts(), [{ kind: 'error', text: 'llm status failed' }]);
+});
+
+test('a genuinely different failure in the same burst still toasts', () => {
+  // Suppression is on the MESSAGE, not on the burst: two distinct facts are two
+  // things the operator needs to know, however close together they arrive.
+  const page = loadChrome();
+  page.respondWithError({ status: 503, responseText: envelope('Internal', 'llm status failed') });
+  page.respondWithError({ status: 503, responseText: envelope('Internal', 'llm status failed') });
+  page.respondWithError({ status: 403, responseText: envelope('PermissionDenied', 'Access denied') });
+
+  assert.deepEqual(page.toasts(), [
+    { kind: 'error', text: 'llm status failed' },
+    { kind: 'error', text: 'Access denied' }
+  ]);
+});
+
+test('the same failure toasts again once the window has passed', () => {
+  // Suppression is a window, not a mute: a failure the operator hit, dismissed
+  // and hit again later is a new event and says so.
+  const page = loadChrome();
+  const body = envelope('Internal', 'llm status failed');
+  page.respondWithError({ status: 503, responseText: body });
+  page.advance(6000);
+  page.respondWithError({ status: 503, responseText: body });
+
+  assert.deepEqual(page.toasts(), [
+    { kind: 'error', text: 'llm status failed' },
+    { kind: 'error', text: 'llm status failed' }
+  ]);
+});
+
+test('a steady stream of the same failure stays quiet, because the window slides', () => {
+  // A page polling a broken endpoint every two seconds must not re-toast every
+  // five: each repeat resets the window, so it says its piece once and waits
+  // for the failure to actually stop and start again.
+  const page = loadChrome();
+  const body = envelope('Internal', 'llm status failed');
+  for (let i = 0; i < 10; i += 1) {
+    page.respondWithError({ status: 503, responseText: body });
+    page.advance(2000);
+  }
+
+  assert.deepEqual(page.toasts(), [{ kind: 'error', text: 'llm status failed' }]);
+});
+
 test('a request that never reached the server says so, in its own words', () => {
   // `xhr.onerror` fires `htmx:afterRequest` and then `htmx:sendError`, and the
   // `responseInfo` both carry has no `successful` field at all — it is assigned

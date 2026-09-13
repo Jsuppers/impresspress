@@ -269,13 +269,46 @@ document.body.addEventListener("showToast", function(e) {
 // doing — `hx-sync` superseding an in-flight request, a navigation away — so
 // toasting it would manufacture noise on exactly the pages that abort most,
 // and nothing in this tree aborts a request a person is waiting on.
+// One page can issue MANY requests without a person asking for any of them,
+// and when they all fail they all fail the same way. `blocks/llm/ui.rs` renders
+// a status badge per model with `hx-trigger="load"`, so an admin opening that
+// page with twenty configured models and an unreachable backend would get
+// twenty identical toasts stacked, each sitting for four seconds.
+//
+// So identical messages collapse: the first one shows, and a repeat of the same
+// text inside the window below is dropped. Deduplicating rather than skipping
+// requests a person did not initiate, because the auto-triggered case is
+// exactly the one where the page has nothing else to say — those twenty badges
+// would otherwise read "Loading…" forever, which is the silence this listener
+// exists to remove. Suppression keeps the INFORMATION and drops only the
+// repetition. A different message is a different fact and always shows.
+//
+// The window is a sliding one: a repeat resets it, so a page polling a broken
+// endpoint every two seconds toasts once and then stays quiet while it goes on
+// failing, rather than re-toasting forever. It is a little longer than the
+// toast's own four-second dismissal, so a duplicate cannot arrive just as its
+// twin disappears and read as a second, separate failure.
+//
 // Wrapped, unlike the `showToast` listener above it, because the three
-// listeners share one `toast()` and that must not become a global.
+// listeners share one `toast()` and its suppression state, and neither may
+// become a global.
 (function () {
     if (window.__htmxErrorToastInit) return;
     window.__htmxErrorToastInit = true;
 
+    var DEDUPE_WINDOW_MS = 5000;
+    var lastShownAt = new Map();
+
     function toast(message) {
+        var now = Date.now();
+        // Forget anything past the window first, so a long-lived page cannot
+        // accumulate one entry per distinct failure it has ever seen.
+        lastShownAt.forEach(function (at, seen) {
+            if (now - at > DEDUPE_WINDOW_MS) lastShownAt.delete(seen);
+        });
+        var suppressed = lastShownAt.has(message);
+        lastShownAt.set(message, now);
+        if (suppressed) return;
         document.body.dispatchEvent(new CustomEvent("showToast", {
             detail: { type: "error", message: message }
         }));

@@ -99,6 +99,10 @@ function fakeElement(tag) {
  */
 export function loadChrome({ toastContainer = true } = {}) {
   const container = toastContainer ? fakeElement('div') : null;
+  // A clock the test drives. The error listeners suppress a repeat of the same
+  // message inside a time window, and "what happens once the window has passed"
+  // is not a property a test can assert by waiting five real seconds.
+  let clock = 1_000_000;
   const body = new StubEventTarget();
   Object.assign(body, {
     attributes: {},
@@ -137,6 +141,8 @@ export function loadChrome({ toastContainer = true } = {}) {
     },
     clearTimeout,
     CustomEvent: StubCustomEvent,
+    Date: { now: () => clock },
+    Map,
     JSON,
     String,
     Array
@@ -165,6 +171,10 @@ export function loadChrome({ toastContainer = true } = {}) {
      */
     fireTransportEvent(type) {
       body.dispatchEvent(new StubCustomEvent(type, { detail: { xhr: {} } }));
+    },
+    /** Move the clock the error listeners read, in milliseconds. */
+    advance(ms) {
+      clock += ms;
     }
   };
 }
