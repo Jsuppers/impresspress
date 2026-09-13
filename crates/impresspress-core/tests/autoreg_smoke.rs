@@ -19,11 +19,10 @@ use wafer_run::{StaticConfigSource, Wafer};
 
 /// Zero-arg blocks the manifest registers on every host build (none of these
 /// is feature-gated off by default). `fastembed` is feature-gated under
-/// `native-embedding` and checked separately; `llm` / framework `auth` /
-/// `transformers-embed` take non-zero-arg constructors and are NOT in the
-/// manifest (the builder installs them explicitly).
+/// `native-embedding` and checked separately; `admin` / `llm` / framework
+/// `auth` / `transformers-embed` take non-zero-arg constructors and are NOT
+/// in the manifest (the builder installs them explicitly).
 const MANIFEST_ZERO_ARG_BLOCKS: &[&str] = &[
-    "impresspress/admin",
     "impresspress/auth-ui",
     "impresspress/email",
     "impresspress/files",
@@ -68,6 +67,15 @@ fn register_feature_blocks_installs_exactly_the_manifest_set() {
 
     // Special cases are NOT in the manifest — their constructors are not
     // zero-argument, so the builder installs them explicitly afterwards.
+    // Admin's production constructor takes the runtime's live `BlockSettings`
+    // handle, so the manifest's zero-arg `new()` would register a block whose
+    // toggle cannot reach the router's snapshot — inert on native until the
+    // process restarts. `ImpresspressBuilder::build` installs it through
+    // `blocks::register_admin` instead; this pins that it did not drift back.
+    assert!(
+        !w.has_block("impresspress/admin"),
+        "AdminBlock (Arc<RwLock<BlockSettings>>) must not be in the feature-block manifest"
+    );
     assert!(
         !w.has_block("impresspress/llm"),
         "LlmBlock (Arc<dyn ProviderAdmin>) must not be in the feature-block manifest"
@@ -96,6 +104,16 @@ fn all_block_infos_covers_the_manifest_set_plus_llm() {
             "all_block_infos() is missing manifest block {name}"
         );
     }
+
+    // Admin is registered outside the manifest (its ctor takes the live
+    // `BlockSettings` handle) but its declarative `info()` must stay in the
+    // discovery set: `collect_all_config_vars()`, the inspector route table
+    // and the routing/auth policy all read it. Asserted explicitly because it
+    // is no longer covered by the manifest loop above.
+    assert!(
+        names.contains(&"impresspress/admin"),
+        "all_block_infos() must include impresspress/admin"
+    );
 
     // `llm` is the one block registered outside the manifest whose info() is
     // still discovered (via a NoopProviderAdmin handle).

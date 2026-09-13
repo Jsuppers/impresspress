@@ -287,6 +287,14 @@ impl ImpresspressBuilder {
         // `transformers-embed`) are registered explicitly below.
         crate::blocks::register_feature_blocks(&mut wafer)?;
 
+        // Admin is registered here rather than from the manifest: its
+        // constructor takes the same `Arc<RwLock<BlockSettings>>` handed to
+        // the router below as `Arc<dyn FeatureConfig>`, so the block toggle
+        // can update the snapshot the router reads per request instead of
+        // only writing the table. Without it the toggle is inert on native
+        // until the process restarts.
+        crate::blocks::register_admin(&mut wafer, self.block_settings.clone())?;
+
         wafer.add_block_config(
             "wafer-run/inspector",
             serde_json::json!({ "allow_anonymous": false }),

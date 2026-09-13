@@ -255,8 +255,14 @@ impl TestContext {
     /// Admin migrations run first so that the
     /// `impresspress__admin__block_settings` tracking table exists before
     /// auth's `apply_if_blessed` upserts its `current_hash` row. In
-    /// production this ordering is guaranteed by `register_feature_blocks`
-    /// (admin is registered first); here we enforce it explicitly.
+    /// production that ordering comes from `builder::boot`, which calls
+    /// `init_block` on admin explicitly before iterating the rest; here we
+    /// enforce it explicitly.
+    ///
+    /// NOT from registration order, which never drove it: `block_names()` is
+    /// sorted, and since `blocks::register_admin` took over from the
+    /// zero-arg manifest, admin in fact registers *after* every manifest
+    /// block.
     pub async fn with_auth() -> Self {
         let ctx = Self::with_admin().await;
         ctx.apply_block_migrations(

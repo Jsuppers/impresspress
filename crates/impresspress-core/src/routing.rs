@@ -520,6 +520,64 @@ pub fn effective_access(
 ///
 /// Used by the WebMCP manifest (`pipeline.rs`), which must not advertise
 /// tools from a block the router 404s.
+/// Meta key by which [`route_to_block`] hands the block it dispatches the
+/// gate decision it just made.
+///
+/// Same shape as `auth.user_roles`: an upstream layer publishes what it
+/// decided, so a downstream handler never re-derives it from a source that can
+/// disagree. It exists because the gate's source — the router's
+/// `Arc<dyn FeatureConfig>` — is reachable only by constructor injection, and
+/// `ui::shell_page` alone has 39 call sites across ten blocks. Those blocks
+/// cannot read the gate; they can read the request.
+///
+/// The value is a JSON array of the block names this request's gate considers
+/// OFF. `"[]"` when none — which is what separates "routed, nothing disabled"
+/// from "never went through the router" (an absent key), since `get_meta`
+/// answers both with an empty string otherwise.
+pub const META_DISABLED_BLOCKS: &str = "routing.disabled_blocks";
+
+/// The blocks `features` reports OFF, as the JSON [`META_DISABLED_BLOCKS`]
+/// carries.
+///
+/// Derived by testing each registered block rather than read off a
+/// `BlockSettings`, because the router holds `Arc<dyn FeatureConfig>` and the
+/// trait's only method is the predicate. That is one in-memory map lookup per
+/// registered block — and on any ordinary deployment the answer is `[]`.
+fn disabled_blocks_json(features: &dyn FeatureConfig, block_infos: &[BlockInfo]) -> String {
+    let disabled: Vec<&str> = block_infos
+        .iter()
+        .map(|b| feature_gate_name(&b.name))
+        .filter(|gate| !features.is_block_enabled(gate))
+        .collect();
+    serde_json::to_string(&disabled).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The gate decision [`route_to_block`] published for this request.
+///
+/// For any handler that renders enablement-dependent UI — the sidebar, the
+/// portal's feature list — so it shows exactly what the router will serve
+/// rather than what the boot snapshot said. The snapshot is frozen at
+/// `build()` (`RuntimeConfig::republish` needs `&mut Wafer`, which no handler
+/// has), so once the admin toggle moves the router's live gate, a
+/// snapshot-backed reader renders links the router has already begun 404ing.
+///
+/// Falls back to that snapshot when the key is absent — a message that did not
+/// come through the router (a direct block call in a test, a lifecycle event).
+/// Never falls back to "all enabled": that would fabricate an answer out of a
+/// missing one, the failure `block_settings::load_and_seed` records a review
+/// finding for.
+pub fn gate_from_request(ctx: &dyn Context, msg: &Message) -> crate::features::BlockSettings {
+    let raw = msg.get_meta(META_DISABLED_BLOCKS);
+    if raw.is_empty() {
+        return crate::features::BlockSettings::from_config_json(
+            ctx.config_get(crate::features::BLOCK_SETTINGS_CONFIG_KEY)
+                .unwrap_or("{}"),
+        );
+    }
+    let disabled: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+    crate::features::BlockSettings::from_map(disabled.into_iter().map(|n| (n, false)).collect())
+}
+
 pub fn feature_gate_name(block_name: &str) -> &str {
     ROUTES
         .iter()
@@ -579,7 +637,7 @@ fn route_prefix_matches(prefix: &str, path: &str) -> bool {
 /// `register_auth`).
 pub async fn route_to_block(
     ctx: &dyn Context,
-    msg: Message,
+    mut msg: Message,
     input: InputStream,
     features: &dyn FeatureConfig,
     block_infos: &[BlockInfo],
@@ -643,6 +701,14 @@ pub async fn route_to_block(
             return denied;
         }
 
+        // Hand the block the gate decision just made, so any enablement-
+        // dependent UI it renders agrees with what this router will serve.
+        // See `META_DISABLED_BLOCKS`.
+        msg.set_meta(
+            META_DISABLED_BLOCKS,
+            disabled_blocks_json(features, block_infos),
+        );
+
         // Dispatch via call_block so WRAP sees the correct caller identity.
         return ctx.call_block(route.dispatch_to, msg, input).await;
     }
@@ -667,6 +733,13 @@ pub async fn route_to_block(
         if let Some(denied) = check_access(extra_route_access(block_infos, route, &msg), &msg) {
             return denied;
         }
+
+        // Same stamp as the built-in loop above — a downstream-registered
+        // route's pages render the same chrome.
+        msg.set_meta(
+            META_DISABLED_BLOCKS,
+            disabled_blocks_json(features, block_infos),
+        );
 
         return ctx.call_block(&route.block_name, msg, input).await;
     }
@@ -1477,6 +1550,132 @@ mod tests {
         );
         // A block with no route at all is gated under its own name.
         assert_eq!(feature_gate_name("test/unrouted"), "test/unrouted");
+    }
+
+    /// The router hands the block it dispatches the gate it just applied.
+    ///
+    /// This is what lets `ui::shell_document` filter the sidebar on the same
+    /// answer the gate gave — without the `Arc<dyn FeatureConfig>` it cannot
+    /// reach (`ui::shell_page` alone has 39 call sites across ten blocks) and
+    /// without a database read in the shared chrome path, which
+    /// `llm::pages`' boundary test forbids outright.
+    ///
+    /// The regression it pins: once the admin toggle began moving the router's
+    /// live gate, a sidebar reading the boot snapshot rendered links the
+    /// router had already started answering with "endpoint not found".
+    #[tokio::test]
+    async fn the_router_hands_the_block_the_gate_it_just_applied() {
+        use crate::test_support::{admin_msg, TestContext};
+
+        struct TicketsOff;
+        impl FeatureConfig for TicketsOff {
+            fn is_block_enabled(&self, full_name: &str) -> bool {
+                full_name != "impresspress/tickets"
+            }
+        }
+
+        struct GateEchoBlock;
+        #[async_trait::async_trait]
+        impl wafer_run::Block for GateEchoBlock {
+            fn info(&self) -> wafer_run::BlockInfo {
+                wafer_run::BlockInfo::new("test/gate-echo", "0.0.1", "echo@v1", "gate echo")
+                    .category(wafer_run::BlockCategory::Service)
+            }
+            async fn handle(
+                &self,
+                _ctx: &dyn Context,
+                msg: Message,
+                _input: InputStream,
+            ) -> OutputStream {
+                crate::http::ResponseBuilder::new().status(200).body(
+                    msg.get_meta(META_DISABLED_BLOCKS).as_bytes().to_vec(),
+                    "text/plain",
+                )
+            }
+            async fn lifecycle(
+                &self,
+                _ctx: &dyn Context,
+                _e: wafer_run::LifecycleEvent,
+            ) -> Result<(), wafer_run::WaferError> {
+                Ok(())
+            }
+        }
+
+        let infos = vec![
+            wafer_run::BlockInfo::new("impresspress/files", "0.0.1", "http-handler@v1", "files"),
+            wafer_run::BlockInfo::new(
+                "impresspress/tickets",
+                "0.0.1",
+                "http-handler@v1",
+                "tickets",
+            ),
+        ];
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("impresspress/files", std::sync::Arc::new(GateEchoBlock));
+
+        // `/b/storage/` is served by `impresspress/files`, which is ENABLED
+        // here — so the request dispatches, and what is asserted is what it
+        // was told about the block that is not.
+        //
+        // Authenticated, not anonymous: these `BlockInfo`s declare no
+        // endpoints, and `declared_access` answers an UNDECLARED path with
+        // `Authenticated` (fail-closed), which outranks the route's own
+        // Public tier. An anonymous caller never reaches dispatch.
+        let out = route_to_block(
+            &ctx,
+            admin_msg("retrieve", "/b/storage/"),
+            InputStream::empty(),
+            &TicketsOff,
+            &infos,
+            &[],
+        )
+        .await;
+        let buf = out.collect_buffered().await.expect("must dispatch");
+        let stamped = String::from_utf8(buf.body).expect("utf-8 body");
+
+        assert_eq!(
+            stamped, r#"["impresspress/tickets"]"#,
+            "the dispatched block must receive the gate the router applied",
+        );
+    }
+
+    /// The property the sidebar rests on: what a reader recovers from the
+    /// stamp is exactly what the router refused.
+    #[tokio::test]
+    async fn gate_from_request_reproduces_the_routers_answer() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        let ctx = TestContext::new().await;
+        let mut msg = anon_msg("retrieve", "/b/admin/");
+        msg.set_meta(META_DISABLED_BLOCKS, r#"["impresspress/tickets"]"#);
+
+        let gate = gate_from_request(&ctx, &msg);
+        assert!(!gate.is_block_enabled("impresspress/tickets"));
+        assert!(
+            gate.is_block_enabled("impresspress/files"),
+            "a block the router did not refuse stays enabled",
+        );
+    }
+
+    /// A message that never went through the router — a direct block call in a
+    /// test, a lifecycle event — falls back to the boot snapshot, and never to
+    /// "everything enabled". Fabricating that out of a missing answer is the
+    /// failure `block_settings::load_and_seed` records a review finding for.
+    #[tokio::test]
+    async fn gate_from_request_falls_back_to_the_boot_snapshot_when_unrouted() {
+        use crate::test_support::{anon_msg, TestContext};
+
+        let mut ctx = TestContext::new().await;
+        ctx.set_config(
+            crate::features::BLOCK_SETTINGS_CONFIG_KEY,
+            &serde_json::json!({ "impresspress/tickets": { "enabled": false } }).to_string(),
+        );
+
+        let gate = gate_from_request(&ctx, &anon_msg("retrieve", "/b/admin/"));
+        assert!(
+            !gate.is_block_enabled("impresspress/tickets"),
+            "an unrouted message must fall back to the snapshot, not to all-enabled",
+        );
     }
 
     #[tokio::test]
