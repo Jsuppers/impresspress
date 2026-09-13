@@ -99,6 +99,7 @@ enum Route {
     CreateVariable,
     EditVariableForm,
     UpdateVariable,
+    DeleteVariable,
     NetworkInboundDetail,
     CreateWrapGrant,
     DeleteWrapGrant,
@@ -435,6 +436,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     )
     .summary("Update variable (form)"),
     EndpointRoute::admin(
+        HttpMethod::Delete,
+        "/b/admin/variables/{key}",
+        Route::DeleteVariable,
+    )
+    .summary("Delete variable (row control)"),
+    EndpointRoute::admin(
         HttpMethod::Get,
         "/b/admin/network/detail/inbound",
         Route::NetworkInboundDetail,
@@ -630,6 +637,7 @@ crate::impresspress_feature_block! {
             Route::CreateVariable => pages::handle_create_variable(ctx, &msg, input).await,
             Route::EditVariableForm => pages::handle_edit_variable_form(ctx, &msg).await,
             Route::UpdateVariable => pages::handle_update_variable(ctx, &msg, input).await,
+            Route::DeleteVariable => pages::handle_delete_variable(ctx, &msg).await,
             Route::NetworkInboundDetail => pages::network_inbound_detail(ctx, &msg).await,
             Route::CreateWrapGrant => handle_create_wrap_grant(ctx, msg, input).await,
             Route::DeleteWrapGrant => handle_delete_wrap_grant(ctx, msg).await,
@@ -1609,6 +1617,12 @@ mod table_tests {
                 &[("key", "WAFER_RUN_SHARED__APP_NAME")],
             ),
             (
+                "delete",
+                "/b/admin/variables/LEGACY_THING",
+                Route::DeleteVariable,
+                &[("key", "LEGACY_THING")],
+            ),
+            (
                 "update",
                 "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME",
                 Route::UpdateVariable,
@@ -1834,7 +1848,7 @@ mod page_link_tests {
 
     /// One row behind every per-record control the pages render: a user
     /// (enable/disable/delete), a custom role (delete), an active API key
-    /// (revoke), a variable (edit), a WRAP grant (delete), a request-log
+    /// (revoke), a variable (edit, delete), a WRAP grant (delete), a request-log
     /// row (network detail) and a Feature block (detail, toggle).
     async fn seeded_ctx() -> (TestContext, Seeds) {
         let mut ctx = TestContext::with_auth().await;
@@ -2086,6 +2100,10 @@ mod page_link_tests {
                 format!("/b/admin/variables/{PROBE_VARIABLE}/edit"),
             ),
             ("update", format!("/b/admin/variables/{PROBE_VARIABLE}")),
+            // The delete control. `PROBE_SETTING` is declared by no block, so
+            // it renders in the unowned and flat tables, both of which offer
+            // one — a change that drops the button from either fails here.
+            ("delete", format!("/b/admin/variables/{PROBE_VARIABLE}")),
             ("create", "/b/admin/grants/rules".to_string()),
             (
                 "delete",

@@ -218,22 +218,14 @@ pub(super) async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStr
         Err(response) => return response,
     };
 
-    if key.starts_with("WAFER_RUN_SHARED__") {
-        return err_bad_request(&format!("Cannot delete shared system variable: {key}"));
+    // The shared-key guard, the delete and the audit row all live in `ops`,
+    // shared with the Variables page's row control — so the two surfaces
+    // refuse the same keys and leave the same trail. This path wrote no audit
+    // row at all before: create and update were audited, delete was not.
+    if let Err(response) = ops::delete_variable(ctx, msg, key).await {
+        return response;
     }
-
-    let row = match variables::get_by_key(ctx, key)
-        .await
-        .map_err(|e| crud::db_error(e, "Setting not found", "Database error"))
-        .and_then(|row| require_row(row, "Setting not found"))
-    {
-        Ok(row) => row,
-        Err(response) => return response,
-    };
-    match variables::delete(ctx, &row.id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": key})),
-        Err(e) => crud::db_error(e, "Setting not found", "Database error"),
-    }
+    ok_json(&serde_json::json!({"deleted": key}))
 }
 
 /// Full block name of the admin block — the `block_settings` row whose

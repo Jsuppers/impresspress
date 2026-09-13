@@ -364,6 +364,103 @@ fn reject_runtime_owned_key(key: &str) -> Result<(), OutputStream> {
     Ok(())
 }
 
+/// Delete a config variable, writing an audit-log row.
+///
+/// Shared by the JSON surface (`settings::handle_delete`) and the Variables
+/// page's row control, so the two refuse the same keys and leave the same
+/// trail. The JSON path wrote no audit row at all before this: variable
+/// creation and update were audited, deletion was not.
+///
+/// `WAFER_RUN_SHARED__*` is refused, as it always was on the JSON path: those
+/// are declared centrally in `config_vars::shared_config_vars()` and re-seeded
+/// on the next boot, so deleting one is a no-op that looks like a change.
+///
+/// Deliberately NOT gated on [`reject_runtime_owned_key`]. Creating or editing
+/// a runtime-owned row is refused because the runtime owns that value — but a
+/// row that already exists (a legacy write, or a seed bundle from before
+/// `dev::data_snapshot::import` learned to refuse them) is exactly what an
+/// operator needs to be able to remove. Refusing it here would leave the row
+/// permanent, which is the gap this function closes.
+pub(super) async fn delete_variable(
+    ctx: &dyn Context,
+    msg: &Message,
+    key: &str,
+) -> Result<(), OutputStream> {
+    if key.is_empty() {
+        return Err(err_bad_request("Missing setting key"));
+    }
+    // The JWT signing secret. Refused because deleting it is not reversible in
+    // the way the confirm dialog implies: nothing breaks until the next boot,
+    // when `seed_jwt_secret`'s `insert_if_absent` mints a DIFFERENT secret and
+    // every issued session JWT and CSRF token stops verifying. The row also
+    // reaches the Variables page's "unowned" table — the auth block never
+    // declares it as a `ConfigVar` (see `variables::seed_jwt_secret`) — so
+    // without this it sits under a trash icon beside the words "legacy or
+    // manually created".
+    //
+    // Note this is NARROWER than `config_vars::is_instance_owned_key`, which
+    // also covers runtime-owned keys. Those stay deletable on purpose: a
+    // stored `__…__` or `IMPRESSPRESS_*` row is inert (the boot map answers
+    // those keys whatever the table holds) and removing one is exactly the
+    // cleanup path this function exists to provide.
+    if key == crate::blocks::auth::JWT_SECRET_KEY {
+        return Err(err_bad_request(&format!(
+            "Cannot delete {key}: it is this instance's JWT signing secret, and the next boot \
+             would generate a different one, invalidating every session"
+        )));
+    }
+    // Shared vars are refused only while they are still DECLARED. The reason
+    // is that they are re-seeded from `shared_config_vars()` on the next boot,
+    // so deleting one is a no-op dressed as a change — but that argument stops
+    // holding the moment a key is renamed or dropped from that list. Nothing
+    // re-seeds a stale row, and it would otherwise be dead data no surface
+    // could remove, which is the gap this function closes.
+    if key.starts_with("WAFER_RUN_SHARED__")
+        && crate::config_vars::shared_config_vars()
+            .iter()
+            .any(|declared| declared.key == key)
+    {
+        return Err(err_bad_request(&format!(
+            "Cannot delete shared system variable: {key}"
+        )));
+    }
+
+    // Through `crud::db_error`, not `err_internal`: it is the one classifier
+    // allowed to map a database error by hand, and it preserves the
+    // distinctions a caller can act on — a WRAP denial stays a sanitized 403
+    // rather than flattening to "Internal server error". The JSON surface
+    // mapped errors this way before the guard moved here, and
+    // `a_denied_settings_delete_is_403` pins it.
+    let row = match variables::get_by_key(ctx, key).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(crate::http::err_not_found("Setting not found")),
+        Err(e) => {
+            return Err(crate::blocks::crud::db_error(
+                e,
+                "Setting not found",
+                "Database error",
+            ))
+        }
+    };
+    if let Err(e) = variables::delete(ctx, &row.id).await {
+        return Err(crate::blocks::crud::db_error(
+            e,
+            "Setting not found",
+            "Database error",
+        ));
+    }
+
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "variable.delete",
+        &format!("variables/{key}"),
+        msg.remote_addr(),
+    )
+    .await;
+    Ok(())
+}
+
 /// Create a config variable, writing an audit-log row. Validates `_URL` keys
 /// against [`validate_url_value`] (SSRF). `key` must be non-empty, and must
 /// not name a key the runtime owns ([`reject_runtime_owned_key`]).
@@ -541,6 +638,111 @@ mod tests {
             .await
             .map(|r| r.len())
             .unwrap_or(0)
+    }
+
+    /// Deletion is audited like creation and update. Before the two surfaces
+    /// shared this helper, the JSON delete path wrote no audit row at all.
+    #[tokio::test]
+    async fn deleting_a_variable_removes_the_row_and_audits() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/settings");
+        create_variable(&ctx, &msg, "LEGACY_THING", "v", None, None, false)
+            .await
+            .map_err(|_| "seed")
+            .expect("seed the variable");
+
+        delete_variable(&ctx, &msg, "LEGACY_THING")
+            .await
+            .map_err(|_| "delete")
+            .expect("delete must succeed");
+
+        assert!(
+            variables::get_by_key(&ctx, "LEGACY_THING")
+                .await
+                .expect("read back")
+                .is_none(),
+            "the row must be gone",
+        );
+        assert_eq!(audit_count(&ctx, "variable.delete").await, 1);
+    }
+
+    /// The JWT signing secret is not deletable.
+    ///
+    /// It reaches the Variables page's "unowned" table (the auth block never
+    /// declares it as a `ConfigVar`), so before this guard it sat under a
+    /// trash icon. Deleting it looks harmless until the next boot mints a
+    /// different secret and every session and CSRF token stops verifying.
+    #[tokio::test]
+    async fn deleting_the_jwt_signing_secret_is_refused() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/settings");
+        let key = crate::blocks::auth::JWT_SECRET_KEY;
+        create_variable(&ctx, &msg, key, "s3cret", None, None, false)
+            .await
+            .map_err(|_| "seed")
+            .expect("seed the secret");
+
+        assert!(
+            delete_variable(&ctx, &msg, key).await.is_err(),
+            "the signing secret must not be deletable",
+        );
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .is_some(),
+            "the refused row must still be there",
+        );
+        assert_eq!(audit_count(&ctx, "variable.delete").await, 0);
+    }
+
+    /// A DECLARED shared var is refused — it is re-seeded on the next boot, so
+    /// deleting it is a no-op that looks like a change.
+    #[tokio::test]
+    async fn deleting_a_declared_shared_variable_is_refused() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/settings");
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        create_variable(&ctx, &msg, key, "Shop", None, None, false)
+            .await
+            .map_err(|_| "seed")
+            .expect("seed the shared var");
+
+        assert!(delete_variable(&ctx, &msg, key).await.is_err());
+        assert!(variables::get_by_key(&ctx, key)
+            .await
+            .expect("read back")
+            .is_some());
+    }
+
+    /// A STALE one is not. Once a key is dropped from `shared_config_vars()`
+    /// nothing re-seeds it, so the "it comes back anyway" reasoning stops
+    /// applying and the row is dead data — precisely what an operator needs to
+    /// be able to remove.
+    #[tokio::test]
+    async fn deleting_an_undeclared_shared_variable_is_allowed() {
+        let ctx = admin_ctx().await;
+        let msg = admin_msg("create", "/admin/settings");
+        let key = "WAFER_RUN_SHARED__RETIRED_SETTING";
+        assert!(
+            !crate::config_vars::shared_config_vars()
+                .iter()
+                .any(|v| v.key == key),
+            "fixture must name a key the shared list does not declare",
+        );
+        create_variable(&ctx, &msg, key, "x", None, None, false)
+            .await
+            .map_err(|_| "seed")
+            .expect("seed the stale row");
+
+        delete_variable(&ctx, &msg, key)
+            .await
+            .map_err(|_| "delete")
+            .expect("a stale shared row must be removable");
+        assert!(variables::get_by_key(&ctx, key)
+            .await
+            .expect("read back")
+            .is_none());
     }
 
     /// SEC drift: the JSON variable path wrote zero audit rows. Both surfaces
