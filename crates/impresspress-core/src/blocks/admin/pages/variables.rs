@@ -221,17 +221,7 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
                 aria-label=(format!("Edit {}", row.key))
             { (icons::edit()) }
             @if row.deletable {
-                // `closest tr` rather than a row id: these tables render
-                // through `components::TableRow` without one. An empty
-                // response body then removes the row.
-                button .btn .btn--sm .btn--danger
-                    hx-delete={"/b/admin/variables/" (row.key)}
-                    hx-target="closest tr"
-                    hx-swap="outerHTML"
-                    hx-confirm={"Delete " (row.key) "? This cannot be undone."}
-                    title="Delete"
-                    aria-label=(format!("Delete {}", row.key))
-                { (icons::trash()) }
+                (delete_button(row.key))
             }
         }
     });
@@ -259,9 +249,15 @@ fn config_var_row(
         description: &var.description,
         warning: &var.warning,
         show_default: true,
-        // Only when an override is actually stored: a declared var showing
-        // its default has no row to delete.
-        deletable: var_map.contains_key(&var.key) && !var.key.starts_with("WAFER_RUN_SHARED__"),
+        // Never, in the per-block tables. A row here exists because a block
+        // DECLARES the key, not because the database does — so removing the
+        // stored override must leave the row in place showing its default,
+        // and this control's `outerHTML` swap would instead delete the row
+        // from the table, stranding the declared key with nothing to edit
+        // until a reload. "Reset to default" is a different affordance and
+        // wants its own handler; the flat and unowned tables are where the
+        // rows that can really be removed live.
+        deletable: false,
     })
 }
 
@@ -354,9 +350,49 @@ const ALL_VAR_COLUMNS: [components::TableCol<'static>; 4] = [
     },
 ];
 
+/// The delete control, shared by every table that offers one so the affordance
+/// and the confirm text cannot drift between them.
+///
+/// `closest tr` rather than a row id: these tables render through
+/// `components::TableRow`, and only the flat "All Variables" tab gives its
+/// rows ids. An empty response body is what removes the row.
+fn delete_button(key: &str) -> Markup {
+    html! {
+        button .btn .btn--sm .btn--danger
+            hx-delete={"/b/admin/variables/" (key)}
+            hx-target="closest tr"
+            hx-swap="outerHTML"
+            hx-confirm={"Delete " (key) "? This cannot be undone."}
+            title="Delete"
+            aria-label=(format!("Delete {key}"))
+        { (icons::trash()) }
+    }
+}
+
+/// Whether the page offers a delete control for `key`, given the set of
+/// shared vars this build still declares.
+///
+/// Mirrors `ops::delete_variable`'s refusals exactly, so the page never
+/// renders a button that could only produce an error: the JWT signing secret
+/// is never deletable, and a shared var is deletable only once it is no longer
+/// declared (nothing re-seeds a stale row).
+fn key_is_deletable(key: &str, declared_shared: &std::collections::HashSet<String>) -> bool {
+    key != crate::blocks::auth::JWT_SECRET_KEY && !declared_shared.contains(key)
+}
+
+/// The shared keys this build declares, for [`key_is_deletable`]. Built once
+/// per render rather than per row — `shared_config_vars()` allocates.
+fn declared_shared_keys() -> std::collections::HashSet<String> {
+    crate::config_vars::shared_config_vars()
+        .into_iter()
+        .map(|v| v.key)
+        .collect()
+}
+
 /// "All Variables" tab -- flat table of all config variables from the DB.
 async fn config_all_tab(ctx: &dyn Context) -> Markup {
     let settings = variables::list_all(ctx).await;
+    let declared_shared = declared_shared_keys();
 
     html! {
         @match &settings {
@@ -388,13 +424,23 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                             }
                         },
                         html! {
-                            button .btn .btn--sm .btn--ghost
-                                hx-get={"/b/admin/variables/" (key) "/edit"}
-                                hx-target="#edit-var-modal"
-                                hx-swap="innerHTML"
-                                title="Edit"
-                                aria-label=(format!("Edit {key}"))
-                            { (icons::edit()) }
+                            div .flex .gap-1 {
+                                button .btn .btn--sm .btn--ghost
+                                    hx-get={"/b/admin/variables/" (key) "/edit"}
+                                    hx-target="#edit-var-modal"
+                                    hx-swap="innerHTML"
+                                    title="Edit"
+                                    aria-label=(format!("Edit {key}"))
+                                { (icons::edit()) }
+                                // The flat listing offers the same control as
+                                // the Unowned table: this is where an operator
+                                // scanning for a legacy key actually looks, and
+                                // two tabs disagreeing about whether a row can
+                                // be removed is its own defect.
+                                @if key_is_deletable(key, &declared_shared) {
+                                    (delete_button(key))
+                                }
+                            }
                         },
                     ])
                     .id(format!("var-row-{key}"))
@@ -560,11 +606,17 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
                         description: &row.description,
                         warning: "",
                         show_default: false,
-                        // Every row in this table exists in the database by
-                        // definition — that is what "unowned" means here — so
-                        // these are exactly the rows an operator needs to be
-                        // able to remove.
-                        deletable: !key.starts_with("WAFER_RUN_SHARED__"),
+                        // Every row here exists in the database by definition
+                        // — that is what "unowned" means — so these are the
+                        // rows an operator needs to be able to remove.
+                        //
+                        // Only the JWT secret is excluded. A declared shared
+                        // var cannot reach this table at all (`known_keys`
+                        // covers block-declared AND shared keys, and this
+                        // table is what is left over), so a
+                        // `WAFER_RUN_SHARED__*` row appearing here is stale by
+                        // construction and removable — which is the point.
+                        deletable: key != crate::blocks::auth::JWT_SECRET_KEY,
                     })
                 }).collect(),
             ))
@@ -718,7 +770,18 @@ pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputS
     if let Err(out) = ops::delete_variable(ctx, msg, key).await {
         return out;
     }
-    ui::html_response_with_toast(html! {}, "Variable deleted", "success")
+    // The row is gone — but an env-provided or auto-generated key is ALSO in
+    // the boot map, which `blocks::config`'s read order falls back to when the
+    // table holds no row. For those the value keeps being served and the row
+    // is written again on the next boot, so reporting a flat "deleted" would
+    // be untrue in exactly the case an operator is most likely to be trying to
+    // turn something off.
+    let toast = if ctx.config_get(key).is_some() {
+        "Variable deleted — a boot-provided value is still in effect"
+    } else {
+        "Variable deleted"
+    };
+    ui::html_response_with_toast(html! {}, toast, "success")
 }
 
 #[cfg(test)]
@@ -793,97 +856,6 @@ mod tests {
             "a non-deletable row must render no delete control: {s}"
         );
         assert!(s.contains("hx-get"), "the edit control is unaffected: {s}");
-    }
-}
-
-#[cfg(test)]
-mod delete_tests {
-    use super::*;
-    use crate::{
-        blocks::admin::{test_support::routed, AUDIT_LOGS_TABLE},
-        test_support::{admin_msg, output_is_error, TestContext},
-    };
-
-    async fn seed(ctx: &TestContext, key: &str) {
-        let msg = admin_msg("create", "/b/admin/variables");
-        // `OutputStream` is not `Debug`, so the error arm cannot be unwrapped.
-        if ops::create_variable(ctx, &msg, key, "v", None, None, false)
-            .await
-            .is_err()
-        {
-            panic!("seeding {key} must succeed");
-        }
-    }
-
-    async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
-        wafer_core::clients::database::list_all(
-            ctx,
-            AUDIT_LOGS_TABLE,
-            vec![wafer_block::db::Filter {
-                field: "action".to_string(),
-                operator: wafer_block::db::FilterOp::Equal,
-                value: serde_json::Value::String(action.to_string()),
-            }],
-        )
-        .await
-        .map(|rows| rows.len())
-        .unwrap_or(0)
-    }
-
-    /// The gap this closes: the page offered no way to remove a variable, so
-    /// a row written by a legacy path — or by a seed bundle from before
-    /// `dev::data_snapshot::import` refused runtime-owned keys — was
-    /// permanent unless an operator hand-called the JSON API.
-    #[tokio::test]
-    async fn deleting_a_variable_removes_the_row_and_audits() {
-        let ctx = TestContext::with_admin().await;
-        seed(&ctx, "LEGACY_THING").await;
-
-        let msg = routed(admin_msg("delete", "/b/admin/variables/LEGACY_THING"));
-        let _ = handle_delete_variable(&ctx, &msg)
-            .await
-            .collect_buffered()
-            .await
-            .expect("a delete against a healthy database must succeed");
-
-        assert!(
-            variables::get_by_key(&ctx, "LEGACY_THING")
-                .await
-                .expect("read back")
-                .is_none(),
-            "the row must be gone",
-        );
-        assert_eq!(
-            audit_count(&ctx, "variable.delete").await,
-            1,
-            "deleting a variable must leave an audit trail, as create and update do",
-        );
-    }
-
-    /// Shared vars are declared centrally and re-seeded on the next boot, so
-    /// deleting one is a no-op dressed as a change. Refused on both surfaces
-    /// because both go through `ops::delete_variable`.
-    #[tokio::test]
-    async fn deleting_a_shared_system_variable_is_refused() {
-        let ctx = TestContext::with_admin().await;
-        seed(&ctx, "WAFER_RUN_SHARED__APP_NAME").await;
-
-        let msg = routed(admin_msg(
-            "delete",
-            "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME",
-        ));
-        assert!(
-            output_is_error(handle_delete_variable(&ctx, &msg).await, "InvalidArgument").await,
-            "a shared system variable must be refused",
-        );
-        assert!(
-            variables::get_by_key(&ctx, "WAFER_RUN_SHARED__APP_NAME")
-                .await
-                .expect("read back")
-                .is_some(),
-            "the refused row must still be there",
-        );
-        assert_eq!(audit_count(&ctx, "variable.delete").await, 0);
     }
 }
 

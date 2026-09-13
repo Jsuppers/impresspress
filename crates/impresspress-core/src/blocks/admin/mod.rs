@@ -1848,7 +1848,7 @@ mod page_link_tests {
 
     /// One row behind every per-record control the pages render: a user
     /// (enable/disable/delete), a custom role (delete), an active API key
-    /// (revoke), a variable (edit), a WRAP grant (delete), a request-log
+    /// (revoke), a variable (edit, delete), a WRAP grant (delete), a request-log
     /// row (network detail) and a Feature block (detail, toggle).
     async fn seeded_ctx() -> (TestContext, Seeds) {
         let mut ctx = TestContext::with_auth().await;
@@ -2100,6 +2100,10 @@ mod page_link_tests {
                 format!("/b/admin/variables/{PROBE_VARIABLE}/edit"),
             ),
             ("update", format!("/b/admin/variables/{PROBE_VARIABLE}")),
+            // The delete control. `PROBE_SETTING` is declared by no block, so
+            // it renders in the unowned and flat tables, both of which offer
+            // one — a change that drops the button from either fails here.
+            ("delete", format!("/b/admin/variables/{PROBE_VARIABLE}")),
             ("create", "/b/admin/grants/rules".to_string()),
             (
                 "delete",
