@@ -369,9 +369,9 @@ pub async fn seed_if_absent(
 /// `util::is_sensitive_key`'s key half has nothing to say about it — and
 /// because a row stored unflagged for a key that should be flagged is a
 /// disagreement between the column and the declaration, which the boot repair
-/// pass then has to reconcile. The metadata arguments are otherwise used only when the row has to
-/// be created — the same shape [`seed_if_absent`] takes, so the two read alike
-/// at a call site.
+/// pass then has to reconcile. The metadata arguments are otherwise used only
+/// when the row has to be created — the same shape [`seed_if_absent`] takes, so
+/// the two read alike at a call site.
 ///
 /// Says which of the four things it did ([`Wrote`]). A boot that re-asserts a
 /// value it already holds performs no write at all, which is what keeps this
