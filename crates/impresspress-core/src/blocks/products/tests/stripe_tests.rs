@@ -3141,7 +3141,7 @@ async fn webhook_rejects_missing_secret_config() {
     // Unavailable, not Internal: the secret being unset means webhook
     // processing is switched off, not that this deployment is broken. (It
     // does not change redelivery — Stripe retries on any non-2xx.) See
-    // `err_unavailable` in `stripe.rs`.
+    // `err_unavailable` in `crate::http`.
     assert!(output_is_error(out, ErrorCode::Unavailable).await);
 }
 

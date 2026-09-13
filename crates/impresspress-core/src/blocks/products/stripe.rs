@@ -11,7 +11,7 @@ use wafer_core::clients::{
     database::{self as db, Record},
     network,
 };
-use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream, WaferError};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
     config::{platform_country, seller_fee_bps, CountryCode},
@@ -30,7 +30,7 @@ use crate::{
     blocks::crud,
     http::{
         err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_not_found,
-        err_unauthorized, ok_json,
+        err_unauthorized, err_unavailable, ok_json,
     },
     util::{hex_encode, sha256_hex, RecordExt},
 };
@@ -531,21 +531,6 @@ pub(crate) async fn replay_webhook_event(
         format!("t={timestamp},v1={}", hex_encode(&signature)),
     );
     Ok(handle_webhook(ctx, &message, InputStream::from_bytes(payload)).await)
-}
-
-/// A capability that is not configured is unavailable, not broken.
-///
-/// `POST /b/products/checkout` and `POST /b/products/webhooks` are both PUBLIC
-/// and reachable on a default install where no Stripe keys are set, which is
-/// how the 2026-09-10 live run recorded them as 500s. `500` claims this
-/// deployment failed; `503` says it is fine and this capability is switched
-/// off, which is what actually happened.
-///
-/// It does NOT stop Stripe redelivering: Stripe retries on any non-2xx, 503
-/// included, and no `Retry-After` is set here. The gain is an honest status —
-/// for the operator reading logs and for a human caller — not fewer retries.
-fn err_unavailable(message: &str) -> OutputStream {
-    OutputStream::error(WaferError::new(ErrorCode::Unavailable, message.to_string()))
 }
 
 pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
