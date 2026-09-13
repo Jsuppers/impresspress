@@ -673,6 +673,13 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
     // A key the storage rule requires cannot be unflagged; show the control as
     // set-and-locked rather than offering a change that would be refused.
     let required_sensitive = crate::config_vars::is_sensitive_for_storage(&key);
+    // Mask on the EFFECTIVE flag, not the stored one. A legacy row an older
+    // build stored unflagged for a required key — the row
+    // `repair_sensitive_flags` exists for, still unrepaired on a deployment
+    // that has not rebooted, which on Cloudflare means no `/_deploy/init`
+    // since the upgrade — would otherwise render its secret in a plain text
+    // input under a hint saying the variable is always sensitive.
+    let show_sensitive = sensitive || required_sensitive;
 
     let markup = html! {
         div .modal-header {
@@ -689,7 +696,7 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                 }
                 div .form-group {
                     label .form-label for="edit-value" { "Value" }
-                    @if sensitive {
+                    @if show_sensitive {
                         div .value-reveal-wrapper {
                             input .form-input #edit-value
                                 type="password"
@@ -714,12 +721,36 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                     input .form-input type="text" #edit-desc name="description" value=(description);
                 }
                 div .form-group {
-                    input type="hidden" name="sensitive_present" value="1";
                     label .form-checkbox {
-                        @if sensitive {
-                            input type="checkbox" name="sensitive" value="1" checked disabled[required_sensitive];
+                        // A hidden field carries the answer and the checkbox
+                        // overrides it, exactly as the Add Variable modal does:
+                        // `parse_form_body` keeps the LAST value for a repeated
+                        // key, so `sensitive` is always posted and the handler
+                        // never has to guess whether the field was on the form.
+                        //
+                        // A DISABLED checkbox is not serialized — not by
+                        // `FormData`, not by htmx's `shouldInclude` — so for a
+                        // required key the hidden field must already say `1`.
+                        // It said `0` here, under a separate presence marker,
+                        // which made every required-sensitive variable
+                        // uneditable: the form posted "not sensitive", the ops
+                        // guard refused the unflag, and the admin's value or
+                        // description edit was dropped with a 400. That hit
+                        // `..._OAUTH_GOOGLE_CLIENT_SECRET`,
+                        // `..._BOOTSTRAP_ADMIN_PASSWORD` and
+                        // `WAFER_RUN__AUTH__JWT_SECRET` — the last of which is
+                        // deliberately left rotatable by
+                        // `reject_runtime_owned_key`.
+                        @if required_sensitive {
+                            input type="hidden" name="sensitive" value="1";
+                            input type="checkbox" name="sensitive" value="1" checked disabled;
                         } @else {
-                            input type="checkbox" name="sensitive" value="1" disabled[required_sensitive];
+                            input type="hidden" name="sensitive" value="0";
+                            @if show_sensitive {
+                                input type="checkbox" name="sensitive" value="1" checked;
+                            } @else {
+                                input type="checkbox" name="sensitive" value="1";
+                            }
                         }
                         span { "Sensitive — mask this value in listings and keep it out of exports" }
                     }
@@ -763,13 +794,12 @@ pub async fn handle_update_variable(
     let update = ops::VariableUpdate {
         value: body.get("value").map(|s| s.as_str()),
         description: body.get("description").map(|s| s.as_str()),
-        // An HTML checkbox posts nothing when unticked, so the form carries a
-        // hidden `sensitive_present` marker: with it, the checkbox's state is
-        // a deliberate answer; without it the field is not being edited at all
-        // and the stored flag is left alone.
+        // Present whenever the surface offers the control — the edit modal
+        // always posts it, hidden field plus checkbox. Absent means the caller
+        // is not editing the flag, and the stored one is left alone.
         sensitive: body
-            .get("sensitive_present")
-            .map(|_| crate::config_vars::form_bool(&body, "sensitive")),
+            .get("sensitive")
+            .map(|value| crate::config_vars::is_truthy(value)),
     };
     if let Err(out) = ops::update_variable(ctx, msg, var_key, update).await {
         return out;
@@ -814,6 +844,170 @@ pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{admin_msg, output_html, TestContext};
+
+    /// Serialize a rendered form the way a BROWSER would, so a test posts what
+    /// a real submit posts.
+    ///
+    /// Two rules carry the weight, and both are why an ops-layer test cannot
+    /// stand in for this one: a `disabled` control is never serialized (not by
+    /// `FormData`, not by htmx's `shouldInclude`), and an unchecked checkbox
+    /// posts nothing. A hidden field with the same `name` is what carries the
+    /// answer in either case — the pattern both variable modals use.
+    fn serialize_form(html: &str) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for tag in html.split("<input").skip(1) {
+            let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+            if tag.contains("disabled") {
+                continue;
+            }
+            let is_checkbox = tag.contains(r#"type="checkbox""#);
+            if is_checkbox && !tag.contains("checked") {
+                continue;
+            }
+            let attr = |name: &str| -> Option<String> {
+                let pat = format!("{name}=\"");
+                let i = tag.find(&pat)? + pat.len();
+                let rest = &tag[i..];
+                Some(rest[..rest.find('"')?].to_string())
+            };
+            if let (Some(name), value) = (attr("name"), attr("value")) {
+                // Later fields win, matching `parse_form_body`'s last-value rule.
+                out.insert(name, value.unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    fn urlencode_form(fields: &std::collections::HashMap<String, String>) -> Vec<u8> {
+        fields
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    crate::util::urlencode(k),
+                    crate::util::urlencode(v)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    /// Editing a REQUIRED-sensitive variable through the modal must work.
+    ///
+    /// The modal's Sensitive checkbox is `disabled` for such a key, so a
+    /// browser posts nothing for it; the hidden field beside it has to already
+    /// say `1`. It said `0` under a separate presence marker, so the form
+    /// posted "not sensitive", `update_variable` refused the unflag, and the
+    /// admin's value edit was dropped with a 400 — on exactly the keys that
+    /// most need the edit path, including `WAFER_RUN__AUTH__JWT_SECRET`, which
+    /// `reject_runtime_owned_key` deliberately leaves rotatable.
+    ///
+    /// Drives the real path: render the modal, serialize it as a browser
+    /// would, post that.
+    #[tokio::test]
+    async fn a_required_sensitive_variable_can_be_edited_through_the_modal() {
+        for key in [
+            crate::blocks::auth::JWT_SECRET_KEY,
+            crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY,
+        ] {
+            let ctx = TestContext::with_admin().await;
+            assert!(
+                crate::config_vars::is_sensitive_for_storage(key),
+                "{key} must be required-sensitive for this test to mean anything"
+            );
+            variables::insert(
+                &ctx,
+                variables::NewVariable {
+                    key: key.to_string(),
+                    value: "old-secret".to_string(),
+                    name: String::new(),
+                    description: String::new(),
+                    warning: String::new(),
+                    sensitive: true,
+                    updated_by: String::new(),
+                    block: variables::block_for_key(key),
+                },
+            )
+            .await
+            .expect("seed the row");
+
+            let msg = crate::blocks::admin::test_support::routed(admin_msg(
+                "retrieve",
+                &format!("/b/admin/variables/{key}/edit"),
+            ));
+            let html = output_html(handle_edit_variable_form(&ctx, &msg).await).await;
+
+            let mut fields = serialize_form(&html);
+            assert_eq!(
+                fields.get("sensitive").map(String::as_str),
+                Some("1"),
+                "a browser must post sensitive=1 for a required key, since the \
+                 checkbox is disabled and not serialized: {html}"
+            );
+            fields.insert("value".to_string(), "rotated-secret".to_string());
+
+            let put = crate::blocks::admin::test_support::routed(admin_msg(
+                "update",
+                &format!("/b/admin/variables/{key}"),
+            ));
+            let out = handle_update_variable(
+                &ctx,
+                &put,
+                InputStream::from_bytes(urlencode_form(&fields)),
+            )
+            .await;
+            let _ = output_html(out).await;
+
+            let row = variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row");
+            assert_eq!(
+                row.value, "rotated-secret",
+                "the admin's edit to {key} must land, not be dropped by the masking guard"
+            );
+            assert!(row.sensitive, "and the key stays masked");
+        }
+    }
+
+    /// A required key whose stored row is still UNFLAGGED must render masked.
+    ///
+    /// That is the row `repair_sensitive_flags` exists for, seen on a
+    /// deployment that has not rebooted since the upgrade — on Cloudflare, one
+    /// that has had no `/_deploy/init`. Reading the checkbox and the input type
+    /// off the stored flag put the secret in a plain text field directly under
+    /// a hint saying the variable is always sensitive.
+    #[tokio::test]
+    async fn an_unrepaired_required_row_still_renders_masked() {
+        let ctx = TestContext::with_admin().await;
+        let key = crate::blocks::auth::JWT_SECRET_KEY;
+
+        // `into_row` would flag it on the way in, which is the whole point —
+        // this is a row an OLDER build left behind. The fixture lives in
+        // `test_support` so no block file names the variables table.
+        variables::seed_row_with_flag(&ctx, key, "legacy-secret", 0).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/variables/{key}/edit"),
+        ));
+        let html = output_html(handle_edit_variable_form(&ctx, &msg).await).await;
+
+        assert!(
+            !html.contains(r#"type="text" name="value""#),
+            "an unrepaired required key must not render its secret in a plain text input: {html}"
+        );
+        assert!(
+            html.contains(r#"type="password" name="value""#),
+            "it must use the masked input: {html}"
+        );
+        assert!(
+            html.contains(r#"type="checkbox" name="sensitive" value="1" checked disabled"#),
+            "and the control must read as set-and-locked, not unchecked: {html}"
+        );
+    }
 
     /// The icon-only edit button must carry an accessible name derived from
     /// the row key (2026-07-11 review: 49 unlabeled icon buttons on the

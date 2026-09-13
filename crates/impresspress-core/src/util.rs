@@ -71,7 +71,16 @@ pub fn json_as_u64(v: &serde_json::Value) -> Option<u64> {
 pub fn flag_is_set(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::Bool(b) => *b,
-        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        // `as_i64` alone is `None` for a float, so `1.0` read as UNSET while
+        // the doc said "any non-zero number". That is a shape this change set
+        // anticipates elsewhere — `variable_is_exportable` lists it, and
+        // `load_rows` names it — and getting it wrong was doubly bad: the row
+        // would have been served in the clear AND rewritten on every boot by a
+        // repair pass that could never make `flag_is_canonical_one` true. The
+        // truth table has to be total over the numbers a backend can produce.
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map_or_else(|| n.as_f64().unwrap_or(0.0) != 0.0, |i| i != 0),
         serde_json::Value::String(s) => s == "true" || s == "1",
         _ => false,
     }

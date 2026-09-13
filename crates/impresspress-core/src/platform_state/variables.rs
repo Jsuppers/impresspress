@@ -609,6 +609,40 @@ async fn seed_jwt_secret(db: &Arc<dyn DatabaseService>) {
     }
 }
 
+/// Seed one row with an explicit `sensitive` column, bypassing
+/// [`NewVariable::into_row`].
+///
+/// TEST FIXTURE, and it lives here because this module owns the table — a
+/// block file naming `TABLE` to build the same row trips `tests/repo_door.rs`,
+/// correctly.
+///
+/// It exists because no supported API can produce this row any more: the
+/// creation funnel raises the flag on the way in, which is the property it
+/// exists for. A row an OLDER build left behind is the thing under test for
+/// the repair pass and for the admin edit form's masking.
+#[cfg(test)]
+pub(crate) async fn seed_row_with_flag(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
+    let now = crate::util::now_rfc3339();
+    let mut data = VariableRow {
+        id: format!("var_{}", uuid::Uuid::new_v4()),
+        key: key.to_string(),
+        value: value.to_string(),
+        name: String::new(),
+        description: String::new(),
+        warning: String::new(),
+        sensitive: false,
+        block: block_for_key(key),
+        updated_by: String::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+    .to_data();
+    data.insert("sensitive".to_string(), serde_json::json!(sensitive));
+    db::create(ctx, TABLE, data)
+        .await
+        .expect("seed a variables row");
+}
+
 /// Read every row into a key→value map. A row that does not decode (an empty
 /// `key`) is skipped and warned about as corruption rather than silently
 /// dropped.
@@ -1580,6 +1614,11 @@ mod boot_tests {
             serde_json::json!(2),
             serde_json::json!(true),
             serde_json::json!("true"),
+            // A float is a shape `variable_is_exportable` already anticipates.
+            // Read as unset it would have been served in the clear AND
+            // rewritten on every boot without ever converging, since
+            // `flag_is_canonical_one` can never become true for it.
+            serde_json::json!(1.0),
         ] {
             // The read paths must already agree that this is sensitive, with
             // no boot required.
