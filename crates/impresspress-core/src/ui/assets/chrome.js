@@ -12,9 +12,12 @@
 //   3. toasts           (was emitted by `ui::layout::page`)
 //   4. modals           (was emitted by `ui::layout::page`)
 //
-// Sections 1, 2 and 4 are IIFEs with their own idempotence guards. Section 3
-// is deliberately NOT wrapped: the toast listener binds `document.body`
-// directly and declares nothing. Section 4 was unwrapped too until the pages
+// Sections 1, 2 and 4 are IIFEs with their own idempotence guards. Section 3's
+// `showToast` listener is deliberately NOT wrapped: it binds `document.body`
+// directly and declares nothing. The htmx error listeners that follow it ARE
+// wrapped, because the three of them share one `toast()` helper and a shared
+// helper at the top level of this file would be a global. Section 4 was
+// unwrapped too until the pages
 // stopped calling `openModal`/`closeModal` from `onclick` attributes; it now
 // owns the shared delegated-action listener and exposes no globals. The rule
 // and the vocabulary are documented at the head of that section.
@@ -251,26 +254,61 @@ document.body.addEventListener("showToast", function(e) {
 // the sentence written for the operator. Everything else is a fallback, ending
 // in one that at least names the status: an empty toast is the same silence
 // this listener exists to remove.
-document.body.addEventListener("htmx:responseError", function(e) {
-    var xhr = (e.detail && e.detail.xhr) || {};
-    var text = typeof xhr.responseText === "string" ? xhr.responseText : "";
-    var message = "";
-    // Parsed only when the body LOOKS like that envelope. A refusal rendered as
-    // an HTML error page is also a 4xx, and putting a whole document through
-    // `textContent` into a toast is worse than not toasting at all.
-    if (text.replace(/^\s+/, "").charAt(0) === "{") {
-        try {
-            var body = JSON.parse(text);
-            if (body && typeof body.message === "string") { message = body.message; }
-        } catch (err) { /* not the envelope after all; fall through */ }
+//
+// `htmx:responseError` covers only the half where a response ARRIVED — in
+// htmx 2.0.4 it is fired from `handleAjaxResponse` and nowhere else. A request
+// that never reached the server takes a different path entirely: `xhr.onerror`
+// fires `htmx:sendError` and `xhr.ontimeout` fires `htmx:timeout`, each after an
+// `htmx:afterRequest` whose `detail.successful` was never assigned (it is set
+// only inside `handleAjaxResponse`). Both are covered below, with their own
+// wording — there is no status and no body to report, and "request failed"
+// would not tell the operator the thing that matters, which is that nothing was
+// sent and retrying is the right move.
+//
+// `htmx:sendAbort` is deliberately NOT covered. An abort is the page's own
+// doing — `hx-sync` superseding an in-flight request, a navigation away — so
+// toasting it would manufacture noise on exactly the pages that abort most,
+// and nothing in this tree aborts a request a person is waiting on.
+// Wrapped, unlike the `showToast` listener above it, because the three
+// listeners share one `toast()` and that must not become a global.
+(function () {
+    if (window.__htmxErrorToastInit) return;
+    window.__htmxErrorToastInit = true;
+
+    function toast(message) {
+        document.body.dispatchEvent(new CustomEvent("showToast", {
+            detail: { type: "error", message: message }
+        }));
     }
-    if (!message) {
-        message = xhr.status ? "Request failed (" + xhr.status + ")" : "Request failed";
-    }
-    document.body.dispatchEvent(new CustomEvent("showToast", {
-        detail: { type: "error", message: message }
-    }));
-});
+
+    document.body.addEventListener("htmx:responseError", function(e) {
+        var xhr = (e.detail && e.detail.xhr) || {};
+        var text = typeof xhr.responseText === "string" ? xhr.responseText : "";
+        var message = "";
+        // Parsed only when the body LOOKS like that envelope. A refusal
+        // rendered as an HTML error page is also a 4xx, and putting a whole
+        // document through `textContent` into a toast is worse than not
+        // toasting at all.
+        if (text.replace(/^\s+/, "").charAt(0) === "{") {
+            try {
+                var body = JSON.parse(text);
+                if (body && typeof body.message === "string") { message = body.message; }
+            } catch (err) { /* not the envelope after all; fall through */ }
+        }
+        if (!message) {
+            message = xhr.status ? "Request failed (" + xhr.status + ")" : "Request failed";
+        }
+        toast(message);
+    });
+
+    document.body.addEventListener("htmx:sendError", function() {
+        toast("Could not reach the server. Check your connection and try again.");
+    });
+
+    document.body.addEventListener("htmx:timeout", function() {
+        toast("The server did not answer in time. Try again.");
+    });
+})();
 
 // --- 4. modals, and the shared delegated-action listener ---
 //

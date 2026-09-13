@@ -88,6 +88,43 @@ test('a request that failed before any response still toasts', () => {
   assert.deepEqual(page.toasts(), [{ kind: 'error', text: 'Request failed' }]);
 });
 
+test('a request that never reached the server says so, in its own words', () => {
+  // `xhr.onerror` fires `htmx:afterRequest` and then `htmx:sendError`, and the
+  // `responseInfo` both carry has no `successful` field at all — it is assigned
+  // only inside `handleAjaxResponse`. So a dropped connection reaches NEITHER
+  // the response-error listener above nor any `if(event.detail.successful)`
+  // guard, and before this branch existed it produced nothing.
+  //
+  // Its own sentence, not the response-error one: there is no status and no
+  // body, and what the operator needs to know is that nothing was sent, so
+  // retrying is the right move rather than a way to create a second row.
+  const page = loadChrome();
+  page.fireTransportEvent('htmx:sendError');
+
+  assert.deepEqual(page.toasts(), [
+    { kind: 'error', text: 'Could not reach the server. Check your connection and try again.' }
+  ]);
+});
+
+test('a timeout says so too', () => {
+  const page = loadChrome();
+  page.fireTransportEvent('htmx:timeout');
+
+  assert.deepEqual(page.toasts(), [
+    { kind: 'error', text: 'The server did not answer in time. Try again.' }
+  ]);
+});
+
+test('an abort is silent, because the page is the one that aborted', () => {
+  // `hx-sync` superseding an in-flight request and a navigation away both land
+  // here. Toasting them would manufacture noise on exactly the pages that abort
+  // most, and nothing in this tree aborts a request a person is waiting on.
+  const page = loadChrome();
+  page.fireTransportEvent('htmx:sendAbort');
+
+  assert.deepEqual(page.toasts(), []);
+});
+
 test('a page with no toast container does not throw', () => {
   // The shipped layout always renders one, but the listener chain must not be
   // the thing that breaks a page that does not.

@@ -154,8 +154,17 @@ export function loadChrome({ toastContainer = true } = {}) {
       })),
     /** Fire one `htmx:responseError`, as htmx does for a 4xx/5xx answer. */
     respondWithError(xhr) {
-      const event = new StubCustomEvent('htmx:responseError', { detail: { xhr } });
-      body.dispatchEvent(event);
+      body.dispatchEvent(new StubCustomEvent('htmx:responseError', { detail: { xhr } }));
+    },
+    /**
+     * Fire one of the events htmx raises when the request never got a
+     * response: `xhr.onerror` → `htmx:sendError`, `xhr.ontimeout` →
+     * `htmx:timeout`, `xhr.onabort` → `htmx:sendAbort`. Each carries the
+     * request's `responseInfo`, which at that point has no status, no body and
+     * no `successful` — that field is assigned only in `handleAjaxResponse`.
+     */
+    fireTransportEvent(type) {
+      body.dispatchEvent(new StubCustomEvent(type, { detail: { xhr: {} } }));
     }
   };
 }

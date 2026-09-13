@@ -258,9 +258,23 @@ pub(super) async fn update_user_fields(
 /// substrings. So there is nothing in the error to match on, and matching on
 /// driver message text would be both magic and backend-specific. The same
 /// reasoning, and the same probe-after-the-write shape, is already written out
-/// at `products::handlers::product::restore_slug_conflict`; when wafer-run
-/// grows an `AlreadyExists` for constraint violations, both collapse into
-/// reading the code.
+/// at `products::handlers::product::restore_slug_conflict`.
+///
+/// The forward path is [`ErrorCode::AlreadyExists`]: a backend that DOES
+/// classify the violation has already answered the question the probe exists to
+/// ask, so that code short-circuits straight to the 409 and no re-read happens
+/// at all. It is wired up now rather than when such a backend lands, because
+/// sending it to [`db_error_internal`] instead — which classifies only
+/// `NotFound`, `PermissionDenied` and `ResourceExhausted`, and folds everything
+/// else into a 500 — would re-introduce this exact bug on the day the backend
+/// improved, with every test still green because the in-memory SQLite these run
+/// against answers `Internal`.
+///
+/// [`ErrorCode::Aborted`] is a probe candidate alongside `Internal` for the same
+/// reason in reverse: `error_code_to_http_status` already renders it 409, and
+/// the "concurrency conflict" it names is precisely what a unique-index
+/// collision is. If the key turns out to be taken, that is this conflict; if it
+/// does not, the write's own failure is kept.
 ///
 /// Probing **after** the failed write rather than before it is what closes the
 /// race: a pre-check that found the key free leaves a gap in which a competing
@@ -280,11 +294,14 @@ pub(super) async fn taken_key_or_db_error(
     probe: impl std::future::Future<Output = Result<bool, wafer_run::WaferError>>,
     conflict: &str,
 ) -> OutputStream {
-    // A WRAP refusal (403) or a quota (429) is not a name collision and keeps
-    // the status `crud` gives it; only the unclassified `Internal` that a
-    // constraint violation collapses into is a candidate for the re-read.
-    if error.code != ErrorCode::Internal {
-        return db_error_internal(error, "Database error");
+    match error.code {
+        // Already classified by the backend — nothing left to find out.
+        ErrorCode::AlreadyExists => return err_conflict(conflict),
+        // The two codes a constraint violation can arrive as unclassified.
+        ErrorCode::Internal | ErrorCode::Aborted => {}
+        // A WRAP refusal (403) or a quota (429) is not a name collision and
+        // keeps the status `crud` gives it.
+        _ => return db_error_internal(error, "Database error"),
     }
     match probe.await {
         Ok(true) => err_conflict(conflict),
@@ -893,6 +910,42 @@ mod tests {
         );
     }
 
+    /// A create whose row LANDED is never reported as a conflict, however thin
+    /// the backend's echo is.
+    ///
+    /// `DatabaseService::create` may answer with the row it stored or with an
+    /// acknowledgement. `variables::insert` used to decode that echo and return
+    /// the decode failure as an error — and a failed insert is classified by
+    /// re-reading the key, which found the row this very request had just
+    /// written. The admin was told the key already existed, the
+    /// `variable.create` audit row was skipped, and the untracked row made
+    /// every retry conflict forever. The write succeeded, so the answer has to
+    /// say so.
+    #[tokio::test]
+    async fn a_create_whose_echo_is_empty_is_a_create_not_a_conflict() {
+        let ctx = crate::test_support::EcholessCreateContext::new(admin_ctx().await);
+        let msg = admin_msg("create", "/admin/settings");
+
+        let row =
+            expect_ok(create_variable(&ctx, &msg, "SITE_NAME", "Acme", None, None, false).await);
+        assert_eq!(
+            row.key, "SITE_NAME",
+            "the row as written is what the caller gets back",
+        );
+        assert_eq!(row.value, "Acme");
+
+        assert_eq!(
+            audit_count(&ctx, "variable.create").await,
+            1,
+            "a create that landed must not go untracked",
+        );
+        let stored = variables::get_by_key(&ctx, "SITE_NAME")
+            .await
+            .expect("read back")
+            .expect("the row really is in the table");
+        assert_eq!(stored.value, "Acme");
+    }
+
     /// The same fact for roles: `roles.name` is UNIQUE too, and the identical
     /// `err_internal` tail two functions above `create_variable` answered the
     /// identical 500. Fixed together so the two copies cannot drift again.
@@ -915,6 +968,77 @@ mod tests {
             1,
             "a refused create is not an audited create",
         );
+    }
+
+    /// A backend that DOES classify the violation short-circuits: the 409 comes
+    /// straight off `AlreadyExists` and the probe is never run.
+    ///
+    /// This is the forward path the helper documents. Before it was wired up,
+    /// `AlreadyExists` fell through to `crud::db_error_internal`, which
+    /// classifies only `NotFound` / `PermissionDenied` / `ResourceExhausted`
+    /// and folds the rest into a 500 — so the day a backend started reporting
+    /// constraint violations properly, this bug would have come back, with
+    /// every other test still green because the in-memory SQLite these run
+    /// against answers `Internal`.
+    #[tokio::test]
+    async fn a_backend_classified_already_exists_is_the_conflict_without_a_probe() {
+        let probed = std::cell::Cell::new(false);
+        let out = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::AlreadyExists, "duplicate key"),
+            async {
+                probed.set(true);
+                Ok(false)
+            },
+            "TAKEN already exists",
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+        assert!(
+            !probed.get(),
+            "the backend already answered; do not re-read"
+        );
+    }
+
+    /// `Aborted` is a probe candidate alongside `Internal`: it renders as 409
+    /// too, and the "concurrency conflict" it names is what a unique-index
+    /// collision is. The re-read still decides, so a free key keeps the fault.
+    #[tokio::test]
+    async fn an_aborted_write_is_classified_by_the_probe_like_an_internal_one() {
+        let taken = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::Aborted, "write conflict"),
+            async { Ok(true) },
+            "TAKEN already exists",
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(taken).await, 409);
+
+        let free = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::Aborted, "write conflict"),
+            async { Ok(false) },
+            "TAKEN already exists",
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(free).await, 500);
+    }
+
+    /// A code that is neither is not a collision candidate at all — it keeps
+    /// the status `crud` gives it, and never reaches the probe.
+    #[tokio::test]
+    async fn a_wrap_refusal_keeps_its_403_and_is_never_probed() {
+        let probed = std::cell::Cell::new(false);
+        let out = taken_key_or_db_error(
+            wafer_run::WaferError::new(ErrorCode::PermissionDenied, "denied"),
+            async {
+                probed.set(true);
+                Ok(true)
+            },
+            "TAKEN already exists",
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 403);
+        assert!(!probed.get(), "a WRAP refusal is not a name collision");
     }
 
     /// A create that fails for a reason which is NOT a name collision keeps the

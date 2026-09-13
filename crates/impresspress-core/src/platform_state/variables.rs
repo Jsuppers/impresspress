@@ -559,7 +559,40 @@ pub async fn insert(ctx: &dyn Context, new: NewVariable) -> Result<VariableRow, 
     let row = new.into_row();
     let rec = db::create(ctx, TABLE, row.to_data()).await?;
     crate::config_generation::note_config_write();
-    VariableRow::from_record(&rec.id, &rec.data).map_err(decode_error)
+    // Past this line the row IS stored, and NOTHING here may report a failure.
+    //
+    // The `?` above is the write failing; everything after it is this function
+    // reading back what it just wrote, and the two must not arrive at a caller
+    // as the same error. `admin::ops::create_variable` classifies a failed
+    // insert by re-reading the key — so a decode failure here came back as "the
+    // key is taken", which is the row this very request created: the admin was
+    // told their key already exists, the `variable.create` audit row was
+    // skipped, and the untracked row made every retry conflict forever. The old
+    // behaviour was a 500, which was unhelpful but at least not false.
+    //
+    // Decoding the echo is therefore a PREFERENCE, not a requirement, and
+    // nothing is lost by declining it: every column was synthesised here
+    // ([`NewVariable::into_row`] mints the id and both timestamps, `to_data`
+    // writes all of them), so the row that was sent is the row that is stored.
+    // A backend whose `create` does not echo the columns back —
+    // [`VariableRow::from_record`] refuses a record with no `key`, which is
+    // corruption on a READ and merely a thin echo here — changes what was
+    // written not at all. The id is taken from the record either way, since
+    // that is the one field a backend may legitimately mint itself.
+    Ok(
+        VariableRow::from_record(&rec.id, &rec.data).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                id = %rec.id,
+                "variables insert landed but the echoed record did not decode; \
+                 reporting the row as written",
+            );
+            VariableRow {
+                id: rec.id.clone(),
+                ..row
+            }
+        }),
+    )
 }
 
 /// Update the row for `key`, or create it when absent, and return the row as
