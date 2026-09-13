@@ -620,6 +620,11 @@ pub(super) async fn delete_variable(
 /// Create a config variable, writing an audit-log row. Validates `_URL` keys
 /// against [`validate_url_value`] (SSRF). `key` must be non-empty, and must
 /// not name a key the runtime owns ([`reject_runtime_owned_key`]).
+///
+/// `value` must also be non-empty for a key something MASKS — judged on the
+/// key alone, not on the `sensitive` argument, for the reason spelled out at
+/// the guard. A blank row for such a key is permanent and blocks the boot
+/// seeder, which is the one shape of empty that cannot be undone.
 pub(super) async fn create_variable(
     ctx: &dyn Context,
     msg: &Message,

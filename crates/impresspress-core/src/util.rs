@@ -682,14 +682,25 @@ pub(crate) fn is_sensitive_key(key: &str, sensitive_flag: i64) -> bool {
 /// question [`is_sensitive_key`] answers, asked with the same stored flag the
 /// reader used.
 ///
-/// Every write surface refuses it: the JSON API and the admin Variables modal
-/// through `blocks::admin::ops::update_variable`, and the generic
-/// ConfigVar-driven form through `ui::settings_form::save_settings`. None of
-/// them silently drops it instead — a caller that is told "saved" while its
-/// write was discarded can never find out, because the next read hands it the
-/// same mask back. "Leave the stored value alone" has its own spelling on each
-/// surface (omit `value`; leave the masked field blank), and that spelling is
-/// what the refusal names.
+/// All four write surfaces refuse it: the JSON API and the admin Variables
+/// modal through `blocks::admin::ops::update_variable`, the generic
+/// ConfigVar-driven form through `ui::settings_form::save_settings`, and
+/// `CONFIG_SET` itself (`blocks::config`'s `ConfigWrite::write`) — the last of
+/// which is what makes this claim true by construction rather than by accident
+/// of who calls what, since any block can reach that operation through
+/// `wafer_core::clients::config::set`. None of them silently drops it instead —
+/// a caller that is told "saved" while its write was discarded can never find
+/// out, because the next read hands it the same mask back. "Leave the stored
+/// value alone" has its own spelling on each surface (omit `value`; leave the
+/// masked field blank), and that spelling is what the refusal names.
+///
+/// `save_settings` is the one that does not use this predicate, and
+/// deliberately: WRAP denies its callers the admin `variables` table, so it
+/// cannot supply the stored flag the third argument stands for. It refuses the
+/// mask for every var it is allowed to write instead — a superset of what the
+/// writer behind it refuses, which is the only shape that lets it promise no
+/// half-applied save. The exactness this predicate provides needs the row, and
+/// only the surfaces that can read the row get it.
 pub(crate) fn is_masked_submission(key: &str, sensitive_flag: i64, value: &str) -> bool {
     value == MASKED_VALUE && is_sensitive_key(key, sensitive_flag)
 }

@@ -198,22 +198,29 @@ pub(super) async fn handle_set(
         // answer with the plaintext secret, turning the writer into the reader
         // the masking exists to prevent.
         //
-        // Both halves of that rule are in the condition, and the first is not
-        // redundant. `is_sensitive_key` alone reads the POST-WRITE flag, and
-        // this very request can LOWER it: an ad hoc row is sensitive by its
-        // column only, so `PATCH {"sensitive": false}` cleared the flag and the
-        // echo then published the secret — one request, no value supplied, and
-        // a value out that no API request could reach before `value` became
-        // optional. A request that supplied no value is answered with no value,
-        // whatever the flag ends up saying.
-        Ok(mut row) => {
-            if value.is_none() || ops::is_sensitive_key(&row.key, i64::from(row.sensitive)) {
-                row.value = MASKED_VALUE.to_string();
+        // Two different situations, and they get two different answers, because
+        // masking is the wrong way to spell "this field was not returned".
+        //
+        // * The request supplied no value: the field is ABSENT from the record.
+        //   Substituting the mask here invented a value for rows nothing masks
+        //   — and a client replaying what it had just read then stored
+        //   `"********"` as a plain setting's value, with
+        //   `is_masked_submission` rightly declining to stop it, since for such
+        //   a row that string is ordinary. That is this endpoint's own hazard,
+        //   re-opened from the other side. Absent is what the request said and
+        //   what a JSON object has for "no value".
+        // * The request supplied a value for a key something masks: the mask,
+        //   as `handle_get` answers. Read off the POST-WRITE flag, which is
+        //   right here precisely because the value came in with the request —
+        //   the caller already knows it.
+        Ok(row) => {
+            let mut data = row.to_data();
+            if value.is_none() {
+                data.remove("value");
+            } else if ops::is_sensitive_key(&row.key, i64::from(row.sensitive)) {
+                data.insert("value".to_string(), serde_json::json!(MASKED_VALUE));
             }
-            ok_json(&db::Record {
-                id: row.id.clone(),
-                data: row.to_data(),
-            })
+            ok_json(&db::Record { id: row.id, data })
         }
         Err(out) => out,
     }
@@ -1005,7 +1012,73 @@ mod tests {
             serde_json::json!("acme-prod"),
             "a request that supplied no value must not be answered with one: {echoed}",
         );
-        assert_eq!(echoed["data"]["value"], serde_json::json!(MASKED_VALUE));
+        assert!(
+            echoed["data"].get("value").is_none(),
+            "and the way it is not answered is ABSENCE, not a substituted mask — see \
+             `a_value_less_patch_on_a_plain_row_does_not_invent_a_mask` for what \
+             substituting one did to rows nothing masks: {echoed}",
+        );
+    }
+
+    /// A value-less PATCH on a row NOTHING masks must not answer with a mask.
+    ///
+    /// Substituting `MASKED_VALUE` was the wrong way to spell "this field was
+    /// not returned", and it re-opened this PR's own hazard from the other
+    /// side: the echo for a plain row said `"********"`, and a client that
+    /// replayed what it had just read stored that string as the value — with
+    /// `is_masked_submission` correctly declining to stop it, because for a row
+    /// nothing masks `"********"` is an ordinary value. The field is simply
+    /// absent from the record now, which is what "no value" means in a JSON
+    /// object and what the request itself said.
+    #[tokio::test]
+    async fn a_value_less_patch_on_a_plain_row_does_not_invent_a_mask() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        seed_var(&ctx, "SITE_MOTTO", "move fast", false).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/SITE_MOTTO",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "sensitive": false }))
+            .expect("serialize request body");
+        let echoed = output_json(handle_set(&ctx, &msg, InputStream::from_bytes(body)).await).await;
+        assert!(
+            echoed["data"].get("value").is_none(),
+            "a field the request did not supply must be absent, not masked: {echoed}"
+        );
+
+        // The read/modify/write client, replaying exactly the fields it was
+        // handed. With `value` absent there is nothing to replay.
+        let mut replay = serde_json::Map::new();
+        if let Some(value) = echoed["data"].get("value") {
+            replay.insert("value".to_string(), value.clone());
+        }
+        replay.insert("sensitive".to_string(), serde_json::json!(false));
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/SITE_MOTTO",
+        ));
+        let body =
+            serde_json::to_vec(&serde_json::Value::Object(replay)).expect("serialize request body");
+        let _ = crate::test_support::output_http_status(
+            handle_set(&ctx, &msg, InputStream::from_bytes(body)).await,
+        )
+        .await;
+
+        assert_eq!(
+            variables::get_by_key(&ctx, "SITE_MOTTO")
+                .await
+                .expect("read back")
+                .expect("row")
+                .value,
+            "move fast",
+            "replaying the echo must not destroy the value it stood for",
+        );
     }
 
     /// A `PATCH` that supplies no value must not CREATE the row it would then
@@ -1104,6 +1177,50 @@ mod tests {
                 .await,
             200,
         );
+    }
+
+    /// ...and it may be created empty while ASKING to be masked.
+    ///
+    /// This is the fixture that pins the guard to the KEY rather than to the
+    /// `sensitive` argument. The Add Variable modal renders its Sensitive box
+    /// `checked` by default (`pages/variables.rs`, and
+    /// `create_modal_posts_the_flag_explicitly_and_is_checked_by_default`
+    /// asserts it), so every empty variable an operator creates through the UI
+    /// arrives here asking to be masked. Gating the refusal on the argument
+    /// would 400 all of them — and the whole suite would still pass without
+    /// this case, since the allowed case above says `"sensitive": false`.
+    ///
+    /// Safe to allow because what makes a blank row a TRAP is the boot seeder
+    /// owning the key and `delete_variable` protecting it, and both follow from
+    /// the key's declaration or spelling. This row is neither: it is deletable,
+    /// and nothing will ever try to seed it.
+    #[tokio::test]
+    async fn creating_an_empty_ad_hoc_variable_marked_sensitive_is_allowed() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let post = crate::blocks::admin::test_support::routed(admin_msg(
+            "create",
+            "/b/admin/api/settings",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "key": "SITE_NOTES", "value": "", "sensitive": true
+        }))
+        .expect("serialize request body");
+        assert_eq!(
+            output_http_status(handle_create(&ctx, &post, InputStream::from_bytes(body)).await)
+                .await,
+            200,
+            "the Add Variable modal's default flow must not be refused",
+        );
+        assert!(variables::get_by_key(&ctx, "SITE_NOTES")
+            .await
+            .expect("read back")
+            .is_some());
     }
 
     /// Making both fields optional must not make an empty body a way to

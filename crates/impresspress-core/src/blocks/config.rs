@@ -251,14 +251,25 @@ impl VariablesConfigBlock {
         //
         // The divergence is not reachable today, though NOT because the
         // bootstrap keys are unrendered — `auth_ui::pages::settings` puts both
-        // of them in its "Admin" section. It is unreachable because
-        // `settings_form::save_settings` short-circuits an EMPTY submission for
-        // a sensitive var before calling `config::set`, so an empty value never
-        // reaches the guard below from the one caller that could produce it.
-        // (A `MASKED_VALUE` submission is a separate case there and gets the
-        // opposite treatment — a 400, not a short-circuit — for the reason
-        // `util::is_masked_submission` gives; either way it does not arrive
-        // here.)
+        // of them in its "Admin" section. It is unreachable because the two
+        // key the exemption differs on — `BOOTSTRAP_ADMIN_TOKEN`, which the
+        // admin path exempts once redeemed and this one never does — is named
+        // by `is_sensitive_key`'s KEY half: `auth::config` declares it
+        // `InputType::Password`, as it does the password beside it. So
+        // `settings_form::save_settings` sees both as sensitive from the
+        // declared `ConfigVar` alone and short-circuits an empty submission for
+        // them before calling `config::set`.
+        //
+        // Note the narrowness: that argument covers THESE keys, not empty
+        // submissions in general. `save_settings` decides sensitivity from the
+        // declared var and this function decides it from the stored row, so a
+        // declared-plain key whose row an operator flagged sensitive DOES reach
+        // the guard below with an empty value and is refused here — which is
+        // correct, and which `save_settings` now forwards as the 400 it is
+        // rather than a 500. A `MASKED_VALUE` submission never arrives from
+        // that caller at all: its pre-pass refuses the mask for every
+        // allowlisted var, deliberately a superset of this guard, because it
+        // cannot read the flag this one reads.
         //
         // KNOWN GAP, recorded rather than fixed: the parity stops at the
         // create path. `variables::set`'s create branch builds its own
@@ -296,12 +307,9 @@ impl VariablesConfigBlock {
                 )))
             }
         };
-        // The static provisioning-only exemption — the narrower of the two, per
-        // the note above. It has to be here at all for the reason it exists on
-        // the admin path: a spent bootstrap password must stay clearable
-        // because `delete_variable` and `key_is_deletable` both refuse to
-        // delete a declared `WAFER_RUN_SHARED__*` row, so without it the
-        // deployment keeps a plaintext admin password by every route.
+        // The row's own flag, shared by the two guards below: neither of them
+        // may decide off the key's spelling alone, or an ad hoc row an admin
+        // marked sensitive in the UI would be judged as if it were plain.
         let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
         // The mask is never a value, on this surface as on the admin ones.
         //
@@ -324,6 +332,12 @@ impl VariablesConfigBlock {
                 ),
             )));
         }
+        // The static provisioning-only exemption — the narrower of the two, per
+        // the note above. It has to be here at all for the reason it exists on
+        // the admin path: a spent bootstrap password must stay clearable
+        // because `delete_variable` and `key_is_deletable` both refuse to
+        // delete a declared `WAFER_RUN_SHARED__*` row, so without it the
+        // deployment keeps a plaintext admin password by every route.
         if value.is_empty()
             && !crate::config_vars::is_provisioning_only_key(key)
             && is_sensitive_key(key, stored_flag)
