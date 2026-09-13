@@ -103,8 +103,10 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
     // source of truth shared with the admin Variables page
     // (`blocks::admin::ops::is_sensitive_key`, re-exported from
     // `crate::util`): sensitive when the var declares `InputType::Password`
-    // *or* its key follows the `_SECRET`/`_KEY` suffix convention, so a var
-    // left on the default `Text` widget by mistake still gets redacted.
+    // *or* the key rule says so — the `_SECRET`/`_KEY` suffix convention, or
+    // the same key declared `Password`/`auto_generate` anywhere in the build —
+    // so a var left on the default `Text` widget by mistake still gets
+    // redacted.
     // `has_value` is captured from the real value (presence only, never its
     // content) so the placeholder can still distinguish "configured" from
     // "not configured" without ever exposing the secret itself.

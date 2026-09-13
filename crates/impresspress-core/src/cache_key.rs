@@ -250,24 +250,33 @@ fn sensitive_check_columns(table: CachedTable) -> Option<(&'static str, &'static
 /// `ConfigVar`-driven settings form use to mask/redact secrets
 /// ([`crate::util::is_sensitive_key`]), so the cache-write policy can never
 /// drift from the display-masking policy: a row is sensitive when its
-/// `sensitive` flag is set OR its key follows the `_SECRET`/`_KEY` suffix
-/// convention.
+/// `sensitive` flag is set OR its key is one the build knows to hold a secret
+/// — the `_SECRET`/`_KEY` suffix convention, or a declared `ConfigVar` that is
+/// `InputType::Password` or `auto_generate`. The declaration half matters
+/// here specifically: `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD`
+/// carries neither suffix, so a legacy row with the flag still clear was
+/// judged cacheable and a plaintext admin password was copied into a globally
+/// replicated store.
 ///
-/// Uses [`crate::util::json_as_i64`] (not a bare `v.as_i64()`) for the
+/// Uses [`crate::util::flag_is_set`] (not a bare `v.as_i64()`) for the
 /// `sensitive` column so this stays in exact parity with the display-masking
 /// path: the SQLite service can round-trip a lazily-added column as a TEXT
-/// `"1"` string, and a flag-only-sensitive row stored that way must still be
-/// treated as sensitive here, or it would leak into KV while the display
-/// path correctly masks it.
+/// `"1"` string, a bool, or a float, and a flag-only-sensitive row stored any
+/// of those ways must still be treated as sensitive here, or it would leak
+/// into KV while the display path correctly masks it. See the note in the
+/// body on why `json_as_i64` was the wrong decoder for exactly this.
 pub fn row_is_sensitive(table: CachedTable, row: &HashMap<String, serde_json::Value>) -> bool {
     let Some((key_col, sensitive_col)) = sensitive_check_columns(table) else {
         return false;
     };
     let key = row.get(key_col).and_then(|v| v.as_str()).unwrap_or("");
-    let sensitive_flag = row
-        .get(sensitive_col)
-        .and_then(crate::util::json_as_i64)
-        .unwrap_or(0);
+    // `flag_is_set`, not `json_as_i64`: that conversion answers `None` for a
+    // JSON bool and for the string `"true"`, so a row stored in either shape
+    // read as UNFLAGGED here while `RecordExt::bool_field` — which the repair
+    // pass and the row codec use — read it as flagged. The row was therefore
+    // skipped as "already fine" and cached as "not sensitive" at the same
+    // time. One truth table for the column, shared with both.
+    let sensitive_flag = i64::from(row.get(sensitive_col).is_some_and(crate::util::flag_is_set));
     crate::util::is_sensitive_key(key, sensitive_flag)
 }
 
@@ -693,6 +702,25 @@ mod tests {
     }
 
     #[test]
+    fn row_is_sensitive_true_for_a_declared_password_var_even_if_flag_unset() {
+        // `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` is declared
+        // `InputType::Password` and spelled with neither `_SECRET` nor `_KEY`,
+        // so a row an older build stored unflagged was judged KV-cacheable —
+        // copying a plaintext admin password into a globally replicated store
+        // for up to the 24h row TTL. The declaration is the only thing that
+        // knows, so the masking predicate has to ask it.
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+        assert!(row_is_sensitive(
+            CachedTable::Variables,
+            &variables_row(key, 0)
+        ));
+    }
+
+    #[test]
     fn row_is_sensitive_false_for_plain_row() {
         assert!(!row_is_sensitive(
             CachedTable::Variables,
@@ -704,7 +732,7 @@ mod tests {
     fn row_is_sensitive_true_when_flag_set_as_string() {
         // A lazily-added column can round-trip as TEXT ("1") rather than a
         // JSON number. `row_is_sensitive` must accept that the same way the
-        // display-masking path (`crate::util::json_as_i64`) does, or a
+        // display-masking path (`crate::util::flag_is_set`) does, or a
         // string-stored sensitive flag would leak into the KV cache while
         // still being masked on display — see the parity note on
         // `row_is_sensitive`.

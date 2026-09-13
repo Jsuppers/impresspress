@@ -43,9 +43,11 @@
 //!    `config::get_default`'s fallback-to-default behaviour is unchanged.
 //!
 //! An empty row value deliberately falls through to the boot map rather than
-//! masking it: `seed_and_load` writes rows with empty values for declared
-//! vars that have no setting yet, and treating those as "explicitly blank"
-//! would blank out env-provided values on the first boot that seeds them.
+//! masking it. Blank means "unset", not "explicitly blank", everywhere in this
+//! repo — the boot seeder skips an empty env value and
+//! `admin::settings::seed_defaults` skips an empty declared default for
+//! exactly that reason — so a row that ended up blank must not shadow what the
+//! boot map holds for the key.
 
 use std::{
     collections::HashMap,
@@ -231,8 +233,47 @@ impl VariablesConfigBlock {
     /// WRAP denies.
     async fn write(&self, key: &str, value: &str) -> Result<(), OutputStream> {
         // The same sensitive-empty and `_URL` guards
-        // `blocks::admin::ops::update_variable` applies, so neither write
-        // surface accepts input the other refuses on those two rules. The
+        // `blocks::admin::ops::update_variable` applies, spelled from the same
+        // helpers, so the two write surfaces agree on the RULES.
+        //
+        // They do not agree on the whole of the sensitive-empty EXEMPTION, and
+        // deliberately: this surface exempts only the static
+        // `config_vars::is_provisioning_only_key` (the bootstrap password),
+        // while the admin PUT calls `ops::is_clearable_provisioning_credential`,
+        // which additionally exempts a bootstrap TOKEN that has already been
+        // redeemed. So `CONFIG_SET` refuses a clear the admin PUT accepts. The
+        // narrower rule is the correct one here and `ops.rs` says why: "is the
+        // token redeemed" is answered by counting admin users, and this
+        // operation runs over the raw `DatabaseService` with no `Context` to
+        // count through. Widening it here would exempt an UNREDEEMED token on
+        // the one surface that cannot check, and clearing a live token is a
+        // lockout with no way back on Cloudflare.
+        //
+        // The divergence is not reachable today, though NOT because the
+        // bootstrap keys are unrendered — `auth_ui::pages::settings` puts both
+        // of them in its "Admin" section. It is unreachable because
+        // `settings_form::save_settings` short-circuits an empty-or-
+        // `MASKED_VALUE` submission for a sensitive var before calling
+        // `config::set`, so an empty value never reaches the guard below from
+        // the one caller that could produce it.
+        //
+        // KNOWN GAP, recorded rather than fixed: the parity stops at the
+        // create path. `variables::set`'s create branch builds its own
+        // `NewVariable` and so bypasses `VariablePatch::into_new`, which is
+        // where `is_sensitive_by_default_when_created` protects an undeclared,
+        // suffix-less ad hoc key. A `config.set` creating one therefore stores
+        // it unflagged where the admin PUT would flag it.
+        //
+        // Not reachable through THIS operation's only caller: every var
+        // `ui::settings_form` renders comes from a `ConfigVar` allowlist, and a
+        // declared key is settled by `into_row`. Note that "declared" has to
+        // mean what `config_vars::collect_all_config_vars` says it means —
+        // `auth_ui::pages::settings` renders
+        // `auth::config::auth_identity_config_vars`, which belongs to no
+        // `BlockInfo`, and an earlier version of that collector missed them and
+        // so called two ordinary admin toggles ad hoc. The gap is latent
+        // because of the allowlist, not because nothing undeclared can reach a
+        // settings form. The
         // runtime-owned refusal below is deliberately NOT symmetric: this
         // surface refuses the JWT secret (no caller legitimately writes it
         // here — `ui::settings_form` writes declared block and shared vars
@@ -240,8 +281,9 @@ impl VariablesConfigBlock {
         // that row IS the next boot's secret. See
         // `blocks::admin::ops::reject_runtime_owned_key`. The
         // sensitive-empty guard reads the stored flag exactly as that path
-        // does; a missing row has no stored secret to wipe, so only the
-        // suffix rule applies there.
+        // does; a missing row contributes no flag, so for it the guard rests
+        // on `is_sensitive_key`'s key half alone — the key's declaration or
+        // its `_SECRET`/`_KEY` spelling.
         let existing = match variables::find_by_key(&self.db, key).await {
             Ok(row) => row,
             Err(e) => {
@@ -251,7 +293,13 @@ impl VariablesConfigBlock {
                 )))
             }
         };
-        if value.is_empty() {
+        // The static provisioning-only exemption — the narrower of the two, per
+        // the note above. It has to be here at all for the reason it exists on
+        // the admin path: a spent bootstrap password must stay clearable
+        // because `delete_variable` and `key_is_deletable` both refuse to
+        // delete a declared `WAFER_RUN_SHARED__*` row, so without it the
+        // deployment keeps a plaintext admin password by every route.
+        if value.is_empty() && !crate::config_vars::is_provisioning_only_key(key) {
             let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
             if is_sensitive_key(key, stored_flag) {
                 return Err(OutputStream::error(WaferError::new(
@@ -269,12 +317,17 @@ impl VariablesConfigBlock {
             }
         }
 
-        // `sensitive` is only consulted when the row has to be created; an
-        // existing row keeps its stored flag. The suffix rule is the same one
-        // `update_variable` applies to a key it is creating.
-        let sensitive = existing
-            .as_ref()
-            .map_or_else(|| is_sensitive_key(key, 0), |row| row.sensitive);
+        // What this asserts ON TOP of the key's own declaration, which
+        // `variables::set` and `NewVariable::into_row` settle themselves: an
+        // existing row's stored flag, so an ad hoc row an admin marked
+        // sensitive in the UI stays that way. Deriving it here from the key's
+        // spelling alone is what let a `Password`-typed declared var with no
+        // row yet —
+        // `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD`, spelled neither
+        // `_SECRET` nor `_KEY` — land unflagged, after which the settings API
+        // served it verbatim and `cache_key::row_is_sensitive` judged it
+        // eligible for the edge cache.
+        let sensitive = existing.as_ref().is_some_and(|row| row.sensitive);
         if let Err(e) = variables::set(&self.db, key, value, "", "", sensitive).await {
             return Err(OutputStream::error(WaferError::new(
                 ErrorCode::Internal,

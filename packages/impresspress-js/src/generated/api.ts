@@ -413,7 +413,9 @@ export interface paths {
                                 key: string;
                                 /**
                                  * @description Whether `value` is masked. True when the row carries the sensitive
-                                 *     flag or the key ends in `_SECRET` or `_KEY`.
+                                 *     flag, or the key is one this build knows to hold a secret: it ends in
+                                 *     `_SECRET` or `_KEY`, or its declaration is a password-typed or
+                                 *     auto-generated variable.
                                  */
                                 sensitive: boolean;
                                 /**

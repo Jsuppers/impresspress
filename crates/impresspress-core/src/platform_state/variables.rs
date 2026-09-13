@@ -125,8 +125,43 @@ pub struct NewVariable {
 impl NewVariable {
     /// The row this becomes: a synthesised `var_<uuid>` id and both
     /// timestamps set to now.
+    ///
+    /// The funnel for creating a variables row through this module —
+    /// `insert_if_absent`, [`set`]'s create branch, [`insert`] and therefore
+    /// [`upsert_by_key`]'s create branch all pass through here — which is why
+    /// the `sensitive` flag is settled here rather than trusted from each
+    /// caller.
+    ///
+    /// One writer to this table does NOT come through here:
+    /// `blocks::dev::data_snapshot::import` upserts a bundle's own columns
+    /// straight through `db::upsert`. It applies the same rule itself
+    /// (`raise_imported_sensitive_flag`) rather than being routed here, because
+    /// it is writing rows that already exist elsewhere rather than minting new
+    /// ones — it must keep the bundle's `id` and timestamps, which this
+    /// function synthesises.
+    ///
+    /// `sensitive` is RAISED to whatever
+    /// [`crate::config_vars::is_sensitive_for_storage`] says the key requires,
+    /// and never lowered: a caller may mark an ad hoc row sensitive on its own
+    /// authority, but it may not mark a `Password`-typed declared var or a
+    /// `*_SECRET`/`*_KEY` key as safe to publish.
+    ///
+    /// Two call sites used to derive this from the key's spelling alone —
+    /// `seed_and_load`'s env loop and `blocks::config`'s `CONFIG_SET` — and
+    /// both therefore stored
+    /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` unflagged, since it
+    /// is declared `InputType::Password` and ends in neither suffix. After that
+    /// `util::is_sensitive_key` had nothing left to go on and the settings API
+    /// served the password verbatim. Settling it here is what makes the next
+    /// call site safe without it having to know the rule.
+    ///
+    /// It does NOT cover a key the build has never heard of: it raises from the
+    /// declaration or the suffix, and an ad hoc key is neither. That case is
+    /// [`VariablePatch::into_new`]'s default, which is the create path an
+    /// admin PUT takes.
     pub fn into_row(self) -> VariableRow {
         let now = crate::util::now_rfc3339();
+        let sensitive = self.sensitive || crate::config_vars::is_sensitive_for_storage(&self.key);
         VariableRow {
             id: format!("var_{}", uuid::Uuid::new_v4()),
             key: self.key,
@@ -134,7 +169,7 @@ impl NewVariable {
             name: self.name,
             description: self.description,
             warning: self.warning,
-            sensitive: self.sensitive,
+            sensitive,
             block: self.block,
             updated_by: self.updated_by,
             created_at: now.clone(),
@@ -183,6 +218,20 @@ impl VariablePatch {
 
     /// The row to create when the key has none yet: unset fields take the
     /// column defaults, `block` is derived from the key.
+    ///
+    /// `sensitive` is the exception to "unset means the column default". An
+    /// unset flag takes [`crate::config_vars::is_sensitive_by_default_when_created`],
+    /// which protects an undeclared ad hoc key, because `false` here was a real
+    /// hole: `admin::ops::update_variable` builds a patch that never sets
+    /// `sensitive`, so a `PATCH /b/admin/api/settings/MY_SERVICE_TOKEN` on a key
+    /// with no row stored it unflagged and the next GET published it — while the
+    /// same key through POST was protected by `handle_create`'s "absent means
+    /// sensitive" rule. `NewVariable::into_row` could not save it either: that
+    /// funnel raises for the declared set and the `_SECRET`/`_KEY` suffix, and
+    /// an ad hoc key is neither.
+    ///
+    /// A caller that means it still wins by saying so — `dev::seed::record_failure`
+    /// passes an explicit `Some(false)` for its diagnostic row.
     fn into_new(self, key: &str) -> NewVariable {
         NewVariable {
             key: key.to_string(),
@@ -190,7 +239,9 @@ impl VariablePatch {
             name: self.name.unwrap_or_default(),
             description: self.description.unwrap_or_default(),
             warning: self.warning.unwrap_or_default(),
-            sensitive: self.sensitive.unwrap_or(false),
+            sensitive: self
+                .sensitive
+                .unwrap_or_else(|| crate::config_vars::is_sensitive_by_default_when_created(key)),
             updated_by: self.updated_by.unwrap_or_default(),
             block: block_for_key(key),
         }
@@ -240,8 +291,13 @@ pub async fn find_by_key(
 }
 
 /// `INSERT OR IGNORE` semantics: insert `row` only when no row with its key
-/// exists. A pre-existing row (env override, prior boot, admin-UI edit)
-/// always wins — seeding never clobbers a stored value.
+/// exists. A pre-existing row (a prior boot's seed, an admin-UI edit) always
+/// wins — seeding never clobbers a stored value.
+///
+/// This is the shape [`seed_and_load`] applies to the process environment: an
+/// env var seeds a key that has no row yet and never overwrites one that does.
+/// Whether that is the right precedence is a separate question, open at the
+/// time of writing and not settled by this module.
 ///
 /// Returns `Ok(true)` when a row was inserted, `Ok(false)` when one already
 /// existed. Errors bubble up so the caller can decide whether a failed seed
@@ -304,15 +360,22 @@ pub async fn seed_if_absent(
 /// `WAFER_RUN_SHARED__HAS_LANDING_PAGE = "true"` silently lost to the
 /// declared `"false"`.
 ///
-/// Only `value` (and `updated_at`) is written on an existing row: `name`,
-/// `description` and `sensitive` describe the variable, not the deployment,
-/// and an operator's edit to them survives. The metadata arguments are used
-/// only when the row has to be created — the same shape [`seed_if_absent`]
-/// takes, so the two read alike at a call site.
+/// On an existing row this writes `value` and, when the caller says the value
+/// is sensitive and the stored flag is clear, raises `sensitive` — never
+/// lowers it. `name` and `description` describe the variable rather than the
+/// deployment, so an operator's wording survives; `sensitive` is different in
+/// kind, because it is the only thing that carries an AD HOC row's
+/// sensitivity — one the build declares no `ConfigVar` for, so
+/// `util::is_sensitive_key`'s key half has nothing to say about it — and
+/// because a row stored unflagged for a key that should be flagged is a
+/// disagreement between the column and the declaration, which the boot repair
+/// pass then has to reconcile. The metadata arguments are otherwise used only
+/// when the row has to be created — the same shape [`seed_if_absent`] takes, so
+/// the two read alike at a call site.
 ///
-/// Returns `Ok(true)` when the stored value actually changed. A boot that
-/// re-asserts a value it already holds performs no write at all, which is
-/// what keeps this callable unconditionally on every boot.
+/// Says which of the four things it did ([`Wrote`]). A boot that re-asserts a
+/// value it already holds performs no write at all, which is what keeps this
+/// callable unconditionally on every boot.
 pub async fn set(
     db: &Arc<dyn DatabaseService>,
     key: &str,
@@ -320,7 +383,7 @@ pub async fn set(
     name: &str,
     description: &str,
     sensitive: bool,
-) -> Result<bool, String> {
+) -> Result<Wrote, String> {
     let Some(existing) = find_by_key(db, key).await? else {
         let row = NewVariable {
             key: key.to_string(),
@@ -337,20 +400,65 @@ pub async fn set(
             .await
             .map_err(|e| format!("insert variable `{key}`: {e}"))?;
         crate::config_generation::note_config_write();
-        return Ok(true);
+        return Ok(Wrote::Created);
     };
-    if existing.value == value {
-        return Ok(false);
+    // The `sensitive` flag is the one piece of metadata a forced write DOES
+    // touch, and only ever upward. `name`/`description` describe the variable
+    // and an operator's wording survives; `sensitive` decides whether the
+    // value reaches an API response at all, and for an AD HOC key — one no
+    // `ConfigVar` declares — it is the only thing that can say so, because
+    // `util::is_sensitive_key`'s key half asks the declaration and there is
+    // none. A row stored with the flag clear when the caller knows better is
+    // a column that contradicts the declaration, so it is repaired in place.
+    // Never lowered: the read path's union means every disagreement must
+    // resolve towards more masking.
+    // The declaration has the final say on the update path too, not just at
+    // the create funnel: `blocks::config`'s `CONFIG_SET` passes the row's OWN
+    // stored flag for an existing row, so a row already stored unflagged would
+    // otherwise re-assert its own mistake forever.
+    let sensitive = sensitive || crate::config_vars::is_sensitive_for_storage(key);
+    let raise_sensitive = sensitive && !existing.sensitive;
+    let value_changed = existing.value != value;
+    if !value_changed && !raise_sensitive {
+        return Ok(Wrote::Unchanged);
     }
     let patch = VariablePatch {
-        value: Some(value.to_string()),
+        value: value_changed.then(|| value.to_string()),
+        sensitive: raise_sensitive.then_some(true),
         ..Default::default()
     };
     db.update(TABLE, &existing.id, patch.to_update_data())
         .await
         .map_err(|e| format!("update variable `{key}`: {e}"))?;
     crate::config_generation::note_config_write();
-    Ok(true)
+    Ok(if value_changed {
+        Wrote::Replaced
+    } else {
+        Wrote::FlagRaised
+    })
+}
+
+/// What a [`set`] call did to the row for its key.
+///
+/// Four cases rather than "did it write", because the callers that log have to
+/// tell them apart: creating the row for a key nobody had set yet is
+/// unremarkable, replacing a value someone else stored is the thing an operator
+/// needs to be told about, and raising a `sensitive` flag is a repair that must
+/// not be reported as either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrote {
+    /// No row existed for the key; one was created.
+    Created,
+    /// A row existed holding a different value, and that value was replaced.
+    /// Its `sensitive` flag may have been raised in the same write.
+    Replaced,
+    /// The row already held this value, but its `sensitive` flag was clear
+    /// and the caller knows the value is sensitive, so only the flag was
+    /// raised. A repair, not a config change.
+    FlagRaised,
+    /// Nothing was written: the row already held this value and its flag was
+    /// already right.
+    Unchanged,
 }
 
 /// Auto-generate random 32-byte hex secrets for every [`wafer_block::ConfigVar`]
@@ -421,8 +529,8 @@ async fn seed_one_secret(
 }
 
 /// Seed `env_vars` into the table (`INSERT OR IGNORE`), auto-generate any
-/// `auto_generate` secrets, and return the full key→value map currently
-/// stored.
+/// `auto_generate` secrets, reconcile every row's `sensitive` flag, and return
+/// the full key→value map currently stored.
 ///
 /// `env_vars` is empty for the browser and Cloudflare targets (their config
 /// lives in the platform store, not process env) and carries the
@@ -438,14 +546,16 @@ pub async fn seed_and_load(
 ) -> Result<HashMap<String, String>, String> {
     // 1. Seed env-provided values (existing rows win).
     for (key, value) in env_vars {
-        let sensitive = key.ends_with("_SECRET") || key.ends_with("_KEY");
+        // `sensitive` is settled by `NewVariable::into_row` from the key's
+        // declaration and the `_SECRET`/`_KEY` suffix; `false` here asserts
+        // nothing extra.
         let row = NewVariable {
             key: key.clone(),
             value: value.clone(),
             name: String::new(),
             description: String::new(),
             warning: String::new(),
-            sensitive,
+            sensitive: false,
             updated_by: String::new(),
             block: block_for_key(key),
         }
@@ -459,8 +569,14 @@ pub async fn seed_and_load(
     seed_auto_generated(db).await;
     seed_jwt_secret(db).await;
 
-    // 3. Load the full set back.
-    load_all(db).await
+    // 3. Load the full set back, reconciling any row whose stored `sensitive`
+    //    flag disagrees with what its key requires while passing over it.
+    let rows = load_rows(db).await?;
+    repair_sensitive_flags_in(db, &rows).await;
+    Ok(rows
+        .into_iter()
+        .map(|loaded| (loaded.row.key, loaded.row.value))
+        .collect())
 }
 
 /// JWT_SECRET is not declared as an `auto_generate: true` `ConfigVar` by the
@@ -497,10 +613,54 @@ async fn seed_jwt_secret(db: &Arc<dyn DatabaseService>) {
     }
 }
 
+/// Seed one row with an explicit `sensitive` column, bypassing
+/// [`NewVariable::into_row`].
+///
+/// TEST FIXTURE, and it lives here because this module owns the table — a
+/// block file naming `TABLE` to build the same row trips `tests/repo_door.rs`,
+/// correctly.
+///
+/// It exists because no supported API can produce this row any more: the
+/// creation funnel raises the flag on the way in, which is the property it
+/// exists for. A row an OLDER build left behind is the thing under test for
+/// the repair pass and for the admin edit form's masking.
+#[cfg(test)]
+pub(crate) async fn seed_row_with_flag(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
+    let now = crate::util::now_rfc3339();
+    let mut data = VariableRow {
+        id: format!("var_{}", uuid::Uuid::new_v4()),
+        key: key.to_string(),
+        value: value.to_string(),
+        name: String::new(),
+        description: String::new(),
+        warning: String::new(),
+        sensitive: false,
+        block: block_for_key(key),
+        updated_by: String::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+    .to_data();
+    data.insert("sensitive".to_string(), serde_json::json!(sensitive));
+    db::create(ctx, TABLE, data)
+        .await
+        .expect("seed a variables row");
+}
+
 /// Read every row into a key→value map. A row that does not decode (an empty
 /// `key`) is skipped and warned about as corruption rather than silently
 /// dropped.
 pub async fn load_all(db: &Arc<dyn DatabaseService>) -> Result<HashMap<String, String>, String> {
+    Ok(load_rows(db)
+        .await?
+        .into_iter()
+        .map(|loaded| (loaded.row.key, loaded.row.value))
+        .collect())
+}
+
+/// Every decodable row. The shared body of [`load_all`] and the boot-time
+/// sensitive-flag repair, which needs the whole row rather than the value.
+async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<LoadedRow>, String> {
     let opts = ListOptions {
         offset: 0,
         limit: 100_000,
@@ -511,16 +671,172 @@ pub async fn load_all(db: &Arc<dyn DatabaseService>) -> Result<HashMap<String, S
         .list(TABLE, &opts)
         .await
         .map_err(|e| format!("load variables from {TABLE}: {e}"))?;
-    let mut vars = HashMap::new();
+    let mut rows = Vec::with_capacity(listed.records.len());
     for record in listed.records {
         match VariableRow::from_record(&record.id, &record.data) {
             Ok(row) => {
-                vars.insert(row.key, row.value);
+                // Compared against the canonical value directly. A shape test
+                // on `Value::Number` was false for every backend that returns
+                // this INTEGER column as a string or a float — the shapes this
+                // change set exists because they occur — so the repair rewrote
+                // every required-sensitive row on every boot, each one bumping
+                // the config-write generation and invalidating warm snapshots.
+                let flag_is_canonical_one =
+                    record.data.get("sensitive") == Some(&serde_json::json!(1));
+                rows.push(LoadedRow {
+                    row,
+                    flag_is_canonical_one,
+                });
             }
             Err(e) => tracing::warn!(error = %e, "variables table contains an undecodable row"),
         }
     }
-    Ok(vars)
+    Ok(rows)
+}
+
+/// A decoded row plus how its `sensitive` column was actually spelled on disk.
+struct LoadedRow {
+    row: VariableRow,
+    /// `true` only when the column came back as exactly the integer `1`.
+    /// Any other spelling a backend or bundle can produce — a bool, a string,
+    /// a float, `2` — is readable (see [`crate::util::flag_is_set`]) but not
+    /// what the schema declares, so the repair pass rewrites it.
+    flag_is_canonical_one: bool,
+}
+
+/// Reconcile every stored row's `sensitive` flag with what its key requires,
+/// reading the table to find the ones that disagree.
+///
+/// Raises a flag the declaration or the `_SECRET`/`_KEY` suffix calls for, and
+/// never clears one. See the RAISE ONLY note in the body: lowering was the
+/// wrong trade — a mis-flagged row is a cosmetic annoyance, an unflagged
+/// credential is a leak — and an admin flagging an ad hoc row by hand is a
+/// decision this code has no standing to reverse either.
+///
+/// The write paths settle this at creation now ([`NewVariable::into_row`]), but
+/// a row an EARLIER build wrote is already in the database with the flag clear,
+/// and nothing else will ever revisit it: [`seed_and_load`] only touches keys
+/// the environment still exports, and `admin::settings::seed_defaults`'
+/// existing-row branch short-circuits on the stamped declared-vars hash for the
+/// life of a release. The likeliest holder of such a row is a bootstrap
+/// credential — set once from `.env` and then removed from it — so "the next
+/// write fixes it" would mean "never" for exactly the rows that matter most.
+///
+/// ## Every target has to call this, and they do not share one entry point
+///
+/// Native and the browser get it inside [`seed_and_load`], which reuses rows it
+/// has already fetched. **Cloudflare never calls `seed_and_load` at all** — its
+/// `CfDeployBootHooks::seed_and_load` runs [`seed_auto_generated`] and the
+/// `block_settings` seed and nothing else — so the hosted target calls this
+/// directly from that same deploy hook, at the cost of the one list this does
+/// for itself.
+///
+/// It belongs in the DEPLOY hook specifically, not the request-path one:
+/// `CfRequestBootHooks` is documented as physically write-free, and a write
+/// from it self-invalidates the fleet's config version and races concurrent
+/// isolates on insert. A repair at `/_deploy/init` time is both sufficient (the
+/// rows are legacy, not newly created) and the only safe slot.
+///
+/// Idempotent, and writes only when a row is actually wrong, so a healthy
+/// deployment pays one list and no writes.
+pub async fn repair_sensitive_flags(db: &Arc<dyn DatabaseService>) {
+    match load_rows(db).await {
+        Ok(rows) => repair_sensitive_flags_in(db, &rows).await,
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not read the variables table to repair `sensitive` flags"
+        ),
+    }
+}
+
+/// [`repair_sensitive_flags`] over rows the caller already has, so
+/// [`seed_and_load`] does not list the table twice.
+async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[LoadedRow]) {
+    for loaded in rows {
+        let row = &loaded.row;
+        let required = crate::config_vars::is_sensitive_for_storage(&row.key);
+
+        // RAISE ONLY. The pass used to also clear the flag on a declared key
+        // whose declaration did not call for one, so a mis-flag was
+        // recoverable. That was the wrong trade and is gone: the Add Variable
+        // modal ticks Sensitive by default, and a declared var with an empty
+        // default has no row until an admin makes one — so
+        // `WAFER_RUN_SHARED__EMBEDDED_SCRIPTS`, which carries operator-supplied
+        // script text that routinely embeds an analytics or API key, could be
+        // created flagged and then silently unflagged by the next boot,
+        // rendered in clear on the Variables page and made exportable into
+        // another deployment's seed bundle. Permanent masking is an annoyance;
+        // auto-unmasking a secret-bearing value and then exporting it is a
+        // leak, and the two do not weigh the same. A mis-flag is now fixed by
+        // the admin who made it, through the edit form's Sensitive control.
+        //
+        // Rewrite when the flag is not the canonical `1`: a row whose column
+        // holds `2`, `true` or `"true"` reads as flagged, so a `row.sensitive`
+        // skip would leave it in a shape the schema does not declare — and,
+        // before the readers were reconciled, one the settings API and the KV
+        // cache both read as UNflagged.
+        if !required || loaded.flag_is_canonical_one {
+            continue;
+        }
+
+        // Whether the clear flag ever exposed anything, which decides how
+        // loudly this is reported. Two kinds of row reach here without having
+        // been readable, and calling either a breach is a false alarm with its
+        // own cost:
+        //
+        //   * a `*_SECRET`/`*_KEY` row. The key half of `util::is_sensitive_key`
+        //     has always covered the suffix, so the read path and the edge
+        //     cache (`cache_key::row_is_sensitive`) masked and excluded it all
+        //     along whatever its flag said — telling an operator their Stripe
+        //     key "was being served unmasked" is simply untrue.
+        //   * a row whose column holds `2`, `true`, `"true"` or `1.0`. That is
+        //     the OTHER reason this branch is reached (`!flag_is_canonical_one`
+        //     rather than a clear flag), and `VariableRow::from_record` decodes
+        //     it through `flag_is_set`, so `row.sensitive` is true and every
+        //     reader masked it on the flag alone. What is wrong with such a row
+        //     is its SHAPE, which is what the rewrite below fixes — nothing was
+        //     published, so nothing needs rotating.
+        //
+        // What is left is a DECLARED `Password`/`auto_generate` key whose
+        // column really is clear. Today's build masks it anyway — the key half
+        // of `is_sensitive_key` asks the declaration now — but the build that
+        // wrote this row did not, and served it in the clear for the row's
+        // whole life up to this upgrade. That is a credential to rotate, and
+        // this is the one moment an operator gets told.
+        let was_exposed = !row.sensitive && !crate::config_vars::has_sensitive_suffix(&row.key);
+        let patch = VariablePatch {
+            sensitive: Some(true),
+            ..Default::default()
+        };
+        match db.update(TABLE, &row.id, patch.to_update_data()).await {
+            Ok(_) => {
+                crate::config_generation::note_config_write();
+                if was_exposed {
+                    tracing::warn!(
+                        key = %row.key,
+                        "repaired the stored `sensitive` flag for this config key; it was \
+                         written before the flag was derived from the variable's declaration, \
+                         so an EARLIER BUILD of this deployment served its value unmasked — \
+                         treat the credential as exposed and rotate it"
+                    );
+                } else {
+                    tracing::info!(
+                        key = %row.key,
+                        "tidied the stored `sensitive` flag for this config key; it was \
+                         already reading as sensitive (its `_SECRET`/`_KEY` name, or a \
+                         non-canonical but truthy column), so nothing was exposed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                key = %row.key,
+                error = %e,
+                "failed to repair a config key's `sensitive` flag; the value stays masked \
+                 (`util::is_sensitive_key` reads the declaration, not just this column), \
+                 but the row keeps a shape the schema does not declare"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +1171,15 @@ mod tests {
             created.name, "",
             "unset patch fields take the column default"
         );
-        assert!(!created.sensitive);
+        // `sensitive` is the one field that does NOT take the column default:
+        // `SITE_TAGLINE` is an ad hoc key no `ConfigVar` declares, so
+        // `into_new` protects it rather than publishing it. Matches what a
+        // POST of the same key through `handle_create` (absent means
+        // sensitive) has always produced.
+        assert!(
+            created.sensitive,
+            "an undeclared key created without an explicit flag is protected"
+        );
 
         let updated = upsert_by_key(
             &ctx,
@@ -973,10 +1297,11 @@ mod boot_tests {
         );
         assert_eq!(value_of(&db, key).await.as_deref(), Some("false"));
 
-        assert!(
+        assert_eq!(
             set(&db, key, "true", "Has Landing Page", "declared", false)
                 .await
                 .expect("force-set"),
+            Wrote::Replaced,
             "the value changed, so the row was written"
         );
         assert_eq!(value_of(&db, key).await.as_deref(), Some("true"));
@@ -987,13 +1312,17 @@ mod boot_tests {
     async fn re_asserting_the_same_value_is_not_a_write() {
         let db = migrated_db().await;
         let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
-        assert!(set(&db, key, "true", "n", "d", false)
-            .await
-            .expect("create"));
-        assert!(
-            !set(&db, key, "true", "n", "d", false)
+        assert_eq!(
+            set(&db, key, "true", "n", "d", false)
+                .await
+                .expect("create"),
+            Wrote::Created
+        );
+        assert_eq!(
+            set(&db, key, "true", "n", "d", false)
                 .await
                 .expect("re-assert"),
+            Wrote::Unchanged,
             "an unchanged value must not be written again"
         );
         assert_eq!(value_of(&db, key).await.as_deref(), Some("true"));
@@ -1005,9 +1334,12 @@ mod boot_tests {
     async fn an_absent_key_is_created_with_its_block_column() {
         let db = migrated_db().await;
         let key = "WAFER_RUN__AUTH__PROBE";
-        assert!(set(&db, key, "true", "Probe", "d", false)
-            .await
-            .expect("create"));
+        assert_eq!(
+            set(&db, key, "true", "Probe", "d", false)
+                .await
+                .expect("create"),
+            Wrote::Created
+        );
 
         let row = find_by_key(&db, key)
             .await
@@ -1090,6 +1422,415 @@ mod boot_tests {
             "metadata describes the variable, not the deployment"
         );
         assert_eq!(row.name, "Has Landing Page");
+    }
+
+    /// `FOO=` in a shell or a `.env` file is "unset", not "set to blank": an
+    /// empty env value must not wipe a meaningful stored one. Same convention
+    /// as `admin::settings::seed_defaults` and `AuthConfig::from_map`.
+    #[tokio::test]
+    async fn an_empty_env_value_does_not_blank_out_a_stored_value() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        seed_if_absent(&db, key, "Impresspress", "App Name", "declared", false)
+            .await
+            .expect("seed");
+
+        let vars = seed_and_load(&db, &[(key.to_string(), String::new())])
+            .await
+            .expect("seed and load");
+        assert_eq!(vars.get(key).map(String::as_str), Some("Impresspress"));
+    }
+
+    /// An env-written row for a `Password`-typed declared var must carry
+    /// `sensitive = 1`, even though its key ends in neither `_SECRET` nor
+    /// `_KEY`. The read path's union (`util::is_sensitive_key`) asks the
+    /// declaration too now, so a wrong column no longer publishes the value —
+    /// but it still decides what the admin UI's Sensitive control reads back,
+    /// and leaving it wrong means every boot re-runs the repair pass and every
+    /// repair re-reports a breach. The masking itself is asserted in
+    /// `blocks::admin::settings`; this pins the column beside it.
+    #[tokio::test]
+    async fn an_env_written_password_var_is_stored_sensitive() {
+        let db = migrated_db().await;
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+
+        seed_and_load(&db, &[(key.to_string(), "hunter2".to_string())])
+            .await
+            .expect("seed and load");
+
+        let row = find_by_key(&db, key).await.expect("list").expect("row");
+        assert!(row.sensitive, "a declared Password var must be flagged");
+    }
+
+    /// Write a row the way an OLDER BUILD did — straight to the table,
+    /// bypassing [`NewVariable::into_row`], which now settles the flag — so
+    /// the repair paths have something to repair. No supported API can produce
+    /// this row any more, which is the point of the funnel.
+    ///
+    /// `flag` is written into the `sensitive` column verbatim, so a test can
+    /// stage the shapes the schema does not declare (`2`, `true`, `"true"`,
+    /// `1.0`) as well as a plain clear flag.
+    async fn raw_insert_with_flag(
+        db: &Arc<dyn DatabaseService>,
+        key: &str,
+        value: &str,
+        flag: Value,
+    ) {
+        let now = crate::util::now_rfc3339();
+        let mut data = VariableRow {
+            id: format!("var_{}", uuid::Uuid::new_v4()),
+            key: key.to_string(),
+            value: value.to_string(),
+            name: String::new(),
+            description: String::new(),
+            warning: String::new(),
+            sensitive: false,
+            block: block_for_key(key),
+            updated_by: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+        .to_data();
+        data.insert("sensitive".to_string(), flag);
+        db.create(TABLE, data).await.expect("raw create");
+    }
+
+    /// [`raw_insert_with_flag`] with the clear flag an older build wrote.
+    async fn raw_insert_unflagged(db: &Arc<dyn DatabaseService>, key: &str, value: &str) {
+        raw_insert_with_flag(db, key, value, json!(0)).await;
+    }
+
+    /// Every create funnels through `NewVariable::into_row`, so a caller that
+    /// passes `sensitive: false` for a `Password`-typed declared var gets a
+    /// flagged row anyway. This is the class fix: `seed_if_absent`, `set`'s
+    /// create branch, `insert` and `upsert_by_key`'s create branch all pass
+    /// through it, so no call site can reintroduce the leak.
+    #[tokio::test]
+    async fn every_create_path_flags_a_password_var_whatever_the_caller_passes() {
+        let password = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        let token = crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY;
+
+        let db = migrated_db().await;
+        seed_if_absent(&db, password, "hunter2", "", "", false)
+            .await
+            .expect("seed");
+        assert!(
+            find_by_key(&db, password)
+                .await
+                .expect("list")
+                .expect("row")
+                .sensitive,
+            "seed_if_absent must not be able to store a Password var unflagged"
+        );
+
+        let db = migrated_db().await;
+        set(&db, token, "tok", "", "", false)
+            .await
+            .expect("set-create");
+        assert!(
+            find_by_key(&db, token)
+                .await
+                .expect("list")
+                .expect("row")
+                .sensitive,
+            "set's create branch must not be able to store a Password var unflagged"
+        );
+    }
+
+    /// A row an older build left unflagged is repaired in place by a write,
+    /// with its value untouched, and the repair is not reported as a config
+    /// change.
+    #[tokio::test]
+    async fn a_write_repairs_an_unflagged_row_without_touching_its_value() {
+        let db = migrated_db().await;
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        raw_insert_unflagged(&db, key, "hunter2").await;
+
+        // `false` is what `blocks::config`'s CONFIG_SET passes for an existing
+        // row: the row's own stored flag, i.e. its own mistake.
+        assert_eq!(
+            set(&db, key, "hunter2", "", "", false)
+                .await
+                .expect("repair"),
+            Wrote::FlagRaised,
+            "an unchanged value whose flag needs raising is a repair, not a replacement"
+        );
+        let row = find_by_key(&db, key).await.expect("list").expect("row");
+        assert!(row.sensitive);
+        assert_eq!(row.value, "hunter2", "a repair must not move the value");
+
+        assert_eq!(
+            set(&db, key, "hunter2", "", "", false)
+                .await
+                .expect("re-assert"),
+            Wrote::Unchanged,
+            "the repair is idempotent"
+        );
+        assert!(
+            find_by_key(&db, key)
+                .await
+                .expect("list")
+                .expect("row")
+                .sensitive,
+            "the flag must never be lowered — the read path's union only ever \
+             resolves towards more masking"
+        );
+    }
+
+    /// The one-shot boot repair, which is what reaches the row that matters
+    /// most: a bootstrap credential an operator set once from `.env` and then
+    /// removed. Nothing writes that key any more — `seed_and_load` only
+    /// touches keys the environment still exports, and `seed_defaults`'
+    /// existing-row branch is hash-gated for the life of a release — so
+    /// without this pass it stays unmasked indefinitely.
+    #[tokio::test]
+    async fn boot_repairs_an_unflagged_row_for_a_key_the_environment_no_longer_sets() {
+        let db = migrated_db().await;
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        raw_insert_unflagged(&db, key, "hunter2").await;
+
+        // An empty environment: the operator removed the export.
+        let vars = seed_and_load(&db, &[]).await.expect("boot");
+
+        let row = find_by_key(&db, key).await.expect("list").expect("row");
+        assert!(
+            row.sensitive,
+            "the boot pass must repair a row nothing else will ever revisit"
+        );
+        assert_eq!(row.value, "hunter2", "a repair must not move the value");
+        assert_eq!(
+            vars.get(key).map(String::as_str),
+            Some("hunter2"),
+            "and the loaded map still carries the value"
+        );
+
+        // Idempotent: a healthy table costs no writes.
+        let before = crate::config_generation::config_write_generation();
+        seed_and_load(&db, &[]).await.expect("second boot");
+        assert_eq!(
+            before,
+            crate::config_generation::config_write_generation(),
+            "a boot with nothing to repair must not write"
+        );
+    }
+
+    /// The standalone entry point, which is what the HOSTED target calls:
+    /// Cloudflare never runs `seed_and_load` (it has no process environment to
+    /// seed from), so `CfDeployBootHooks::seed_and_load` calls this directly.
+    /// That crate is wasm-only and CI does not execute its tests, so this is
+    /// the executed coverage for the function behind that call.
+    #[tokio::test]
+    async fn the_standalone_repair_entry_point_fixes_an_unflagged_row() {
+        let db = migrated_db().await;
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        raw_insert_unflagged(&db, key, "hunter2").await;
+
+        repair_sensitive_flags(&db).await;
+
+        let row = find_by_key(&db, key).await.expect("list").expect("row");
+        assert!(row.sensitive);
+        assert_eq!(row.value, "hunter2", "a repair must not move the value");
+    }
+
+    /// A flag stored in a shape the schema does not declare is normalised,
+    /// not skipped.
+    ///
+    /// `2`, `true` and `"true"` all read as flagged by `RecordExt::bool_field`
+    /// — so the repair pass used to `continue` past them as "already fine" —
+    /// while `util::is_sensitive_key` wanted exactly `1` and
+    /// `cache_key::row_is_sensitive` converted with `json_as_i64`, which
+    /// answers `None` for a bool and for `"true"`. The row was therefore
+    /// served in the clear and judged KV-cacheable at the same time as being
+    /// "already flagged". Both halves are asserted: every shape reads as
+    /// sensitive on the two read paths, and the repair rewrites it to the
+    /// canonical integer.
+    #[tokio::test]
+    async fn a_non_canonical_sensitive_flag_is_read_as_set_and_normalised() {
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        for shape in [
+            serde_json::json!(2),
+            serde_json::json!(true),
+            serde_json::json!("true"),
+            // A float is a shape `variable_is_exportable` already anticipates.
+            // Read as unset it would have been served in the clear AND
+            // rewritten on every boot without ever converging, since
+            // `flag_is_canonical_one` can never become true for it.
+            serde_json::json!(1.0),
+        ] {
+            // The read paths must already agree that this is sensitive, with
+            // no boot required.
+            assert!(
+                crate::util::flag_is_set(&shape),
+                "{shape} must read as a set flag"
+            );
+            let mut row_map = HashMap::new();
+            row_map.insert("key".to_string(), serde_json::json!(key));
+            row_map.insert("sensitive".to_string(), shape.clone());
+            assert!(
+                crate::cache_key::row_is_sensitive(
+                    crate::cache_key::CachedTable::Variables,
+                    &row_map
+                ),
+                "{shape} must keep the row out of the KV cache"
+            );
+
+            // And the repair normalises it to the declared integer.
+            let db = migrated_db().await;
+            raw_insert_with_flag(&db, key, "hunter2", shape.clone()).await;
+
+            repair_sensitive_flags(&db).await;
+
+            let stored = db
+                .list(
+                    TABLE,
+                    &ListOptions {
+                        limit: 10,
+                        skip_count: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("list")
+                .records;
+            assert_eq!(
+                stored[0].data.get("sensitive"),
+                Some(&serde_json::json!(1)),
+                "{shape} must be normalised to the canonical integer"
+            );
+        }
+    }
+
+    /// A non-canonical but TRUTHY flag is a shape defect, not a breach.
+    ///
+    /// `2`, `true`, `"true"` and `1.0` all decode through `flag_is_set`, so
+    /// `VariableRow::sensitive` is true and every read path masked the value on
+    /// the flag alone. The repair still rewrites the column — that is what the
+    /// test above pins — but reporting "an EARLIER BUILD … served its value
+    /// unmasked" for such a row sends an operator to rotate a credential that
+    /// was never published. The pass already refuses that false alarm for the
+    /// `_SECRET`/`_KEY` case; the argument is the same here.
+    ///
+    /// The clear-flag row is the positive control in the same test, so a
+    /// `was_exposed` that simply answered `false` everywhere could not pass it.
+    #[tokio::test]
+    async fn only_a_row_that_was_really_readable_is_reported_as_exposed() {
+        /// A fragment unique to the breach WARN.
+        const BREACH: &str = "rotate it";
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "a suffix key is already exempt for a different reason; this needs the other kind"
+        );
+
+        for shape in [json!(2), json!(true), json!("true"), json!(1.0)] {
+            let db = migrated_db().await;
+            raw_insert_with_flag(&db, key, "hunter2", shape.clone()).await;
+
+            let capture = crate::test_support::MessageCapture::default();
+            {
+                let _guard = tracing::subscriber::set_default(capture.clone());
+                repair_sensitive_flags(&db).await;
+            }
+            assert_eq!(
+                capture.count_containing(BREACH),
+                0,
+                "{shape} read as a set flag, so the value was masked all along — \
+                 reporting it as exposed is a false breach report"
+            );
+        }
+
+        // Positive control: a genuinely clear flag on the same key WAS served
+        // unmasked by the build that wrote it, and must still be reported.
+        let db = migrated_db().await;
+        raw_insert_unflagged(&db, key, "hunter2").await;
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            repair_sensitive_flags(&db).await;
+        }
+        assert_eq!(
+            capture.count_containing(BREACH),
+            1,
+            "a declaration-only-sensitive row stored with a clear flag really was \
+             published by the build that wrote it, and the operator has to be told"
+        );
+    }
+
+    /// The repair pass NEVER clears a flag, only raises it.
+    ///
+    /// It used to clear one on any declared key the declaration did not call
+    /// for, so a mis-flag was recoverable. The Add Variable modal ticks
+    /// Sensitive by default and a declared var with an empty default has no
+    /// row until an admin makes one — so
+    /// `WAFER_RUN_SHARED__EMBEDDED_SCRIPTS`, which carries operator-supplied
+    /// script text that routinely embeds an analytics or API key, could be
+    /// created flagged and silently unflagged by the next boot, then rendered
+    /// in clear and allowed into a seed bundle. Recovery from a mis-flag is
+    /// the edit form's job now.
+    #[tokio::test]
+    async fn the_repair_pass_never_clears_a_flag_an_admin_set() {
+        let db = migrated_db().await;
+        let key = "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS";
+        assert!(
+            !crate::config_vars::is_sensitive_for_storage(key),
+            "the declaration does not call for a flag here — that is the case under test"
+        );
+
+        // What the Add Variable modal produces with its default tick.
+        seed_if_absent(&db, key, "/analytics.js?token=abc123", "", "", true)
+            .await
+            .expect("admin creates it flagged");
+
+        repair_sensitive_flags(&db).await;
+
+        assert!(
+            find_by_key(&db, key)
+                .await
+                .expect("list")
+                .expect("row")
+                .sensitive,
+            "a boot must never unmask a value an admin chose to mask"
+        );
+    }
+
+    /// A row that is legitimately not sensitive is left alone by the repair
+    /// pass — it raises flags, it does not set them everywhere.
+    #[tokio::test]
+    async fn the_boot_repair_leaves_an_ordinary_row_alone() {
+        let db = migrated_db().await;
+        seed_if_absent(&db, "WAFER_RUN_SHARED__APP_NAME", "Foo", "", "", false)
+            .await
+            .expect("seed");
+        seed_and_load(&db, &[]).await.expect("boot");
+        assert!(
+            !find_by_key(&db, "WAFER_RUN_SHARED__APP_NAME")
+                .await
+                .expect("list")
+                .expect("row")
+                .sensitive
+        );
+    }
+
+    /// A boot that re-asserts the same environment writes nothing at all —
+    /// the property that keeps a boot from issuing an UPDATE per declared key
+    /// on every cold start.
+    #[tokio::test]
+    async fn re_applying_the_same_environment_writes_nothing() {
+        let db = migrated_db().await;
+        let env = [("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string())];
+        seed_and_load(&db, &env).await.expect("first boot");
+
+        let before = crate::config_generation::config_write_generation();
+        seed_and_load(&db, &env).await.expect("second boot");
+        assert_eq!(
+            before,
+            crate::config_generation::config_write_generation(),
+            "an unchanged environment must not write a row"
+        );
     }
 
     /// `load_all` skips a row whose key is empty (corruption) rather than

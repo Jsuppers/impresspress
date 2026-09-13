@@ -779,6 +779,42 @@ impl TestContext {
         self.boot_config_service_with(&[]).await;
     }
 
+    /// Run the production boot-time `sensitive`-flag reconciliation
+    /// ([`crate::platform_state::variables::repair_sensitive_flags`]) over this
+    /// fixture's database — the pass native and the browser get inside
+    /// `seed_and_load` and Cloudflare gets from its deploy hook.
+    ///
+    /// Exists so a test can drive it without a boot: it is deliberately
+    /// un-gated, and a test that reached it only through `seed_and_load` could
+    /// not tell that apart from `admin::settings::seed_defaults`' hash-gated
+    /// path.
+    pub async fn repair_sensitive_flags(&self) {
+        crate::platform_state::variables::repair_sensitive_flags(&self.db_service).await;
+    }
+
+    /// Run the production boot seeder
+    /// ([`crate::platform_state::variables::seed_and_load`]) over this
+    /// fixture's database with `env_vars` — the batch `cli/server.rs` builds
+    /// from the process environment and hands it on native.
+    ///
+    /// The way to model "an operator set this in the deployment environment"
+    /// without touching `std::env`, which is `unsafe` in Rust 2024 and races
+    /// every other test in the binary. Writes rows only; use
+    /// [`Self::boot_config_service`] as well if the test also needs the
+    /// config service filled from them.
+    ///
+    /// PRECONDITION: admin migrations have run, so the `variables` table
+    /// exists.
+    pub async fn seed_env_vars(&self, env_vars: &[(&str, &str)]) {
+        let owned: Vec<(String, String)> = env_vars
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        crate::platform_state::variables::seed_and_load(&self.db_service, &owned)
+            .await
+            .expect("seed env vars at boot");
+    }
+
     /// [`Self::boot_config_service`], then layer `adapter_values` onto BOTH
     /// config surfaces the way a target's boot hook does after seeding — the
     /// browser adapter's `RuntimeConfig::republish` of

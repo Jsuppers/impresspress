@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, ConfigVar, InputStream, InputType, Message, OutputStream};
+use wafer_run::{context::Context, ConfigVar, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{AdminSettingView, AdminSettingsResponse},
@@ -97,9 +97,12 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
         Ok(row) => row,
         Err(response) => return response,
     };
-    // SEC-060: mask on the row flag OR the `_SECRET` / `_KEY` suffix — the
-    // single-key getter previously masked on the flag alone, so a `*_SECRET`
-    // key with the flag unset leaked its value here.
+    // SEC-060: mask on the row flag OR what the KEY says — the `_SECRET` /
+    // `_KEY` suffix, or a declaration that calls the var a password. The
+    // single-key getter masked on the flag alone once, so a `*_SECRET` key with
+    // the flag unset leaked its value here; it then masked on flag-or-suffix,
+    // so an unrepaired `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` row
+    // leaked instead.
     if ops::is_sensitive_key(key, i64::from(row.sensitive)) {
         row.value = MASKED_VALUE.to_string();
     }
@@ -126,6 +129,9 @@ pub(super) async fn handle_set(
     #[derive(serde::Deserialize)]
     struct Req {
         value: serde_json::Value,
+        /// Optional: absent leaves the stored masking flag alone.
+        #[serde(default)]
+        sensitive: Option<bool>,
     }
     let raw = input.collect_to_bytes().await;
     let body: Req = match serde_json::from_slice(&raw) {
@@ -150,6 +156,7 @@ pub(super) async fn handle_set(
         ops::VariableUpdate {
             value: Some(&value),
             description: None,
+            sensitive: body.sensitive,
         },
     )
     .await
@@ -237,20 +244,29 @@ const ADMIN_BLOCK_NAME: &str = "impresspress/admin";
 /// description, default, warning, sensitive flag) feeds the hash; sort by
 /// key so map ordering can't make two equivalent inputs hash differently.
 ///
-/// `var.auto_generate` / `var.optional` don't affect what `seed_defaults`
-/// writes — they're consumed by `seed_auto_generated` (CF runner) and the
-/// startup validator respectively — so they're intentionally omitted.
+/// `var.optional` does not affect what `seed_defaults` writes — it is consumed
+/// by the startup validator — so it is intentionally omitted.
+///
+/// `var.auto_generate` IS folded in, through the `sensitive` term:
+/// `config_vars::is_sensitive_var` unions it (an auto-generated secret is a
+/// secret, whatever its `input_type` says), so flipping `auto_generate` on a
+/// declared var moves this hash. That is deliberate — it changes the flag a
+/// fresh row is created with — and it is why the term is `is_sensitive_var(v)`
+/// rather than `input_type == Password`.
 fn seed_payload_hash(vars: &[ConfigVar]) -> String {
     use std::fmt::Write as _;
     let mut keys: Vec<&ConfigVar> = vars.iter().collect();
     keys.sort_by(|a, b| a.key.cmp(&b.key));
     let mut buf = String::with_capacity(vars.len() * 128);
     for v in keys {
-        let sensitive = if v.input_type == InputType::Password {
-            1
-        } else {
-            0
-        };
+        // The same rule the seed loop below writes with, so the hash and the
+        // write cannot disagree about what a var's flag should be — and so a
+        // build that changes a var's sensitivity invalidates the gate and
+        // re-seeds instead of leaving the stored flag stale. Read from the var
+        // in hand (`is_sensitive_var`), not looked up by key: this hash exists
+        // to notice a DECLARATION change, including a var that just became a
+        // password.
+        let sensitive = i32::from(crate::config_vars::is_sensitive_var(v));
         // Fixed shape per var: `key\x1fname\x1fdescription\x1fdefault\x1fwarning\x1fsensitive\x1e`.
         // ASCII unit-separator (0x1f) + record-separator (0x1e) bracket
         // each field so embedded newlines / colons in description text
@@ -300,7 +316,9 @@ pub async fn seed_defaults(ctx: &dyn Context) {
         .collect();
 
     for var in &vars {
-        let sensitive = var.input_type == InputType::Password;
+        // What the DECLARATION requires. Not what gets written unconditionally:
+        // see the existing-row branch, which may only raise.
+        let sensitive = crate::config_vars::is_sensitive_var(var);
         let name = if var.name.is_empty() {
             &var.key
         } else {
@@ -337,15 +355,22 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 let same_name = row.name == *name;
                 let same_desc = row.description == var.description;
                 let same_warn = row.warning == var.warning;
-                let same_sens = row.sensitive == sensitive;
-                if same_name && same_desc && same_warn && same_sens && !stale_builtin_asset {
+                // `sensitive` is deliberately NOT patched here, in either
+                // direction. This branch is behind the declared-vars hash gate
+                // above, which every settled deployment passes — so anything
+                // written here waits for a release that changes a declaration,
+                // and a security flag cannot be on that schedule.
+                // `platform_state::variables::repair_sensitive_flags` owns the
+                // reconciliation instead: same rule, un-gated, on all three
+                // targets. This loop keeps only the descriptive metadata, which
+                // is exactly what the gate is appropriate for.
+                if same_name && same_desc && same_warn && !stale_builtin_asset {
                     continue;
                 }
                 let mut patch = VariablePatch {
                     name: Some(name.clone()),
                     description: Some(var.description.clone()),
                     warning: Some(var.warning.clone()),
-                    sensitive: Some(sensitive),
                     ..Default::default()
                 };
                 if stale_builtin_asset {
@@ -411,6 +436,8 @@ pub async fn seed_defaults(ctx: &dyn Context) {
 
 #[cfg(test)]
 mod tests {
+    use wafer_run::InputType;
+
     use super::*;
     use crate::test_support::TestContext;
 
@@ -437,9 +464,10 @@ mod tests {
     ///
     /// The endpoint's OpenAPI description promises exactly this, and the
     /// promise rests on two independent halves of `is_sensitive_key`: the
-    /// row's `sensitive` flag, and the `_SECRET` / `_KEY` suffix convention.
-    /// A key needs only one of them. Nothing tested this before the endpoint
-    /// was documented, which is the worst order to do it in.
+    /// row's `sensitive` flag, and what the KEY says — the `_SECRET` / `_KEY`
+    /// suffix convention, or a declaration that calls the var a password. A
+    /// key needs only one of them. Nothing tested this before the endpoint was
+    /// documented, which is the worst order to do it in.
     #[tokio::test]
     async fn list_masks_every_sensitive_value() {
         let ctx = TestContext::new().await;
@@ -671,6 +699,126 @@ mod tests {
             Some(MASKED_VALUE),
             "a *_SECRET value must be masked even with the sensitive flag unset"
         );
+    }
+
+    /// A `Password`-typed declared var supplied through the process
+    /// environment must come back MASKED from the settings read path.
+    ///
+    /// The boot seeder derived the row's `sensitive` flag from the
+    /// `_SECRET`/`_KEY` suffix alone, so
+    /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` — declared
+    /// `InputType::Password`, ending in neither suffix — landed with
+    /// `sensitive = 0`. `is_sensitive_key` was then a union of the stored flag
+    /// and the suffix alone, and this key satisfies neither, so `GET
+    /// /b/admin/api/settings/{key}` returned the bootstrap password in clear.
+    /// `seed_defaults` never repairs it: the declared-vars hash gate
+    /// short-circuits once stamped. Both halves are closed now and this test
+    /// pins the WRITE one — the reader's own declaration half is pinned by
+    /// `a_legacy_unflagged_declared_password_row_is_masked_by_every_read_path`,
+    /// which stages the row the writer can no longer produce.
+    ///
+    /// Drives the real write path (`seed_and_load`) into the real read paths,
+    /// not the stored integer, because the integer is only interesting for
+    /// what the reader does with it.
+    #[tokio::test]
+    async fn an_env_supplied_password_var_is_masked_by_the_settings_read_path() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        ctx.seed_env_vars(&[(key, "hunter2")]).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let body = output_json(handle_get(&ctx, &msg).await).await;
+        assert_eq!(
+            body.get("data")
+                .and_then(|d| d.get("value"))
+                .and_then(|v| v.as_str()),
+            Some(MASKED_VALUE),
+            "an env-supplied bootstrap password must not be readable through the settings API"
+        );
+
+        // The listings publish it too, and both must agree.
+        for listing in [
+            output_json(handle_list(&ctx).await).await,
+            output_json(handle_list_full(&ctx).await).await,
+        ] {
+            let raw = listing.to_string();
+            assert!(
+                !raw.contains("hunter2"),
+                "a settings listing leaked the bootstrap password: {raw}"
+            );
+        }
+    }
+
+    /// A row an OLDER build stored UNFLAGGED for a declaration-only-sensitive
+    /// key must still be masked by every settings read path.
+    ///
+    /// `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` is declared
+    /// `InputType::Password` and spelled with neither `_SECRET` nor `_KEY`, so
+    /// the stored flag was the only thing the readers consulted — and on a
+    /// deployment that has not yet run `repair_sensitive_flags` (on Cloudflare,
+    /// one with no `/_deploy/init` since the upgrade) that flag is still `0`.
+    /// The edit modal already masks such a row off the DECLARATION
+    /// (`handle_edit_variable_form`'s `show_sensitive`); these three endpoints
+    /// published the password verbatim in the same window. The modal's source
+    /// and the read paths' have to be the same source.
+    ///
+    /// Stages the row in the variables TABLE, not the boot snapshot, and drives
+    /// the three real handlers.
+    #[tokio::test]
+    async fn a_legacy_unflagged_declared_password_row_is_masked_by_every_read_path() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
+        assert!(
+            !crate::config_vars::has_sensitive_suffix(key),
+            "the point of this test is a key the suffix rule cannot catch"
+        );
+        assert!(
+            crate::config_vars::is_sensitive_for_storage(key),
+            "and one the declaration does call sensitive"
+        );
+
+        // `variables::insert` would raise the flag on the way in — this is the
+        // row an older build left behind, so it goes in unflagged.
+        variables::seed_row_with_flag(&ctx, key, "hunter2", 0).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let body = output_json(handle_get(&ctx, &msg).await).await;
+        assert_eq!(
+            body.get("data")
+                .and_then(|d| d.get("value"))
+                .and_then(|v| v.as_str()),
+            Some(MASKED_VALUE),
+            "an unrepaired bootstrap-password row must not be readable through the settings API"
+        );
+
+        for listing in [
+            output_json(handle_list(&ctx).await).await,
+            output_json(handle_list_full(&ctx).await).await,
+        ] {
+            let raw = listing.to_string();
+            assert!(
+                !raw.contains("hunter2"),
+                "a settings listing leaked an unrepaired bootstrap password: {raw}"
+            );
+        }
     }
 
     /// Read one variable row's `value` column.
