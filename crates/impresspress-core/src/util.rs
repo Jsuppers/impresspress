@@ -657,6 +657,36 @@ pub(crate) fn is_sensitive_key(key: &str, sensitive_flag: i64) -> bool {
     sensitive_flag == 1 || crate::config_vars::is_sensitive_for_storage(key)
 }
 
+/// Whether a submitted `value` for `key` is the [`MASKED_VALUE`] a read path
+/// produced rather than a value its sender means.
+///
+/// The counterpart of [`is_sensitive_key`], for the write direction. Every read
+/// surface answers a sensitive key with `"********"`, so the read/modify/write
+/// loop a JSON client is built around — GET the settings, change one, PATCH
+/// them back — hands the mask straight back to the writer for every key it did
+/// not touch. Stored, it replaces the secret with eight asterisks; the worst
+/// case is a live `..._BOOTSTRAP_ADMIN_TOKEN`, which is what provisions the
+/// first admin.
+///
+/// Gated on sensitivity, not on the string alone: `"********"` is a perfectly
+/// ordinary value for a variable nothing masks (placeholder copy, a redaction
+/// marker), and refusing it there would be the write path inventing a reserved
+/// word. It is only a mask where something masked it — which is exactly the
+/// question [`is_sensitive_key`] answers, asked with the same stored flag the
+/// reader used.
+///
+/// Every write surface refuses it: the JSON API and the admin Variables modal
+/// through `blocks::admin::ops::update_variable`, and the generic
+/// ConfigVar-driven form through `ui::settings_form::save_settings`. None of
+/// them silently drops it instead — a caller that is told "saved" while its
+/// write was discarded can never find out, because the next read hands it the
+/// same mask back. "Leave the stored value alone" has its own spelling on each
+/// surface (omit `value`; leave the masked field blank), and that spelling is
+/// what the refusal names.
+pub(crate) fn is_masked_submission(key: &str, sensitive_flag: i64, value: &str) -> bool {
+    value == MASKED_VALUE && is_sensitive_key(key, sensitive_flag)
+}
+
 /// Percent-encode a string for use as an OAuth / `application/x-www-form-urlencoded`
 /// query parameter or form-body value. Delegates to
 /// [`url::form_urlencoded::byte_serialize`] which encodes spaces as `+` and

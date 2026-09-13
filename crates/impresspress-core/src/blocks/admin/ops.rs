@@ -42,7 +42,7 @@ pub(super) use crate::util::validate_url_value;
 /// modal, the shared settings form, the edge-cache exclusion and the export
 /// filter) must agree on this rule; re-exported here so existing
 /// `ops::`-qualified call sites in this module tree keep working.
-pub(super) use crate::util::{is_sensitive_key, MASKED_VALUE};
+pub(super) use crate::util::{is_masked_submission, is_sensitive_key, MASKED_VALUE};
 use crate::{
     blocks::{
         auth::{
@@ -700,6 +700,22 @@ pub(super) struct VariableUpdate<'a> {
     pub sensitive: Option<bool>,
 }
 
+/// The `sensitive` column of the stored row for `key`, as the `i64` flag
+/// [`is_sensitive_key`] takes, or `0` when no row is stored yet.
+///
+/// Its own function because two of [`update_variable`]'s guards need it and
+/// neither fires on an ordinary write: reading it lazily is what keeps the
+/// common write path at one statement. A read failure is a 500 rather than a
+/// guessed `0` — guessing would decide a security question by assuming the
+/// answer that lets the write through.
+async fn stored_sensitive_flag(ctx: &dyn Context, key: &str) -> Result<i64, OutputStream> {
+    match variables::get_by_key(ctx, key).await {
+        Ok(Some(row)) => Ok(i64::from(row.sensitive)),
+        Ok(None) => Ok(0),
+        Err(e) => Err(db_error_internal(e, "Database error")),
+    }
+}
+
 /// Update a config variable identified by `key` (upsert on the `key` column),
 /// writing an audit-log row. Enforces the sensitive-empty guard (a sensitive
 /// value can't be cleared — see [`is_sensitive_key`]: the row's stored
@@ -708,6 +724,10 @@ pub(super) struct VariableUpdate<'a> {
 /// SPENT provisioning credential, which [`is_clearable_provisioning_credential`]
 /// names and which must stay clearable because nothing can delete it either)
 /// and the `_URL` SSRF validation on both surfaces.
+///
+/// Also refuses a value that is the mask a read path emitted rather than a
+/// value the caller means — see [`is_masked_submission`]. Both surfaces route
+/// their writes through here, so neither can store `"********"` over a secret.
 ///
 /// Returns the upserted row.
 pub(super) async fn update_variable(
@@ -723,6 +743,29 @@ pub(super) async fn update_variable(
     let admin_id = msg.user_id().to_string();
 
     if let Some(value) = update.value {
+        // The mask is not a value. Every read path answers a sensitive key with
+        // `MASKED_VALUE`, so a client that GETs a setting and PATCHes it back —
+        // the read/modify/write loop a JSON client is built around — hands
+        // eight asterisks to the writer for every key it never meant to change.
+        // See [`is_masked_submission`] for why this is a refusal rather than a
+        // silent skip, and why it is gated on the key being masked at all.
+        //
+        // Checked on the same stored flag as the empty guard below, so the two
+        // cannot disagree about which keys they cover. They are mutually
+        // exclusive (`MASKED_VALUE` is not empty), so at most one of the two
+        // row reads ever happens. The string comparison is repeated outside the
+        // predicate only so that an ordinary write never pays for that read;
+        // the predicate is still what decides.
+        if value == MASKED_VALUE {
+            let stored_flag = stored_sensitive_flag(ctx, key).await?;
+            if is_masked_submission(key, stored_flag, value) {
+                return Err(err_bad_request(&format!(
+                    "{MASKED_VALUE} is the mask {key} reads back as, not its value: storing \
+                     it would destroy the secret. Send the real value to change it, or leave \
+                     the value out of the request to keep the stored one."
+                )));
+            }
+        }
         // Prevent clearing a sensitive value (would break auth). Sensitivity
         // is the same union the read/masking paths use ([`is_sensitive_key`]):
         // the row's stored `sensitive` flag OR what the key itself says — the
@@ -731,8 +774,9 @@ pub(super) async fn update_variable(
         // `BOOTSTRAP_ADMIN_PASSWORD` and `*_TOKEN`. The stored flag still adds
         // the ad hoc rows an admin marked in the UI, about which the
         // declaration knows nothing. The row lookup only happens on the
-        // empty-value path; a missing row (upsert-create branch) has no stored
-        // secret to wipe, so for it the key half decides alone.
+        // empty-value path (and the masked one above); a missing row (upsert-
+        // create branch) has no stored secret to wipe, so for it the key half
+        // decides alone.
         // A provisioning-only credential is the exception, and it has to be,
         // because this guard and the delete path would otherwise trap it
         // between them: `delete_variable` and the Variables page's
@@ -747,17 +791,24 @@ pub(super) async fn update_variable(
         // equally safe: bootstrap then declines to auto-create an admin, which
         // is a documented path (`"no bootstrap admin configured"`) and
         // re-settable, not a lockout.
-        if value.is_empty() && !is_clearable_provisioning_credential(ctx, key).await {
-            let stored_flag = match variables::get_by_key(ctx, key).await {
-                Ok(Some(row)) => i64::from(row.sensitive),
-                Ok(None) => 0,
-                Err(e) => return Err(db_error_internal(e, "Database error")),
-            };
-            if is_sensitive_key(key, stored_flag) {
-                return Err(err_bad_request(&format!(
-                    "Cannot set {key} to an empty value"
-                )));
-            }
+        //
+        // NOTE the deliberate difference from the mask: an EMPTY value is a
+        // refusal here but means "leave the stored value alone" on the two
+        // surfaces whose widget renders a masked field blank
+        // (`pages::variables::handle_update_variable` and
+        // `ui::settings_form::save_settings`, which both drop it before calling
+        // a writer). That is not a disagreement about the mask — both of them
+        // send a literal `MASKED_VALUE` straight here to be refused — it is the
+        // widget speaking: a blank masked field is the only thing a browser can
+        // post for "I did not touch this", whereas an empty value arriving on
+        // the JSON API was typed by a caller that had something else to say.
+        if value.is_empty()
+            && !is_clearable_provisioning_credential(ctx, key).await
+            && is_sensitive_key(key, stored_sensitive_flag(ctx, key).await?)
+        {
+            return Err(err_bad_request(&format!(
+                "Cannot set {key} to an empty value"
+            )));
         }
         // Validate URL-type keys (SSRF) on both surfaces.
         if key.ends_with("_URL") {

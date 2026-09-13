@@ -126,12 +126,21 @@ fn render_field(var: &ConfigVar, value: &str) -> Markup {
             }
         },
         InputType::Password => {
+            // Built from `MASKED_VALUE` rather than spelled out, so the
+            // placeholder and the mask every read path emits cannot drift into
+            // two different strings. The admin Variables edit modal renders the
+            // same pair.
+            let placeholder = if has_value {
+                format!("{MASKED_VALUE} (set)")
+            } else {
+                "Not configured".to_string()
+            };
             html! {
                 div .form-group {
                     label .form-label for=(var.key) { (label) }
                     div .value-reveal-wrapper {
                         input .form-input #(var.key) name=(var.key) type="password" value=(value)
-                            placeholder=(if has_value { "******** (set)" } else { "Not configured" });
+                            placeholder=(placeholder);
                         button type="button" .btn .btn--ghost .btn--icon .btn-icon-right
                             data-action="reveal-toggle"
                             data-reveal-target=(var.key)
@@ -362,16 +371,32 @@ pub async fn save_settings(
         // SEC-060: `render_field` never echoes a sensitive var's real value
         // back into the DOM (it renders empty + a placeholder instead), so
         // when the admin re-submits the form without retyping the secret the
-        // browser posts back either an empty string or — if some client
-        // literally round-trips the placeholder — the `MASKED_VALUE` mask
-        // itself. Neither is a real value; treat both as "leave the stored
-        // secret alone" instead of overwriting it with blank/mask bytes.
-        // Only a genuinely retyped value reaches `config::set`. Uses the
-        // same single-sourced `is_sensitive_key` rule as the render path so
-        // the two can't disagree on which fields this guard applies to.
+        // browser posts back an empty string. That is the widget saying "I did
+        // not touch this" — the only thing a blank masked field can mean — so
+        // the stored secret is left alone and only a genuinely retyped value
+        // reaches `config::set`. Uses the same single-sourced
+        // `is_sensitive_key` rule as the render path so the two can't disagree
+        // on which fields this applies to.
         let is_sensitive = is_sensitive_key(&var.key, var.is_sensitive() as i64);
-        if is_sensitive && (value.is_empty() || value == MASKED_VALUE) {
+        if is_sensitive && value.is_empty() {
             continue;
+        }
+        // The mask itself is a different case and gets a different answer. It
+        // is not something this form can post — the field is blank, and a
+        // placeholder is not submitted — so a client that sends it round-tripped
+        // a read, and storing it would replace the secret with eight asterisks.
+        // Refused rather than skipped, and refused identically by the admin
+        // variable surfaces (`blocks::admin::ops::update_variable`): a caller
+        // told "Settings saved" for a write that was discarded can never find
+        // out, because the next read hands it the same mask back. See
+        // `util::is_masked_submission`.
+        if crate::util::is_masked_submission(&var.key, var.is_sensitive() as i64, value) {
+            return err_bad_request(&format!(
+                "{}: {MASKED_VALUE} is the mask this value reads back as, not the value \
+                 itself. Type the real value to change it, or leave the field blank to keep \
+                 the stored one.",
+                var.key
+            ));
         }
         // Surface the first write failure instead of reporting a false
         // "saved" — htmx clients branch on the status, not a 200 body.
@@ -639,7 +664,7 @@ mod tests {
     // --- SEC-060: save_settings' unchanged-secret guard ---
 
     #[tokio::test]
-    async fn save_settings_leaves_a_sensitive_field_unchanged_on_empty_or_masked_submit() {
+    async fn save_settings_leaves_a_sensitive_field_unchanged_on_empty_submit() {
         let mut ctx = TestContext::new().await;
         // Registers a real `wafer-run/config` service block (TestContext::set_config)
         // and seeds the current stored secret.
@@ -657,22 +682,6 @@ mod tests {
             "an empty submit for a sensitive field must not clear/overwrite the stored secret"
         );
 
-        // A literal round-trip of the mask placeholder must also be treated
-        // as "unchanged", not stored as the literal mask string.
-        let out = run_save(
-            &ctx,
-            &allowed,
-            serde_json::json!({"X__API_SECRET": MASKED_VALUE}),
-        )
-        .await;
-        let body = output_json(out).await;
-        assert_eq!(body["message"], "Settings saved");
-        assert_eq!(
-            config::get_default(&ctx, "X__API_SECRET", "").await,
-            "original-secret",
-            "submitting the mask placeholder must not overwrite the stored secret with it"
-        );
-
         // A genuinely new value must still be written.
         let out = run_save(
             &ctx,
@@ -686,6 +695,68 @@ mod tests {
             config::get_default(&ctx, "X__API_SECRET", "").await,
             "brand-new-secret",
             "a genuinely retyped secret must be saved"
+        );
+    }
+
+    /// A literal round-trip of the mask is REFUSED, not silently dropped.
+    ///
+    /// It used to be folded in with the empty submit as "unchanged", which kept
+    /// the secret safe but answered `200 {"message": "Settings saved"}` to a
+    /// client whose write was discarded — and since the next read hands that
+    /// client the same mask back, nothing it could do would reveal the write
+    /// never happened. The two are different things and get different answers:
+    /// a blank field is the widget's only way to say "I did not touch this",
+    /// while the mask can only have come from a client round-tripping a read.
+    /// Same answer as the admin variable surfaces, whose
+    /// `ops::update_variable` refuses it identically — see
+    /// `util::is_masked_submission`.
+    #[tokio::test]
+    async fn save_settings_refuses_the_mask_rather_than_storing_or_dropping_it() {
+        let mut ctx = TestContext::new().await;
+        ctx.set_config("X__API_SECRET", "original-secret");
+        let allowed = [var("X__API_SECRET", "API Secret", InputType::Password)];
+
+        let out = run_save(
+            &ctx,
+            &allowed,
+            serde_json::json!({"X__API_SECRET": MASKED_VALUE}),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            400,
+            "a client that posts the mask must be told, not thanked"
+        );
+        assert_eq!(
+            config::get_default(&ctx, "X__API_SECRET", "").await,
+            "original-secret",
+            "and the stored secret must survive the refusal"
+        );
+    }
+
+    /// The refusal is scoped to fields something masks. A plain text setting
+    /// may hold the same eight characters — it is only a mask where a read path
+    /// put one.
+    #[tokio::test]
+    async fn save_settings_stores_the_mask_string_for_a_plain_field() {
+        let mut ctx = TestContext::new().await;
+        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
+        let allowed = [var(
+            "WAFER_RUN_SHARED__APP_NAME",
+            "App Name",
+            InputType::Text,
+        )];
+
+        let out = run_save(
+            &ctx,
+            &allowed,
+            serde_json::json!({"WAFER_RUN_SHARED__APP_NAME": MASKED_VALUE}),
+        )
+        .await;
+        assert_eq!(output_json(out).await["message"], "Settings saved");
+        assert_eq!(
+            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            MASKED_VALUE,
         );
     }
 
