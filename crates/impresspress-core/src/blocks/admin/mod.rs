@@ -1877,7 +1877,12 @@ mod page_link_tests {
     /// "Reset to environment" control for it. Separate from [`PROBE_VARIABLE`]
     /// because that one has to stay unpinned: an unpinned row is what proves
     /// the control is conditional rather than rendered for everything.
-    const PINNED_VARIABLE: &str = "PINNED_SETTING";
+    ///
+    /// A DECLARED shared var, not an ad hoc key. `key_can_be_seeded_from_env`
+    /// mirrors `filter_to_declared_keys`, so the control only renders for a key
+    /// the process environment can actually set — and an ad hoc fixture would
+    /// have proved the control exists on a row where pressing it does nothing.
+    const PINNED_VARIABLE: &str = "WAFER_RUN_SHARED__APP_NAME";
 
     /// The two blocks an admin page may link to, by the router prefix each
     /// owns (`routing.rs`); a link anywhere else is a new decision.

@@ -47,6 +47,16 @@ you want:
 After that boot the rule is simply: the environment sets a key until an admin
 edits it in the UI.
 
+**What this does not protect.** The upgrade boot can only resolve conflicts it
+can see, which means keys you were *already exporting*. A key your deployment
+config does **not** export is not considered at all. So: **adding an export for a
+key you were not already setting takes effect, including over a change you made
+in the admin UI before upgrading.** If you closed signup or disabled OAuth in the
+UI and later add `WAFER_RUN_SHARED__ALLOW_SIGNUP` / `..._ENABLE_OAUTH` to your
+deployment config, the config wins. Re-apply the setting in the UI once after
+upgrading and it is recorded for good — an admin edit made *after* the upgrade is
+always safe.
+
 **Keys worth checking first**, because they decide who can get in:
 
 - `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` — **every** signup with this
@@ -67,6 +77,28 @@ edits it in the UI.
   if you rotated one in the UI and your deployment config still carries the old
   one, the rotated value is what is kept. Neither value is printed in the log;
   compare the stored one where you issued it.
+
+**Break glass — if a pin locks you out.** Every route above needs a working admin
+login, and the keys most able to deny you one are pinnable. The case to know
+about: a deployment with no admin user yet, whose stored
+`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` / `..._PASSWORD` are wrong, and
+whose corrected values are in the deployment config. The upgrade boot keeps the
+stored pair, and `auth::bootstrap` creates the first admin from **those** — so
+signing in to fix it needs the credentials you were replacing.
+
+Release a key without logging in by clearing its marker directly in the database
+(`impresspress__admin__variables`), then restarting:
+
+```sql
+UPDATE impresspress__admin__variables
+   SET updated_by = ''
+ WHERE key = 'WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL';
+```
+
+`updated_by` is the whole mechanism: empty means nothing has claimed the row, so
+the next boot seeds it from your environment again. Only native deployments can
+be in this position — Cloudflare and the browser never seed from a process
+environment, so nothing there is ever pinned against one.
 
 **No migration.** Nothing to opt into, and the transition runs once per database
 whether or not you pass `--run-migrations`. Cloudflare and browser deployments

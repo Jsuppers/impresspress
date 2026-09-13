@@ -239,7 +239,7 @@ fn var_row(row: &VarRow) -> Vec<Markup> {
                 title="Edit"
                 aria-label=(format!("Edit {}", row.key))
             { (icons::edit()) }
-            @if row.pin.is_some() && row.offer_reset {
+            @if row.pin.is_some() && row.offer_reset && key_can_be_seeded_from_env(row.key) {
                 (reset_to_environment_button(row.key))
             }
             @if row.deletable {
@@ -480,6 +480,30 @@ fn key_is_deletable(key: &str, declared_shared: &std::collections::HashSet<Strin
     key != crate::blocks::auth::JWT_SECRET_KEY && !declared_shared.contains(key)
 }
 
+/// Whether the process environment can ever set `key`, and so whether handing
+/// it back to the environment does anything.
+///
+/// The same shape as [`key_is_deletable`], and there for the same reason: the
+/// page must not render a button whose action is inert. A pin is real on any
+/// row an admin has edited, but `reset_to_environment` only means something
+/// when a later boot will actually re-seed the key — and the control's toast
+/// promises exactly that ("replaced on the next restart").
+///
+/// Derived from the production gate rather than restated: `cli::server_config::
+/// filter_to_declared_keys` — the filter in front of
+/// `variables::seed_and_load` on native — keeps exactly
+/// [`crate::config_vars::is_declared_key`], so a key outside it never reaches
+/// the seeder whatever the environment says. `WAFER_RUN__AUTH__JWT_SECRET` is
+/// the case that matters and needs no special mention here: it is declared by
+/// no `ConfigVar`, which is precisely why the filter strips it, even though
+/// `ops::reject_runtime_owned_key` deliberately lets an admin edit it.
+///
+/// The runtime-owned half is `seed_and_load`'s own guard, restated here because
+/// the two refusals are independent and the page must mirror both.
+fn key_can_be_seeded_from_env(key: &str) -> bool {
+    crate::config_vars::is_declared_key(key) && !crate::config_vars::is_runtime_owned_key(key)
+}
+
 /// The shared keys this build declares, for [`key_is_deletable`]. Built once
 /// per render rather than per row — `shared_config_vars()` allocates.
 fn declared_shared_keys() -> std::collections::HashSet<String> {
@@ -542,7 +566,10 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
                                 // here by a boot WARN naming one key actually
                                 // looks for it, so it must offer what the By
                                 // Block tables offer.
-                                @if offer_reset && variables::pin_of(row).is_some() {
+                                @if offer_reset
+                                    && variables::pin_of(row).is_some()
+                                    && key_can_be_seeded_from_env(key)
+                                {
                                     (reset_to_environment_button(key))
                                 }
                                 // The flat listing offers the same control as
@@ -998,16 +1025,6 @@ pub async fn handle_update_variable(
     variables_page(ctx, msg).await
 }
 
-/// `DELETE /b/admin/variables/{key}` — the Variables page's row control.
-///
-/// The page had no delete affordance at all before this: a variable could only
-/// be removed by calling `DELETE /b/admin/api/settings/{key}` by hand, which
-/// is not a thing an operator can be expected to discover.
-///
-/// The shared-key guard, the delete and the audit row live in
-/// `ops::delete_variable`, shared with that JSON surface, so the two cannot
-/// drift on what they refuse.
-///
 /// `POST /b/admin/variables/{key}/reset-to-environment` — the Variables page's
 /// row control for handing a key back to the process environment.
 ///
@@ -1033,6 +1050,14 @@ pub async fn handle_reset_variable_to_environment(
 }
 
 /// `DELETE /b/admin/variables/{key}` — the Variables page's delete row control.
+///
+/// The page had no delete affordance at all before this: a variable could only
+/// be removed by calling `DELETE /b/admin/api/settings/{key}` by hand, which
+/// is not a thing an operator can be expected to discover.
+///
+/// The shared-key guard, the delete and the audit row live in
+/// `ops::delete_variable`, shared with that JSON surface, so the two cannot
+/// drift on what they refuse.
 ///
 /// Returns EMPTY markup rather than re-rendering the page the way
 /// [`handle_update_variable`] does: the control targets `closest tr` with
@@ -1383,6 +1408,48 @@ mod tests {
                 "the {tab:?} tab must not offer to hand a key back to an environment this \
                  deployment does not have: {html}"
             );
+        }
+    }
+
+    /// A pinned row the process environment can NEVER set offers no reset
+    /// control.
+    ///
+    /// Two shapes, both reachable today:
+    ///
+    /// - an ad hoc key an operator created and edited. `filter_to_declared_keys`
+    ///   keeps only declared keys, so nothing the environment says about it ever
+    ///   reaches the seeder.
+    /// - `WAFER_RUN__AUTH__JWT_SECRET`, which `reject_runtime_owned_key`
+    ///   deliberately lets an admin edit — and which no `ConfigVar` declares, so
+    ///   the same filter strips it from every env batch.
+    ///
+    /// For both, clearing the pin does nothing and the toast ("replaced on the
+    /// next restart") would be false: nothing ever replaces it. Same rule as
+    /// `key_is_deletable` — the page does not render a button whose action is
+    /// inert.
+    #[tokio::test]
+    async fn a_key_the_environment_cannot_set_offers_no_reset_control() {
+        for key in ["MY_LEGACY_THING", crate::blocks::auth::JWT_SECRET_KEY] {
+            assert!(
+                !key_can_be_seeded_from_env(key),
+                "{key} must be one the env batch cannot carry, or this proves nothing"
+            );
+            let ctx = ctx_with_a_pinned_key(key, true).await;
+
+            for tab in ["", "all"] {
+                let html = variables_page_html(&ctx, tab).await;
+                assert!(
+                    html.contains(key),
+                    "the row must be on the {tab:?} tab: {html}"
+                );
+                assert!(
+                    !html.contains(&format!(
+                        r#"hx-post="/b/admin/variables/{key}/reset-to-environment""#
+                    )),
+                    "{key} cannot be seeded from the environment, so the {tab:?} tab must \
+                     not offer to hand it back: {html}"
+                );
+            }
         }
     }
 

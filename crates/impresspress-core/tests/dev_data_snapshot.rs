@@ -851,6 +851,34 @@ async fn import_refuses_a_planted_jwt_secret() {
     );
 }
 
+/// The env-precedence transition's gate row never travels in a bundle.
+///
+/// It records that a one-time upgrade pass has run on THIS database. Exported
+/// and re-imported it would disarm that pass on a deployment that has not run
+/// it — silently turning off the protection for every pre-upgrade admin edit on
+/// the importing side.
+///
+/// It is already held back, by the rule that holds back every
+/// `IMPRESSPRESS_`-prefixed key (`variable_is_exportable`): the gate is
+/// `IMPRESSPRESS__ADMIN__ENV_PRECEDENCE_TRANSITION`, which is block-scoped
+/// config describing the exporting instance, exactly what that rule exists for.
+/// Asserted here rather than left to be re-derived, because the consequence of
+/// the prefix rule ever narrowing is not obvious from the gate's own code.
+#[test]
+fn the_env_precedence_transition_gate_is_not_exportable() {
+    let row: serde_json::Map<String, serde_json::Value> = json_map(json!({
+        "key": variables::ENV_PRECEDENCE_TRANSITION_KEY,
+        "value": "done",
+        "sensitive": false,
+    }))
+    .into_iter()
+    .collect();
+    assert!(
+        !data_snapshot::variable_is_exportable(&row),
+        "the gate row must never reach another deployment's database"
+    );
+}
+
 /// The other side of that boundary: the guard refuses only what the RUNTIME
 /// owns, not everything with a prefix.
 ///
