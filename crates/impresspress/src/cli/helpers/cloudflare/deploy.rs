@@ -1681,7 +1681,7 @@ mod tests {
         let release = release_manifest_from_staged_dir(staged.path()).unwrap();
         let immutable_key = release.immutable_key("hero.webp");
         let mut r2 = MemoryR2 {
-            corrupt_on_get: Some(immutable_key.clone()),
+            corrupt_on_get: Some(immutable_key),
             ..Default::default()
         };
 

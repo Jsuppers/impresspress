@@ -109,10 +109,25 @@ jobs:
       # and `Clippy (browser-devtools, wasm32)` in the `e2e-dev-sandbox` job)
       # were the only enforcing ones, and no `RUSTFLAGS` supplies the flag
       # anywhere in `.github/workflows/`, so every warning in every other crate
-      # printed and passed. The two that had accumulated behind it —
-      # `needless_range_loop` in `cli/helpers/cloudflare/deploy.rs` and
-      # `too_many_arguments` in the wrangler-config generator next to it — are
-      # fixed alongside this line.
+      # printed and passed.
+      #
+      # `--all-targets` for the same reason the wasm32 steps below carry it: a
+      # bare `cargo clippy` builds lib and bins only, so every
+      # `#[cfg(test)] mod tests` body and every file under `tests/` was
+      # compiled by nobody with lints on. Adding `-D warnings` without it would
+      # have closed half the gap and read as if it closed all of it.
+      #
+      # Six findings had accumulated behind the two flags, all fixed alongside
+      # this line: `needless_range_loop` and `too_many_arguments` in
+      # `cli/helpers/cloudflare/`, `question_mark` x2 in `cli/mode.rs`, and —
+      # reachable only via `--all-targets` — `redundant_clone` x2 and
+      # `needless_collect` x2 in test code. `redundant_clone` is one of the six
+      # lints `[workspace.lints.clippy]` explicitly opts into, so two opted-in
+      # findings had been sitting in a blind spot this step is named for.
+      #
+      # Still NOT covered, deliberately: the `--no-default-features --features
+      # sqlite` shape below stays a `cargo check`. This step lints the default
+      # feature set only.
       #
       # The two exclusions stay: `impresspress-cloudflare` is wasm32-only by
       # construction (its R2/D1 services wrap `!Send` `JsFuture`s that cannot
@@ -122,7 +137,7 @@ jobs:
       # for wasm32 by its own step instead — `impresspress-cloudflare` in the
       # `cloudflare` job, `impresspress-web` in `e2e-dev-sandbox`.
       - name: Run clippy
-        run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare -- -D warnings
+        run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare --all-targets -- -D warnings
 
       # `impresspress`'s CLI (`deploy cloudflare`) silently stopped compiling
       # under `--no-default-features --features sqlite` (no `embed-assets`):

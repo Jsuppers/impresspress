@@ -555,7 +555,7 @@ mod tests {
         .unwrap();
         parse_verify_response(&body, &plan, None).unwrap();
 
-        let mut wrong_plan = plan.clone();
+        let mut wrong_plan = plan;
         wrong_plan.application.id = "other".into();
         assert!(parse_verify_response(&body, &wrong_plan, None).is_err());
     }
