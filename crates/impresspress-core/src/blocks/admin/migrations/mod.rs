@@ -6,7 +6,7 @@
 //! all live in [`crate::migration_helper::apply_migrations`]. Earlier
 //! versions of this module called `db::ddl` directly in a loop, bypassing
 //! the gate and re-running every DDL on every cold isolate (~2,800 D1
-//! queries/day on wafer.run — see the 2026-05-14 config-snapshot spec).
+//! queries/day on wafer.run — the measurement that motivated the gate).
 
 const SQL_001_SQLITE: &str = include_str!("001_admin_schema.sqlite.sql");
 #[cfg(feature = "postgres")]
@@ -19,15 +19,42 @@ const SQL_001_POSTGRES: &str = include_str!("001_admin_schema.postgres.sql");
 // this migration creates are still live — `block` is exactly what the
 // in-memory grouping keys on — so only the query strategy moved on.
 //
+// Both dialect files ALSO end their header with a `Spec:` line naming a
+// design document that does not exist in this repository and never did. Read
+// the paragraph above instead; it is the whole of what that pointer was
+// standing in for.
+//
 // The .sql files are deliberately NOT edited to say so. A shipped migration
 // is hash-addressed over its whole text, comments included, so retouching a
 // `--` line logs `schema drift` on every boot of every deployment that
 // already applied it and needs a `--run-migrations` redeploy to clear. See
 // `crate::migration_helper`'s "A shipped .sql file is immutable, comments
-// included", which prescribes exactly this note.
+// included", which prescribes exactly this note. It is also why
+// `scripts/check-doc-pointers.sh` skips `migrations/*.sql` — a guard cannot
+// ask for an edit the runtime punishes. This file is not skipped.
 const SQL_002_SQLITE: &str = include_str!("002_variables_block_column.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_002_POSTGRES: &str = include_str!("002_variables_block_column.postgres.sql");
+// 003 adds `block_settings.seed_defaults_hash`, which lets
+// `crate::blocks::admin::settings::seed_defaults` skip its bulk `variables`
+// read when the declared shared config has not changed since the last seed.
+// The gate is the same shape `crate::migration_helper::apply_if_blessed` uses
+// for DDL: hash the payload, compare against the stored digest, return early
+// on a match. `seed_defaults` computes its side through `seed_payload_hash`
+// over `crate::config_vars::shared_config_vars()` and stamps the column on a
+// miss. Both directions are covered in `admin::settings`'s own tests —
+// `second_call_with_matching_snapshot_hash_short_circuits` and
+// `mismatched_snapshot_hash_re_runs_seed` — because what the gate does is a
+// property of that function, not of this DDL.
+//
+// Both dialect files end their header on a dangling `Spec:` pointer of their
+// own — a different document from 002's, and equally absent from this
+// repository — left in place for the same immutability reason. What it stood
+// for is the paragraph above. The sqlite file additionally credits the D1
+// read volume it removed to "PR 2 of the 2026-05-14 config-snapshot spec";
+// that document is not here either. The reads it names came from the bulk
+// `list_all` that work added to `seed_defaults` — exactly what this column
+// lets the function skip.
 const SQL_003_SQLITE: &str = include_str!("003_block_settings_seed_hash.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgres.sql");

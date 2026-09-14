@@ -228,8 +228,7 @@ pub async fn build_native_runtime(
     // the synchronous `ctx.config_get` surface. They must carry the same data
     // so `migration_helper::apply_if_blessed` (which reads
     // `BLOCK_SETTINGS_CONFIG_KEY` + `IMPRESSPRESS_RUN_MIGRATIONS` via
-    // `config_get`) sees the boot values without a per-call DB hop. See
-    // `docs/superpowers/specs/2026-05-14-config-snapshot-and-migration-gate-design.md`.
+    // `config_get`) sees the boot values without a per-call DB hop.
     // Native has no divergence: every key below is `both`.
     let mut runtime_config = builder::RuntimeConfig::new();
     runtime_config

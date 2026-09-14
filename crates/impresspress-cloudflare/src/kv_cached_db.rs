@@ -3,8 +3,6 @@
 //! `impresspress_core::cache_key::read_key` recognizes on the `variables`
 //! and `block_settings` tables.
 //!
-//! See `docs/superpowers/specs/2026-05-22-kv-cached-d1-config-source-design.md`.
-//!
 //! Host-testable logic lives in `impresspress-core` so it can be unit-tested
 //! (this crate is wasm32-only and excluded from `cargo test --workspace`):
 //! pure cache-key derivation in `impresspress_core::cache_key`, and the

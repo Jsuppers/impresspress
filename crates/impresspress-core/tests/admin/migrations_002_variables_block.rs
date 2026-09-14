@@ -1,8 +1,6 @@
 //! Apply admin migrations 001+002 against in-memory SQLite and verify the
 //! new `variables.block` column + backfill semantics for the lazy-init
 //! redesign.
-//!
-//! Spec: docs/superpowers/specs/2026-05-15-lazy-block-init-design.md §6
 
 use std::collections::HashMap;
 

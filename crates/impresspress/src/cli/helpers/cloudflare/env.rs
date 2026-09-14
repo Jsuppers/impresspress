@@ -86,8 +86,15 @@ pub fn parse(repo_root: &Path) -> Result<RawCloudflareConfig> {
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     parsed.cloudflare.ok_or_else(|| {
         anyhow!(
-            "{} is missing a [cloudflare] section — see \
-             docs/superpowers/specs/2026-05-06-impresspress-cloudflare-cli-flow-design.md",
+            "{} is missing a [cloudflare] section. It must declare d1.binding and \
+             r2.binding, plus account_id, worker_name, compatibility_date, \
+             d1.database_name, d1.database_id and r2.bucket_name — those six may \
+             come from the environment instead (CLOUDFLARE_ACCOUNT_ID, \
+             IMPRESSPRESS_CLOUDFLARE_WORKER_NAME, \
+             IMPRESSPRESS_CLOUDFLARE_COMPATIBILITY_DATE, \
+             IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_NAME, \
+             IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID, \
+             IMPRESSPRESS_CLOUDFLARE_R2_BUCKET_NAME).",
             path.display()
         )
     })

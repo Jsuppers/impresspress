@@ -26,8 +26,6 @@
 //! as `WAFER_RUN__AUTH__JWT_SECRET`) on top of the D1 rows. Overlay values
 //! win over D1 — overlay represents CF env bindings that must override
 //! whatever an admin happens to have stored in the variables table.
-//!
-//! Spec: docs/superpowers/specs/2026-05-15-lazy-block-init-design.md §2, §6
 
 use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 

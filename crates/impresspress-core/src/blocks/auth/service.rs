@@ -14,8 +14,11 @@
 //! The session table is not a credential store: a row there is a login family
 //! for the userportal device list (B12), never something a request presents.
 //!
-//! See `docs/superpowers/specs/2026-04-21-auth-block-design.md` §4 for the
-//! cross-block contract and §6 for the bootstrap-token fallback.
+//! No document states the cross-block contract; code does.
+//! [`crate::blocks::register_auth`] installs this impl behind wafer-core's
+//! framework `AuthBlock`, which is what other blocks reach, and
+//! [`auth_grants`] enumerates every OTHER block allowed to touch this block's
+//! `wafer_run__auth__*` tables and `WAFER_RUN__AUTH__*` config keys.
 
 use std::sync::{Arc, OnceLock};
 
@@ -189,12 +192,23 @@ async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthEr
     Ok(Creds::Pat(hash_token(&bearer)))
 }
 
-/// Static WRAP grants for the framework `wafer-run/auth` block. Returned by
-/// both [`AuthService::grants`] (consumed by `AuthBlock::info()` so the
-/// runtime registers them at startup) and called directly by userportal
-/// pages that reflect over auth's grant list to compose their own WRAP
-/// scope. Keep these in sync with the spec at
-/// `docs/superpowers/specs/2026-04-21-auth-block-design.md`.
+/// Static WRAP grants for the framework `wafer-run/auth` block: every other
+/// block allowed to reach this block's `wafer_run__auth__*` tables and
+/// `WAFER_RUN__AUTH__*` config keys.
+///
+/// Returned by [`AuthService::grants`], which `AuthBlock::info()` consumes so
+/// the runtime registers them at startup — that is the only non-test caller.
+/// WRAP tests in `blocks::userportal::pages::{sessions, security}` and
+/// `crate::crypto` call it directly to enforce against the real list rather
+/// than re-listing literals (the rule `TestContext::with_wrap` documents).
+///
+/// This vec is the source of truth: no document mirrors it, and nothing
+/// derives it. `scripts/audit-wrap-grants.sh` is what keeps it honest — it
+/// walks the typed `db::*` callsites under `blocks/` and fails CI when the
+/// table's OWNING block declares no grant covering one, which for every
+/// `wafer_run__auth__*` table is this vec. Its own header states what it does
+/// not reach: raw SQL, `call_block_buffered`, the dev guest templates, and
+/// sites carrying an `audit-allow` pragma.
 pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
     // String literals are used (instead of repo::*::TABLE consts) so the
     // static WRAP-grant audit script (scripts/audit-wrap-grants.sh) can
@@ -358,10 +372,10 @@ impl AuthService for AuthServiceImpl {
     /// framework `AuthBlock::info()` embeds these into `BlockInfo::grants`
     /// (wafer-run #45) so the runtime registers them at startup.
     ///
-    /// Delegates to the [`auth_grants`] free function so non-trait callers
-    /// (e.g. userportal's WRAP-grant reflection in `pages/sessions.rs` and
-    /// `pages/security.rs`) can see the same list without instantiating
-    /// the framework block.
+    /// Delegates to the [`auth_grants`] free function, which is where the list
+    /// actually lives, so it can be read without instantiating the framework
+    /// block. This method is the only caller that is not a test; see
+    /// [`auth_grants`] for who reads it the other way and why.
     fn grants(&self) -> Vec<wafer_block::types::ResourceGrant> {
         auth_grants()
     }

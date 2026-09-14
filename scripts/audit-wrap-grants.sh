@@ -31,8 +31,8 @@
 #   - Network grants are NOT audited. impresspress/blocks/admin/mod.rs declares a
 #     default-allow `ResourceGrant::read("*", "*").typed(Network)`, which makes
 #     a meaningful "missing grant" finding impossible until the policy is
-#     locked down. See docs/superpowers/specs/2026-05-29-wave-23-wrap-audit-
-#     storage-design.md for the deferred-Network rationale.
+#     locked down. Auditing Network only becomes useful once that
+#     default-allow grant is narrowed.
 #   - Tables outside the `{org}__{block}__` convention (none currently exist
 #     in impresspress-core but flagged if found).
 #
