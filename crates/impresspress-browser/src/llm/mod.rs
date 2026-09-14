@@ -1,7 +1,7 @@
 //! Browser LLM — `LlmService` impl driving WebLLM's MLCEngine via a
-//! SW↔page postMessage bridge. `catalog` carries the model list, `bridge` the
-//! postMessage protocol, and `service` wires them together behind
-//! `wafer_core::interfaces::llm::service::LlmService`.
+//! SW↔page postMessage bridge. `catalog` carries the model list, `bridge` is
+//! the Rust side of the postMessage glue, and `service` wires them together
+//! behind `wafer_core::interfaces::llm::service::LlmService`.
 
 #[cfg(target_arch = "wasm32")]
 pub mod bridge;

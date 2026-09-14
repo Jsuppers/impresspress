@@ -6,7 +6,7 @@
 //! all live in [`crate::migration_helper::apply_migrations`]. Earlier
 //! versions of this module called `db::ddl` directly in a loop, bypassing
 //! the gate and re-running every DDL on every cold isolate (~2,800 D1
-//! queries/day on wafer.run — see the 2026-05-14 config-snapshot spec).
+//! queries/day on wafer.run — the measurement that motivated the gate).
 
 const SQL_001_SQLITE: &str = include_str!("001_admin_schema.sqlite.sql");
 #[cfg(feature = "postgres")]
@@ -47,12 +47,14 @@ const SQL_002_POSTGRES: &str = include_str!("002_variables_block_column.postgres
 // `mismatched_snapshot_hash_re_runs_seed` — because what the gate does is a
 // property of that function, not of this DDL.
 //
-// Both dialect files carry the same dangling `Spec:` pointer 002 does, left
-// in place for the same immutability reason. The sqlite file additionally
-// credits the D1 read volume it removed to "PR 2 of the 2026-05-14
-// config-snapshot spec"; that document is not in this repository either. The
-// reads it names came from the bulk `list_all` that work added to
-// `seed_defaults` — exactly what this column lets the function skip.
+// Both dialect files end their header on a dangling `Spec:` pointer of their
+// own — a different document from 002's, and equally absent from this
+// repository — left in place for the same immutability reason. What it stood
+// for is the paragraph above. The sqlite file additionally credits the D1
+// read volume it removed to "PR 2 of the 2026-05-14 config-snapshot spec";
+// that document is not here either. The reads it names came from the bulk
+// `list_all` that work added to `seed_defaults` — exactly what this column
+// lets the function skip.
 const SQL_003_SQLITE: &str = include_str!("003_block_settings_seed_hash.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgres.sql");

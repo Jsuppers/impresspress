@@ -12,27 +12,30 @@
 # What counts as a citation: the literal directory name below, followed by a
 # slash and a path, where the character before it is not alphanumeric, `/` or
 # `.`. That preceding-character rule is what keeps URLs and longer paths out
-# (`https://developer.mozilla.org/en-US/<dir>/Web/HTTP/...`, `/b/vector/api/<dir>/a`)
-# without an allow-list of files.
+# (an MDN link, a `/b/vector/api/<dir>/a` route) with no allow-list of files.
 #
 # A citation resolves if the path exists as written, or with `.md` appended.
-# A citation that ends the line with `-` is a path wrapped across two comment
-# lines: it can never be verified by grep or followed by a reader, so it fails
-# with its own message.
+# A citation that ends the line on `-` or `/` is a path wrapped across two
+# comment lines: it can never be verified by grep or followed by a reader, so
+# it fails with its own message. Both joiners have to count — a path broken
+# after a `/` leaves a token that IS a real directory, so an existence check
+# alone waves it through, which is exactly the defect this guard exists to
+# catch. A directory named mid-line is untouched; only end-of-line is a wrap.
 #
 # The one exemption: `.sql` files under a `migrations/` directory. Not a
-# convenience — it is forced by an invariant of the migration system itself. `crate::migration_helper`'s "A shipped .sql file is immutable,
-# comments included" records it: `apply_if_blessed` hashes a migration's WHOLE
-# text, so editing a `--` comment changes its hash exactly as much as editing a
+# convenience — it is forced by an invariant of the migration system itself.
+# `crate::migration_helper`'s "A shipped .sql file is immutable, comments
+# included" records it: `apply_if_blessed` hashes a migration's WHOLE text, so
+# editing a `--` comment changes its hash exactly as much as editing a
 # statement does, and every deployment that already applied it then logs
 # `schema drift` on each boot until someone redeploys with `--run-migrations`.
 # A guard that demanded that edit would be asking for something the runtime
 # punishes, so it does not ask. That rule also says where the explanation goes
 # instead: the block's `migrations/mod.rs`, beside the constant, where it is
-# not hash-addressed — which is where the admin block's two dangling citations
+# not hash-addressed — which is where the admin block's dangling citations
 # are written out (`blocks/admin/migrations/mod.rs`). That `mod.rs` is NOT
 # exempt: it is ordinary source, and the exemption is exactly as wide as the
-# hashing is.
+# hashing.
 #
 # Run from anywhere in the working tree.
 set -euo pipefail
@@ -72,7 +75,12 @@ records=$(
         rest = substr(rest, RSTART + RLENGTH)
         # Drop the preceding separator the pattern had to consume.
         if (substr(tok, 1, 1) != substr(dir, 1, 1)) tok = substr(tok, 2)
-        if (tok ~ /-$/ && endpos == length(line)) {
+        # A path that runs to end-of-line and stops on a joiner is continued on
+        # the next line. Both joiners count: `-` inside a dated filename, and
+        # `/` between segments. The `/` shape is the dangerous one — the token
+        # left behind is a real directory, so a bare existence check passes and
+        # the broken citation ships silently.
+        if (tok ~ /[-\/]$/ && endpos == length(line)) {
           printf "WRAPPED\t%s\t%d\t%s\n", FILENAME, FNR, tok
           continue
         }
