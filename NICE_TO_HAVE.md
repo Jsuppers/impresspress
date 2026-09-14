@@ -8,8 +8,6 @@ Low-priority improvements identified during code review. None are blocking, but 
 
 ## Security
 
-- **Whether a stored Stripe webhook payload carries a capability** — `impresspress__products__stripe_events.payload_base64` holds the raw body of every webhook Stripe posts, base64-encoded (`blocks/products/stripe.rs`). `secret_tables::SECRET_TABLES` deliberately leaves it readable by the admin SQL explorer: it is a third-party payload, and nothing in it authenticates anyone *to this deployment*, which is the rule that module applies. What was not established is whether an embedded Stripe object can carry a capability of Stripe's own — a Checkout Session object has a `client_secret`, and this repo reads exactly that field off a session response (`stripe.rs`), so a payload that embeds a session would embed one too. Settling it means reading Stripe's event payloads rather than this repo, and the answer changes only whether one more table joins the refused set. Its sibling `provider_operations.request_json`/`response_json` was checked and is clear: both columns hold summaries this repo builds itself, never a provider body.
-
 - **Configurable Argon2 params for native deployments** — Current params (4 MiB memory, 2 iterations, 1 lane) are tuned for Cloudflare Workers' constrained environment. Native deployments should use higher cost params (e.g. 64 MiB, 3 iterations) for stronger password hashing. Could be driven by a `ARGON2_MEMORY_COST` env var.
 
 ## Testing

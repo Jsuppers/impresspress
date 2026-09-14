@@ -598,6 +598,13 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/stripe.rs",
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
+            // the admin SQL explorer's refusal list names this one as a
+            // literal for the same reason as `shares` and `purchases`: its
+            // owning module is behind a block feature and the table outlives
+            // the build that created it. `secret_tables.rs` pins the literal
+            // to this door's own constant in a `#[cfg(feature = ..)]` test,
+            // and issues no query against it
+            "secret_tables.rs",
         ],
     ),
     ("products_variables", &["blocks/products/repo/variables.rs"]),
@@ -1047,6 +1054,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/dev/data_snapshot.rs",
             // category 4: the webhook pipeline that predates the convention
             "blocks/products/stripe.rs",
+            // the admin SQL explorer's refusal list, which names the constant
+            // only to assert its own literal still matches it, and issues no
+            // query — see the note on the `variables` door above
+            "secret_tables.rs",
         ],
     ),
     (
