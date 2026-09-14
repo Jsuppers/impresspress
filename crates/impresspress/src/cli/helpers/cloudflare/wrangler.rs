@@ -127,9 +127,7 @@ pub fn generate(cfg: &CloudflareConfig, repo_root: &Path, out_dir: &Path) -> Res
         out_dir,
         "wrangler.toml",
         ConfigRole::Build,
-        None,
-        None,
-        None,
+        VersionIdentities::default(),
     )
 }
 
@@ -163,9 +161,10 @@ pub fn generate_upload_with_release(
         out_dir,
         "wrangler-upload.toml",
         ConfigRole::Upload,
-        release,
-        None,
-        None,
+        VersionIdentities {
+            release,
+            ..VersionIdentities::default()
+        },
     )
 }
 
@@ -185,9 +184,11 @@ pub fn generate_candidate_upload(
         out_dir,
         "wrangler-candidate.toml",
         ConfigRole::Upload,
-        Some(release),
-        Some(identity),
-        None,
+        VersionIdentities {
+            release: Some(release),
+            artifact: Some(identity),
+            prepared: None,
+        },
     )
 }
 
@@ -208,9 +209,11 @@ pub fn generate_final_upload(
         out_dir,
         "wrangler-final.toml",
         ConfigRole::Upload,
-        Some(release),
-        Some(identity),
-        Some(prepared),
+        VersionIdentities {
+            release: Some(release),
+            artifact: Some(identity),
+            prepared: Some(prepared),
+        },
     )
 }
 
@@ -234,9 +237,7 @@ pub fn generate_triggers(
         out_dir,
         "wrangler-triggers.toml",
         ConfigRole::WorkerSettings,
-        None,
-        None,
-        None,
+        VersionIdentities::default(),
     )
 }
 
@@ -285,16 +286,39 @@ impl ConfigRole {
     }
 }
 
+/// The identities a generated config binds into the Worker *version* it
+/// uploads, as opposed to the worker-level settings [`ConfigRole`] decides.
+///
+/// Each is independently optional because the deploy pipeline uploads three
+/// different versions and each one knows more than the last: the plain upload
+/// carries a release asset set only, the dynamic candidate adds the Wasm +
+/// wafer.lock identity `/_deploy/prepare` consumes, and the final version adds
+/// the prepared Text plan module. Grouping them keeps that progression in one
+/// place instead of three positional `None`s at every call site.
+#[derive(Clone, Copy, Default)]
+struct VersionIdentities<'a> {
+    /// Immutable release asset set — [`RELEASE_ASSET_ID_VAR`] and friends.
+    release: Option<&'a ReleaseManifest>,
+    /// Built artifact identity — [`PREPARED_APPLICATION_ID_VAR`] and friends.
+    artifact: Option<&'a ApplicationArtifactIdentity>,
+    /// Prepared runtime plan. Also repoints `main` at the prepared shim and
+    /// installs the Text module rule the plan is served through.
+    prepared: Option<&'a PreparedModule>,
+}
+
 fn generate_named(
     cfg: &CloudflareConfig,
     repo_root: &Path,
     out_dir: &Path,
     file_name: &str,
     role: ConfigRole,
-    release: Option<&ReleaseManifest>,
-    identity: Option<&ApplicationArtifactIdentity>,
-    prepared: Option<&PreparedModule>,
+    identities: VersionIdentities<'_>,
 ) -> Result<PathBuf> {
+    let VersionIdentities {
+        release,
+        artifact,
+        prepared,
+    } = identities;
     let mut value = base_toml(cfg, role);
 
     if let Some(rel) = cfg.wrangler_overrides_path.as_ref() {
@@ -355,7 +379,7 @@ fn generate_named(
         );
     }
 
-    if let Some(identity) = identity {
+    if let Some(identity) = artifact {
         let vars = value
             .as_table_mut()
             .expect("base wrangler config is a table")

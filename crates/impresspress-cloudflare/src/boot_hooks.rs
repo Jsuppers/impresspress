@@ -461,7 +461,6 @@ mod boot_hook_tests {
                 bump_on_write: true,
             },
         );
-        #[allow(clippy::arc_with_non_send_sync)]
         let service: Arc<dyn DatabaseService> = Arc::new(service);
         (service, inner, kv)
     }
@@ -527,7 +526,7 @@ mod boot_hook_tests {
         };
         deploy.seed_and_load().await.expect("deploy seed");
         assert!(
-            db.writes.borrow().iter().any(|w| *w == repair_write),
+            db.writes.borrow().contains(&repair_write),
             "the deploy hook must repair a mis-flagged row; it wrote {:?}",
             db.writes.borrow(),
         );

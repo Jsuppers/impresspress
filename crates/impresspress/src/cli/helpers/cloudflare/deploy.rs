@@ -374,7 +374,12 @@ pub async fn call_deploy_verify(
             entry.sha256.as_str(),
         )
     });
-    for attempt in 0..=VERIFY_RETRY_SECS.len() {
+    // The attempt budget IS the delay list: one attempt, then one more for
+    // each delay it yields — seven attempts across the six delays above. The
+    // first `next()` that comes back empty is the terminal failure, which is
+    // why this loop needs neither an attempt counter nor an unreachable tail.
+    let mut backoff = VERIFY_RETRY_SECS.iter().copied();
+    loop {
         let response = client
             .post(&url)
             .header("x-deploy-token", token)
@@ -395,19 +400,22 @@ pub async fn call_deploy_verify(
                     .map(|(logical, immutable, hash)| (*logical, immutable.as_str(), *hash)),
             );
         }
-        if !status.is_server_error() || attempt == VERIFY_RETRY_SECS.len() {
+        let retry_in = if status.is_server_error() {
+            backoff.next()
+        } else {
+            None
+        };
+        let Some(delay) = retry_in else {
             bail!(
                 "{VERIFY_ENDPOINT} failed with {status}: {}",
                 String::from_utf8_lossy(&bytes)
             );
-        }
-        let delay = VERIFY_RETRY_SECS[attempt];
+        };
         eprintln!(
             "-> {VERIFY_ENDPOINT} returned {status}; retrying in {delay}s for KV propagation"
         );
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
     }
-    unreachable!("bounded verify retry loop always returns")
 }
 
 /// Exercise an ordinary final-candidate route through preview-host lockdown.
