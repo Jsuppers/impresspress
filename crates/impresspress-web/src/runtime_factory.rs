@@ -421,18 +421,10 @@ impl RuntimeFactory {
             // *the* gate ("the router — not any check inside any handler").
             // An unrouted block has no HTTP surface at all.
             //
-            // `arc_with_non_send_sync`: `DevShared` holds an
-            // `Arc<dyn RuntimeControl>`, whose `MaybeSend + MaybeSync` bound is
-            // unbounded on wasm32 so the browser control can hold the live
-            // `Rc<Wafer>`. `extra_block` takes an `Arc<dyn Block>` regardless,
-            // and wasm32 is single-threaded — the same allowance the rest of
-            // the block registration path carries.
-            //
             // Which constructor is the mode itself: both register the block,
             // but only the workspace one routes `/b/dev` below, and only it
             // may therefore declare that surface in its `BlockInfo` — see
             // `DevBlock::runtime_only`.
-            #[allow(clippy::arc_with_non_send_sync)]
             let dev_block: Arc<dyn wafer_run::Block> = Arc::new(if self.mode.workspace() {
                 dev::DevBlock::with_workspace(dev.clone())
             } else {

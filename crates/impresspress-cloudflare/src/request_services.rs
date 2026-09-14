@@ -1100,13 +1100,10 @@ mod tests {
         )
         .is_err());
         // Manifest key doesn't match `{prefix}/manifest.json`.
-        assert!(ReleaseAssetIdentity::parse(
-            id,
-            prefix.clone(),
-            "wrong/manifest.json".into(),
-            valid_sha,
-        )
-        .is_err());
+        assert!(
+            ReleaseAssetIdentity::parse(id, prefix, "wrong/manifest.json".into(), valid_sha)
+                .is_err()
+        );
     }
 
     #[wasm_bindgen_test]

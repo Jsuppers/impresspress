@@ -277,6 +277,22 @@ fn fetch_site_for(
         // is provably ours passes. An absent one is refused rather than
         // reported as `none` — see the note above; this function never
         // returns `none`.
+        //
+        // `collapsible_match` wants this folded into a match guard, with the
+        // refusal falling through to `_` below. Refused on purpose: the
+        // refusal is the security-relevant half, and as a fall-through its
+        // target is whatever arm happens to sit last. Any arm added between
+        // this one and `_` would silently take it over. Kept adjacent to the
+        // condition it belongs to, so the verdict does not depend on arm
+        // order.
+        //
+        // `"cors" | "no-cors"` above is the same shape and clippy does not
+        // flag it — not because an or-pattern cannot carry a guard (it can:
+        // `"cors" | "no-cors" if cond => ..` compiles), simply because the
+        // lint does not fire there. Nor does it fire on older stable at all:
+        // measured absent on 1.94.0 and present on 1.98.0, so this allow reads
+        // as inert to anyone checking on a toolchain behind CI's.
+        #[allow(clippy::collapsible_match)]
         "navigate" => {
             if !referrer.is_empty() && origin_of(referrer) == self_origin {
                 "same-origin"

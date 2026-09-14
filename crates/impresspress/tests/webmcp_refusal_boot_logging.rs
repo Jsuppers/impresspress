@@ -303,24 +303,22 @@ async fn webmcp_refusal_boot_log_includes_scope() {
          OutputSchemaNotAnObject (field only): {refusal_logs:?}"
     );
 
-    let tool_scoped: Vec<&String> = refusal_logs
+    let tool_scoped = refusal_logs
         .iter()
         .filter(|m| m.contains("scope=tool "))
-        .collect();
+        .count();
     assert_eq!(
-        tool_scoped.len(),
-        2,
+        tool_scoped, 2,
         "both DuplicateToolName refusals must be logged with scope=tool (the whole tool was \
          refused): {refusal_logs:?}"
     );
 
-    let output_schema_scoped: Vec<&String> = refusal_logs
+    let output_schema_scoped = refusal_logs
         .iter()
         .filter(|m| m.contains("scope=outputSchema "))
-        .collect();
+        .count();
     assert_eq!(
-        output_schema_scoped.len(),
-        1,
+        output_schema_scoped, 1,
         "the OutputSchemaNotAnObject refusal must be logged with scope=outputSchema (only the \
          field was dropped, the tool was still published): {refusal_logs:?}"
     );

@@ -498,14 +498,13 @@ pub struct DevShared {
 impl DevShared {
     /// Build the shared state around the two host seams.
     ///
-    /// `arc_with_non_send_sync`: [`RuntimeControl`] is bounded on
-    /// `MaybeSend + MaybeSync`, which is unbounded on wasm32 — that is what
-    /// lets the browser control hold the live `Rc<Wafer>` and its factory. On
-    /// wasm32 the resulting `Arc` therefore is not `Send`/`Sync`, and on that
-    /// single-threaded target it does not need to be; on native the same
-    /// bounds are `Send + Sync` and the lint does not fire at all. The same
-    /// allowance the block registration path already carries.
-    #[allow(clippy::arc_with_non_send_sync)]
+    /// [`RuntimeControl`] is bounded on `MaybeSend + MaybeSync`, which is
+    /// unbounded on wasm32 — that is what lets the browser control hold the
+    /// live `Rc<Wafer>` and its factory. The `Arc` this returns is therefore
+    /// not `Send`/`Sync` on that target, and on a single-threaded one it does
+    /// not need to be; see the crate-level
+    /// `allow(clippy::arc_with_non_send_sync)` in `lib.rs` for why the lint
+    /// that says so is off for wasm32 only.
     pub fn new(control: Arc<dyn RuntimeControl>, shell: Arc<dyn ShellSource>) -> Arc<Self> {
         Arc::new(Self {
             control,

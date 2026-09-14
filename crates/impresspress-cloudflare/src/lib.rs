@@ -32,6 +32,43 @@
 //! `impresspress_core::release_inventory::ReleaseManifest`, the same type
 //! `impresspress deploy` writes.
 
+// `clippy::arc_with_non_send_sync` is stated once here, crate-wide and
+// target-scoped, rather than repeated at every `Arc::new`.
+//
+// wafer-run's service and block traits are bounded on
+// `wafer_block::compat::{MaybeSend, MaybeSync}`. Those are `Send`/`Sync` on
+// native, and on wasm32 they are *unbounded* blanket markers
+// (`impl<T: ?Sized> MaybeSend for T`), so `dyn DatabaseService`,
+// `dyn ConfigService`, `dyn ConfigSource`, `dyn Block` and every other such
+// object is `!Send + !Sync` on this target by construction.
+//
+// The SMART POINTER is forced at every site the lint reaches — that is the
+// claim this allow rests on, and it is narrower than "the code is all
+// API-shaped". `wafer_run::Wafer::register_block`, the
+// `wafer_core::service_blocks::*::register_with` constructors and
+// `KvCachedD1DatabaseService::{new,with_mode}` all take `Arc<dyn _>` by value,
+// so a value reaching one of them is either already such an `Arc` or a
+// concrete type built as `Arc` purely to coerce into one. `Rc` is not an
+// option there: `Rc<T> as Arc<dyn Trait>` does not compile (checked, E0605).
+//
+// The VALUE TYPE is not always the API's. Of the eleven sites only three are
+// production wiring (`runtime_build` x2, `services` x1); the other eight sit
+// in `#[cfg(test)]`. Seven of those eight build a double this crate defines —
+// `RecordingDb`, `RecordingKv`, `CountingDb`, `MockKv`, `ProbeMockKv` — and
+// the eighth wraps the production `KvCachedD1DatabaseService` in a fixture.
+// Their `Arc` is forced all the same, by the same coercion: a test double has
+// to satisfy the very `Arc<dyn DatabaseService>` / `Arc<dyn KvBackend>`
+// parameter the production path passes.
+//
+// On a single-threaded target none of the eleven is making a cross-thread
+// claim to be wrong about.
+//
+// Scoped to wasm32 even though this crate is wasm-only, because that is the
+// actual precondition: were it ever built for a native target, the same bounds
+// would resolve to real `Send + Sync`, the lint would be accurate again, and
+// this allow must not silence it.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 mod boot_hooks;
 pub mod config_service;
 pub mod config_source;

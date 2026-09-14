@@ -46,11 +46,6 @@ impl BlockState {
     /// Production constructor — context cell starts empty and is populated
     /// later by [`AuthServiceImpl::init`] when the framework AuthBlock fires
     /// its `Init` lifecycle event.
-    // `dyn Context` only requires `MaybeSend + MaybeSync` (real `Send + Sync`
-    // on native, a no-op marker on wasm32 — see wafer_block::compat), so this
-    // `Arc` doesn't promise cross-thread safety on wasm32; it's a shared
-    // handle, not a thread-safety claim, and wasm32 is single-threaded.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         Self {
             ctx: Arc::new(OnceLock::new()),
@@ -59,7 +54,6 @@ impl BlockState {
 
     /// Test-only constructor. Pre-populates the context cell so service
     /// methods can run without going through the full `init` lifecycle.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn for_test(ctx: Arc<dyn Context>) -> Self {
         let cell = OnceLock::new();
         let _ = cell.set(ctx);

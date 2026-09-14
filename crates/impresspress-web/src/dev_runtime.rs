@@ -34,9 +34,15 @@
 //! `Context`, `Block`) is bounded on `wafer_run::MaybeSend + MaybeSync`, which
 //! is unbounded on `wasm32`. `Rc`, `Cell` and `RefCell` therefore cross those
 //! boundaries without an `unsafe` marker impl; the only cost is
-//! `clippy::arc_with_non_send_sync`, allowed at the three sites that build an
-//! `Arc` over a single-threaded value with the same justification the block
-//! registration path already carries.
+//! `clippy::arc_with_non_send_sync`, which the crate-level
+//! `allow(clippy::arc_with_non_send_sync)` in `lib.rs` turns off for wasm32
+//! and only wasm32.
+//!
+//! It fires at three sites here — both `Context::clone_arc` impls and
+//! `BrowserRuntimeControl::new` — and NOT on [`attach`]'s
+//! `Arc::new(BrowserShellSource)`, because `BrowserShellSource` is a fieldless
+//! unit struct and so is genuinely `Send + Sync`. That site carried a per-site
+//! allow for a lint that never fired there; it is gone.
 
 use std::{
     cell::{Cell, RefCell},
@@ -169,7 +175,6 @@ impl Context for DenyAllContext {
         // for a caller to retain, and a probe step's verdict must be decided
         // by the calls made *during* that step through the context the step
         // was given.
-        #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(Self::default())
     }
 
@@ -263,7 +268,6 @@ struct RetainedRuntime {
 impl BrowserRuntimeControl {
     /// A control with no factory yet. `Arc` because that is what `DevShared`
     /// holds; single-threaded contents are fine (see the module header).
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             factory: RefCell::new(Weak::new()),
@@ -615,7 +619,6 @@ impl Context for BootContext {
     }
 
     fn clone_arc(&self) -> Arc<dyn Context> {
-        #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(self.clone())
     }
 
@@ -820,10 +823,9 @@ pub fn attach(factory: RuntimeFactory) -> (Rc<RuntimeFactory>, Option<Sandbox>) 
         return (Rc::new(factory), None);
     }
     let control = BrowserRuntimeControl::new();
-    // `arc_with_non_send_sync`: `ShellSource` is `MaybeSend + MaybeSync`,
-    // unbounded on wasm32, for the same reason `RuntimeControl` is — this
-    // implementation resolves through a `JsFuture`.
-    #[allow(clippy::arc_with_non_send_sync)]
+    // `ShellSource` is `MaybeSend + MaybeSync`, unbounded on wasm32, for the
+    // same reason `RuntimeControl` is — this implementation resolves through a
+    // `JsFuture`.
     let shell: Arc<dyn ShellSource> = Arc::new(BrowserShellSource);
     let shared = DevShared::new(control.clone(), shell);
     let factory = Rc::new(factory.with_dev(shared.clone()));

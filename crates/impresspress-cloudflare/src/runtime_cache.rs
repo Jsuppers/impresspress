@@ -38,6 +38,18 @@ const PROBE_INTERVAL_FLOOR_MS: u64 = 300_000;
 /// Width of the jitter added on top of the floor (ms) — see
 /// [`next_probe_deadline_ms`]. Probes land 5–10 minutes apart.
 const PROBE_INTERVAL_JITTER_MS: u64 = 300_000;
+// The probe window is the 2026-08-31 read-quota fix: ~45s average per isolate
+// burned ~1,920 reads/day/isolate against a 100k/day allowance. Pin the window
+// to the reviewed 5–10 minute range as a property, not an exact value.
+//
+// A `const` assertion rather than the `#[wasm_bindgen_test]` this used to be:
+// both operands are compile-time, so the check costs nothing at runtime and
+// fails every build that breaks it — including the plain `cargo check` and
+// `cargo clippy` CI steps, which compile this crate but run no test at all.
+// The wasm test needed a `wasm-bindgen-test-runner`, so only the diff-gated
+// `cloudflare-wasm-test` job ever evaluated it.
+const _: () = assert!(PROBE_INTERVAL_FLOOR_MS >= 300_000);
+const _: () = assert!(PROBE_INTERVAL_FLOOR_MS + PROBE_INTERVAL_JITTER_MS <= 600_000);
 /// Ceiling on the widened probe window after consecutive probe FAILURES —
 /// see [`probe_failure_window_ms`]. Retrying an exhausted daily allowance at
 /// full cadence provides no freshness and just manufactures failed
@@ -1993,15 +2005,10 @@ mod tests {
         ));
     }
 
-    /// The probe window is the 2026-08-31 read-quota fix: ~45s average per
-    /// isolate burned ~1,920 reads/day/isolate against a 100k/day allowance.
-    /// Pin the window to the reviewed 5–10 minute range as a property, not an
-    /// exact value.
-    #[wasm_bindgen_test]
-    fn probe_window_is_five_to_ten_minutes() {
-        assert!(PROBE_INTERVAL_FLOOR_MS >= 300_000);
-        assert!(PROBE_INTERVAL_FLOOR_MS + PROBE_INTERVAL_JITTER_MS <= 600_000);
-    }
+    // The 5–10 minute probe window itself is pinned by the `const _: () =
+    // assert!(..)` pair next to `PROBE_INTERVAL_FLOOR_MS` at the top of this
+    // file, which holds on every build rather than only under a wasm test
+    // runner.
 
     /// With a 5-minute jitter width, two random bytes (max 65,535ms) would
     /// silently cap the spread at ~65s and re-synchronize isolates that

@@ -5,6 +5,44 @@
 //! `wafer_block_crypto::primitives`) used by both the Cloudflare Worker and
 //! native standalone binary.
 
+// `clippy::arc_with_non_send_sync` is stated once here, crate-wide and
+// target-scoped, rather than repeated at every `Arc::new`.
+//
+// wafer-run's service and block traits are bounded on
+// `wafer_block::compat::{MaybeSend, MaybeSync}`. Those are `Send`/`Sync` on
+// native, and on wasm32 they are *unbounded* blanket markers
+// (`impl<T: ?Sized> MaybeSend for T`), so `dyn Block`, `dyn Context`,
+// `dyn StorageService`, `dyn LlmService`, `dyn ProviderAdmin` and every other
+// such object is `!Send + !Sync` on that target by construction.
+//
+// The SMART POINTER is forced at every site the lint reaches, by one of two
+// mechanisms — that is the claim this allow rests on, and it is narrower than
+// "the code is all API-shaped".
+//
+//  1. Most sites feed an `Arc<dyn _>` parameter directly:
+//     `wafer_run::Wafer::register_block` and the
+//     `wafer_core::service_blocks::*::register_with` constructors take one by
+//     value, so the value is either already such an `Arc` or a concrete type
+//     built as `Arc` purely to coerce into one. `Rc` cannot: `Rc<T> as
+//     Arc<dyn Trait>` does not compile (E0605). The concrete half is often
+//     this crate's own — `ImpresspressRouterBlock`, `TransformersEmbedBlock`,
+//     `ImpresspressStorageBlock` — but the `Arc` around it is not.
+//  2. A few are struct FIELDS with no API parameter behind them —
+//     `BlockState::ctx`, `DevShared`'s handles. Those are forced by the
+//     NATIVE build instead: this crate is dual-target, `AuthService` and
+//     friends are `MaybeSend + MaybeSync` which is real `Send + Sync` off
+//     wasm32, and an `Rc` field would make the owning type fail that bound.
+//
+// So on wasm32 the pointer is never the free choice the lint assumes, and on
+// that single-threaded target none of these is making a cross-thread claim to
+// be wrong about.
+//
+// On native the same bounds resolve to real `Send + Sync`, the lint is
+// accurate, and this allow does not apply — which is why it is `cfg_attr`'d on
+// the same `target_arch = "wasm32"` predicate `wafer_block::compat` itself
+// switches on, and not a blanket allow.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 pub mod blocks;
 pub mod builder;
 pub mod cache;

@@ -522,11 +522,6 @@ async fn log_storage_access(
 ///
 /// After the runtime starts, call `update_wrap_grants()` to inject the
 /// collected grants for cross-block access checks.
-// `StorageService` only requires `MaybeSend + MaybeSync` (real `Send + Sync`
-// on native, a no-op marker on wasm32 — see wafer_block::compat), so this
-// `Arc` doesn't promise cross-thread safety on wasm32; it's a shared handle,
-// not a thread-safety claim, and wasm32 is single-threaded.
-#[allow(clippy::arc_with_non_send_sync)]
 pub fn create(
     service: Arc<dyn StorageService>,
     admin_block: Arc<str>,
