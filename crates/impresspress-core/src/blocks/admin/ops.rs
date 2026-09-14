@@ -569,6 +569,52 @@ pub(super) async fn reset_variable_to_environment(
     Ok(())
 }
 
+/// Hand back every key the one-time upgrade transition pinned, and nothing
+/// else. Returns the keys released, in the order they were.
+///
+/// The upgrade boot pins precisely the keys whose stored value disagreed with
+/// an export — the keys an operator had configured — so on a deployment that
+/// has been administered at all this is several keys, not one, and the per-key
+/// control is one confirm dialog each before a single restart.
+///
+/// **It cannot touch a [`variables::Pin::AdminEdit`] row**, and that is a
+/// property of the types rather than of this loop: the only thing it can pass
+/// to [`reset_variable_to_environment`] is a
+/// [`variables::PinnedAtUpgrade`], whose inner key is private to
+/// `platform_state::variables` and whose only constructor refuses every other
+/// pin. Widening it means editing that constructor, next to the reason it
+/// refuses. An admin edit winning permanently is rule 2 of the precedence
+/// contract, and a bulk control that quietly cleared one would be a worse
+/// defect than the clicking it saves.
+///
+/// One audit row PER KEY, written by the per-key path itself, carrying the same
+/// `variable.reset_to_environment` action and `variables/{key}` resource a
+/// single release writes. Both halves are deliberate: the outcome is identical
+/// per key, so an operator asking the audit log who released a given key has to
+/// find it whichever control was used — `logs::handle_list` filters `resource`
+/// with `LIKE` and `action` with equality, and an aggregate row would answer
+/// neither query with the key it hid inside a list.
+///
+/// A failure part way through leaves the keys already released released, and
+/// reports the error. That is safe because the action is idempotent: a released
+/// row is no longer [`variables::Pin::PreUpgrade`], so it is not in the set the
+/// next press collects, and pressing again retries exactly the remainder.
+pub(super) async fn release_keys_pinned_at_upgrade(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> Result<Vec<String>, OutputStream> {
+    let pinned = match variables::keys_pinned_at_upgrade(ctx).await {
+        Ok(keys) => keys,
+        Err(e) => return Err(err_internal("Database error", e)),
+    };
+    let mut released = Vec::with_capacity(pinned.len());
+    for key in &pinned {
+        reset_variable_to_environment(ctx, msg, key.key()).await?;
+        released.push(key.key().to_string());
+    }
+    Ok(released)
+}
+
 /// Delete a config variable, writing an audit-log row.
 ///
 /// Shared by the JSON surface (`settings::handle_delete`) and the Variables

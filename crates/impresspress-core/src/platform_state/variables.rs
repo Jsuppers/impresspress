@@ -566,6 +566,91 @@ pub async fn reset_to_environment(ctx: &dyn Context, key: &str) -> Result<(), Wa
     upsert_by_key(ctx, key, patch).await.map(|_| ())
 }
 
+/// Whether the process environment can ever set `key`, and so whether handing
+/// it back to the environment does anything.
+///
+/// A pin is real on any row an admin has edited, but [`reset_to_environment`]
+/// only means something when a later boot will actually re-seed the key — and
+/// every surface that offers the action promises exactly that ("replaced on the
+/// next restart"). A surface must not render a control whose action is inert.
+///
+/// Derived from the production gate rather than restated:
+/// `cli::server_config::filter_to_declared_keys` — the filter in front of
+/// [`seed_and_load`] on native — keeps exactly
+/// [`crate::config_vars::is_declared_key`], so a key outside it never reaches
+/// the seeder whatever the environment says. `WAFER_RUN__AUTH__JWT_SECRET` is
+/// the case that matters and needs no special mention here: it is declared by
+/// no `ConfigVar`, which is precisely why the filter strips it, even though
+/// `admin::ops::reject_runtime_owned_key` deliberately lets an admin edit it.
+///
+/// The runtime-owned half is [`seed_and_load`]'s own guard, restated here
+/// because the two refusals are independent and a surface must mirror both.
+///
+/// Answers a different question from [`deployment_seeds_from_process_env`],
+/// which is per DEPLOYMENT rather than per key: that one says whether there is
+/// a process environment at all on this target, this one says whether a
+/// particular key could ever come from it. Both have to hold before handing a
+/// key back does anything.
+pub fn key_can_be_seeded_from_env(key: &str) -> bool {
+    crate::config_vars::is_declared_key(key) && !crate::config_vars::is_runtime_owned_key(key)
+}
+
+/// A key [`seed_and_load`]'s one-time upgrade transition pinned, which the
+/// process environment can still set.
+///
+/// The input type of the bulk release (`admin::ops::release_keys_pinned_at_upgrade`),
+/// and the reason that action cannot reach a [`Pin::AdminEdit`] row. The inner
+/// `String` is private to this module and [`Self::of`] is the only constructor,
+/// so no caller outside this file can name a key to release — it can only ask
+/// [`keys_pinned_at_upgrade`] which rows qualify. Releasing an admin edit would
+/// silently undo the decision rule 2 of the precedence contract exists to make
+/// permanent, so "which keys" is not a question a UI surface gets to answer.
+#[derive(Debug)]
+pub struct PinnedAtUpgrade(String);
+
+impl PinnedAtUpgrade {
+    /// `Some` when `row` is one the bulk release may act on.
+    ///
+    /// The match on [`Pin`] is EXHAUSTIVE on purpose rather than an equality
+    /// test against [`Pin::PreUpgrade`]: a third pin kind added later is then a
+    /// compile error here, where somebody has to decide whether a bulk release
+    /// may clear it, instead of silently falling into either answer.
+    fn of(row: &VariableRow) -> Option<Self> {
+        match pin_of(row)? {
+            // The transition kept this row because it could not prove an admin
+            // set it. Handing the whole set back is the operator supplying the
+            // proof it lacked.
+            Pin::PreUpgrade => {}
+            // A person made this decision and this build recorded it. Nothing
+            // here may undo it in bulk.
+            Pin::AdminEdit => return None,
+        }
+        // A pin on a key no environment can set is real, but releasing it
+        // changes nothing — the same rule that keeps the per-key control off
+        // such a row.
+        key_can_be_seeded_from_env(&row.key).then(|| Self(row.key.clone()))
+    }
+
+    /// The config key, for the release itself and the audit row that records
+    /// it. Read-only: there is no way back from a `&str` to one of these.
+    pub fn key(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Every key the one-time upgrade transition pinned and this deployment could
+/// still seed from its process environment.
+///
+/// Says nothing about whether there IS a process environment — that is
+/// [`deployment_seeds_from_process_env`], which a surface has to check as well.
+pub async fn keys_pinned_at_upgrade(ctx: &dyn Context) -> Result<Vec<PinnedAtUpgrade>, WaferError> {
+    Ok(list_all(ctx)
+        .await?
+        .iter()
+        .filter_map(PinnedAtUpgrade::of)
+        .collect())
+}
+
 async fn set_with_owner(
     db: &Arc<dyn DatabaseService>,
     key: &str,
@@ -984,6 +1069,10 @@ pub async fn seed_and_load(
     //    for every one of them and goes out once, below, so the per-key lines
     //    carry only what differs.
     let mut inert_exports = 0usize;
+    // How many of `inert_exports` are held by an upgrade pin rather than an
+    // admin edit: the ones the page's BULK release would act on, and so the only
+    // ones the summary line may point at it for.
+    let mut upgrade_pins = 0usize;
     for (key, value) in env_vars {
         if crate::config_vars::is_runtime_owned_key(key) {
             tracing::warn!(
@@ -1047,6 +1136,9 @@ pub async fn seed_and_load(
                 if row.value != *value {
                     warn_export_is_inert(key, pin);
                     inert_exports += 1;
+                    if pin == Pin::PreUpgrade {
+                        upgrade_pins += 1;
+                    }
                 }
                 continue;
             }
@@ -1058,6 +1150,7 @@ pub async fn seed_and_load(
             if !transition_done && is_unclaimed(row) && row.value != *value {
                 if pin_at_upgrade(db, row).await {
                     inert_exports += 1;
+                    upgrade_pins += 1;
                 }
                 continue;
             }
@@ -1082,7 +1175,7 @@ pub async fn seed_and_load(
     }
 
     if inert_exports > 0 {
-        warn_how_to_undo_a_pin(inert_exports);
+        warn_how_to_undo_a_pin(inert_exports, upgrade_pins);
     }
 
     // 1b. Record that the transition has run — LAST, so a boot that dies
@@ -1430,16 +1523,37 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 ///   control for — a summary that over-counts by one per such key on a path
 ///   production does
 ///   not take, which is not worth a second per-key pass to avoid.
-fn warn_how_to_undo_a_pin(count: usize) {
+///
+/// `upgrade_pins` is how many of those `count` keys are held by a
+/// [`Pin::PreUpgrade`] rather than a [`Pin::AdminEdit`], and it is passed
+/// separately so the extra sentence about the BULK control is printed only when
+/// that control will be on the page. That control needs one more thing than
+/// this line does — at least one upgrade pin — and the [`Pin::AdminEdit`] half
+/// of `count` does not supply it, so a deployment whose only inert exports are
+/// admin edits would be told to press a button that is not there. The per-key
+/// caveat above applies to this number the same way and for the same reason.
+fn warn_how_to_undo_a_pin(count: usize, upgrade_pins: usize) {
+    // Named separately from the message so the sentence reads as one thing an
+    // operator can act on rather than a conditional clause.
+    let bulk = if upgrade_pins > 0 {
+        format!(
+            ". {upgrade_pins} of them were pinned by this deployment's one-time upgrade boot; \
+             \"Reset all keys pinned at upgrade\" on that page releases all {upgrade_pins} at \
+             once, and never touches a key an admin edited"
+        )
+    } else {
+        String::new()
+    };
     tracing::warn!(
         inert_exports = count,
+        upgrade_pins,
         // Deliberately NOT the per-key lines' "NO EFFECT" wording: that phrase
         // is how an operator greps for the keys to act on, and how this
         // module's tests count them, so the summary must not inflate it.
         "{count} environment variable(s) named above are set but are not in effect, \
          because a stored value takes precedence for those keys. To hand one back to the \
          environment, use \"Reset to environment\" on the admin Variables page (or POST \
-         /b/admin/api/settings/{{key}}/reset-to-environment) and restart"
+         /b/admin/api/settings/{{key}}/reset-to-environment) and restart{bulk}"
     );
 }
 
@@ -2980,6 +3094,43 @@ mod boot_tests {
             capture.count_containing("Reset to environment"),
             1,
             "and the advice exactly once, however many keys there are"
+        );
+        // Every one of these was pinned by this very boot's transition, so the
+        // bulk control will be on the page and the advice says so.
+        assert_eq!(
+            capture.count_containing("Reset all keys pinned at upgrade"),
+            1,
+            "with several upgrade pins, the one-press route has to be named"
+        );
+    }
+
+    /// The summary names the BULK control only when that control will render.
+    ///
+    /// It is gated on at least one upgrade pin, and an admin-edited key is not
+    /// one: `PinnedAtUpgrade::of` refuses it, so nothing on the Variables page
+    /// would offer to release it in bulk. Naming a button that is not there is
+    /// the shape of advice this module's WARNs exist to stop giving.
+    #[tokio::test]
+    async fn the_bulk_advice_is_withheld_when_only_an_admin_edit_is_inert() {
+        let ctx = crate::test_support::TestContext::with_admin().await;
+        let key = "WAFER_RUN_SHARED__APP_NAME";
+        seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
+
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            ctx.seed_env_vars(&[(key, "FromEnv")]).await;
+        }
+
+        assert_eq!(
+            capture.count_containing("Reset to environment"),
+            1,
+            "the per-key advice still applies — an admin can release their own edit"
+        );
+        assert_eq!(
+            capture.count_containing("Reset all keys pinned at upgrade"),
+            0,
+            "but the bulk control does not render for an admin edit, so it is not named"
         );
     }
 

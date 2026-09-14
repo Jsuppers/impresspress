@@ -4,7 +4,11 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use crate::{
     blocks::admin::ops,
     http::{err_internal, err_not_found},
-    platform_state::variables,
+    // `key_can_be_seeded_from_env` lives beside the two gates it mirrors — the
+    // native env filter and `seed_and_load`'s runtime-owned refusal — and is
+    // shared with the bulk release's selection, so the page and the action
+    // cannot disagree about which keys the environment can set.
+    platform_state::variables::{self, key_can_be_seeded_from_env},
     ui::{
         self,
         components::{self, Badge, BadgeVariant},
@@ -21,11 +25,15 @@ use crate::{
 pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     let tab = msg.query("tab");
     let active_tab = if tab == "all" { "all" } else { "blocks" };
+    let upgrade_pins = bulk_release_count(ctx).await;
 
     html! {
-        div .mb-3 {
+        div .mb-3 .flex .gap-1 {
             button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-var" {
                 (icons::plus()) " Add Variable"
+            }
+            @if upgrade_pins > 0 {
+                (reset_pinned_at_upgrade_button(upgrade_pins))
             }
         }
 
@@ -442,6 +450,85 @@ fn reset_to_environment_button(key: &str) -> Markup {
     }
 }
 
+/// How many keys the bulk release would act on, or `0` when the page must not
+/// offer it at all.
+///
+/// Two independent conditions, the same pair the per-row control is gated on
+/// and for the same reasons:
+///
+/// - PER DEPLOYMENT, [`variables::deployment_seeds_from_process_env`]: Cloudflare
+///   never runs `variables::seed_and_load` and the browser runs it with an empty
+///   batch, so nothing there is pinned against a process environment and the
+///   action's toast would be false.
+/// - PER KEY, which [`variables::keys_pinned_at_upgrade`] applies itself
+///   (`key_can_be_seeded_from_env`), so the count is exactly the number of rows
+///   whose own "Reset to environment" control is on the page. The two agreeing
+///   is what stops a bulk button appearing above a table where no row offers
+///   the single-key one.
+///
+/// Zero rather than an error when the table cannot be read. This is the second
+/// of the page's two reads of that table — the active tab takes the other — and
+/// the tab is what already decides how a failed read is reported ("All
+/// Variables" renders the error, "By Block" falls back to an empty list). A
+/// bulk control drawn from a count nobody could take would offer work it has no
+/// evidence exists.
+async fn bulk_release_count(ctx: &dyn Context) -> usize {
+    if !variables::deployment_seeds_from_process_env(ctx).await {
+        return 0;
+    }
+    variables::keys_pinned_at_upgrade(ctx)
+        .await
+        .map(|keys| keys.len())
+        .unwrap_or(0)
+}
+
+/// The control that hands every key pinned at upgrade back to the process
+/// environment at once.
+///
+/// The per-key control is the correctness fix; this is the one that matches
+/// what the upgrade boot actually does. The transition pins precisely the keys
+/// whose stored value disagreed with an export — the keys the operator had
+/// configured — so "several" is the ordinary case, and an operator who decides
+/// the environment was right all along faced one confirm dialog per key before
+/// a single restart.
+///
+/// It names the count rather than the keys: the keys are listed on this page,
+/// each carrying the "Pinned at upgrade" badge, and a confirm dialog carrying
+/// ten `WAFER_RUN_SHARED__*` names is one nobody reads. The confirm text says
+/// what it will NOT touch instead, because that is the question a bulk action
+/// over configuration has to answer before it is pressed.
+///
+/// `hx-swap="none"` for the reason [`reset_to_environment_button`] gives:
+/// nothing is removed and no row's identity changes, so the toast its
+/// `HX-Trigger` carries is the whole result, and the pin badges go stale until
+/// the next render — the change does not take effect until a restart either.
+fn reset_pinned_at_upgrade_button(count: usize) -> Markup {
+    let keys = pluralize_keys(count);
+    html! {
+        button .btn .btn--secondary .btn--sm type="button"
+            hx-post="/b/admin/variables/reset-pinned-at-upgrade"
+            hx-swap="none"
+            hx-confirm={
+                "Hand " (keys) " pinned at upgrade back to the environment? Their stored \
+                 values stop taking precedence, and the next restart seeds those keys from \
+                 the process environment again. Keys an admin edited here are not affected."
+            }
+            data-error-label="Could not hand the keys pinned at upgrade back to the environment"
+            title="Reset every key the upgrade boot pinned"
+        { (icons::refresh_cw()) " Reset all keys pinned at upgrade (" (count) ")" }
+    }
+}
+
+/// `"1 key"` / `"4 keys"`, so the confirm dialog and the toast read as English
+/// on the single-key case the bulk control still renders for.
+fn pluralize_keys(count: usize) -> String {
+    if count == 1 {
+        "1 key".to_string()
+    } else {
+        format!("{count} keys")
+    }
+}
+
 /// The badge that says WHY a row outranks the process environment.
 ///
 /// Two wordings, because they are two different claims and only one of them is
@@ -478,30 +565,6 @@ fn pin_badge(pin: variables::Pin) -> Markup {
 /// declared (nothing re-seeds a stale row).
 fn key_is_deletable(key: &str, declared_shared: &std::collections::HashSet<String>) -> bool {
     key != crate::blocks::auth::JWT_SECRET_KEY && !declared_shared.contains(key)
-}
-
-/// Whether the process environment can ever set `key`, and so whether handing
-/// it back to the environment does anything.
-///
-/// The same shape as [`key_is_deletable`], and there for the same reason: the
-/// page must not render a button whose action is inert. A pin is real on any
-/// row an admin has edited, but `reset_to_environment` only means something
-/// when a later boot will actually re-seed the key — and the control's toast
-/// promises exactly that ("replaced on the next restart").
-///
-/// Derived from the production gate rather than restated: `cli::server_config::
-/// filter_to_declared_keys` — the filter in front of
-/// `variables::seed_and_load` on native — keeps exactly
-/// [`crate::config_vars::is_declared_key`], so a key outside it never reaches
-/// the seeder whatever the environment says. `WAFER_RUN__AUTH__JWT_SECRET` is
-/// the case that matters and needs no special mention here: it is declared by
-/// no `ConfigVar`, which is precisely why the filter strips it, even though
-/// `ops::reject_runtime_owned_key` deliberately lets an admin edit it.
-///
-/// The runtime-owned half is `seed_and_load`'s own guard, restated here because
-/// the two refusals are independent and the page must mirror both.
-fn key_can_be_seeded_from_env(key: &str) -> bool {
-    crate::config_vars::is_declared_key(key) && !crate::config_vars::is_runtime_owned_key(key)
 }
 
 /// The shared keys this build declares, for [`key_is_deletable`]. Built once
@@ -1047,6 +1110,43 @@ pub async fn handle_reset_variable_to_environment(
         "Handed back to the environment — the stored value is replaced on the next restart",
         "success",
     )
+}
+
+/// `POST /b/admin/variables/reset-pinned-at-upgrade` — the Variables page's
+/// bulk control for handing back every key the one-time upgrade transition
+/// pinned.
+///
+/// Takes no key: which rows qualify is `ops::release_keys_pinned_at_upgrade`'s
+/// to decide, and the type it decides with is what keeps an admin-edited row
+/// out of reach. A body or a path variable here would be the widenable filter
+/// that design exists to avoid.
+///
+/// Reports ZERO as a success rather than an error. The page only renders the
+/// control when the count is non-zero, so reaching this with nothing to do
+/// means the page went stale — another admin released the keys, or this one
+/// did, from the per-row controls beside them. Nothing has failed, and saying
+/// so is more useful than an error the operator cannot act on.
+pub async fn handle_reset_variables_pinned_at_upgrade(
+    ctx: &dyn Context,
+    msg: &Message,
+) -> OutputStream {
+    let released = match ops::release_keys_pinned_at_upgrade(ctx, msg).await {
+        Ok(released) => released,
+        Err(out) => return out,
+    };
+    // The stored values are deliberately left in place; only the next boot
+    // re-seeds them from the environment. Same wording as the per-key toast,
+    // because it is the same promise.
+    let toast = if released.is_empty() {
+        "No keys are pinned at upgrade — nothing to hand back".to_string()
+    } else {
+        format!(
+            "Handed {} back to the environment — the stored values are replaced on the next \
+             restart",
+            pluralize_keys(released.len())
+        )
+    };
+    ui::html_response_with_toast(html! {}, &toast, "success")
 }
 
 /// `DELETE /b/admin/variables/{key}` — the Variables page's delete row control.
@@ -1767,6 +1867,384 @@ mod tests {
             "a non-deletable row must render no delete control: {s}"
         );
         assert!(s.contains("hx-get"), "the edit control is unaffected: {s}");
+    }
+
+    // -----------------------------------------------------------------------
+    // "Reset all keys pinned at upgrade"
+    // -----------------------------------------------------------------------
+
+    /// Three rows in the three states the bulk action has to tell apart:
+    /// pinned by the upgrade transition (released), pinned by an admin edit
+    /// (never touched), and claimed by nobody (already follows the
+    /// environment, so nothing to release).
+    const UPGRADE_PINNED: [&str; 2] = [
+        "WAFER_RUN_SHARED__APP_NAME",
+        "WAFER_RUN_SHARED__AUTH_HEADLINE",
+    ];
+    const ADMIN_EDITED: &str = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+    const UNCLAIMED: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+    /// An admin context holding one row in each pin state.
+    ///
+    /// The upgrade-pinned rows are staged through
+    /// `variables::seed_row_with_owner`, which writes the `updated_by` column
+    /// directly, because no surface a test can reach writes
+    /// `PRE_UPGRADE_SENTINEL`: only `seed_and_load`'s one-time transition does.
+    /// The admin-edited row goes through the REAL admin create, which is what
+    /// stamps an admin pin — a hand-written marker there would prove nothing
+    /// about the state the surface actually produces.
+    async fn ctx_with_every_pin_state(has_process_env: bool) -> TestContext {
+        let mut ctx = TestContext::with_admin().await;
+        if has_process_env {
+            ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+        }
+        for key in UPGRADE_PINNED {
+            variables::seed_row_with_owner(
+                &ctx,
+                key,
+                "KeptAtUpgrade",
+                variables::PRE_UPGRADE_SENTINEL,
+            )
+            .await;
+        }
+        let msg = admin_msg("update", "/admin/settings");
+        assert!(
+            ops::create_variable(&ctx, &msg, ADMIN_EDITED, "false", None, None, false)
+                .await
+                .is_ok(),
+            "the fixture's admin create must land"
+        );
+        variables::seed_row_with_owner(&ctx, UNCLAIMED, "#123456", "").await;
+
+        assert_eq!(
+            pin_of_key(&ctx, ADMIN_EDITED).await,
+            Some(variables::Pin::AdminEdit),
+            "the fixture's admin row has to be an admin pin, or the exclusion is untested"
+        );
+        assert_eq!(
+            pin_of_key(&ctx, UPGRADE_PINNED[0]).await,
+            Some(variables::Pin::PreUpgrade),
+            "and the upgrade rows have to be upgrade pins"
+        );
+        ctx
+    }
+
+    async fn pin_of_key(ctx: &TestContext, key: &str) -> Option<variables::Pin> {
+        variables::pin_of(
+            &variables::get_by_key(ctx, key)
+                .await
+                .expect("get")
+                .expect("row"),
+        )
+    }
+
+    async fn updated_by_of(ctx: &TestContext, key: &str) -> String {
+        variables::get_by_key(ctx, key)
+            .await
+            .expect("get")
+            .expect("row")
+            .updated_by
+    }
+
+    /// The bulk action as the wire reaches it: through the block's own
+    /// dispatch, so the route table and the handler are both the production
+    /// ones. Calling the handler directly would pass even with no route bound
+    /// to it.
+    ///
+    /// The response is returned rather than collected here, because the tests
+    /// that assert on the STORED rows must fail on those assertions — collecting
+    /// an unrouted request through `output_html` panics inside the helper
+    /// instead, which says nothing about whether the release happened.
+    async fn bulk_release_request(ctx: &TestContext) -> OutputStream {
+        use wafer_run::Block as _;
+        crate::blocks::admin::AdminBlock::new()
+            .handle(
+                ctx,
+                admin_msg("create", "/b/admin/variables/reset-pinned-at-upgrade"),
+                InputStream::empty(),
+            )
+            .await
+    }
+
+    /// Drive the bulk action and discard the response, for a test whose subject
+    /// is what the table now holds.
+    async fn post_bulk_release(ctx: &TestContext) {
+        crate::test_support::output_http_status(bulk_release_request(ctx).await).await;
+    }
+
+    /// THE ACTION. Every key the upgrade transition pinned is released in one
+    /// press, and NOTHING else moves.
+    ///
+    /// The admin-edited row is the assertion that matters: "an admin edit wins
+    /// permanently" is the contract the whole precedence design rests on, and a
+    /// bulk control that quietly cleared one would be a worse defect than the
+    /// clicking it saves.
+    #[tokio::test]
+    async fn the_bulk_action_releases_every_upgrade_pin_and_only_those() {
+        let ctx = ctx_with_every_pin_state(true).await;
+
+        post_bulk_release(&ctx).await;
+
+        for key in UPGRADE_PINNED {
+            assert_eq!(
+                updated_by_of(&ctx, key).await,
+                variables::RELEASED_TO_ENV_SENTINEL,
+                "{key} must carry the same released marker the per-key control writes"
+            );
+        }
+        assert_eq!(
+            pin_of_key(&ctx, ADMIN_EDITED).await,
+            Some(variables::Pin::AdminEdit),
+            "an admin edit wins permanently; a bulk release must never clear one"
+        );
+        assert_eq!(
+            updated_by_of(&ctx, UNCLAIMED).await,
+            "",
+            "a row nothing has claimed already follows the environment, and stamping it \
+             released would hide it from the one-time upgrade transition"
+        );
+    }
+
+    /// One audit row per released key, naming the key.
+    ///
+    /// The same `variable.reset_to_environment` action the per-key control
+    /// writes: the outcome is identical per key, so an operator filtering the
+    /// audit log for who released a given key must find it whichever control
+    /// was used.
+    #[tokio::test]
+    async fn the_bulk_action_audits_each_key_it_released() {
+        let ctx = ctx_with_every_pin_state(true).await;
+
+        post_bulk_release(&ctx).await;
+
+        let rows = wafer_core::clients::database::list_all(
+            &ctx,
+            crate::blocks::admin::logs::AUDIT_LOGS_TABLE,
+            vec![wafer_block::db::Filter {
+                field: "action".to_string(),
+                operator: wafer_block::db::FilterOp::Equal,
+                value: serde_json::Value::String("variable.reset_to_environment".to_string()),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        let resources: std::collections::BTreeSet<String> = rows
+            .iter()
+            .filter_map(|r| r.data.get("resource")?.as_str().map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            resources,
+            UPGRADE_PINNED
+                .iter()
+                .map(|k| format!("variables/{k}"))
+                .collect::<std::collections::BTreeSet<String>>(),
+            "the trail has to say WHICH keys were released, and no others"
+        );
+    }
+
+    /// The control renders only when there is something for it to do.
+    #[tokio::test]
+    async fn the_page_offers_the_bulk_release_when_a_key_is_pinned_at_upgrade() {
+        let ctx = ctx_with_every_pin_state(true).await;
+
+        for tab in ["", "all"] {
+            let html = variables_page_html(&ctx, tab).await;
+            assert!(
+                html.contains(r#"hx-post="/b/admin/variables/reset-pinned-at-upgrade""#),
+                "the {tab:?} tab must offer the bulk release: {html}"
+            );
+            assert!(
+                html.contains("Reset all keys pinned at upgrade"),
+                "and label it the way the pin badge names the state: {html}"
+            );
+        }
+    }
+
+    /// An admin edit is not an upgrade pin, and must not make the bulk control
+    /// appear: pressing it would release nothing, and a control that offers to
+    /// clear admin edits is the misreading this action must not invite.
+    #[tokio::test]
+    async fn an_admin_edit_alone_offers_no_bulk_release() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+        let msg = admin_msg("update", "/admin/settings");
+        assert!(
+            ops::create_variable(&ctx, &msg, ADMIN_EDITED, "false", None, None, false)
+                .await
+                .is_ok(),
+            "the fixture's admin create must land"
+        );
+
+        for tab in ["", "all"] {
+            let html = variables_page_html(&ctx, tab).await;
+            assert!(
+                html.contains(ADMIN_EDITED),
+                "the row must be on the {tab:?} tab, or this proves nothing: {html}"
+            );
+            assert!(
+                !html.contains("reset-pinned-at-upgrade"),
+                "nothing is pinned at upgrade, so the {tab:?} tab must offer no bulk \
+                 release: {html}"
+            );
+        }
+    }
+
+    /// The released rows have to hold against the ONE-TIME UPGRADE TRANSITION,
+    /// not merely against later boots — the property
+    /// [`variables::RELEASED_TO_ENV_SENTINEL`] exists for.
+    ///
+    /// The gate is recorded only by a boot that HAD exports, so a deployment
+    /// whose early boots carried none reaches the admin UI with the transition
+    /// still armed. If the bulk release emptied `updated_by` instead, the first
+    /// boot that did carry an export would read every released row as
+    /// never-considered and pin it straight back — the control silently not
+    /// working, in bulk. Mirrors
+    /// `variables::boot_tests::a_reset_is_not_undone_by_a_transition_that_has_not_run_yet`
+    /// for the path that releases many keys at once.
+    #[tokio::test]
+    async fn keys_released_in_bulk_are_not_re_pinned_by_the_next_boot() {
+        let ctx = ctx_with_every_pin_state(true).await;
+        assert!(
+            variables::get_by_key(&ctx, variables::ENV_PRECEDENCE_TRANSITION_KEY)
+                .await
+                .expect("get")
+                .is_none(),
+            "the premise: the transition has not run, so it could still re-pin a row"
+        );
+
+        post_bulk_release(&ctx).await;
+
+        // The operator adds the exports they wanted all along, and restarts.
+        let exports: Vec<(&str, &str)> = UPGRADE_PINNED
+            .iter()
+            .map(|key| (*key, "FromEnv"))
+            .chain(std::iter::once((ADMIN_EDITED, "true")))
+            .collect();
+        ctx.seed_env_vars(&exports).await;
+
+        for key in UPGRADE_PINNED {
+            let row = variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row");
+            assert_eq!(
+                row.value, "FromEnv",
+                "{key} was released, so the environment sets it from this boot on"
+            );
+            assert!(
+                !variables::is_pinned(&row),
+                "{key} must not be re-pinned by a transition that had not run yet"
+            );
+        }
+        assert_eq!(
+            variables::get_by_key(&ctx, ADMIN_EDITED)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "false",
+            "the admin-edited key the bulk release passed over still outranks its export"
+        );
+    }
+
+    /// A key pinned at upgrade that the environment can NEVER set is left
+    /// alone, and does not make the control appear.
+    ///
+    /// `key_can_be_seeded_from_env` mirrors the two gates between the process
+    /// environment and this table, so releasing such a key would change nothing
+    /// and the toast ("replaced on the next restart") would be false — the same
+    /// rule that keeps the per-row control off it. The two agreeing is what
+    /// stops a bulk button appearing above a table where no row offers the
+    /// single-key one.
+    #[tokio::test]
+    async fn a_key_the_environment_cannot_set_is_not_part_of_the_bulk_release() {
+        let key = "MY_LEGACY_THING";
+        assert!(
+            !key_can_be_seeded_from_env(key),
+            "the fixture's key must be one no env batch can carry, or this proves nothing"
+        );
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+        variables::seed_row_with_owner(&ctx, key, "legacy", variables::PRE_UPGRADE_SENTINEL).await;
+
+        for tab in ["", "all"] {
+            let html = variables_page_html(&ctx, tab).await;
+            assert!(
+                html.contains(key),
+                "the row must be on the {tab:?} tab: {html}"
+            );
+            assert!(
+                !html.contains("reset-pinned-at-upgrade"),
+                "no row on the {tab:?} tab can be handed back, so no bulk control: {html}"
+            );
+        }
+
+        post_bulk_release(&ctx).await;
+        assert_eq!(
+            updated_by_of(&ctx, key).await,
+            variables::PRE_UPGRADE_SENTINEL,
+            "and the action itself leaves it pinned"
+        );
+    }
+
+    /// The toast is the whole result — `hx-swap="none"` swaps no markup — so it
+    /// has to say how many keys moved and that nothing changes until a restart.
+    #[tokio::test]
+    async fn the_bulk_action_reports_what_it_released() {
+        let ctx = ctx_with_every_pin_state(true).await;
+
+        let trigger =
+            crate::test_support::output_header(bulk_release_request(&ctx).await, "HX-Trigger")
+                .await
+                .expect("the control's only result is its toast");
+
+        assert!(
+            trigger.contains("Handed 2 keys back to the environment"),
+            "the toast must name how many keys moved: {trigger}"
+        );
+        assert!(
+            trigger.contains("next restart"),
+            "and that the stored values stand until then: {trigger}"
+        );
+    }
+
+    /// Pressing the control on a stale page, after the keys have already been
+    /// released, is news rather than a failure.
+    #[tokio::test]
+    async fn a_bulk_release_with_nothing_pinned_succeeds_and_says_so() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
+
+        let trigger =
+            crate::test_support::output_header(bulk_release_request(&ctx).await, "HX-Trigger")
+                .await
+                .expect("a toast, not an error");
+        assert!(
+            trigger.contains("No keys are pinned at upgrade"),
+            "an empty release must report the truth, not a failure: {trigger}"
+        );
+    }
+
+    /// On a target with no process environment there is nothing to hand the
+    /// keys back to — the same gate the per-key control uses, for the same
+    /// reason.
+    #[tokio::test]
+    async fn a_target_without_a_process_environment_offers_no_bulk_release() {
+        let ctx = ctx_with_every_pin_state(false).await;
+
+        for tab in ["", "all"] {
+            let html = variables_page_html(&ctx, tab).await;
+            assert!(
+                html.contains(UPGRADE_PINNED[0]),
+                "the pinned row must be on the {tab:?} tab: {html}"
+            );
+            assert!(
+                !html.contains("reset-pinned-at-upgrade"),
+                "the {tab:?} tab must not offer to hand keys back to an environment this \
+                 deployment does not have: {html}"
+            );
+        }
     }
 }
 
