@@ -648,11 +648,14 @@ pub(crate) const MASKED_VALUE: &str = "********";
 /// closes.
 ///
 /// That list is the surfaces that ASK, not every surface that can publish a
-/// stored value. The admin SQL explorer (`POST /b/admin/api/database/query`)
-/// is outside it by construction — its job is to return what the query asked
-/// for, so `SELECT value FROM …__variables` answers in plaintext. Recorded
-/// under Security in `NICE_TO_HAVE.md` rather than closed here, so this
-/// enumeration is not read as exhaustive.
+/// stored value. The admin SQL explorer (`POST /b/admin/api/database/query`
+/// and its SSR twin) cannot join it: `db::query_raw` returns records keyed by
+/// the column name the QUERY chose, so a mask keyed on `(table, column)` is
+/// defeated by `SELECT value AS v`. It is held to the same promise by a
+/// different mechanism — [`crate::secret_tables`] refuses, before execution,
+/// any query naming a table that stores credential material — which is why
+/// this enumeration can be read as covering every surface that publishes a
+/// stored value, even though the explorer is not on it.
 ///
 /// It is deliberately the same key predicate the WRITE path applies when it
 /// decides what the stored flag gets ([`crate::config_vars::is_sensitive_for_storage`],

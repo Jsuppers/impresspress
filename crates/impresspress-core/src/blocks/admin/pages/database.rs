@@ -292,8 +292,15 @@ async fn right_pane(ctx: &dyn Context, selected: Option<&str>, tab: Tab) -> Mark
 }
 
 fn sql_panel(selected: Option<&str>, query: Option<&str>, result: Option<Markup>) -> Markup {
+    // A table the validator refuses is not prefilled with a query that cannot
+    // run: the panel says why and where to go instead, rather than handing an
+    // operator a Run button whose only outcome is a 403. Same text the API
+    // returns, from the same entry — the page cannot describe the rule
+    // differently from the rule.
+    let refused = selected.and_then(crate::secret_tables::secret_table_named_in);
     let initial = match (query, selected) {
         (Some(q), _) if !q.is_empty() => q.to_string(),
+        _ if refused.is_some() => "SELECT 1;".to_string(),
         (_, Some(t)) => format!("SELECT * FROM {t} LIMIT 100;"),
         _ => "SELECT 1;".to_string(),
     };
@@ -306,6 +313,9 @@ fn sql_panel(selected: Option<&str>, query: Option<&str>, result: Option<Markup>
             {
                 @if let Some(t) = selected {
                     input type="hidden" name="table" value=(t);
+                }
+                @if let Some(entry) = refused {
+                    p .text-muted .text-sm { (entry.refusal()) }
                 }
                 textarea name="query" rows="6" .db-sql__input
                     spellcheck="false"

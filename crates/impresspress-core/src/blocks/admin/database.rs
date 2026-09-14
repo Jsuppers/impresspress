@@ -219,7 +219,15 @@ impl QueryValidationError {
 ///
 /// Accepts: SELECT / PRAGMA (whitelisted) / EXPLAIN / WITH.
 /// Rejects: multi-statement (`;`), any write keyword (whole-word match),
-/// and unsafe PRAGMAs.
+/// unsafe PRAGMAs, and any statement naming a
+/// [`crate::secret_tables::SECRET_TABLES`] table.
+///
+/// The secret-table refusal is here, in the validator, rather than over the
+/// result set: `db::query_raw` returns records keyed by the column name the
+/// query chose, so a mask keyed on `(table, column)` is defeated by
+/// `SELECT value AS v`. Refusing before execution is the only rule the query
+/// text cannot be reshaped around — see the `secret_tables` module docs and
+/// `tests/admin/sql_explorer_secrets.rs`.
 ///
 /// Used by both the JSON API (`POST /b/admin/api/database/query`) and the
 /// admin SSR page handler (`POST /b/admin/database/query`). Single
@@ -245,6 +253,23 @@ pub(in crate::blocks::admin) fn validate_readonly_query(
         return Err(QueryValidationError::Forbidden(
             "Multi-statement queries are not allowed".to_string(),
         ));
+    }
+
+    // A query that names a table holding authentication material is refused
+    // whatever verb it uses and whatever it would have done with the rows.
+    // Placed ahead of the keyword scan, the PRAGMA whitelist and the
+    // first-word check so the refusal never depends on any of them reading the
+    // statement the way the backend will: an `EXPLAIN`, a `PRAGMA`, or a shape
+    // none of them recognise is refused here just the same.
+    if crate::secret_tables::rejects_unicode_escape(trimmed) {
+        return Err(QueryValidationError::Forbidden(
+            "Unicode-escaped identifiers and string constants (U&\"…\" / U&'…') are not \
+             allowed: they can spell a table name this validator would not see"
+                .to_string(),
+        ));
+    }
+    if let Some(entry) = crate::secret_tables::secret_table_named_in(trimmed) {
+        return Err(QueryValidationError::Forbidden(entry.refusal()));
     }
 
     let query_upper = trimmed.to_uppercase();
@@ -442,5 +467,29 @@ mod tests {
     fn validate_marks_unknown_first_word_as_bad_request() {
         let err = validate_readonly_query("EXEC users").unwrap_err();
         assert!(matches!(err, QueryValidationError::BadRequest(_)));
+    }
+
+    /// A secret table is `Forbidden` (403), not `BadRequest` — the query is
+    /// well-formed and the answer is "not here". The end-to-end coverage,
+    /// including the shapes a result-set mask would have missed, lives in
+    /// `tests/admin/sql_explorer_secrets.rs`.
+    #[test]
+    fn validate_refuses_every_secret_table_whatever_shape_names_it() {
+        for entry in crate::secret_tables::SECRET_TABLES {
+            let table = entry.table;
+            for query in [
+                format!("SELECT * FROM {table}"),
+                format!("SELECT x AS v FROM {table}"),
+                format!("WITH q AS (SELECT x FROM {table}) SELECT * FROM q"),
+                format!("PRAGMA table_info({table})"),
+            ] {
+                let err = validate_readonly_query(&query).unwrap_err();
+                assert!(
+                    matches!(err, QueryValidationError::Forbidden(_)),
+                    "{query}: {err:?}"
+                );
+                assert!(err.message().contains(table), "{query}: {err:?}");
+            }
+        }
     }
 }

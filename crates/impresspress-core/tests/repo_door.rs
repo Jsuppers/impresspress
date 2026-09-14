@@ -381,7 +381,19 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "platform_state/wrap_grants.rs",
         ],
     ),
-    ("shares", &["blocks/files/repo/shares.rs"]),
+    (
+        "shares",
+        &[
+            "blocks/files/repo/shares.rs",
+            // the admin SQL explorer's refusal list names these two as
+            // literals because their owning module is behind a block
+            // feature and the table outlives the build that created it;
+            // `secret_tables.rs` pins each literal to this door's own
+            // constant in a `#[cfg(feature = ..)]` test, and issues no
+            // query against either
+            "secret_tables.rs",
+        ],
+    ),
     ("share_access_logs", &["blocks/files/repo/shares.rs"]),
     ("quota", &["blocks/files/repo/quota.rs"]),
     ("views", &["blocks/files/repo/views.rs"]),
@@ -504,6 +516,13 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     (
         "purchases",
         &[
+            // the admin SQL explorer's refusal list names these two as
+            // literals because their owning module is behind a block
+            // feature and the table outlives the build that created it;
+            // `secret_tables.rs` pins each literal to this door's own
+            // constant in a `#[cfg(feature = ..)]` test, and issues no
+            // query against either
+            "secret_tables.rs",
             "blocks/products/repo/purchases.rs",
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/purchase_tests.rs",
@@ -656,6 +675,12 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "cache_key.rs",
             // the config-snapshot invalidation predicate compares names
             "config_generation.rs",
+            // the admin SQL explorer's refusal list: it compares the table
+            // name against the text of a submitted query and never issues
+            // one. Naming the door's constant is the point — a re-typed
+            // literal here would be a second spelling of the table that
+            // could drift out of the refusal silently.
+            "secret_tables.rs",
             // `BlockInfo::collections(..)` / `grants(..)` are advisory
             // declarations for WRAP and the admin database explorer
             "blocks/admin/mod.rs",
@@ -704,6 +729,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "users",
         &[
+            // the admin SQL explorer's refusal list; see the note on
+            // the `variables` door above
+            "secret_tables.rs",
             // the export allowlist/exclusion bookkeeping; its reads go
             // through a generic `db::list_all(ctx, table, ..)` over the
             // allowlist and its import through `seed::import`
@@ -736,6 +764,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "refresh_tokens",
         &[
+            // the admin SQL explorer's refusal list; see the note on
+            // the `variables` door above
+            "secret_tables.rs",
             "blocks/dev/data_snapshot.rs",
             // Five `FailingDbOpContext` fixtures across the flows that revoke
             // refresh rows: logout, password change, password reset, refresh
@@ -809,6 +840,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "shares",
         &[
+            // the admin SQL explorer's refusal list; see the note on
+            // the `variables` door above
+            "secret_tables.rs",
             "blocks/files/mod.rs",
             // `("database.get", shares::TABLE)` — the share-delete
             // authorization test: a failed ownership read must stop the
@@ -918,6 +952,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "purchases",
         &[
+            // the admin SQL explorer's refusal list; see the note on
+            // the `variables` door above
+            "secret_tables.rs",
             "blocks/products/repo/purchases.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
@@ -1015,6 +1052,13 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "products_variables",
         &[
+            // A false attribution, kept rather than silenced: the file
+            // names `platform_state::variables::TABLE` (the config
+            // store) and, separately, `products::PURCHASES_TABLE`, and
+            // the second import is what puts the "products" qualifier in
+            // it. It never names this table, and it issues no query at
+            // all — see the note on the `variables` door above.
+            "secret_tables.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             "blocks/products/tests/offer_pricing_tests.rs",
