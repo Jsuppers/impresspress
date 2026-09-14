@@ -11,6 +11,20 @@
 const SQL_001_SQLITE: &str = include_str!("001_admin_schema.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_001_POSTGRES: &str = include_str!("001_admin_schema.postgres.sql");
+// 002's header comment — in BOTH dialect files — says the `block` column is
+// "for indexed per-block lookup by D1ConfigSource". That was true when the
+// migration shipped and is not any more: `D1ConfigSource` reads the whole
+// variables table once and groups by `block` in memory, issuing no
+// `WHERE block = ?` at all (see that module's doc). The column and the index
+// this migration creates are still live — `block` is exactly what the
+// in-memory grouping keys on — so only the query strategy moved on.
+//
+// The .sql files are deliberately NOT edited to say so. A shipped migration
+// is hash-addressed over its whole text, comments included, so retouching a
+// `--` line logs `schema drift` on every boot of every deployment that
+// already applied it and needs a `--run-migrations` redeploy to clear. See
+// `crate::migration_helper`'s "A shipped .sql file is immutable, comments
+// included", which prescribes exactly this note.
 const SQL_002_SQLITE: &str = include_str!("002_variables_block_column.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_002_POSTGRES: &str = include_str!("002_variables_block_column.postgres.sql");

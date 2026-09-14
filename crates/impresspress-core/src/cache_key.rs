@@ -136,9 +136,10 @@ pub fn read_key(table: CachedTable, opts: &ListOptions) -> Option<String> {
         return None;
     }
     match opts.filters.len() {
-        // Full-table read. For `block_settings` (the eager
-        // `load_block_settings` list with no filter) cache it under the
-        // all-rows sentinel. For `variables` REFUSE it: the only filterless
+        // Full-table read. For `block_settings` (the eager filterless list
+        // `platform_state::block_settings::read_rows` issues, reached from
+        // `load` and `load_and_seed`) cache it under the all-rows sentinel.
+        // For `variables` REFUSE it: the only filterless
         // variables list is `D1ConfigSource`'s whole-table snapshot, and
         // there is no invalidation story for a whole-table variables key —
         // `invalidate_keys` emits the all-rows key for `block_settings`
@@ -186,7 +187,7 @@ pub fn write_key(table: CachedTable, row: &HashMap<String, serde_json::Value>) -
 ///
 /// Always includes the per-row key when the identity column is extractable.
 /// For `block_settings` it additionally includes the all-rows key, because
-/// `load_block_settings`'s cached full-table read depends on every row — so
+/// `block_settings::read_rows`' cached full-table read depends on every row — so
 /// any insert / toggle / delete must drop it. The all-rows key is emitted
 /// unconditionally for `block_settings` (even when the per-row key can't be
 /// extracted) so the full-table cache can never be left stale.
@@ -480,10 +481,10 @@ mod tests {
         assert_eq!(write_key(CachedTable::Variables, &r), None);
     }
 
-    // --- Full-table block_settings read (the eager `load_block_settings`) ---
+    // --- Full-table block_settings read (`block_settings::read_rows`) ---
 
-    /// The shape `load_block_settings` actually issues: no filter, full
-    /// limit, skip_count, no offset, no sort.
+    /// The shape `platform_state::block_settings::read_rows` actually issues:
+    /// no filter, full limit, skip_count, no offset, no sort.
     fn full_table_opts() -> ListOptions {
         ListOptions {
             offset: 0,
@@ -598,8 +599,8 @@ mod tests {
     }
 
     /// Even when the per-row key can't be extracted, the full-table key must
-    /// still be invalidated so the cached `load_block_settings` read can't go
-    /// stale.
+    /// still be invalidated so the cached `block_settings::read_rows` read
+    /// can't go stale.
     #[test]
     fn invalidate_keys_block_settings_missing_column_still_drops_all() {
         let r = row("id", serde_json::Value::String("bs_123".into()));

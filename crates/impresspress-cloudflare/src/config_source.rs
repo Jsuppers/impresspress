@@ -7,7 +7,9 @@
 //! method lists the table with no filter, groups the rows by the `block`
 //! column IN MEMORY, and memoizes that grouping against the config-write
 //! generation it was read at; `fetch_block_variables` is then a map lookup,
-//! not a query.
+//! not a query. One grouping is deliberately NOT memoized — rows read but
+//! every one of them dropped, the pre-migration-002 shape — for the reason
+//! the `snapshot` method records.
 //!
 //! The `block` column (added by migration 002, which also indexed it) is NOT
 //! obsolete — it is still exactly what the grouping keys on, and a row
