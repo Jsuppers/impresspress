@@ -216,6 +216,52 @@ mod typed_client_tests {
         );
     }
 
+    /// The same single-use contract as
+    /// [`take_valid_by_hash_consumes_the_row_exactly_once`], but over a
+    /// file-backed database — the read/write-split topology every native
+    /// deployment runs, and the one the in-memory fixture above cannot
+    /// produce (see [`TestContext::new_on_disk`]).
+    ///
+    /// `take_valid_by_hash` is a `DELETE … RETURNING`, a write. Dispatched
+    /// down the read path it reaches a `SQLITE_OPEN_READ_ONLY` connection and
+    /// fails, and `wafer-block-sqlite`'s pre-fix `run_fetch` dropped that
+    /// per-row failure as if it were a decode error, so the whole call
+    /// returned `Ok(vec![])` — no rows, no error. That is `Ok(false)` here,
+    /// and the redemption handler (`POST /b/auth/api/bootstrap`,
+    /// [`crate::blocks::auth_ui::api::bootstrap`]) answers `Ok(false)` with
+    /// `err_unauthorized("invalid or expired bootstrap token")`: on native,
+    /// redemption of a perfectly valid token could not succeed at all. The
+    /// failure is closed, not open — the token is never accepted, so it is
+    /// also never replayed — but it is invisible to every in-memory test,
+    /// which is why this one exists.
+    #[tokio::test]
+    async fn take_valid_by_hash_consumes_the_row_on_a_file_backed_database() {
+        let ctx = TestContext::with_auth_on_disk().await.with_wrap(
+            "wafer-run/auth",
+            Vec::new(),
+            vec![],
+            "impresspress/admin",
+        );
+        let hash = vec![0x44_u8; 32];
+        insert(&ctx, hash.clone(), &future_iso(3600)).await.unwrap();
+
+        assert!(
+            take_valid_by_hash(&ctx, &hash).await.unwrap(),
+            "the take must reach the write connection and delete the row: a \
+             valid, unexpired bootstrap token that reports itself unconsumable \
+             makes redemption answer 401 on every native deployment"
+        );
+        assert!(
+            !is_valid(&ctx, &hash).await.unwrap(),
+            "the redeemed token must be gone from the table, not merely \
+             reported as taken"
+        );
+        assert!(
+            !take_valid_by_hash(&ctx, &hash).await.unwrap(),
+            "second take on the same hash must find nothing left to consume"
+        );
+    }
+
     #[tokio::test]
     async fn take_valid_by_hash_unknown_hash_returns_false() {
         let ctx = TestContext::with_auth().await.with_wrap(

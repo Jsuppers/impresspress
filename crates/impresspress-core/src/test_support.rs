@@ -1,9 +1,12 @@
 //! Test infrastructure for impresspress-core integration tests.
 //!
-//! [`TestContext`] wires a real in-memory SQLite database (via the production
-//! `DatabaseBlock` + `SQLiteDatabaseService::open_in_memory()`) into a minimal
-//! [`Context`] implementation so unit and integration tests can exercise the
-//! full block client stack without running a server process.
+//! [`TestContext`] wires a real SQLite database (via the production
+//! `DatabaseBlock` + `SQLiteDatabaseService`) into a minimal [`Context`]
+//! implementation so unit and integration tests can exercise the full block
+//! client stack without running a server process. In-memory by default
+//! ([`TestContext::new`]); [`TestContext::new_on_disk`] is the same thing
+//! over a file-backed service, for the tests whose subject is the read/write
+//! connection split only that topology has.
 //!
 //! Additional capabilities (message helpers, auth state, extra block dispatch)
 //! are added in subsequent tasks.
@@ -94,15 +97,105 @@ pub struct TestContext {
     /// rather than only through HTTP.
     #[cfg(feature = "block-dev")]
     dev_shared: Option<Arc<crate::blocks::dev::DevShared>>,
+    /// Drop guard only — never read. Keeps the on-disk database file alive
+    /// for exactly as long as some handle to it exists and deletes it
+    /// afterwards; `None` for the in-memory constructors, which have no file.
+    /// See [`TempDbFile`].
+    ///
+    /// Declared LAST on purpose: struct fields drop in declaration order, so
+    /// `db_service` (and with it the write/reader connections and their
+    /// worker threads) is already closed by the time the file is unlinked,
+    /// which is what lets SQLite clean up its own `-wal`/`-shm` sidecars.
+    _db_file: Option<Arc<TempDbFile>>,
+}
+
+/// A temporary on-disk SQLite database that deletes itself — and the WAL /
+/// shared-memory sidecars `PRAGMA journal_mode=WAL` creates next to it — when
+/// the last [`TestContext`] clone holding it is dropped.
+///
+/// Owned through an `Arc` inside `TestContext` rather than returned to the
+/// caller as a guard, because `TestContext` is `Clone` (shallowly, onto the
+/// same database) and `Context::clone_arc` hands clones to service objects
+/// that outlive the `&TestContext` a test holds. A caller-held guard would
+/// have to outlive all of those by hand; refcounting the file alongside the
+/// service it backs makes that automatic.
+struct TempDbFile(std::path::PathBuf);
+
+impl Drop for TempDbFile {
+    fn drop(&mut self) {
+        let base = self.0.as_os_str().to_owned();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = base.clone();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
 }
 
 impl TestContext {
     /// Construct a `TestContext` with a fresh in-memory SQLite database.
     pub async fn new() -> Self {
-        let svc: Arc<dyn wafer_core::interfaces::database::service::DatabaseService> = Arc::new(
-            wafer_block_sqlite::service::SQLiteDatabaseService::open_in_memory()
-                .expect("open in-memory sqlite"),
+        Self::over(
+            Arc::new(
+                wafer_block_sqlite::service::SQLiteDatabaseService::open_in_memory()
+                    .expect("open in-memory sqlite"),
+            ),
+            None,
+        )
+    }
+
+    /// Construct a `TestContext` over a fresh **file-backed** SQLite database.
+    ///
+    /// The difference from [`Self::new`] is not durability, it is topology:
+    /// `SQLiteDatabaseService::open` opens dedicated `SQLITE_OPEN_READ_ONLY`
+    /// reader connections alongside the single writable one and serves the
+    /// `DbExec` read primitives from them, whereas `open_in_memory` opens zero
+    /// readers (separate connections cannot see a private in-memory database)
+    /// and therefore serves every operation, read and write alike, from the
+    /// one write connection. That is the configuration every native
+    /// deployment runs and the only one in which a write dispatched down the
+    /// read path can be observed failing — under `open_in_memory` such a
+    /// write simply succeeds on the write connection, which is how
+    /// `DbExec::take_where` shipped dispatching its `DELETE … RETURNING`
+    /// through `run_fetch` with a fully green test suite.
+    ///
+    /// Slower than [`Self::new`] (real file I/O, three connections, three
+    /// worker threads), so it is for tests that specifically need the
+    /// read/write split, not a default.
+    ///
+    /// The reader count is asserted here rather than in each test: `open`
+    /// treats a reader connection that fails to open as non-fatal and
+    /// degrades to serving reads from the write worker, which is precisely
+    /// the in-memory topology — a fixture that degraded that way would hand
+    /// every test built on it a green result for the wrong reason.
+    pub async fn new_on_disk() -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "impresspress-test-{}-{nonce}.db",
+            std::process::id()
+        ));
+        let svc = wafer_block_sqlite::service::SQLiteDatabaseService::open(
+            path.to_str().expect("temp dir path is UTF-8"),
+        )
+        .expect("open file-backed sqlite");
+        assert!(
+            svc.reader_count() > 0,
+            "the file-backed fixture must open read-only reader connections, \
+             or it exercises the same single-connection topology as \
+             TestContext::new"
         );
+        Self::over(Arc::new(svc), Some(Arc::new(TempDbFile(path))))
+    }
+
+    /// The common wiring both constructors above share: put `svc` behind the
+    /// production `DatabaseBlock` and hand back a context routing
+    /// `wafer-run/database` at it.
+    fn over(
+        svc: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+        db_file: Option<Arc<TempDbFile>>,
+    ) -> Self {
         let database_block: Arc<dyn Block> = Arc::new(
             wafer_core::service_blocks::database::DatabaseBlock::new(svc.clone()),
         );
@@ -121,6 +214,7 @@ impl TestContext {
             storage: None,
             #[cfg(feature = "block-dev")]
             dev_shared: None,
+            _db_file: db_file,
         }
     }
 
@@ -264,14 +358,25 @@ impl TestContext {
     /// zero-arg manifest, admin in fact registers *after* every manifest
     /// block.
     pub async fn with_auth() -> Self {
-        let ctx = Self::with_admin().await;
-        ctx.apply_block_migrations(
-            "wafer-run/auth",
-            crate::blocks::auth::migrations::SQLITE_MIGRATIONS,
-            crate::blocks::auth::migrations::POSTGRES_MIGRATIONS,
-        )
-        .await;
-        ctx
+        Self::with_admin().await.with_auth_added().await
+    }
+
+    /// [`Self::with_auth`]'s schema over a **file-backed** database — the
+    /// read/write-split topology described on [`Self::new_on_disk`], which
+    /// `with_auth` (in-memory, zero readers) cannot produce.
+    ///
+    /// For auth tests whose subject is a statement that both reads and
+    /// writes: `oauth_pkce::take` and `bootstrap_tokens::take_valid_by_hash`
+    /// both consume their row with a single `DELETE … RETURNING`, and whether
+    /// that statement runs on the write connection or a read-only one is
+    /// invisible under `with_auth` and decisive here.
+    pub async fn with_auth_on_disk() -> Self {
+        Self::new_on_disk()
+            .await
+            .with_admin_added()
+            .await
+            .with_auth_added()
+            .await
     }
 
     /// Add auth's migrations to an EXISTING fixture — the same
@@ -342,14 +447,22 @@ impl TestContext {
     /// `impresspress__admin__block_settings` exists so `apply_if_blessed` can
     /// upsert its tracking row.
     pub async fn with_admin() -> Self {
-        let ctx = Self::new().await;
-        ctx.apply_block_migrations(
+        Self::new().await.with_admin_added().await
+    }
+
+    /// Add admin's migrations to an EXISTING fixture — [`Self::with_admin`]'s
+    /// schema layered on whatever `self` already carries, the counterpart of
+    /// [`Self::with_auth_added`]. Lets a constructor choose its database
+    /// topology (in-memory or [`Self::new_on_disk`]) without restating the
+    /// migration chain built on top of it.
+    pub async fn with_admin_added(self) -> Self {
+        self.apply_block_migrations(
             "impresspress/admin",
             crate::blocks::admin::migrations::SQLITE_MIGRATIONS,
             crate::blocks::admin::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        self
     }
 
     /// Build a `TestContext` with admin + auth + files migrations applied,
