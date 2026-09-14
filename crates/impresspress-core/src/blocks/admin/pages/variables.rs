@@ -681,7 +681,19 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
     // that has not rebooted, which on Cloudflare means no `/_deploy/init`
     // since the upgrade — would otherwise render its secret in a plain text
     // input under a hint saying the variable is always sensitive.
-    let show_sensitive = sensitive || required_sensitive;
+    //
+    // Spelled as `is_sensitive_key` rather than re-derived, because
+    // `handle_update_variable` has to ask the SAME question to read this
+    // widget's answer back, and the tables on the page behind the modal ask it
+    // too. One predicate, one union.
+    let show_sensitive = ops::is_sensitive_key(&key, i64::from(sensitive));
+    // Presence only, never the content: enough for the placeholder to tell a
+    // configured secret from an unset one without publishing either.
+    let masked_placeholder = if value.is_empty() {
+        "Not configured".to_string()
+    } else {
+        format!("{} (set)", ops::MASKED_VALUE)
+    };
 
     let markup = html! {
         div .modal-header {
@@ -699,11 +711,31 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                 div .form-group {
                     label .form-label for="edit-value" { "Value" }
                     @if show_sensitive {
+                        // SEC-060: the stored secret must not reach the DOM.
+                        // This rendered `value=(value)` inside the password
+                        // input, which is the pattern
+                        // `ui::settings_form::render_field` refuses and says
+                        // why: `type="password"` masks the glyphs, not the
+                        // bytes, so the secret was plain in page source, in
+                        // devtools and in the response body — one `hx-get` away
+                        // from tables that all mask it.
+                        //
+                        // Blank instead, with the placeholder carrying the only
+                        // thing an operator needs that the value itself was
+                        // carrying: whether one is set. `handle_update_variable`
+                        // reads an empty masked field back as "not supplied", so
+                        // saving the form without retyping the secret keeps it
+                        // and lands the rest of the edit, and typing a new one
+                        // still rotates it. The reveal toggle stays: it now
+                        // shows what the operator is TYPING, exactly as it does
+                        // on the shared settings form, which renders this same
+                        // blank-field-plus-eye pair.
                         div .value-reveal-wrapper {
                             input .form-input #edit-value
                                 type="password"
                                 name="value"
-                                value=(value);
+                                value=""
+                                placeholder=(masked_placeholder);
                             button .btn .btn--ghost .btn--icon .btn-icon-right
                                 type="button"
                                 data-action="reveal-toggle"
@@ -713,6 +745,9 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
                                 title="Reveal"
                                 aria-label="Reveal value"
                             { (icons::eye()) }
+                        }
+                        p .form-hint {
+                            "Leave blank to keep the stored value. Typing a new one replaces it."
                         }
                     } @else {
                         input .form-input type="text" #edit-value name="value" value=(value);
@@ -791,10 +826,45 @@ pub async fn handle_update_variable(
     let bytes = input.collect_to_bytes().await;
     let body = parse_form_body(&bytes);
 
-    // Sensitive-empty guard, URL/SSRF validation (the SSR path previously had
-    // none), audit-log write, and the upsert live in the shared ops layer.
+    // What `handle_edit_variable_form` rendered for this key: a masked field is
+    // rendered BLANK (SEC-060), so an empty `value` coming back from it is the
+    // browser saying "I did not touch this", not "clear it". Dropping the field
+    // is how that reaches `ops::update_variable` as the absence it is —
+    // otherwise the sensitive-empty guard refuses the request and the admin's
+    // description or flag edit dies with a 400, which is the same shape as the
+    // `disabled`-checkbox bug: a form posting something the server cannot read
+    // as "leave this alone".
+    //
+    // The stored flag is READ rather than derived from the key, because
+    // `show_sensitive` is the `is_sensitive_key` union and an ad hoc row an
+    // operator flagged sensitive is masked by it while the key alone says
+    // nothing. Reading the widget back off a narrower rule than the one that
+    // rendered it is exactly how the two drift.
+    //
+    // Through `crud::db_error_internal` rather than `err_internal`, for the
+    // reason `ops::stored_sensitive_flag`'s sibling read gives: this read names
+    // its own table, so a `NotFound` really is a 500 — but a WRAP refusal is a
+    // 403 and a quota a 429, and flattening those into "Internal server error"
+    // is the drift `tests/error_door.rs` exists to stop (it cannot catch this
+    // one; its own doc names the no-`NotFound`-arm blind spot).
+    let stored_flag = match variables::get_by_key(ctx, var_key).await {
+        Ok(Some(row)) => i64::from(row.sensitive),
+        Ok(None) => 0,
+        Err(e) => return crate::blocks::crud::db_error_internal(e, "Database error"),
+    };
+    let field_was_masked = ops::is_sensitive_key(var_key, stored_flag);
+
+    // Sensitive-empty guard, the masked-round-trip refusal, URL/SSRF validation
+    // (the SSR path previously had none), audit-log write, and the upsert live
+    // in the shared ops layer. A literal `MASKED_VALUE` is deliberately NOT
+    // dropped here: this form never renders it, so one arriving was typed, and
+    // the operator gets the same refusal the JSON API gives rather than a
+    // silent no-op reported as a save.
     let update = ops::VariableUpdate {
-        value: body.get("value").map(|s| s.as_str()),
+        value: body
+            .get("value")
+            .map(|s| s.as_str())
+            .filter(|value| !(field_was_masked && value.is_empty())),
         description: body.get("description").map(|s| s.as_str()),
         // Present whenever the surface offers the control — the edit modal
         // always posts it, hidden field plus checkbox. Absent means the caller
@@ -1101,6 +1171,227 @@ mod tests {
         assert!(
             s.contains(r#"aria-label="Delete LEGACY_THING""#),
             "icon-only delete button must expose an aria-label: {s}"
+        );
+    }
+
+    /// Seed one sensitive row and render its edit modal, returning the HTML.
+    async fn sensitive_row_modal(ctx: &TestContext, key: &str, value: &str) -> String {
+        variables::insert(
+            ctx,
+            variables::NewVariable {
+                key: key.to_string(),
+                value: value.to_string(),
+                name: String::new(),
+                description: "before".to_string(),
+                warning: String::new(),
+                sensitive: true,
+                updated_by: String::new(),
+                block: variables::block_for_key(key),
+            },
+        )
+        .await
+        .expect("seed the row");
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/variables/{key}/edit"),
+        ));
+        output_html(handle_edit_variable_form(ctx, &msg).await).await
+    }
+
+    /// POST a serialized edit form back through the real update handler.
+    async fn submit_edit(
+        ctx: &TestContext,
+        key: &str,
+        fields: &std::collections::HashMap<String, String>,
+    ) -> u16 {
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            &format!("/b/admin/variables/{key}"),
+        ));
+        crate::test_support::output_http_status(
+            handle_update_variable(ctx, &put, InputStream::from_bytes(urlencode_form(fields)))
+                .await,
+        )
+        .await
+    }
+
+    /// SEC-060: the edit modal must not put the stored secret in the DOM.
+    ///
+    /// It rendered `value=(value)` inside a `type="password"` input, which is
+    /// the exact pattern `ui::settings_form::render_field` refuses: the masking
+    /// is a rendering of the character glyphs, not of the bytes, so the secret
+    /// is plain in page source, in devtools, in a saved page and in anything
+    /// that reads the response body. Every other admin surface masks this row;
+    /// one `hx-get` away it was readable in full.
+    ///
+    /// Asserts on what the REAL page handler emits, and on what a browser would
+    /// submit from it — a secret that is not in the serialized form is not in
+    /// the document either.
+    #[tokio::test]
+    async fn the_edit_modal_does_not_render_the_stored_secret() {
+        let ctx = TestContext::with_admin().await;
+        let key = "MAILER_API_KEY";
+        let html = sensitive_row_modal(&ctx, key, "sk-live-realsecret").await;
+
+        assert!(
+            html.contains(r#"type="password" name="value""#),
+            "the fixture must be taking the masked branch, or it proves nothing: {html}"
+        );
+        assert!(
+            !html.contains("sk-live-realsecret"),
+            "the edit modal put the stored secret in the page source: {html}"
+        );
+        assert_ne!(
+            serialize_form(&html).get("value").map(String::as_str),
+            Some("sk-live-realsecret"),
+            "and a browser would have submitted it straight back: {html}"
+        );
+        assert!(
+            html.contains("(set)"),
+            "the blank field must still say the variable HAS a value, or an \
+             operator cannot tell 'unchanged' from 'not configured': {html}"
+        );
+    }
+
+    /// Saving the modal without retyping the secret must keep the secret and
+    /// land the rest of the edit.
+    ///
+    /// This is the half a blank-the-field fix breaks on its own: the field the
+    /// browser posts is empty, `ops::update_variable`'s sensitive-empty guard
+    /// refuses an empty value for a sensitive key, and the admin's description
+    /// edit dies with a 400 — the same shape as the `disabled`-checkbox bug,
+    /// where the form posted something the server could not read as "leave this
+    /// alone". An empty masked field means "not supplied", not "clear it".
+    #[tokio::test]
+    async fn saving_the_modal_without_retyping_the_secret_keeps_it() {
+        let ctx = TestContext::with_admin().await;
+        let key = "MAILER_API_KEY";
+        let html = sensitive_row_modal(&ctx, key, "sk-live-realsecret").await;
+
+        let mut fields = serialize_form(&html);
+        fields.insert("description".to_string(), "after".to_string());
+        assert_eq!(submit_edit(&ctx, key, &fields).await, 200);
+
+        let row = variables::get_by_key(&ctx, key)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.value, "sk-live-realsecret",
+            "an untouched masked field must leave the stored secret alone",
+        );
+        assert_eq!(
+            row.description, "after",
+            "and the edit the admin actually made must land",
+        );
+    }
+
+    /// Rotation still works: a value typed into the blank field is written.
+    #[tokio::test]
+    async fn a_secret_typed_into_the_blank_field_rotates_it() {
+        let ctx = TestContext::with_admin().await;
+        let key = "MAILER_API_KEY";
+        let html = sensitive_row_modal(&ctx, key, "sk-live-realsecret").await;
+
+        let mut fields = serialize_form(&html);
+        fields.insert("value".to_string(), "sk-live-rotated".to_string());
+        assert_eq!(submit_edit(&ctx, key, &fields).await, 200);
+
+        assert_eq!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "sk-live-rotated",
+        );
+    }
+
+    /// A row the OPERATOR flagged sensitive, whose key says nothing, behaves
+    /// like a declared one — masked on render, and read back as masked.
+    ///
+    /// This is the case that pins where `field_was_masked` comes from. Both
+    /// other modal fixtures are decided by the KEY (`MAILER_API_KEY`'s suffix,
+    /// `SITE_MOTTO`'s absence of one), so swapping the handler's stored-row read
+    /// for `config_vars::is_sensitive_for_storage(key)` passes them both. It
+    /// cannot pass this one: the key half answers false here, the render masks
+    /// off the stored flag anyway, and a handler reading the widget back off the
+    /// narrower rule would forward the blank field to the sensitive-empty guard
+    /// and drop the admin's edit with a 400.
+    #[tokio::test]
+    async fn an_operator_flagged_row_is_masked_and_read_back_as_masked() {
+        let ctx = TestContext::with_admin().await;
+        let key = "MY_SERVICE_HANDLE";
+        assert!(
+            !crate::config_vars::is_sensitive_for_storage(key),
+            "the point of this test is a key the declaration/suffix rule cannot catch"
+        );
+        let html = sensitive_row_modal(&ctx, key, "acme-prod-secret").await;
+
+        assert!(
+            !html.contains("acme-prod-secret"),
+            "a row the operator flagged sensitive must be masked too: {html}"
+        );
+
+        let mut fields = serialize_form(&html);
+        fields.insert("description".to_string(), "after".to_string());
+        assert_eq!(submit_edit(&ctx, key, &fields).await, 200);
+
+        let row = variables::get_by_key(&ctx, key)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.value, "acme-prod-secret",
+            "the secret survives the save"
+        );
+        assert_eq!(row.description, "after", "and the edit lands");
+    }
+
+    /// A NON-sensitive variable keeps the editor it always had: its value is
+    /// rendered, and clearing the field really does clear it.
+    #[tokio::test]
+    async fn a_plain_variable_still_shows_and_clears_its_value() {
+        let ctx = TestContext::with_admin().await;
+        let key = "SITE_MOTTO";
+        variables::insert(
+            &ctx,
+            variables::NewVariable {
+                key: key.to_string(),
+                value: "move fast".to_string(),
+                name: String::new(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: String::new(),
+                block: variables::block_for_key(key),
+            },
+        )
+        .await
+        .expect("seed the row");
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/variables/{key}/edit"),
+        ));
+        let html = output_html(handle_edit_variable_form(&ctx, &msg).await).await;
+        assert!(
+            html.contains(r#"value="move fast""#),
+            "a plain variable's value is not a secret and is still editable in place: {html}"
+        );
+
+        let mut fields = serialize_form(&html);
+        fields.insert("value".to_string(), String::new());
+        assert_eq!(submit_edit(&ctx, key, &fields).await, 200);
+        assert_eq!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "",
+            "an empty field on an unmasked variable is an explicit clear",
         );
     }
 

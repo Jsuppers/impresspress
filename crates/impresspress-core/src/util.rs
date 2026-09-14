@@ -647,6 +647,13 @@ pub(crate) const MASKED_VALUE: &str = "********";
 /// value the table beside it rendered in clear is exactly the drift this
 /// closes.
 ///
+/// That list is the surfaces that ASK, not every surface that can publish a
+/// stored value. The admin SQL explorer (`POST /b/admin/api/database/query`)
+/// is outside it by construction — its job is to return what the query asked
+/// for, so `SELECT value FROM …__variables` answers in plaintext. Recorded
+/// under Security in `NICE_TO_HAVE.md` rather than closed here, so this
+/// enumeration is not read as exhaustive.
+///
 /// It is deliberately the same key predicate the WRITE path applies when it
 /// decides what the stored flag gets ([`crate::config_vars::is_sensitive_for_storage`],
 /// at `platform_state::variables::NewVariable::into_row`). Reader and writer
@@ -655,6 +662,51 @@ pub(crate) const MASKED_VALUE: &str = "********";
 /// build that did not know the key, is still masked.
 pub(crate) fn is_sensitive_key(key: &str, sensitive_flag: i64) -> bool {
     sensitive_flag == 1 || crate::config_vars::is_sensitive_for_storage(key)
+}
+
+/// Whether a submitted `value` for `key` is the [`MASKED_VALUE`] a read path
+/// produced rather than a value its sender means.
+///
+/// The counterpart of [`is_sensitive_key`], for the write direction. Every read
+/// surface answers a sensitive key with `"********"`, so the read/modify/write
+/// loop a JSON client is built around — GET the settings, change one, PATCH
+/// them back — hands the mask straight back to the writer for every key it did
+/// not touch. Stored, it replaces the secret with eight asterisks; the worst
+/// case is a live `..._BOOTSTRAP_ADMIN_TOKEN`, which is what provisions the
+/// first admin.
+///
+/// Gated on sensitivity, not on the string alone: `"********"` is a perfectly
+/// ordinary value for a variable nothing masks (placeholder copy, a redaction
+/// marker), and refusing it there would be the write path inventing a reserved
+/// word. It is only a mask where something masked it — which is exactly the
+/// question [`is_sensitive_key`] answers, asked with the same stored flag the
+/// reader used.
+///
+/// All four write surfaces refuse it: the JSON API and the admin Variables
+/// modal through `blocks::admin::ops::update_variable`, the generic
+/// ConfigVar-driven form through `ui::settings_form::save_settings`, and
+/// `CONFIG_SET` itself (`blocks::config`'s `ConfigWrite::write`) — the last of
+/// which is what makes this claim true by construction rather than by accident
+/// of who calls what, since any block can reach that operation through
+/// `wafer_core::clients::config::set`. None of them silently drops it instead —
+/// a caller that is told "saved" while its write was discarded can never find
+/// out, because the next read hands it the same mask back. "Leave the stored
+/// value alone" has its own spelling on each surface (omit `value`; leave the
+/// masked field blank), and that spelling is what the refusal names.
+///
+/// `save_settings` is the one that does not use this predicate, and
+/// deliberately: WRAP denies four of its five callers (all but
+/// `admin::pages::email`, which runs as the admin block itself) the admin
+/// `variables` table, and a shared helper has to work for the four — so it
+/// cannot supply the stored flag the third argument stands for. It asks a
+/// question that needs no flag instead: would this mask REPLACE the value the
+/// field currently holds? That covers more than this predicate does, which is
+/// the only shape that lets it promise no half-applied save, and it stops
+/// short of refusing a submission that changes nothing. The exactness this
+/// predicate provides needs the row, and only the surfaces that can read the
+/// row get it.
+pub(crate) fn is_masked_submission(key: &str, sensitive_flag: i64, value: &str) -> bool {
+    value == MASKED_VALUE && is_sensitive_key(key, sensitive_flag)
 }
 
 /// Percent-encode a string for use as an OAuth / `application/x-www-form-urlencoded`

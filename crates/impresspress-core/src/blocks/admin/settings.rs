@@ -116,6 +116,13 @@ pub(super) async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream
 
 /// `PATCH /b/admin/api/settings/{key}`. `{key}` is read only as the route
 /// table bound it.
+///
+/// A real partial update: every field of the body is optional and an absent
+/// one leaves its column alone. `value` in particular, because a sensitive key
+/// reads back as `MASKED_VALUE` and [`ops::update_variable`] refuses to store
+/// that mask — leaving it out is how a caller says "keep the secret I cannot
+/// see", and the echoed record then carries no `value` field at all. When a
+/// value WAS supplied, the echo masks it the same way [`handle_get`] does.
 pub(super) async fn handle_set(
     ctx: &dyn Context,
     msg: &Message,
@@ -128,7 +135,16 @@ pub(super) async fn handle_set(
 
     #[derive(serde::Deserialize)]
     struct Req {
-        value: serde_json::Value,
+        /// Optional: absent leaves the stored value alone.
+        ///
+        /// It was required, which made this a PATCH that could not patch. A
+        /// sensitive key reads back as `MASKED_VALUE` and `ops::update_variable`
+        /// refuses to store that mask, so with `value` required there was no
+        /// request at all that changed only the `sensitive` flag of a key whose
+        /// value the caller cannot see. Absent is how a caller says "not this
+        /// field", and it is the remedy the mask refusal names.
+        #[serde(default)]
+        value: Option<serde_json::Value>,
         /// Optional: absent leaves the stored masking flag alone.
         #[serde(default)]
         sensitive: Option<bool>,
@@ -139,13 +155,26 @@ pub(super) async fn handle_set(
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
+    // Both fields optional means a body carrying neither now parses, and
+    // `update_variable` upserts — so `PATCH {}` against an unstored key would
+    // create a blank row, and against a stored one would write an audit entry
+    // for a change nobody made. A request with nothing to change is a malformed
+    // request, not a no-op, and saying so keeps the field-is-absent spelling
+    // meaning exactly one thing.
+    if body.value.is_none() && body.sensitive.is_none() {
+        return err_bad_request(
+            "Nothing to update: send `value`, `sensitive`, or both. Leaving `value` out \
+             keeps the stored value.",
+        );
+    }
+
     // The `value` column is TEXT; a string value is stored verbatim, anything
     // else as its JSON form (the prior validation already read it via
     // `as_str().unwrap_or("")`, so non-string values were treated as empty).
-    let value = match &body.value {
+    let value = body.value.as_ref().map(|value| match value {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
-    };
+    });
 
     // Guards (sensitive-empty + URL/SSRF), audit-log write, and upsert live in
     // the shared ops layer so the SSR variable surface can't diverge.
@@ -154,7 +183,7 @@ pub(super) async fn handle_set(
         msg,
         key,
         ops::VariableUpdate {
-            value: Some(&value),
+            value: value.as_deref(),
             description: None,
             sensitive: body.sensitive,
         },
@@ -163,10 +192,36 @@ pub(super) async fn handle_set(
     {
         // Echoed in the `{id, data}` record envelope this endpoint has
         // always published; declared without a schema until it is typed.
-        Ok(row) => ok_json(&db::Record {
-            id: row.id.clone(),
-            data: row.to_data(),
-        }),
+        //
+        // The stored value is never handed back to a request that did not send
+        // it: the echo is the row AS STORED, so without this a
+        // `PATCH {"sensitive": true}` would answer with the plaintext secret,
+        // turning the writer into the reader the masking exists to prevent.
+        //
+        // Two different situations, and they get two different answers, because
+        // masking is the wrong way to spell "this field was not returned".
+        //
+        // * The request supplied no value: the field is ABSENT from the record.
+        //   Substituting the mask here invented a value for rows nothing masks
+        //   — and a client replaying what it had just read then stored
+        //   `"********"` as a plain setting's value, with
+        //   `is_masked_submission` rightly declining to stop it, since for such
+        //   a row that string is ordinary. That is this endpoint's own hazard,
+        //   re-opened from the other side. Absent is what the request said and
+        //   what a JSON object has for "no value".
+        // * The request supplied a value for a key something masks: the mask,
+        //   as `handle_get` answers. Read off the POST-WRITE flag, which is
+        //   right here precisely because the value came in with the request —
+        //   the caller already knows it.
+        Ok(row) => {
+            let mut data = row.to_data();
+            if value.is_none() {
+                data.remove("value");
+            } else if ops::is_sensitive_key(&row.key, i64::from(row.sensitive)) {
+                data.insert("value".to_string(), serde_json::json!(MASKED_VALUE));
+            }
+            ok_json(&db::Record { id: row.id, data })
+        }
         Err(out) => out,
     }
 }
@@ -819,6 +874,416 @@ mod tests {
                 "a settings listing leaked an unrepaired bootstrap password: {raw}"
             );
         }
+    }
+
+    /// A client that reads a sensitive setting and writes what it read back
+    /// must not be able to replace the secret with the mask.
+    ///
+    /// `GET /b/admin/api/settings/{key}` answers `"********"` for a sensitive
+    /// key, and `PATCH` stored the request value verbatim — so the read/modify/
+    /// write loop every JSON client is built around (GET the settings, change
+    /// one, PATCH them back) overwrote every OTHER secret with eight asterisks.
+    /// The worst case is a LIVE `..._BOOTSTRAP_ADMIN_TOKEN`, which is what
+    /// provisions the first admin: destroying it strands the deployment with no
+    /// admin path, and on Cloudflare there is no process environment to re-seed
+    /// it from.
+    ///
+    /// Drives the two real handlers, GET into PATCH, with the row staged in the
+    /// `variables` table — a hand-built mask string would prove only that the
+    /// constant is refused, not that the round trip produces it.
+    #[tokio::test]
+    async fn patching_back_a_masked_value_cannot_overwrite_the_secret() {
+        use crate::test_support::{admin_msg, output_http_status, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY;
+        seed_var(&ctx, key, "live-bootstrap-token", true).await;
+
+        // What the client reads.
+        let get = crate::blocks::admin::test_support::routed(admin_msg(
+            "retrieve",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let read_back = output_json(handle_get(&ctx, &get).await).await["data"]["value"]
+            .as_str()
+            .expect("the getter publishes a value")
+            .to_string();
+        assert_eq!(
+            read_back, MASKED_VALUE,
+            "the read path masks it, which is what makes the write path reachable"
+        );
+
+        // ...and what it writes straight back.
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "value": read_back }))
+            .expect("serialize request body");
+        let status =
+            output_http_status(handle_set(&ctx, &put, InputStream::from_bytes(body)).await).await;
+
+        assert_eq!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read the row back")
+                .expect("the row is still there")
+                .value,
+            "live-bootstrap-token",
+            "a masked round trip must not overwrite the stored secret",
+        );
+        assert_eq!(
+            status, 400,
+            "and the client must be told, not given a 200 for a write that did not happen",
+        );
+    }
+
+    /// The remedy the refusal names has to exist: a `PATCH` that leaves `value`
+    /// out changes only the fields it carries.
+    ///
+    /// Without it the refusal would be a dead end for a sensitive key — the
+    /// only value a client can read is the mask, and the mask is now refused,
+    /// so there would be no way to change the `sensitive` flag (or, later, any
+    /// other column) without also knowing the secret.
+    #[tokio::test]
+    async fn patching_without_a_value_leaves_the_stored_value_alone() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        // An ad hoc row: sensitive by the operator's flag alone, so the flag is
+        // a thing that can legitimately be turned off.
+        seed_var(&ctx, "MY_SERVICE_HANDLE", "acme-prod", true).await;
+
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/MY_SERVICE_HANDLE",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "sensitive": false }))
+            .expect("serialize request body");
+        let status =
+            output_http_status(handle_set(&ctx, &put, InputStream::from_bytes(body)).await).await;
+        assert_eq!(status, 200, "a value-less PATCH is a valid partial update");
+
+        let row = variables::get_by_key(&ctx, "MY_SERVICE_HANDLE")
+            .await
+            .expect("read the row back")
+            .expect("the row is still there");
+        assert_eq!(row.value, "acme-prod", "the value column is untouched");
+        assert!(!row.sensitive, "and the field that was sent did change");
+    }
+
+    /// The echoed row never carries a value the request did not supply.
+    ///
+    /// The echo used to be masked on the POST-WRITE flag alone, and this exact
+    /// request lowers it: an ad hoc row is sensitive by its column only — the
+    /// key says nothing — so `PATCH {"sensitive": false}` cleared the flag,
+    /// `is_sensitive_key` then answered false, and the response body carried
+    /// the plaintext secret back in a request that supplied no value. Making
+    /// `value` optional is what created that read; before it, an unflag was
+    /// impossible without also overwriting the value it would expose.
+    #[tokio::test]
+    async fn a_value_less_patch_never_echoes_the_stored_value() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        seed_var(&ctx, "MY_SERVICE_HANDLE", "acme-prod", true).await;
+
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/MY_SERVICE_HANDLE",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "sensitive": false }))
+            .expect("serialize request body");
+        let echoed = output_json(handle_set(&ctx, &put, InputStream::from_bytes(body)).await).await;
+
+        assert_ne!(
+            echoed["data"]["value"],
+            serde_json::json!("acme-prod"),
+            "a request that supplied no value must not be answered with one: {echoed}",
+        );
+        assert!(
+            echoed["data"].get("value").is_none(),
+            "and the way it is not answered is ABSENCE, not a substituted mask — see \
+             `a_value_less_patch_on_a_plain_row_does_not_invent_a_mask` for what \
+             substituting one did to rows nothing masks: {echoed}",
+        );
+    }
+
+    /// A value-less PATCH on a row NOTHING masks must not answer with a mask.
+    ///
+    /// Substituting `MASKED_VALUE` was the wrong way to spell "this field was
+    /// not returned", and it re-opened this PR's own hazard from the other
+    /// side: the echo for a plain row said `"********"`, and a client that
+    /// replayed what it had just read stored that string as the value — with
+    /// `is_masked_submission` correctly declining to stop it, because for a row
+    /// nothing masks `"********"` is an ordinary value. The field is simply
+    /// absent from the record now, which is what "no value" means in a JSON
+    /// object and what the request itself said.
+    #[tokio::test]
+    async fn a_value_less_patch_on_a_plain_row_does_not_invent_a_mask() {
+        use crate::test_support::{admin_msg, output_json};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        seed_var(&ctx, "SITE_MOTTO", "move fast", false).await;
+
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/SITE_MOTTO",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "sensitive": false }))
+            .expect("serialize request body");
+        let echoed = output_json(handle_set(&ctx, &msg, InputStream::from_bytes(body)).await).await;
+        assert!(
+            echoed["data"].get("value").is_none(),
+            "a field the request did not supply must be absent, not masked: {echoed}"
+        );
+
+        // The read/modify/write client, replaying exactly the fields it was
+        // handed. With `value` absent there is nothing to replay.
+        let mut replay = serde_json::Map::new();
+        if let Some(value) = echoed["data"].get("value") {
+            replay.insert("value".to_string(), value.clone());
+        }
+        replay.insert("sensitive".to_string(), serde_json::json!(false));
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/SITE_MOTTO",
+        ));
+        let body =
+            serde_json::to_vec(&serde_json::Value::Object(replay)).expect("serialize request body");
+        let _ = crate::test_support::output_http_status(
+            handle_set(&ctx, &msg, InputStream::from_bytes(body)).await,
+        )
+        .await;
+
+        assert_eq!(
+            variables::get_by_key(&ctx, "SITE_MOTTO")
+                .await
+                .expect("read back")
+                .expect("row")
+                .value,
+            "move fast",
+            "replaying the echo must not destroy the value it stood for",
+        );
+    }
+
+    /// A `PATCH` that supplies no value must not CREATE the row it would then
+    /// have to leave empty.
+    ///
+    /// `update_variable` upserts, and the "Nothing to update" guard only closes
+    /// the both-fields-absent case — so `{"sensitive": true}` on a key with no
+    /// stored row skipped the `if let Some(value)` block entirely, which is
+    /// where the sensitive-empty guard lives, and created a row with `value:
+    /// ""`. Before `value` became optional the equivalent `{"value": ""}` was
+    /// refused by that guard, so optionality removed a check that had been
+    /// running only because the field was always present.
+    ///
+    /// The blank row is then permanent AND load-bearing: `seed_and_load` seeds
+    /// through `insert_if_absent`, which skips any key that already has a row,
+    /// and `delete_variable` refuses a declared `WAFER_RUN_SHARED__*` row. One
+    /// such request against the bootstrap token disables the environment path
+    /// for it forever — the lockout class this whole change exists to prevent.
+    #[tokio::test]
+    async fn a_value_less_patch_does_not_create_a_blank_row() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY;
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "sensitive": true }))
+            .expect("serialize request body");
+        let status =
+            output_http_status(handle_set(&ctx, &put, InputStream::from_bytes(body)).await).await;
+
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .is_none(),
+            "a PATCH with no value must not create a row the boot seeder can never fill",
+        );
+        assert_eq!(status, 400);
+    }
+
+    /// `POST` must not create a blank row for a key something masks either.
+    ///
+    /// The same row by the other route, and this one predates the change:
+    /// `ops::create_variable` has never had an empty-value guard, so
+    /// `POST {"key": "...BOOTSTRAP_ADMIN_TOKEN", "value": ""}` produced exactly
+    /// the permanent blank row above. Closed here because the guard belongs to
+    /// the write, not to one surface's request shape.
+    #[tokio::test]
+    async fn creating_a_masked_key_with_an_empty_value_is_refused() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY;
+        let post = crate::blocks::admin::test_support::routed(admin_msg(
+            "create",
+            "/b/admin/api/settings",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "key": key, "value": "" }))
+            .expect("serialize request body");
+        let status =
+            output_http_status(handle_create(&ctx, &post, InputStream::from_bytes(body)).await)
+                .await;
+
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .is_none(),
+            "a create with an empty value must not store a masked key as blank",
+        );
+        assert_eq!(status, 400);
+
+        // A plain variable may still be created empty — the guard is about what
+        // is masked, not about emptiness.
+        let post = crate::blocks::admin::test_support::routed(admin_msg(
+            "create",
+            "/b/admin/api/settings",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "key": "SITE_NOTES", "value": "", "sensitive": false
+        }))
+        .expect("serialize request body");
+        assert_eq!(
+            output_http_status(handle_create(&ctx, &post, InputStream::from_bytes(body)).await)
+                .await,
+            200,
+        );
+    }
+
+    /// ...and it may be created empty while ASKING to be masked.
+    ///
+    /// This is the fixture that pins the guard to the KEY rather than to the
+    /// `sensitive` argument. The Add Variable modal renders its Sensitive box
+    /// `checked` by default (`pages/variables.rs`, and
+    /// `create_modal_posts_the_flag_explicitly_and_is_checked_by_default`
+    /// asserts it), so every empty variable an operator creates through the UI
+    /// arrives here asking to be masked. Gating the refusal on the argument
+    /// would 400 all of them — and the whole suite would still pass without
+    /// this case, since the allowed case above says `"sensitive": false`.
+    ///
+    /// Safe to allow because what makes a blank row a TRAP is the boot seeder
+    /// owning the key and `delete_variable` protecting it, and both follow from
+    /// the key's declaration or spelling. This row is neither: it is deletable,
+    /// and nothing will ever try to seed it.
+    #[tokio::test]
+    async fn creating_an_empty_ad_hoc_variable_marked_sensitive_is_allowed() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let post = crate::blocks::admin::test_support::routed(admin_msg(
+            "create",
+            "/b/admin/api/settings",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "key": "SITE_NOTES", "value": "", "sensitive": true
+        }))
+        .expect("serialize request body");
+        assert_eq!(
+            output_http_status(handle_create(&ctx, &post, InputStream::from_bytes(body)).await)
+                .await,
+            200,
+            "the Add Variable modal's default flow must not be refused",
+        );
+        assert!(variables::get_by_key(&ctx, "SITE_NOTES")
+            .await
+            .expect("read back")
+            .is_some());
+    }
+
+    /// Making both fields optional must not make an empty body a way to
+    /// conjure a blank row: `update_variable` upserts, so `PATCH {}` on an
+    /// unstored key would create one.
+    #[tokio::test]
+    async fn patching_with_no_fields_at_all_is_refused() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/NOT_STORED_YET",
+        ));
+        let status = output_http_status(
+            handle_set(&ctx, &put, InputStream::from_bytes(b"{}".to_vec())).await,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(
+            variables::get_by_key(&ctx, "NOT_STORED_YET")
+                .await
+                .expect("read back")
+                .is_none(),
+            "a field-less PATCH must not create a row",
+        );
+    }
+
+    /// The refusal is scoped to keys whose value the reader masks. A variable
+    /// that is not sensitive may hold the literal string — it is only a mask
+    /// where something masked it.
+    #[tokio::test]
+    async fn a_non_sensitive_variable_may_hold_the_mask_string() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        seed_var(&ctx, "PASSWORD_PLACEHOLDER_TEXT", "type here", false).await;
+
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            "/b/admin/api/settings/PASSWORD_PLACEHOLDER_TEXT",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({ "value": MASKED_VALUE }))
+            .expect("serialize request body");
+        assert_eq!(
+            output_http_status(handle_set(&ctx, &put, InputStream::from_bytes(body)).await).await,
+            200,
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, "PASSWORD_PLACEHOLDER_TEXT")
+                .await
+                .expect("read the row back")
+                .expect("the row is still there")
+                .value,
+            MASKED_VALUE,
+        );
     }
 
     /// Read one variable row's `value` column.

@@ -232,7 +232,7 @@ impl VariablesConfigBlock {
     /// `ctx`-routed write to the admin block's table is a cross-block write
     /// WRAP denies.
     async fn write(&self, key: &str, value: &str) -> Result<(), OutputStream> {
-        // The same sensitive-empty and `_URL` guards
+        // The same masked-submission, sensitive-empty and `_URL` guards
         // `blocks::admin::ops::update_variable` applies, spelled from the same
         // helpers, so the two write surfaces agree on the RULES.
         //
@@ -249,13 +249,27 @@ impl VariablesConfigBlock {
         // the one surface that cannot check, and clearing a live token is a
         // lockout with no way back on Cloudflare.
         //
-        // The divergence is not reachable today, though NOT because the
-        // bootstrap keys are unrendered — `auth_ui::pages::settings` puts both
-        // of them in its "Admin" section. It is unreachable because
-        // `settings_form::save_settings` short-circuits an empty-or-
-        // `MASKED_VALUE` submission for a sensitive var before calling
-        // `config::set`, so an empty value never reaches the guard below from
-        // the one caller that could produce it.
+        // The divergence is not reachable today, and the reason is simpler than
+        // it looks. It concerns exactly one key — `BOOTSTRAP_ADMIN_TOKEN`,
+        // which the admin path exempts once redeemed and this one never does —
+        // and that key is in no `save_settings` allowlist at all. The only
+        // settings form carrying bootstrap keys is `auth_ui::pages::settings`,
+        // whose "Admin" section is the bootstrap EMAIL and PASSWORD; nothing
+        // renders the token. So this caller cannot submit a value for it,
+        // empty or otherwise.
+        //
+        // Note the narrowness: that is an argument about ONE key, not about
+        // empty submissions in general. `save_settings` decides sensitivity
+        // from the declared var and this function decides it from the stored
+        // row, so a declared-plain key whose row an operator flagged sensitive
+        // DOES reach the guard below with an empty value and is refused here —
+        // which is correct, and which `save_settings` now forwards as the 400
+        // it is rather than the 500 it used to flatten it into. A
+        // `MASKED_VALUE` submission is handled before it can get here: that
+        // caller's pre-pass refuses a mask that would replace a value, for
+        // every allowlisted var and not just the ones it can see are sensitive,
+        // deliberately covering more than this guard does because it cannot
+        // read the flag this one reads.
         //
         // KNOWN GAP, recorded rather than fixed: the parity stops at the
         // create path. `variables::set`'s create branch builds its own
@@ -293,20 +307,72 @@ impl VariablesConfigBlock {
                 )))
             }
         };
+        // The row's own flag, shared by the two guards below: neither of them
+        // may decide off the key's spelling alone, or an ad hoc row an admin
+        // marked sensitive in the UI would be judged as if it were plain.
+        let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
+        // The mask is never a value, on this surface as on the admin ones.
+        //
+        // This operation is reachable by ANY block through
+        // `wafer_core::clients::config::set`, so without the guard here the
+        // rule held only because the three surfaces that exist today each
+        // enforce it themselves — an invariant that breaks silently the day a
+        // block adds a call. Nothing stops it being enforced here: the stored
+        // row is already in hand for the empty guard below, which is the only
+        // thing the mask check needs. (Contrast the provisioning EXEMPTION
+        // discussed above, which genuinely cannot be mirrored here because it
+        // asks a question only a `Context` can answer.)
+        //
+        // Narrowed to a mask that would REPLACE something, for the reason
+        // `ui::settings_form`'s pre-pass is: a write that changes nothing
+        // destroys nothing, and refusing it only strands whoever is holding a
+        // value that already is those eight characters.
+        //
+        // "Already" has to mean what a READER would answer, which is this
+        // block's own read order — a non-empty row, else the boot map — and not
+        // the row alone. The pre-pass asks `config::get_default`, which is that
+        // order; comparing against `existing.value` here made the two disagree
+        // in exactly the case the row cannot speak for: absent or empty, where
+        // `CONFIG_GET` drops it and the boot map answers. For a key whose boot
+        // value is the mask the pre-pass then allowed and this guard refused,
+        // mid-loop, with the rest of the page already written — reachable from
+        // an env-seeded credential that is literally `********`, cleared on the
+        // Variables page and typed again on a settings form. One question,
+        // asked the same way on both sides, is what makes that impossible
+        // rather than merely unlikely.
+        if crate::util::is_masked_submission(key, stored_flag, value) {
+            let boot_value = self.boot.get(key);
+            let current = existing
+                .as_ref()
+                .map(|row| row.value.as_str())
+                .filter(|stored| !stored.is_empty())
+                .or(boot_value.as_deref())
+                .unwrap_or("");
+            if current != value {
+                return Err(OutputStream::error(WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "{} is the mask {key} reads back as, not its value: storing it would \
+                         destroy the secret",
+                        crate::util::MASKED_VALUE
+                    ),
+                )));
+            }
+        }
         // The static provisioning-only exemption — the narrower of the two, per
         // the note above. It has to be here at all for the reason it exists on
         // the admin path: a spent bootstrap password must stay clearable
         // because `delete_variable` and `key_is_deletable` both refuse to
         // delete a declared `WAFER_RUN_SHARED__*` row, so without it the
         // deployment keeps a plaintext admin password by every route.
-        if value.is_empty() && !crate::config_vars::is_provisioning_only_key(key) {
-            let stored_flag = existing.as_ref().map_or(0, |row| i64::from(row.sensitive));
-            if is_sensitive_key(key, stored_flag) {
-                return Err(OutputStream::error(WaferError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("Cannot set {key} to an empty value"),
-                )));
-            }
+        if value.is_empty()
+            && !crate::config_vars::is_provisioning_only_key(key)
+            && is_sensitive_key(key, stored_flag)
+        {
+            return Err(OutputStream::error(WaferError::new(
+                ErrorCode::InvalidArgument,
+                format!("Cannot set {key} to an empty value"),
+            )));
         }
         if key.ends_with("_URL") {
             if let Err(e) = validate_url_value(value) {
@@ -703,6 +769,61 @@ mod boot_owned_key_tests {
                 .expect("read back")
                 .is_none(),
             "a refused write must not leave a row behind"
+        );
+    }
+
+    /// `CONFIG_SET` refuses the mask, like every other write surface.
+    ///
+    /// This is the FOURTH writer into the `variables` table — any block can
+    /// reach it through `wafer_core::clients::config::set` — and it is the one
+    /// that makes the claim in `util::is_masked_submission` true by
+    /// construction rather than by accident of who happens to call what today.
+    /// Without it the guard held only because the two admin surfaces and
+    /// `ui::settings_form` all enforce it themselves, which is the kind of
+    /// invariant that breaks silently the day a block adds a call.
+    #[tokio::test]
+    async fn config_set_refuses_the_mask_for_a_sensitive_key() {
+        const KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
+        let ctx = booted_with(&[]).await;
+        store_row(&ctx, KEY, "real-client-secret").await;
+
+        let result = wafer_core::clients::config::set(&ctx, KEY, crate::util::MASKED_VALUE).await;
+        assert!(
+            result.is_err(),
+            "storing the mask over a secret must fail, not report success"
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row is still there")
+                .value,
+            "real-client-secret",
+            "and the stored secret must survive the refusal"
+        );
+    }
+
+    /// The mask refusal is for a mask that REPLACES something. A row already
+    /// holding those eight characters is a no-op write, and refusing it would
+    /// strand whoever holds such a row — and, since
+    /// `ui::settings_form`'s pre-pass allows a submission equal to the current
+    /// value, would do it mid-loop with part of the page already saved.
+    #[tokio::test]
+    async fn config_set_allows_the_mask_when_it_replaces_nothing() {
+        const KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
+        let ctx = booted_with(&[]).await;
+        store_row(&ctx, KEY, crate::util::MASKED_VALUE).await;
+
+        wafer_core::clients::config::set(&ctx, KEY, crate::util::MASKED_VALUE)
+            .await
+            .expect("a write that changes nothing must not be refused");
+        assert_eq!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row is still there")
+                .value,
+            crate::util::MASKED_VALUE,
         );
     }
 
