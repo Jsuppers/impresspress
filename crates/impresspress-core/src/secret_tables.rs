@@ -82,17 +82,25 @@
 //! # One that was considered and left readable
 //!
 //! `impresspress__products__provider_operations.request_json` /
-//! `response_json` sound like raw Stripe bodies and are not: the only `ensure`
-//! call site writes the literal `{"version":1}`, and every `resolve_*` writes
-//! a summary this repo assembles itself — at most
-//! `{id, status, amount_minor, livemode, source}`, in places fewer keys and in
-//! places the empty object. Two call sites forward
-//! `refunds.response_json` rather than a fresh literal, and that column has
-//! the same three writers (`purchase::refund_purchase`,
-//! `stripe::handle_webhook`, `stripe_provider::reconcile_refund_operation`),
-//! each building the same summary. The shape is illustrative; what is
-//! exhaustive is that no writer forwards a provider payload, so no capability
-//! of Stripe's can reach either column.
+//! `response_json` sound like raw Stripe bodies and are not.
+//!
+//! Three repo functions write those two columns: `ensure` (`request_json`),
+//! and `mark_completed` and `resolve_unleased` (`response_json`, which the
+//! `resolve_for_aggregate` / `complete_for_aggregate` helpers reach through
+//! `resolve_unleased` rather than writing themselves). Every value handed to
+//! them is one of three things: a literal spelled at the call site
+//! (`{"version":1}`, `{}`), a `serde_json::json!` summary this repo builds —
+//! at most `{id, status, amount_minor, livemode, source}`, in places fewer
+//! keys — or a read-back of `refunds.response_json`. That last column is the
+//! only indirection, and it has the same property at its own source: exactly
+//! two functions write it, `refunds::record_provider_response` and
+//! `refunds::record_webhook_response`, and every caller of those hands them a
+//! summary built the same way.
+//!
+//! Deliberately no count of call sites here — call sites get added, and a
+//! number in a security rationale rots into a falsehood. What is exhaustive
+//! is the mechanism: nowhere does a Stripe response body get assigned to
+//! either column, so no capability of Stripe's can reach them.
 //!
 //! # Why `stripe_events.payload_base64` is refused
 //!
@@ -133,9 +141,12 @@
 //! `invoice.paid` payload carries `hosted_invoice_url`, which
 //! <https://docs.stripe.com/api/invoices/object> describes as the page "which
 //! allows customers to view and pay an invoice"; `charge.refunded` carries
-//! `receipt_url`; a Checkout Session carries `client_secret` whenever
-//! `ui_mode` is `embedded_page`, and `stripe::handle_offer_checkout` reads
-//! that very field off a session response to serve embedded checkout.
+//! `receipt_url`; a Checkout Session carries `client_secret` whenever its
+//! `ui_mode` is `embedded_page` or `elements`. This block sends
+//! `ui_mode=embedded` (the legacy spelling, in `stripe.rs`) and
+//! `stripe::handle_offer_checkout` reads `client_secret` straight off the
+//! session response — so the sessions it creates are exactly the kind that
+//! carry one.
 //!
 //! Stated as plainly as the negative deserves: **nothing in Stripe's
 //! documentation says any field is stripped, redacted or nulled in a webhook

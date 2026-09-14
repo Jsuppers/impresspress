@@ -746,8 +746,11 @@ fn looks_like_a_credential(column: &str) -> bool {
         || c.ends_with("_hash")
 }
 
-/// The second convention: a column whose name says its contents were composed
-/// by something other than this repo.
+/// The second convention: a column named `*payload*`, `*body*` or `*raw*`.
+///
+/// `payload` and `body` are the words this schema uses today when a column
+/// holds a document rather than a field; `raw` matches nothing yet and is
+/// here because it is the third word someone would reach for.
 ///
 /// `impresspress__products__stripe_events.payload_base64` is why this exists.
 /// It matches nothing in [`looks_like_a_credential`] — no name convention
@@ -756,6 +759,17 @@ fn looks_like_a_credential(column: &str) -> bool {
 /// `client_secret` in them. A name scan cannot judge that; what it can do is
 /// refuse to let such a column pass unlooked-at, which is the same job the
 /// credential scan does one row above.
+///
+/// These three needles, and not a general "foreign document" test: a column
+/// spelled `*_manifest_json` or `*_info_json` would hold a document and would
+/// not be caught. The four that exist today are each a serialisation of a
+/// local typed struct, so nothing is uncovered now —
+/// `impresspress__dev__generations.site_manifest_json` and
+/// `block_manifest_json` are `generation::canonical_text` of the staged
+/// manifest, and `impresspress__dev__builds.block_info_json` and
+/// `diagnostics_json` are `serde_json::to_string` of a `BlockInfo` and of the
+/// compiler diagnostics. Widen the needles rather than trusting this note if
+/// a column ever holds a document someone else composed.
 ///
 /// Over-broad on purpose, and cheaply so: across every migration in the tree
 /// it selects three columns in two tables — `payload_base64` and
@@ -802,8 +816,10 @@ fn the_registry_and_the_clearances_still_describe_the_schema() {
         for column in entry.columns {
             assert!(
                 shaped.contains(&(entry.table.to_string(), (*column).to_string())),
-                "{}.{column} is registered as credential-bearing but the migrations no longer \
-                 declare it",
+                "{}.{column} is registered in SECRET_TABLES but the scan does not select it. \
+                 Either the migrations no longer declare the column, or its name matches \
+                 neither `looks_like_a_credential` nor `looks_like_a_foreign_document` — check \
+                 which before assuming the schema changed",
                 entry.table
             );
         }

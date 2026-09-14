@@ -1287,14 +1287,19 @@ async fn reset_operation_to_pending(ctx: &crate::test_support::TestContext, id: 
 /// empty string, silently dropping the refund's provider outcome from a
 /// payments audit trail. Nothing reads it back, so nothing failed loudly.
 ///
-/// The three carrying reads are exercised here in the order a real refund
-/// meets them: the reconcile worker settling a pending refund
+/// Four call sites carry that summary from the refund ledger onto the
+/// provider-operation row. Three are exercised here, in the order a real
+/// refund meets them: the reconcile worker settling a pending refund
 /// (`stripe_provider::reconcile_refund_operation` → `mark_completed`), a
 /// second reconcile of an already-settled ledger row (its early return), and
 /// a retried delivery of the original refund request
 /// (`purchase::refund_purchase`'s `Succeeded` arm → `resolve_unleased`).
+///
+/// The fourth is `refund_purchase`'s `ProviderSucceeded` arm, which reads the
+/// same column through the same `resolve_unleased` and so shares the fix, but
+/// is reached only from a ledger state this test does not stage.
 #[tokio::test]
-async fn refund_reconciliation_keeps_the_raw_provider_response() {
+async fn refund_reconciliation_keeps_the_provider_response_summary() {
     let mut ctx = ctx_with(&[(
         "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
         "sk_test_refunds",
