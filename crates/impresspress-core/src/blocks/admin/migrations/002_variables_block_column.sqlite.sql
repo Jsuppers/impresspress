@@ -5,6 +5,8 @@
 -- two `__`-delimited segments. e.g. key `WAFER_RUN__AUTH__JWT_SECRET` ->
 -- block `WAFER_RUN__AUTH`. Keys without two segments (legacy or shared
 -- WAFER_RUN_SHARED__*) leave `block` NULL.
+--
+-- Spec: docs/superpowers/specs/2026-05-15-lazy-block-init-design.md §6
 
 ALTER TABLE impresspress__admin__variables ADD COLUMN block TEXT;
 

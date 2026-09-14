@@ -5,11 +5,11 @@
 -- On cold start, when the cached hash matches the current
 -- `shared_config_vars()` hash, `seed_defaults` short-circuits before
 -- issuing any D1 query — dropping the residual ~100 D1 reads/day attributed
--- to that function in prod — those reads came from the bulk `list_all` the
--- config-snapshot work had added to `seed_defaults`.
+-- to that function in prod (the bulk `list_all` introduced by PR 2 of the
+-- 2026-05-14 config-snapshot spec).
 --
--- The gate is the same shape `migration_helper::apply_if_blessed` uses for
--- DDL: hash the payload, compare against the stored digest, skip on a match.
+-- Spec: docs/superpowers/specs/2026-05-14-config-snapshot-and-migration-gate-design.md
+--       § "Hash-gate seed_defaults like migrations" (PR 3)
 
 ALTER TABLE impresspress__admin__block_settings
     ADD COLUMN seed_defaults_hash TEXT NOT NULL DEFAULT '';

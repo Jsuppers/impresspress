@@ -5,6 +5,8 @@
 -- exposes `strpos` (1-indexed, returns 0 when not found) and
 -- `substring(s FROM start FOR length)` — semantically equivalent to
 -- the SQLite `instr`/`substr` formula in the sibling file.
+--
+-- Spec: docs/superpowers/specs/2026-05-15-lazy-block-init-design.md §6
 
 ALTER TABLE impresspress__admin__variables ADD COLUMN IF NOT EXISTS block TEXT;
 
