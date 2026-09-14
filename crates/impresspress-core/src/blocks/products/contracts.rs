@@ -3232,7 +3232,13 @@ impl LineItemView {
 // the rule `ProviderOperationSummary` already states for the block's
 // provider operations ("request/response payloads, idempotency keys ... stay
 // private"): `idempotency_key`, the Stripe idempotency key the refund was
-// claimed under, and `response_json`, the raw provider response.
+// claimed under, and `response_json`. The latter is NOT the raw provider
+// response, as this comment used to say: every writer passes a summary this
+// block builds itself (`stripe.rs` assembles `{id, status, amount_minor,
+// livemode, source}`; the reconciliation path in `purchase.rs` forwards that
+// same stored text). Still withheld — a provider's own view of a refund is
+// not part of the order contract — but withheld as bookkeeping, not as a
+// payload that might carry anything of Stripe's.
 /// One refund on an order: `impresspress__products__refunds`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RefundView {

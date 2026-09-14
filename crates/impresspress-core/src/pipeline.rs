@@ -513,10 +513,25 @@ pub async fn handle_request(
 /// the share link's token IS the credential, checked by equality against
 /// `impresspress__files__cloud_shares.token`.
 ///
-/// Deliberately NOT `{key}` or `{id}`: `{key}` is an object key inside a
-/// storage bucket and `{id}` a row id, and redacting either would cost the
+/// Deliberately NOT `{id}`, which is a row id: redacting it would cost the
 /// audit log the thing an operator opens it for. Deliberately not a substring
 /// match either — `{tokenize}` is not a token.
+///
+/// `{key}` is the one worth spelling out, because it has two meanings in this
+/// build and neither is a capability:
+///
+///  * an object key inside a storage bucket
+///    (`/b/storage/api/buckets/{bucket}/objects/{key}`) — a filename, and
+///    knowing it grants nothing: those routes are authenticated and
+///    authorize per bucket;
+///  * a config variable's NAME
+///    (`/b/admin/api/settings/{key}`, `/b/admin/variables/{key}` and their
+///    `/edit` and `/reset-to-environment` siblings) — the key, never the
+///    value. `WAFER_RUN__AUTH__JWT_SECRET` in a path says which secret an
+///    admin opened, which is exactly what an audit row is for; the value it
+///    holds is what [`crate::secret_tables`] keeps out of every read surface.
+///
+/// So both are logged as they arrived.
 fn path_var_is_capability(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name == "token" || name.ends_with("_token")
@@ -548,8 +563,20 @@ fn capability_path_templates(block_infos: &[BlockInfo]) -> Vec<&str> {
         .collect()
 }
 
+/// A path in the shape [`redact_capability_path_vars`] compares against a
+/// route template: lowercased, with trailing slashes removed.
+///
+/// Neither transformation is what the ROUTER does — routing is case-sensitive
+/// and `/b/storage/direct/x/` genuinely resolves to nothing. That asymmetry is
+/// the point: the router's job is to decide what to serve, and this one's is
+/// to decide what must not be written down, which has to be the more
+/// suspicious of the two.
+fn normalize_for_match(path: &str) -> String {
+    path.trim_end_matches('/').to_ascii_lowercase()
+}
+
 /// `path` with every capability-bound segment replaced by the variable's own
-/// name, or `None` when `path` matches no such route.
+/// name, or `None` when `path` resembles no such route.
 ///
 /// `/b/storage/direct/sharetok-9f3c…` becomes `/b/storage/direct/{token}`: the
 /// row still says which route was hit, which is what the audit log is for,
@@ -559,19 +586,51 @@ fn capability_path_templates(block_infos: &[BlockInfo]) -> Vec<&str> {
 /// and that is the point: a request that 404s binds nothing, and a *failed*
 /// share access is exactly when someone goes looking in the logs. A redaction
 /// that only worked once a route had resolved would leak on every probe.
+///
+/// # It matches more loosely than the router does, deliberately
+///
+/// A URL that only NEARLY names the route still carries a live token, and the
+/// ways of nearly naming it are ordinary user error rather than attacks: a
+/// pasted share link with a trailing slash, a client that capitalised the
+/// host-style prefix. Both 404 — no file is served — and both would otherwise
+/// put the capability into the audit table in the clear.
+///
+/// So the match runs against a normalised path ([`normalize_for_match`]:
+/// lowercased, trailing slashes trimmed) while the REBUILD takes its literal
+/// and non-capability segments from the path as it arrived. The row therefore
+/// keeps the casing that explains why the request missed, and loses only the
+/// stray trailing slash and the credential.
+///
+/// Over-matching here is the cheap direction: the worst it can do is print
+/// `{token}` in place of one segment of a path that was never going to serve
+/// anything. Under-matching logs a live capability. `an_ordinary_path_variable_is_logged_verbatim`
+/// and `redaction_keeps_every_other_segment` pin the other direction, so the
+/// looseness cannot grow into redacting identifiers.
+///
+/// What it still does NOT normalise, stated rather than implied: duplicated
+/// (`/b//storage/…`) or percent-encoded (`%2f`) separators, and `.`/`..`
+/// segments. Those change how the path splits rather than how a segment reads,
+/// and no adapter this runtime ships hands them through — but a path shaped
+/// that way is matched by no template and so is logged as it arrived.
 fn redact_capability_path_vars(path: &str, block_infos: &[BlockInfo]) -> Option<String> {
+    let normalized = normalize_for_match(path);
     for template in capability_path_templates(block_infos) {
-        if endpoint_match::match_template(template, path).is_none() {
+        if endpoint_match::match_template(template, &normalized).is_none() {
             continue;
         }
         let template_segments: Vec<&str> = template.split('/').collect();
-        let path_segments: Vec<&str> = path.split('/').collect();
+        // Rebuilt from the path as it ARRIVED, not from the normalised copy,
+        // so the row keeps the request's own casing. The trailing-slash trim
+        // is what makes the two align segment for segment.
+        let path_segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
         let mut out: Vec<&str> = Vec::with_capacity(path_segments.len());
         for (i, segment) in template_segments.iter().enumerate() {
             let var = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
             let Some(var) = var else {
-                // A literal segment matched literally.
-                out.push(segment);
+                // A literal segment. Taken from the PATH, not the template:
+                // the match was case-insensitive, and the row should show the
+                // request as it arrived.
+                out.push(path_segments.get(i).copied().unwrap_or(segment));
                 continue;
             };
             let rest = var.ends_with("...");
@@ -2539,24 +2598,48 @@ mod secret_path_redaction_tests {
     /// check over the whole stored row is meaningful.
     const SHARE_TOKEN: &str = "sharetok-9f3c21aa77b4e5d1";
 
-    async fn logged_paths(ctx: &TestContext) -> Vec<String> {
+    /// The `(path, status_code)` of every audit row, so a test can pin the
+    /// status its reasoning depends on instead of asserting it in a comment.
+    async fn logged_rows(ctx: &TestContext) -> Vec<(String, i64)> {
         request_logs::paginated(ctx, 1, 50, "")
             .await
             .expect("list request_logs")
             .rows
             .iter()
-            .map(|r| r.path.clone())
+            .map(|r| (r.path.clone(), r.status_code))
             .collect()
     }
 
     /// Drive one request through the real pipeline with the real blocks'
-    /// declared endpoints, and return the paths it logged.
+    /// declared endpoints, and return the `(path, status_code)` rows it
+    /// logged.
     ///
-    /// No block is registered for the route, so the request 404s — which is
-    /// the case that matters most: a *failed* share access is exactly when an
-    /// operator goes looking in the logs, and a redaction that only worked on
-    /// the success path would leak on every probe.
-    async fn drive_and_read_paths(path: &str) -> Vec<String> {
+    /// No request here reaches the share handler, which is the case that
+    /// matters: a *failed* share access is exactly when an operator goes
+    /// looking in the logs, and a redaction that only worked on the success
+    /// path would leak on every probe. Each fails at a different point, all
+    /// of them before any handler, and the tests pin the status rather than
+    /// asserting it in prose (the sentence this doc replaced claimed a 404
+    /// none of them produce):
+    ///
+    ///  * `/b/storage/direct/<tok>` IS declared — `real_block_infos` includes
+    ///    `FilesBlock::info()` — so it routes, and then dies in dispatch
+    ///    because this harness registers no block INSTANCE: "block
+    ///    'impresspress/files' not registered in TestContext";
+    ///  * a capitalised spelling misses the case-sensitive `/b/storage/`
+    ///    prefix in `routing::ROUTES` and is refused as "endpoint not found";
+    ///  * the trailing-slash spelling matches that prefix but is not a
+    ///    declared endpoint, so the access gate refuses it ("authentication
+    ///    required") before the block is called.
+    ///
+    /// All three are recorded with `status_code` 500 by this build's audit
+    /// tail, which is why the near-miss test asserts `>= 400` rather than a
+    /// code that says more than it knows.
+    ///
+    /// None of them binds `{token}` as a path variable, which is why the
+    /// redaction matches templates itself instead of reading back what
+    /// routing bound.
+    async fn drive_and_read_rows(path: &str) -> Vec<(String, i64)> {
         set_request_log_mode(RequestLogMode::Inline);
         let ctx = TestContext::with_admin().await;
         let infos = real_block_infos();
@@ -2573,31 +2656,78 @@ mod secret_path_redaction_tests {
         )
         .await;
         let _ = out.collect_buffered().await;
-        logged_paths(&ctx).await
+        logged_rows(&ctx).await
     }
 
     #[tokio::test]
     async fn a_share_token_never_reaches_the_audit_log() {
-        let paths = drive_and_read_paths(&format!("/b/storage/direct/{SHARE_TOKEN}")).await;
-        assert_eq!(paths.len(), 1, "expected exactly one audit row: {paths:?}");
+        let rows = drive_and_read_rows(&format!("/b/storage/direct/{SHARE_TOKEN}")).await;
+        assert_eq!(rows.len(), 1, "expected exactly one audit row: {rows:?}");
+        let (path, status) = &rows[0];
         assert!(
-            !paths[0].contains(SHARE_TOKEN),
-            "the share token was written to request_logs.path: {:?}",
-            paths[0]
+            !path.contains(SHARE_TOKEN),
+            "the share token was written to request_logs.path: {path:?}"
         );
         assert_eq!(
-            paths[0], "/b/storage/direct/{token}",
+            path, "/b/storage/direct/{token}",
             "the row must still say which route was hit"
         );
+        // Pinned, not asserted in prose: this path IS declared, so it resolves
+        // and then dies in dispatch because the harness registers no block
+        // instance. It never reached the share handler either way.
+        assert_eq!(*status, 500, "{rows:?}");
+    }
+
+    /// A URL that *nearly* names the share route still carries a live token,
+    /// and a near miss is ordinary user error rather than an attack: a pasted
+    /// link with a trailing slash, a hostname-style capitalisation. Both 404,
+    /// so no file is served — and both used to put the capability into
+    /// `request_logs.path` in the clear, which is the one table this whole
+    /// change exists to keep tokens out of.
+    #[tokio::test]
+    async fn a_near_miss_url_has_its_token_redacted_too() {
+        for path in [
+            // A trailing slash on a pasted share link.
+            format!("/b/storage/direct/{SHARE_TOKEN}/"),
+            // Capitalisation someone's client or their muscle memory added.
+            format!("/b/Storage/direct/{SHARE_TOKEN}"),
+            format!("/B/STORAGE/DIRECT/{SHARE_TOKEN}"),
+            // Both at once.
+            format!("/b/Storage/Direct/{SHARE_TOKEN}/"),
+        ] {
+            let rows = drive_and_read_rows(&path).await;
+            assert_eq!(rows.len(), 1, "{path}: {rows:?}");
+            let (logged, status) = &rows[0];
+            assert!(
+                !logged.contains(SHARE_TOKEN),
+                "{path}: the token reached request_logs.path as {logged:?}"
+            );
+            // Refused, never served — see the helper's doc for where each
+            // one stops. Nothing bound the token as a path variable, so only
+            // the template match could have found it.
+            assert!(
+                *status >= 400,
+                "{path} was served rather than refused: {rows:?}"
+            );
+        }
+    }
+
+    /// Redaction must not cost the audit log the casing an operator needs to
+    /// see WHY a request missed: the row keeps the path as it was typed, with
+    /// only the capability segment replaced.
+    #[tokio::test]
+    async fn a_near_miss_keeps_the_casing_that_explains_it() {
+        let rows = drive_and_read_rows(&format!("/b/Storage/direct/{SHARE_TOKEN}")).await;
+        assert_eq!(rows[0].0, "/b/Storage/direct/{token}");
     }
 
     #[tokio::test]
     async fn an_ordinary_path_variable_is_logged_verbatim() {
         // `{id}` is an identifier, not a capability: redacting it would cost
         // the audit log the thing it exists for.
-        let paths = drive_and_read_paths("/b/admin/api/users/user_12345").await;
-        assert_eq!(paths.len(), 1, "{paths:?}");
-        assert_eq!(paths[0], "/b/admin/api/users/user_12345");
+        let rows = drive_and_read_rows("/b/admin/api/users/user_12345").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "/b/admin/api/users/user_12345");
     }
 
     /// The closed set: every declared endpoint that binds a secret path

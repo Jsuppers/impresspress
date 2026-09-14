@@ -82,9 +82,11 @@
 //! * `impresspress__products__provider_operations.request_json` /
 //!   `response_json` sound like raw Stripe bodies and are not: the only
 //!   `ensure` call site writes the literal `{"version":1}`, and every
-//!   `resolve_*` writes a summary this repo builds itself
-//!   (`{id, status, amount_minor, livemode, source}`). No provider payload,
-//!   and so no capability, reaches either column.
+//!   `resolve_*` writes a summary this repo assembles itself — at most
+//!   `{id, status, amount_minor, livemode, source}`, in places fewer keys and
+//!   in places the empty object. The shape is illustrative; what is exhaustive
+//!   is that no writer forwards a provider payload, so no capability of
+//!   Stripe's can reach either column.
 //! * `impresspress__products__stripe_events.payload_base64` IS the raw webhook
 //!   body, base64 of exactly what Stripe posted. It can carry customer PII and
 //!   Stripe object ids. It is left readable because the explorer's value for
