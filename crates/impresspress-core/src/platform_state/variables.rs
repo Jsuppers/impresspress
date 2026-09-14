@@ -638,17 +638,32 @@ impl PinnedAtUpgrade {
     }
 }
 
-/// Every key the one-time upgrade transition pinned and this deployment could
-/// still seed from its process environment.
+/// Every key in `rows` the one-time upgrade transition pinned and this
+/// deployment could still seed from its process environment.
+///
+/// Over rows the caller already holds, so the admin Variables page can count
+/// them from the listing it renders rather than reading the table a second
+/// time. That the page's badge count and the action's selection are the SAME
+/// function is what makes "the number on the button equals the number of rows
+/// offering their own reset control" true by construction rather than by two
+/// filters agreeing.
 ///
 /// Says nothing about whether there IS a process environment — that is
 /// [`deployment_seeds_from_process_env`], which a surface has to check as well.
+pub fn pinned_at_upgrade(rows: &[VariableRow]) -> Vec<PinnedAtUpgrade> {
+    rows.iter().filter_map(PinnedAtUpgrade::of).collect()
+}
+
+/// [`pinned_at_upgrade`] over the whole table, for a caller that is acting
+/// rather than rendering.
+///
+/// The bulk release reads for itself rather than trusting a set a request
+/// carried: what the page rendered is a snapshot, and the authoritative
+/// question is what the table says now. (Even this is only "now" as of the
+/// read — see `admin::ops::ReleaseGuard::StillPinnedAtUpgrade` for the window
+/// between it and each write.)
 pub async fn keys_pinned_at_upgrade(ctx: &dyn Context) -> Result<Vec<PinnedAtUpgrade>, WaferError> {
-    Ok(list_all(ctx)
-        .await?
-        .iter()
-        .filter_map(PinnedAtUpgrade::of)
-        .collect())
+    Ok(pinned_at_upgrade(&list_all(ctx).await?))
 }
 
 async fn set_with_owner(
@@ -1514,14 +1529,13 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 ///   reached only from [`seed_and_load`]'s env loop, whose body does not run
 ///   when `env_vars` is empty, and it is empty on exactly the targets that hide
 ///   the control.
-/// - PER KEY, `admin::pages::variables::key_can_be_seeded_from_env`. This line
-///   does not check it, and on the native path it does not have to: every key
-///   the loop saw came through `cli::server_config::filter_to_declared_keys`,
-///   which is the predicate that mirrors. A caller assembling its own batch
-///   (the case this module's runtime-owned guard is documented for, and what
-///   its unit tests do) can get a count here for a key the page would offer no
-///   control for — a summary that over-counts by one per such key on a path
-///   production does
+/// - PER KEY, [`key_can_be_seeded_from_env`]. This line does not check it, and
+///   on the native path it does not have to: every key the loop saw came
+///   through `cli::server_config::filter_to_declared_keys`, which is the
+///   predicate that mirrors. A caller assembling its own batch (the case this
+///   module's runtime-owned guard is documented for, and what its unit tests
+///   do) can get a count here for a key the page would offer no control for — a
+///   summary that over-counts by one per such key on a path production does
 ///   not take, which is not worth a second per-key pass to avoid.
 ///
 /// `upgrade_pins` is how many of those `count` keys are held by a
@@ -1530,19 +1544,28 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 /// that control will be on the page. That control needs one more thing than
 /// this line does — at least one upgrade pin — and the [`Pin::AdminEdit`] half
 /// of `count` does not supply it, so a deployment whose only inert exports are
-/// admin edits would be told to press a button that is not there. The per-key
-/// caveat above applies to this number the same way and for the same reason.
+/// admin edits would be told to press a button that is not there.
+///
+/// The sentence names NO NUMBER, and that is not squeamishness: `upgrade_pins`
+/// and the page's count are taken over different populations and legitimately
+/// disagree. This one counts upgrade pins whose export is still present AND
+/// still differing, because it is derived from the env loop that has just
+/// walked that batch; the button counts every [`Pin::PreUpgrade`] row in the
+/// table. Remove one export from a deployment with two pinned keys and this
+/// would say "1" while the page says "2" and the action releases 2 — and an
+/// operator reading both has no way to tell which is lying. Deriving the honest
+/// number here would mean a second pass over the whole table on every boot that
+/// finds an inert export, to put a figure in a log line that is pointing at a
+/// page which shows the real one.
 fn warn_how_to_undo_a_pin(count: usize, upgrade_pins: usize) {
     // Named separately from the message so the sentence reads as one thing an
     // operator can act on rather than a conditional clause.
     let bulk = if upgrade_pins > 0 {
-        format!(
-            ". {upgrade_pins} of them were pinned by this deployment's one-time upgrade boot; \
-             \"Reset all keys pinned at upgrade\" on that page releases all {upgrade_pins} at \
-             once, and never touches a key an admin edited"
-        )
+        ". At least one of them was pinned by this deployment's one-time upgrade boot; \
+         \"Reset all keys pinned at upgrade\" on that page releases every such key at once, \
+         and never touches a key an admin edited"
     } else {
-        String::new()
+        ""
     };
     tracing::warn!(
         inert_exports = count,
@@ -3132,6 +3155,55 @@ mod boot_tests {
             0,
             "but the bulk control does not render for an admin edit, so it is not named"
         );
+    }
+
+    /// The summary must not put a NUMBER on what the bulk control will release.
+    ///
+    /// This boot's count is over the batch it just walked; the page's count is
+    /// over the table. Drop one export from a deployment with two pinned keys
+    /// and the two disagree — the log would say one, the button would say two,
+    /// and the action would release two. An operator reading both has no way to
+    /// tell which is lying, so the line names the control and leaves the count
+    /// to the page that can take it honestly.
+    #[tokio::test]
+    async fn the_bulk_advice_claims_no_count_the_page_would_contradict() {
+        let ctx = crate::test_support::TestContext::with_admin().await;
+        let kept = "WAFER_RUN_SHARED__APP_NAME";
+        let dropped = "WAFER_RUN_SHARED__AUTH_HEADLINE";
+        for key in [kept, dropped] {
+            seed_row_with_owner(&ctx, key, "KeptAtUpgrade", PRE_UPGRADE_SENTINEL).await;
+        }
+
+        // The operator has since removed one of the two exports, so this boot
+        // sees only one of the pinned keys — while both are still pinned.
+        let capture = crate::test_support::MessageCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            ctx.seed_env_vars(&[(kept, "FromEnv")]).await;
+        }
+
+        assert_eq!(
+            keys_pinned_at_upgrade(&ctx).await.expect("select").len(),
+            2,
+            "the premise: the button would offer to release both"
+        );
+        assert_eq!(
+            capture.count_containing("Reset all keys pinned at upgrade"),
+            1,
+            "the bulk route is still worth naming"
+        );
+        assert_eq!(
+            capture.count_containing("releases every such key at once"),
+            1,
+            "but it must describe the scope rather than count it"
+        );
+        for wrong in ["1 of them", "releases all 1"] {
+            assert_eq!(
+                capture.count_containing(wrong),
+                0,
+                "the line must not claim a figure the page contradicts: {wrong:?}"
+            );
+        }
     }
 
     /// No boot line ever prints the value of a credential, on either side of a

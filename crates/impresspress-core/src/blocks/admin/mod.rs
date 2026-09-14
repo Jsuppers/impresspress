@@ -458,9 +458,10 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .summary("Reset variable to environment (row control)"),
     // A literal where the rows above carry `{key}`, and unambiguous against
     // them: the only other `POST` under `/b/admin/variables/` is
-    // `{key}/reset-to-environment`, which has one more segment, and the three
-    // `/b/admin/variables/{key}` rows are bound to `retrieve`, `update` and
-    // `delete` — none to `create`. So no template can match this path.
+    // `{key}/reset-to-environment`, which has one more segment, and the two
+    // rows of this shape — `PATCH` and `DELETE /b/admin/variables/{key}` — are
+    // bound to `update` and `delete`, neither to `create`. So no template with
+    // a `{key}` here can match this path.
     EndpointRoute::admin(
         HttpMethod::Post,
         "/b/admin/variables/reset-pinned-at-upgrade",

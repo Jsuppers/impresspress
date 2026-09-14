@@ -1,13 +1,15 @@
 use maud::{html, Markup};
-use wafer_run::{context::Context, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::admin::ops,
     http::{err_internal, err_not_found},
-    // `key_can_be_seeded_from_env` lives beside the two gates it mirrors — the
-    // native env filter and `seed_and_load`'s runtime-owned refusal — and is
-    // shared with the bulk release's selection, so the page and the action
-    // cannot disagree about which keys the environment can set.
+    // `key_can_be_seeded_from_env` lives in `platform_state::variables` because
+    // it mirrors the two gates between the process environment and that table —
+    // `cli::server_config::filter_to_declared_keys` and `seed_and_load`'s own
+    // runtime-owned refusal — and because the bulk release's selection applies
+    // it too, so the page and the action cannot disagree about which keys the
+    // environment can set.
     platform_state::variables::{self, key_can_be_seeded_from_env},
     ui::{
         self,
@@ -25,7 +27,14 @@ use crate::{
 pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     let tab = msg.query("tab");
     let active_tab = if tab == "all" { "all" } else { "blocks" };
-    let upgrade_pins = bulk_release_count(ctx).await;
+    // ONE read of the table and one of the process-environment marker per
+    // render, here rather than inside each consumer. Both tabs and the bulk
+    // control's count want the same rows, and the tabs used to take them
+    // separately; a third read for the count would have made the page's answer
+    // to "how many keys are pinned" depend on which snapshot you asked.
+    let rows = variables::list_all(ctx).await;
+    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
+    let upgrade_pins = bulk_release_count(rows.as_deref().unwrap_or_default(), offer_reset);
 
     html! {
         div .mb-3 .flex .gap-1 {
@@ -54,9 +63,9 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
 
         div #variables-content {
             @if active_tab == "all" {
-                (config_all_tab(ctx).await)
+                (config_all_tab(&rows, offer_reset))
             } @else {
-                (config_by_block_tab(ctx).await)
+                (config_by_block_tab(ctx, rows.as_deref().unwrap_or_default(), offer_reset))
             }
         }
 
@@ -466,20 +475,21 @@ fn reset_to_environment_button(key: &str) -> Markup {
 ///   is what stops a bulk button appearing above a table where no row offers
 ///   the single-key one.
 ///
-/// Zero rather than an error when the table cannot be read. This is the second
-/// of the page's two reads of that table — the active tab takes the other — and
-/// the tab is what already decides how a failed read is reported ("All
-/// Variables" renders the error, "By Block" falls back to an empty list). A
-/// bulk control drawn from a count nobody could take would offer work it has no
+/// Counted over the rows [`settings_body`] already holds rather than from a
+/// read of its own, and through the very function the action's selection uses
+/// ([`variables::pinned_at_upgrade`]). So the number on the button is the
+/// number of rows below it carrying a "Pinned at upgrade" badge and their own
+/// reset control — by construction, not by two filters that happen to agree.
+///
+/// An unreadable table reaches this as no rows and so as no control, which is
+/// the honest answer: the "All Variables" tab reports the failure, and a bulk
+/// button drawn from a count nobody could take would offer work it has no
 /// evidence exists.
-async fn bulk_release_count(ctx: &dyn Context) -> usize {
-    if !variables::deployment_seeds_from_process_env(ctx).await {
+fn bulk_release_count(rows: &[variables::VariableRow], offer_reset: bool) -> usize {
+    if !offer_reset {
         return 0;
     }
-    variables::keys_pinned_at_upgrade(ctx)
-        .await
-        .map(|keys| keys.len())
-        .unwrap_or(0)
+    variables::pinned_at_upgrade(rows).len()
 }
 
 /// The control that hands every key pinned at upgrade back to the process
@@ -577,14 +587,20 @@ fn declared_shared_keys() -> std::collections::HashSet<String> {
 }
 
 /// "All Variables" tab -- flat table of all config variables from the DB.
-async fn config_all_tab(ctx: &dyn Context) -> Markup {
-    let settings = variables::list_all(ctx).await;
+///
+/// The rows and `offer_reset` are the caller's — see [`settings_body`], which
+/// takes each exactly once for the whole page. This tab keeps the `Result`
+/// rather than the rows, because it is the surface that REPORTS a failed read;
+/// the "By Block" tab renders declared vars whether or not the table can be
+/// listed, so it takes the rows alone.
+fn config_all_tab(
+    settings: &Result<Vec<variables::VariableRow>, WaferError>,
+    offer_reset: bool,
+) -> Markup {
     let declared_shared = declared_shared_keys();
-    // One read per render, not per row — see `VarRow::offer_reset`.
-    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
 
     html! {
-        @match &settings {
+        @match settings {
             Ok(rows) => {
                 @let table_rows: Vec<components::TableRow> = rows.iter().map(|row| {
                     let key = row.key.as_str();
@@ -662,12 +678,19 @@ async fn config_all_tab(ctx: &dyn Context) -> Markup {
 }
 
 /// "By Block" tab -- groups config variables by owning block with WRAP access info.
-async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
+///
+/// `all_vars` and `offer_reset` are the caller's — see [`settings_body`]. The
+/// rows arrive already unwrapped: this tab's subject is the DECLARED config
+/// vars, which it renders with their defaults whether or not the table could be
+/// listed, so an unreadable table is an empty overlay here rather than an error
+/// page. [`config_all_tab`] is the surface that reports the failure.
+fn config_by_block_tab(
+    ctx: &dyn Context,
+    all_vars: &[variables::VariableRow],
+    offer_reset: bool,
+) -> Markup {
     let blocks = ctx.registered_blocks();
     let shared_vars = crate::config_vars::shared_config_vars();
-
-    // Load all variables from DB
-    let all_vars = variables::list_all(ctx).await.unwrap_or_default();
 
     let var_map: std::collections::HashMap<String, StoredVar> = all_vars
         .iter()
@@ -682,10 +705,6 @@ async fn config_by_block_tab(ctx: &dyn Context) -> Markup {
             )
         })
         .collect();
-
-    // One read per render, not per row: whether handing a key back to a process
-    // environment means anything on this target.
-    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
 
     // Collect blocks that have config_keys
     let blocks_with_config: Vec<_> = blocks
@@ -2002,6 +2021,84 @@ mod tests {
             "",
             "a row nothing has claimed already follows the environment, and stamping it \
              released would hide it from the one-time upgrade transition"
+        );
+    }
+
+    /// THE RACE. An admin edit that lands BETWEEN the selection and the write
+    /// must still be safe.
+    ///
+    /// `PinnedAtUpgrade` proves a row was an upgrade pin when the set was READ.
+    /// The loop then writes each key one at a time, and `release_each`'s
+    /// per-key re-read is what decides whether the row still qualifies — so
+    /// without a pin check there, a bulk release started before a colleague's
+    /// edit lands would clear that edit, which is the one thing this action must
+    /// never do. Recoverable rather than destructive (only `updated_by` moves,
+    /// the stored value stands until the next boot), but only if somebody
+    /// notices before that boot.
+    ///
+    /// Driven at the `release_each` boundary because that is where the window
+    /// is: the set is collected first, the row is edited second, the writes run
+    /// third. The interleaving is real even though the test is single-threaded.
+    #[tokio::test]
+    async fn an_admin_edit_landing_after_the_selection_is_not_released() {
+        let ctx = ctx_with_every_pin_state(true).await;
+        let msg = admin_msg("update", "/admin/settings");
+
+        // The operator presses the button: the set is read, both keys qualify.
+        let selected = variables::keys_pinned_at_upgrade(&ctx)
+            .await
+            .expect("select the upgrade pins");
+        assert_eq!(
+            selected.len(),
+            UPGRADE_PINNED.len(),
+            "both keys have to be in the selection, or the race is not staged"
+        );
+
+        // A colleague edits one of them before the writes land.
+        let raced = UPGRADE_PINNED[1];
+        assert!(
+            ops::update_variable(
+                &ctx,
+                &msg,
+                raced,
+                ops::VariableUpdate {
+                    value: Some("DecidedJustNow"),
+                    description: None,
+                    sensitive: None,
+                },
+            )
+            .await
+            .is_ok(),
+            "the racing admin edit must land"
+        );
+        assert_eq!(
+            pin_of_key(&ctx, raced).await,
+            Some(variables::Pin::AdminEdit),
+            "and it must really have re-pinned the row"
+        );
+
+        let Ok(released) = ops::release_each(&ctx, &msg, &selected).await else {
+            panic!("the release must not fail over one racing edit")
+        };
+
+        assert_eq!(
+            released,
+            vec![UPGRADE_PINNED[0].to_string()],
+            "only the key that still qualified at write time may be released"
+        );
+        assert_eq!(
+            pin_of_key(&ctx, raced).await,
+            Some(variables::Pin::AdminEdit),
+            "the decision made during the window survives it"
+        );
+        assert_eq!(
+            variables::get_by_key(&ctx, raced)
+                .await
+                .expect("get")
+                .expect("row")
+                .value,
+            "DecidedJustNow",
+            "and so does the value that decision set"
         );
     }
 
