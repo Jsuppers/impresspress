@@ -30,6 +30,7 @@ pub mod platform_state;
 pub mod prepared_plan;
 pub mod release_inventory;
 pub mod routing;
+pub mod secret_tables;
 pub mod ssrf;
 pub mod streaming;
 pub mod ui;

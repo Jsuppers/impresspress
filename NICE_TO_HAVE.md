@@ -8,8 +8,6 @@ Low-priority improvements identified during code review. None are blocking, but 
 
 ## Security
 
-- **The admin SQL explorer returns stored secrets unmasked** — `POST /b/admin/api/database/query` accepts any `SELECT`/`WITH`/`EXPLAIN` (`blocks/admin/database.rs:316-334`) and returns raw rows with no masking (`:355`), so `SELECT key, value FROM impresspress__admin__variables` hands an admin the JWT signing secret, OAuth client secrets, Stripe keys and an unredeemed bootstrap token in plaintext. It is the one surface outside the `util::is_sensitive_key` funnel every other read path goes through — by construction, since the endpoint's job is to return what the query asked for. Not a privilege escalation (admin-only, and an admin can already change these values); what it defeats is containment — screen sharing, browser history, proxy logs, and one admin session being enough to exfiltrate every credential in a single request. Options: redact that table's `value` column per row with the same rule, refuse queries naming the table (the explorer already has a `Forbidden` path), or write down why neither. Whatever is decided should be referenced from `util::is_sensitive_key`'s doc comment, which enumerates the surfaces that ask it and otherwise reads as exhaustive. Recorded here rather than as a GitHub issue because this fork has issues disabled; found during review of the masked-value work, deliberately not fixed with it.
-
 - **Configurable Argon2 params for native deployments** — Current params (4 MiB memory, 2 iterations, 1 lane) are tuned for Cloudflare Workers' constrained environment. Native deployments should use higher cost params (e.g. 64 MiB, 3 iterations) for stronger password hashing. Could be driven by a `ARGON2_MEMORY_COST` env var.
 
 ## Testing
