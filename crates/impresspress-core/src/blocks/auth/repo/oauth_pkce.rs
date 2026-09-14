@@ -5,10 +5,11 @@
 //! the secret `code_verifier`, provider name, and redirect_uri live here,
 //! keyed by `state_id` and bounded by `expires_at`.
 //!
-//! [`take`] performs select-then-delete so a given `state_id` can only
-//! be redeemed once. Rows past `expires_at` are treated as missing and
-//! also dropped on lookup as a side effect — a periodic sweeper is
-//! additive, not load-bearing for correctness.
+//! [`take`] reads and deletes in one `DELETE … RETURNING` statement, so a
+//! given `state_id` can only be redeemed once. Rows past `expires_at` are
+//! treated as missing and also dropped on lookup as a side effect — a
+//! periodic sweeper ([`delete_expired`]) is additive, not load-bearing for
+//! correctness.
 
 use std::collections::HashMap;
 
@@ -162,6 +163,52 @@ mod tests {
 
         // Second take returns None — single-use.
         assert!(take(&ctx, "state-1").await.expect("take").is_none());
+    }
+
+    /// The same round-trip as
+    /// [`insert_then_take_returns_row_and_deletes`], but over a file-backed
+    /// database — the read/write-split topology every native deployment runs,
+    /// and the one the in-memory fixture cannot produce (see
+    /// [`TestContext::new_on_disk`]).
+    ///
+    /// [`take`] is a `DELETE … RETURNING`, a write. Dispatched down the read
+    /// path it reaches a `SQLITE_OPEN_READ_ONLY` connection and fails, and
+    /// `wafer-block-sqlite`'s pre-fix `run_fetch` dropped that per-row failure
+    /// as if it were a decode error, so the call returned `Ok(vec![])` — no
+    /// rows, no error. `take` reads that as `Ok(None)` and
+    /// `auth_ui::oauth::callback` answers `Invalid or expired OAuth state`:
+    /// on native, no OAuth sign-in could complete, and the state row it
+    /// should have consumed stayed in the table until `delete_expired` swept
+    /// it.
+    #[tokio::test]
+    async fn take_consumes_the_row_on_a_file_backed_database() {
+        let ctx = TestContext::with_auth_on_disk().await;
+        let expires = iso_plus_seconds(600);
+        insert(
+            &ctx,
+            NewPkceState {
+                state_id: "state-on-disk",
+                provider: "github",
+                code_verifier: "verifier-on-disk",
+                redirect_uri: "https://example.test/b/auth/oauth/callback",
+                expires_at: &expires,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let row = take(&ctx, "state-on-disk").await.expect("take").expect(
+            "the take must reach the write connection and return the row it \
+             deleted: a live PKCE state that reports itself missing fails \
+             every OAuth callback on a native deployment",
+        );
+        assert_eq!(row.code_verifier, "verifier-on-disk");
+
+        assert!(
+            take(&ctx, "state-on-disk").await.expect("take").is_none(),
+            "the redeemed state must be gone from the table, not merely \
+             reported as taken"
+        );
     }
 
     #[tokio::test]

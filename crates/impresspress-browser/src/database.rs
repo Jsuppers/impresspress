@@ -264,6 +264,28 @@ impl DbExec for BrowserDatabaseService {
         Ok(rows_modified as i64)
     }
 
+    /// Delegates to [`run_fetch`](Self::run_fetch): sql.js is a single
+    /// in-process database behind one bridge handle, so there is no
+    /// reader/writer split for a `DELETE … RETURNING` to land on the wrong
+    /// side of, and `bridge.js`'s `dbQueryRaw` runs the statement through
+    /// `_db.exec()`, which applies side effects and returns the `RETURNING`
+    /// rows in the same call.
+    ///
+    /// Like [`run_execute`](Self::run_execute) and every other `DbExec`
+    /// primitive here, it deliberately does NOT flush to OPFS — flushing is
+    /// coalesced once per logical `DatabaseService` call by
+    /// [`BrowserDatabaseService::with_flush`], and `take_where` (this
+    /// primitive's one caller, via the shared [`DbExec::take_where`]) is a
+    /// `custom` entry in the ledger below precisely so it gets that flush.
+    /// See the module doc comment's durability contract.
+    async fn run_execute_returning(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Vec<Record>, DatabaseError> {
+        self.run_fetch(sql, params).await
+    }
+
     async fn run_scalar_i64(
         &self,
         sql: &str,

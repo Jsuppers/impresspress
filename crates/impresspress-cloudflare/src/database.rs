@@ -266,6 +266,30 @@ impl DbExec for D1DatabaseService {
         Ok(changes as i64)
     }
 
+    /// Delegates to [`run_fetch`](Self::run_fetch): a D1 binding is one
+    /// handle, and every statement this adapter issues goes through
+    /// `db.prepare()` on it — there is no reader/writer split for a
+    /// `DELETE … RETURNING` to land on the wrong side of, and
+    /// `D1PreparedStatement::all()` applies a statement's side effects just
+    /// as `run()` does while also handing back the `RETURNING` rows. (This
+    /// adapter uses no D1 Sessions API, so no read-replica routing exists
+    /// here either.) Delegating rather than repeating `prepare_bind` +
+    /// `all()` + `record_from_json_row` keeps the two decode paths identical
+    /// by construction.
+    ///
+    /// It stays a distinct trait method rather than riding on `run_fetch`
+    /// at the call site because the *contract* differs — a statement with
+    /// side effects that also returns rows — and the shared
+    /// [`DbExec::take_where`] now routes through it: the day this adapter
+    /// grows read-replica routing, only this delegation changes.
+    async fn run_execute_returning(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Vec<Record>, DatabaseError> {
+        self.run_fetch(sql, params).await
+    }
+
     async fn run_scalar_i64(
         &self,
         sql: &str,

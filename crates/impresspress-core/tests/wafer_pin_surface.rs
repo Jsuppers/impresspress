@@ -110,3 +110,29 @@ fn phase_four_producer_surface_is_pinned() {
         &[&wafer_block::StaticBlockRegistration],
     ) -> Result<(), wafer_run::RuntimeError> = wafer_run::Wafer::register_static_blocks;
 }
+
+/// The two public items upstream PR #333 added, pinned for the same reason as
+/// everything above: a pin move that loses them fails here by name.
+///
+/// This one is not merely convenience. `DbExec::run_execute_returning` has no
+/// default body, so a missing pin is normally caught by the compiler at the
+/// `impl` — except that BOTH of this repo's `DbExec` impls (`D1DatabaseService`,
+/// `BrowserDatabaseService`) are `wasm32`-only, and neither is built by any
+/// host job. A host-only build would therefore not notice the method
+/// disappearing. This test is the host-side witness.
+#[test]
+fn take_where_write_path_surface_is_pinned() {
+    // #333: the write-path primitive `DbExec::take_where` now dispatches its
+    // `DELETE … RETURNING` through, instead of the read-path `run_fetch`.
+    // Named as a function item so the signature resolves without an impl in
+    // this crate, the same way `_db_exec_defaults` above names #328's.
+    fn _db_exec_write_returning<T: wafer_core::interfaces::database::exec::DbExec>() {
+        let _ = T::run_execute_returning;
+    }
+
+    // #333: the reader-connection count, made `pub` so a test can assert it is
+    // exercising the read/write-split topology rather than silently degrading
+    // to the single-connection one. `TestContext::new_on_disk` asserts on it.
+    let _: fn(&wafer_block_sqlite::service::SQLiteDatabaseService) -> usize =
+        wafer_block_sqlite::service::SQLiteDatabaseService::reader_count;
+}

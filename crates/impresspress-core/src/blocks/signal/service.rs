@@ -304,20 +304,17 @@ pub async fn answer_room(ctx: &dyn Context, code: &str, sdp: &str) -> Result<(),
 /// is still what it returns, and the other side's next poll sees `Gone` (a
 /// join that failed rather than one that half-worked).
 ///
-/// The delete is `db::delete_by_filters_count`, not `db::take_by_filters`:
-/// `DbExec`'s shared `take_where` (upstream `wafer-core`) issues its
-/// `DELETE … RETURNING` through the reader-pool `run_fetch` path rather than
-/// `run_execute`, so against a file-backed `SQLiteDatabaseService::open`
-/// (every real native deployment — anything with dedicated reader workers,
-/// see that crate's own `run_fetch` docs) the delete hits a read-only
-/// connection, fails with "attempt to write a readonly database", and that
-/// failure is swallowed per-row rather than surfaced — the row silently
-/// survives and a poll after the first would hand the answer out again
-/// forever instead of 404ing. Confirmed against the real native binary
-/// (`cargo build -p impresspress --bin impresspress` + a curl smoke test),
-/// not just the in-memory test fixture, which has no reader pool and never
-/// exercises the bug. `delete_by_filters_count` is the same call `sweep`
-/// already uses and goes through `run_execute`, so it isn't exposed to it.
+/// The paragraph above is now the ONLY reason this is two calls. It used to
+/// have a second one: `DbExec`'s shared `take_where` dispatched its
+/// `DELETE … RETURNING` through `run_fetch`, the read path, so against a
+/// file-backed `SQLiteDatabaseService::open` (every real native deployment)
+/// the delete reached a read-only connection, failed with "attempt to write a
+/// readonly database", and `run_fetch` swallowed that failure per-row — the
+/// row silently survived and a poll after the first handed the answer out
+/// again instead of 404ing. That is fixed upstream (`take_where` now runs
+/// through `DbExec::run_execute_returning`, the write path), so
+/// `db::take_by_filters` is no longer unsafe here; the polling semantics
+/// above are what still rule it out.
 pub async fn take_answer(ctx: &dyn Context, code: &str) -> Result<Option<String>, RoomError> {
     let row = fetch_live(ctx, code).await?;
     if row.answer_sdp.is_empty() {
