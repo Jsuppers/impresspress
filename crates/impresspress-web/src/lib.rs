@@ -11,14 +11,16 @@
 // `wafer_block::compat::{MaybeSend, MaybeSync}`. Those are `Send`/`Sync` on
 // native, and on wasm32 they are *unbounded* blanket markers
 // (`impl<T: ?Sized> MaybeSend for T`) — which is precisely what lets this
-// crate hand `Rc`/`Cell`/`RefCell`-backed values (`BrowserRuntimeControl`, the
-// dev `Context` impls, `BrowserShellSource`) across those trait boundaries
-// with no `unsafe impl Send`/`Sync`. The `Arc` is not a choice either:
-// `ImpresspressBuilder::extra_block`, `DevShared::new` and
-// `Context::clone_arc` all take or return `Arc<dyn _>` by value. So the lint
-// fires on handles whose type and smart pointer are both dictated by the API,
-// and on this single-threaded target none of them is making a cross-thread
-// claim to be wrong about.
+// crate hand `Cell`/`RefCell`-backed values (`BrowserRuntimeControl` and the
+// dev `Context` impls) across those trait boundaries with no
+// `unsafe impl Send`/`Sync`.
+//
+// The SMART POINTER is forced at the four sites the lint reaches — that is the
+// claim this allow rests on, and it is narrower than "the code is all
+// API-shaped". `ImpresspressBuilder::extra_block`, `DevShared::new` and
+// `Context::clone_arc` take or return `Arc<dyn _>` by value, and `Rc` does not
+// coerce into an `Arc<dyn Trait>` (E0605). On this single-threaded target none
+// of the four is making a cross-thread claim to be wrong about.
 //
 // Scoped to wasm32 even though this crate only ships to a browser, because
 // that is the actual precondition: on a native target the same bounds resolve

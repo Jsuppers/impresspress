@@ -163,7 +163,8 @@ pub fn generate_upload_with_release(
         ConfigRole::Upload,
         VersionIdentities {
             release,
-            ..VersionIdentities::default()
+            artifact: None,
+            prepared: None,
         },
     )
 }

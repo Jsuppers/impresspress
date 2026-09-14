@@ -34,10 +34,15 @@
 //! `Context`, `Block`) is bounded on `wafer_run::MaybeSend + MaybeSync`, which
 //! is unbounded on `wasm32`. `Rc`, `Cell` and `RefCell` therefore cross those
 //! boundaries without an `unsafe` marker impl; the only cost is
-//! `clippy::arc_with_non_send_sync` firing on every `Arc` this module builds
-//! over a single-threaded value, which the crate-level
+//! `clippy::arc_with_non_send_sync`, which the crate-level
 //! `allow(clippy::arc_with_non_send_sync)` in `lib.rs` turns off for wasm32
 //! and only wasm32.
+//!
+//! It fires at three sites here — both `Context::clone_arc` impls and
+//! `BrowserRuntimeControl::new` — and NOT on [`attach`]'s
+//! `Arc::new(BrowserShellSource)`, because `BrowserShellSource` is a fieldless
+//! unit struct and so is genuinely `Send + Sync`. That site carried a per-site
+//! allow for a lint that never fired there; it is gone.
 
 use std::{
     cell::{Cell, RefCell},

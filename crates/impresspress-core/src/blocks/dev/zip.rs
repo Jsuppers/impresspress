@@ -131,11 +131,12 @@ pub struct ZipWriter {
     /// past the 4 GiB ceiling, without `finish` itself needing to be
     /// fallible.
     ///
-    /// `u64` like [`MAX_ARCHIVE_BYTES`]: the largest legal central directory
-    /// ([`MAX_ENTRIES`] records of up to `CENTRAL_HEADER_FIXED_LEN +
-    /// u16::MAX` bytes each) is over 4 GiB, so this running total can exceed
-    /// `usize` on wasm32 before the ceiling check that refuses it has a
-    /// chance to run.
+    /// `u64` to match the arithmetic it feeds, not because it can overflow:
+    /// the ceiling check in [`ZipWriter::add`] reads this field and refuses
+    /// the entry BEFORE the increment that would grow it, so it stays under
+    /// `MAX_ARCHIVE_BYTES` and would fit a 32-bit `usize`. The type keeps the
+    /// projected-size expression in one width instead of casting this operand
+    /// where that expression reads it.
     central_dir_bytes: u64,
 }
 
