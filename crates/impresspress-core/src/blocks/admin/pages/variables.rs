@@ -465,21 +465,20 @@ fn reset_to_environment_button(key: &str) -> Markup {
 /// Two independent conditions, the same pair the per-row control is gated on
 /// and for the same reasons:
 ///
-/// - PER DEPLOYMENT, [`variables::deployment_seeds_from_process_env`]: Cloudflare
-///   never runs `variables::seed_and_load` and the browser runs it with an empty
-///   batch, so nothing there is pinned against a process environment and the
-///   action's toast would be false.
-/// - PER KEY, which [`variables::keys_pinned_at_upgrade`] applies itself
-///   (`key_can_be_seeded_from_env`), so the count is exactly the number of rows
-///   whose own "Reset to environment" control is on the page. The two agreeing
-///   is what stops a bulk button appearing above a table where no row offers
-///   the single-key one.
+/// - PER DEPLOYMENT, [`variables::deployment_seeds_from_process_env`], which
+///   arrives here as `offer_reset`: Cloudflare never runs
+///   `variables::seed_and_load` and the browser runs it with an empty batch, so
+///   nothing there is pinned against a process environment and the action's
+///   toast would be false.
+/// - PER KEY, `key_can_be_seeded_from_env`, which
+///   [`variables::count_pinned_at_upgrade`] applies for itself.
 ///
 /// Counted over the rows [`settings_body`] already holds rather than from a
-/// read of its own, and through the very function the action's selection uses
-/// ([`variables::pinned_at_upgrade`]). So the number on the button is the
-/// number of rows below it carrying a "Pinned at upgrade" badge and their own
-/// reset control — by construction, not by two filters that happen to agree.
+/// read of its own, and through the same selection the action uses. So the
+/// number on the button is the number of rows below it carrying a "Pinned at
+/// upgrade" badge and their own reset control — by construction, not by two
+/// filters that happen to agree, and from the same snapshot, not from a second
+/// read that could have moved.
 ///
 /// An unreadable table reaches this as no rows and so as no control, which is
 /// the honest answer: the "All Variables" tab reports the failure, and a bulk
@@ -489,7 +488,7 @@ fn bulk_release_count(rows: &[variables::VariableRow], offer_reset: bool) -> usi
     if !offer_reset {
         return 0;
     }
-    variables::pinned_at_upgrade(rows).len()
+    variables::count_pinned_at_upgrade(rows)
 }
 
 /// The control that hands every key pinned at upgrade back to the process
@@ -1141,10 +1140,15 @@ pub async fn handle_reset_variable_to_environment(
 /// that design exists to avoid.
 ///
 /// Reports ZERO as a success rather than an error. The page only renders the
-/// control when the count is non-zero, so reaching this with nothing to do
-/// means the page went stale — another admin released the keys, or this one
-/// did, from the per-row controls beside them. Nothing has failed, and saying
-/// so is more useful than an error the operator cannot act on.
+/// control when the count is non-zero, so reaching this with nothing to do has
+/// three causes and none of them is a failure: the page went stale because
+/// another admin released the keys; this admin released them from the per-row
+/// controls beside them; or every selected key was skipped at write time by
+/// `ops::ReleaseGuard::StillPinnedAtUpgrade`, which is the action working
+/// exactly as intended. Saying so beats an error the operator cannot act on.
+///
+/// A PARTIAL skip needs no special case either: `released` is what actually
+/// moved, so the toast counts that rather than what was selected.
 pub async fn handle_reset_variables_pinned_at_upgrade(
     ctx: &dyn Context,
     msg: &Message,

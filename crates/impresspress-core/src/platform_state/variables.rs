@@ -599,12 +599,31 @@ pub fn key_can_be_seeded_from_env(key: &str) -> bool {
 /// process environment can still set.
 ///
 /// The input type of the bulk release (`admin::ops::release_keys_pinned_at_upgrade`),
-/// and the reason that action cannot reach a [`Pin::AdminEdit`] row. The inner
-/// `String` is private to this module and [`Self::of`] is the only constructor,
-/// so no caller outside this file can name a key to release — it can only ask
-/// [`keys_pinned_at_upgrade`] which rows qualify. Releasing an admin edit would
-/// silently undo the decision rule 2 of the precedence contract exists to make
-/// permanent, so "which keys" is not a question a UI surface gets to answer.
+/// and what stops that action SELECTING a [`Pin::AdminEdit`] row. Releasing an
+/// admin edit would silently undo the decision rule 2 of the precedence
+/// contract exists to make permanent, so "which keys" is not a question a UI
+/// surface gets to answer.
+///
+/// Three things together are what make it an answer the surface cannot forge,
+/// and all three are load-bearing:
+///
+/// * the inner `String` is private to this module, so nobody outside can build
+///   one from a key;
+/// * [`Self::of`] is the only constructor and is private too;
+/// * [`keys_pinned_at_upgrade`] is the only PUBLIC way to obtain one, and it
+///   reads the real table.
+///
+/// The third is easy to lose. [`count_pinned_at_upgrade`] takes caller-supplied
+/// rows, and [`VariableRow`] is a public struct with public fields — so had that
+/// function returned `PinnedAtUpgrade` values instead of a count, any caller
+/// could have forged a row (`updated_by: PRE_UPGRADE_SENTINEL`) for a key
+/// nothing pinned and minted one from it. It returns `usize` for exactly that
+/// reason, not because a count happened to be all the page wanted.
+///
+/// What this type does NOT prove is the state of the row at the moment of the
+/// WRITE: it is evidence about a read that has already happened. See
+/// `admin::ops::ReleaseGuard::StillPinnedAtUpgrade` for the half that speaks
+/// for the row itself.
 #[derive(Debug)]
 pub struct PinnedAtUpgrade(String);
 
@@ -641,21 +660,36 @@ impl PinnedAtUpgrade {
 /// Every key in `rows` the one-time upgrade transition pinned and this
 /// deployment could still seed from its process environment.
 ///
-/// Over rows the caller already holds, so the admin Variables page can count
-/// them from the listing it renders rather than reading the table a second
-/// time. That the page's badge count and the action's selection are the SAME
-/// function is what makes "the number on the button equals the number of rows
-/// offering their own reset control" true by construction rather than by two
-/// filters agreeing.
-///
-/// Says nothing about whether there IS a process environment — that is
-/// [`deployment_seeds_from_process_env`], which a surface has to check as well.
-pub fn pinned_at_upgrade(rows: &[VariableRow]) -> Vec<PinnedAtUpgrade> {
+/// PRIVATE, and the doc on [`PinnedAtUpgrade`] says why: this is the one place
+/// that mints them from rows, and rows are forgeable by any caller. The two
+/// public faces of it are [`count_pinned_at_upgrade`] (a number, for rendering)
+/// and [`keys_pinned_at_upgrade`] (the values, over rows this module read
+/// itself).
+fn pinned_at_upgrade(rows: &[VariableRow]) -> Vec<PinnedAtUpgrade> {
     rows.iter().filter_map(PinnedAtUpgrade::of).collect()
 }
 
+/// How many of `rows` the one-time upgrade transition pinned and this
+/// deployment could still seed from its process environment.
+///
+/// Over rows the caller already holds, so the admin Variables page can count
+/// them from the listing it renders rather than reading the table a second
+/// time, and through the same [`pinned_at_upgrade`] the action's selection uses
+/// — which is what makes "the number on the button equals the number of rows
+/// below it offering their own reset control" true by construction rather than
+/// by two filters agreeing.
+///
+/// A COUNT rather than the values, so that handing rows in cannot mint a
+/// [`PinnedAtUpgrade`]; see that type's doc.
+///
+/// Says nothing about whether there IS a process environment — that is
+/// [`deployment_seeds_from_process_env`], which a surface has to check as well.
+pub fn count_pinned_at_upgrade(rows: &[VariableRow]) -> usize {
+    pinned_at_upgrade(rows).len()
+}
+
 /// [`pinned_at_upgrade`] over the whole table, for a caller that is acting
-/// rather than rendering.
+/// rather than rendering. The only public source of [`PinnedAtUpgrade`] values.
 ///
 /// The bulk release reads for itself rather than trusting a set a request
 /// carried: what the page rendered is a snapshot, and the authoritative
@@ -1546,6 +1580,15 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 /// of `count` does not supply it, so a deployment whose only inert exports are
 /// admin edits would be told to press a button that is not there.
 ///
+/// "Only when" carries the same per-key caveat as `count` above, and for the
+/// same reason: this number does not consult [`key_can_be_seeded_from_env`],
+/// while [`PinnedAtUpgrade::of`] does. A caller assembling its own batch with an
+/// undeclared key can therefore reach `upgrade_pins >= 1` with no button
+/// rendering. Not reachable in production — a runtime-owned key `continue`s
+/// before it is counted, and on native `filter_to_declared_keys` has already
+/// removed every other undeclared key — and not worth a second pass over the
+/// table to tighten.
+///
 /// The sentence names NO NUMBER, and that is not squeamishness: `upgrade_pins`
 /// and the page's count are taken over different populations and legitimately
 /// disagree. This one counts upgrade pins whose export is still present AND
@@ -1568,8 +1611,13 @@ fn warn_how_to_undo_a_pin(count: usize, upgrade_pins: usize) {
         ""
     };
     tracing::warn!(
+        // `inert_exports` and nothing else. `upgrade_pins` decides WHETHER the
+        // sentence below is printed but is never published, for the same reason
+        // the sentence names no figure: it counts this batch, the page counts
+        // the table, and a field is not a lesser claim than message text — an
+        // operator grepping `upgrade_pins=1` beside a button reading "(2)" is
+        // in exactly the position the wording change exists to avoid.
         inert_exports = count,
-        upgrade_pins,
         // Deliberately NOT the per-key lines' "NO EFFECT" wording: that phrase
         // is how an operator greps for the keys to act on, and how this
         // module's tests count them, so the summary must not inflate it.
@@ -3204,6 +3252,20 @@ mod boot_tests {
                 "the line must not claim a figure the page contradicts: {wrong:?}"
             );
         }
+        // And not as a structured field either. A field is not a lesser claim
+        // than message text — this is exactly where the figure hid after it was
+        // taken out of the sentence.
+        assert_eq!(
+            capture.count_fields_containing("upgrade_pins"),
+            0,
+            "the count must not be published as a field once it is out of the message"
+        );
+        assert_eq!(
+            capture.count_fields_containing("inert_exports=1"),
+            1,
+            "the field that IS published has to be the one the message agrees with, \
+             or this test would pass by publishing nothing at all"
+        );
     }
 
     /// No boot line ever prints the value of a credential, on either side of a

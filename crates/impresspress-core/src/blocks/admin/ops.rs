@@ -580,6 +580,18 @@ enum ReleaseGuard {
     /// concurrent edit must not fail the release of the other nine keys, and
     /// the skipped key is still pinned afterwards, so the next press collects
     /// nothing for it and the operator sees the count they actually got.
+    ///
+    /// It NARROWS the window; it does not close it. This is a re-read followed
+    /// by a write, not a conditional write, so an edit landing between
+    /// [`release_to_environment`]'s `get_by_key` and its
+    /// `variables::reset_to_environment` still loses its pin — the value
+    /// survives, but `updated_by` becomes `RELEASED_TO_ENV_SENTINEL` and the
+    /// next boot seeds over it. A conditional write is not available:
+    /// `db::update` addresses a row by id with no predicate, and
+    /// `variables::upsert_by_key` is itself read-then-update-by-id, as is
+    /// [`update_variable`]. The gain is real and is the whole point — the window
+    /// shrinks from the entire loop (every key's read, every earlier key's
+    /// write) to one round trip on the key being written.
     StillPinnedAtUpgrade,
 }
 
@@ -595,8 +607,9 @@ async fn release_to_environment(
         return Err(err_bad_request("Missing setting key"));
     }
     // Bound rather than discarded: under `StillPinnedAtUpgrade` the row's pin
-    // as it stands NOW is the precondition, and this read is the only look at
-    // it between the caller's selection and the write below.
+    // as it stands NOW is the precondition, and this read is the last look at
+    // it before the write below. The gap between the two is the residual window
+    // that guard's doc describes.
     let row = match variables::get_by_key(ctx, key).await {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -638,21 +651,23 @@ async fn release_to_environment(
 /// has been administered at all this is several keys, not one, and the per-key
 /// control is one confirm dialog each before a single restart.
 ///
-/// **It cannot touch a [`variables::Pin::AdminEdit`] row**, and it takes two
-/// mechanisms to say that without qualification, because the selection and the
-/// writes happen at different times:
+/// **It does not release a [`variables::Pin::AdminEdit`] row**, and that rests
+/// on two mechanisms answering two different questions, because the selection
+/// and the writes happen at different times:
 ///
-/// * WHICH KEYS — a property of the types rather than of this loop. The only
-///   thing it can hand to [`release_to_environment`] is a
-///   [`variables::PinnedAtUpgrade`], whose inner key is private to
-///   `platform_state::variables` and whose only constructor refuses every other
-///   pin. Widening it means editing that constructor, next to the reason it
-///   refuses.
-/// * WHEN — that type proves the row was an upgrade pin when the set was READ,
-///   which is a narrower claim than it looks: an admin edit can land in the
-///   window before that key's own write. [`ReleaseGuard::StillPinnedAtUpgrade`]
-///   re-checks the pin on the row the write is about to change, and skips it
-///   otherwise.
+/// * WHICH KEYS — the SELECTION, and a property of the types rather than of
+///   this loop. The only thing it can hand to [`release_to_environment`] is a
+///   [`variables::PinnedAtUpgrade`], which cannot be built from a key or from a
+///   caller's rows: see that type's doc for the three separate things that make
+///   it unforgeable and for why
+///   [`variables::count_pinned_at_upgrade`] returns a number rather than values.
+/// * WHICH ROW — the WRITE. The type above is evidence about a read that has
+///   already happened, so it says nothing about the row a given write is about
+///   to change; an admin edit can land in between.
+///   [`ReleaseGuard::StillPinnedAtUpgrade`] re-reads the row and skips it unless
+///   it is still an upgrade pin. That is what actually speaks for the row, and
+///   it is a re-read rather than a conditional write — see the guard's own doc
+///   for the residual window it narrows but cannot close.
 ///
 /// An admin edit winning permanently is rule 2 of the precedence contract, and
 /// a bulk control that quietly cleared one would be a worse defect than the
@@ -685,14 +700,16 @@ pub(super) async fn release_keys_pinned_at_upgrade(
 /// selected.
 ///
 /// Split out so a test can put something between the selection and the writes —
-/// which is the whole window [`ReleaseGuard::StillPinnedAtUpgrade`] exists to
-/// close, and which is otherwise unreachable, the loop being sequential with no
-/// injection point.
+/// the window [`ReleaseGuard::StillPinnedAtUpgrade`] exists to narrow, and
+/// otherwise unreachable, the loop being sequential with no injection point.
 ///
 /// Taking a `&[variables::PinnedAtUpgrade]` rather than keys widens nothing:
-/// those can still only be minted by the private constructor in
-/// `platform_state::variables`, so a caller here cannot name an arbitrary row
-/// any more than the handler can.
+/// `platform_state::variables` exposes no way to build one from a key or from
+/// caller-supplied rows, so a caller here cannot name an arbitrary row any more
+/// than the handler can. That is a property of THAT module, not of this
+/// signature — it was briefly lost when a row-taking selector was made public
+/// there — so the reasoning lives on `variables::PinnedAtUpgrade` and this is
+/// only pointing at it.
 pub(super) async fn release_each(
     ctx: &dyn Context,
     msg: &Message,
