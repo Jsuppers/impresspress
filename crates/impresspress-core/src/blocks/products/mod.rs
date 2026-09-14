@@ -36,6 +36,14 @@ mod tests;
 pub(crate) use repo::products::{
     list_all as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot, TABLE,
 };
+// `stripe_events` has two non-production readers and no production one, so
+// its re-export carries both of their cfgs rather than claiming the name is
+// always live: `blocks::dev::data_snapshot`'s closed-list bookkeeping under
+// `block-dev`, and, under the lib's own `cfg(test)`, the `secret_tables` pin
+// test that holds the admin SQL explorer's literal to this door's constant so
+// a renamed table cannot drop out of the refusal silently.
+#[cfg(any(feature = "block-dev", test))]
+pub(crate) use repo::stripe_events::TABLE as STRIPE_EVENTS_TABLE;
 // `repo` is private to this module (unlike `auth`'s `pub mod repo`, whose
 // table constants are meant to be named from anywhere in the crate) — these
 // re-exports are the curated exception list, extended here so
@@ -54,7 +62,7 @@ pub(crate) use repo::{
     product_templates::TABLE as PRODUCT_TEMPLATES_TABLE,
     product_versions::TABLE as PRODUCT_VERSIONS_TABLE,
     provider_operations::TABLE as PROVIDER_OPERATIONS_TABLE, refunds::TABLE as REFUNDS_TABLE,
-    seller_accounts::TABLE as SELLER_ACCOUNTS_TABLE, stripe_events::TABLE as STRIPE_EVENTS_TABLE,
+    seller_accounts::TABLE as SELLER_ACCOUNTS_TABLE,
     subscription_items::TABLE as SUBSCRIPTION_ITEMS_TABLE, subscriptions::SUBSCRIPTIONS_TABLE,
     types::TABLE as TYPES_TABLE,
 };

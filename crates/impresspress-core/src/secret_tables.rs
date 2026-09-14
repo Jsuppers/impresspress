@@ -44,6 +44,13 @@
 //! `tokens`, `personal_access_tokens`, `api_keys`, `bootstrap_tokens`,
 //! `users.verification_token` and `purchases.receipt_token_hash`).
 //!
+//! **"Someone" is not "someone to this site".** `provider_links.access_token`
+//! authenticates nobody here: it is a third party's bearer token, replayable
+//! against that provider with no involvement of this deployment, and it has
+//! been on this list since the list existed. `stripe_events.payload_base64`
+//! is on it for the same reason — see below. The rule is about what a value
+//! *is*, not about whose front door it opens.
+//!
 //! The digests are included deliberately. A boundary drawn at "plaintext only"
 //! would have to re-judge each digest's crackability every time the schema or
 //! the hash parameters change — `local_credentials.password_hash` is Argon2id
@@ -72,34 +79,97 @@
 //! `sql_explorer_secrets.rs` now models `DROP TABLE` precisely so that class
 //! of claim fails rather than reads plausibly.
 //!
-//! # Two that were considered and left readable
+//! # One that was considered and left readable
 //!
-//! Both hold third-party data rather than this deployment's own credentials,
-//! so neither is authentication material under the rule above. Naming them
-//! here because "nobody mentioned it" and "somebody decided" look identical
-//! six months later.
+//! `impresspress__products__provider_operations.request_json` /
+//! `response_json` sound like raw Stripe bodies and are not.
 //!
-//! * `impresspress__products__provider_operations.request_json` /
-//!   `response_json` sound like raw Stripe bodies and are not: the only
-//!   `ensure` call site writes the literal `{"version":1}`, and every
-//!   `resolve_*` writes a summary this repo assembles itself — at most
-//!   `{id, status, amount_minor, livemode, source}`, in places fewer keys and
-//!   in places the empty object. The shape is illustrative; what is exhaustive
-//!   is that no writer forwards a provider payload, so no capability of
-//!   Stripe's can reach either column.
-//! * `impresspress__products__stripe_events.payload_base64` IS the raw webhook
-//!   body, base64 of exactly what Stripe posted. It can carry customer PII and
-//!   Stripe object ids. It is left readable because the explorer's value for
-//!   debugging a payment is real and because none of it authenticates anyone
-//!   *to this site* — but that is a narrower claim than "it holds no
-//!   capability", which this PR did not establish either way, and
-//!   `NICE_TO_HAVE.md` records the open question rather than letting the
-//!   omission read as a finding.
+//! Three repo functions write those two columns: `ensure` (`request_json`),
+//! and `mark_completed` and `resolve_unleased` (`response_json`, which the
+//! `resolve_for_aggregate` / `complete_for_aggregate` helpers reach through
+//! `resolve_unleased` rather than writing themselves). Every value handed to
+//! them is one of three things: a literal spelled at the call site
+//! (`{"version":1}`, `{}`), a `serde_json::json!` summary this repo builds —
+//! at most `{id, status, amount_minor, livemode, source}`, in places fewer
+//! keys — or a read-back of `refunds.response_json`. That last column is the
+//! only indirection, and it has the same property at its own source: exactly
+//! two functions write it, `refunds::record_provider_response` and
+//! `refunds::record_webhook_response`, and every caller of those hands them a
+//! summary built the same way.
+//!
+//! Deliberately no count of call sites here — call sites get added, and a
+//! number in a security rationale rots into a falsehood. What is exhaustive
+//! is the mechanism: nowhere does a Stripe response body get assigned to
+//! either column, so no capability of Stripe's can reach them.
+//!
+//! # Why `stripe_events.payload_base64` is refused
+//!
+//! It is the one entry here whose credential belongs to somebody else's
+//! system, so the evidence is written out rather than asserted.
+//!
+//! `payload_base64` is the verbatim body of a Stripe webhook, base64 of
+//! exactly the bytes that were signed — `stripe::handle_webhook` passes
+//! `&raw_body` straight to `record_event`, for **every** signed delivery that
+//! carries an event id, not only the types the block handles. An unhandled
+//! `type` is ordinary traffic there — `contracts::StripeEventType`'s own docs
+//! say a destination can be subscribed to more event types than this block
+//! handles — so the set of objects that can land in this column is the
+//! destination's subscription list, not the block's 21 handled types.
+//!
+//! What Stripe puts in that body:
+//!
+//! * `data.object` is the whole object, not a projection —
+//!   <https://docs.stripe.com/api/events/object> — "Object containing the API
+//!   resource relevant to the event. For example, an `invoice.created` event
+//!   will have a full invoice object as the value of the object key."
+//! * The one documented reduction is expansion, not redaction —
+//!   <https://docs.stripe.com/expand> — "Objects sent in events are always in
+//!   their minimal form." Minimal means *unexpanded*: an expandable field
+//!   arrives as an id. Top-level fields arrive as themselves.
+//! * And the reference's own worked example proves a secret survives that:
+//!   the `setup_intent.created` Event printed at
+//!   <https://docs.stripe.com/api/events/object> carries
+//!   `"client_secret": "seti_…_secret_…"` inside `data.object`, populated.
+//! * Which Stripe classes as a credential —
+//!   <https://docs.stripe.com/api/payment_intents/object> — "The client secret
+//!   can be used to complete a payment from your frontend. It should not be
+//!   stored, logged, or exposed to anyone other than the customer."
+//!
+//! That is decisive on its own, and this deployment is squarely in range: the
+//! block handles `payment_intent.succeeded` and four siblings, whose
+//! `data.object` IS a PaymentIntent. It is not the only such field. An
+//! `invoice.paid` payload carries `hosted_invoice_url`, which
+//! <https://docs.stripe.com/api/invoices/object> describes as the page "which
+//! allows customers to view and pay an invoice"; `charge.refunded` carries
+//! `receipt_url`; a Checkout Session carries `client_secret` whenever its
+//! `ui_mode` is `embedded_page` or `elements`. This block sends
+//! `ui_mode=embedded` (the legacy spelling, in `stripe.rs`) and
+//! `stripe::handle_offer_checkout` reads `client_secret` straight off the
+//! session response — so the sessions it creates are exactly the kind that
+//! carry one.
+//!
+//! Stated as plainly as the negative deserves: **nothing in Stripe's
+//! documentation says any field is stripped, redacted or nulled in a webhook
+//! payload relative to the API response.** The absence of such a promise is
+//! not itself the finding — the populated `client_secret` in Stripe's own
+//! example is — but it is why "Stripe surely removes it" is not available as
+//! an answer.
+//!
+//! The cost is small and was checked: the explorer was not the surface for
+//! reading these rows. `GET /b/products/api/admin/webhook-events` already
+//! serves them through `WebhookEventSummary`, which omits `payload_base64`
+//! and `processing_owner` by construction, and the Stripe setup page
+//! (`/b/products/admin/stripe`) renders that list with a status filter and a
+//! per-delivery replay. `blocks::products::stripe` is the only module that
+//! reads or writes rows here; the one other mention, in
+//! `blocks::dev::data_snapshot`, is a closed-list membership check that
+//! issues no query.
 //!
 //! Each entry names its table through the constant its owning repo module
 //! declares, so a table that is ever renamed cannot drift out of this list
-//! silently. The two whose owning module is behind a block feature
-//! (`cloud_shares`, `purchases`) are the exception and are named as literals —
+//! silently. The three whose owning module is behind a block feature
+//! (`cloud_shares`, `purchases`, `stripe_events`) are the exception and are
+//! named as literals —
 //! see the comment on [`CLOUD_SHARES_TABLE`] for why a `#[cfg]` would have
 //! been the wrong answer, and for the tests that pin the literals to those
 //! constants.
@@ -127,7 +197,7 @@ use crate::{
     platform_state::variables,
 };
 
-// The two tables whose owning module lives behind a block feature, named as
+// The three tables whose owning module lives behind a block feature, named as
 // literals rather than through their constants.
 //
 // A `#[cfg]` on the entries themselves would make the refusal a property of
@@ -140,13 +210,14 @@ use crate::{
 // else's D1.
 //
 // So the literal is the price of naming a table a build may not compile. It
-// is pinned to the door's own constant by the two tests at the bottom of this
-// file, which run in every build that HAS the module — so the anti-drift
+// is pinned to the door's own constant by the three tests at the bottom of
+// this file, which run in every build that HAS the module — so the anti-drift
 // property the constant gives every other entry is kept, enforced by a test
 // instead of by the type system. `tests/repo_door.rs` carries the matching
 // `LITERAL_ALLOWED` entries with the same reason.
 const CLOUD_SHARES_TABLE: &str = "impresspress__files__cloud_shares";
 const PRODUCTS_PURCHASES_TABLE: &str = "impresspress__products__purchases";
+const PRODUCTS_STRIPE_EVENTS_TABLE: &str = "impresspress__products__stripe_events";
 
 /// One table the SQL explorer refuses, with the columns that put it here and
 /// the admin surface that serves the same need safely.
@@ -254,6 +325,15 @@ pub const SECRET_TABLES: &[SecretTable] = &[
         columns: &["receipt_token_hash"],
         instead: "Use the seller orders page (/b/products/selling/orders) for order state.",
     },
+    // `payload_base64` is the verbatim body of every webhook Stripe posted.
+    // Stripe renders `data.object` as the whole object, secrets included —
+    // the reasoning and the citations are in the module docs above.
+    SecretTable {
+        table: PRODUCTS_STRIPE_EVENTS_TABLE,
+        columns: &["payload_base64"],
+        instead: "Use the Stripe setup page (/b/products/admin/stripe), whose webhook panel \
+                  lists and replays deliveries without their payloads.",
+    },
 ];
 
 impl SecretTable {
@@ -343,13 +423,22 @@ mod tests {
         );
     }
 
-    /// The same pin for the products door.
+    /// The same pin for the products doors.
     #[cfg(feature = "block-products")]
     #[test]
     fn the_purchases_literal_matches_its_door_constant() {
         assert_eq!(
             PRODUCTS_PURCHASES_TABLE,
             crate::blocks::products::PURCHASES_TABLE
+        );
+    }
+
+    #[cfg(feature = "block-products")]
+    #[test]
+    fn the_stripe_events_literal_matches_its_door_constant() {
+        assert_eq!(
+            PRODUCTS_STRIPE_EVENTS_TABLE,
+            crate::blocks::products::STRIPE_EVENTS_TABLE
         );
     }
 

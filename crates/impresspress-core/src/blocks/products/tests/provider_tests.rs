@@ -1275,23 +1275,31 @@ async fn reset_operation_to_pending(ctx: &crate::test_support::TestContext, id: 
     .unwrap();
 }
 
-/// `response_json` is the raw provider response: a JSON-object column written
-/// as `serde_json::json!({..}).to_string()` and declared `TEXT NOT NULL
-/// DEFAULT '{}'`. Native SQLite and the browser re-parse a JSON-shaped TEXT
-/// column on read, so it arrives as a `Value::Object` — for which `str_field`,
-/// having no structured arm, answers `""`. Every reader that carries the
-/// payload from the refund ledger onto the provider-operation row therefore
-/// persisted an empty string, silently discarding the raw Stripe response from
-/// a payments audit trail. Nothing reads it back, so nothing failed loudly.
+/// `response_json` is this repo's own summary of a provider response — never
+/// a Stripe body; see the note on `provider_operations` in
+/// `impresspress_core::secret_tables` for why that distinction is load-
+/// bearing. It is a JSON-object column written as
+/// `serde_json::json!({..}).to_string()` and declared `TEXT NOT NULL DEFAULT
+/// '{}'`. Native SQLite and the browser re-parse a JSON-shaped TEXT column on
+/// read, so it arrives as a `Value::Object` — for which `str_field`, having no
+/// structured arm, answers `""`. Every reader that carries the summary from
+/// the refund ledger onto the provider-operation row therefore persisted an
+/// empty string, silently dropping the refund's provider outcome from a
+/// payments audit trail. Nothing reads it back, so nothing failed loudly.
 ///
-/// The three carrying reads are exercised here in the order a real refund
-/// meets them: the reconcile worker settling a pending refund
+/// Four call sites carry that summary from the refund ledger onto the
+/// provider-operation row. Three are exercised here, in the order a real
+/// refund meets them: the reconcile worker settling a pending refund
 /// (`stripe_provider::reconcile_refund_operation` → `mark_completed`), a
 /// second reconcile of an already-settled ledger row (its early return), and
 /// a retried delivery of the original refund request
 /// (`purchase::refund_purchase`'s `Succeeded` arm → `resolve_unleased`).
+///
+/// The fourth is `refund_purchase`'s `ProviderSucceeded` arm, which reads the
+/// same column through the same `resolve_unleased` and so shares the fix, but
+/// is reached only from a ledger state this test does not stage.
 #[tokio::test]
-async fn refund_reconciliation_keeps_the_raw_provider_response() {
+async fn refund_reconciliation_keeps_the_provider_response_summary() {
     let mut ctx = ctx_with(&[(
         "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
         "sk_test_refunds",

@@ -286,6 +286,94 @@ async fn every_registered_secret_table_is_refused() {
     }
 }
 
+/// The `client_secret` inside [`STRIPE_EVENT_BODY`]. Distinctive enough that
+/// a substring check over a whole response body is meaningful, and not
+/// invented: it is the value Stripe's own Event reference prints.
+#[cfg(feature = "block-products")]
+const STRIPE_CLIENT_SECRET: &str =
+    "seti_1NG8Du2eZvKYlo2C9XMqbR0x_secret_O2CdhLwGFh2Aej7bCY7qp8jlIuyR8DJ";
+
+/// A Stripe webhook body, trimmed to the fields that matter here.
+///
+/// The `client_secret` is not a fixture invention: `data.object` is copied
+/// from the `setup_intent.created` example Event that Stripe's own reference
+/// prints at <https://docs.stripe.com/api/events/object>, which carries a
+/// populated secret. See the module docs on `secret_tables` for why that
+/// example is the evidence this table is refused.
+#[cfg(feature = "block-products")]
+const STRIPE_EVENT_BODY: &str = concat!(
+    r#"{"id":"evt_1NG8Du2eZvKYlo2CUI79vXWy","object":"event","#,
+    r#""type":"setup_intent.created","livemode":false,"data":{"object":{"#,
+    r#""id":"seti_1NG8Du2eZvKYlo2C9XMqbR0x","object":"setup_intent","#,
+    r#""client_secret":"seti_1NG8Du2eZvKYlo2C9XMqbR0x_secret_O2CdhLwGFh2Aej7bCY7qp8jlIuyR8DJ""#,
+    r#"}}}"#,
+);
+
+/// A stored Stripe webhook body can carry a credential of Stripe's own, so
+/// the explorer must refuse the table that holds it.
+///
+/// The row is staged the way `stripe::record_event` stages one — base64 of
+/// the verbatim bytes Stripe posted — and the fixture asserts the secret
+/// really decodes out of the stored column before testing the refusal, so a
+/// pass cannot come from having staged nothing.
+#[cfg(feature = "block-products")]
+#[tokio::test]
+async fn a_stored_stripe_webhook_body_is_not_served_by_the_explorer() {
+    use base64ct::{Base64, Encoding};
+
+    let mut ctx = TestContext::with_products().await;
+    ctx.register_block("impresspress/admin", std::sync::Arc::new(AdminBlock::new()));
+
+    let mut row: HashMap<String, serde_json::Value> = HashMap::new();
+    row.insert("id".into(), json!("evt_1NG8Du2eZvKYlo2CUI79vXWy"));
+    row.insert("event_type".into(), json!("setup_intent.created"));
+    row.insert("status".into(), json!("processed"));
+    row.insert(
+        "payload_base64".into(),
+        json!(Base64::encode_string(STRIPE_EVENT_BODY.as_bytes())),
+    );
+    row.insert("created_at".into(), json!("2026-01-01T00:00:00Z"));
+    db::create(&ctx, "impresspress__products__stripe_events", row)
+        .await
+        .expect("stage a stripe_events row");
+
+    let rows = db::query_raw(
+        &ctx,
+        "SELECT payload_base64 FROM impresspress__products__stripe_events",
+        &[],
+    )
+    .await
+    .expect("read back the staged row");
+    let stored = rows
+        .first()
+        .and_then(|r| r.data.get("payload_base64"))
+        .and_then(|v| v.as_str())
+        .expect("the staged row has a payload_base64");
+    let decoded = String::from_utf8(Base64::decode_vec(stored).expect("stored value is base64"))
+        .expect("the decoded body is utf-8");
+    assert!(
+        decoded.contains(STRIPE_CLIENT_SECRET),
+        "the fixture did not put a Stripe credential in the column under test: {decoded}"
+    );
+
+    // The same evasion shapes the config store is tested against: a result-set
+    // mask has nothing to key on, so the refusal has to come before the query
+    // runs.
+    for query in [
+        "SELECT * FROM impresspress__products__stripe_events",
+        "SELECT payload_base64 AS v FROM impresspress__products__stripe_events",
+        "SELECT substr(payload_base64, 1, 40) FROM impresspress__products__stripe_events",
+        "WITH e AS (SELECT * FROM impresspress__products__stripe_events) SELECT * FROM e",
+    ] {
+        let (status, body) = run_json(&ctx, query).await;
+        assert_eq!(status, 403, "{query} was answered\nbody: {body}");
+        assert!(
+            !body.contains(STRIPE_CLIENT_SECRET) && !body.contains(stored),
+            "{query}: the response carried the stored webhook body: {body}"
+        );
+    }
+}
+
 /// Postgres can spell an identifier without its own characters appearing in
 /// the statement, which is the one hole in a substring test. The explorer
 /// refuses the syntax outright rather than leaving it open.
@@ -359,10 +447,10 @@ async fn ordinary_tables_are_still_queryable() {
 /// The scan below is deliberately over-broad: it matches on the naming
 /// convention alone, so every digest column in the schema lands in front of it.
 /// That is the point — a new `*_hash`, `*token*`, `*secret*`, `*password*` or
-/// `*verifier*` column, or a new table carrying a `sensitive` flag, has to be
-/// classified by a person. Adding a row here is how you record "looked at it,
-/// it is not a credential"; the alternative is
-/// `impresspress_core::secret_tables::SECRET_TABLES`.
+/// `*verifier*` column, a new `*payload*`, `*body*` or `*raw*` column, or a
+/// new table carrying a `sensitive` flag, has to be classified by a person.
+/// Adding a row here is how you record "looked at it, it is not a credential";
+/// the alternative is `impresspress_core::secret_tables::SECRET_TABLES`.
 const CLEARED_COLUMNS: &[(&str, &str, &str)] = &[
     (
         "impresspress__admin__block_settings",
@@ -393,6 +481,13 @@ const CLEARED_COLUMNS: &[(&str, &str, &str)] = &[
         "impresspress__tickets__tickets",
         "dedupe_hash",
         "digest of an inbound message, for idempotency",
+    ),
+    (
+        "impresspress__tickets__events",
+        "body",
+        "one ticket message's prose. A submitter does compose it, but it is \
+         text this block stores and serves back itself, not a structured \
+         document from another system with fields of its own",
     ),
 ];
 
@@ -601,8 +696,10 @@ fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
         .then(|| line[keyword.len()..].trim_start())
 }
 
-/// `(table, column)` for every column whose name matches the credential
-/// convention, plus every column of a table that carries a `sensitive` flag.
+/// `(table, column)` for every column a person has to classify: one whose
+/// name matches the credential convention, one whose name says it stores a
+/// document composed elsewhere, plus every column of a table that carries a
+/// `sensitive` flag.
 ///
 /// The `sensitive` clause is what catches
 /// `impresspress__admin__variables.value`, whose name says nothing: a
@@ -610,13 +707,13 @@ fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
 /// may hold a secret. That is the same column `cache_key::row_is_sensitive`
 /// reads (paired with `key` by `sensitive_check_columns`) to keep secrets out
 /// of the KV cache.
-fn credential_shaped_columns() -> BTreeSet<(String, String)> {
+fn columns_needing_classification() -> BTreeSet<(String, String)> {
     let schema = migration_schema();
     let mut out = BTreeSet::new();
     for (table, columns) in &schema {
         let flagged = columns.iter().any(|c| c.eq_ignore_ascii_case("sensitive"));
         for column in columns {
-            if flagged || looks_like_a_credential(column) {
+            if flagged || looks_like_a_credential(column) || looks_like_a_foreign_document(column) {
                 out.insert((table.clone(), column.clone()));
             }
         }
@@ -649,15 +746,51 @@ fn looks_like_a_credential(column: &str) -> bool {
         || c.ends_with("_hash")
 }
 
+/// The second convention: a column named `*payload*`, `*body*` or `*raw*`.
+///
+/// `payload` and `body` are the words this schema uses today when a column
+/// holds a document rather than a field; `raw` matches nothing yet and is
+/// here because it is the third word someone would reach for.
+///
+/// `impresspress__products__stripe_events.payload_base64` is why this exists.
+/// It matches nothing in [`looks_like_a_credential`] — no name convention
+/// could, because what makes it refusable is not the column's name but the
+/// fact that a third party chooses its contents, and Stripe puts a
+/// `client_secret` in them. A name scan cannot judge that; what it can do is
+/// refuse to let such a column pass unlooked-at, which is the same job the
+/// credential scan does one row above.
+///
+/// These three needles, and not a general "foreign document" test: a column
+/// spelled `*_manifest_json` or `*_info_json` would hold a document and would
+/// not be caught. The four that exist today are each a serialisation of a
+/// local typed struct, so nothing is uncovered now —
+/// `impresspress__dev__generations.site_manifest_json` and
+/// `block_manifest_json` are `generation::canonical_text` of the staged
+/// manifest, and `impresspress__dev__builds.block_info_json` and
+/// `diagnostics_json` are `serde_json::to_string` of a `BlockInfo` and of the
+/// compiler diagnostics. Widen the needles rather than trusting this note if
+/// a column ever holds a document someone else composed.
+///
+/// Over-broad on purpose, and cheaply so: across every migration in the tree
+/// it selects three columns in two tables — `payload_base64` and
+/// `payload_sha256`, both on the refused `stripe_events`, and
+/// `impresspress__tickets__events.body`, cleared above.
+fn looks_like_a_foreign_document(column: &str) -> bool {
+    let c = column.to_ascii_lowercase();
+    ["payload", "body", "raw"]
+        .iter()
+        .any(|needle| c.contains(needle))
+}
+
 #[test]
-fn every_credential_shaped_column_is_either_refused_or_cleared() {
+fn every_column_needing_classification_is_refused_or_cleared() {
     let refused: BTreeSet<&str> = SECRET_TABLES.iter().map(|e| e.table).collect();
     let cleared: BTreeSet<(&str, &str)> = CLEARED_COLUMNS
         .iter()
         .map(|(table, column, _why)| (*table, *column))
         .collect();
 
-    let unclassified: Vec<(String, String)> = credential_shaped_columns()
+    let unclassified: Vec<(String, String)> = columns_needing_classification()
         .into_iter()
         .filter(|(table, column)| {
             !refused.contains(table.as_str())
@@ -667,7 +800,7 @@ fn every_credential_shaped_column_is_either_refused_or_cleared() {
 
     assert!(
         unclassified.is_empty(),
-        "credential-shaped columns nobody has classified: {unclassified:?} — either add the \
+        "columns nobody has classified: {unclassified:?} — either add the \
          table to `secret_tables::SECRET_TABLES` or record in CLEARED_COLUMNS why its contents \
          are not a credential"
     );
@@ -678,13 +811,15 @@ fn every_credential_shaped_column_is_either_refused_or_cleared() {
 /// going stale is how a boundary quietly stops covering what it names.
 #[test]
 fn the_registry_and_the_clearances_still_describe_the_schema() {
-    let shaped = credential_shaped_columns();
+    let shaped = columns_needing_classification();
     for entry in SECRET_TABLES {
         for column in entry.columns {
             assert!(
                 shaped.contains(&(entry.table.to_string(), (*column).to_string())),
-                "{}.{column} is registered as credential-bearing but the migrations no longer \
-                 declare it",
+                "{}.{column} is registered in SECRET_TABLES but the scan does not select it. \
+                 Either the migrations no longer declare the column, or its name matches \
+                 neither `looks_like_a_credential` nor `looks_like_a_foreign_document` — check \
+                 which before assuming the schema changed",
                 entry.table
             );
         }
@@ -719,12 +854,6 @@ fn deliberately_readable_tables_stay_readable() {
             "impresspress__products__provider_operations",
             "request_json is the literal {\"version\":1} and response_json a \
              summary this repo builds; no provider body reaches either",
-        ),
-        (
-            "impresspress__products__stripe_events",
-            "raw third-party webhook bodies: PII and Stripe ids, but nothing \
-             that authenticates anyone to this deployment - see the open \
-             question recorded in NICE_TO_HAVE.md",
         ),
         (
             "impresspress__admin__block_settings",
