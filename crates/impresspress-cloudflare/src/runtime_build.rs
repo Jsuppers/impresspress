@@ -238,10 +238,11 @@ where
     })?;
 
     // 2. Load block settings (enablement + migration state) eagerly —
-    //    this is the only D1 read at cold start now. The per-block
+    //    the only database read this build issues itself. The per-block
     //    env-config pre-load is gone; D1ConfigSource resolves declared
-    //    config keys lazily on first block init via an indexed lookup
-    //    on `variables.block`. block_settings still needs an eager load
+    //    config keys later, on first init of a block that declares any,
+    //    from ONE unfiltered read of the whole variables table grouped by
+    //    `block` in memory. block_settings still needs an eager load
     //    because the ImpresspressRouter consumes the enablement map up front
     //    when wiring routes (it can't defer to a per-block init event).
     // A read error here is a genuine operational failure (D1 outage,
@@ -307,7 +308,8 @@ where
         (request_services::config_proxy(), concrete)
     });
 
-    // 5. ConfigSource: D1-backed lazy per-block fetch. The overlay layers
+    // 5. ConfigSource: D1-backed, resolving each block against one lazily
+    //    fetched unfiltered snapshot of the variables table. The overlay layers
     //    worker::Env secrets (PROTECTED_ENV_KEYS) on top of D1 rows so
     //    secrets never need to be mirrored into the variables table.
     // `ConfigSource` only requires `MaybeSend + MaybeSync` (real
@@ -834,8 +836,8 @@ mod tests {
             config.service_only_keys().is_empty(),
             "no structural key diverges",
         );
-        // Secrets are also layered over the D1 `variables` rows the per-block
-        // `ConfigSource` resolves; worker vars are builder-time middleware
+        // Secrets are also layered over the D1 `variables` rows the
+        // `ConfigSource` resolves against; worker vars are builder-time middleware
         // input and deliberately are not.
         assert_eq!(
             overlay
