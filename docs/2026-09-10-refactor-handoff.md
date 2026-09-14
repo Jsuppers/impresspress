@@ -7,10 +7,15 @@
 > **Update (2026-09-14)** block saying what happened and where the answer now
 > lives. Nothing has been quietly rewritten to look right in hindsight — where a
 > claim is dead it says so, and where a recommendation was *not* taken it says
-> that too. Three sections needed no change: **What merged** (a record of what
-> had merged by that date), **What is not proven**, and **The process that
-> worked**. Every claim added on 2026-09-14 was re-checked against the tree
-> before it was written down.
+> that too. **What merged** (a record of what had merged by that date) and
+> **What is not proven** needed no change. **Resuming the work** was updated only
+> in its opening paragraph; its two subsections, **The process that worked** and
+> **Verification before any merge**, still hold as written.
+>
+> Every claim added on 2026-09-14 was checked against the tree before it was
+> written down. That is not a guarantee it is right: the first review of this
+> update found a citation pointing at a plausible-looking neighbour of the code
+> it named. Open the file at the line before relying on one.
 >
 > The rendered artifact linked below is the original and has not been
 > re-rendered.
@@ -90,10 +95,11 @@ Upstream `wafer-run` also took #328, #330, #331, #332 during phase 4.
 > - `crates/impresspress-core/src/config_generation.rs:1-26` — the
 >   isolate-local write counter the cache invalidation rides on, why a build that
 >   seeds nothing never bumps it, and why it is a `Cell` and never a `RefCell`.
-> - `crates/impresspress-core/src/platform_state/variables.rs:390-600` — the
->   env-precedence contract: an env value seeds a key, an admin edit then wins
->   permanently, and a one-time upgrade transition pins rows that predate edit
->   tracking.
+> - `crates/impresspress-core/src/platform_state/variables.rs:967` — the
+>   env-precedence contract itself, "Exactly what the transition promises",
+>   inside `seed_and_load`'s doc-comment: an env value seeds a key, an admin edit
+>   then wins permanently, and a one-time upgrade transition pins rows that
+>   predate edit tracking. The ownership rules it rests on are at `:390-600`.
 > - `crates/impresspress-cloudflare/src/config_service.rs:25-38` — why
 >   `HashMapConfigService::set` stays a silent no-op now that nothing in the tree
 >   calls it.
@@ -179,23 +185,27 @@ documented contract for Init config on every target.
 >    carry things the table cannot: worker and env bindings, the builder-time
 >    CORS, CSP and `STRICT_SCHEMA` values, and the synthetic block-settings JSON.
 >    What changed is that it stopped being a *copy* of the table and became a
->    *boot map* consulted after it. `cli/server.rs:234-278` now seeds exactly the
->    keys something must read synchronously — the JWT secret, CORS origins, CSP
->    directives — plus the block-settings JSON and the `HAS_PROCESS_ENV` marker,
->    with the migration and strict-schema keys when they are set. Its own comment
+>    *boot map* consulted after it. `crates/impresspress/src/cli/server.rs:234-293`
+>    now seeds exactly the keys something must read synchronously — the JWT
+>    secret, CORS origins, CSP directives — plus the block-settings JSON and the
+>    `HAS_PROCESS_ENV` marker (`:282`), with `RUN_MIGRATIONS` (`:286`) and
+>    `STRICT_SCHEMA` (`:290`) when they are set. Its own comment
 >    is the reasoning: "Copying the whole table here is what step 1 made
 >    redundant — and worse than redundant: every admin-editable key sitting on a
 >    boot-frozen surface is a stale read waiting for its first caller."
 >    `RuntimeConfig::extend_both` was left in the tree and is now dead API:
->    `builder/config.rs:77` defines it and `builder/config.rs:267` is its only
->    caller, its own unit test.
-> 4. **Shipped.** No production `ctx.config_get` reads branding any more. The
->    sync surface now carries only the JWT secret (`csrf.rs:181`,
+>    `builder/config.rs:77` defines it and the only call is at
+>    `builder/config.rs:269`, inside its own unit test.
+> 4. **Shipped.** No production `ctx.config_get` reads branding any more. What
+>    the sync surface still carries is the JWT secret (`csrf.rs:181`,
 >    `auth/service.rs:185`), the block-settings JSON (`admin/settings.rs:368`,
 >    `routing.rs:581`, `migration_helper.rs:299`, `tickets/config.rs:137`), the
->    signal block's own Init keys (`signal/rest.rs:38`, `:44`, `:68`) and the
->    migration gate (`migration_helper.rs:180`) — each of which is a key the boot
->    map, not the table, is supposed to own.
+>    signal block's own Init keys (`signal/rest.rs:38`, `:44`, `:68`), the
+>    migration gate (`migration_helper.rs:180`), and one probe that is not a
+>    config read at all — `admin/pages/variables.rs:1200` asks whether an
+>    arbitrary key is present in the boot map to choose which toast the Variables
+>    page shows after a delete. Each is a key the boot map, not the table, is
+>    supposed to own.
 
 ### Deliberately not doing
 
@@ -319,8 +329,12 @@ skew error metrics.
 > `InvalidArgument`/`FailedPrecondition` to 400 and everything else to
 > `crud::db_error`, so a caller naming a backend that does not exist gets a 404
 > under *our* label rather than the runtime's (#67). userportal button delete
-> answers `err_not_found("Button not found")`
-> (`userportal/pages/admin_buttons.rs:253`). Both public Stripe endpoints answer
+> (`handle_delete_button`, `userportal/pages/admin_buttons.rs:334`) sends the
+> failed `db::delete` through the same classifier —
+> `crud::db_error(e, "Button not found", "Failed to delete button")` at `:339` —
+> because `DbExec::delete` answers `NotFound` when no row matched, so a stale id
+> in the caller's own page is their 404 rather than this site reporting a fault
+> and inviting a retry. Both public Stripe endpoints answer
 > a real 503 through a dedicated `err_unavailable` constructor
 > (`impresspress-core/src/http.rs:43-63`, called at `products/stripe.rs:543` and
 > `:546`), whose doc-comment names the 2026-09-10 live run as the reason it
@@ -367,8 +381,10 @@ grant. Fail-closed, but unguarded.
 > ops explicitly and classifies everything else, "including any op added upstream
 > after this was written", as a write (`:146`), which is the fail-closed answer —
 > it demands the stricter grant rather than admitting a mutation under a read
-> grant. Tests at `:590` and `:778`, with a negative control at `:789` so the
-> enumeration test at `:740` cannot pass by the fallthrough having been deleted.
+> grant. Its tests are `:590` and `:778`. (The shim's *other* fallthrough — the
+> op dispatch in `rewrite_request_body` that #61 enumerated — is separately
+> covered at `:740`, with a negative control at `:789`. Two different matches;
+> do not read the second pair as evidence about the first.)
 >
 > The gap itself survives, and it is the one named in the first sentence:
 > **nothing compares a block's declared `requires` against the
@@ -420,6 +436,13 @@ The working checkout is a git worktree, detached at the last merge:
 ```
 /home/joris/Programs/suppers-ai/impresspress-worktrees/phase0
 ```
+
+> **Update (2026-09-14).** That worktree is no longer detached: it holds the
+> branch `docs/refactor-handoff`, which is 86 commits behind `origin/main`
+> because it was branched from `7f731605` and everything in this update landed
+> after it. Check what is checked out before assuming the path tracks `main`.
+> The two subsections below are unchanged and still describe how the work was
+> done.
 
 `origin` is the fork `Jsuppers/impresspress`. The organisation repo
 `impresspress/impresspress` is frozen as a hackathon submission and its push URL
