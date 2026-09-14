@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Fail when a tracked file outside the documentation tree cites a
+# repo-relative documentation path that does not resolve in this repo.
+#
+# The invariant: a repo-relative path written in a source comment must name a
+# file that exists here. A document that lives in another repository must not
+# be cited with a path that looks in-repo — inline the substance instead, or
+# name the external source unambiguously. A pointer to nothing is worse than
+# no pointer: it reads as "the answer is written down over there" when it is
+# not written down anywhere.
+#
+# What counts as a citation: the literal directory name below, followed by a
+# slash and a path, where the character before it is not alphanumeric, `/` or
+# `.`. That preceding-character rule is what keeps URLs and longer paths out
+# (`https://developer.mozilla.org/en-US/<dir>/Web/HTTP/...`, `/b/vector/api/<dir>/a`)
+# without an allow-list of files.
+#
+# A citation resolves if the path exists as written, or with `.md` appended.
+# A citation that ends the line with `-` is a path wrapped across two comment
+# lines: it can never be verified by grep or followed by a reader, so it fails
+# with its own message.
+#
+# Run from anywhere in the working tree.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# The directory whose contents this guard resolves citations against. Spelled
+# once, via a variable, so this script's own text contains no citation for it
+# to find.
+ROOT_DIR="docs"
+
+mapfile -t candidates < <(git grep -I -l -e "${ROOT_DIR}/" -- ":!${ROOT_DIR}/" || true)
+
+if [ "${#candidates[@]}" -eq 0 ]; then
+  echo "check-doc-pointers: no citations found."
+  exit 0
+fi
+
+# Emit one `status<TAB>file<TAB>line<TAB>path` record per citation.
+# status is WRAPPED for a citation broken across lines, else CHECK.
+records=$(
+  awk -v dir="$ROOT_DIR" '
+    BEGIN {
+      # Preceding char must not be alphanumeric, "/" or "." — plus start-of-line.
+      re = "(^|[^A-Za-z0-9/.])" dir "/[A-Za-z0-9_./-]+"
+    }
+    {
+      line = $0
+      rest = line
+      consumed = 0
+      while (match(rest, re)) {
+        tok = substr(rest, RSTART, RLENGTH)
+        endpos = consumed + RSTART + RLENGTH - 1
+        consumed += RSTART + RLENGTH - 1
+        rest = substr(rest, RSTART + RLENGTH)
+        # Drop the preceding separator the pattern had to consume.
+        if (substr(tok, 1, 1) != substr(dir, 1, 1)) tok = substr(tok, 2)
+        if (tok ~ /-$/ && endpos == length(line)) {
+          printf "WRAPPED\t%s\t%d\t%s\n", FILENAME, FNR, tok
+          continue
+        }
+        # Trailing sentence punctuation is not part of the path.
+        sub(/[.-]+$/, "", tok)
+        printf "CHECK\t%s\t%d\t%s\n", FILENAME, FNR, tok
+      }
+    }
+  ' "${candidates[@]}"
+)
+
+failures=0
+checked=0
+
+while IFS=$'\t' read -r status file line path; do
+  [ -n "${status:-}" ] || continue
+  checked=$((checked + 1))
+  if [ "$status" = "WRAPPED" ]; then
+    failures=$((failures + 1))
+    printf '%s:%s: wrapped path — "%s" is broken across comment lines.\n' \
+      "$file" "$line" "$path"
+    printf '    A path split over two lines cannot be verified or followed. Keep it on one line.\n'
+    continue
+  fi
+  if [ -e "$path" ] || [ -e "$path.md" ]; then
+    continue
+  fi
+  failures=$((failures + 1))
+  printf '%s:%s: dangling path — "%s" does not exist in this repository.\n' \
+    "$file" "$line" "$path"
+  printf '    Inline what the document said, or name the external source without an in-repo path.\n'
+done <<< "$records"
+
+if [ "$failures" -gt 0 ]; then
+  echo
+  echo "check-doc-pointers: $failures unresolvable citation(s) out of $checked checked."
+  exit 1
+fi
+
+echo "check-doc-pointers: $checked citation(s), all resolve."

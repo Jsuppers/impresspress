@@ -60,8 +60,6 @@ pub(crate) fn make_d1_database_service_concrete(
 ///
 /// Fails fast if the KV binding is missing — silent degradation would
 /// mask a config-drift outage.
-///
-/// Spec: `docs/superpowers/specs/2026-05-22-kv-cached-d1-config-source-design.md`.
 pub fn make_kv_cached_database_service(
     env: &worker::Env,
     d1_binding: &str,

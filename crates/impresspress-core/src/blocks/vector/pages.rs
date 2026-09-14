@@ -1464,9 +1464,9 @@ mod backend_availability_tests {
     }
 
     /// `TestContext::with_vector()` on its own — no `wafer-run/vector` block
-    /// registered — is exactly the default native-server configuration
-    /// (`docs/checks/...` bug report: native impresspress ships no
-    /// `wafer-run/vector` backend). Before this fix, `list_indexes` blindly
+    /// registered — is exactly the default native-server configuration: native
+    /// impresspress ships no `wafer-run/vector` backend. That is the shape a
+    /// live bug report hit. Before this fix, `list_indexes` blindly
     /// propagated the backend's `NotFound: block 'wafer-run/vector' not
     /// found` through `err_internal`, which is what surfaced as the live
     /// 500 `GET /b/vector/api/indexes` returned.
