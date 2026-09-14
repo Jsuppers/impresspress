@@ -1,9 +1,24 @@
 //! D1ConfigSource — Cloudflare target's [`ConfigSource`] impl.
 //!
 //! Reads block-declared env-var config keys from the admin block's
-//! `impresspress__admin__variables` D1 table. Filters by the new `block`
-//! column (added by migration 002) for an indexed per-block lookup — no
-//! full-table scan, no `LIKE prefix%` scan.
+//! `impresspress__admin__variables` D1 table.
+//!
+//! ONE unfiltered read of the whole table serves every block. The `snapshot`
+//! method lists the table with no filter, groups the rows by the `block`
+//! column IN MEMORY, and memoizes that grouping against the config-write
+//! generation it was read at; `fetch_block_variables` is then a map lookup,
+//! not a query.
+//!
+//! The `block` column (added by migration 002, which also indexed it) is NOT
+//! obsolete — it is still exactly what the grouping keys on, and a row
+//! without it belongs to no block's config. Only the QUERY STRATEGY changed:
+//! this source used to issue one filtered `WHERE block = ?` lookup per
+//! registered block (the column existed so that lookup could be an indexed
+//! equality rather than a `LIKE prefix%` match on `key`), and that was one
+//! KV-cached read per block on every cold hydration. Neither filtered shape
+//! is issued here now. The `snapshot` FIELD records the measurement
+//! behind that trade; the `snapshot` METHOD records why the unfiltered shape
+//! is deliberately not cacheable.
 //!
 //! Optionally layers an in-memory overlay (e.g. `worker::Env` secrets such
 //! as `WAFER_RUN__AUTH__JWT_SECRET`) on top of the D1 rows. Overlay values
@@ -212,7 +227,7 @@ impl D1ConfigSource {
         // that by re-reading on every call; caching the emptiness instead
         // would leave every block on defaults for the rest of the boot.
         //
-        // An genuinely empty TABLE is not this case and is safely cached:
+        // A genuinely empty TABLE is not this case and is safely cached:
         // seeding it goes through `create`, which does record a write.
         if snapshot.is_empty() && returned_rows > 0 {
             tracing::warn!(

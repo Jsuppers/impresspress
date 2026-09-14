@@ -1,5 +1,7 @@
 //! `KvCachedD1DatabaseService` — wraps a `DatabaseService` with a
-//! Cloudflare KV cache for the per-block config-var hot path.
+//! Cloudflare KV cache for the config-state read shapes
+//! `impresspress_core::cache_key::read_key` recognizes on the `variables`
+//! and `block_settings` tables.
 //!
 //! See `docs/superpowers/specs/2026-05-22-kv-cached-d1-config-source-design.md`.
 //!
@@ -98,7 +100,8 @@ impl Default for CacheMode {
 }
 
 /// Wraps a [`DatabaseService`] with a write-through-invalidated KV cache
-/// for the `variables` and `block_settings` per-block read paths.
+/// for the `variables` and `block_settings` read shapes
+/// [`cache_key::read_key`] recognizes.
 pub struct KvCachedD1DatabaseService {
     inner: Arc<dyn DatabaseService>,
     kv: Arc<dyn KvBackend>,

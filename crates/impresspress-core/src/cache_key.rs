@@ -109,8 +109,8 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
 /// - `D1ConfigSource`'s single variables snapshot — deliberately NOT cached
 ///   (see `read_key`'s zero-filter arm, and the test that pins it). One
 ///   uncached D1 query replaces one KV read per configured block, which on a
-///   22-block deployment is 22 KV reads traded for a single indexed query
-///   against a table of a few dozen rows.
+///   22-block deployment is 22 KV reads traded for a single unfiltered read
+///   of a table of a few dozen rows.
 pub fn full_table_list_opts() -> ListOptions {
     ListOptions {
         filters: Vec::new(),
@@ -136,10 +136,14 @@ pub fn read_key(table: CachedTable, opts: &ListOptions) -> Option<String> {
         return None;
     }
     match opts.filters.len() {
-        // Full-table read. Only `block_settings` issues this (the eager
-        // `load_block_settings` list with no filter); cache it under the
-        // all-rows sentinel. Variables is always read per-block, so a
-        // filterless variables list is not a recognized shape.
+        // Full-table read. For `block_settings` (the eager
+        // `load_block_settings` list with no filter) cache it under the
+        // all-rows sentinel. For `variables` REFUSE it: the only filterless
+        // variables list is `D1ConfigSource`'s whole-table snapshot, and
+        // there is no invalidation story for a whole-table variables key —
+        // `invalidate_keys` emits the all-rows key for `block_settings`
+        // alone, so a variables write would leave such an entry stale until
+        // its TTL.
         0 => match table {
             CachedTable::BlockSettings => Some(format_key(table, ALL_ROWS_SENTINEL)),
             CachedTable::Variables => None,

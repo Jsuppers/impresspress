@@ -45,8 +45,15 @@ pub(crate) fn make_d1_database_service_concrete(
 }
 
 /// Construct a [`DatabaseService`] backed by D1 with a Cloudflare KV cache
-/// layered on top of the per-block read paths (`variables WHERE block=?`
-/// and `block_settings WHERE block_name=?`).
+/// layered on top of the read shapes
+/// `impresspress_core::cache_key::read_key` recognizes — in practice today,
+/// `block_settings`' eager full-table load.
+///
+/// The per-block `variables WHERE block=?` shape is still recognized, and
+/// variables writes still invalidate its key, but `D1ConfigSource` — the
+/// reader that shape was built for — now takes ONE unfiltered snapshot of
+/// the variables table instead, which `read_key` deliberately refuses to
+/// cache. See `cache_key::block_list_opts`.
 ///
 /// The KV binding name must match a `[[kv_namespaces]]` entry in the
 /// consumer's `wrangler.toml` (canonical name: `"CONFIG_CACHE"`).
