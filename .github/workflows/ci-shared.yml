@@ -104,8 +104,25 @@ jobs:
           name: impresspress-web-pkg
           path: crates/impresspress-web/pkg
 
+      # `-D warnings`, because without it this step only *printed* findings and
+      # passed. The two crate-scoped clippy steps (`Clippy (block-dev)` below
+      # and `Clippy (browser-devtools, wasm32)` in the `e2e-dev-sandbox` job)
+      # were the only enforcing ones, and no `RUSTFLAGS` supplies the flag
+      # anywhere in `.github/workflows/`, so every warning in every other crate
+      # printed and passed. The two that had accumulated behind it —
+      # `needless_range_loop` in `cli/helpers/cloudflare/deploy.rs` and
+      # `too_many_arguments` in the wrangler-config generator next to it — are
+      # fixed alongside this line.
+      #
+      # The two exclusions stay: `impresspress-cloudflare` is wasm32-only by
+      # construction (its R2/D1 services wrap `!Send` `JsFuture`s that cannot
+      # satisfy wafer-core's `Send`-bounded host traits, which is also why the
+      # workspace manifest keeps it out of `default-members`), and
+      # `impresspress-web` is a browser cdylib over `web-sys`. Each is linted
+      # for wasm32 by its own step instead — `impresspress-cloudflare` in the
+      # `cloudflare` job, `impresspress-web` in `e2e-dev-sandbox`.
       - name: Run clippy
-        run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare
+        run: cargo clippy --locked --workspace --exclude impresspress-web --exclude impresspress-cloudflare -- -D warnings
 
       # `impresspress`'s CLI (`deploy cloudflare`) silently stopped compiling
       # under `--no-default-features --features sqlite` (no `embed-assets`):
@@ -267,6 +284,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          # Named explicitly because this job now runs clippy, the same way
+          # the `check` job names it. `e2e-dev-sandbox` gets away without it
+          # only because the runner image happens to ship clippy with its
+          # preinstalled stable; that is the image's choice, not a guarantee
+          # this workflow should rest a gate on.
+          components: clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -283,25 +306,32 @@ jobs:
       # impresspress-cloudflare is wasm-only (cdylib targeting CF Workers).
       # Excluded from host `cargo test`/`clippy` because its R2/D1 services
       # wrap `!Send` JsFutures that violate wafer-core's Send-bound traits
-      # on host. Verify the crate compiles for wasm32 here. `--all-targets`
-      # so `#[cfg(test)]` code (e.g. static_asset_target_tests, including
-      # the path-traversal guard on asset serving) is at least compiled --
-      # plain `cargo check` skips test code entirely, so without this a
-      # test-only compile error would go undetected here. Actually
-      # *executing* wasm32 tests needs a wasm-bindgen-test-runner in CI,
-      # which this does not attempt -- follow-up.
-      - name: Check impresspress-cloudflare (wasm32)
-        run: cargo check --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --all-targets
-
-      # `--tests` is what pulls the crate's `#[wasm_bindgen_test]` modules into
-      # the type check — the plain check above does not compile `#[cfg(test)]`
-      # code at all, so a signature break in the runtime-cache / KV-cache
-      # regression tests sat invisible. Same reasoning (and same fix) as the
-      # `Check impresspress-browser conformance wiring` step below; kept
-      # separate from the `cloudflare-wasm-test` job so it runs unconditionally
-      # even when that job's pull-request-only diff gate skips it.
-      - name: Check impresspress-cloudflare tests (wasm32)
-        run: cargo check --locked --tests -p impresspress-cloudflare --target wasm32-unknown-unknown
+      # on host — which is why this, and not the `check` job, is the only
+      # place the crate is linted at all. `clippy` rather than `check`: the
+      # crate opts into `[workspace.lints.clippy]` like every other member, and
+      # under `cargo check` those opt-ins bought it nothing.
+      #
+      # `--all-targets` so `#[cfg(test)]` code (e.g. static_asset_target_tests,
+      # including the path-traversal guard on asset serving) is compiled and
+      # linted -- a plain check/clippy skips test code entirely, so without this
+      # a test-only compile error or lint would go undetected here. Actually
+      # *executing* wasm32 tests is the `cloudflare-wasm-test` job's business,
+      # which this does not attempt.
+      #
+      # Deliberately NOT `--no-deps`: impresspress-core is a workspace member,
+      # so leaving it in scope lints core under `cfg(target_arch = "wasm32")`
+      # for the feature set a Worker actually builds. (The `browser-devtools`
+      # clippy step in `e2e-dev-sandbox` covers core's wasm32 code under the
+      # browser's feature set; between them nothing in core's wasm32 half is
+      # compiled without lints.)
+      #
+      # Both shapes, because they are different code: `default = []` is the
+      # lean Worker with no optional block, `full` is the whole block set and
+      # what a block-carrying consumer actually deploys.
+      - name: Clippy impresspress-cloudflare (wasm32)
+        run: |
+          cargo clippy --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --all-targets -- -D warnings
+          cargo clippy --locked -p impresspress-cloudflare --features full --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       # Compile-time DatabaseService conformance assertions (wafer-run #319
       # shared suite) for the D1 + KV-cached adapters. Off-by-default feature so
@@ -318,11 +348,12 @@ jobs:
       # `block-llm`, so the second command covers the first; both are listed
       # because either can break on its own if that implication ever changes.
       #
-      # `--tests` for the same reason as the step above: a bare check compiles
-      # no `#[cfg(test)]` code at all, so without it this step would build the
-      # library under these two features and leave every wasm test in the crate
-      # untouched under them. The `cloudflare-wasm-test` job enables neither
-      # feature (and on the pull-request side its diff gate can skip it
+      # `--tests` because a bare check compiles no `#[cfg(test)]` code at all,
+      # so without it this step would build the library under these two
+      # features and leave every wasm test in the crate untouched under them.
+      # (The clippy step above reaches test code via `--all-targets`, but only
+      # under `default` and `full`.) The `cloudflare-wasm-test` job enables
+      # neither feature (and on the pull-request side its diff gate can skip it
       # outright), so this is the only place they meet test code.
       - name: Check impresspress-cloudflare optional blocks (wasm32)
         run: |
@@ -731,11 +762,20 @@ jobs:
           name: impresspress-web-pkg
           path: crates/impresspress-web/pkg
 
-      # The only `--features browser-devtools` gate in CI. `--no-deps` scopes it
-      # to this crate: the un-scoped command is red on six pre-existing
-      # impresspress-core warnings in other features' code.
+      # The only `--features browser-devtools` gate in CI.
+      #
+      # It used to carry `--no-deps` because the un-scoped command was red on
+      # six pre-existing impresspress-core warnings. Five were
+      # `arc_with_non_send_sync` on `Arc`s wafer-run's own API dictates, now
+      # stated once as a `cfg_attr(target_arch = "wasm32", ...)` allow in each
+      # affected crate's `lib.rs`; the sixth was a real wasm32-only defect in
+      # `blocks/dev/zip.rs` (a `usize` archive-size ceiling that equals
+      # `usize::MAX` on a 32-bit target, so it never refused anything there).
+      # With both addressed there is nothing left to scope out, and dropping
+      # the flag is what makes this the gate on impresspress-core's
+      # `browser-devtools` code under wasm32 — which nothing else compiles.
       - name: Clippy (browser-devtools, wasm32)
-        run: cargo clippy --locked -p impresspress-web --target wasm32-unknown-unknown --features browser-devtools --no-deps -- -D warnings
+        run: cargo clippy --locked -p impresspress-web --target wasm32-unknown-unknown --features browser-devtools -- -D warnings
 
       # Debug build, as `e2e-build` does: the CLI only assembles static files
       # here, so its runtime speed is irrelevant and a debug compile is cheaper.
