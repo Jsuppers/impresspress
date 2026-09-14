@@ -44,6 +44,16 @@ you want:
   applies from then on, with no further intervention.
 - *the stored one* — do nothing. The line stops once you remove the export.
 
+**If the answer is "the environment, for all of them".** The upgrade boot pins
+exactly the keys you had configured, so several keys is the ordinary case rather
+than the rare one. **Reset all keys pinned at upgrade**, at the top of Admin →
+Settings → Variables, releases every one of them in a single confirm, then one
+restart. It is scoped to the keys *that boot* pinned and cannot touch a key an
+admin edited in the UI — those stay, whether the edit was before the upgrade or
+after it. The button only appears while at least one such key is pinned, and only
+on a deployment that boots from a process environment, so on Cloudflare and in
+the browser it is never shown.
+
 After that boot the rule is simply: the environment sets a key until an admin
 edits it in the UI.
 

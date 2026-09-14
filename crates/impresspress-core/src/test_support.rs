@@ -2704,18 +2704,37 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
 /// current thread — so a `#[tokio::test]` on the multi-thread runtime would
 /// miss events from work that migrated to another worker. Every use so far
 /// runs the awaited call on the test's own thread.
+///
+/// The STRUCTURED FIELDS are captured separately from the message, and a test
+/// that cares what a line claims has to assert on both. A field is not a lesser
+/// part of the line: a claim this module had deliberately taken OUT of a
+/// message text — `warn_how_to_undo_a_pin`'s count of upgrade pins, removed
+/// because it could contradict the page it points at — was still being emitted
+/// as `upgrade_pins=…`, and a message-only assertion saw nothing.
 #[derive(Clone, Default)]
-pub struct MessageCapture(Arc<Mutex<Vec<String>>>);
-
-struct MessageVisitor<'a> {
-    out: &'a mut String,
+pub struct MessageCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+    /// One entry per event: its non-`message` fields rendered as
+    /// `name=value` and joined with spaces, in the order `tracing` visits them.
+    fields: Arc<Mutex<Vec<String>>>,
 }
 
-impl tracing::field::Visit for MessageVisitor<'_> {
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+    fields: String,
+}
+
+impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            *self.out = format!("{value:?}");
+            self.message = format!("{value:?}");
+            return;
         }
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        self.fields.push_str(&format!("{}={value:?}", field.name()));
     }
 }
 
@@ -2729,25 +2748,41 @@ impl tracing::Subscriber for MessageCapture {
     fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        let mut message = String::new();
-        event.record(&mut MessageVisitor { out: &mut message });
-        self.0
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        self.messages
             .lock()
             .expect("MessageCapture mutex poisoned")
-            .push(message);
+            .push(visitor.message);
+        self.fields
+            .lock()
+            .expect("MessageCapture mutex poisoned")
+            .push(visitor.fields);
     }
     fn enter(&self, _span: &tracing::span::Id) {}
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 impl MessageCapture {
-    /// How many captured messages contain `needle`.
+    /// How many captured messages contain `needle`. Message text only — see
+    /// [`Self::count_fields_containing`] for what the same line carried as
+    /// structured fields.
     pub fn count_containing(&self, needle: &str) -> usize {
-        self.0
+        Self::count(&self.messages, needle)
+    }
+
+    /// How many captured events carry `needle` among their non-`message`
+    /// fields, each rendered `name=value`.
+    pub fn count_fields_containing(&self, needle: &str) -> usize {
+        Self::count(&self.fields, needle)
+    }
+
+    fn count(store: &Arc<Mutex<Vec<String>>>, needle: &str) -> usize {
+        store
             .lock()
             .expect("MessageCapture mutex poisoned")
             .iter()
-            .filter(|m| m.contains(needle))
+            .filter(|entry| entry.contains(needle))
             .count()
     }
 }

@@ -58,5 +58,6 @@
   "POST /b/admin/users/{id}/disable admin",
   "POST /b/admin/users/{id}/enable admin",
   "POST /b/admin/variables admin",
+  "POST /b/admin/variables/reset-pinned-at-upgrade admin",
   "POST /b/admin/variables/{key}/reset-to-environment admin"
 ]

@@ -102,6 +102,7 @@ enum Route {
     UpdateVariable,
     DeleteVariable,
     ResetVariableToEnvironment,
+    ResetVariablesPinnedAtUpgrade,
     NetworkInboundDetail,
     CreateWrapGrant,
     DeleteWrapGrant,
@@ -455,6 +456,18 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         Route::ResetVariableToEnvironment,
     )
     .summary("Reset variable to environment (row control)"),
+    // A literal where the rows above carry `{key}`, and unambiguous against
+    // them: the only other `POST` under `/b/admin/variables/` is
+    // `{key}/reset-to-environment`, which has one more segment, and the two
+    // rows of this shape — `PATCH` and `DELETE /b/admin/variables/{key}` — are
+    // bound to `update` and `delete`, neither to `create`. So no template with
+    // a `{key}` here can match this path.
+    EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/admin/variables/reset-pinned-at-upgrade",
+        Route::ResetVariablesPinnedAtUpgrade,
+    )
+    .summary("Reset every key pinned at upgrade to environment"),
     EndpointRoute::admin(
         HttpMethod::Get,
         "/b/admin/network/detail/inbound",
@@ -657,6 +670,9 @@ crate::impresspress_feature_block! {
             Route::DeleteVariable => pages::handle_delete_variable(ctx, &msg).await,
             Route::ResetVariableToEnvironment => {
                 pages::handle_reset_variable_to_environment(ctx, &msg).await
+            }
+            Route::ResetVariablesPinnedAtUpgrade => {
+                pages::handle_reset_variables_pinned_at_upgrade(ctx, &msg).await
             }
             Route::NetworkInboundDetail => pages::network_inbound_detail(ctx, &msg).await,
             Route::CreateWrapGrant => handle_create_wrap_grant(ctx, msg, input).await,
@@ -1654,6 +1670,16 @@ mod table_tests {
                 Route::ResetVariableToEnvironment,
                 &[("key", "WAFER_RUN_SHARED__APP_NAME")],
             ),
+            // The bulk sibling. Its literal segment sits exactly where the
+            // rows above carry `{key}`, so this case is also what proves it is
+            // not swallowed by one: nothing binds `/b/admin/variables/{key}`
+            // to `create` today, and this asserts it stays that way.
+            (
+                "create",
+                "/b/admin/variables/reset-pinned-at-upgrade",
+                Route::ResetVariablesPinnedAtUpgrade,
+                &[],
+            ),
             (
                 "update",
                 "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME",
@@ -1886,6 +1912,16 @@ mod page_link_tests {
     /// control exists on a row where pressing it does nothing.
     const PINNED_VARIABLE: &str = "WAFER_RUN_SHARED__APP_NAME";
 
+    /// A variables row the one-time upgrade transition pinned, so the Variables
+    /// page renders the BULK "Reset all keys pinned at upgrade" control.
+    ///
+    /// Separate from [`PINNED_VARIABLE`], which carries an admin pin: that one
+    /// must not make the bulk control appear, so a fixture with only it would
+    /// have let the markup be deleted without a failure here. Declared and
+    /// shared for the same reason [`PINNED_VARIABLE`] is — the bulk selection
+    /// applies `variables::key_can_be_seeded_from_env` too.
+    const UPGRADE_PINNED_VARIABLE: &str = "WAFER_RUN_SHARED__AUTH_HEADLINE";
+
     /// The two blocks an admin page may link to, by the router prefix each
     /// owns (`routing.rs`); a link anywhere else is a new decision.
     const ADMIN_PREFIX: &str = "/b/admin/";
@@ -1970,6 +2006,23 @@ mod page_link_tests {
         )
         .await
         .expect("seed pinned variable");
+        // And one pinned by the UPGRADE TRANSITION, which is the only state the
+        // bulk control renders for.
+        variables::insert(
+            &ctx,
+            variables::NewVariable {
+                key: UPGRADE_PINNED_VARIABLE.to_string(),
+                value: "kept at upgrade".to_string(),
+                name: UPGRADE_PINNED_VARIABLE.to_string(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: false,
+                updated_by: variables::PRE_UPGRADE_SENTINEL.to_string(),
+                block: variables::block_for_key(UPGRADE_PINNED_VARIABLE),
+            },
+        )
+        .await
+        .expect("seed upgrade-pinned variable");
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         let grant = wrap_grants::create(
             &ctx,
@@ -2176,6 +2229,13 @@ mod page_link_tests {
             (
                 "create",
                 format!("/b/admin/variables/{PINNED_VARIABLE}/reset-to-environment"),
+            ),
+            // The bulk sibling, which renders only because
+            // `UPGRADE_PINNED_VARIABLE` is seeded above: an admin pin alone
+            // does not bring it out.
+            (
+                "create",
+                "/b/admin/variables/reset-pinned-at-upgrade".to_string(),
             ),
             ("create", "/b/admin/grants/rules".to_string()),
             (
