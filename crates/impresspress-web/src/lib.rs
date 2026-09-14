@@ -4,6 +4,28 @@
 //! `ImpresspressBuilder` (from `impresspress-core`) to wire up the full Impresspress
 //! block suite + the app-specific `BrowserLlmService`.
 
+// `clippy::arc_with_non_send_sync` is stated once here, crate-wide and
+// target-scoped, rather than repeated at every `Arc::new`.
+//
+// wafer-run's service and block traits are bounded on
+// `wafer_block::compat::{MaybeSend, MaybeSync}`. Those are `Send`/`Sync` on
+// native, and on wasm32 they are *unbounded* blanket markers
+// (`impl<T: ?Sized> MaybeSend for T`) — which is precisely what lets this
+// crate hand `Rc`/`Cell`/`RefCell`-backed values (`BrowserRuntimeControl`, the
+// dev `Context` impls, `BrowserShellSource`) across those trait boundaries
+// with no `unsafe impl Send`/`Sync`. The `Arc` is not a choice either:
+// `ImpresspressBuilder::extra_block`, `DevShared::new` and
+// `Context::clone_arc` all take or return `Arc<dyn _>` by value. So the lint
+// fires on handles whose type and smart pointer are both dictated by the API,
+// and on this single-threaded target none of them is making a cross-thread
+// claim to be wrong about.
+//
+// Scoped to wasm32 even though this crate only ships to a browser, because
+// that is the actual precondition: on a native target the same bounds resolve
+// to real `Send + Sync`, the lint is accurate again, and this allow must not
+// silence it.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 use std::sync::Arc;
 
 use impresspress_core::builder;

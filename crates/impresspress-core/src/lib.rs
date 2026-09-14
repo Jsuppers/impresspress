@@ -5,6 +5,27 @@
 //! `wafer_block_crypto::primitives`) used by both the Cloudflare Worker and
 //! native standalone binary.
 
+// `clippy::arc_with_non_send_sync` is stated once here, crate-wide and
+// target-scoped, rather than repeated at every `Arc::new`.
+//
+// wafer-run's service and block traits are bounded on
+// `wafer_block::compat::{MaybeSend, MaybeSync}`. Those are `Send`/`Sync` on
+// native, and on wasm32 they are *unbounded* blanket markers
+// (`impl<T: ?Sized> MaybeSend for T`), so `dyn Block`, `dyn Context`,
+// `dyn StorageService`, `dyn LlmService`, `dyn ProviderAdmin` and every other
+// such object is `!Send + !Sync` on that target by construction. The `Arc` is
+// not a choice this crate makes either: `wafer_run::Wafer::register_block` and
+// the `wafer_core::service_blocks::*::register_with` constructors take
+// `Arc<dyn _>` by value. So on wasm32 the lint fires on handles whose type and
+// smart pointer are both dictated by the API, and on that single-threaded
+// target none of them is making a cross-thread claim to be wrong about.
+//
+// On native the same bounds resolve to real `Send + Sync`, the lint is
+// accurate, and this allow does not apply — which is why it is `cfg_attr`'d on
+// the same `target_arch = "wasm32"` predicate `wafer_block::compat` itself
+// switches on, and not a blanket allow.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 pub mod blocks;
 pub mod builder;
 pub mod cache;

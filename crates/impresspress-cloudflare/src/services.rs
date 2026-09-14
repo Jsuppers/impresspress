@@ -105,11 +105,6 @@ pub(crate) fn make_kv_cached_database_service_with_backend(
     let d1 = make_d1_database_service_concrete(env, d1_binding)?;
     let inner: Arc<dyn DatabaseService> = d1.clone();
     let backend = make_kv_backend(env, kv_binding)?;
-    // `DatabaseService` only requires `MaybeSend + MaybeSync` (real
-    // `Send + Sync` on native, a no-op marker on wasm32 — see
-    // wafer_block::compat), so this `Arc` doesn't promise cross-thread
-    // safety; this crate only ever targets wasm32, which is single-threaded.
-    #[allow(clippy::arc_with_non_send_sync)]
     let db = Arc::new(kv_cached_db::KvCachedD1DatabaseService::with_mode(
         inner,
         backend.clone(),

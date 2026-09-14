@@ -192,12 +192,6 @@ impl ImpresspressBuilder {
             llm_router.register(label, svc);
         }
 
-        // `MultiBackendLlmService` holds `dyn LlmService` backends, which only
-        // require `MaybeSend + MaybeSync` (real `Send + Sync` on native, a
-        // no-op marker on wasm32 — see wafer_block::compat), so this `Arc`
-        // doesn't promise cross-thread safety on wasm32; wasm32 is
-        // single-threaded.
-        #[allow(clippy::arc_with_non_send_sync)]
         wafer_core::service_blocks::llm::register_with(&mut wafer, Arc::new(llm_router))?;
 
         // 4a-bis. Build the image router and register the service block
@@ -210,12 +204,6 @@ impl ImpresspressBuilder {
         for (label, svc) in self.extra_image_services {
             image_router.register(label, svc);
         }
-        // `MultiBackendImageService` holds `dyn ImageService` backends, which
-        // only require `MaybeSend + MaybeSync` (real `Send + Sync` on native,
-        // a no-op marker on wasm32 — see wafer_block::compat), so this `Arc`
-        // doesn't promise cross-thread safety on wasm32; wasm32 is
-        // single-threaded.
-        #[allow(clippy::arc_with_non_send_sync)]
         wafer_core::service_blocks::image::register_with(&mut wafer, Arc::new(image_router))?;
 
         // 4b. Register the `wafer-run/vector` runtime block when the
@@ -238,18 +226,13 @@ impl ImpresspressBuilder {
                 emb_svc.clone(),
             )?;
             // Registered on every target, because the condition is the
-            // injected service and not the build. `TransformersEmbedBlock`
-            // only requires `MaybeSend + MaybeSync` (real `Send + Sync` on
-            // native, a no-op marker on wasm32 — see wafer_block::compat), so
-            // this `Arc` doesn't promise cross-thread safety on wasm32, which
-            // is single-threaded.
+            // injected service and not the build.
             //
             // This used to carry a `cfg(target_arch = "wasm32")`, so a native
             // caller that injected an embedding service got
             // `wafer-run/vector` registered and the block that actually
             // embeds silently dropped — and every embed call then failed with
             // "block not found" wrapped in a 500.
-            #[allow(clippy::arc_with_non_send_sync)]
             wafer.register_block(
                 "impresspress/transformers-embed".to_string(),
                 Arc::new(crate::blocks::transformers_embed::TransformersEmbedBlock::new(emb_svc)),
@@ -471,12 +454,6 @@ impl ImpresspressBuilder {
             block_infos,
             self.extra_routes,
         );
-        // `ImpresspressRouterBlock` holds `Arc<dyn FeatureConfig>`, which only
-        // requires `MaybeSend + MaybeSync` (real `Send + Sync` on native, a
-        // no-op marker on wasm32 — see wafer_block::compat), so this `Arc`
-        // doesn't promise cross-thread safety on wasm32; wasm32 is
-        // single-threaded.
-        #[allow(clippy::arc_with_non_send_sync)]
         wafer.register_block("impresspress/router", Arc::new(router))?;
         wafer.add_block_config("impresspress/router", routes_cfg);
 

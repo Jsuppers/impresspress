@@ -32,6 +32,28 @@
 //! `impresspress_core::release_inventory::ReleaseManifest`, the same type
 //! `impresspress deploy` writes.
 
+// `clippy::arc_with_non_send_sync` is stated once here, crate-wide and
+// target-scoped, rather than repeated at every `Arc::new`.
+//
+// wafer-run's service and block traits are bounded on
+// `wafer_block::compat::{MaybeSend, MaybeSync}`. Those are `Send`/`Sync` on
+// native, and on wasm32 they are *unbounded* blanket markers
+// (`impl<T: ?Sized> MaybeSend for T`), so `dyn DatabaseService`,
+// `dyn ConfigService`, `dyn ConfigSource`, `dyn Block` and every other such
+// object is `!Send + !Sync` on this target by construction. The `Arc` is not a
+// choice this crate makes either: `wafer_run::Wafer::register_block` and the
+// `wafer_core::service_blocks::*::register_with` constructors take
+// `Arc<dyn _>` by value, and `KvCachedD1DatabaseService` takes its inner
+// service the same way. So the lint fires on handles whose type and smart
+// pointer are both dictated by the API, and on a single-threaded target none
+// of them is making a cross-thread claim to be wrong about.
+//
+// Scoped to wasm32 even though this crate is wasm-only, because that is the
+// actual precondition: were it ever built for a native target, the same bounds
+// would resolve to real `Send + Sync`, the lint would be accurate again, and
+// this allow must not silence it.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 mod boot_hooks;
 pub mod config_service;
 pub mod config_source;

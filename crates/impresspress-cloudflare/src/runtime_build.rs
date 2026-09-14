@@ -312,11 +312,6 @@ where
     //    fetched unfiltered snapshot of the variables table. The overlay layers
     //    worker::Env secrets (PROTECTED_ENV_KEYS) on top of D1 rows so
     //    secrets never need to be mirrored into the variables table.
-    // `ConfigSource` only requires `MaybeSend + MaybeSync` (real
-    // `Send + Sync` on native, a no-op marker on wasm32 — see
-    // wafer_block::compat), so this `Arc` doesn't promise cross-thread
-    // safety; this crate only ever targets wasm32, which is single-threaded.
-    #[allow(clippy::arc_with_non_send_sync)]
     let cfg_source: Arc<dyn wafer_run::ConfigSource> = Arc::new(
         config_source::D1ConfigSource::with_overlay(db.clone(), overlay),
     );
@@ -587,7 +582,6 @@ pub(crate) fn warm_request_services(
     let crypto = make_jwt_crypto_service(environment.jwt_secret().to_string());
     let network = make_fetch_network_service();
     let logger = console_logger(environment.cf_log_level());
-    #[allow(clippy::arc_with_non_send_sync)]
     let config_source: Arc<dyn wafer_run::ConfigSource> = Arc::new(
         config_source::D1ConfigSource::with_overlay(db.clone(), overlay),
     );
