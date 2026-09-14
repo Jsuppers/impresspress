@@ -927,6 +927,31 @@ fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
     row.insert("sensitive".to_string(), serde_json::json!(1));
 }
 
+/// Neutralise an imported variables row's `updated_by` on INSERT, without ever
+/// writing it over a row this instance already has.
+///
+/// That column is the local admin-ownership marker
+/// ([`crate::platform_state::variables::is_pinned`]): non-empty means an
+/// admin HERE edited the row, which is what makes it outrank the process
+/// environment. It has to be protected from a bundle in BOTH directions, and
+/// blanking the value alone only covered one of them:
+///
+/// - A bundle must not CLAIM ownership here. An admin on the exporting
+///   instance is not an admin on this one, and a verbatim copy would let a seed
+///   bundle silently pin keys against this deployment's own `.env` while the
+///   boot log blamed an edit that never happened here. Blanking the value in
+///   the row handles this: a newly inserted row arrives seeder-owned, so the
+///   local environment can still seed it.
+/// - A bundle must not REVOKE ownership here either — the case the first
+///   version of this missed. On `Mode::Upsert` the bundle's columns are written
+///   over the destination's, so a blank would erase a marker a local admin had
+///   set and hand their key back to the local `.env`. That is why
+///   `updated_by` is dropped from the update column set in [`import_row`]
+///   rather than merely blanked: on a conflict the destination keeps its own.
+fn neutralise_imported_owner(row: &mut serde_json::Map<String, Value>) {
+    row.insert("updated_by".to_string(), serde_json::json!(""));
+}
+
 /// Write one row into `table` under `mode`. Split out of [`import`] because
 /// the two modes' typed calls take different shapes (`create`'s owned
 /// `HashMap` vs. `upsert`'s ordered pair list) that don't share a body.
@@ -942,6 +967,7 @@ async fn import_row(
     let row = if table == variables::TABLE {
         let mut copy = row.clone();
         raise_imported_sensitive_flag(&mut copy);
+        neutralise_imported_owner(&mut copy);
         owned = copy;
         &owned
     } else {
@@ -960,9 +986,18 @@ async fn import_row(
             // import that rewrote it would break every row already pointing
             // at it — a `user_roles.role_id`, say — to graft on an id whose
             // only merit is that another instance happened to mint it.
+            //
+            // `variables.updated_by` is excluded for a related reason: it is
+            // the DESTINATION's admin-ownership marker, so writing the
+            // bundle's over it on a conflict would revoke a local admin's
+            // claim and hand their key back to the local `.env`. Excluded
+            // rather than blanked — a blank is still a write — so a row this
+            // instance already has keeps whatever it had. See
+            // `neutralise_imported_owner`, which covers the insert direction.
             let update_columns: Vec<String> = row
                 .keys()
                 .filter(|key| key.as_str() != "id" && !conflict.contains(&key.as_str()))
+                .filter(|key| !(table == variables::TABLE && key.as_str() == "updated_by"))
                 .cloned()
                 .collect();
             let conflict: Vec<String> = conflict.iter().map(|c| (*c).to_string()).collect();

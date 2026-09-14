@@ -16,7 +16,10 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks, NativeRuntime};
+use impresspress::cli::{
+    server::{build_native_runtime, NativeBootHooks, NativeRuntime},
+    server_config::filter_to_declared_keys,
+};
 use impresspress_core::builder::{boot, BootHooks, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
 use wafer_core::interfaces::database::service::DatabaseService;
@@ -65,6 +68,22 @@ async fn build_runtime(
     Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
     Arc<dyn DatabaseService>,
 ) {
+    build_runtime_with_env(db_path, storage_root, &[]).await
+}
+
+/// [`build_runtime`] with an explicit env-var batch, the one `run()` builds
+/// with `filter_to_declared_keys(collect_app_env_vars())`. Passed as an
+/// argument rather than exported into the process environment: env mutation is
+/// `unsafe` in Rust 2024 and races every other test in the binary.
+async fn build_runtime_with_env(
+    db_path: &Path,
+    storage_root: &Path,
+    env_vars: &[(String, String)],
+) -> (
+    Wafer,
+    Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
+    Arc<dyn DatabaseService>,
+) {
     let infra = infra_for(db_path, storage_root);
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
@@ -73,7 +92,7 @@ async fn build_runtime(
     let NativeRuntime {
         wafer,
         storage_block,
-    } = build_native_runtime(&infra, database.clone(), &[], false)
+    } = build_native_runtime(&infra, database.clone(), env_vars, false)
         .await
         .expect("build impresspress runtime");
 
@@ -381,4 +400,109 @@ async fn the_native_build_fills_the_synchronous_config_surface() {
         "seeded variables must reach the synchronous surface: {:?}",
         snapshot.keys().collect::<Vec<_>>()
     );
+    // The marker that says this target boots from a process environment.
+    //
+    // Native is the ONLY publisher — the key fails closed, so nothing catches a
+    // build that stops publishing it except an assertion here. Without it the
+    // admin Variables page renders no "Reset to environment" control, and the
+    // boot WARN that names that control is pointing at nothing: exactly the
+    // defect this branch shipped the markup to fix, reintroduced silently.
+    assert_eq!(
+        snapshot
+            .get(impresspress_core::platform_state::variables::HAS_PROCESS_ENV_CONFIG_KEY)
+            .map(String::as_str),
+        Some("1"),
+        "the native build must declare that it has a process environment: {:?}",
+        snapshot.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The 2026-09-10 live-server finding, end to end over the binary's own boot
+/// path: an operator sets `WAFER_RUN_SHARED__APP_NAME` on a deployment whose
+/// database already exists, and the value they set must be the one that boots.
+///
+/// It used to be discarded from the second boot on — env vars were seeded with
+/// `INSERT OR IGNORE`, so they only ever landed on a virgin database. This
+/// drives two boots over the *same* sqlite file with two different values to
+/// cover exactly that, and shapes the batch with `filter_to_declared_keys`, so
+/// what reaches the seeder is what reaches it in production.
+///
+/// Both boots here are a FRESH database's, so the first one creates the row and
+/// records the one-time upgrade transition, and the second is the steady state.
+/// The upgrade boot of a database that predates edit tracking is a different
+/// case — it keeps a disagreeing row and says so — and is covered by
+/// `platform_state::variables`' own tests, which can stage an unmarked row.
+///
+/// The `IMPRESSPRESS_DEPLOY_TOKEN` assertion below pins that FILTER, not
+/// `seed_and_load`'s own `is_runtime_owned_key` guard: an infrastructure key
+/// carries no `__`, so `collect_app_env_vars` and `filter_to_declared_keys`
+/// both drop it long before the seeder runs, and this assertion would pass
+/// with that guard deleted. The guard's own coverage is a unit test in
+/// `platform_state::variables`, which is the only place able to reach it.
+#[tokio::test]
+async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("env_precedence.sqlite3");
+    let storage_root = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+
+    // The operator's environment, exactly as `run()` shapes it.
+    let environment = |app_name: &str| {
+        filter_to_declared_keys(HashMap::from([
+            (KEY.to_string(), app_name.to_string()),
+            // Infrastructure: never a variables-table row.
+            (
+                impresspress_core::config_vars::DEPLOY_TOKEN_KEY.to_string(),
+                "deploy-token".to_string(),
+            ),
+        ]))
+    };
+
+    // --- First boot: fresh database, the operator's value lands. ---
+    let (mut wafer, storage_block, db) =
+        build_runtime_with_env(&db_path, &storage_root, &environment("First")).await;
+    boot(
+        &mut wafer,
+        &storage_block,
+        &NativeBootHooks,
+        NATIVE_GRANTS,
+        InitPolicy::Reported,
+    )
+    .await
+    .expect("first boot");
+    assert_eq!(stored(&db, KEY).await.as_deref(), Some("First"));
+
+    // --- Second boot over the same file with a changed environment. ---
+    let (mut wafer2, storage_block2, db2) =
+        build_runtime_with_env(&db_path, &storage_root, &environment("Second")).await;
+    boot(
+        &mut wafer2,
+        &storage_block2,
+        &NativeBootHooks,
+        NATIVE_GRANTS,
+        InitPolicy::Reported,
+    )
+    .await
+    .expect("second boot");
+
+    assert_eq!(
+        stored(&db2, KEY).await.as_deref(),
+        Some("Second"),
+        "the environment an operator set for THIS boot has to be the one in effect"
+    );
+    assert_eq!(
+        stored(&db2, impresspress_core::config_vars::DEPLOY_TOKEN_KEY).await,
+        None,
+        "`filter_to_declared_keys` must keep an infrastructure key out of the batch"
+    );
+}
+
+/// The value stored in the variables table for `key`, if any.
+async fn stored(db: &Arc<dyn DatabaseService>, key: &str) -> Option<String> {
+    impresspress_core::platform_state::variables::find_by_key(db, key)
+        .await
+        .expect("read the variables table")
+        .map(|row| row.value)
 }

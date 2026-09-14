@@ -394,7 +394,29 @@ impl VariablesConfigBlock {
         // served it verbatim and `cache_key::row_is_sensitive` judged it
         // eligible for the edge cache.
         let sensitive = existing.as_ref().is_some_and(|row| row.sensitive);
-        if let Err(e) = variables::set(&self.db, key, value, "", "", sensitive).await {
+        // Through `set_by_admin`, so the row is stamped admin-owned and
+        // `seed_and_load` stops letting the process environment overwrite it.
+        // This operation has exactly one caller in the tree —
+        // `ui::settings_form::save_settings`, the admin settings forms — so
+        // "reaching CONFIG_SET" IS "an admin edited it"; there is no other
+        // writer whose intent this could misattribute.
+        //
+        // The marker rather than a user id because the identity does not reach
+        // here: `wafer_core::clients::config::set` builds a fresh message
+        // (`svc!`) instead of forwarding the caller's (`svc_msg!`), so
+        // `msg.user_id()` in this block is empty on this path. Threading it
+        // would be an upstream change; the row only has to record THAT a human
+        // owns it, which is exactly what `block_settings` records with the same
+        // sentinel.
+        if let Err(e) = variables::set_by_admin(
+            &self.db,
+            key,
+            value,
+            sensitive,
+            crate::features::USER_EDITED_SENTINEL,
+        )
+        .await
+        {
             return Err(OutputStream::error(WaferError::new(
                 ErrorCode::Internal,
                 format!("config.set could not write {key}: {e}"),

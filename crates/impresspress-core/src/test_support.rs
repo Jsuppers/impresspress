@@ -806,13 +806,27 @@ impl TestContext {
     /// PRECONDITION: admin migrations have run, so the `variables` table
     /// exists.
     pub async fn seed_env_vars(&self, env_vars: &[(&str, &str)]) {
+        self.try_seed_env_vars(env_vars)
+            .await
+            .expect("seed env vars at boot");
+    }
+
+    /// [`Self::seed_env_vars`] without the `expect`, for a test that is about
+    /// the seeder's behaviour WHEN THE DATABASE FAILS.
+    ///
+    /// Exists because [`Self::break_list_reads`] makes `seed_and_load` return
+    /// `Err` from its final table read, so the panicking wrapper cannot reach
+    /// the per-key branches that run before it — and the per-key
+    /// read-failure branch ("cannot tell whether this row is pinned, so leave
+    /// it alone") is exactly the kind that goes uncovered and then goes wrong.
+    pub async fn try_seed_env_vars(&self, env_vars: &[(&str, &str)]) -> Result<(), String> {
         let owned: Vec<(String, String)> = env_vars
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         crate::platform_state::variables::seed_and_load(&self.db_service, &owned)
             .await
-            .expect("seed env vars at boot");
+            .map(|_| ())
     }
 
     /// [`Self::boot_config_service`], then layer `adapter_values` onto BOTH

@@ -626,6 +626,120 @@ async fn import_raises_a_sensitive_flag_the_bundle_understated() {
     );
 }
 
+/// An imported row must not arrive claiming to be an admin edit of THIS
+/// instance.
+///
+/// `updated_by` is the admin-ownership marker that makes a row outrank the
+/// process environment. A bundle carries the EXPORTING instance's column, and
+/// an admin over there is not an admin over here — importing it verbatim would
+/// let a seed bundle silently pin keys against this deployment's own `.env`,
+/// and the boot log would blame an admin edit that never happened here.
+#[tokio::test]
+async fn import_clears_another_instances_admin_ownership_marker() {
+    let key = "WAFER_RUN_SHARED__APP_NAME";
+    let ctx = TestContext::with_products().await;
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        variables::TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "var_imported",
+            "key": key,
+            "value": "FromBundle",
+            "sensitive": false,
+            "updated_by": "admin_on_another_instance",
+            "created_at": STAMP,
+            "updated_at": STAMP,
+        }))
+        .into_iter()
+        .collect()],
+    );
+    let snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snap).await.expect("import");
+
+    let vars = db::list_all(&ctx, variables::TABLE, Vec::new())
+        .await
+        .unwrap();
+    let row = vars
+        .iter()
+        .find(|v| v.data["key"] == json!(key))
+        .expect("the row was imported");
+    assert_eq!(
+        row.data["updated_by"],
+        json!(""),
+        "an imported row must be seeder-owned here, so this deployment's own \
+         environment can still seed it: {row:?}"
+    );
+}
+
+/// The other direction of the same column: an import must not REVOKE an
+/// ownership marker a local admin set.
+///
+/// `Mode::Upsert` writes the bundle's columns over the destination's, so
+/// blanking `updated_by` in the imported row — which is right for an INSERT —
+/// would erase a local admin's claim on a conflict and hand their key back to
+/// the local `.env`. The column is therefore dropped from the update set.
+#[tokio::test]
+async fn import_does_not_revoke_a_local_admin_ownership_marker() {
+    let key = "WAFER_RUN_SHARED__APP_NAME";
+    let ctx = TestContext::with_products().await;
+
+    // This instance already has the key, pinned by a local admin.
+    variables::insert(
+        &ctx,
+        variables::NewVariable {
+            key: key.to_string(),
+            value: "LocalAdminChoice".to_string(),
+            name: String::new(),
+            description: String::new(),
+            warning: String::new(),
+            sensitive: false,
+            updated_by: "local_admin".to_string(),
+            block: variables::block_for_key(key),
+        },
+    )
+    .await
+    .expect("seed the local pinned row");
+
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        variables::TABLE.to_string(),
+        vec![json_map(json!({
+            "id": "var_from_bundle",
+            "key": key,
+            "value": "FromBundle",
+            "sensitive": false,
+            "updated_by": "",
+            "created_at": STAMP,
+            "updated_at": STAMP,
+        }))
+        .into_iter()
+        .collect()],
+    );
+    let snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    };
+
+    data_snapshot::import(&ctx, &snap).await.expect("import");
+
+    let row = variables::get_by_key(&ctx, key)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(
+        row.value, "FromBundle",
+        "the bundle's VALUE still lands — that is what an import is for"
+    );
+    assert_eq!(
+        row.updated_by, "local_admin",
+        "but the local admin's ownership marker survives the import"
+    );
+}
+
 /// A snapshot carries ordinary site config — that is what an export is FOR —
 /// but never a key the runtime owns.
 ///
@@ -734,6 +848,34 @@ async fn import_refuses_a_planted_jwt_secret() {
     assert!(
         !vars.iter().any(|v| v.data["key"] == json!(key)),
         "a refused import must not have planted a signing secret: {vars:?}",
+    );
+}
+
+/// The env-precedence transition's gate row never travels in a bundle.
+///
+/// It records that a one-time upgrade pass has run on THIS database. Exported
+/// and re-imported it would disarm that pass on a deployment that has not run
+/// it — silently turning off the protection for every pre-upgrade admin edit on
+/// the importing side.
+///
+/// It is already held back, by the rule that holds back every
+/// `IMPRESSPRESS_`-prefixed key (`variable_is_exportable`): the gate is
+/// `IMPRESSPRESS__ADMIN__ENV_PRECEDENCE_TRANSITION`, which is block-scoped
+/// config describing the exporting instance, exactly what that rule exists for.
+/// Asserted here rather than left to be re-derived, because the consequence of
+/// the prefix rule ever narrowing is not obvious from the gate's own code.
+#[test]
+fn the_env_precedence_transition_gate_is_not_exportable() {
+    let row: serde_json::Map<String, serde_json::Value> = json_map(json!({
+        "key": variables::ENV_PRECEDENCE_TRANSITION_KEY,
+        "value": "done",
+        "sensitive": false,
+    }))
+    .into_iter()
+    .collect();
+    assert!(
+        !data_snapshot::variable_is_exportable(&row),
+        "the gate row must never reach another deployment's database"
     );
 }
 

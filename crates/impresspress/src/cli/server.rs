@@ -269,6 +269,18 @@ pub async fn build_native_runtime(
         .both(
             impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
             features.to_config_json(),
+        )
+        // Not a config value — a fact about the target. This is the one build
+        // that hands `variables::seed_and_load` a real process environment
+        // (Cloudflare never calls it, the browser calls it with `&[]`), so it
+        // is the one that publishes the marker the admin Variables page reads
+        // before offering to hand a key back to that environment. Absent means
+        // "no", so no other target has to remember to say anything — and
+        // `tests/boot_lifecycle.rs` asserts this line, because a fail-closed
+        // marker has no other way of noticing it went missing.
+        .both(
+            impresspress_core::platform_state::variables::HAS_PROCESS_ENV_CONFIG_KEY,
+            "1",
         );
     if run_migrations {
         runtime_config.both(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1");

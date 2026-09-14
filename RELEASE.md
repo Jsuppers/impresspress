@@ -17,6 +17,113 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Config: your `.env` applies again, and one boot decides the ties
+
+**What changes.** A `WAFER_RUN_SHARED__*` / `{ORG}__{BLOCK}__*` environment
+variable used to be silently ignored from the second boot onward. It was seeded
+with `INSERT OR IGNORE`, so it only ever landed on a virgin database; afterwards
+a row existed, the insert was discarded, and nothing said so. From this release
+the environment sets a key on every boot — **unless an admin has edited that key
+through the admin UI**, in which case the stored row wins permanently and the
+boot log says which key and why.
+
+**The one-time upgrade boot.** Rows written before this release carry no record
+of who wrote them, so an admin's settings-form edit and an earlier boot's env
+seed look identical. On the first boot after upgrading, any key whose stored
+value **differs** from a value you export is **kept as it is**, pinned, and
+named in a WARN. Nothing is reverted, and no export is lost — it simply does not
+apply until you say so. A key whose stored value already matches its export is
+left alone silently.
+
+**What to do.** Read the boot log. For each `NO EFFECT` line, decide which value
+you want:
+
+- *the environment's* — open **Admin → Settings → Variables**, find the key, and
+  use **Reset to environment** (or `POST
+  /b/admin/api/settings/{key}/reset-to-environment`), then restart. The export
+  applies from then on, with no further intervention.
+- *the stored one* — do nothing. The line stops once you remove the export.
+
+After that boot the rule is simply: the environment sets a key until an admin
+edits it in the UI.
+
+**What this does not protect.** The upgrade boot can only resolve conflicts it
+can actually see. This applies to changes made on a **block settings page**
+(Products, Legal pages, User portal, Email, Auth) — a change made on **Admin →
+Variables** records who made it and is protected outright, whatever your
+deployment config says. Such a settings-page change is kept **only if, on that
+boot, your deployment config exported that same key with a non-empty value that
+differed from the stored one.** If any of those is not
+true — the key is not in your config, or it is set to an empty value, or it is
+set to the value already stored — the boot passes over it silently and the key
+is ordinary from then on. **A later change to your deployment config then wins,
+including over that pre-upgrade UI change.**
+
+Concretely: you disabled OAuth in the UI, your compose file said nothing about
+it at upgrade time, and months later you add
+`WAFER_RUN_SHARED__ENABLE_OAUTH=true`. OAuth comes back on. Same for
+`WAFER_RUN_SHARED__ALLOW_SIGNUP`.
+
+The remedy is one action, and it is worth doing now rather than later:
+**re-apply in the admin UI any setting you care about that you changed there
+before upgrading.** That records it for good — an admin edit made *after* the
+upgrade is always safe, whatever your deployment config says.
+
+**Keys worth checking first**, because they decide who can get in:
+
+- `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` — **every** signup with this
+  address is granted admin, not just the first one (`auth::initial_role_for`),
+  so a stale value here is a standing back door. Clear it once you have your
+  admin account.
+- `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` and
+  `..._BOOTSTRAP_ADMIN_TOKEN` — plaintext credentials; a cleared one now stays
+  cleared across a restart even with the export still present.
+- `WAFER_RUN_SHARED__ALLOW_SIGNUP` and `WAFER_RUN_SHARED__ENABLE_OAUTH` — if you
+  turned either off in the UI during an incident, it stays off.
+- `WAFER_RUN_SHARED__ENVIRONMENT` — if this deployment first booted as
+  `development` and your deployment config later said `production`, the stored
+  value is the **less secure** one (session cookies without `Secure`, and a
+  wildcard `Access-Control-Allow-Origin` on discovery documents). Reset this key
+  to the environment before anything else.
+- Block-scoped credentials such as `IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY` —
+  if you rotated one in the UI and your deployment config still carries the old
+  one, the rotated value is what is kept. Neither value is printed in the log;
+  compare the stored one where you issued it.
+
+**Break glass — if a pin locks you out.** Every route above needs a working admin
+login, and the keys most able to deny you one are pinnable. The case to know
+about: a deployment with no admin user yet, whose stored
+`WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` / `..._PASSWORD` are wrong, and
+whose corrected values are in the deployment config. The upgrade boot keeps the
+stored pair, and `auth::bootstrap` creates the first admin from **those** — so
+signing in to fix it needs the credentials you were replacing.
+
+Release a key without logging in by writing the released marker directly in the
+database (`impresspress__admin__variables`), then restarting:
+
+```sql
+UPDATE impresspress__admin__variables
+   SET updated_by = 'released-to-environment'
+ WHERE key = 'WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL';
+```
+
+`updated_by` is the whole mechanism, and `released-to-environment` is exactly
+what the **Reset to environment** button writes. **Do not blank the column
+instead.** An empty `updated_by` means "nothing has ever claimed this row",
+which is the state the one-time upgrade pass looks for — so on a deployment that
+has not recorded that pass yet, blanking the column can get the key pinned
+straight back on the next boot, with no UI to tell you. The sentinel above reads
+as "the environment owns this" and is correct either way.
+
+Only native deployments can be in this position — Cloudflare and the browser
+never seed from a process environment, so nothing there is ever pinned against
+one.
+
+**No migration.** Nothing to opt into, and the transition runs once per database
+whether or not you pass `--run-migrations`. Cloudflare and browser deployments
+are unaffected: neither seeds from a process environment, so neither has a tie
+to break, and the **Reset to environment** control does not render there.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one
