@@ -2,6 +2,22 @@
 //! SQL explorer applies to them: a query that names one is refused before it
 //! runs.
 //!
+//! # What this is and is not
+//!
+//! It is **containment, not privilege separation.** Every caller who can reach
+//! the explorer is an admin, and an admin can still *change* every one of
+//! these values through the surfaces that own them — the Variables page writes
+//! the config store, the Users page disables an account. Nothing here is a
+//! defence against a hostile administrator, and reading it as one would be
+//! reading it wrong.
+//!
+//! What it stops is one admin session being enough to exfiltrate every
+//! credential in the database in a single request: a screen share, a browser
+//! history entry, a proxy log, an over-the-shoulder read, a support call where
+//! someone is asked to "run this query and paste the output". Those are the
+//! ways a deployment's secrets actually escape, and until this existed the
+//! shortest path to all of them was one `SELECT`.
+//!
 //! # Why this is a table-level refusal and not a masked column
 //!
 //! Every other surface that can publish a stored secret redacts the value it
@@ -25,9 +41,8 @@
 //! whether in the clear (`variables.value`, `provider_links.access_token`,
 //! `oauth_pkce_states.code_verifier`, `cloud_shares.token`) or as a digest of
 //! it (`local_credentials.password_hash`, and the SHA-256 columns of
-//! `sessions`, `tokens`, `personal_access_tokens`, `api_keys`,
-//! `bootstrap_tokens`, `users.verification_token` and
-//! `purchases.receipt_token_hash`).
+//! `tokens`, `personal_access_tokens`, `api_keys`, `bootstrap_tokens`,
+//! `users.verification_token` and `purchases.receipt_token_hash`).
 //!
 //! The digests are included deliberately. A boundary drawn at "plaintext only"
 //! would have to re-judge each digest's crackability every time the schema or
@@ -39,15 +54,53 @@
 //!
 //! Tables that are *near* credentials but hold none are deliberately left
 //! readable, and `tests/admin/sql_explorer_secrets.rs` records why for each:
-//! `jwt_blocklist` (revoked `jti`s, which are identifiers of tokens rather
-//! than tokens), `block_settings` (`current_hash`/`blessed_hash`/
-//! `seed_defaults_hash` are migration-state digests), `orgs`, `rate_limits`.
+//! `sessions` (see below), `jwt_blocklist` (revoked `jti`s, which are
+//! identifiers of tokens rather than tokens), `block_settings`
+//! (`current_hash`/`blessed_hash`/`seed_defaults_hash` are migration-state
+//! digests), `orgs`, `rate_limits`.
+//!
+//! `wafer_run__auth__sessions` is the one worth spelling out, because its name
+//! argues for inclusion and its schema does not. Migration
+//! `012_sessions_family` DROPPED the table and recreated it keyed on the
+//! refresh-rotation `family`: the columns are `family`, `user_id`,
+//! `auth_method` and timestamps, and the `token_hash` that made it look like
+//! bearer storage is gone. Its own repo module says it outright — "a row here
+//! is a *device*, not a credential… Nothing authenticates against this table".
+//! Refusing it would cost an operator an ad hoc read of a device list for no
+//! security gain. The first draft of this module registered it anyway, on a
+//! column that had not existed for a migration; the guard test in
+//! `sql_explorer_secrets.rs` now models `DROP TABLE` precisely so that class
+//! of claim fails rather than reads plausibly.
+//!
+//! # Two that were considered and left readable
+//!
+//! Both hold third-party data rather than this deployment's own credentials,
+//! so neither is authentication material under the rule above. Naming them
+//! here because "nobody mentioned it" and "somebody decided" look identical
+//! six months later.
+//!
+//! * `impresspress__products__provider_operations.request_json` /
+//!   `response_json` sound like raw Stripe bodies and are not: the only
+//!   `ensure` call site writes the literal `{"version":1}`, and every
+//!   `resolve_*` writes a summary this repo builds itself
+//!   (`{id, status, amount_minor, livemode, source}`). No provider payload,
+//!   and so no capability, reaches either column.
+//! * `impresspress__products__stripe_events.payload_base64` IS the raw webhook
+//!   body, base64 of exactly what Stripe posted. It can carry customer PII and
+//!   Stripe object ids. It is left readable because the explorer's value for
+//!   debugging a payment is real and because none of it authenticates anyone
+//!   *to this site* — but that is a narrower claim than "it holds no
+//!   capability", which this PR did not establish either way, and
+//!   `NICE_TO_HAVE.md` records the open question rather than letting the
+//!   omission read as a finding.
 //!
 //! Each entry names its table through the constant its owning repo module
-//! declares — directly where that module is public, through the block's
-//! re-exported alias where it is not (`products::PURCHASES_TABLE`) — never
-//! through a re-typed literal, so a table that is ever renamed cannot drift
-//! out of this list silently.
+//! declares, so a table that is ever renamed cannot drift out of this list
+//! silently. The two whose owning module is behind a block feature
+//! (`cloud_shares`, `purchases`) are the exception and are named as literals —
+//! see the comment on [`CLOUD_SHARES_TABLE`] for why a `#[cfg]` would have
+//! been the wrong answer, and for the tests that pin the literals to those
+//! constants.
 //!
 //! # The cost, stated
 //!
@@ -64,22 +117,40 @@
 //! indirectly — a rule with carve-outs, where a miss is silent. This one has
 //! none.
 
-#[cfg(feature = "block-files")]
-use crate::blocks::files::repo::shares;
-#[cfg(feature = "block-products")]
-use crate::blocks::products::PURCHASES_TABLE;
 use crate::{
     blocks::auth::repo::{
-        api_keys, bootstrap_tokens, local_credentials, oauth_pkce, pats, provider_links, sessions,
-        tokens, users,
+        api_keys, bootstrap_tokens, local_credentials, oauth_pkce, pats, provider_links, tokens,
+        users,
     },
     platform_state::variables,
 };
 
+// The two tables whose owning module lives behind a block feature, named as
+// literals rather than through their constants.
+//
+// A `#[cfg]` on the entries themselves would make the refusal a property of
+// the BUILD, and the table is a property of the DATABASE. A deployment that
+// once ran with `block-files` keeps `impresspress__files__cloud_shares`, live
+// share tokens included, when it is next built without the block:
+// `introspect_table_summaries` still lists it, the SQL explorer still reads
+// it, and a `#[cfg]`-ed registry would have had nothing to say about it. The
+// same holds for a build that never had the block but inherited someone
+// else's D1.
+//
+// So the literal is the price of naming a table a build may not compile. It
+// is pinned to the door's own constant by the two tests at the bottom of this
+// file, which run in every build that HAS the module — so the anti-drift
+// property the constant gives every other entry is kept, enforced by a test
+// instead of by the type system. `tests/repo_door.rs` carries the matching
+// `LITERAL_ALLOWED` entries with the same reason.
+const CLOUD_SHARES_TABLE: &str = "impresspress__files__cloud_shares";
+const PRODUCTS_PURCHASES_TABLE: &str = "impresspress__products__purchases";
+
 /// One table the SQL explorer refuses, with the columns that put it here and
 /// the admin surface that serves the same need safely.
 pub struct SecretTable {
-    /// The table name, taken from its owning repo module's `TABLE` constant.
+    /// The table name, taken from its owning repo module's `TABLE` constant
+    /// (or, for a feature-gated module, from the pinned literal beside it).
     pub table: &'static str,
     /// The columns that hold authentication material. Recorded for the
     /// completeness test in `tests/admin/sql_explorer_secrets.rs`, which
@@ -103,10 +174,6 @@ const VARIABLES_PAGE: &str =
 const USERS_PAGE: &str = "Use the Users page (/b/admin/users) for account state.";
 
 /// Every table the explorer refuses.
-///
-/// Feature-gated entries track their block: a table a build does not compile
-/// is a table that build's database does not have, so leaving it out is the
-/// accurate answer rather than a gap.
 pub const SECRET_TABLES: &[SecretTable] = &[
     // The config store. `value` holds whatever this deployment configured —
     // the JWT signing secret, OAuth client secrets, Stripe keys, SMTP
@@ -146,15 +213,10 @@ pub const SECRET_TABLES: &[SecretTable] = &[
         columns: &["code_verifier"],
         instead: USERS_PAGE,
     },
-    // The five bearer-material tables. Each stores SHA-256 of a token the
-    // client holds, so a reader learns a digest rather than a credential —
-    // included for the reason in the module docs, not because a digest is
-    // itself replayable.
-    SecretTable {
-        table: sessions::TABLE,
-        columns: &["token_hash"],
-        instead: USERS_PAGE,
-    },
+    // The bearer-material tables. Each stores SHA-256 of a token the client
+    // holds, so a reader learns a digest rather than a credential — included
+    // for the reason in the module docs, not because a digest is itself
+    // replayable.
     SecretTable {
         table: tokens::TABLE,
         columns: &["token_hash"],
@@ -177,18 +239,16 @@ pub const SECRET_TABLES: &[SecretTable] = &[
     },
     // The capability in a public `/b/storage/direct/{token}` URL, stored in
     // the clear because the share handler looks it up by equality.
-    #[cfg(feature = "block-files")]
     SecretTable {
-        table: shares::TABLE,
+        table: CLOUD_SHARES_TABLE,
         columns: &["token"],
         instead: "Use the Storage page (/b/admin/storage) to manage shares.",
     },
     // `receipt_token_hash` is the digest of the guest receipt capability
     // issued at checkout: whoever holds the raw token reads the order's
     // status with no session. `PurchaseView` withholds it on every tier.
-    #[cfg(feature = "block-products")]
     SecretTable {
-        table: PURCHASES_TABLE,
+        table: PRODUCTS_PURCHASES_TABLE,
         columns: &["receipt_token_hash"],
         instead: "Use the seller orders page (/b/products/selling/orders) for order state.",
     },
@@ -206,18 +266,32 @@ impl SecretTable {
 
 /// The first [`SECRET_TABLES`] entry `query` names, or `None`.
 ///
-/// Matching is a case-insensitive substring test on the whole statement, and
-/// that is sound rather than lazy: SQL has no way to read a table without
-/// spelling its name, and every way of dressing the name up leaves the name
-/// itself intact — `"quoted"`, `[bracketed]`, `` `backticked` ``,
-/// `main.qualified`, and any case, since SQLite folds identifier case and
-/// these names are already lowercase in Postgres. Over-matching is the only
-/// error it can make (a query that merely mentions the name in a string
-/// literal is refused too), and over-matching is the safe direction.
+/// Matching is a case-insensitive substring test on the whole statement. Every
+/// way of dressing an identifier up leaves the name itself intact —
+/// `"quoted"`, `[bracketed]`, `` `backticked` ``, `main.qualified`, and any
+/// case, since SQLite folds identifier case and these names are already
+/// lowercase in Postgres. Over-matching is the only error it can make (a query
+/// that merely mentions the name in a string literal is refused too), and
+/// over-matching is the safe direction.
 ///
-/// The one construct that could spell a name without containing it is
-/// Postgres's `U&"..."` unicode-escaped identifier; [`rejects_unicode_escape`]
-/// is why that cannot reach here.
+/// # The two assumptions it rests on
+///
+/// Neither is a law of SQL, and if either stops holding this function stops
+/// covering the table it names.
+///
+/// 1. **No view, and no other indirection, stands over a refused table.** A
+///    view is precisely a way to read a table without naming it, so one over
+///    `…__variables` would read straight through this check. As of this
+///    writing no migration in the tree contains `CREATE VIEW` (nor `CREATE
+///    TRIGGER`, nor `ATTACH`), and the explorer cannot mint one because
+///    `CREATE` and `ATTACH` are both on the validator's forbidden-keyword
+///    list. Nothing enforces it beyond that: a migration that adds a view over
+///    a refused table re-opens the gap silently, and whoever writes it has to
+///    account for it here.
+/// 2. **Identifiers appear in the statement as themselves.** The one construct
+///    that breaks this is Postgres's `U&"…"` unicode-escaped identifier, which
+///    can spell a name the bytes of the statement never contain;
+///    [`rejects_unicode_escape`] is why it cannot reach here.
 pub fn secret_table_named_in(query: &str) -> Option<&'static SecretTable> {
     let lowered = query.to_ascii_lowercase();
     SECRET_TABLES
@@ -253,6 +327,28 @@ mod tests {
     /// the same reason the registry above does it.
     fn store() -> &'static str {
         variables::TABLE
+    }
+
+    /// The `block-files` build pins the literal to the door's own constant.
+    /// Without this the `#[cfg]`-free entry would be a second spelling of the
+    /// table that could drift from the door.
+    #[cfg(feature = "block-files")]
+    #[test]
+    fn the_cloud_shares_literal_matches_its_door_constant() {
+        assert_eq!(
+            CLOUD_SHARES_TABLE,
+            crate::blocks::files::repo::shares::TABLE
+        );
+    }
+
+    /// The same pin for the products door.
+    #[cfg(feature = "block-products")]
+    #[test]
+    fn the_purchases_literal_matches_its_door_constant() {
+        assert_eq!(
+            PRODUCTS_PURCHASES_TABLE,
+            crate::blocks::products::PURCHASES_TABLE
+        );
     }
 
     #[test]

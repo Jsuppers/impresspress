@@ -381,7 +381,19 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "platform_state/wrap_grants.rs",
         ],
     ),
-    ("shares", &["blocks/files/repo/shares.rs"]),
+    (
+        "shares",
+        &[
+            "blocks/files/repo/shares.rs",
+            // the admin SQL explorer's refusal list names these two as
+            // literals because their owning module is behind a block
+            // feature and the table outlives the build that created it;
+            // `secret_tables.rs` pins each literal to this door's own
+            // constant in a `#[cfg(feature = ..)]` test, and issues no
+            // query against either
+            "secret_tables.rs",
+        ],
+    ),
     ("share_access_logs", &["blocks/files/repo/shares.rs"]),
     ("quota", &["blocks/files/repo/quota.rs"]),
     ("views", &["blocks/files/repo/views.rs"]),
@@ -504,6 +516,13 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     (
         "purchases",
         &[
+            // the admin SQL explorer's refusal list names these two as
+            // literals because their owning module is behind a block
+            // feature and the table outlives the build that created it;
+            // `secret_tables.rs` pins each literal to this door's own
+            // constant in a `#[cfg(feature = ..)]` test, and issues no
+            // query against either
+            "secret_tables.rs",
             "blocks/products/repo/purchases.rs",
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/purchase_tests.rs",
@@ -736,9 +755,6 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "sessions",
         &[
-            // the admin SQL explorer's refusal list; see the note on
-            // the `variables` door above
-            "secret_tables.rs",
             "blocks/dev/data_snapshot.rs",
             // `("database.delete_where_count", sessions::TABLE)` — logout's
             // "a failed session-row delete is not a successful logout" test

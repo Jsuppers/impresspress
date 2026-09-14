@@ -18,7 +18,7 @@
 //! guarantee it cannot keep. Refusing the query before it runs is the only
 //! rule the query text cannot be reshaped around.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use impresspress_core::{
     blocks::admin::{migrations, AdminBlock},
@@ -396,21 +396,27 @@ const CLEARED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// `(table, column)` for every column in every block migration whose name
-/// matches the credential convention, plus every column of a table that
-/// carries a `sensitive` flag.
+/// The schema the migrations leave behind: `table → columns`, as of the last
+/// migration, per block.
 ///
-/// The `sensitive` clause is what catches
-/// `impresspress__admin__variables.value`, whose name says nothing: a
-/// `sensitive` column is the schema's own statement that rows of this table
-/// may hold a secret. That is the same column `cache_key::row_is_sensitive`
-/// reads (paired with `key` by `sensitive_check_columns`) to keep secrets out
-/// of the KV cache.
-fn credential_shaped_columns() -> BTreeSet<(String, String)> {
+/// **Migration ORDER and `DROP TABLE` are modelled, not ignored.** A union
+/// over every `CREATE TABLE` in a block's history is not the schema — it is
+/// the schema plus every column any earlier version ever had.
+/// `012_sessions_family` drops `wafer_run__auth__sessions` and recreates it
+/// without the `token_hash` that `001_auth_schema` declared, and a scan that
+/// unions the two reports a column no deployment has. That is not a corner:
+/// the guard tests below exist to catch a registry entry naming a column that
+/// is not there, and a history-union scan cannot see exactly that mistake.
+///
+/// Each dialect is folded separately, in filename order (which is migration
+/// order — every file is `NNN_name.{sqlite,postgres}.sql`), and the two
+/// results are unioned. A column only one dialect declares is kept: a
+/// divergence between the two is its own bug, and over-reporting is the safe
+/// direction for everything built on this.
+fn migration_schema() -> BTreeMap<String, BTreeSet<String>> {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let blocks_dir = manifest_dir.join("src/blocks");
-    let mut tables_with_sensitive_flag: BTreeSet<String> = BTreeSet::new();
-    let mut all_columns: Vec<(String, String)> = Vec::new();
+    let mut merged: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     let blocks = std::fs::read_dir(&blocks_dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", blocks_dir.display()));
@@ -419,50 +425,78 @@ fn credential_shaped_columns() -> BTreeSet<(String, String)> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // `(dialect, filename) → path`, so a BTreeMap key sorts each dialect's
+        // files into migration order.
+        let mut files: BTreeMap<(String, String), std::path::PathBuf> = BTreeMap::new();
         for entry in entries {
             let path = entry.expect("dir entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("sql") {
                 continue;
             }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("migration filename")
+                .to_string();
+            // A file that names no dialect is a naming scheme this scan does
+            // not understand; failing loudly beats folding it into one dialect
+            // arbitrarily or skipping it silently.
+            let dialect = if name.ends_with(".sqlite.sql") {
+                "sqlite"
+            } else if name.ends_with(".postgres.sql") {
+                "postgres"
+            } else {
+                panic!("{}: migration filename names no dialect", path.display());
+            };
+            files.insert((dialect.to_string(), name), path);
+        }
+
+        let mut per_dialect: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+        for ((dialect, _name), path) in files {
             let sql = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            scan_sql(&sql, &mut all_columns, &mut tables_with_sensitive_flag);
+            apply_sql(&sql, &path, per_dialect.entry(dialect).or_default());
+        }
+        for schema in per_dialect.into_values() {
+            for (table, columns) in schema {
+                merged.entry(table).or_default().extend(columns);
+            }
         }
     }
 
     assert!(
-        all_columns.len() > 200,
-        "the migration column scan found {} columns — it lost its way",
-        all_columns.len()
+        merged.values().map(BTreeSet::len).sum::<usize>() > 200,
+        "the migration scan found {} columns — it lost its way",
+        merged.values().map(BTreeSet::len).sum::<usize>()
     );
-    all_columns
-        .into_iter()
-        .filter(|(table, column)| {
-            looks_like_a_credential(column) || tables_with_sensitive_flag.contains(table)
-        })
-        .collect()
+    merged
 }
 
-/// Collect `(table, column)` for one migration file.
+/// Apply one migration file's DDL to `schema`.
 ///
-/// Handles the two shapes the migrations use: a `CREATE TABLE … ( … )` block
-/// whose body lines are `<name> <TYPE> …`, and `ALTER TABLE <t> ADD COLUMN
-/// [IF NOT EXISTS] <c> …`, whose clause may sit on the `ALTER TABLE` line or
-/// on the line after it (admin migration 003 wraps; the products and auth ones
-/// do not).
-fn scan_sql(
-    sql: &str,
-    all_columns: &mut Vec<(String, String)>,
-    tables_with_sensitive_flag: &mut BTreeSet<String>,
-) {
+/// Handles the four shapes the migrations use: `DROP TABLE [IF EXISTS] <t>`
+/// (which forgets every column, so a following `CREATE TABLE` starts clean),
+/// `CREATE TABLE [IF NOT EXISTS] <t> ( … )` whose body lines are
+/// `<name> <TYPE> …`, and `ALTER TABLE <t> ADD COLUMN [IF NOT EXISTS] <c> …`,
+/// whose clause may sit on the `ALTER TABLE` line or on the line after it
+/// (admin migration 003 wraps; the products and auth ones do not).
+fn apply_sql(sql: &str, path: &std::path::Path, schema: &mut BTreeMap<String, BTreeSet<String>>) {
     let mut current: Option<String> = None;
     let mut altering: Option<String> = None;
-    for line in sql.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("ALTER TABLE") {
-            let table = identifier(rest.trim_start());
+    for (lineno, raw) in sql.lines().enumerate() {
+        let line = raw.trim();
+        if let Some(rest) = strip_keyword(line, "DROP TABLE") {
+            let rest = strip_keyword(rest, "IF EXISTS").unwrap_or(rest);
+            schema.remove(&identifier(rest));
+            current = None;
+            continue;
+        }
+        if let Some(rest) = strip_keyword(line, "ALTER TABLE") {
+            let table = identifier(rest);
             match add_column_name(line) {
-                Some(col) => all_columns.push((table, col)),
+                Some(col) => {
+                    schema.entry(table).or_default().insert(col);
+                }
                 // The clause wrapped: remember the table for the next line.
                 None => altering = Some(table),
             }
@@ -471,16 +505,15 @@ fn scan_sql(
         }
         if let Some(table) = altering.take() {
             if let Some(col) = add_column_name(line) {
-                all_columns.push((table, col));
+                schema.entry(table).or_default().insert(col);
             }
             continue;
         }
-        if let Some(rest) = line.strip_prefix("CREATE TABLE") {
-            let rest = rest.trim_start();
-            let rest = rest
-                .strip_prefix("IF NOT EXISTS")
-                .map_or(rest, str::trim_start);
-            current = Some(identifier(rest));
+        if let Some(rest) = strip_keyword(line, "CREATE TABLE") {
+            let rest = strip_keyword(rest, "IF NOT EXISTS").unwrap_or(rest);
+            let table = identifier(rest);
+            schema.entry(table.clone()).or_default();
+            current = Some(table);
             continue;
         }
         let Some(table) = current.clone() else {
@@ -490,34 +523,111 @@ fn scan_sql(
             current = None;
             continue;
         }
-        // A column declaration is `<name> <TYPE> …`. A table constraint
-        // (`UNIQUE (a, b)`, `PRIMARY KEY (…)`) fails the type check below, and
-        // a comment line fails the identifier check.
         let mut words = line.split_whitespace();
         let (Some(name), Some(ty)) = (words.next(), words.next()) else {
             continue;
         };
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        // Not a column declaration: a comment, or a table-level constraint
+        // (`UNIQUE (a, b)`, `PRIMARY KEY (…)`), or a continuation line of a
+        // multi-line CHECK. Decided by the leading word, so that what counts
+        // as a column is never decided by the column's TYPE — a whitelist of
+        // types silently drops every column declared with one nobody thought
+        // of, which is the opposite of the derivation this file claims.
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || NON_COLUMN_LEADING_WORDS
+                .iter()
+                .any(|kw| name.eq_ignore_ascii_case(kw))
+        {
             continue;
         }
-        let ty = ty.trim_end_matches(',').to_ascii_uppercase();
-        if !matches!(
-            ty.as_str(),
-            "TEXT" | "BLOB" | "BYTEA" | "INTEGER" | "BIGINT" | "REAL" | "BOOLEAN" | "JSONB"
-        ) {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("sensitive") {
-            tables_with_sensitive_flag.insert(table.clone());
-        }
-        all_columns.push((table, name.to_string()));
+        // Past that filter the line IS a column declaration, so its type must
+        // be one this scan knows. An unrecognised token is a loud failure
+        // rather than a dropped column: `TIMESTAMPTZ` and `DOUBLE PRECISION`
+        // were both already in the tree and both silently invisible here.
+        let ty = ty
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(',')
+            .to_ascii_uppercase();
+        assert!(
+            KNOWN_COLUMN_TYPES.contains(&ty.as_str()),
+            "{}:{}: unrecognised column type {ty:?} in {line:?} — add it to \
+             KNOWN_COLUMN_TYPES (or to NON_COLUMN_LEADING_WORDS if this line is \
+             not a column declaration). Left out, the column would be scanned \
+             as if it did not exist.",
+            path.display(),
+            lineno + 1,
+        );
+        schema.entry(table).or_default().insert(name.to_string());
     }
 }
 
-/// The leading identifier of `rest`, stopping at whitespace or `(`.
+/// Leading words that mean "this line inside a `CREATE TABLE` body is not a
+/// column declaration". Table constraints and the continuation lines of a
+/// multi-line `CHECK`.
+const NON_COLUMN_LEADING_WORDS: &[&str] = &[
+    "UNIQUE",
+    "PRIMARY",
+    "FOREIGN",
+    "CHECK",
+    "CONSTRAINT",
+    "AND",
+    "OR",
+    "NOT",
+    "REFERENCES",
+    "ON",
+];
+
+/// Every column type the migrations use. Not a filter — a checklist: a type
+/// missing from here fails the scan rather than dropping its column.
+const KNOWN_COLUMN_TYPES: &[&str] = &[
+    "TEXT",
+    "INTEGER",
+    "BIGINT",
+    "BOOLEAN",
+    "REAL",
+    "DOUBLE",
+    "BLOB",
+    "BYTEA",
+    "TIMESTAMPTZ",
+];
+
+/// Strip a leading SQL keyword (case-insensitively) plus the whitespace after
+/// it, or `None` when `line` does not start with it.
+fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let head = line.get(..keyword.len())?;
+    head.eq_ignore_ascii_case(keyword)
+        .then(|| line[keyword.len()..].trim_start())
+}
+
+/// `(table, column)` for every column whose name matches the credential
+/// convention, plus every column of a table that carries a `sensitive` flag.
+///
+/// The `sensitive` clause is what catches
+/// `impresspress__admin__variables.value`, whose name says nothing: a
+/// `sensitive` column is the schema's own statement that rows of this table
+/// may hold a secret. That is the same column `cache_key::row_is_sensitive`
+/// reads (paired with `key` by `sensitive_check_columns`) to keep secrets out
+/// of the KV cache.
+fn credential_shaped_columns() -> BTreeSet<(String, String)> {
+    let schema = migration_schema();
+    let mut out = BTreeSet::new();
+    for (table, columns) in &schema {
+        let flagged = columns.iter().any(|c| c.eq_ignore_ascii_case("sensitive"));
+        for column in columns {
+            if flagged || looks_like_a_credential(column) {
+                out.insert((table.clone(), column.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The leading identifier of `rest`, stopping at whitespace, `(` or `;`.
 fn identifier(rest: &str) -> String {
     rest.chars()
-        .take_while(|c| !c.is_whitespace() && *c != '(')
+        .take_while(|c| !c.is_whitespace() && *c != '(' && *c != ';')
         .collect()
 }
 
@@ -525,12 +635,7 @@ fn identifier(rest: &str) -> String {
 fn add_column_name(line: &str) -> Option<String> {
     let at = line.to_ascii_uppercase().find("ADD COLUMN")?;
     let rest = line[at + "ADD COLUMN".len()..].trim_start();
-    let rest = match rest.get(.."IF NOT EXISTS".len()) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("IF NOT EXISTS") => {
-            rest["IF NOT EXISTS".len()..].trim_start()
-        }
-        _ => rest,
-    };
+    let rest = strip_keyword(rest, "IF NOT EXISTS").unwrap_or(rest);
     Some(identifier(rest))
 }
 
@@ -599,11 +704,28 @@ fn deliberately_readable_tables_stay_readable() {
     let refused: BTreeSet<&str> = SECRET_TABLES.iter().map(|e| e.table).collect();
     for (table, why) in [
         (
+            "wafer_run__auth__sessions",
+            "a device list since migration 012 dropped and recreated it: \
+             family/user_id/auth_method/timestamps, no token_hash, and its repo \
+             module says nothing authenticates against it",
+        ),
+        (
             "wafer_run__auth__jwt_blocklist",
             "revoked `jti`s: identifiers of tokens, not tokens",
         ),
         ("wafer_run__auth__orgs", "org names and verification refs"),
         ("wafer_run__auth__rate_limits", "counters keyed by bucket"),
+        (
+            "impresspress__products__provider_operations",
+            "request_json is the literal {\"version\":1} and response_json a \
+             summary this repo builds; no provider body reaches either",
+        ),
+        (
+            "impresspress__products__stripe_events",
+            "raw third-party webhook bodies: PII and Stripe ids, but nothing \
+             that authenticates anyone to this deployment - see the open \
+             question recorded in NICE_TO_HAVE.md",
+        ),
         (
             "impresspress__admin__block_settings",
             "per-block enable flag plus migration-state digests",
@@ -655,4 +777,110 @@ async fn the_sql_editor_does_not_prefill_a_query_it_will_refuse() {
         page.contains("SELECT * FROM impresspress__admin__roles LIMIT 100;"),
         "an ordinary table lost its prefill"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The scanner's own properties
+// ---------------------------------------------------------------------------
+//
+// These drive `apply_sql` over synthetic DDL rather than over the tree,
+// deliberately. Asserting against the real migrations cannot pin either
+// property: `rate_limits.created_at` is `TIMESTAMPTZ` in the postgres file and
+// `TEXT` in the sqlite one, so the union hides a postgres-only type from any
+// tree-level assertion — a tree-level test of the type handling passes even
+// with the type filter restored, which is exactly the kind of test that proves
+// nothing. What the scanner must do is a property of the scanner.
+
+/// Fold one synthetic migration file and return the resulting schema.
+fn schema_of(sql: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut schema = BTreeMap::new();
+    apply_sql(sql, std::path::Path::new("<test>.sqlite.sql"), &mut schema);
+    schema
+}
+
+/// A column is read whatever its declared type.
+///
+/// The first draft decided "is this line a column?" with a whitelist of eight
+/// type names, so every column declared with anything else was dropped in
+/// silence. `TIMESTAMPTZ` and `DOUBLE PRECISION` were both already in the tree
+/// and both invisible; a credential column declared `VARCHAR(64)` would have
+/// left the whole suite green, which the "derived, not hand-kept" claim this
+/// file rests on cannot survive.
+#[test]
+fn the_scanner_reads_a_column_of_any_known_type() {
+    let schema = schema_of(
+        "CREATE TABLE IF NOT EXISTS t (
+            id          TEXT PRIMARY KEY,
+            seen_at     TIMESTAMPTZ NOT NULL,
+            score       DOUBLE PRECISION NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
+            digest      BYTEA,
+            hits        BIGINT NOT NULL DEFAULT 0,
+            UNIQUE (id, seen_at)
+        );",
+    );
+    let cols = schema.get("t").expect("table scanned");
+    assert_eq!(
+        cols.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["digest", "hits", "id", "score", "seen_at"],
+        "a column was dropped, or a constraint line was read as one"
+    );
+}
+
+/// A type the scanner does not know is a loud failure, not a dropped column —
+/// so the checklist cannot quietly fall behind the schema the way the old
+/// whitelist did.
+#[test]
+#[should_panic(expected = "unrecognised column type \"VARCHAR\"")]
+fn the_scanner_panics_on_an_unknown_column_type() {
+    schema_of("CREATE TABLE t (\n    name VARCHAR(64) NOT NULL\n);");
+}
+
+/// `DROP TABLE` forgets the dropped table's columns, so a recreated table is
+/// described by its CURRENT declaration rather than by the union of every
+/// declaration it has ever had.
+///
+/// This is the property the `sessions` entry needed and did not have: the
+/// registry claimed `sessions.token_hash`, the guard test passed, and the
+/// column had not existed since `012_sessions_family` dropped and recreated
+/// the table without it.
+#[test]
+fn the_scanner_honours_drop_table() {
+    let schema = schema_of(
+        "CREATE TABLE IF NOT EXISTS t (
+            token_hash TEXT PRIMARY KEY,
+            user_id    TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS kept (
+            id TEXT PRIMARY KEY
+        );
+        DROP TABLE IF EXISTS t;
+        CREATE TABLE IF NOT EXISTS t (
+            family  TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL
+        );",
+    );
+    let t = schema.get("t").expect("table scanned");
+    assert!(
+        !t.contains("token_hash"),
+        "the scan is unioning history rather than applying the drop: {t:?}"
+    );
+    assert!(t.contains("family"), "{t:?}");
+    // The drop must forget one table, not the file.
+    assert!(schema.get("kept").is_some_and(|c| c.contains("id")));
+}
+
+/// And the same property, as the tree actually stands: `sessions` is the table
+/// it caught, so a regression that reintroduced history-unioning would show up
+/// here without anyone reading a synthetic fixture.
+#[test]
+fn the_sessions_table_is_scanned_as_migration_012_left_it() {
+    let schema = migration_schema();
+    let sessions = schema
+        .get("wafer_run__auth__sessions")
+        .expect("the sessions table is declared");
+    assert!(
+        !sessions.contains("token_hash"),
+        "`012_sessions_family` dropped this column: {sessions:?}"
+    );
+    assert!(sessions.contains("family"), "{sessions:?}");
 }
