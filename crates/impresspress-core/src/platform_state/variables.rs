@@ -645,11 +645,18 @@ async fn set_with_row(
     //
     // It used to stamp on any admin-surface write, on the reasoning that
     // saving a form is a human decision. That is false per key:
-    // `ui::settings_form::save_settings` calls `config::set` for every field
-    // the form posts, and the form posts every named input — so changing one
-    // colour on an admin settings page pinned `APP_NAME`, every logo URL and
-    // the favicon too, silently making their exports inert forever. Requiring
-    // a real change keeps the claim honest: the admin edited THIS key.
+    // `ui::settings_form::save_settings` calls `config::set` for every PLAIN
+    // field the form posts, and the form posts every named input — so changing
+    // one colour on an admin settings page pinned `APP_NAME`, every logo URL
+    // and the favicon too, silently making their exports inert forever.
+    // Requiring a real change keeps the claim honest: the admin edited THIS
+    // key.
+    //
+    // "Plain" because `save_settings` skips a blank SENSITIVE field —
+    // `render_field` renders a secret empty, so blank means "I did not touch
+    // this". That skip is not a substitute for this rule: every key named
+    // above is a plain one, posted and written on every save, so the fields
+    // that motivated the rule are exactly the ones it does not cover.
     //
     // The narrow cost is that an admin cannot pin a key by re-saving the value
     // the environment already supplies — but there is nothing to pin then, the
@@ -2302,9 +2309,11 @@ mod boot_tests {
     /// test was named for. Staging the row first is the whole difference.
     ///
     /// Why the rule is what it is: `ui::settings_form::save_settings` calls
-    /// `config::set` for every field the form posts, and the form posts every
-    /// named input — so stamping on any admin-surface write pinned a whole
-    /// settings page at once.
+    /// `config::set` for every PLAIN field the form posts, and the form posts
+    /// every named input — so stamping on any admin-surface write pinned a
+    /// whole settings page at once. (A blank SENSITIVE field is skipped
+    /// instead; that covers secrets, not the branding and toggle fields this
+    /// rule is about.)
     #[tokio::test]
     async fn re_saving_the_value_the_environment_supplies_does_not_pin_the_key() {
         let db = migrated_db().await;
@@ -2392,11 +2401,13 @@ mod boot_tests {
 
     /// One "Save settings" click must pin only the field that changed.
     ///
-    /// `ui::settings_form::save_settings` calls `config::set` for EVERY key the
-    /// form posts, and the form posts every named input — so stamping on any
-    /// admin-surface write pinned a whole page of variables at once, silently
-    /// making their exports inert forever. This drives the same shape: one
-    /// changed key among several re-asserted ones.
+    /// `ui::settings_form::save_settings` calls `config::set` for every PLAIN
+    /// key the form posts, and the form posts every named input — so stamping
+    /// on any admin-surface write pinned a whole page of variables at once,
+    /// silently making their exports inert forever. (A blank SENSITIVE field is
+    /// skipped instead, because `render_field` renders a secret empty; that
+    /// covers secrets, not the branding fields below.) This drives the same
+    /// shape: one changed key among several re-asserted ones.
     #[tokio::test]
     async fn saving_a_settings_form_pins_only_the_field_that_changed() {
         let db = migrated_db().await;
