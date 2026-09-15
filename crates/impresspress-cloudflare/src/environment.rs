@@ -62,13 +62,24 @@ pub(crate) const CF_LOG_LEVEL_KEY: &str = "IMPRESSPRESS_CF_LOG_LEVEL";
 pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth::JWT_SECRET_KEY];
 
 /// Shared configuration consumed synchronously while the builder constructs
-/// middleware, plus the one operational database knob a deploy sets in
-/// `wrangler.toml`. Unlike block-scoped values these cannot be deferred to the
-/// D1-backed `ConfigSource`, because the flow (and the database service) already
-/// exist by the time per-block config is resolvable.
+/// middleware, plus the two operational knobs a deploy sets in
+/// `wrangler.toml`.
+///
+/// Most entries are here because they cannot be deferred to the D1-backed
+/// `ConfigSource`: the flow (and the database service) already exist by the
+/// time per-block config is resolvable.
+///
+/// `IMPRESSPRESS_REQUEST_LOG` is the exception, and that reason does **not**
+/// apply to it — it is read per request, long after both exist. It is here
+/// for a different reason: it is an infrastructure key
+/// ([`impresspress_core::config_vars::is_infrastructure_key`]), so
+/// `blocks::config` answers it from the boot map whatever the `variables`
+/// table holds and `CONFIG_SET` refuses to write it. A Worker var is the only
+/// channel it has.
 pub(crate) const BUILDER_WORKER_VAR_KEYS: &[&str] = &[
     impresspress_core::config_vars::CORS_ALLOWED_ORIGINS_KEY,
     impresspress_core::config_vars::CSP_DIRECTIVES_KEY,
+    impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY,
     wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
 ];
 
@@ -97,6 +108,7 @@ pub(crate) struct CfEnvironment {
     cors_allowed_origins: Option<String>,
     csp_directives: Option<String>,
     strict_schema: Option<String>,
+    request_log: Option<String>,
 
     // ── operational knobs read by a service constructor or a request guard ───
     cf_log_level: Option<String>,
@@ -178,6 +190,7 @@ impl CfEnvironment {
                 env,
                 wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
             ),
+            request_log: var(env, impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY),
 
             cf_log_level: var(env, CF_LOG_LEVEL_KEY),
             asset_base_url: var(env, impresspress_core::ui::assets::ASSET_BASE_URL_VAR),
@@ -260,6 +273,8 @@ impl CfEnvironment {
             &self.csp_directives
         } else if key == wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY {
             &self.strict_schema
+        } else if key == impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY {
+            &self.request_log
         } else {
             return None;
         };
@@ -573,6 +588,7 @@ pub(crate) mod test_support {
             cors_allowed_origins: None,
             csp_directives: None,
             strict_schema: None,
+            request_log: None,
             cf_log_level: None,
             asset_base_url: None,
             allow_workers_dev: None,
@@ -612,6 +628,7 @@ pub(crate) mod test_support {
                 e.csp_directives = Some("v".to_string())
             }),
             ("strict_schema", |e| e.strict_schema = Some("v".to_string())),
+            ("request_log", |e| e.request_log = Some("v".to_string())),
             ("cf_log_level", |e| e.cf_log_level = Some("v".to_string())),
             ("asset_base_url", |e| {
                 e.asset_base_url = Some("v".to_string())
@@ -742,6 +759,10 @@ mod tests {
             (
                 wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
                 "1",
+            ),
+            (
+                impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY,
+                "errors",
             ),
             (CF_LOG_LEVEL_KEY, "debug"),
             (
@@ -985,6 +1006,7 @@ mod tests {
         all_set.cors_allowed_origins = Some("cors".to_string());
         all_set.csp_directives = Some("csp".to_string());
         all_set.strict_schema = Some("1".to_string());
+        all_set.request_log = Some("errors".to_string());
 
         for key in PROTECTED_ENV_KEYS.iter().chain(BUILDER_WORKER_VAR_KEYS) {
             assert!(
@@ -993,10 +1015,45 @@ mod tests {
             );
             assert!(CfEnvironment::owns_config_key(key));
         }
-        assert_eq!(all_set.config_map().len(), 4);
+        assert_eq!(all_set.config_map().len(), 5);
         assert!(!CfEnvironment::owns_config_key(
             impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY
         ));
+    }
+
+    /// `IMPRESSPRESS_REQUEST_LOG` reaches the runtime's config surfaces from a
+    /// `wrangler.toml` var, and a Worker var is the ONLY channel it has:
+    /// `config_vars::is_infrastructure_key` makes it runtime-owned, so
+    /// `blocks::config` answers it from the boot map whatever the `variables`
+    /// table holds and `CONFIG_SET` refuses to write it. Dropped from
+    /// `BUILDER_WORKER_VAR_KEYS`, `pipeline::write_request_log` would read
+    /// nothing and every deployment would silently be back on `all`.
+    #[wasm_bindgen_test]
+    fn the_request_log_policy_reaches_config_from_a_worker_var() {
+        let key = impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY;
+        assert!(
+            impresspress_core::config_vars::is_infrastructure_key(key),
+            "the key must stay infrastructure-prefixed, or the variables table \
+             could serve it",
+        );
+
+        let env = RecordingEnv::new(&[(key, "errors")]);
+        let captured = CfEnvironment::capture(&env.env);
+        assert_eq!(captured.config_value(key), Some("errors"));
+        assert_eq!(
+            captured.config_map().get(key).map(String::as_str),
+            Some("errors"),
+            "the value must reach the map both config surfaces are filled from",
+        );
+
+        let unbound = RecordingEnv::new(&[]);
+        assert!(
+            !CfEnvironment::capture(&unbound.env)
+                .config_map()
+                .contains_key(key),
+            "an unbound var must leave the key absent, which `RequestLogPolicy` \
+             reads as `all`",
+        );
     }
 
     #[wasm_bindgen_test]
