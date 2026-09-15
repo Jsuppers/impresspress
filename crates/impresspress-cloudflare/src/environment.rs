@@ -63,12 +63,15 @@ pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth
 
 /// Shared configuration consumed synchronously while the builder constructs
 /// middleware, plus the two operational knobs a deploy sets in
-/// `wrangler.toml`. Unlike block-scoped values these cannot be deferred to the
-/// D1-backed `ConfigSource`, because the flow (and the database service) already
-/// exist by the time per-block config is resolvable.
+/// `wrangler.toml`.
 ///
-/// `IMPRESSPRESS_REQUEST_LOG` is on this list for a second reason as well as
-/// that one: it is an infrastructure key
+/// Most entries are here because they cannot be deferred to the D1-backed
+/// `ConfigSource`: the flow (and the database service) already exist by the
+/// time per-block config is resolvable.
+///
+/// `IMPRESSPRESS_REQUEST_LOG` is the exception, and that reason does **not**
+/// apply to it — it is read per request, long after both exist. It is here
+/// for a different reason: it is an infrastructure key
 /// ([`impresspress_core::config_vars::is_infrastructure_key`]), so
 /// `blocks::config` answers it from the boot map whatever the `variables`
 /// table holds and `CONFIG_SET` refuses to write it. A Worker var is the only

@@ -466,6 +466,13 @@ pub async fn handle_request(
             // every attacker-minted junk URL would have counted as a 5xx and
             // been kept. Same function as the adapters use, so the two cannot
             // drift. See `an_unmatched_endpoint_is_logged_404_not_500`.
+            //
+            // The label is derived from the resolved code, not pinned to
+            // "ERROR", for the same reason the streamed-download branch above
+            // derives it: an error carrying an explicit `META_RESP_STATUS`
+            // override can resolve below 400, and a row labelled ERROR with a
+            // 2xx/3xx `status_code` would be the same disagreement in the
+            // other direction. See `the_label_follows_the_resolved_status`.
             let message = err.message.clone();
             let code = i64::from(http_codec::resolve_error_status(&err));
             let label = if code >= 400 { "ERROR" } else { "OK" };
@@ -696,18 +703,36 @@ pub const UNMATCHED_PATH_LABEL: &str = "<unmatched>";
 /// a route is a user's mistake and keeps its row; only one that names nothing
 /// at all collapses.
 ///
-/// Both halves of the routing table are consulted, because a block's declared
-/// `BlockEndpoint`s are not all of it: `extra_routes` carries the prefixes a
-/// consumer registered through `ImpresspressBuilder::add_route`, whose paths
-/// are not declared as endpoints anywhere this function can see.
+/// Three things count as naming a route, because a block's declared
+/// `BlockEndpoint`s are not all of the routing table:
 ///
-/// [`routing::ROUTES`] is deliberately NOT consulted — its entries are prefixes
-/// for blocks whose own `BlockInfo::endpoints` the caller already passes in.
+///  * **`/`**, which no block declares and every public site serves most.
+///    [`routing::route_to_block`] answers it from an arm of its own, above all
+///    block dispatch — a redirect, or the landing page through
+///    `wafer-run/web`, whose `BlockInfo` declares no endpoints at all. Without
+///    this arm the single highest-traffic request on a site would be stored in
+///    the same bucket as attacker junk, which is the opposite of what the
+///    collapse is for.
+///  * `extra_routes`, the prefixes a consumer registered through
+///    `ImpresspressBuilder::add_route`, whose paths are declared as endpoints
+///    nowhere this function can see.
+///  * every declared `BlockEndpoint` template.
+///
+/// [`routing::ROUTES`] is deliberately NOT consulted, and it is NOT redundant
+/// with the endpoint templates: its entries are prefixes, so an *undeclared*
+/// path beneath one (`/b/admin/aaa1`, `/b/admin/aaa2`, …) routes to the block
+/// and is refused by the access gate without ever matching a template.
+/// Consulting the prefixes would keep exactly those rows — the unbounded
+/// attacker-minted key space this collapse exists to close. A real endpoint
+/// under the same prefix matches its own template and is kept.
 fn resembles_a_declared_route(
     path: &str,
     block_infos: &[BlockInfo],
     extra_routes: &[ExtraRoute],
 ) -> bool {
+    if path == "/" {
+        return true;
+    }
     let normalized = normalize_for_match(path);
     if extra_routes
         .iter()
@@ -759,24 +784,46 @@ impl RequestLogPolicy {
             Self::Off => false,
         }
     }
+
+    /// Whether [`REQUEST_LOG_CEILING_PER_WINDOW`] applies.
+    ///
+    /// Only under [`Errors`](Self::Errors), and the asymmetry is the point.
+    ///
+    /// `All` is an operator saying "record everything", so a ceiling there
+    /// would be the thing that binds rather than a backstop — and it binds
+    /// *first-come-first-served*, so a flood of 200s in the first minute of an
+    /// hour would silence a genuine 5xx in the fiftieth. That is exactly the
+    /// wrong triage order, and on Cloudflare the budget is per isolate, a
+    /// count Cloudflare controls and varies by traffic and colo, so an
+    /// operator could not even predict what fraction of the audit trail
+    /// survived. A nondeterministic cap on an audit log is worse than no cap:
+    /// the operator asked for every row, and the honest answer to "that is too
+    /// many rows" is `errors`, not a silent sample of `all`.
+    ///
+    /// Under `Errors` the kept class is 5xx only, so the ceiling is a genuine
+    /// backstop against an error storm rather than a quota on ordinary
+    /// traffic, and first-come-first-served is a fair sample *within one
+    /// class*: the first 200 errors of an hour describe the storm as well as
+    /// any other 200 would.
+    fn is_bounded(self) -> bool {
+        matches!(self, Self::Errors)
+    }
 }
 
-/// The most `request_logs` rows one isolate/thread will write in one window.
+/// The most `request_logs` rows one isolate/thread will write in one window
+/// **under [`RequestLogPolicy::Errors`]** — see
+/// [`is_bounded`](RequestLogPolicy::is_bounded) for why it is that policy and
+/// no other.
 ///
-/// The backstop. [`RequestLogPolicy`] reasons about WHICH requests deserve a
-/// row; this bounds HOW MANY regardless of that reasoning being right.
+/// The backstop against an error storm: `Errors` already drops everything an
+/// attacker can mint directly, so what is left to bound is a 5xx loop the
+/// application itself generates. Real error traffic never approaches this;
+/// a storm hits it immediately.
 ///
-/// Two honest limits, neither of which this constant can fix on its own:
-///
-///  * it bounds a thread-local, so it is per *isolate* on Cloudflare and per
-///    *tokio worker thread* natively. A determined flood still multiplies by
-///    whatever that count is, which is why it is the third layer and not the
-///    only one;
-///  * on a deployment busier than this under the default `all` policy, THIS is
-///    what binds rather than the policy, and rows are dropped. That is not
-///    silent — [`claim_request_log_budget`] warns the first time each window
-///    engages — and such a deployment is the one that should be setting
-///    `errors`.
+/// It bounds a thread-local, so it is per *isolate* on Cloudflare and per
+/// *tokio worker thread* natively. A flood therefore still multiplies by
+/// whatever that count is — which is why it is a backstop behind the policy
+/// rather than the thing the policy relies on.
 pub const REQUEST_LOG_CEILING_PER_WINDOW: usize = 200;
 
 /// The ceiling's window. Long enough that a flood cannot simply wait it out at
@@ -854,7 +901,11 @@ async fn write_request_log(
     if !policy.keeps(row.status_code) {
         return;
     }
-    if !claim_request_log_budget(crate::util::now_millis()) {
+    // The budget is claimed before the insert, so a failed write still spends
+    // it. That is deliberate: under `errors` the thing worth bounding is the
+    // number of write ATTEMPTS an error storm makes, and on Cloudflare a
+    // failing D1 insert costs a subrequest exactly like a succeeding one.
+    if policy.is_bounded() && !claim_request_log_budget(crate::util::now_millis()) {
         return;
     }
     // A capability that travels in the path is redacted here rather than at
@@ -3001,8 +3052,8 @@ mod request_log_policy_tests {
     //!     choice, defaulting to today's "all of them";
     //!  2. [`UNMATCHED_PATH_LABEL`] — what a row is allowed to STORE from a
     //!     path nobody's route claims;
-    //!  3. [`REQUEST_LOG_CEILING_PER_WINDOW`] — HOW MANY rows, whatever the
-    //!     first two concluded.
+    //!  3. [`REQUEST_LOG_CEILING_PER_WINDOW`] — HOW MANY rows, under
+    //!     `errors` only, as a backstop against a 5xx storm.
     //!
     //! The status fix belongs here too rather than beside them: layer 1
     //! selects on `status_code`, so an audit tail that called every failure a
@@ -3057,13 +3108,39 @@ mod request_log_policy_tests {
         }
     }
 
+    /// Fails with an explicit `META_RESP_STATUS` below 400 — the case that
+    /// separates "the error's code" from "every error is an ERROR row".
+    struct RedirectingErrorBlock;
+
+    #[wafer_block::wafer_async_trait]
+    impl RunBlock for RedirectingErrorBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/moved", "0.1.0", "test/probe@v1", "redirect probe")
+        }
+        async fn handle(&self, _c: &dyn Context, _m: Message, _i: InputStream) -> OutputStream {
+            OutputStream::error(WaferError {
+                code: ErrorCode::Internal,
+                message: "moved".to_string(),
+                meta: vec![MetaEntry {
+                    key: wafer_run::META_RESP_STATUS.into(),
+                    value: "302".into(),
+                }],
+            })
+        }
+        async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
     const OK_ROUTE: &str = "/x/ok";
     const BOOM_ROUTE: &str = "/x/boom";
+    const MOVED_ROUTE: &str = "/x/moved";
 
     fn routes() -> Vec<ExtraRoute> {
         vec![
             ExtraRoute::new(OK_ROUTE, "test/ok", RouteAccess::Public),
             ExtraRoute::new(BOOM_ROUTE, "test/boom", RouteAccess::Public),
+            ExtraRoute::new(MOVED_ROUTE, "test/moved", RouteAccess::Public),
         ]
     }
 
@@ -3074,6 +3151,7 @@ mod request_log_policy_tests {
         }
         ctx.register_block("test/ok", Arc::new(OkBlock));
         ctx.register_block("test/boom", Arc::new(BoomBlock));
+        ctx.register_block("test/moved", Arc::new(RedirectingErrorBlock));
         ctx
     }
 
@@ -3133,6 +3211,29 @@ mod request_log_policy_tests {
             logged(&ctx).await.iter().map(|r| r.1).collect::<Vec<_>>(),
             vec![404],
             "an unroutable endpoint is a client error, not a server error",
+        );
+    }
+
+    /// The `status` label follows the resolved code rather than being pinned
+    /// to "ERROR" on the error arm. An error carrying an explicit
+    /// `META_RESP_STATUS` below 400 would otherwise produce a row labelled
+    /// ERROR with a 3xx `status_code` — the same row/response disagreement the
+    /// hardcoded 500 produced, in the other direction.
+    #[tokio::test]
+    async fn the_label_follows_the_resolved_status() {
+        let ctx = ctx_with(Some("all")).await;
+        reset_request_log_budget_for_test();
+        drive(&ctx, MOVED_ROUTE).await;
+
+        let rows = request_logs::paginated(&ctx, 1, 10, "")
+            .await
+            .expect("list request_logs")
+            .rows;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].status_code, 302, "the override wins over the code");
+        assert_eq!(
+            rows[0].status, "OK",
+            "a sub-400 status must not be labelled ERROR",
         );
     }
 
@@ -3235,8 +3336,15 @@ mod request_log_policy_tests {
     /// The other half of that rule, and the reason it is not "every 404": a
     /// path that DOES name a route keeps its row readable. Here the route
     /// exists and the block refuses the request — the diagnostic case an
-    /// operator opens the log for, and the shape
-    /// `secret_path_redaction_tests` depends on for a near-miss share link.
+    /// operator opens the log for.
+    ///
+    /// Note what this does NOT cover, because an earlier draft of this comment
+    /// claimed it did: `secret_path_redaction_tests`' near-miss share link is
+    /// saved by the REDACTION arm, which fires first and returns `Some`, so
+    /// `resembles_a_declared_route` never runs for it. The two arms overlap by
+    /// construction — redaction matches a subset of the templates this
+    /// function matches — so the ordering is belt-and-braces, not load-bearing
+    /// for that case.
     #[tokio::test]
     async fn a_path_that_names_a_route_is_stored_even_when_it_fails() {
         let ctx = ctx_with(Some("all")).await;
@@ -3249,19 +3357,101 @@ mod request_log_policy_tests {
         );
     }
 
-    /// The backstop. Whatever the policy concluded, one isolate cannot be made
-    /// to write without limit — this is what makes the worst case bounded.
+    /// The backstop, under the one policy that has it: an error storm cannot
+    /// make one isolate write without limit.
     #[tokio::test]
-    async fn a_flood_cannot_exceed_the_per_isolate_write_ceiling() {
-        let ctx = ctx_with(Some("all")).await;
+    async fn an_error_storm_cannot_exceed_the_per_isolate_write_ceiling() {
+        let ctx = ctx_with(Some("errors")).await;
         reset_request_log_budget_for_test();
         for _ in 0..(REQUEST_LOG_CEILING_PER_WINDOW + 25) {
-            drive(&ctx, OK_ROUTE).await;
+            drive(&ctx, BOOM_ROUTE).await;
         }
         assert_eq!(
             logged(&ctx).await.len(),
             REQUEST_LOG_CEILING_PER_WINDOW,
-            "the ceiling must hold no matter how many requests arrive",
+            "under `errors` the ceiling must hold no matter how many arrive",
+        );
+    }
+
+    /// …and `all` has no ceiling at all.
+    ///
+    /// An operator who asked to record everything gets everything. A ceiling
+    /// here would bind before the policy did, and it would bind
+    /// first-come-first-served — so a flood of 200s early in a window would
+    /// silence a genuine 5xx later in it, which is the wrong way round. The
+    /// honest answer to "that is too many rows" is `errors`, not a silent
+    /// sample of `all`. This drives past the ceiling deliberately: it is what
+    /// makes `the_default_policy_logs_every_request`'s name true rather than
+    /// true only for the first two requests.
+    #[tokio::test]
+    async fn the_all_policy_has_no_ceiling() {
+        let ctx = ctx_with(Some("all")).await;
+        reset_request_log_budget_for_test();
+        let total = REQUEST_LOG_CEILING_PER_WINDOW + 25;
+        for _ in 0..total {
+            drive(&ctx, OK_ROUTE).await;
+        }
+        assert_eq!(
+            logged(&ctx).await.len(),
+            total,
+            "`all` means all — no row may be dropped by a write ceiling",
+        );
+    }
+
+    /// The ceiling is the policy's, not the writer's: a 5xx that `all` would
+    /// have kept must not be refused because an `errors` run earlier in the
+    /// same window exhausted the budget. Pins that `is_bounded` gates the
+    /// claim rather than the claim happening regardless and being ignored.
+    #[tokio::test]
+    async fn an_exhausted_budget_does_not_reach_the_all_policy() {
+        reset_request_log_budget_for_test();
+        // The CURRENT window, not an arbitrary timestamp: `write_request_log`
+        // claims against `now_millis()`, so a budget filled at ms 1000 would
+        // simply have rolled over by then and the test would pass without
+        // exercising anything.
+        let now = crate::util::now_millis();
+        for _ in 0..REQUEST_LOG_CEILING_PER_WINDOW {
+            assert!(claim_request_log_budget(now));
+        }
+        assert!(
+            !claim_request_log_budget(now),
+            "pre-condition: this window is exhausted",
+        );
+
+        let ctx = ctx_with(Some("all")).await;
+        drive(&ctx, BOOM_ROUTE).await;
+        assert_eq!(
+            logged(&ctx).await,
+            vec![(BOOM_ROUTE.to_string(), 500)],
+            "`all` must not consult a budget it does not have",
+        );
+    }
+
+    #[tokio::test]
+    async fn repro_site_root_is_not_collapsed() {
+        let ctx = ctx_with(Some("all")).await;
+        reset_request_log_budget_for_test();
+        set_request_log_mode(RequestLogMode::Inline);
+        let infos = crate::test_support::real_block_infos();
+        let out = handle_request(
+            &ctx,
+            anon_msg("retrieve", "/"),
+            InputStream::empty(),
+            None,
+            "test-secret",
+            false,
+            &AllEnabled,
+            &infos,
+            &[],
+        )
+        .await;
+        let _ = out.collect_buffered().await;
+        let rows = logged(&ctx).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].0, "/",
+            "the site root is the highest-traffic route on any public site; \
+             collapsing it destroys the signal the collapse exists to create",
         );
     }
 
@@ -3290,6 +3480,19 @@ mod request_log_policy_tests {
         assert!(RequestLogPolicy::Errors.keeps(500));
         assert!(RequestLogPolicy::Errors.keeps(503));
         assert!(!RequestLogPolicy::Off.keeps(500));
+
+        assert!(
+            RequestLogPolicy::Errors.is_bounded(),
+            "the ceiling is a backstop against a 5xx storm",
+        );
+        assert!(
+            !RequestLogPolicy::All.is_bounded(),
+            "`all` means all; a ceiling there would bind before the policy did",
+        );
+        assert!(
+            !RequestLogPolicy::Off.is_bounded(),
+            "`off` writes nothing, so there is nothing to bound",
+        );
     }
 
     /// The window rolls over, so a ceiling reached during an incident does not
