@@ -353,7 +353,7 @@ where
     // one retained by the isolate-cached runtime.
     let rows = impresspress_core::pipeline::drain_queued_request_logs();
     if !rows.is_empty() {
-        match make_d1_database_service_concrete(&env, runner::D1_BINDING) {
+        match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING) {
             Ok(batch_db) => {
                 ctx.wait_until(async move {
                     let mut by_table: std::collections::HashMap<

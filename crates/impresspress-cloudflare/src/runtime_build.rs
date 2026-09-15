@@ -225,6 +225,7 @@ where
     // 1. Construct D1 service (with KV cache) first — env vars live in D1.
     let (db, _kv, _batch_db) = make_kv_cached_database_service_with_backend(
         env,
+        environment,
         runner::D1_BINDING,
         runner::KV_BINDING,
         cache_mode,
@@ -569,6 +570,7 @@ pub(crate) fn warm_request_services(
 ) -> Result<std::rc::Rc<request_services::RequestServices>, Box<dyn std::error::Error>> {
     let (db, _kv, _batch_db) = make_kv_cached_database_service_with_backend(
         env,
+        environment,
         runner::D1_BINDING,
         runner::KV_BINDING,
         kv_cached_db::CacheMode::default(),
