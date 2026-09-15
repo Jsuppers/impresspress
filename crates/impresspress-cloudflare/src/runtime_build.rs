@@ -200,6 +200,25 @@ pub(crate) async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<Bo
 /// same tolerance is owed by the `wrap_grants` read the callers make, which is
 /// now `GrantSource::Database` inside `impresspress_core::builder::boot`
 /// rather than a call in this crate.
+///
+/// Both reads own that tolerance explicitly, through
+/// `DatabaseService::schema_table_exists`. Neither may go back to leaning on
+/// `DbExec::list`'s table-existence guard, because STRICT_SCHEMA — which the
+/// generated `wrangler.toml` sets on every deploy, and which this crate now
+/// applies from construction rather than only at `Init` — disables exactly
+/// that guard: `table_present_for_op` returns `Ok(true)` unconditionally in
+/// strict mode, so the SELECT reaches the backend and gets "no such table".
+/// `block_settings`' own
+/// `read_rows` documents the probe; `repro_cold_start_under_strict_schema`
+/// pins it.
+///
+/// Every other read on this pre-migration window is already safe by ordering,
+/// not by luck: `D1ConfigSource` is reached only through
+/// `ConfigSource::load_for_block`, which short-circuits for a block declaring
+/// no config keys — and `boot` initializes `impresspress/admin`, which
+/// declares none, before any block that does, so the `variables` table exists
+/// by the time anything reads it. `migration_helper::read_state` reads the
+/// config snapshot, not the database.
 // Eight arguments. The captured environment is deliberately a parameter rather
 // than something re-derived from `env` here: reading a var twice per request is
 // exactly what `CfEnvironment` exists to stop, and a function that could reach

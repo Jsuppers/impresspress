@@ -54,11 +54,23 @@ pub(crate) fn make_d1_database_service_concrete(
     environment: &crate::environment::CfEnvironment,
     binding: &str,
 ) -> Result<Arc<database::D1DatabaseService>, worker::Error> {
-    let db = env.d1(binding)?;
-    Ok(Arc::new(database::D1DatabaseService::new(
-        db,
-        environment.strict_schema_enabled(),
-    )))
+    Ok(Arc::new(d1_service(env.d1(binding)?, environment)))
+}
+
+/// The environment → adapter joint, split out from the binding lookup above so
+/// it can be tested.
+///
+/// `env.d1(binding)` resolves a real Worker binding — a `dyn_into` that no
+/// fake `Env` satisfies, and CI has no workerd D1 — so
+/// [`make_d1_database_service_concrete`] as a whole cannot run under
+/// `wasm-bindgen-test`. Everything it decides is here, where a test can hand
+/// in a handle directly; what stays uncovered is the binding lookup and the
+/// `Arc`. See `the_service_takes_its_strict_verdict_from_the_environment`.
+pub(crate) fn d1_service(
+    db: worker::D1Database,
+    environment: &crate::environment::CfEnvironment,
+) -> database::D1DatabaseService {
+    database::D1DatabaseService::new(db, environment.strict_schema_enabled())
 }
 
 /// Construct a [`DatabaseService`] backed by D1 with a Cloudflare KV cache
@@ -256,4 +268,45 @@ pub(crate) fn resolved_log_level(
 /// CF Workers are stateless.
 pub fn make_config_service(vars: HashMap<String, String>) -> Arc<dyn ConfigService> {
     Arc::new(config_service::HashMapConfigService::new(vars))
+}
+
+#[cfg(test)]
+mod tests {
+    use wafer_core::interfaces::database::exec::DbExec;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+    use crate::environment::test_support::empty_environment;
+
+    /// A `D1Database` that is never queried — see `database::tests`, which
+    /// uses the same handle for the same reason: `DbExec::strict_schema` is
+    /// plain Rust state, so the `undefined` is never dereferenced.
+    fn never_queried_handle() -> worker::D1Database {
+        wasm_bindgen::JsCast::unchecked_into::<worker::D1Database>(
+            wasm_bindgen::JsValue::undefined(),
+        )
+    }
+
+    /// The joint between the environment and the adapter.
+    ///
+    /// `database::tests` proves the adapter honours whatever verdict it is
+    /// constructed with, and `environment::tests` proves the environment reads
+    /// the var the way wafer-core does. Neither sees whether this crate
+    /// actually connects the two — a hardcoded `false` here would pass both.
+    #[wasm_bindgen_test]
+    fn the_service_takes_its_strict_verdict_from_the_environment() {
+        let mut on = empty_environment();
+        on.set_strict_schema_for_test("true");
+        assert!(
+            DbExec::strict_schema(&d1_service(never_queried_handle(), &on)),
+            "a deploy that sets the var must get a strict service",
+        );
+
+        let off = empty_environment();
+        assert!(
+            !DbExec::strict_schema(&d1_service(never_queried_handle(), &off)),
+            "and one that does not must not — a hardcoded `true` is as wrong \
+             as a hardcoded `false`",
+        );
+    }
 }

@@ -297,6 +297,13 @@ impl CfEnvironment {
         self.jwt_secret = Some(value.to_string());
     }
 
+    /// Bind `WAFER_RUN__DATABASE__STRICT_SCHEMA` to the raw string a Worker
+    /// var would carry. Test-only, same rule as above.
+    #[cfg(test)]
+    pub(crate) fn set_strict_schema_for_test(&mut self, value: &str) {
+        self.strict_schema = Some(value.to_string());
+    }
+
     /// The deployed Worker version id, when the `[version_metadata]` binding is
     /// configured and non-empty.
     pub(crate) fn worker_version(&self) -> Option<&str> {
