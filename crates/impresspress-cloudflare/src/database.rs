@@ -31,14 +31,24 @@
 //!   schema-*mutation* methods never run on the live path (schema is
 //!   migration-owned; a runtime mutation attempt is an explicit error, see the
 //!   `DatabaseService` impl) and so touch no cache.
-//! - [`strict_schema`](DbExec::strict_schema) reads a flag applied once at
-//!   lifecycle `Init` via [`set_strict_schema`](DatabaseService::set_strict_schema)
-//!   (the shared `wafer-run/database` handler reads
-//!   `WAFER_RUN__DATABASE__STRICT_SCHEMA` from `ctx.config_get`). When set the
-//!   executor trusts the migrated schema and skips introspection *entirely* —
-//!   no table-exists probe, no lazy column-add — removing it from the hot path.
+//! - [`strict_schema`](DbExec::strict_schema) reads a flag seeded at
+//!   construction from the deploy's `WAFER_RUN__DATABASE__STRICT_SCHEMA` var
+//!   (see [`D1DatabaseService::new`]) and re-applied at lifecycle `Init` via
+//!   [`set_strict_schema`](DatabaseService::set_strict_schema) for the one
+//!   service a Wafer runtime is built around (the shared `wafer-run/database`
+//!   handler reads the same var from `ctx.config_get`). When set the executor
+//!   trusts the migrated schema and skips introspection *entirely* — no
+//!   table-exists probe, no lazy column-add — removing it from the hot path.
 //!   Production CF deploys enable it (wrangler `[vars]`); a write/query
 //!   referencing an unmigrated column then fails loudly, as intended.
+//!
+//!   Seeding at construction is what covers the D1 services that never reach
+//!   an `Init`: the request-log drain's batch handle, built per request inside
+//!   `run_with_config` and used from `ctx.wait_until`, and the handle
+//!   `build_runtime` reads `block_settings` through before a runtime exists.
+//!   Each is discarded with the request, so its `SchemaCache` is always cold —
+//!   a drain-only site with strict off pays one `pragma_table_info` per insert
+//!   batch forever, which is the cost this seeding removes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -64,20 +74,36 @@ pub struct D1DatabaseService {
     /// by it on every schema mutation. Unused while `strict_schema` is set
     /// (strict mode skips introspection outright).
     schema_cache: SchemaCache,
-    /// STRICT_SCHEMA flag; applied once at lifecycle `Init` via
-    /// [`DatabaseService::set_strict_schema`]. When set, the shared executor
-    /// skips schema introspection entirely. `AtomicBool` (not `Cell`) so the
-    /// struct keeps the `Sync` bound `Arc<dyn DatabaseService>` needs; on
-    /// wasm32's single thread the ordering is immaterial.
+    /// STRICT_SCHEMA flag. Seeded at construction from the deploy's
+    /// `WAFER_RUN__DATABASE__STRICT_SCHEMA` var, and re-applied at lifecycle
+    /// `Init` via [`DatabaseService::set_strict_schema`] for the one service a
+    /// Wafer runtime is built around. When set, the shared executor skips
+    /// schema introspection entirely. `AtomicBool` (not `Cell`) so the struct
+    /// keeps the `Sync` bound `Arc<dyn DatabaseService>` needs; on wasm32's
+    /// single thread the ordering is immaterial.
     strict_schema: AtomicBool,
 }
 
 impl D1DatabaseService {
-    pub fn new(db: D1Database) -> Self {
+    /// Wrap a D1 binding, with this deploy's STRICT_SCHEMA verdict already
+    /// applied.
+    ///
+    /// `strict_schema` is a parameter rather than a `false` default a caller
+    /// may later overwrite because not every D1 service reaches a lifecycle
+    /// `Init`: the request-log drain handle and `build_runtime`'s pre-`Init`
+    /// `block_settings` read are both constructed outside any runtime, and a
+    /// default would silently put them on the always-introspect path. Callers
+    /// get the verdict from
+    /// [`CfEnvironment::strict_schema_enabled`](crate::environment::CfEnvironment::strict_schema_enabled).
+    ///
+    /// `Init` still calls [`DatabaseService::set_strict_schema`] on the
+    /// runtime's own service; it reads the same var through `ctx.config_get`,
+    /// so it re-affirms this value rather than contradicting it.
+    pub fn new(db: D1Database, strict_schema: bool) -> Self {
         Self {
             db,
             schema_cache: SchemaCache::new(),
-            strict_schema: AtomicBool::new(false),
+            strict_schema: AtomicBool::new(strict_schema),
         }
     }
 
@@ -750,5 +776,58 @@ mod tests {
         assert_eq!(scalar_i64(None), 0);
         assert_eq!(scalar_f64(Some(serde_json::json!({"total": 2.5}))), 2.5);
         assert_eq!(scalar_f64(None), 0.0);
+    }
+
+    /// A `D1Database` that is never queried.
+    ///
+    /// `unchecked_into` only re-types the `JsValue`; it calls nothing on it.
+    /// The tests below read `DbExec::strict_schema`, which is plain Rust state
+    /// on the adapter (`AtomicBool`), so the `undefined` handle is never
+    /// dereferenced. Constructing a *usable* one needs a workerd D1 binding,
+    /// which neither this runner nor CI has — see the module note above and
+    /// `conformance.rs`.
+    fn never_queried_handle() -> D1Database {
+        wasm_bindgen::JsCast::unchecked_into::<D1Database>(JsValue::undefined())
+    }
+
+    /// The verdict a D1 service is *born* with is the one the executor reads.
+    ///
+    /// This is what covers the two services that never reach a lifecycle
+    /// `Init` — the request-log drain handle in `run_with_config` and
+    /// `build_runtime`'s pre-`Init` `block_settings` read. Both are built and
+    /// dropped inside one request, so `set_strict_schema` is never called on
+    /// them and their `SchemaCache` never warms: with strict off,
+    /// `create_many`'s `DbExec::ensure_data_columns` introspects on every
+    /// single drain.
+    #[wasm_bindgen_test]
+    fn a_d1_service_is_born_with_the_deploys_strict_schema_verdict() {
+        let strict = D1DatabaseService::new(never_queried_handle(), true);
+        assert!(
+            DbExec::strict_schema(&strict),
+            "a service constructed with STRICT_SCHEMA on must already skip \
+             introspection — nothing calls `set_strict_schema` on the drain or \
+             pre-Init handles",
+        );
+
+        let lax = D1DatabaseService::new(never_queried_handle(), false);
+        assert!(
+            !DbExec::strict_schema(&lax),
+            "and a service constructed with it off must still introspect",
+        );
+    }
+
+    /// `Init` must still be able to speak. `handle_lifecycle` calls
+    /// `set_strict_schema` on the runtime's own service after construction; on
+    /// Cloudflare it reads the same var, so it normally re-affirms the seeded
+    /// value — but the setter has to remain the authority, not be shadowed by
+    /// the constructor.
+    #[wasm_bindgen_test]
+    fn lifecycle_init_still_overrides_the_constructed_verdict() {
+        let svc = D1DatabaseService::new(never_queried_handle(), false);
+        DatabaseService::set_strict_schema(&svc, true);
+        assert!(DbExec::strict_schema(&svc));
+
+        DatabaseService::set_strict_schema(&svc, false);
+        assert!(!DbExec::strict_schema(&svc));
     }
 }

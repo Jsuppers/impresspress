@@ -28,7 +28,12 @@ pub fn make_d1_database_service(
     env: &worker::Env,
     binding: &str,
 ) -> Result<Arc<dyn DatabaseService>, worker::Error> {
-    Ok(make_d1_database_service_concrete(env, binding)?)
+    let environment = crate::environment::CfEnvironment::capture(env);
+    Ok(make_d1_database_service_concrete(
+        env,
+        &environment,
+        binding,
+    )?)
 }
 
 /// Concrete-typed variant of [`make_d1_database_service`]. Used internally
@@ -36,12 +41,36 @@ pub fn make_d1_database_service(
 /// `DatabaseService` trait object — e.g. the audit-log batch-insert path in
 /// `run()`, which needs D1's native `batch()` API via
 /// [`database::D1DatabaseService::create_many`].
+///
+/// `environment` is a parameter rather than a capture of its own for the same
+/// reason [`build_runtime`](crate::runtime_build::build_runtime) takes one:
+/// every internal caller already holds the request's capture, and a
+/// constructor that could reach for `env.var` itself would put the duplicate
+/// per-request var reads `CfEnvironment` exists to stop back on the path. The
+/// public wrappers above capture because a consumer hands them only an `Env`
+/// — the same shape [`make_console_logger`] uses.
 pub(crate) fn make_d1_database_service_concrete(
     env: &worker::Env,
+    environment: &crate::environment::CfEnvironment,
     binding: &str,
 ) -> Result<Arc<database::D1DatabaseService>, worker::Error> {
-    let db = env.d1(binding)?;
-    Ok(Arc::new(database::D1DatabaseService::new(db)))
+    Ok(Arc::new(d1_service(env.d1(binding)?, environment)))
+}
+
+/// The environment → adapter joint, split out from the binding lookup above so
+/// it can be tested.
+///
+/// `env.d1(binding)` resolves a real Worker binding — a `dyn_into` that no
+/// fake `Env` satisfies, and CI has no workerd D1 — so
+/// [`make_d1_database_service_concrete`] as a whole cannot run under
+/// `wasm-bindgen-test`. Everything it decides is here, where a test can hand
+/// in a handle directly; what stays uncovered is the binding lookup and the
+/// `Arc`. See `the_service_takes_its_strict_verdict_from_the_environment`.
+pub(crate) fn d1_service(
+    db: worker::D1Database,
+    environment: &crate::environment::CfEnvironment,
+) -> database::D1DatabaseService {
+    database::D1DatabaseService::new(db, environment.strict_schema_enabled())
 }
 
 /// Construct a [`DatabaseService`] backed by D1 with a Cloudflare KV cache
@@ -65,8 +94,10 @@ pub fn make_kv_cached_database_service(
     d1_binding: &str,
     kv_binding: &str,
 ) -> Result<Arc<dyn DatabaseService>, worker::Error> {
+    let environment = crate::environment::CfEnvironment::capture(env);
     let (db, _backend, _batch_db) = make_kv_cached_database_service_with_backend(
         env,
+        &environment,
         d1_binding,
         kv_binding,
         kv_cached_db::CacheMode::default(),
@@ -96,11 +127,12 @@ type KvCachedDbServiceWithBackend = (
 
 pub(crate) fn make_kv_cached_database_service_with_backend(
     env: &worker::Env,
+    environment: &crate::environment::CfEnvironment,
     d1_binding: &str,
     kv_binding: &str,
     mode: kv_cached_db::CacheMode,
 ) -> Result<KvCachedDbServiceWithBackend, worker::Error> {
-    let d1 = make_d1_database_service_concrete(env, d1_binding)?;
+    let d1 = make_d1_database_service_concrete(env, environment, d1_binding)?;
     let inner: Arc<dyn DatabaseService> = d1.clone();
     let backend = make_kv_backend(env, kv_binding)?;
     let db = Arc::new(kv_cached_db::KvCachedD1DatabaseService::with_mode(
@@ -236,4 +268,45 @@ pub(crate) fn resolved_log_level(
 /// CF Workers are stateless.
 pub fn make_config_service(vars: HashMap<String, String>) -> Arc<dyn ConfigService> {
     Arc::new(config_service::HashMapConfigService::new(vars))
+}
+
+#[cfg(test)]
+mod tests {
+    use wafer_core::interfaces::database::exec::DbExec;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+    use crate::environment::test_support::empty_environment;
+
+    /// A `D1Database` that is never queried — see `database::tests`, which
+    /// uses the same handle for the same reason: `DbExec::strict_schema` is
+    /// plain Rust state, so the `undefined` is never dereferenced.
+    fn never_queried_handle() -> worker::D1Database {
+        wasm_bindgen::JsCast::unchecked_into::<worker::D1Database>(
+            wasm_bindgen::JsValue::undefined(),
+        )
+    }
+
+    /// The joint between the environment and the adapter.
+    ///
+    /// `database::tests` proves the adapter honours whatever verdict it is
+    /// constructed with, and `environment::tests` proves the environment reads
+    /// the var the way wafer-core does. Neither sees whether this crate
+    /// actually connects the two — a hardcoded `false` here would pass both.
+    #[wasm_bindgen_test]
+    fn the_service_takes_its_strict_verdict_from_the_environment() {
+        let mut on = empty_environment();
+        on.set_strict_schema_for_test("true");
+        assert!(
+            DbExec::strict_schema(&d1_service(never_queried_handle(), &on)),
+            "a deploy that sets the var must get a strict service",
+        );
+
+        let off = empty_environment();
+        assert!(
+            !DbExec::strict_schema(&d1_service(never_queried_handle(), &off)),
+            "and one that does not must not — a hardcoded `true` is as wrong \
+             as a hardcoded `false`",
+        );
+    }
 }

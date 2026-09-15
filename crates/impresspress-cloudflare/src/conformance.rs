@@ -44,7 +44,9 @@
 //!   binding). Smallest change that would close the gap: a `wrangler dev` /
 //!   miniflare (workerd) test harness with a `[[d1_databases]]` binding — or
 //!   the `@cloudflare/vitest-pool-workers` runner — invoking
-//!   `run_conformance(&D1DatabaseService::new(env.d1("DB")?)).await`. The suite
+//!   `run_conformance(&D1DatabaseService::new(env.d1("DB")?, false)).await`
+//!   (the suite's first act is `set_strict_schema(false)` anyway — it exercises
+//!   the lazy-column paths strict mode skips). The suite
 //!   already drops-then-creates its own `conf_*` tables, so it is safe against
 //!   a persistent D1 instance.
 //!

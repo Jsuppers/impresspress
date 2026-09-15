@@ -192,19 +192,56 @@ fn settings_from_rows(rows: &[BlockSettingsRow]) -> BlockSettings {
 /// Built by `cache_key` rather than open-coded: that shape is what
 /// `read_key` recognizes as the cacheable full-table read, so a local
 /// literal here could drift out of cache coverage silently.
+///
+/// # The missing table is this function's own problem
+///
+/// A first-ever deploy reads this table BEFORE anything has created it:
+/// `/_deploy/prepare` builds a runtime, and only the next line runs the
+/// migrations. So "table absent" is an ordinary cold start here and must
+/// yield no rows, while every other failure must propagate — fabricating
+/// [`BlockSettings::default`] out of an outage reports every block enabled.
+///
+/// That tolerance used to be inherited from `DbExec::list`, which returns
+/// `Ok(RecordList::default())` for a table its `table_present_for_op` guard
+/// says is absent. **STRICT_SCHEMA disables that guard**: it makes
+/// `table_present_for_op` return `Ok(true)` unconditionally (trusting the
+/// migrated schema is the whole point), so the SELECT runs and the backend
+/// answers "no such table". Cloudflare deploys set the var, so relying on
+/// that guard made the cold start depend on a flag that exists to remove it.
+///
+/// The probe is [`DatabaseService::schema_table_exists`], which `DbExec`
+/// deliberately routes past `table_present_for_op` straight to
+/// `dbx_table_exists` and which strict mode therefore does not disable.
+/// [`crate::platform_state::wrap_grants::load`] — the other read on this
+/// same pre-migration path — probes the same way.
+///
+/// It runs only AFTER a failed read, where `wrap_grants` probes first,
+/// because this read is the one the Cloudflare KV row cache is built to
+/// serve (`cache_key::read_key`): probing first would spend a database
+/// round-trip on every cold isolate start even when the cache could answer
+/// the list without one. On a healthy deployment the table exists, the list
+/// succeeds, and the probe never runs at all.
 async fn read_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<BlockSettingsRow>, DatabaseError> {
     let opts = crate::cache_key::full_table_list_opts();
-    let listed = db.list(TABLE, &opts).await.map_err(|e| {
-        // Not the missing-table case (that's `Ok(empty)`, handled inside
-        // `list` itself) — a genuine operational error. Do not fabricate
-        // all-enabled; propagate so the caller fails closed.
-        tracing::error!(
-            error = %e,
-            "block_settings list failed (operational error, not a missing table); \
-             refusing to fabricate all-enabled defaults"
-        );
-        e
-    })?;
+    let listed = match db.list(TABLE, &opts).await {
+        Ok(listed) => listed,
+        Err(e) => {
+            // A probe that cannot answer is not evidence the table is there,
+            // so anything but a definite `false` keeps the original error.
+            if let Ok(false) = db.schema_table_exists(TABLE).await {
+                tracing::debug!(
+                    "block_settings table absent (fresh boot before migrations); no rows"
+                );
+                return Ok(Vec::new());
+            }
+            tracing::error!(
+                error = %e,
+                "block_settings list failed (operational error, not a missing table); \
+                 refusing to fabricate all-enabled defaults"
+            );
+            return Err(e);
+        }
+    };
     Ok(decode_rows(
         listed.records.iter().map(|r| (r.id.as_str(), &r.data)),
     ))
@@ -644,6 +681,27 @@ mod load_and_seed_tests {
         .collect()
     }
 
+    /// A first-ever deploy's database: opened, nothing created.
+    fn unmigrated_db() -> Arc<dyn DatabaseService> {
+        Arc::new(
+            wafer_block_sqlite::service::SQLiteDatabaseService::open_in_memory()
+                .expect("open in-memory sqlite"),
+        )
+    }
+
+    #[tokio::test]
+    async fn repro_cold_start_under_strict_schema() {
+        let db = unmigrated_db();
+        db.set_strict_schema(true);
+        let result = load(&db).await;
+        assert!(
+            result.is_ok(),
+            "a first deploy builds its runtime BEFORE migrations run, so this \
+             read must tolerate the missing table even under STRICT_SCHEMA: {:?}",
+            result.err(),
+        );
+    }
+
     /// A `DatabaseService` with the admin schema applied through the
     /// pre-wafer DDL runner (the migration-file-runner exception to the
     /// no-raw-SQL rule), so the table under test is the one production
@@ -907,8 +965,13 @@ mod operational_error_tests {
             unreachable!()
         }
 
+        /// The table IS there; the failure this mock injects is operational.
+        /// `read_rows` probes here after a failed list to tell the two apart,
+        /// so answering `true` is what makes
+        /// `genuine_read_error_propagates_instead_of_fabricating_all_enabled`
+        /// test the case it is named for rather than the cold-start case.
         async fn schema_table_exists(&self, _name: &str) -> Result<bool, DatabaseError> {
-            unreachable!()
+            Ok(true)
         }
 
         async fn schema_drop_table(&self, _name: &str) -> Result<(), DatabaseError> {

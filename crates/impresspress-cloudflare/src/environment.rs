@@ -127,6 +127,29 @@ fn secret(env: &worker::Env, name: &str) -> Option<String> {
     env.secret(name).ok().map(|value| value.to_string())
 }
 
+/// Interpret a bound `WAFER_RUN__DATABASE__STRICT_SCHEMA` value exactly as
+/// `wafer-core` does.
+///
+/// This deliberately mirrors `wafer-core`'s private `config_flag_enabled`
+/// (`interfaces/database/handler.rs`), which is what
+/// `handle_lifecycle` applies at `Init`: trimmed, `"true"` case-insensitively
+/// or `"1"`, and nothing else. Both readings are of the *same* var — the
+/// constructor's, through [`CfEnvironment::strict_schema_enabled`], and
+/// `Init`'s, through `ctx.config_get` on a config map this environment fills
+/// (`BUILDER_WORKER_VAR_KEYS`) — so a value the two disagreed about would put a
+/// runtime's own D1 service and its drain handle into different modes.
+///
+/// It is therefore NOT
+/// [`impresspress_core::config_vars::is_truthy`], the repository's general
+/// yes/no predicate: that one also accepts `"yes"` and `"on"`, which
+/// `wafer-core` reads as disabled. The test
+/// `strict_schema_reads_the_flag_the_way_wafer_core_does` in this module's
+/// `tests` pins the difference.
+fn strict_schema_flag_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("true") || value == "1"
+}
+
 impl CfEnvironment {
     /// Read every var and secret this crate consumes, once.
     ///
@@ -274,6 +297,13 @@ impl CfEnvironment {
         self.jwt_secret = Some(value.to_string());
     }
 
+    /// Bind `WAFER_RUN__DATABASE__STRICT_SCHEMA` to the raw string a Worker
+    /// var would carry. Test-only, same rule as above.
+    #[cfg(test)]
+    pub(crate) fn set_strict_schema_for_test(&mut self, value: &str) {
+        self.strict_schema = Some(value.to_string());
+    }
+
     /// The deployed Worker version id, when the `[version_metadata]` binding is
     /// configured and non-empty.
     pub(crate) fn worker_version(&self) -> Option<&str> {
@@ -298,6 +328,29 @@ impl CfEnvironment {
     /// way — see [`host_policy`](crate::host_policy).
     pub(crate) fn allows_workers_dev(&self) -> bool {
         self.allow_workers_dev.as_deref() == Some("1")
+    }
+
+    /// This deploy's `WAFER_RUN__DATABASE__STRICT_SCHEMA` verdict — whether a
+    /// SQL backend may trust its migrated schema and skip per-operation
+    /// introspection.
+    ///
+    /// Every D1 service this crate constructs is born with this verdict
+    /// already applied (see
+    /// [`make_d1_database_service_concrete`](crate::services::make_d1_database_service_concrete)),
+    /// because `wafer-run`'s own application of it — `handle_lifecycle`
+    /// calling [`DatabaseService::set_strict_schema`] at `Init`, from
+    /// `ctx.config_get` — only ever reaches the one service a *Wafer runtime*
+    /// was built around. Two D1 services are built outside any runtime and so
+    /// are never reached by it: the request-log drain's batch handle in
+    /// `run_with_config` (constructed per request, used inside
+    /// `ctx.wait_until`) and the handle `build_runtime` reads `block_settings`
+    /// through before it has a runtime to run `Init` on.
+    ///
+    /// [`DatabaseService::set_strict_schema`]: wafer_core::interfaces::database::service::DatabaseService::set_strict_schema
+    pub(crate) fn strict_schema_enabled(&self) -> bool {
+        self.strict_schema
+            .as_deref()
+            .is_some_and(strict_schema_flag_enabled)
     }
 
     /// The deploy-token secret. `None` disables the `/_deploy/*` control plane
@@ -772,6 +825,45 @@ mod tests {
             .prepared_runtime_identity()
             .expect("a fully bound prepared-runtime contract parses");
         assert_eq!(prepared.application_id, "app");
+    }
+
+    /// The STRICT_SCHEMA verdict every D1 service is constructed with must be
+    /// the one `wafer-core` would reach from the same string, because
+    /// `handle_lifecycle` re-applies the var through `ctx.config_get` on the
+    /// runtime's own service. If the two readings disagreed, that service and
+    /// the request-log drain's handle would run in different modes off one var.
+    ///
+    /// `"yes"` and `"on"` are the rows that matter: they are true for
+    /// [`impresspress_core::config_vars::is_truthy`], the repository's general
+    /// yes/no predicate, and false for `wafer-core`'s `config_flag_enabled`.
+    /// Swapping `strict_schema_flag_enabled` for `is_truthy` fails here.
+    #[wasm_bindgen_test]
+    fn strict_schema_reads_the_flag_the_way_wafer_core_does() {
+        let key = wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY;
+        let enabled_by = ["true", "TRUE", "True", " true ", "1", " 1 "];
+        let disabled_by = ["", " ", "0", "false", "yes", "on", "YES", "ON", "enabled"];
+
+        for value in enabled_by {
+            let env = RecordingEnv::new(&[(key, value)]);
+            assert!(
+                CfEnvironment::capture(&env.env).strict_schema_enabled(),
+                "{value:?} enables STRICT_SCHEMA for wafer-core, so it must here",
+            );
+        }
+        for value in disabled_by {
+            let env = RecordingEnv::new(&[(key, value)]);
+            assert!(
+                !CfEnvironment::capture(&env.env).strict_schema_enabled(),
+                "{value:?} does NOT enable STRICT_SCHEMA for wafer-core, so it \
+                 must not here",
+            );
+        }
+
+        let unbound = RecordingEnv::new(&[]);
+        assert!(
+            !CfEnvironment::capture(&unbound.env).strict_schema_enabled(),
+            "an unset var is off, matching wafer-core's `is_some_and`",
+        );
     }
 
     /// An absent binding is `None`, not an empty string, and reading it still
