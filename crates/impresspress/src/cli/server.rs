@@ -223,6 +223,17 @@ pub async fn build_native_runtime(
     let strict_schema =
         std::env::var(wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY).ok();
 
+    // `IMPRESSPRESS_REQUEST_LOG`: the same shape, and threaded here for a
+    // second reason on top of the one above. It is an infrastructure key
+    // (`config_vars::is_infrastructure_key`), so `blocks::config` answers it
+    // from the boot map whatever the `variables` table holds and `CONFIG_SET`
+    // refuses to write it — the process environment is the only channel it
+    // has. `filter_to_declared_keys` would drop it too: it is nobody's
+    // declared `ConfigVar`, deliberately, because it is an operator deploy
+    // decision rather than an admin-editable runtime toggle.
+    // `pipeline::write_request_log` reads it per request via `config_get`.
+    let request_log = std::env::var(impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY).ok();
+
     // 7. Assemble both config surfaces once. `EnvConfigService` is the async
     // (`wafer-run/config`) read surface; the snapshot the builder installs is
     // the synchronous `ctx.config_get` surface. They must carry the same data
@@ -289,6 +300,9 @@ pub async fn build_native_runtime(
             wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
             v,
         );
+    }
+    if let Some(v) = request_log {
+        runtime_config.both(impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY, v);
     }
 
     // Dispatch on the infra config: `IMPRESSPRESS_STORAGE_TYPE` (local|s3) selects

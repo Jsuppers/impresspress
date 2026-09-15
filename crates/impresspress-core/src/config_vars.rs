@@ -19,6 +19,35 @@ use wafer_run::{ConfigVar, InputType};
 /// `WAFER_RUN_SHARED__*` entry.
 pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 
+/// What `impresspress__admin__request_logs` keeps: `all` (the default),
+/// `errors`, or `off`. See [`crate::pipeline::RequestLogPolicy`].
+///
+/// Infrastructure-prefixed on purpose. `IMPRESSPRESS_*` with no `__` is what
+/// [`is_infrastructure_key`] recognises, which makes this a deploy-time
+/// operator decision rather than an admin-editable runtime toggle:
+/// `blocks::config`'s `served_only_from_boot_map` answers it from the boot map
+/// whatever the `variables` table holds, and `CONFIG_SET` refuses to write it.
+/// Each target threads it onto both config surfaces at boot, the way
+/// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is threaded — the native CLI from the
+/// process environment, the Cloudflare worker from a `wrangler.toml` var
+/// through `CfEnvironment`. Absent means `all`, which is the behaviour every
+/// existing deployment already has.
+///
+/// # Why this exists
+///
+/// A row per request on a public unauthenticated route means anyone can mint
+/// rows by sending GETs. On Cloudflare D1 the cost is concrete — one
+/// insert is 3 rows written (the row, the `id` PRIMARY KEY autoindex, the
+/// `created_at` index), so 33,333 requests exhaust a free tier's entire
+/// 100,000 writes/day. Measured on one production site on 2026-09-04: 4,042
+/// requests/hour, about 291,000 rows/day written, and request logs were 100%
+/// of all writes.
+///
+/// `errors` keeps the only field an edge log cannot reconstruct — the app's
+/// own `error_message` on a 5xx — and drops the rest, which Cloudflare's
+/// request analytics already records for free.
+pub const REQUEST_LOG_CONFIG_KEY: &str = "IMPRESSPRESS_REQUEST_LOG";
+
 /// Shared config key: the wordmark image shown in the header and on auth
 /// pages. Blank means "no wordmark" — the templates then render the app name
 /// as text beside the brand icon.
