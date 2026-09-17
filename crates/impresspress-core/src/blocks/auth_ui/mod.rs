@@ -811,3 +811,100 @@ mod table_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod outbound_mail_wiring_tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use wafer_run::{Block, InputStream, Message, OutputStream};
+
+    use super::*;
+    use crate::{
+        blocks::auth::repo::users::{self, NewUser},
+        test_support::{anon_msg, output_json, TestContext},
+    };
+
+    /// Stands in for `impresspress/email` and counts the sends that reached
+    /// it. Answers `{"sent": true}`, so nothing here is refused for any
+    /// reason other than the budget under test.
+    struct CountingEmail(Arc<AtomicUsize>);
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for CountingEmail {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("impresspress/email", "0.0.1", "service@v1", "counting stub")
+        }
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            assert_eq!(msg.kind, "email.send_template");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ok_json(&serde_json::json!({ "sent": true }))
+        }
+    }
+
+    /// The budget only bounds anything if `handle()` hands the send helper
+    /// the block's OWN limiter and the request's own `Message`. A throwaway
+    /// `UserRateLimiter::new()` per request, or a message carrying no client
+    /// IP, would leave every unit test in `api::tests` green while the limit
+    /// did nothing per request — so this drives the real route, repeatedly,
+    /// through `routing::route_to_block`, and counts what reached the email
+    /// block.
+    #[tokio::test]
+    async fn the_mail_budget_survives_across_requests_to_the_real_route() {
+        let mut ctx = TestContext::with_auth_and_crypto().await;
+        users::insert(
+            &ctx,
+            NewUser {
+                email: "known@example.com".into(),
+                display_name: "Known".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: true,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("insert user");
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        ctx.register_block(
+            "impresspress/email",
+            Arc::new(CountingEmail(Arc::clone(&sends))),
+        );
+        ctx.register_block("impresspress/auth-ui", Arc::new(AuthUiBlock::new()));
+
+        let budget = crate::blocks::rate_limit::RateLimit::AUTH_EMAIL.max_requests as usize;
+        let mut bodies = Vec::new();
+        for _ in 0..budget + 1 {
+            let mut msg = anon_msg("create", "/b/auth/api/forgot-password");
+            msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.9");
+            let body = serde_json::to_vec(&serde_json::json!({ "email": "known@example.com" }))
+                .expect("serialize body");
+            bodies.push(
+                output_json(
+                    ctx.dispatch_with_input(msg, InputStream::from_bytes(body))
+                        .await,
+                )
+                .await,
+            );
+        }
+
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            budget,
+            "the {budget}-per-window budget must be spent across requests, not reset by each one"
+        );
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "the refused request must answer the same constant body as the others: a response \
+             that changed once the budget ran out would be an enumeration oracle"
+        );
+    }
+}

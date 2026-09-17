@@ -4,7 +4,7 @@
 use wafer_run::{context::Context, InputStream, Message};
 
 use crate::blocks::rate_limit::{
-    check_rate_limit, ip_identity, RateLimit, RateLimitOutcome, UserRateLimiter,
+    check_rate_limit, ip_identity, RateLimit, RateLimitOutcome, UserRateLimiter, UNKNOWN_IP,
 };
 
 pub mod api_keys;
@@ -22,21 +22,33 @@ pub mod verify;
 
 /// Why a transactional email did not go out.
 ///
-/// The email block answers a refusal (rate limit, recipient allow-list,
-/// malformed address) as an error stream and a failed Mailgun call as a
-/// `200 {"sent": false}` body. Both mean "no mail was sent", and neither
-/// used to be distinguishable here from a delivery: the old helper checked
-/// the stream for an error, logged a single line, and never looked at
-/// `sent` at all, so a provider outage read as success.
+/// The email block answers a rate-limit refusal, an allow-list rejection, a
+/// malformed request and a WRAP denial all as error terminals, and a failed
+/// Mailgun call as a `200 {"sent": false}` body. Every one of them means "no
+/// mail was sent", and none of them used to be distinguishable here from a
+/// delivery: the old helper checked the stream for an error, logged a single
+/// line, and never looked at `sent` at all, so a provider outage read as
+/// success.
+///
+/// The variants are split by who has to act, not by where the failure
+/// happened, because that is the only question the log level answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EmailNotSent {
     /// This requester has spent their [`RateLimit::AUTH_EMAIL`] budget for
     /// the window. Nothing left this block; the email block was never
     /// called, so no shared quota was touched.
     RequesterLimited,
-    /// The email block refused the message before attempting delivery. Its
-    /// `Retry-After`-bearing 429 (both outbound rate limits) arrives here.
-    Refused(String),
+    /// The email block refused the message under one of ITS rate limits —
+    /// the per-recipient bucket or the deployment-wide per-caller ceiling.
+    /// Identified by the `rate_limit_exceeded` detail code its 429 carries
+    /// (`rate_limit::rate_limited_response`), never by the message text.
+    RateLimited(String),
+    /// The call to the email block failed for any other reason: the block is
+    /// absent or disabled, a WRAP grant denies the call, the request is
+    /// malformed, or `IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS` does
+    /// not match the recipient. Every one of these is a deployment fault
+    /// that silently drops auth mail, and none of them resolves itself.
+    Undeliverable(String),
     /// The email block accepted the message and the provider call failed.
     ProviderFailed,
 }
@@ -44,16 +56,23 @@ pub(crate) enum EmailNotSent {
 impl EmailNotSent {
     /// Whether this outcome needs an operator.
     ///
-    /// A rate-limit refusal — this requester's budget, this recipient's, or
-    /// the deployment ceiling — is abuse handling working as designed and is
-    /// reported by whichever limiter made the decision at the level that
-    /// decision deserves (`email.rs` logs the deployment ceiling at `error`
-    /// precisely because that one does affect everybody). A provider failure
-    /// is different: the deployment believes it can send mail and cannot.
+    /// A rate-limit decision does not: it is abuse handling working as
+    /// designed, it is already reported by the limiter that made it (and
+    /// `email.rs` logs the deployment ceiling at `error` precisely because
+    /// that one does affect everybody), and it clears itself when the window
+    /// rolls over.
+    ///
+    /// Everything else does. A provider failure means the deployment
+    /// believes it can send mail and cannot; an [`Self::Undeliverable`] means
+    /// the mail never reached the provider at all — a missing block, a
+    /// missing grant, an allow-list that drops every address — and it will
+    /// keep happening, unnoticed, until somebody changes the deployment.
+    /// Filing those under "rate limiting, nobody needs to look" is exactly
+    /// the silent-drop case this whole change exists to end.
     fn needs_an_operator(&self) -> bool {
         match self {
-            Self::RequesterLimited | Self::Refused(_) => false,
-            Self::ProviderFailed => true,
+            Self::RequesterLimited | Self::RateLimited(_) => false,
+            Self::Undeliverable(_) | Self::ProviderFailed => true,
         }
     }
 }
@@ -64,9 +83,36 @@ impl std::fmt::Display for EmailNotSent {
             Self::RequesterLimited => {
                 f.write_str("this requester has sent their limit of transactional mail")
             }
-            Self::Refused(reason) => write!(f, "refused by the email block: {reason}"),
+            Self::RateLimited(reason) => write!(f, "rate-limited by the email block: {reason}"),
+            Self::Undeliverable(reason) => {
+                write!(f, "the email block could not be asked to send: {reason}")
+            }
             Self::ProviderFailed => f.write_str("accepted but the provider send failed"),
         }
+    }
+}
+
+/// Classify an error terminal from the `impresspress/email` call.
+///
+/// Reads the `WaferError` rather than its rendered text: a rate-limit
+/// refusal carries the `rate_limit_exceeded` detail code, and
+/// `ResourceExhausted` is the wafer code that detail maps to, so either
+/// spelling is recognised while nothing depends on wording. Anything else —
+/// `NotFound` for an unregistered block, `PermissionDenied` for a WRAP
+/// denial, `InvalidArgument` for an allow-list rejection — is a deployment
+/// fault and is classified as such.
+fn classify_email_error(terminal: &wafer_run::TerminalNotResponse) -> EmailNotSent {
+    let wafer_run::TerminalNotResponse::Error(error) = terminal else {
+        return EmailNotSent::Undeliverable(format!("{terminal:?}"));
+    };
+    let rate_limited = error.detail_code()
+        == Some(crate::blocks::errors::ErrorCode::RateLimitExceeded.as_str())
+        || error.code == wafer_run::ErrorCode::ResourceExhausted;
+    let reason = format!("{:?}: {}", error.code, error.message);
+    if rate_limited {
+        EmailNotSent::RateLimited(reason)
+    } else {
+        EmailNotSent::Undeliverable(reason)
     }
 }
 
@@ -112,9 +158,14 @@ pub(crate) fn log_email_not_sent(flow: &str, user_id: &str, failure: &EmailNotSe
 /// buckets cap one address's share of the deployment ceiling but not one
 /// requester's — a caller naming a fresh address every time spends the whole
 /// ceiling under those two alone. Charged here, ten minutes of signups from
-/// one IP costs ten messages instead of a hundred. The category resolves
-/// `WAFER_RUN_SHARED__RATE_LIMIT_AUTH_EMAIL` like every other bucket, so a
-/// deployment behind a shared egress IP can raise or disable it.
+/// one IP costs ten messages instead of a hundred.
+///
+/// The category resolves `WAFER_RUN_SHARED__RATE_LIMIT_AUTH_EMAIL` (format
+/// `requests/seconds`, `0` disables) like every other bucket, which is how a
+/// deployment behind a shared egress IP raises or disables it. Like every
+/// other `RATE_LIMIT_*` category it is set by key — process environment or
+/// the `variables` table — and is declared by no `ConfigVar`, so it does not
+/// appear as a field in the admin settings UI.
 ///
 /// Returns why the mail did not go out, so a caller can say so in its own
 /// terms instead of assuming delivery. Delivery stays best-effort — a
@@ -130,15 +181,29 @@ pub(crate) async fn send_template_email(
     to: &str,
     token: &str,
 ) -> Result<(), EmailNotSent> {
+    let requester = ip_identity(msg);
     if let RateLimitOutcome::Limited(_) = check_rate_limit(
         limiter,
         ctx,
-        &ip_identity(msg),
+        &requester,
         "auth_email",
         RateLimit::AUTH_EMAIL,
     )
     .await
     {
+        // A refusal charged against `UNKNOWN_IP` is not one requester being
+        // told to slow down: it is every request that arrived without a
+        // client IP sharing one bucket, so the deployment as a whole just
+        // stopped sending auth mail. That is an outage with a cause an
+        // operator can fix (the platform is not populating `remote_addr`),
+        // and it must not read as routine abuse handling.
+        if requester == UNKNOWN_IP {
+            tracing::error!(
+                "outbound mail refused on the no-client-IP bucket: this deployment is not \
+                 populating a client IP, so every requester shares one budget and auth mail \
+                 is now failing for everyone"
+            );
+        }
         // The 429 `check_rate_limit` built is dropped on purpose: no caller
         // of this helper may answer one. All three flows answer a body that
         // is constant for every account state, and a 429 that appeared only
@@ -166,7 +231,7 @@ pub(crate) async fn send_template_email(
         .await;
     let buffered = match out.collect_buffered().await {
         Ok(buffered) => buffered,
-        Err(e) => return Err(EmailNotSent::Refused(format!("{e:?}"))),
+        Err(terminal) => return Err(classify_email_error(&terminal)),
     };
     // `{"sent": false}` is the email block's own report that the Mailgun
     // call failed; it rides a 200, so only the body tells the two apart. An
@@ -206,8 +271,8 @@ mod tests {
     }
 
     /// The email block answers a rate-limit refusal as an error stream. That
-    /// refusal reaches the caller as [`EmailNotSent::Refused`], instead of
-    /// being swallowed into a log line the flow cannot see.
+    /// refusal reaches the caller as [`EmailNotSent::RateLimited`], instead
+    /// of being swallowed into a log line the flow cannot see.
     #[tokio::test]
     async fn a_rate_limit_refusal_reaches_the_caller() {
         let ctx = ctx_with_email("1").await;
@@ -241,11 +306,11 @@ mod tests {
         )
         .await
         {
-            Err(EmailNotSent::Refused(reason)) => assert!(
-                reason.to_lowercase().contains("rate"),
-                "the refusal must carry the block's reason, got {reason:?}"
+            Err(EmailNotSent::RateLimited(reason)) => assert!(
+                reason.contains("ResourceExhausted"),
+                "the refusal must carry the code the block refused with, got {reason:?}"
             ),
-            other => panic!("expected a refusal, got {other:?}"),
+            other => panic!("expected a rate-limit refusal, got {other:?}"),
         }
     }
 
@@ -331,10 +396,13 @@ mod tests {
         );
     }
 
-    /// A send nobody can perform — the email block is not registered at all —
-    /// is a refusal, never a silent success.
+    /// A send nobody can perform — the email block is not registered at all
+    /// — is `Undeliverable`, not a rate limit and not a silent success. It
+    /// is the shape a disabled block, a missing WRAP grant and an allow-list
+    /// that matches nothing all arrive in, and the one that must keep
+    /// paging: nothing about it clears itself.
     #[tokio::test]
-    async fn an_absent_email_block_is_not_reported_as_delivered() {
+    async fn an_absent_email_block_is_undeliverable_not_rate_limited() {
         let ctx = TestContext::new().await;
         let (limiter, msg) = test_mail_request();
         match send_template_email(
@@ -347,8 +415,58 @@ mod tests {
         )
         .await
         {
-            Err(EmailNotSent::Refused(_)) => {}
-            other => panic!("expected a refusal, got {other:?}"),
+            Err(failure @ EmailNotSent::Undeliverable(_)) => {
+                assert!(
+                    failure.needs_an_operator(),
+                    "a deployment fault must not be logged as routine"
+                );
+            }
+            other => panic!("expected an undeliverable outcome, got {other:?}"),
+        }
+    }
+
+    /// The classification reads the error, not its text: only the detail
+    /// code (or the wafer code that detail maps to) makes an error a rate
+    /// limit. Everything else is a deployment fault that keeps paging.
+    #[test]
+    fn only_a_rate_limit_error_is_classified_as_one() {
+        let limited = crate::blocks::rate_limit::rate_limited_response(30);
+        let terminal = futures::executor::block_on(limited.collect_buffered())
+            .expect_err("a 429 terminates as an error");
+        assert!(matches!(
+            classify_email_error(&terminal),
+            EmailNotSent::RateLimited(_)
+        ));
+
+        // Same words, no code: an error that merely mentions rate limiting
+        // must NOT be filed as one.
+        let impostor = wafer_run::TerminalNotResponse::Error(wafer_run::WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            "rate limit exceeded".to_string(),
+        ));
+        assert!(matches!(
+            classify_email_error(&impostor),
+            EmailNotSent::Undeliverable(_)
+        ));
+
+        // The shapes a deployment fault actually arrives in: an absent or
+        // disabled block, a WRAP denial, an allow-list rejection.
+        for code in [
+            wafer_run::ErrorCode::NotFound,
+            wafer_run::ErrorCode::PermissionDenied,
+            wafer_run::ErrorCode::InvalidArgument,
+        ] {
+            let terminal = wafer_run::TerminalNotResponse::Error(wafer_run::WaferError::new(
+                code,
+                "nope".to_string(),
+            ));
+            assert!(
+                matches!(
+                    classify_email_error(&terminal),
+                    EmailNotSent::Undeliverable(_)
+                ),
+                "{code:?} is a deployment fault"
+            );
         }
     }
 
@@ -390,13 +508,14 @@ mod tests {
         );
     }
 
-    /// Only a provider failure pages an operator. A rate-limit refusal —
-    /// this requester's budget or this recipient's — is ordinary abuse
-    /// handling and is already reported by the limiter that made the call.
+    /// Rate limiting is routine; everything else pages. A rate-limit
+    /// decision is already reported by the limiter that made it and clears
+    /// itself when the window rolls over — a deployment fault does neither.
     #[test]
-    fn only_a_provider_failure_needs_an_operator() {
-        assert!(EmailNotSent::ProviderFailed.needs_an_operator());
+    fn only_rate_limiting_is_routine() {
         assert!(!EmailNotSent::RequesterLimited.needs_an_operator());
-        assert!(!EmailNotSent::Refused("429".into()).needs_an_operator());
+        assert!(!EmailNotSent::RateLimited("429".into()).needs_an_operator());
+        assert!(EmailNotSent::Undeliverable("no such block".into()).needs_an_operator());
+        assert!(EmailNotSent::ProviderFailed.needs_an_operator());
     }
 }

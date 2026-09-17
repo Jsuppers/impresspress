@@ -391,14 +391,22 @@ pub async fn check_user_rate_limit_with(
     check_rate_limit(limiter, ctx, &user_id, category, default).await
 }
 
+/// The bucket identity a request with no client IP falls back to.
+///
+/// Every such request shares this one bucket — fail-closed, so a platform
+/// that stops populating `remote_addr` cannot turn an IP-keyed limit off.
+/// The cost is that the limit then applies to the whole deployment at once,
+/// which is why a caller whose refusal was charged against this identity
+/// should say so rather than report an ordinary per-IP refusal (see
+/// `auth_ui::api::send_template_email`).
+pub const UNKNOWN_IP: &str = "unknown";
+
 /// The identity an IP-keyed rate-limit bucket uses for a request: the remote
-/// address, or `"unknown"` when the platform didn't populate one (so anonymous
-/// callers behind a missing `remote_addr` still share one bucket rather than
-/// bypassing the limit entirely).
+/// address, or [`UNKNOWN_IP`] when the platform didn't populate one.
 pub fn ip_identity(msg: &wafer_run::Message) -> String {
     let ip = msg.remote_addr();
     if ip.is_empty() {
-        "unknown".to_string()
+        UNKNOWN_IP.to_string()
     } else {
         ip.to_string()
     }

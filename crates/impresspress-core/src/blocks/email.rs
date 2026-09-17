@@ -603,10 +603,15 @@ where
         .unwrap_or(default)
 }
 
-/// The rate-limit bucket identity for a recipient: the address trimmed and
-/// lowercased (the normalization [`validate_recipient`] already applies
-/// before accepting it, so `" V@x.com"` and `"v@x.com"` are one mailbox and
-/// get one bucket), then hashed.
+/// The rate-limit bucket identity for a recipient: the address trimmed,
+/// lowercased, then hashed, so `" V@x.com"` and `"v@x.com"` share one
+/// bucket.
+///
+/// The normalization is this function's own. [`validate_recipient`] trims a
+/// copy for its own checks and never lowercases, and what goes to Mailgun is
+/// the address as the caller wrote it — so a key that reused either of those
+/// spellings would let padding or capitalization buy a second quota for one
+/// mailbox.
 ///
 /// Hashed because this identity is persisted on Cloudflare: `UserRateLimiter`
 /// writes the composite key into the `wafer_run__auth__rate_limits` D1 table,

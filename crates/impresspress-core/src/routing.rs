@@ -296,8 +296,9 @@ pub const ROUTES: &[Route] = &[
     // LLM — chat orchestrator
     // Route is open; the tier comes from `LlmBlock::info().endpoints`:
     // admin for the UI pages, provider CRUD, model load/unload and the two
-    // per-thread config WRITES; authenticated for chat, the config read and
-    // the model listings.
+    // per-thread config WRITES; authenticated for chat (buffered and SSE),
+    // the config read, the aggregated model list and the per-model status
+    // probe.
     Route::new("/b/llm", RouteAccess::Public, "impresspress/llm"),
     // Vector — similarity search, hybrid retrieval, RAG ingestion.
     //
