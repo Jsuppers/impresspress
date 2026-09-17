@@ -61,22 +61,41 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
         return err_bad_request("Invalid bucket name");
     }
 
-    // Create the blob-namespace folder first, then record the metadata row.
-    if let Err(e) = store::create_folder(ctx, &body.name, body.public).await {
-        return err_internal("Failed to create bucket", e);
+    // The metadata row goes in FIRST, because it is the claim on the name:
+    // `buckets.name` is UNIQUE (migration 002), so the insert is what decides
+    // which of two users asking for the same name gets the folder, and it
+    // decides it without a gap a competing create could slip through. A taken
+    // name is a 409 — the key is held, pick another — and no storage call has
+    // happened by then.
+    //
+    // Creating the folder first cannot be made safe, which is why the order is
+    // this way round: a bucket name IS the blob-namespace folder name, every
+    // backend's `create_folder` is idempotent, so a second user's create
+    // succeeded against the first user's folder — and the compensating
+    // `delete_folder` below would then have deleted that user's data on the
+    // way to reporting the failure.
+    if let Err(e) = repo::buckets::insert(ctx, &body.name, body.public, msg.user_id()).await {
+        return crud::taken_key_or_db_error(
+            e,
+            repo::buckets::name_exists(ctx, &body.name),
+            &format!(
+                "A bucket named \"{}\" already exists. Pick another name.",
+                body.name
+            ),
+        )
+        .await;
     }
 
-    // [`repo::buckets::TABLE`] is the source of truth for bucket existence,
-    // so the metadata insert must succeed for the bucket to count as created.
-    // If it fails, compensate by deleting the just-created folder rather than
-    // warn-and-continue (which would leave an orphan folder invisible to every
-    // listing path, which now all read the table).
-    if let Err(e) = repo::buckets::insert(ctx, &body.name, body.public, msg.user_id()).await {
-        if let Err(cleanup) = store::delete_folder(ctx, &body.name).await {
+    // The row is the source of truth for bucket existence, so a bucket whose
+    // folder could not be created must not keep its row: it would list a
+    // namespace no object can be written to. Roll the claim back rather than
+    // warn-and-continue.
+    if let Err(e) = store::create_folder(ctx, &body.name, body.public).await {
+        if let Err(cleanup) = repo::buckets::delete_by_name(ctx, &body.name).await {
             tracing::error!(
                 bucket = %body.name,
                 error = %cleanup,
-                "failed to roll back orphan storage folder after bucket metadata insert failed",
+                "failed to roll back the bucket row after its storage folder could not be created",
             );
         }
         return err_internal("Failed to create bucket", e);
@@ -135,11 +154,14 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
 #[cfg(test)]
 mod integration_tests {
     use super::{
-        super::test_helpers::{ctx_with_storage, seed_bucket, seed_object_row},
+        super::test_helpers::{
+            ctx_with_storage, ctx_with_storage_handle, seed_bucket, seed_object_row,
+        },
         *,
     };
     use crate::test_support::{
-        admin_msg, auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
+        admin_msg, auth_msg, output_http_status, output_is_error, output_json, FailingDbOpContext,
+        TestContext,
     };
 
     fn bucket_names(v: &serde_json::Value) -> Vec<String> {
@@ -180,6 +202,108 @@ mod integration_tests {
             handle_list_buckets(&ctx, &auth_msg("retrieve", "/storage/buckets", "alice")).await;
         let names = bucket_names(&output_json(out).await);
         assert_eq!(names, vec!["alice-bucket"]);
+    }
+
+    /// Build the request body + message the router produces for
+    /// `POST /b/storage/api/buckets`, as the create-bucket modal sends it
+    /// (`files-browser.js`: `{"name": …, "public": …}`).
+    fn create_bucket_msg(user: &str) -> Message {
+        let mut msg = auth_msg("create", "/b/storage/api/buckets", user);
+        msg.set_meta("req.content_type", "application/json");
+        msg
+    }
+
+    fn create_bucket_body(name: &str, public: bool) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::json!({ "name": name, "public": public })
+                .to_string()
+                .into_bytes(),
+        )
+    }
+
+    /// A bucket name IS the blob-namespace folder name, so a second user
+    /// creating a name someone else already holds used to be handed the first
+    /// user's folder: `create_folder` is idempotent on every backend, the
+    /// `buckets` table had no unique index, so the insert succeeded and
+    /// `find_owned` then answered for the squatter. From there they could list
+    /// and read every object in it, overwrite them, and delete the bucket —
+    /// which deletes the folder.
+    ///
+    /// The name is refused with a 409 instead, and nothing about the first
+    /// owner's bucket changes.
+    #[tokio::test]
+    async fn a_taken_bucket_name_is_refused_not_shared_with_the_second_creator() {
+        let ctx = ctx_with_storage().await;
+        let created = handle_create_bucket(
+            &ctx,
+            &create_bucket_msg("alice"),
+            create_bucket_body("assets", false),
+        )
+        .await;
+        assert_eq!(
+            output_json(created).await["created"],
+            serde_json::json!(true)
+        );
+        store::put(&ctx, "assets", "secret.txt", b"alice's bytes", "text/plain")
+            .await
+            .expect("alice stores an object");
+
+        let taken = handle_create_bucket(
+            &ctx,
+            &create_bucket_msg("mallory"),
+            create_bucket_body("assets", false),
+        )
+        .await;
+
+        assert_eq!(
+            output_http_status(taken).await,
+            409,
+            "a bucket name someone else holds is a conflict, not a second owner",
+        );
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "mallory")
+                .await
+                .expect("bucket lookup")
+                .is_none(),
+            "the refused create must not leave mallory owning alice's bucket",
+        );
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "alice")
+                .await
+                .expect("bucket lookup")
+                .is_some(),
+            "alice must still own her bucket",
+        );
+        let (bytes, _) = store::get(&ctx, "assets", "secret.txt")
+            .await
+            .expect("alice's object must survive the refused create");
+        assert_eq!(bytes, b"alice's bytes");
+    }
+
+    /// The row is the claim on the name, so it goes in first — which means a
+    /// bucket whose folder could not be created must not keep its row. A
+    /// surviving row would list a namespace no object can be written to, and
+    /// would hold the name against the owner's own retry.
+    #[tokio::test]
+    async fn a_bucket_whose_folder_cannot_be_created_keeps_no_row() {
+        let (ctx, storage) = ctx_with_storage_handle().await;
+        storage.refuse("create_folder");
+
+        let out = handle_create_bucket(
+            &ctx,
+            &create_bucket_msg("alice"),
+            create_bucket_body("assets", false),
+        )
+        .await;
+
+        assert!(output_is_error(out, "Internal").await);
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "alice")
+                .await
+                .expect("bucket lookup")
+                .is_none(),
+            "the claim must be rolled back when the folder could not be created",
+        );
     }
 
     /// Build the message the router produces for
