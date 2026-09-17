@@ -49,6 +49,21 @@ impl RateLimit {
         max_requests: 30,
         window: Duration::from_secs(60),
     };
+    /// Transactional email one requester can cause to be SENT: 10 per hour
+    /// per IP. Distinct from [`Self::AUTH`], which bounds requests to the
+    /// auth routes; this bounds the outbound mail those requests spend.
+    ///
+    /// Charged at the send site (`auth_ui::api::send_template_email`), not
+    /// per route, so a caller who mistypes an address or asks about an
+    /// unregistered one — neither of which sends anything — keeps their
+    /// budget. Without it, one requester could still empty the email block's
+    /// deployment-wide ceiling simply by naming a new address each time: the
+    /// per-recipient bucket caps one address's share of that ceiling, not one
+    /// requester's.
+    pub const AUTH_EMAIL: Self = Self {
+        max_requests: 10,
+        window: Duration::from_secs(3600),
+    };
     /// API reads: 300 requests per 60 seconds per user.
     pub const API_READ: Self = Self {
         max_requests: 300,

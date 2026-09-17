@@ -155,7 +155,14 @@ mod tests {
     /// Sign a user up through the real signup handler and return their id.
     async fn signup_user(ctx: &TestContext, email: &str, password: &str) -> String {
         let body = serde_json::json!({"email": email, "password": password}).to_string();
-        let out = signup::handle(ctx, InputStream::from_bytes(body.into_bytes())).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let out = signup::handle(
+            &limiter,
+            ctx,
+            &msg,
+            InputStream::from_bytes(body.into_bytes()),
+        )
+        .await;
         let json = output_json(out).await;
         json["user"]["id"]
             .as_str()

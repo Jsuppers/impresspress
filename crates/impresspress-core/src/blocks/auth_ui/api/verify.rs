@@ -6,7 +6,7 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse},
+    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse, rate_limit::UserRateLimiter},
     http::{err_bad_request, err_internal, ok_json},
     ui,
     ui::{components::auth_panel, icons, templates::auth_split},
@@ -100,7 +100,12 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     )
 }
 
-pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle_resend(
+    limiter: &UserRateLimiter,
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct Req {
         email: String,
@@ -171,16 +176,13 @@ pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStrea
     }
 
     if let Err(failure) =
-        super::send_template_email(ctx, "verification", &email_lower, &new_token).await
+        super::send_template_email(limiter, ctx, msg, "verification", &email_lower, &new_token)
+            .await
     {
         // Same constraint as forgot-password: `constant()` is the answer for
         // every account state, so the failure is recorded here rather than
         // in the body.
-        tracing::error!(
-            user_id = %user.id,
-            %failure,
-            "resend-verification: the verification email was not sent"
-        );
+        super::log_email_not_sent("resend-verification", &user.id, &failure);
     }
 
     constant()
@@ -376,9 +378,16 @@ mod resend_tests {
             .await
             .expect("set token");
 
-        let unregistered = output_json(handle_resend(&ctx, body("nobody@example.com")).await).await;
-        let already = output_json(handle_resend(&ctx, body("verified@example.com")).await).await;
-        let cooldown = output_json(handle_resend(&ctx, body("cooling@example.com")).await).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let unregistered =
+            output_json(handle_resend(&limiter, &ctx, &msg, body("nobody@example.com")).await)
+                .await;
+        let already =
+            output_json(handle_resend(&limiter, &ctx, &msg, body("verified@example.com")).await)
+                .await;
+        let cooldown =
+            output_json(handle_resend(&limiter, &ctx, &msg, body("cooling@example.com")).await)
+                .await;
 
         assert_eq!(
             already, unregistered,
@@ -402,7 +411,8 @@ mod resend_tests {
             .await
             .expect("set token");
 
-        let _ = handle_resend(&ctx, body("cooling@example.com"))
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let _ = handle_resend(&limiter, &ctx, &msg, body("cooling@example.com"))
             .await
             .collect_buffered()
             .await;
@@ -424,10 +434,14 @@ mod resend_tests {
     async fn resend_answers_the_constant_body_even_when_the_lookup_fails() {
         let ctx = TestContext::with_auth_and_crypto().await;
         seed(&ctx, "known@example.com", false).await;
-        let expected = output_json(handle_resend(&ctx, body("known@example.com")).await).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let expected =
+            output_json(handle_resend(&limiter, &ctx, &msg, body("known@example.com")).await).await;
         let failing = ctx.break_reads();
 
-        let outage = output_json(handle_resend(&failing, body("known@example.com")).await).await;
+        let outage =
+            output_json(handle_resend(&limiter, &failing, &msg, body("known@example.com")).await)
+                .await;
 
         assert_eq!(
             outage, expected,

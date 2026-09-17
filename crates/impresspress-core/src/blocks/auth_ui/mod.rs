@@ -511,7 +511,7 @@ crate::impresspress_feature_block! {
             Route::OauthStart => oauth::start::handle(ctx, &msg).await,
             Route::OauthCallback => oauth::callback::handle(ctx, &msg).await,
             Route::Login => api::login::handle(ctx, input).await,
-            Route::Signup => api::signup::handle(ctx, input).await,
+            Route::Signup => api::signup::handle(&this.limiter, ctx, &msg, input).await,
             Route::Refresh => api::refresh::handle(ctx, input).await,
             Route::Logout => api::logout::handle(ctx, &msg).await,
             Route::Me => api::me::handle_get(ctx, &msg).await,
@@ -522,8 +522,12 @@ crate::impresspress_feature_block! {
             Route::RevokeApiKey => api::api_keys::handle_revoke(ctx, &msg).await,
             Route::DeleteApiKey => api::api_keys::handle_delete(ctx, &msg).await,
             Route::Verify => api::verify::handle(ctx, &msg, input).await,
-            Route::ResendVerification => api::verify::handle_resend(ctx, input).await,
-            Route::ForgotPassword => api::forgot_password::handle(ctx, input).await,
+            Route::ResendVerification => {
+                api::verify::handle_resend(&this.limiter, ctx, &msg, input).await
+            }
+            Route::ForgotPassword => {
+                api::forgot_password::handle(&this.limiter, ctx, &msg, input).await
+            }
             Route::ResetPassword => api::reset_password::handle(ctx, input).await,
             Route::OauthProviders => oauth::providers::handle(ctx).await,
             Route::Bootstrap => api::bootstrap::handle(ctx, &msg, input).await,
