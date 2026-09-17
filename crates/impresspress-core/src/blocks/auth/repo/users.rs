@@ -43,6 +43,17 @@ pub struct UserRow {
     /// but must not authenticate.
     pub deleted_at: Option<String>,
     pub email_verified: bool,
+    /// What proved the address, if anything ever did: `"email_token"` for a
+    /// redeemed verification link, `"oauth.<provider>"` for a provider
+    /// assertion. `None`/empty means nobody proved it.
+    ///
+    /// Separate from [`email_verified`](Self::email_verified), which is a
+    /// policy flag: signup writes it `!REQUIRE_VERIFICATION`, so on a
+    /// deployment that does not require verification it says only that the
+    /// deployment does not require verification. Anything that needs evidence
+    /// of mailbox control — currently the OAuth callback's account-adoption
+    /// rule — reads THIS field, never that one.
+    pub email_verified_by: Option<String>,
     /// Stamped by [`touch_last_login`] on every successful sign-in; `None`
     /// for an account that has never signed in.
     pub last_login_at: Option<String>,
@@ -62,6 +73,16 @@ impl UserRow {
     /// credential-verification path.
     pub fn is_active(&self) -> bool {
         !self.disabled && !self.is_deleted()
+    }
+
+    /// True when someone actually proved control of this address — a redeemed
+    /// verification link or a provider assertion — rather than the deployment
+    /// merely not asking for one. See
+    /// [`email_verified_by`](Self::email_verified_by).
+    pub fn email_is_proven(&self) -> bool {
+        self.email_verified_by
+            .as_deref()
+            .is_some_and(|by| !by.is_empty())
     }
 }
 
@@ -99,6 +120,7 @@ fn row_from(id: String, m: &HashMap<String, Value>) -> Result<UserRow, WaferErro
         disabled: map_bool(m, "disabled"),
         deleted_at: map_opt_str(m, "deleted_at"),
         email_verified: map_bool(m, "email_verified"),
+        email_verified_by: map_opt_str(m, "email_verified_by"),
         last_login_at: map_opt_str(m, "last_login_at"),
         created_at: map_str(m, "created_at"),
         updated_at: map_str(m, "updated_at"),
@@ -232,6 +254,13 @@ pub async fn set_email_verified(
 ) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("email_verified".to_string(), json!(verified));
+    // Clearing the flag retracts the proof with it — a row nobody considers
+    // verified must not still name what verified it. Setting the flag does
+    // NOT mint one: only [`record_email_proof`] can, from a caller that
+    // watched the proof happen.
+    if !verified {
+        data.insert("email_verified_by".to_string(), json!(""));
+    }
     crate::util::stamp_updated(&mut data);
 
     db::update(ctx, TABLE, user_id, data)
@@ -257,17 +286,42 @@ pub async fn find_by_verification_token(
     }
 }
 
-/// Mark a user's email as verified and clear their `verification_token` in one
-/// write. Stamps `updated_at` with [`super::now_iso`].
-pub async fn mark_email_verified(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
+/// Record that someone proved control of this user's address, naming the
+/// proof, and clear their `verification_token` in the same write. Stamps
+/// `updated_at` with [`super::now_iso`].
+///
+/// The ONLY writer of `email_verified_by`. Call it from a caller that has just
+/// watched the proof happen — `auth_ui::api::verify` redeeming a mailed token
+/// (`proof::EMAIL_TOKEN`), or `auth_ui::oauth::callback` receiving a verified
+/// address from a provider that asserts one (`proof::oauth`). Setting the
+/// policy flag alone is [`set_email_verified`], which deliberately cannot
+/// manufacture a proof.
+pub async fn record_email_proof(
+    ctx: &dyn Context,
+    user_id: &str,
+    proof: &str,
+) -> Result<(), WaferError> {
     let mut data = std::collections::HashMap::new();
     data.insert("email_verified".to_string(), json!(true));
+    data.insert("email_verified_by".to_string(), json!(proof));
     data.insert("verification_token".to_string(), json!(""));
     data.insert("updated_at".to_string(), json!(now_iso()));
     db::update(ctx, TABLE, user_id, data)
         .await
-        .map_err(|e| db_failed(&format!("mark verified for {user_id}"), e))?;
+        .map_err(|e| db_failed(&format!("record email proof for {user_id}"), e))?;
     Ok(())
+}
+
+/// The values [`record_email_proof`] writes. A proof names the act that
+/// produced it, so a row can be read back and audited.
+pub mod proof {
+    /// A verification link mailed to the address was redeemed.
+    pub const EMAIL_TOKEN: &str = "email_token";
+
+    /// An OAuth provider that asserts verification returned this address.
+    pub fn oauth(provider: &str) -> String {
+        format!("oauth.{provider}")
+    }
 }
 
 /// Read a user's `last_verification_sent` timestamp (the resend cooldown
@@ -1341,13 +1395,53 @@ mod typed_client_tests {
             "2026-06-01T00:00:00Z"
         );
 
-        mark_email_verified(&ctx, &id).await.unwrap();
+        record_email_proof(&ctx, &id, proof::EMAIL_TOKEN)
+            .await
+            .unwrap();
         assert!(is_email_verified(&ctx, &id).await.unwrap());
+        // The proof is recorded, not merely the flag: this is the field the
+        // OAuth adoption rule reads.
+        let verified = find_by_id(&ctx, &id).await.unwrap().expect("row");
+        assert!(verified.email_is_proven());
+        assert_eq!(
+            verified.email_verified_by.as_deref(),
+            Some(proof::EMAIL_TOKEN)
+        );
         // Token cleared → no longer findable.
         assert!(find_by_verification_token(&ctx, "vhash")
             .await
             .unwrap()
             .is_none());
+
+        // Retracting the flag retracts the proof with it.
+        set_email_verified(&ctx, &id, false).await.unwrap();
+        assert!(!find_by_id(&ctx, &id)
+            .await
+            .unwrap()
+            .expect("row")
+            .email_is_proven());
+    }
+
+    /// The policy flag cannot manufacture a proof. `signup` writes
+    /// `email_verified = !REQUIRE_VERIFICATION`, so a row can be "verified"
+    /// having proved nothing; `email_is_proven` must still say no.
+    #[tokio::test]
+    async fn setting_the_flag_does_not_create_a_proof() {
+        let ctx = TestContext::with_auth().await.with_wrap(
+            "wafer-run/auth",
+            Vec::new(),
+            vec![],
+            "impresspress/admin",
+        );
+        let id = seed_one(&ctx).await;
+
+        set_email_verified(&ctx, &id, true).await.unwrap();
+        let row = find_by_id(&ctx, &id).await.unwrap().expect("row");
+        assert!(row.email_verified, "the policy flag is set");
+        assert!(
+            !row.email_is_proven(),
+            "but nobody proved the address, so it is not proven"
+        );
     }
 
     #[tokio::test]

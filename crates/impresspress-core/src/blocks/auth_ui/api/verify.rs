@@ -2,7 +2,6 @@
 //! relocated from auth/login.rs in Task 5.
 
 use maud::html;
-use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
@@ -10,7 +9,7 @@ use crate::{
     http::{err_bad_request, err_internal, ok_json},
     ui,
     ui::{components::auth_panel, icons, templates::auth_split},
-    util::{hex_encode, sha256_hex},
+    util::sha256_hex,
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
@@ -84,8 +83,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         );
     }
 
-    // Mark as verified + clear token in one typed write.
-    if let Err(e) = users::mark_email_verified(ctx, &user.id).await {
+    // Record the proof + clear the token in one typed write. The holder of
+    // this link received it at the address, which is the only evidence of
+    // mailbox control this app ever collects itself.
+    if let Err(e) = users::record_email_proof(ctx, &user.id, users::proof::EMAIL_TOKEN).await {
         return err_internal("Failed to verify email", e.to_string());
     }
 
@@ -146,19 +147,6 @@ pub async fn handle_resend(
 
     if user.email_verified {
         return constant();
-    }
-
-    // 60 second cooldown: inside it, neither mint a token nor say so.
-    let last_sent = users::last_verification_sent(ctx, &user.id)
-        .await
-        .unwrap_or_default();
-    if !last_sent.is_empty() {
-        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last_sent) {
-            let elapsed = chrono::Utc::now() - last.with_timezone(&chrono::Utc);
-            if elapsed.num_seconds() < 60 {
-                return constant();
-            }
-        }
     }
 
     // Generate new token. The raw token goes in the email link; only its
