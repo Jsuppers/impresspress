@@ -2,11 +2,14 @@
 //!
 //! Object metadata rows — one row per uploaded file (sibling of the raw
 //! storage blob in `wafer-run/storage`). Tracks size, content type,
-//! status, uploader and timestamps. Rows are inserted `pending` *before*
-//! the storage upload (to close the quota TOCTOU window) and flipped to
-//! `complete` afterward; quota accounting sums/counts by `uploaded_by`
-//! (including in-flight `pending` reservations), while user-facing search
-//! and admin stats only see `complete` rows.
+//! status, uploader and timestamps. A row is claimed `pending` *before* the
+//! storage upload ([`reserve_upload`], which closes the quota TOCTOU window)
+//! and flipped to `complete` afterward; quota accounting sums/counts by
+//! `uploaded_by` (including in-flight `pending` reservations), while
+//! user-facing search and admin stats only see `complete` rows.
+//!
+//! `(bucket, key)` is UNIQUE, so a re-upload reuses the existing row rather
+//! than inserting a second one — see [`reserve_upload`].
 
 use std::collections::HashMap;
 
@@ -126,18 +129,80 @@ fn escape_like(input: &str) -> String {
     out
 }
 
-/// Insert the `pending` reservation row written BEFORE the storage upload,
-/// so concurrent quota checks see the in-flight size (closes the
-/// check-quota → upload TOCTOU race). `uploaded_at` is stamped with
-/// [`crate::util::now_rfc3339`].
-pub async fn insert_pending(
+/// The row for `(bucket, key)`, or `None` when the key holds no object.
+///
+/// `(bucket, key)` is UNIQUE (`idx_objects_bucket_key`, migration 001), so
+/// there is at most one.
+pub async fn find_by_bucket_key(
+    ctx: &dyn Context,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<ObjectRow>, WaferError> {
+    let records = db::list_all(ctx, TABLE, bucket_key_filters(bucket, key)).await?;
+    records.first().map(ObjectRow::from_record).transpose()
+}
+
+fn bucket_key_filters(bucket: &str, key: &str) -> Vec<Filter> {
+    vec![
+        Filter {
+            field: "bucket".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(bucket.to_string()),
+        },
+        Filter {
+            field: "key".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(key.to_string()),
+        },
+    ]
+}
+
+/// The object a [`Reservation`] took the place of, as its row read before the
+/// reservation overwrote it. [`release_reservation`] writes it back when the
+/// storage upload fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacedObject {
+    pub size: i64,
+    pub content_type: String,
+    pub status: ObjectStatus,
+    pub uploaded_by: String,
+    pub uploaded_at: String,
+}
+
+/// A claim on `(bucket, key)` held while a storage upload is in flight, taken
+/// by [`reserve_upload`] and settled by [`mark_complete`] or
+/// [`release_reservation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    /// Row id of the reservation — a new row, or the row of the object being
+    /// replaced.
+    pub id: String,
+    /// `Some` when this upload overwrites an object already stored under the
+    /// key, carrying what that object's row said. `None` for a new key.
+    pub replaced: Option<ReplacedObject>,
+}
+
+/// Claim `(bucket, key)` for an upload of `size` bytes, BEFORE the storage
+/// upload runs, so concurrent quota checks see the in-flight size (this is
+/// what closes the check-quota → upload TOCTOU race). `uploaded_at` is stamped
+/// with [`crate::util::now_rfc3339`].
+///
+/// `(bucket, key)` is UNIQUE, so a re-upload cannot get a second row: when the
+/// key already holds an object the reservation TAKES OVER that row, flipping
+/// it to [`ObjectStatus::Pending`] with the new size, content type and
+/// uploader. Inserting instead is what used to answer 500 for every re-upload
+/// of an existing key. Until the upload settles, the row charges the new
+/// (possibly larger) size against the new uploader — the conservative
+/// direction — and [`release_reservation`] puts the old values back if the
+/// upload fails.
+pub async fn reserve_upload(
     ctx: &dyn Context,
     bucket: &str,
     key: &str,
     size: usize,
     content_type: &str,
     uploaded_by: &str,
-) -> Result<ObjectRow, WaferError> {
+) -> Result<Reservation, WaferError> {
     let data = crate::util::json_map(serde_json::json!({
         "bucket": bucket,
         "key": key,
@@ -147,11 +212,60 @@ pub async fn insert_pending(
         "uploaded_by": uploaded_by,
         "uploaded_at": crate::util::now_rfc3339(),
     }));
-    ObjectRow::from_record(&db::create(ctx, TABLE, data).await?)
+
+    match find_by_bucket_key(ctx, bucket, key).await? {
+        Some(existing) => {
+            db::update(ctx, TABLE, &existing.id, data).await?;
+            Ok(Reservation {
+                id: existing.id,
+                replaced: Some(ReplacedObject {
+                    size: existing.size,
+                    content_type: existing.content_type,
+                    status: existing.status,
+                    uploaded_by: existing.uploaded_by,
+                    uploaded_at: existing.uploaded_at,
+                }),
+            })
+        }
+        None => Ok(Reservation {
+            id: db::create(ctx, TABLE, data).await?.id,
+            replaced: None,
+        }),
+    }
+}
+
+/// Give up a [`Reservation`] whose storage upload failed: delete the row it
+/// created, or — when it took over the row of an object that is still stored —
+/// put that object's values back, so the surviving blob keeps being described
+/// and charged correctly.
+pub async fn release_reservation(
+    ctx: &dyn Context,
+    reservation: &Reservation,
+) -> Result<(), WaferError> {
+    match &reservation.replaced {
+        None => delete(ctx, &reservation.id).await,
+        Some(previous) => {
+            let data = crate::util::json_map(serde_json::json!({
+                "size": previous.size,
+                "content_type": previous.content_type,
+                "status": previous.status,
+                "uploaded_by": previous.uploaded_by,
+                "uploaded_at": previous.uploaded_at,
+            }));
+            db::update(ctx, TABLE, &reservation.id, data)
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 /// Flip a [`ObjectStatus::Pending`] row to [`ObjectStatus::Complete`] after
-/// its storage upload succeeded.
+/// its storage upload succeeded — the only thing that settles a
+/// [`Reservation`] as a stored object.
+///
+/// A row left `pending` is swept within the hour
+/// (`quota::sweep_stale_pending`), so this failing means the upload is not
+/// recorded: the caller reports it rather than answering `uploaded: true`.
 pub async fn mark_complete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
     let data = crate::util::json_map(serde_json::json!({ "status": ObjectStatus::Complete }));
     db::update(ctx, TABLE, id, data).await.map(|_| ())
@@ -182,23 +296,7 @@ pub async fn delete_by_bucket_key(
     bucket: &str,
     key: &str,
 ) -> Result<i64, WaferError> {
-    db::delete_by_filters_count(
-        ctx,
-        TABLE,
-        vec![
-            Filter {
-                field: "bucket".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(bucket.to_string()),
-            },
-            Filter {
-                field: "key".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::Value::String(key.to_string()),
-            },
-        ],
-    )
-    .await
+    db::delete_by_filters_count(ctx, TABLE, bucket_key_filters(bucket, key)).await
 }
 
 /// Delete `user_id`'s `pending`-status rows with `uploaded_at` strictly

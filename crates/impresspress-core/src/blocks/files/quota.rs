@@ -40,6 +40,15 @@ pub async fn get_user_usage(
 
 /// Admit or refuse an upload of `file_size` bytes for `user_id`.
 ///
+/// `replaces_own_bytes` is `Some(size)` when the upload overwrites an object
+/// this same user already stores under the key — the size of that object, as
+/// it is still counted in `user_id`'s usage. It is what makes an overwrite
+/// cost the *difference*: replacing a 100 MB file with a 1 MB one frees
+/// 99 MB, and neither one adds a file to the count. `None` — a new key, or a
+/// key whose current row belongs to someone else, whose bytes are in THAT
+/// user's usage and not in this one's — charges the full size and one more
+/// file.
+///
 /// Fails closed: if the quota or the current usage cannot be read, the
 /// upload is refused with an internal error rather than admitted against
 /// the defaults or against zero usage.
@@ -47,11 +56,14 @@ pub async fn check_quota(
     ctx: &dyn Context,
     user_id: &str,
     file_size: i64,
+    replaces_own_bytes: Option<i64>,
 ) -> Result<(), OutputStream> {
     let quota = get_user_quota(ctx, user_id)
         .await
         .map_err(|e| err_internal("Quota lookup failed", e))?;
 
+    // The per-file cap is about this file, not about the net change: a file
+    // over the limit is refused however much the one it replaces frees.
     if file_size > quota.max_file_size_bytes {
         return Err(err_bad_request(&format!(
             "File exceeds maximum size of {} bytes",
@@ -62,11 +74,13 @@ pub async fn check_quota(
     let current_bytes = get_used_bytes(ctx, user_id)
         .await
         .map_err(|e| err_internal("Quota usage lookup failed", e))?;
-    if current_bytes + file_size > quota.max_storage_bytes {
+    if current_bytes + file_size - replaces_own_bytes.unwrap_or(0) > quota.max_storage_bytes {
         return Err(err_bad_request("Storage quota exceeded"));
     }
 
-    if quota.max_files_per_bucket > 0 {
+    // An overwrite adds no row, so a user already at the file-count limit can
+    // still replace what they have.
+    if quota.max_files_per_bucket > 0 && replaces_own_bytes.is_none() {
         let file_count = get_file_count(ctx, user_id)
             .await
             .map_err(|e| err_internal("Quota usage lookup failed", e))?;
@@ -82,11 +96,14 @@ pub async fn check_quota(
 }
 
 /// Sweep `pending`-status object rows older than `older_than_seconds` for
-/// the given user. Pending rows are inserted before the actual storage
-/// upload to close the quota TOCTOU window; if the upload errors AND the
-/// compensating delete also errors, the row sticks around and inflates the
-/// user's quota usage forever. Calling this best-effort on each new upload
-/// keeps the table self-healing without a separate cron.
+/// the given user. A row is claimed `pending` before the actual storage
+/// upload to close the quota TOCTOU window, and two failures can leave one
+/// behind: the upload errored AND `release_reservation` errored too, or the
+/// upload succeeded but `mark_complete` could not record it (which the
+/// uploader is told about, so their retry re-claims the same row). Either way
+/// the row would otherwise inflate that user's quota usage forever. Calling
+/// this best-effort on each new upload keeps the table self-healing without a
+/// separate cron.
 ///
 /// 1 hour is a comfortable cutoff: the largest realistic upload finishes
 /// inside that window, and anything still pending afterward is almost
@@ -166,9 +183,9 @@ mod tests {
         row.insert("max_storage_bytes".into(), json!(2048));
         repo::quota::seed(&ctx, row).await.expect("seed quota");
 
-        assert!(check_quota(&ctx, "u1", 1024).await.is_ok());
+        assert!(check_quota(&ctx, "u1", 1024, None).await.is_ok());
         assert!(
-            check_quota(&ctx, "u1", 4096).await.is_err(),
+            check_quota(&ctx, "u1", 4096, None).await.is_err(),
             "file above the override cap must be rejected"
         );
     }
@@ -180,7 +197,7 @@ mod tests {
         let ctx = TestContext::with_files().await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.list", repo::quota::TABLE)]);
 
-        let out = check_quota(&failing, "u1", 1)
+        let out = check_quota(&failing, "u1", 1, None)
             .await
             .expect_err("an override lookup outage must not admit the upload");
 
@@ -197,7 +214,7 @@ mod tests {
         let ctx = TestContext::with_files().await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.sum", repo::objects::TABLE)]);
 
-        let out = check_quota(&failing, "u1", 1)
+        let out = check_quota(&failing, "u1", 1, None)
             .await
             .expect_err("a usage lookup outage must not admit the upload");
 
