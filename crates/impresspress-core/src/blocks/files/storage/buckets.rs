@@ -74,26 +74,38 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
     // succeeded against the first user's folder — and the compensating
     // `delete_folder` below would then have deleted that user's data on the
     // way to reporting the failure.
-    if let Err(e) = repo::buckets::insert(ctx, &body.name, body.public, msg.user_id()).await {
-        return crud::taken_key_or_db_error(
-            e,
-            repo::buckets::name_exists(ctx, &body.name),
-            &format!(
-                "A bucket named \"{}\" already exists. Pick another name.",
-                body.name
-            ),
-        )
-        .await;
-    }
+    let row = match repo::buckets::insert(ctx, &body.name, body.public, msg.user_id()).await {
+        Ok(row) => row,
+        Err(e) => {
+            return crud::taken_key_or_db_error(
+                e,
+                repo::buckets::name_exists(ctx, &body.name),
+                &format!(
+                    "A bucket named \"{}\" already exists. Pick another name.",
+                    body.name
+                ),
+                "Failed to create bucket",
+            )
+            .await
+        }
+    };
 
     // The row is the source of truth for bucket existence, so a bucket whose
     // folder could not be created must not keep its row: it would list a
     // namespace no object can be written to. Roll the claim back rather than
     // warn-and-continue.
+    //
+    // By ROW ID, not by name. A name-scoped delete is only safe while the
+    // unique index exists, and a deployment that takes this code without
+    // `--run-migrations` has the handler but not the index: there a second
+    // user's create on a taken name still inserts, and rolling back by name
+    // would delete the first owner's row too — trading the folder this
+    // ordering protects for the row that lists it.
     if let Err(e) = store::create_folder(ctx, &body.name, body.public).await {
-        if let Err(cleanup) = repo::buckets::delete_by_name(ctx, &body.name).await {
+        if let Err(cleanup) = repo::buckets::delete(ctx, &row.id).await {
             tracing::error!(
                 bucket = %body.name,
+                bucket_id = %row.id,
                 error = %cleanup,
                 "failed to roll back the bucket row after its storage folder could not be created",
             );
@@ -155,7 +167,8 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
 mod integration_tests {
     use super::{
         super::test_helpers::{
-            ctx_with_storage, ctx_with_storage_handle, seed_bucket, seed_object_row,
+            ctx_with_storage, ctx_with_storage_handle, ctx_with_storage_without_the_unique_index,
+            seed_bucket, seed_object_row,
         },
         *,
     };
@@ -303,6 +316,55 @@ mod integration_tests {
                 .expect("bucket lookup")
                 .is_none(),
             "the claim must be rolled back when the folder could not be created",
+        );
+    }
+
+    /// The rollback deletes the row it inserted, not every row with that name.
+    ///
+    /// `RELEASE.md` anticipates a deployment that takes this code without
+    /// `--run-migrations`: the handler is there, the unique index is not, and
+    /// a second user's create on a taken name still inserts. If the folder
+    /// then fails, a name-scoped rollback would delete the FIRST owner's row
+    /// too — their bucket disappears from every listing while their objects
+    /// keep charging their quota. That trades the folder this ordering
+    /// protects for the row that lists it, so the rollback is by id and does
+    /// not depend on the index at all.
+    #[tokio::test]
+    async fn the_create_rollback_removes_only_the_row_it_inserted() {
+        let (ctx, storage) = ctx_with_storage_without_the_unique_index().await;
+        let created = handle_create_bucket(
+            &ctx,
+            &create_bucket_msg("alice"),
+            create_bucket_body("assets", false),
+        )
+        .await;
+        assert_eq!(
+            output_json(created).await["created"],
+            serde_json::json!(true)
+        );
+
+        storage.refuse("create_folder");
+        let out = handle_create_bucket(
+            &ctx,
+            &create_bucket_msg("mallory"),
+            create_bucket_body("assets", false),
+        )
+        .await;
+
+        assert!(output_is_error(out, "Internal").await);
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "alice")
+                .await
+                .expect("bucket lookup")
+                .is_some(),
+            "the first owner's bucket must survive somebody else's failed create",
+        );
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "mallory")
+                .await
+                .expect("bucket lookup")
+                .is_none(),
+            "and the row the failed create inserted must be gone",
         );
     }
 

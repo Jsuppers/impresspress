@@ -199,10 +199,15 @@ fn seal(failure: DbFailure, context: &str) -> OutputStream {
 /// a genuine fault, and a probe that could not run is **not** "free" — "could
 /// not tell" keeps the write's own failure, so a transient read outage cannot
 /// turn a 500 into a wrong 409 or vice versa.
+///
+/// `context` is the log label every non-collision answer carries into
+/// [`db_error_internal`] — the caller's own ("Failed to create bucket"), not a
+/// generic one, so an operator reading the log still knows which write failed.
 pub async fn taken_key_or_db_error(
     error: wafer_run::WaferError,
     probe: impl std::future::Future<Output = Result<bool, wafer_run::WaferError>>,
     conflict: &str,
+    context: &str,
 ) -> OutputStream {
     match error.code {
         // Already classified by the backend — nothing left to find out.
@@ -211,17 +216,17 @@ pub async fn taken_key_or_db_error(
         ErrorCode::Internal | ErrorCode::Aborted => {}
         // A WRAP refusal (403) or a quota (429) is not a name collision and
         // keeps the status `crud` gives it.
-        _ => return db_error_internal(error, "Database error"),
+        _ => return db_error_internal(error, context),
     }
     match probe.await {
         Ok(true) => err_conflict(conflict),
-        Ok(false) => db_error_internal(error, "Database error"),
+        Ok(false) => db_error_internal(error, context),
         Err(probe_error) => {
             tracing::warn!(
                 error = %probe_error,
                 "could not re-read the key a refused insert may have collided with",
             );
-            db_error_internal(error, "Database error")
+            db_error_internal(error, context)
         }
     }
 }
@@ -826,6 +831,7 @@ mod tests {
                 Ok(false)
             },
             "TAKEN already exists",
+            "Database error",
         )
         .await;
 
@@ -845,6 +851,7 @@ mod tests {
             WaferError::new(ErrorCode::Aborted, "write conflict"),
             async { Ok(true) },
             "TAKEN already exists",
+            "Database error",
         )
         .await;
         assert_eq!(crate::test_support::output_http_status(taken).await, 409);
@@ -853,6 +860,7 @@ mod tests {
             WaferError::new(ErrorCode::Aborted, "write conflict"),
             async { Ok(false) },
             "TAKEN already exists",
+            "Database error",
         )
         .await;
         assert_eq!(crate::test_support::output_http_status(free).await, 500);
@@ -870,6 +878,7 @@ mod tests {
                 Ok(true)
             },
             "TAKEN already exists",
+            "Database error",
         )
         .await;
 

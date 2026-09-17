@@ -270,6 +270,7 @@ pub(super) async fn handle_create_permission(
                      another name.",
                     body.name
                 ),
+                "Database error",
             )
             .await
         }

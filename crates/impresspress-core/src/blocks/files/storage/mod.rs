@@ -244,8 +244,32 @@ mod test_helpers {
     /// ([`MemStorage::refuse`]) and drive a handler's compensation path
     /// against the database state the successful calls left.
     pub(super) async fn ctx_with_storage_handle() -> (TestContext, Arc<MemStorage>) {
+        with_storage(TestContext::with_files().await)
+    }
+
+    /// [`ctx_with_storage_handle`] on a database that has migration 001 but
+    /// NOT 002 — a deployment that took this code without `--run-migrations`,
+    /// which `RELEASE.md` explicitly anticipates.
+    ///
+    /// `TestContext::with_files` applies every migration the block declares,
+    /// so no other fixture can reach this state, and the handler behaviour
+    /// that must not depend on the unique index would go untested.
+    pub(super) async fn ctx_with_storage_without_the_unique_index() -> (TestContext, Arc<MemStorage>)
+    {
+        let ctx = TestContext::with_auth().await;
+        crate::migration_helper::apply_migrations(
+            &ctx,
+            "impresspress/files",
+            &[crate::blocks::files::migrations::SQLITE_MIGRATIONS[0].1],
+            &[],
+        )
+        .await
+        .expect("001 applies");
+        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+    }
+
+    fn with_storage(mut ctx: TestContext) -> (TestContext, Arc<MemStorage>) {
         let service = Arc::new(MemStorage::default());
-        let mut ctx = TestContext::with_files().await;
         ctx.register_block(
             "wafer-run/storage",
             crate::blocks::files::test_wrap::storage_block(service.clone()),

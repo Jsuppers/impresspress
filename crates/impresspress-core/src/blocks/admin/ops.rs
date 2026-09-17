@@ -292,6 +292,7 @@ pub(super) async fn create_role(
                 &format!(
                     "A role named \"{name}\" already exists. Edit that role, or pick another name."
                 ),
+                "Database error",
             )
             .await)
         }
@@ -817,6 +818,7 @@ pub(super) async fn create_variable(
                     "A variable named \"{key}\" already exists. Edit that variable, or pick \
                      another key."
                 ),
+                "Database error",
             )
             .await)
         }
