@@ -125,15 +125,16 @@ describe("AuthService", () => {
     expect(JSON.parse(init.body)).toEqual({ email: "a@b.com" });
   });
 
-  it("signInWithOAuth passes provider as a query param and reads auth_url (not `url`)", async () => {
-    fetchMock.mockResolvedValueOnce(
-      fakeJsonResponse({ auth_url: "https://accounts.google.com/x", provider: "google" }),
-    );
+  it("signInWithOAuth returns the start URL to navigate to, without calling it", async () => {
     const res = await client().auth.signInWithOAuth("google");
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://api.test/b/auth/oauth/login?provider=google",
-    );
-    expect(res.auth_url).toContain("accounts.google.com");
+    expect(res).toEqual({
+      auth_url: "http://api.test/b/auth/oauth/login?provider=google",
+      provider: "google",
+    });
+    // Navigating is the point: the start endpoint sets the cookie that binds
+    // the flow to this browser, and a fetch from another origin cannot store
+    // it. A request here would mean that binding is lost in Safari.
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("refreshSession requires refresh_token in the body (server rejects an empty one)", async () => {

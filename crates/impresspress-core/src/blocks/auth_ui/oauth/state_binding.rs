@@ -20,21 +20,46 @@
 //!   travels in URLs (the authorize redirect, the callback query string) and
 //!   so leaks into `Referer` headers, proxy logs and browser history; the
 //!   value that binds the flow does not.
+//! * One cookie **per flow**, named after the first bytes of that hash. A
+//!   single fixed name would mean a single pending flow per browser: a second
+//!   tab, or "Google, then GitHub on second thoughts", would overwrite the
+//!   first flow's binding and its callback would be refused.
+//! * `__Host-` prefix wherever `Secure` is emitted. Without it a sibling
+//!   subdomain — or anything that can write cookies for the registrable
+//!   domain — can plant a binding for a flow it started and restore exactly
+//!   the CSRF this module exists to close; `__Host-` cookies can only be set
+//!   by the exact host, over HTTPS, with `Path=/` and no `Domain`. The prefix
+//!   is dropped on a development deployment for the same reason `Secure` is:
+//!   a browser rejects a `__Host-` cookie that is not `Secure`, so keeping it
+//!   on `http://localhost` would leave no binding at all.
 //! * `SameSite=Lax`, because the callback arrives as a cross-site top-level
 //!   navigation from the provider — `Strict` would withhold the cookie there
 //!   and break every sign-in.
-//! * `Path=/`, because `IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI` is
+//! * `Path=/`, which `__Host-` requires anyway, and which
+//!   `IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI` needs: it is
 //!   operator-configurable and need not sit under the start endpoint's path.
-//! * The start endpoint must therefore be same-origin with the page that
-//!   calls it: a cross-origin `fetch` cannot store a `SameSite=Lax` cookie,
-//!   and the callback would then have nothing to match against.
+//!
+//! The cookie is first-party because `start.rs` answers a top-level
+//! navigation with a 302 to the provider: the browser is *at* this origin
+//! when the cookie is set, in the tab or popup the user is signing in with.
+//! An earlier shape — a JSON endpoint the page fetched — put that write in a
+//! third-party context for any caller served from another origin, which
+//! Safari blocks outright and Firefox partitions, so the callback would never
+//! find the binding.
 
 use wafer_run::{context::Context, Message};
 
 use crate::{blocks::auth::helpers::cookie_secure_attribute, util::sha256_hex};
 
-/// Cookie name carrying the binding hash.
-pub(super) const COOKIE_NAME: &str = "oauth_state";
+/// Cookie-name stem. The per-flow discriminator and, on a secure deployment,
+/// the `__Host-` prefix are appended/prepended by [`cookie_name`].
+const COOKIE_STEM: &str = "oauth_state";
+
+/// Number of hex characters of the binding hash that name the cookie. 8 hex
+/// characters = 32 bits: enough that two flows a user has open at once do not
+/// collide, while the full 256-bit hash stays in the value, which is what is
+/// actually compared.
+const NAME_DISCRIMINATOR_LEN: usize = 8;
 
 /// The value stored in the cookie for `state_id`: hex SHA-256, so the cookie
 /// never repeats a value that also travels in a URL.
@@ -42,33 +67,57 @@ fn binding_hash(state_id: &str) -> String {
     sha256_hex(state_id.as_bytes())
 }
 
+/// The cookie name for one flow. `secure_attribute` is the output of
+/// [`cookie_secure_attribute`]; an empty one means this deployment serves
+/// plain HTTP, where a `__Host-` cookie would be rejected.
+fn cookie_name(hash: &str, secure_attribute: &str) -> String {
+    let prefix = if secure_attribute.is_empty() {
+        ""
+    } else {
+        "__Host-"
+    };
+    format!("{prefix}{COOKIE_STEM}_{}", &hash[..NAME_DISCRIMINATOR_LEN])
+}
+
 /// `Set-Cookie` value binding `state_id` to this browser for `max_age_secs`,
 /// which the caller keeps equal to the PKCE state's own TTL so the two halves
 /// of a flow expire together.
 pub(super) async fn issue(ctx: &dyn Context, state_id: &str, max_age_secs: i64) -> String {
+    let secure = cookie_secure_attribute(ctx).await;
+    let hash = binding_hash(state_id);
     format!(
-        "{COOKIE_NAME}={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={max_age_secs}{}",
-        binding_hash(state_id),
-        cookie_secure_attribute(ctx).await
+        "{}={hash}; HttpOnly; Path=/; SameSite=Lax; Max-Age={max_age_secs}{secure}",
+        cookie_name(&hash, secure),
     )
 }
 
-/// `Set-Cookie` value that removes the binding cookie. Emitted once a callback
-/// has redeemed the state, so a single-use binding does not outlive its flow.
-pub(super) async fn clear(ctx: &dyn Context) -> String {
+/// `Set-Cookie` value that removes this flow's binding cookie. Emitted on
+/// every answer a callback gives once it has matched a binding — the flow is
+/// over whether it succeeded or was refused, and a binding that outlives its
+/// single-use state is a cookie the browser keeps offering for nothing.
+pub(super) async fn clear(ctx: &dyn Context, state_id: &str) -> String {
+    let secure = cookie_secure_attribute(ctx).await;
+    let hash = binding_hash(state_id);
     format!(
-        "{COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{}",
-        cookie_secure_attribute(ctx).await
+        "{}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{secure}",
+        cookie_name(&hash, secure),
     )
 }
 
-/// Whether `msg` carries the binding cookie for `state_id`.
+/// Whether `msg` carries this flow's binding cookie.
 ///
 /// A missing cookie is a mismatch: the whole point is that a browser which
 /// never ran the start endpoint cannot complete the flow.
-pub(super) fn matches(msg: &Message, state_id: &str) -> bool {
-    let presented = msg.cookie(COOKIE_NAME);
-    !presented.is_empty() && presented == binding_hash(state_id)
+///
+/// The comparison is a plain `==`, not a constant-time one. Both operands are
+/// derived from `state_id`, which the caller supplied in the URL and the
+/// provider echoes in the clear; there is no secret here whose bytes a timing
+/// side channel could recover, only a value the attacker already has.
+pub(super) async fn matches(ctx: &dyn Context, msg: &Message, state_id: &str) -> bool {
+    let secure = cookie_secure_attribute(ctx).await;
+    let hash = binding_hash(state_id);
+    let presented = msg.cookie(&cookie_name(&hash, secure));
+    !presented.is_empty() && presented == hash
 }
 
 #[cfg(test)]
@@ -76,35 +125,84 @@ mod tests {
     use super::*;
     use crate::test_support::TestContext;
 
-    fn msg_with_cookie(value: &str) -> Message {
+    /// The `Cookie` header a browser sends for a `Set-Cookie` value: the
+    /// name/value pair without the attributes.
+    pub(super) fn cookie_header_for(set_cookie: &str) -> &str {
+        set_cookie.split(';').next().unwrap_or("")
+    }
+
+    fn msg_with_cookie(header: &str) -> Message {
         let mut msg = Message::new("auth.oauth.callback");
-        msg.set_meta("http.header.cookie", format!("{COOKIE_NAME}={value}"));
+        msg.set_meta("http.header.cookie", header);
         msg
     }
 
-    #[test]
-    fn matches_only_the_hash_of_the_state_id() {
-        let state = "abc123";
-        assert!(matches(&msg_with_cookie(&binding_hash(state)), state));
-        // The raw state id is NOT the cookie value — a caller that echoed the
-        // URL parameter into the cookie would not satisfy the binding.
-        assert!(!matches(&msg_with_cookie(state), state));
-        assert!(!matches(&msg_with_cookie(&binding_hash("other")), state));
+    async fn dev_ctx() -> TestContext {
+        TestContext::new().await
     }
 
-    #[test]
-    fn a_message_without_the_cookie_never_matches() {
-        let msg = Message::new("auth.oauth.callback");
-        assert!(!matches(&msg, "abc123"));
-        assert!(!matches(&msg_with_cookie(""), "abc123"));
+    /// A deployment that serves HTTPS — `WAFER_RUN_SHARED__ENVIRONMENT` is
+    /// anything but `development`.
+    async fn prod_ctx() -> TestContext {
+        let mut ctx = TestContext::new().await;
+        ctx.set_config("WAFER_RUN_SHARED__ENVIRONMENT", "production");
+        ctx
+    }
+
+    #[tokio::test]
+    async fn matches_only_the_hash_of_the_state_id() {
+        let ctx = dev_ctx().await;
+        let state = "abc123";
+        let issued = issue(&ctx, state, 600).await;
+        assert!(matches(&ctx, &msg_with_cookie(cookie_header_for(&issued)), state).await);
+
+        // The raw state id is NOT the cookie value — a caller that echoed the
+        // URL parameter into the cookie would not satisfy the binding.
+        let name = cookie_name(&binding_hash(state), "");
+        assert!(!matches(&ctx, &msg_with_cookie(&format!("{name}={state}")), state).await);
+
+        let other = issue(&ctx, "some-other-state", 600).await;
+        assert!(!matches(&ctx, &msg_with_cookie(cookie_header_for(&other)), state).await);
+    }
+
+    #[tokio::test]
+    async fn a_message_without_the_cookie_never_matches() {
+        let ctx = dev_ctx().await;
+        assert!(!matches(&ctx, &Message::new("auth.oauth.callback"), "abc123").await);
+        let name = cookie_name(&binding_hash("abc123"), "");
+        assert!(!matches(&ctx, &msg_with_cookie(&format!("{name}=")), "abc123").await);
+    }
+
+    /// Two flows in flight at once — a second tab, or a change of provider —
+    /// each keep their own binding, and each callback still matches.
+    #[tokio::test]
+    async fn two_pending_flows_do_not_evict_each_other() {
+        let ctx = dev_ctx().await;
+        let first = issue(&ctx, "state-one", 600).await;
+        let second = issue(&ctx, "state-two", 600).await;
+        assert_ne!(
+            cookie_header_for(&first).split('=').next(),
+            cookie_header_for(&second).split('=').next(),
+            "each flow must get its own cookie name, or the second start \
+             silently cancels the first"
+        );
+
+        // The browser now holds both, as one `Cookie` header.
+        let both = format!(
+            "{}; {}",
+            cookie_header_for(&first),
+            cookie_header_for(&second)
+        );
+        assert!(matches(&ctx, &msg_with_cookie(&both), "state-one").await);
+        assert!(matches(&ctx, &msg_with_cookie(&both), "state-two").await);
     }
 
     #[tokio::test]
     async fn issued_cookie_carries_the_hash_and_the_lax_http_only_attributes() {
-        let ctx = TestContext::new().await;
+        let ctx = dev_ctx().await;
         let cookie = issue(&ctx, "abc123", 600).await;
         assert!(
-            cookie.starts_with(&format!("{COOKIE_NAME}={}", binding_hash("abc123"))),
+            cookie.contains(&format!("={}", binding_hash("abc123"))),
             "cookie must carry the hash, not the state id: {cookie}"
         );
         assert!(
@@ -117,12 +215,49 @@ mod tests {
         assert!(cookie.contains("; Max-Age=600"), "{cookie}");
     }
 
+    /// On HTTPS the cookie is `__Host-` prefixed, which is what stops a
+    /// sibling subdomain planting a binding for the parent domain. On plain
+    /// HTTP it is not, because a browser rejects a `__Host-` cookie without
+    /// `Secure` and the binding would simply not exist.
     #[tokio::test]
-    async fn clear_expires_the_same_cookie() {
-        let ctx = TestContext::new().await;
-        let cookie = clear(&ctx).await;
-        assert!(cookie.starts_with(&format!("{COOKIE_NAME}=;")), "{cookie}");
-        assert!(cookie.contains("; Max-Age=0"), "{cookie}");
-        assert!(cookie.contains("; Path=/"), "{cookie}");
+    async fn the_host_prefix_tracks_the_secure_attribute() {
+        let prod = prod_ctx().await;
+        let secure_cookie = issue(&prod, "abc123", 600).await;
+        assert!(
+            secure_cookie.starts_with("__Host-"),
+            "a Secure cookie must carry the __Host- prefix: {secure_cookie}"
+        );
+        assert!(secure_cookie.contains("; Secure"), "{secure_cookie}");
+        assert!(
+            matches(
+                &prod,
+                &msg_with_cookie(cookie_header_for(&secure_cookie)),
+                "abc123"
+            )
+            .await,
+            "the callback must look for the same name the start endpoint set"
+        );
+
+        let dev = dev_ctx().await;
+        let dev_cookie = issue(&dev, "abc123", 600).await;
+        assert!(
+            !dev_cookie.contains("__Host-"),
+            "a non-Secure cookie must not claim __Host-, browsers drop it: {dev_cookie}"
+        );
+        assert!(!dev_cookie.contains("; Secure"), "{dev_cookie}");
+    }
+
+    #[tokio::test]
+    async fn clear_expires_the_cookie_the_flow_was_issued() {
+        let ctx = dev_ctx().await;
+        let issued = issue(&ctx, "abc123", 600).await;
+        let cleared = clear(&ctx, "abc123").await;
+        let issued_name = cookie_header_for(&issued).split('=').next().unwrap();
+        assert!(
+            cleared.starts_with(&format!("{issued_name}=;")),
+            "clear must name the cookie that was issued: {cleared} vs {issued}"
+        );
+        assert!(cleared.contains("; Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("; Path=/"), "{cleared}");
     }
 }

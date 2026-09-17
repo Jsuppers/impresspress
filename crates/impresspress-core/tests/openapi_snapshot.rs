@@ -237,7 +237,11 @@ async fn endpoints_the_sdk_calls_publish_a_response_schema() {
         ("post", "/b/auth/api/change-password"),
         ("post", "/b/auth/api/refresh"),
         ("post", "/b/auth/api/resend-verification"),
-        ("get", "/b/auth/oauth/login"),
+        // `/b/auth/oauth/login` is deliberately absent: `signInWithOAuth`
+        // builds that URL for the caller to NAVIGATE to and never requests
+        // it, because the endpoint's binding cookie is only stored
+        // first-party on a top-level navigation. There is no response body
+        // for the SDK's types to go stale against.
         // iam.service.ts
         ("get", "/b/admin/api/iam/roles"),
         ("post", "/b/admin/api/iam/roles"),

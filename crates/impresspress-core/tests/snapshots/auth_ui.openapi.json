@@ -628,30 +628,6 @@
       ],
       "responses": {
         "200": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "description": "`GET /b/auth/oauth/login?provider=` response body.\n\nThe browser-facing OAuth entry point answers JSON, not a redirect: the\ncaller (the SDK's `signInWithOAuth` / `signInWithOAuthPopup`, or the login\npage's buttons) decides whether to navigate the current tab or open a\npopup at `auth_url`.\n\nThe response also sets the `oauth_state` cookie that binds the flow to\nthis browser (`oauth::state_binding`); the callback rejects a `state` that\ndoes not match it, so the request for this body must be same-origin and\ncredentialed.",
-                "properties": {
-                  "auth_url": {
-                    "description": "Absolute authorize URL at the provider, with `client_id`,\n`redirect_uri`, the single-use PKCE `state` and `code_challenge`\nalready interpolated.",
-                    "format": "uri",
-                    "type": "string"
-                  },
-                  "provider": {
-                    "description": "Echo of the requested provider — one of `OAUTH_PROVIDERS`.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "auth_url",
-                  "provider"
-                ],
-                "title": "OauthStartResponse",
-                "type": "object"
-              }
-            }
-          },
           "description": "Successful response"
         }
       },

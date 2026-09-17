@@ -266,23 +266,35 @@ export class AuthService extends BaseService {
   }
 
   /**
-   * Start an OAuth flow. `GET /b/auth/oauth/login?provider=`, which returns
-   * `{ auth_url, provider }` for the caller to navigate to (full-page
-   * redirect or a popup — see `signInWithOAuthPopup`).
+   * Start an OAuth flow: returns `{ auth_url, provider }` where `auth_url` is
+   * `GET /b/auth/oauth/login?provider=` on this deployment, for the caller to
+   * NAVIGATE to — a full-page redirect or a popup (see
+   * `signInWithOAuthPopup`). That endpoint answers `302` to the provider.
+   *
+   * Deliberately builds the URL instead of calling it. The start endpoint
+   * sets the cookie that binds the flow to this browser, and a cookie set on
+   * a `fetch` response is a third-party write whenever the page is served
+   * from another origin than the API — Safari blocks it, Firefox partitions
+   * it, and the OAuth callback would then reject every sign-in. Navigating
+   * makes the browser first-party at the API origin, so the binding is
+   * stored wherever this page came from.
    */
   async signInWithOAuth(
     provider: OAuthProviderName,
   ): Promise<{ auth_url: string; provider: string }> {
-    return this.request<{ auth_url: string; provider: string }>({
-      method: "GET",
-      url: `/b/auth/oauth/login?provider=${encodeURIComponent(provider)}`,
-    });
+    const base = this.config.url.replace(/\/+$/, "");
+    return {
+      auth_url: `${base}/b/auth/oauth/login?provider=${encodeURIComponent(provider)}`,
+      provider,
+    };
   }
 
   /**
    * Sign in via an OAuth popup. Single consolidated implementation (see
-   * `PopupAuthSession`) — the server sets an httpOnly cookie and redirects
-   * the popup to `FRONTEND_URL`, with no `postMessage` contract of its own,
+   * `PopupAuthSession`) — the popup opens at this deployment's OAuth start
+   * endpoint, which redirects it on to the provider; the server then sets an
+   * httpOnly cookie and redirects the popup to `FRONTEND_URL`, with no
+   * `postMessage` contract of its own,
    * so the session is finalized by polling for the popup closing and then
    * verifying the cookie via `getUser()`. A `postMessage({type: "oauth-success"
    * | "oauth-error", error?})` from the popup (e.g. a consumer-built bridge

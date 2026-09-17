@@ -149,28 +149,18 @@ pub async fn handle_resend(
         return constant();
     }
 
-    // Generate new token. The raw token goes in the email link; only its
-    // SHA-256 hex digest is persisted so a row-read leak doesn't grant
-    // verification.
-    let new_token = match crypto::random_bytes(ctx, 32).await {
-        Ok(bytes) => hex_encode(&bytes),
-        Err(e) => return err_internal("Token generation failed", e),
-    };
-    let new_token_hash = sha256_hex(new_token.as_bytes());
-
-    let now = crate::util::now_rfc3339();
-    if let Err(e) = users::set_verification_token(ctx, &user.id, &new_token_hash, &now).await {
-        return err_internal("Failed to update token", e.to_string());
-    }
-
-    if let Err(failure) =
-        super::send_template_email(limiter, ctx, msg, "verification", &email_lower, &new_token)
-            .await
-    {
+    // Mint, persist and mail a fresh link — the shared path, which owns both
+    // the 60-second resend cooldown and the outbound-mail budget. Inside the
+    // cooldown nothing is minted and nothing is said.
+    match super::send_verification_email(limiter, ctx, msg, &user.id, &email_lower).await {
+        Ok(super::VerificationMail::Sent | super::VerificationMail::WithinCooldown) => {}
         // Same constraint as forgot-password: `constant()` is the answer for
         // every account state, so the failure is recorded here rather than
         // in the body.
-        super::log_email_not_sent("resend-verification", &user.id, &failure);
+        Ok(super::VerificationMail::NotSent(failure)) => {
+            super::log_email_not_sent("resend-verification", &user.id, &failure);
+        }
+        Err(e) => return err_internal("Failed to mint the verification token", e),
     }
 
     constant()

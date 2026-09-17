@@ -1,4 +1,21 @@
-//! GET /b/auth/oauth/login — relocated from auth/oauth.rs::handle_oauth_login in Task 5.
+//! GET /b/auth/oauth/login — the browser's entry into an OAuth sign-in.
+//!
+//! This endpoint is **navigated to**, not fetched: it answers `302` to the
+//! provider's authorize URL and sets the cookie that binds the flow to this
+//! browser (`state_binding`). Both halves depend on that.
+//!
+//! * The binding cookie is only usable if the browser is at this origin when
+//!   it is set. Answering JSON for a caller to `fetch` put that write in a
+//!   third-party context whenever the page was served from another origin —
+//!   Safari blocks it, Firefox partitions it — and the callback would then
+//!   find no binding and refuse every sign-in. A top-level navigation is
+//!   first-party in the tab or popup the user is signing in with, wherever
+//!   the page that sent them here was served from.
+//! * A `302` is also what the provider round trip already is: the caller has
+//!   nothing to do with `auth_url` except go to it.
+//!
+//! `impresspress-js`'s `signInWithOAuth` therefore builds this URL rather
+//! than calling it, and `signInWithOAuthPopup` opens the popup here.
 
 use sha2::{Digest, Sha256};
 use wafer_block_crypto::primitives;
@@ -6,10 +23,7 @@ use wafer_core::clients::config;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::{
-        auth::repo::oauth_pkce::{self, NewPkceState},
-        auth_ui::contracts::OauthStartResponse,
-    },
+    blocks::auth::repo::oauth_pkce::{self, NewPkceState},
     http::{err_bad_request, err_forbidden, err_internal, ResponseBuilder},
     util::urlencode,
 };
@@ -123,9 +137,12 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let binding = super::state_binding::issue(ctx, &state_id, PKCE_STATE_TTL_SECS).await;
 
     ResponseBuilder::new()
+        .status(302)
         .set_cookie(&binding)
-        .json(&OauthStartResponse {
-            auth_url,
-            provider: provider.to_string(),
-        })
+        .set_header("Location", &auth_url)
+        // The provider's authorize URL is not a secret, but it carries this
+        // flow's `state`, and a cached copy of it would hand a second browser
+        // a URL whose binding cookie it does not hold.
+        .set_header("Cache-Control", "no-store")
+        .body(Vec::new(), "")
 }

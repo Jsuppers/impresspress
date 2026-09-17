@@ -100,35 +100,25 @@ pub(super) fn oauth_provider_icon(provider: &str) -> Markup {
     }
 }
 
-/// Browser-side handler for OAuth buttons. Hits the existing JSON endpoint,
-/// reads `auth_url`, and redirects. The fetch path uses same-origin cookies
-/// implicitly. On error we surface the message in the existing `#error`
-/// area so it's consistent with the email/password flow.
+/// Browser-side handler for OAuth buttons: a top-level navigation to the
+/// start endpoint, which answers `302` to the provider.
 ///
-/// `login.rs` renders `#error`/`#info` via `components::alert`, which starts
-/// `hidden` (not an inline `display:none` style). `base.css` pins
-/// `[hidden] { display: none !important; }`, so revealing the element must
-/// clear the `hidden` IDL property (`el.hidden = false`), not set
-/// `el.style.display` — a plain inline style loses to that `!important`.
+/// Deliberately a navigation and not a `fetch`. The start endpoint sets the
+/// cookie that binds the flow to this browser, and a cookie set on a `fetch`
+/// response is only stored first-party when the page and the API share an
+/// origin — see `oauth::start`. Navigating also means there is no JSON to
+/// read and no error to surface here: a refused start renders the API's own
+/// error response, and the buttons themselves are only rendered for
+/// providers this deployment has configured (`oauth_provider_configured`).
 pub(super) fn oauth_button_script() -> &'static str {
     r#"
-async function oauthStart(provider){
-  var err=document.getElementById('error');
-  try{
-    var r=await fetch('/b/auth/oauth/login?provider='+encodeURIComponent(provider),{credentials:'same-origin'});
-    var d=await r.json();
-    if(!r.ok||!d.auth_url){throw new Error((d&&d.error&&d.error.message)||d&&d.message||'OAuth start failed');}
-    window.location.href=d.auth_url;
-  }catch(ex){
-    if(err){err.textContent=ex.message||'Failed to start OAuth flow';err.hidden=false;}
-  }
-}
 document.addEventListener('click',function(e){
   if(!(e.target instanceof Element))return;
   var el=e.target.closest('[data-action="oauth-start"]');
   if(!el)return;
   e.preventDefault();
-  oauthStart(el.getAttribute('data-provider')||'');
+  var provider=el.getAttribute('data-provider')||'';
+  window.location.href='/b/auth/oauth/login?provider='+encodeURIComponent(provider);
 });
 "#
 }
