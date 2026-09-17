@@ -10,13 +10,15 @@ use crate::{
         auth::repo::oauth_pkce::{self, NewPkceState},
         auth_ui::contracts::OauthStartResponse,
     },
-    http::{err_bad_request, err_forbidden, err_internal, ok_json},
+    http::{err_bad_request, err_forbidden, err_internal, ResponseBuilder},
     util::urlencode,
 };
 
 /// PKCE state TTL: 10 minutes. OAuth round-trips complete in seconds; this
 /// is forgiving enough for a slow user on a captive-portal Wi-Fi without
-/// keeping abandoned-flow rows around indefinitely.
+/// keeping abandoned-flow rows around indefinitely. The browser-binding
+/// cookie carries the same lifetime, so both halves of a flow expire
+/// together.
 const PKCE_STATE_TTL_SECS: i64 = 600;
 
 /// Generate a PKCE code verifier (43-128 chars, URL-safe).
@@ -73,10 +75,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let code_challenge = pkce_challenge(&code_verifier);
 
-    // SEC-040: the PKCE `code_verifier` is the client-side secret half of
-    // PKCE. Previously it rode in a client-visible JWT (defeats the point of
-    // PKCE entirely). Persist it server-side keyed by a random `state_id`
-    // and send only the opaque id to the provider.
+    // SEC-040: the `code_verifier` is the secret half of PKCE and never
+    // leaves the server. It is persisted keyed by a random `state_id`, and
+    // only that opaque id travels to the provider.
     let state_id = match generate_state_id() {
         Ok(s) => s,
         Err(e) => return err_internal("Failed to generate state", e),
@@ -116,8 +117,15 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         None => return err_bad_request(&format!("Unsupported provider: {provider}")),
     };
 
-    ok_json(&OauthStartResponse {
-        auth_url,
-        provider: provider.to_string(),
-    })
+    // Bind the flow to this browser. The provider echoes `state_id` back to
+    // whichever browser follows the callback URL; only the browser holding
+    // this cookie may redeem it (see `state_binding`).
+    let binding = super::state_binding::issue(ctx, &state_id, PKCE_STATE_TTL_SECS).await;
+
+    ResponseBuilder::new()
+        .set_cookie(&binding)
+        .json(&OauthStartResponse {
+            auth_url,
+            provider: provider.to_string(),
+        })
 }

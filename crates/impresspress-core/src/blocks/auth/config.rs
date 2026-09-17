@@ -53,7 +53,9 @@ pub const PASSWORD_MIN_LENGTH_KEY: &str = "WAFER_RUN_SHARED__AUTH__PASSWORD_MIN_
 pub const ACCESS_TOKEN_LIFETIME_SECS_KEY: &str = "WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS";
 
 /// `WAFER_RUN__AUTH__REQUIRE_VERIFICATION` — when `true`, users must verify
-/// their email before they can log in. Read by login/signup/refresh.
+/// their email before they can log in. Read by login/signup/refresh and by
+/// the OAuth callback, which counts a provider's own verified-email assertion
+/// (`auth_ui::oauth::spec::EmailAssertion`) as the verification.
 pub const REQUIRE_VERIFICATION_KEY: &str = "WAFER_RUN__AUTH__REQUIRE_VERIFICATION";
 
 /// `WAFER_RUN__AUTH__ALLOWED_EMAIL_DOMAINS` — comma-separated allowlist of

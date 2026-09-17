@@ -211,6 +211,11 @@ pub struct RefreshResponse {
 /// caller (the SDK's `signInWithOAuth` / `signInWithOAuthPopup`, or the login
 /// page's buttons) decides whether to navigate the current tab or open a
 /// popup at `auth_url`.
+///
+/// The response also sets the `oauth_state` cookie that binds the flow to
+/// this browser (`oauth::state_binding`); the callback rejects a `state` that
+/// does not match it, so the request for this body must be same-origin and
+/// credentialed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OauthStartResponse {
     /// Absolute authorize URL at the provider, with `client_id`,

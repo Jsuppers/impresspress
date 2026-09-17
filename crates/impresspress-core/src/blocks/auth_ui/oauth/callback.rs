@@ -9,6 +9,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use crate::{
     blocks::{
         auth::{
+            config::REQUIRE_VERIFICATION_KEY,
             helpers::{
                 email_domain_allowed, ensure_admin_role, initial_role_for, issue_tokens_and_cookie,
                 signup_allowed,
@@ -16,6 +17,7 @@ use crate::{
             repo::{oauth_pkce, provider_links, users},
         },
         auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, ResponseBuilder},
 };
@@ -32,6 +34,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let state = msg.query("state");
     if code.is_empty() || state.is_empty() {
         return err_bad_request("Missing code or state parameter");
+    }
+
+    // The `state` is only half the proof. It says a flow this deployment
+    // started is being completed; the binding cookie says it is being
+    // completed by the browser that started it. Checked BEFORE the take, so a
+    // forged callback cannot burn someone else's single-use state either.
+    if !super::state_binding::matches(msg, state) {
+        return err_bad_request("OAuth state does not belong to this browser");
     }
 
     // SEC-040: look up the server-side PKCE state by the opaque `state_id`
@@ -92,14 +102,16 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Err(r) => return r,
     };
 
-    // Phase 2: fetch the user's profile (with GitHub's /user/emails fallback).
+    // Phase 2: fetch the user's profile, and what the provider promises
+    // about the address on it.
     let info = match fetch_user_info(ctx, spec, &oauth_token).await {
         Ok(i) => i,
         Err(r) => return r,
     };
 
     // Phase 3: resolve the local user (link / email-merge / create), enforcing
-    // the disabled-account and signup gates, and upsert the provider link.
+    // the signup, disabled-account and email-verification gates, and upsert
+    // the provider link.
     let user_id = match resolve_user(ctx, &provider, &oauth_token, &info).await {
         Ok(id) => id,
         Err(r) => return r,
@@ -174,6 +186,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     ResponseBuilder::new()
         .status(302)
         .set_cookie(&issued.cookie)
+        // The binding cookie has done its job for this flow; a single-use
+        // binding must not outlive the state it was minted for.
+        .set_cookie(&super::state_binding::clear(ctx).await)
         .set_header("Location", &redirect_url)
         .json(&serde_json::json!({"redirect": redirect_url}))
 }
@@ -181,14 +196,19 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// The profile fields the callback needs from a provider's userinfo response,
 /// already normalised (email lowercased, missing strings empty).
 struct OAuthUserInfo {
-    /// Lowercased verified email (after the GitHub `/user/emails` fallback).
+    /// Lowercased email address the provider returned.
     email: String,
+    /// Whether the provider asserted that the account holder controls
+    /// [`email`](Self::email) — resolved from the provider's
+    /// [`EmailAssertion`](super::spec::EmailAssertion). `false` means "not
+    /// asserted", which is also what an absent or malformed claim produces.
+    email_verified: bool,
     /// Display name, empty if the provider omitted it.
     name: String,
     /// Avatar URL, empty if the provider omitted it.
     avatar: String,
-    /// Stable provider-side user id (`sub` for Google, `id` for GitHub /
-    /// Microsoft), coerced to a string.
+    /// Stable provider-side user id (`sub` for Google and Microsoft, `id` for
+    /// GitHub), coerced to a string.
     provider_ref: String,
     /// Per-provider login handle (GitHub `login`, else the email local-part).
     provider_login: String,
@@ -249,10 +269,13 @@ async fn exchange_code(
 
 /// Phase 2 — fetch and normalise the user's profile.
 ///
-/// Calls the provider userinfo endpoint, then (for providers with an
-/// `emails_url`, i.e. GitHub) falls back to `/user/emails` for a verified
-/// primary address when the userinfo payload omits one. Returns the normalised
-/// [`OAuthUserInfo`]; a missing email or stable id is an error.
+/// Calls the provider userinfo endpoint and resolves the address together with
+/// what the provider promises about it, per the provider's
+/// [`EmailAssertion`](super::spec::EmailAssertion): a boolean claim in the
+/// same payload (Google), a separate per-address list (GitHub `/user/emails`),
+/// or nothing at all (Microsoft). Returns the normalised [`OAuthUserInfo`]; a
+/// missing email or stable id is an error, an unverifiable one is not — it is
+/// reported as such and the caller decides what it may be used for.
 async fn fetch_user_info(
     ctx: &dyn Context,
     spec: &super::spec::OAuthProviderSpec,
@@ -307,6 +330,16 @@ async fn fetch_user_info(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase();
+    // Only a provider that declares a verification claim gets to assert one,
+    // and only a literal `true` counts: an absent, `false` or non-boolean
+    // value is "not asserted".
+    let mut email_verified = match spec.email_assertion {
+        super::spec::EmailAssertion::Claim(field) => user_info
+            .get(field)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        super::spec::EmailAssertion::AddressList(_) | super::spec::EmailAssertion::None => false,
+    };
     let name = user_info
         .get("name")
         .and_then(|v| v.as_str())
@@ -319,12 +352,15 @@ async fn fetch_user_info(
         .unwrap_or("")
         .to_string();
 
-    // GitHub's /user endpoint returns a null `email` for users who have
-    // their primary email set to private. The authoritative list lives at
-    // /user/emails — which is only returned when the `user:email` scope
-    // was granted. Pick the first primary verified address. Only providers
-    // with an `emails_url` (GitHub) carry this fallback.
-    if let (true, Some(emails_url)) = (email.is_empty(), spec.emails_url) {
+    // For an `AddressList` provider the userinfo payload is not authoritative
+    // about the address at all: GitHub's `/user` returns the *public profile*
+    // address, which is null when the user keeps it private and carries no
+    // confirmation either way. `/user/emails` (granted by the `user:email`
+    // scope) is the list that does, so it is always consulted, and only an
+    // entry flagged `verified` is taken — preferring the primary one. If the
+    // call fails or yields nothing verified, the profile address stands as an
+    // unverified address rather than a verified one.
+    if let super::spec::EmailAssertion::AddressList(emails_url) = spec.email_assertion {
         if let Ok(emails_resp) =
             network::do_request(ctx, "GET", emails_url, &api_headers(), None).await
         {
@@ -345,6 +381,7 @@ async fn fetch_user_info(
                     if let Some(e) = pick {
                         if let Some(s) = e.get("email").and_then(|v| v.as_str()) {
                             email = s.to_lowercase();
+                            email_verified = true;
                         }
                     }
                 }
@@ -357,8 +394,8 @@ async fn fetch_user_info(
     }
 
     // Extract the stable provider-side user identifier.
-    // GitHub returns `id` as a JSON number; Google returns `sub` (string);
-    // Microsoft returns `id` (string). Coerce to string in all cases.
+    // GitHub returns `id` as a JSON number; Google and Microsoft return the
+    // OIDC `sub` (string). Coerce to string in all cases.
     let provider_ref = match user_info.get("sub").or_else(|| user_info.get("id")) {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Number(n)) => n.to_string(),
@@ -379,6 +416,7 @@ async fn fetch_user_info(
 
     Ok(OAuthUserInfo {
         email,
+        email_verified,
         name,
         avatar,
         provider_ref,
@@ -389,9 +427,10 @@ async fn fetch_user_info(
 /// Phase 3 — resolve the local user id for this OAuth identity.
 ///
 /// Tries, in order: an existing `(provider, provider_ref)` link; an
-/// email-matched local account (rejected if disabled); otherwise creates a new
-/// user (subject to the shared signup gates). Then upserts the provider link.
-/// Returns the resolved local user id.
+/// email-matched local account (only when both sides have proven the address —
+/// see below); otherwise creates a new user (subject to the shared signup
+/// gates). Every branch then passes the lifecycle and verification gates
+/// before the provider link is upserted. Returns the resolved local user id.
 async fn resolve_user(
     ctx: &dyn Context,
     provider: &str,
@@ -410,11 +449,42 @@ async fn resolve_user(
         // Known provider link — reuse the bound user.
         link.user_id
     } else {
-        // No link yet. Try email-based account merging.
+        // No link yet. An account already holding this address may be adopted
+        // only when BOTH sides have proven control of the mailbox.
+        //
+        // Without that, the address is just a string two parties happen to
+        // type, and matching on it hands the account to whichever of them
+        // arrives second: an attacker who signs up locally with
+        // `victim@example.com` (never confirming it) inherits the victim's
+        // real account the moment the victim signs in with a provider — the
+        // classic pre-account takeover. It runs the other way too: a provider
+        // that will hand out a token for an address it never confirmed
+        // (Microsoft, see `spec::EmailAssertion`) lets its own users claim any
+        // local account by address alone.
+        //
+        // A refusal here does tell the caller that an account with this
+        // address exists. That is unavoidable — `users.email` is UNIQUE, so
+        // the alternative is not silence but a failed insert — and it is the
+        // lesser disclosure by a wide margin.
         match users::find_by_email(ctx, &info.email).await {
             Ok(Some(existing_user)) => {
-                // (removed) the per-branch `if !existing_user.is_active()` check
-                // — the shared gate below now covers every branch.
+                if !info.email_verified {
+                    return Err(error_response(
+                        ErrorCode::EmailAlreadyExists,
+                        &format!(
+                            "An account already uses this email address, and {provider} does \
+                             not confirm that this address belongs to you. Sign in to that \
+                             account instead."
+                        ),
+                    ));
+                }
+                if !existing_user.email_verified {
+                    return Err(error_response(
+                        ErrorCode::EmailAlreadyExists,
+                        "An account already uses this email address but has never confirmed \
+                         it. Sign in to that account and verify the address first.",
+                    ));
+                }
                 existing_user.id
             }
             Ok(None) => {
@@ -448,12 +518,13 @@ async fn resolve_user(
                         Some(info.avatar.clone())
                     },
                     role: role.to_string(),
-                    // Unchanged from before `NewUser` carried the field: the
-                    // OAuth branch never wrote `email_verified`, so the row
-                    // took migration 001's `DEFAULT 0`. Whether a provider's
-                    // assertion should count as verification is a product
-                    // question, not a repo-boundary one.
-                    email_verified: false,
+                    // The provider's own assertion IS the verification: a
+                    // confirmation email would ask the user to prove exactly
+                    // what Google (or GitHub's verified address list) just
+                    // proved. A provider that asserts nothing produces an
+                    // unverified row, which the gate below then holds to the
+                    // deployment's verification policy like any other.
+                    email_verified: info.email_verified,
                     verification_token_hash: None,
                 };
                 // The initial role is the inline `users.role` that
@@ -469,17 +540,49 @@ async fn resolve_user(
         }
     };
 
-    // --- Lifecycle gate (single enforcement point) ---
+    // --- Lifecycle + verification gates (single enforcement point) ---
     // Every branch above (existing link, email merge, new signup) converges
-    // here. Verify the resolved account may authenticate BEFORE mutating the
-    // provider link or issuing tokens. `is_active()` covers both `disabled`
-    // and soft-delete (`deleted_at`). The existing-link branch previously
-    // skipped this, letting disabled/deleted linked accounts re-authenticate.
-    match users::find_by_id(ctx, &user_id).await {
-        Ok(Some(u)) if u.is_active() => {}
+    // here — including the existing-link branch, which authenticates a user
+    // it never looked up. Verify the resolved account may authenticate BEFORE
+    // mutating the provider link or issuing tokens. `is_active()` covers both
+    // `disabled` and soft-delete (`deleted_at`).
+    let account = match users::find_by_id(ctx, &user_id).await {
+        Ok(Some(u)) if u.is_active() => u,
         Ok(Some(_)) => return Err(err_forbidden("Account is disabled")),
         Ok(None) => return Err(err_forbidden("Account not found")),
         Err(e) => return Err(err_internal("User lookup failed", e)),
+    };
+
+    // A provider assertion about the account's own address is verification,
+    // so an account that has one records it. This is what carries a row
+    // created by an earlier sign-in — when the flow ignored the assertion and
+    // stored `email_verified = 0` — over to verified on the next sign-in,
+    // instead of stranding it against the policy below forever.
+    let verified_now =
+        if info.email_verified && !account.email_verified && account.email == info.email {
+            if let Err(e) = users::set_email_verified(ctx, &user_id, true).await {
+                return Err(err_internal("Failed to record the verified email", e));
+            }
+            true
+        } else {
+            account.email_verified
+        };
+
+    // The same verification policy `api::login` and `api::refresh` enforce.
+    // A callback that issues tokens to an unverified account while refresh
+    // rejects it at the first rotation is not a lenient sign-in; it is a
+    // sign-in that logs the user back out minutes later, every time, with no
+    // way out of the loop.
+    let require_verification =
+        crate::config_vars::get_bool(ctx, REQUIRE_VERIFICATION_KEY, false).await;
+    if require_verification && !verified_now {
+        return Err(error_response(
+            ErrorCode::EmailNotVerified,
+            &format!(
+                "This site requires a verified email address, and this account does not have \
+                 one — {provider} does not confirm the address it returned."
+            ),
+        ));
     }
 
     // --- Step 4: upsert the provider_links row ---
@@ -496,8 +599,9 @@ async fn resolve_user(
     .await
     {
         // Log but don't fail — the user is authenticated; link persistence
-        // is best-effort metadata. A failed upsert means re-login will
-        // fall back to email-based merging on next attempt.
+        // is best-effort metadata. A failed upsert means the next sign-in
+        // resolves the account by address again, which only succeeds under
+        // the adoption rule above.
         tracing::warn!("Failed to upsert provider_links: {e}");
     }
 
@@ -609,21 +713,27 @@ mod tests {
     }
 }
 
-/// End-to-end regression tests for the OAuth callback's two historical
-/// security drifts (audit Top-10 #4):
+/// End-to-end tests for the OAuth callback's security gates.
 ///
-/// 1. OAuth logins never created a session row, so they were invisible on the
-///    userportal device list. [`oauth_login_creates_session_row`] proves the
-///    row now exists after a successful Google callback.
-/// 2. Disabled accounts could still authenticate via OAuth because the
-///    callback checked `role == "disabled"` (a value nothing ever writes)
-///    instead of the real `UserRow.disabled` flag.
-///    [`disabled_user_cannot_oauth_in`] proves a disabled account is rejected
-///    and no session is minted.
+/// Every test drives the real [`handle`] through a mock `wafer-run/network`
+/// block serving canned provider responses, so the assertions are about the
+/// shipped flow rather than a re-implementation of it. What they hold in
+/// place:
 ///
-/// Both drive the real [`handle`] end-to-end through a mock `wafer-run/network`
-/// block that returns canned Google token + userinfo responses, so a future
-/// refactor that re-breaks either path fails here.
+/// * **Browser binding** — a callback is only honoured in the browser that
+///   ran the start endpoint, so a `code`/`state` pair captured in the
+///   attacker's browser cannot be replayed at the victim's (login CSRF).
+/// * **Account adoption** — an OAuth identity joins an existing local account
+///   only when the provider asserts a verified address AND the local row is
+///   itself verified (pre-account takeover).
+/// * **Verification policy** — the callback applies
+///   `WAFER_RUN__AUTH__REQUIRE_VERIFICATION` exactly as login and refresh do,
+///   instead of issuing tokens that the first rotation rejects.
+/// * **Provider wiring** — Microsoft signs in through the OIDC userinfo
+///   endpoint; Graph `/v1.0/me`, which returns no `email` at all, cannot
+///   produce a sign-in.
+/// * **Lifecycle** — disabled and soft-deleted accounts are rejected on every
+///   branch, and a successful login leaves exactly one session row.
 #[cfg(test)]
 mod security_regression_tests {
     use std::{collections::HashMap, sync::Arc};
@@ -636,29 +746,86 @@ mod security_regression_tests {
 
     use super::handle;
     use crate::{
-        blocks::auth::repo::{oauth_pkce, sessions, users},
+        blocks::auth::repo::{oauth_pkce, provider_links, sessions, users},
         test_support::TestContext,
     };
 
-    /// Mock network block: maps Google's token + userinfo URLs to canned JSON.
-    /// The userinfo email is fixed so tests can pre-seed a matching user.
-    struct MockGoogleNetwork {
-        userinfo_email: String,
+    /// The `state_id` every fixture seeds, and the one `callback_msg` binds to.
+    const STATE_ID: &str = "state-xyz";
+
+    /// Stable provider-side user ids the mock returns, per provider.
+    const GOOGLE_SUB: &str = "google-user-123";
+    const MICROSOFT_SUB: &str = "microsoft-user-456";
+    const GITHUB_ID: &str = "4242";
+
+    /// Mock network block serving one provider's token + profile endpoints.
+    ///
+    /// Any other URL is an error, which is what makes these tests able to say
+    /// *which* endpoint the flow talks to: a handler pointed at the wrong
+    /// userinfo URL gets an error or an unusable payload, never a pass.
+    struct MockOAuthNetwork {
+        email: String,
+        /// Google: the value of the `verified_email` claim. GitHub: the
+        /// `verified` flag on the `/user/emails` entry. Microsoft asserts
+        /// nothing, so it is unused there.
+        provider_verified: bool,
+        /// GitHub only: whether `/user` exposes the address. A user who keeps
+        /// their address private gets `null` there, which is what makes
+        /// `/user/emails` the only place an address can be found.
+        profile_email_public: bool,
     }
 
     #[async_trait]
-    impl NetworkService for MockGoogleNetwork {
+    impl NetworkService for MockOAuthNetwork {
         async fn do_request(&self, req: &Request) -> Result<Response, NetworkError> {
-            let body = if req.url.contains("oauth2.googleapis.com/token") {
-                serde_json::json!({ "access_token": "mock-google-access-token" })
-            } else if req.url.contains("googleapis.com/oauth2/v2/userinfo") {
+            let url = req.url.as_str();
+            let body = if url.ends_with("/token") || url.ends_with("oauth/access_token") {
+                serde_json::json!({ "access_token": "mock-access-token" })
+            } else if url == "https://www.googleapis.com/oauth2/v2/userinfo" {
                 serde_json::json!({
-                    "sub": "google-user-123",
-                    "email": self.userinfo_email,
+                    "sub": GOOGLE_SUB,
+                    "email": self.email,
+                    "verified_email": self.provider_verified,
                     "name": "Mock Google User",
                 })
+            } else if url == "https://graph.microsoft.com/oidc/userinfo" {
+                // Microsoft's OIDC userinfo claims. No `email_verified`:
+                // Microsoft does not make that assertion.
+                serde_json::json!({
+                    "sub": MICROSOFT_SUB,
+                    "email": self.email,
+                    "name": "Mock Microsoft User",
+                })
+            } else if url == "https://graph.microsoft.com/v1.0/me" {
+                // Graph's own user resource, for comparison: `mail` and
+                // `userPrincipalName`, and no `email` key anywhere.
+                serde_json::json!({
+                    "id": MICROSOFT_SUB,
+                    "displayName": "Mock Microsoft User",
+                    "mail": self.email,
+                    "userPrincipalName": self.email,
+                })
+            } else if url == "https://api.github.com/user" {
+                // The public profile address — null for a user who keeps it
+                // private, and in no case something GitHub vouches for.
+                serde_json::json!({
+                    "id": GITHUB_ID.parse::<i64>().unwrap(),
+                    "login": "mockgh",
+                    "email": if self.profile_email_public {
+                        serde_json::Value::String(self.email.clone())
+                    } else {
+                        serde_json::Value::Null
+                    },
+                    "avatar_url": "https://avatars.example/mockgh.png",
+                })
+            } else if url == "https://api.github.com/user/emails" {
+                serde_json::json!([{
+                    "email": self.email,
+                    "primary": true,
+                    "verified": self.provider_verified,
+                }])
             } else {
-                return Err(NetworkError::Other(format!("unexpected URL: {}", req.url)));
+                return Err(NetworkError::Other(format!("unexpected URL: {url}")));
             };
             Ok(Response {
                 status_code: 200,
@@ -668,70 +835,146 @@ mod security_regression_tests {
         }
     }
 
-    /// Build a ctx with auth migrations, a crypto block (token minting), a mock
-    /// Google network block, OAuth enabled, and a seeded PKCE state row so the
-    /// callback's single-use state redemption succeeds.
-    ///
-    /// `extra_config` is folded into the same `wafer-run/config` block as the
-    /// OAuth flags below (e.g. `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`
-    /// for the role-aware-redirect tests) — it can't be layered on afterward
-    /// via `TestContext::set_config`, which would replace this block wholesale
-    /// and drop the OAuth flags the callback needs to get past its own gates.
-    async fn ctx_for_oauth(userinfo_email: &str, extra_config: &[(&str, &str)]) -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
+    /// One OAuth sign-in attempt, described: which provider answers, with
+    /// which address, whether that provider vouches for it, and any extra
+    /// config the deployment carries.
+    struct OauthFlow {
+        provider: &'static str,
+        email: &'static str,
+        provider_verified: bool,
+        profile_email_public: bool,
+        config: Vec<(String, String)>,
+    }
 
-        // Crypto block — issue_tokens_and_cookie signs JWTs and pulls random
-        // bytes for the rotation family / jti.
-        let crypto_svc = Arc::new(
-            wafer_block_crypto::service::Argon2JwtCryptoService::new(
-                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-            )
-            .expect("test secret is long enough"),
-        );
-        let crypto_block: Arc<dyn Block> = Arc::new(
-            wafer_core::service_blocks::crypto::CryptoBlock::new(crypto_svc),
-        );
-        ctx.register_block("wafer-run/crypto", crypto_block);
-
-        // Mock network block under the production block id.
-        let net: Arc<dyn Block> = Arc::new(wafer_core::service_blocks::network::NetworkBlock::new(
-            Arc::new(MockGoogleNetwork {
-                userinfo_email: userinfo_email.to_string(),
-            }),
-        ));
-        ctx.register_block("wafer-run/network", net);
-
-        // Config block — the handler reads OAuth flags / client credentials via
-        // `config::get_default`, which dispatches to the `wafer-run/config`
-        // block (NOT the TestContext config_get snapshot). Register one backed
-        // by an override map seeded with what the callback needs before it will
-        // attempt the code exchange.
-        use wafer_core::{
-            interfaces::config::service::ConfigService,
-            service_blocks::config::{ConfigBlock, EnvConfigService},
-        };
-        let cfg_svc = EnvConfigService::new();
-        cfg_svc.set("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
-        cfg_svc.set("IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID", "client-id");
-        cfg_svc.set(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_SECRET",
-            "client-secret",
-        );
-        for (k, v) in extra_config {
-            cfg_svc.set(k, v);
+    impl OauthFlow {
+        fn google(email: &'static str) -> Self {
+            Self {
+                provider: "google",
+                email,
+                provider_verified: true,
+                profile_email_public: false,
+                config: Vec::new(),
+            }
         }
-        let cfg_block: Arc<dyn Block> = Arc::new(ConfigBlock::new(Arc::new(cfg_svc)));
-        ctx.register_block("wafer-run/config", cfg_block);
 
-        // Seed a single-use PKCE state row keyed by the `state` query param.
+        fn github(email: &'static str) -> Self {
+            Self {
+                provider: "github",
+                email,
+                provider_verified: true,
+                profile_email_public: false,
+                config: Vec::new(),
+            }
+        }
+
+        fn microsoft(email: &'static str) -> Self {
+            Self {
+                provider: "microsoft",
+                email,
+                // Microsoft returns no verification claim whatever the
+                // account looks like; the field is inert here.
+                provider_verified: false,
+                profile_email_public: false,
+                config: Vec::new(),
+            }
+        }
+
+        /// Whether the provider vouches for the address (Google's
+        /// `verified_email`, GitHub's per-address `verified`).
+        fn provider_verified(mut self, verified: bool) -> Self {
+            self.provider_verified = verified;
+            self
+        }
+
+        /// GitHub only: publish the address on the profile endpoint, as a
+        /// user who has not made it private does.
+        fn profile_email_public(mut self) -> Self {
+            self.profile_email_public = true;
+            self
+        }
+
+        fn config(mut self, key: &str, value: &str) -> Self {
+            self.config.push((key.to_string(), value.to_string()));
+            self
+        }
+
+        /// Build a ctx with auth migrations, a crypto block (token minting), a
+        /// mock network block for this provider, OAuth enabled, and a seeded
+        /// PKCE state row so the callback's single-use state redemption
+        /// succeeds.
+        ///
+        /// The extra config is folded into the same `wafer-run/config` block
+        /// as the OAuth flags — it can't be layered on afterward via
+        /// `TestContext::set_config`, which would replace this block wholesale
+        /// and drop the OAuth flags the callback needs to get past its own
+        /// gates.
+        async fn ctx(&self) -> TestContext {
+            let mut ctx = TestContext::with_auth().await;
+
+            // Crypto block — issue_tokens_and_cookie signs JWTs and pulls
+            // random bytes for the rotation family / jti.
+            let crypto_svc = Arc::new(
+                wafer_block_crypto::service::Argon2JwtCryptoService::new(
+                    "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
+                )
+                .expect("test secret is long enough"),
+            );
+            let crypto_block: Arc<dyn Block> = Arc::new(
+                wafer_core::service_blocks::crypto::CryptoBlock::new(crypto_svc),
+            );
+            ctx.register_block("wafer-run/crypto", crypto_block);
+
+            // Mock network block under the production block id.
+            let net: Arc<dyn Block> =
+                Arc::new(wafer_core::service_blocks::network::NetworkBlock::new(
+                    Arc::new(MockOAuthNetwork {
+                        email: self.email.to_string(),
+                        provider_verified: self.provider_verified,
+                        profile_email_public: self.profile_email_public,
+                    }),
+                ));
+            ctx.register_block("wafer-run/network", net);
+
+            // Config block — the handler reads OAuth flags / client
+            // credentials via `config::get_default`, which dispatches to the
+            // `wafer-run/config` block (NOT the TestContext config_get
+            // snapshot).
+            use wafer_core::{
+                interfaces::config::service::ConfigService,
+                service_blocks::config::{ConfigBlock, EnvConfigService},
+            };
+            let cfg_svc = EnvConfigService::new();
+            cfg_svc.set("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
+            let upper = self.provider.to_uppercase();
+            cfg_svc.set(
+                &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{upper}_CLIENT_ID"),
+                "client-id",
+            );
+            cfg_svc.set(
+                &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{upper}_CLIENT_SECRET"),
+                "client-secret",
+            );
+            for (k, v) in &self.config {
+                cfg_svc.set(k, v);
+            }
+            let cfg_block: Arc<dyn Block> = Arc::new(ConfigBlock::new(Arc::new(cfg_svc)));
+            ctx.register_block("wafer-run/config", cfg_block);
+
+            seed_state(&ctx, STATE_ID, self.provider).await;
+            ctx
+        }
+    }
+
+    /// Seed a single-use PKCE state row keyed by `state_id`.
+    async fn seed_state(ctx: &TestContext, state_id: &str, provider: &str) {
         let expires = (chrono::Utc::now() + chrono::Duration::minutes(10))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         oauth_pkce::insert(
-            &ctx,
+            ctx,
             oauth_pkce::NewPkceState {
-                state_id: "state-xyz",
-                provider: "google",
+                state_id,
+                provider,
                 code_verifier: "verifier-abc",
                 redirect_uri: "https://app.example.com/b/auth/oauth/callback",
                 expires_at: &expires,
@@ -739,29 +982,449 @@ mod security_regression_tests {
         )
         .await
         .expect("seed pkce state");
-
-        ctx
     }
 
-    /// Build the callback request message carrying `code` + `state` query
-    /// params (read via `msg.query(...)` → `req.query.*` meta).
-    fn callback_msg() -> Message {
-        let mut msg = Message::new("auth.oauth.callback");
-        msg.set_meta("req.query.code", "auth-code-123");
-        msg.set_meta("req.query.state", "state-xyz");
+    /// The `Cookie` header a browser sends back for a `Set-Cookie` value —
+    /// the name/value pair, without the attributes.
+    fn cookie_header_for(set_cookie: &str) -> &str {
+        set_cookie.split(';').next().unwrap_or("")
+    }
+
+    /// The callback request a browser makes on its way back from the
+    /// provider: `code` + `state` query params, plus the binding cookie the
+    /// start endpoint set for `state_id`.
+    async fn callback_msg(ctx: &TestContext) -> Message {
+        let set_cookie =
+            crate::blocks::auth_ui::oauth::state_binding::issue(ctx, STATE_ID, 600).await;
+        let mut msg = callback_msg_unbound();
+        msg.set_meta("http.header.cookie", cookie_header_for(&set_cookie));
         msg
     }
 
-    #[tokio::test]
-    async fn oauth_login_creates_session_row() {
-        // No pre-existing user: the callback creates one, then must persist a
-        // session row (the drift that made OAuth logins invisible on the
-        // userportal device list).
-        let email = "newoauth@example.com";
-        let ctx = ctx_for_oauth(email, &[]).await;
+    /// The same callback with no binding cookie at all — the shape a forged
+    /// callback arrives in, since the attacker's cookie is in the attacker's
+    /// browser.
+    fn callback_msg_unbound() -> Message {
+        let mut msg = Message::new("auth.oauth.callback");
+        msg.set_meta("req.query.code", "auth-code-123");
+        msg.set_meta("req.query.state", STATE_ID);
+        msg
+    }
 
-        let out = handle(&ctx, &callback_msg()).await;
-        let status = crate::test_support::output_status(out).await;
+    /// Seed a local account as a password signup would leave it.
+    async fn seed_user(ctx: &TestContext, email: &str, email_verified: bool) -> users::UserRow {
+        users::insert(
+            ctx,
+            users::NewUser {
+                email: email.to_string(),
+                display_name: "Seeded User".to_string(),
+                avatar_url: None,
+                role: "user".to_string(),
+                email_verified,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed user")
+    }
+
+    // ---------------------------------------------------------------
+    // Browser binding (login CSRF)
+    // ---------------------------------------------------------------
+
+    /// The two halves agree: the cookie the real start handler sets is the
+    /// one the real callback demands. A round trip through both handlers, so
+    /// neither can drift from the other's idea of the binding.
+    #[tokio::test]
+    async fn start_binds_the_flow_and_the_callback_accepts_it() {
+        let email = "roundtrip@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+
+        let mut start_msg = Message::new("auth.oauth.login");
+        start_msg.set_meta("req.query.provider", "google");
+        let started = wafer_block::http_codec::collect_http_response(
+            crate::blocks::auth_ui::oauth::start::handle(&ctx, &start_msg).await,
+        )
+        .await;
+        let set_cookie = started
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .expect("the start endpoint must bind the flow to this browser");
+
+        let body: serde_json::Value = serde_json::from_slice(&started.body).expect("start json");
+        let auth_url = body["auth_url"].as_str().expect("auth_url");
+        let state = auth_url
+            .split("&state=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("authorize URL carries the state");
+
+        let mut msg = Message::new("auth.oauth.callback");
+        msg.set_meta("req.query.code", "auth-code-123");
+        msg.set_meta("req.query.state", state);
+        msg.set_meta("http.header.cookie", cookie_header_for(&set_cookie));
+
+        let status = crate::test_support::output_status(handle(&ctx, &msg).await).await;
+        assert_eq!(
+            status, 302,
+            "a callback carrying the cookie the start endpoint set must complete"
+        );
+    }
+
+    /// Login CSRF: an attacker runs the authorize step in their own browser
+    /// and hands the victim the resulting callback URL. The victim's browser
+    /// has no binding cookie, so the callback must refuse — otherwise the
+    /// victim is silently signed in to the attacker's account.
+    #[tokio::test]
+    async fn callback_without_the_binding_cookie_is_refused() {
+        let email = "csrf-victim@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+
+        let out = handle(&ctx, &callback_msg_unbound()).await;
+        assert!(
+            crate::test_support::output_is_error(out, "InvalidArgument").await,
+            "a callback from a browser that never started the flow must be refused"
+        );
+
+        assert!(
+            users::find_by_email(&ctx, email)
+                .await
+                .expect("user lookup ok")
+                .is_none(),
+            "no account may be created by an unbound callback"
+        );
+        // The refusal happens before the take, so the victim's own pending
+        // flow (if any) is not burned by the forgery.
+        assert!(
+            oauth_pkce::take(&ctx, STATE_ID)
+                .await
+                .expect("take ok")
+                .is_some(),
+            "an unbound callback must not consume the single-use state"
+        );
+    }
+
+    /// A cookie from some other flow is not a binding either.
+    #[tokio::test]
+    async fn callback_with_a_foreign_binding_cookie_is_refused() {
+        let ctx = OauthFlow::google("csrf-victim2@example.com").ctx().await;
+
+        let foreign =
+            crate::blocks::auth_ui::oauth::state_binding::issue(&ctx, "some-other-state", 600)
+                .await;
+        let mut msg = callback_msg_unbound();
+        msg.set_meta("http.header.cookie", cookie_header_for(&foreign));
+
+        assert!(
+            crate::test_support::output_is_error(handle(&ctx, &msg).await, "InvalidArgument").await,
+            "a binding cookie minted for another state must not redeem this one"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Account adoption (pre-account takeover)
+    // ---------------------------------------------------------------
+
+    /// Pre-account takeover: an attacker signs up locally with the victim's
+    /// address and never confirms it. When the victim later signs in with a
+    /// provider, matching on the address alone would hand the victim's
+    /// session to the attacker's row. The callback must refuse instead.
+    #[tokio::test]
+    async fn an_unverified_local_account_is_not_adopted() {
+        let email = "preclaimed@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+        let squatted = seed_user(&ctx, email, false).await;
+
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
+        assert!(
+            crate::test_support::output_is_error(out, "AlreadyExists").await,
+            "an OAuth identity must not adopt an account whose address was never confirmed"
+        );
+
+        assert!(
+            sessions::list_for_user(&ctx, &squatted.id)
+                .await
+                .expect("list sessions ok")
+                .is_empty(),
+            "no session may be minted for the account that was not adopted"
+        );
+        assert!(
+            provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_SUB)
+                .await
+                .expect("link lookup ok")
+                .is_none(),
+            "no provider link may be written for a refused adoption"
+        );
+    }
+
+    /// The legitimate case: both sides have proven the address, so the
+    /// identity joins the existing account rather than failing on the UNIQUE
+    /// email or creating a second one.
+    #[tokio::test]
+    async fn a_verified_local_account_is_adopted_once() {
+        let email = "verified-local@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+        let existing = seed_user(&ctx, email, true).await;
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(status, 302, "a verified account may be adopted");
+
+        let link = provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_SUB)
+            .await
+            .expect("link lookup ok")
+            .expect("the adopted account is linked to the provider identity");
+        assert_eq!(
+            link.user_id, existing.id,
+            "the link must bind to the existing account, not a new one"
+        );
+        assert_eq!(
+            users::find_by_email(&ctx, email)
+                .await
+                .expect("user lookup ok")
+                .expect("user present")
+                .id,
+            existing.id,
+            "adoption must not duplicate the account"
+        );
+    }
+
+    /// A provider that makes no verification assertion cannot adopt an
+    /// account either, however well-confirmed the local row is: its `email`
+    /// claim is a mutable profile attribute, not proof of the mailbox.
+    #[tokio::test]
+    async fn a_provider_without_an_assertion_cannot_adopt_an_account() {
+        let email = "ms-adopt@example.com";
+        let ctx = OauthFlow::microsoft(email).ctx().await;
+        let existing = seed_user(&ctx, email, true).await;
+
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
+        assert!(
+            crate::test_support::output_is_error(out, "AlreadyExists").await,
+            "Microsoft asserts nothing about the address, so it cannot claim an account by it"
+        );
+        assert!(
+            sessions::list_for_user(&ctx, &existing.id)
+                .await
+                .expect("list sessions ok")
+                .is_empty(),
+            "no session for a refused adoption"
+        );
+    }
+
+    /// Same refusal when the provider does assert, but says the address is
+    /// NOT verified.
+    #[tokio::test]
+    async fn an_unverified_provider_address_cannot_adopt_an_account() {
+        let email = "unverified-google@example.com";
+        let ctx = OauthFlow::google(email)
+            .provider_verified(false)
+            .ctx()
+            .await;
+        seed_user(&ctx, email, true).await;
+
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
+        assert!(
+            crate::test_support::output_is_error(out, "AlreadyExists").await,
+            "an address the provider itself flags unverified cannot claim an account"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Provider wiring
+    // ---------------------------------------------------------------
+
+    /// Microsoft sign-in works, and works through the OIDC userinfo endpoint.
+    /// Graph `/v1.0/me` — which the mock also serves, in its real shape —
+    /// carries `mail` / `userPrincipalName` and no `email`, so a flow pointed
+    /// at it ends at "No email returned by OAuth provider" for every user.
+    #[tokio::test]
+    async fn microsoft_signs_in_through_the_oidc_userinfo_endpoint() {
+        let email = "msuser@example.com";
+        let ctx = OauthFlow::microsoft(email).ctx().await;
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(status, 302, "a Microsoft sign-in must complete");
+
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("the Microsoft callback created the account");
+        assert!(
+            !user.email_verified,
+            "Microsoft asserts nothing about the address, so the row is not verified"
+        );
+        let link = provider_links::find_by_provider_ref(&ctx, "microsoft", MICROSOFT_SUB)
+            .await
+            .expect("link lookup ok")
+            .expect("the link keys on the OIDC `sub`");
+        assert_eq!(link.user_id, user.id);
+    }
+
+    /// GitHub's profile address is not authoritative: the flow reads
+    /// `/user/emails` and takes the verified primary entry, which is also
+    /// what makes the resulting account verified.
+    #[tokio::test]
+    async fn github_takes_the_verified_primary_address() {
+        let email = "ghuser@example.com";
+        let ctx = OauthFlow::github(email).ctx().await;
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(status, 302, "a GitHub sign-in must complete");
+
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("the GitHub callback created the account");
+        assert!(
+            user.email_verified,
+            "a GitHub address flagged verified on /user/emails is verified"
+        );
+    }
+
+    /// The same address with the `verified` flag cleared creates an account
+    /// that is NOT verified — the list is read for the flag, not merely for
+    /// an address.
+    #[tokio::test]
+    async fn github_unverified_address_creates_an_unverified_account() {
+        let email = "gh-unverified@example.com";
+        let ctx = OauthFlow::github(email)
+            .provider_verified(false)
+            .profile_email_public()
+            .ctx()
+            .await;
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(status, 302);
+
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("account created");
+        assert!(
+            !user.email_verified,
+            "an unverified GitHub address must not produce a verified account"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Verification policy
+    // ---------------------------------------------------------------
+
+    /// With `REQUIRE_VERIFICATION` on, the callback must apply the policy
+    /// login and refresh apply. Issuing tokens here to an unverified account
+    /// only produced a sign-in that the first refresh rotation threw out.
+    #[tokio::test]
+    async fn require_verification_refuses_an_unasserted_login() {
+        let email = "needs-verification@example.com";
+        let ctx = OauthFlow::microsoft(email)
+            .config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true")
+            .ctx()
+            .await;
+
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "an unverified account must be refused, not signed in and logged out again"
+        );
+
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("the signup itself is allowed");
+        assert!(
+            sessions::list_for_user(&ctx, &user.id)
+                .await
+                .expect("list sessions ok")
+                .is_empty(),
+            "no session may be minted for an account the policy refuses"
+        );
+    }
+
+    /// And the provider's assertion satisfies that same policy: a Google
+    /// sign-in under `REQUIRE_VERIFICATION` completes, because the row it
+    /// creates records the assertion.
+    #[tokio::test]
+    async fn require_verification_admits_a_provider_verified_login() {
+        let email = "google-verified@example.com";
+        let ctx = OauthFlow::google(email)
+            .config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true")
+            .ctx()
+            .await;
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(
+            status, 302,
+            "a provider-verified address satisfies the verification policy"
+        );
+
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("account created");
+        assert!(
+            user.email_verified,
+            "the provider's assertion must be recorded on the row"
+        );
+    }
+
+    /// A row left unverified by an earlier sign-in is carried over on the
+    /// next one rather than stranded: the provider still asserts the address,
+    /// so the account records it and the policy admits it.
+    #[tokio::test]
+    async fn a_provider_assertion_upgrades_an_unverified_linked_account() {
+        let email = "legacy-oauth@example.com";
+        let ctx = OauthFlow::google(email)
+            .config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true")
+            .ctx()
+            .await;
+        let user = seed_user(&ctx, email, false).await;
+        provider_links::upsert(
+            &ctx,
+            provider_links::NewLink {
+                provider: "google",
+                provider_ref: GOOGLE_SUB,
+                user_id: &user.id,
+                provider_login: "legacy",
+                access_token: "old-token",
+            },
+        )
+        .await
+        .expect("seed provider link");
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(status, 302, "the linked account signs in");
+        assert!(
+            users::find_by_id(&ctx, &user.id)
+                .await
+                .expect("user lookup ok")
+                .expect("user present")
+                .email_verified,
+            "the provider's assertion must be recorded on the existing row"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Identity resolution
+    // ---------------------------------------------------------------
+
+    /// First sign-in: the callback creates the account AND the provider link,
+    /// and persists a session row — OAuth logins are visible on the
+    /// userportal device list like every other login.
+    #[tokio::test]
+    async fn first_login_creates_the_user_the_link_and_a_session() {
+        let email = "newoauth@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+
+        let status =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
         assert_eq!(status, 302, "successful OAuth callback should 302-redirect");
 
         let user = users::find_by_email(&ctx, email)
@@ -769,13 +1432,64 @@ mod security_regression_tests {
             .expect("user lookup ok")
             .expect("OAuth callback created the user");
 
+        let link = provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_SUB)
+            .await
+            .expect("link lookup ok")
+            .expect("OAuth callback created the provider link");
+        assert_eq!(link.user_id, user.id);
+
         let session_rows = sessions::list_for_user(&ctx, &user.id)
             .await
             .expect("list sessions ok");
         assert_eq!(
             session_rows.len(),
             1,
-            "OAuth login must persist exactly one session row (regression: it persisted none)"
+            "OAuth login must persist exactly one session row"
+        );
+    }
+
+    /// Second sign-in with the same provider identity reuses the linked
+    /// account: one user row, one link row, a fresh access token on it.
+    #[tokio::test]
+    async fn re_login_reuses_the_linked_account() {
+        let email = "returning@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+
+        let first =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(first, 302);
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("user present");
+
+        // A second flow needs its own single-use state.
+        seed_state(&ctx, STATE_ID, "google").await;
+        let second =
+            crate::test_support::output_status(handle(&ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(second, 302, "a returning user signs in again");
+
+        assert_eq!(
+            users::find_by_email(&ctx, email)
+                .await
+                .expect("user lookup ok")
+                .expect("user present")
+                .id,
+            user.id,
+            "re-login must not create a second account"
+        );
+        let link = provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_SUB)
+            .await
+            .expect("link lookup ok")
+            .expect("link present");
+        assert_eq!(link.user_id, user.id);
+        assert_eq!(
+            sessions::list_for_user(&ctx, &user.id)
+                .await
+                .expect("list sessions ok")
+                .len(),
+            2,
+            "each login leaves its own session row"
         );
     }
 
@@ -784,12 +1498,14 @@ mod security_regression_tests {
     #[tokio::test]
     async fn oauth_login_non_admin_redirects_to_userportal() {
         let email = "oauthuser@example.com";
-        let ctx = ctx_for_oauth(email, &[]).await;
+        let ctx = OauthFlow::google(email).ctx().await;
 
-        let out = handle(&ctx, &callback_msg()).await;
-        let location = crate::test_support::output_header(out, "Location")
-            .await
-            .expect("302 redirect must set a Location header");
+        let location = crate::test_support::output_header(
+            handle(&ctx, &callback_msg(&ctx).await).await,
+            "Location",
+        )
+        .await
+        .expect("302 redirect must set a Location header");
         assert!(
             location.ends_with("/b/userportal/"),
             "non-admin OAuth login must default to the user portal, not the \
@@ -803,46 +1519,39 @@ mod security_regression_tests {
     #[tokio::test]
     async fn oauth_login_admin_email_redirects_to_admin_home() {
         let email = "oauthadmin@example.com";
-        let ctx = ctx_for_oauth(
-            email,
-            &[("WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL", email)],
-        )
-        .await;
+        let ctx = OauthFlow::google(email)
+            .config("WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL", email)
+            .ctx()
+            .await;
 
-        let out = handle(&ctx, &callback_msg()).await;
-        let location = crate::test_support::output_header(out, "Location")
-            .await
-            .expect("302 redirect must set a Location header");
+        let location = crate::test_support::output_header(
+            handle(&ctx, &callback_msg(&ctx).await).await,
+            "Location",
+        )
+        .await
+        .expect("302 redirect must set a Location header");
         assert!(
             location.ends_with("/b/admin/"),
             "admin OAuth login must still default to the admin home: {location}"
         );
     }
 
+    // ---------------------------------------------------------------
+    // Lifecycle
+    // ---------------------------------------------------------------
+
     #[tokio::test]
     async fn disabled_user_cannot_oauth_in() {
-        // Seed a DISABLED user with the email the provider will return.
+        // A DISABLED account holding the address the provider will return.
+        // It is `email_verified`, so the adoption gate lets the flow reach
+        // the lifecycle gate under test.
         let email = "disabled@example.com";
-        let ctx = ctx_for_oauth(email, &[]).await;
+        let ctx = OauthFlow::google(email).ctx().await;
 
-        let user = users::insert(
-            &ctx,
-            users::NewUser {
-                email: email.to_string(),
-                display_name: "Disabled User".to_string(),
-                avatar_url: None,
-                role: "user".to_string(),
-                email_verified: false,
-                verification_token_hash: None,
-            },
-        )
-        .await
-        .expect("seed user");
-        // Flip the real `disabled` flag (the value the fixed check reads).
+        let user = seed_user(&ctx, email, true).await;
         users::set_disabled(&ctx, &user.id, true)
             .await
             .expect("disable user");
-        // Sanity: the typed row now reports disabled.
         assert!(
             users::find_by_id(&ctx, &user.id)
                 .await
@@ -853,11 +1562,11 @@ mod security_regression_tests {
         );
 
         // The callback rejects with a PermissionDenied error stream (mapped to
-        // HTTP 403 at the boundary). Before the fix this returned a 302 login.
-        let out = handle(&ctx, &callback_msg()).await;
+        // HTTP 403 at the boundary).
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
         assert!(
             crate::test_support::output_is_error(out, "PermissionDenied").await,
-            "disabled account must be rejected at the OAuth callback (regression: it logged in)"
+            "disabled account must be rejected at the OAuth callback"
         );
 
         // And no session row was minted for the disabled user.
@@ -870,55 +1579,32 @@ mod security_regression_tests {
         );
     }
 
-    /// Regression test for the whole-branch review finding: credential
-    /// *issuance* paths (login / refresh / OAuth) gated on `user.disabled`
-    /// only, not on soft-delete. `db::soft_delete` leaves `local_credentials`
-    /// and refresh tokens intact, so a soft-deleted user could still
-    /// authenticate via OAuth email-matching and mint fresh tokens. The fix
-    /// replaces `existing_user.disabled` with `!existing_user.is_active()`,
-    /// which also covers `is_deleted()`.
+    /// Credential *issuance* paths (login / refresh / OAuth) must gate on
+    /// soft-delete too, not just `disabled`. `db::soft_delete` leaves
+    /// `local_credentials` and refresh tokens intact, so a soft-deleted user
+    /// could otherwise authenticate by address and mint fresh tokens.
     #[tokio::test]
     async fn soft_deleted_user_cannot_oauth_in() {
-        // Seed a SOFT-DELETED (but not `disabled`) user with the email the
-        // provider will return.
         let email = "softdeleted@example.com";
-        let ctx = ctx_for_oauth(email, &[]).await;
+        let ctx = OauthFlow::google(email).ctx().await;
 
-        let user = users::insert(
-            &ctx,
-            users::NewUser {
-                email: email.to_string(),
-                display_name: "Soft Deleted User".to_string(),
-                avatar_url: None,
-                role: "user".to_string(),
-                email_verified: false,
-                verification_token_hash: None,
-            },
-        )
-        .await
-        .expect("seed user");
+        let user = seed_user(&ctx, email, true).await;
         // Soft-delete (stamps `deleted_at`) — NOT `disabled`. Mirrors the
-        // Task-1/2 lifecycle tests in `auth/repo/users.rs`.
+        // lifecycle tests in `auth/repo/users.rs`.
         users::soft_delete(&ctx, &user.id)
             .await
             .expect("soft-delete user");
-        // Sanity: the typed row now reports deleted/inactive but NOT disabled.
         let row = users::find_by_id(&ctx, &user.id).await.unwrap().unwrap();
         assert!(row.is_deleted(), "fixture user must be soft-deleted");
         assert!(!row.disabled, "fixture user must not be `disabled`");
         assert!(!row.is_active(), "soft-deleted user must not be active");
 
-        // The callback must reject with a PermissionDenied error stream (mapped
-        // to HTTP 403 at the boundary), the same as a disabled account. Before
-        // the fix this only checked `existing_user.disabled` and returned a
-        // 302 login for a soft-deleted user.
-        let out = handle(&ctx, &callback_msg()).await;
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
         assert!(
             crate::test_support::output_is_error(out, "PermissionDenied").await,
-            "soft-deleted account must be rejected at the OAuth callback (regression: it logged in)"
+            "soft-deleted account must be rejected at the OAuth callback"
         );
 
-        // And no session row was minted for the soft-deleted user.
         let session_rows = sessions::list_for_user(&ctx, &user.id)
             .await
             .expect("list sessions ok");
@@ -928,36 +1614,23 @@ mod security_regression_tests {
         );
     }
 
-    /// Whole-branch regression: the existing-provider-link path reused
-    /// `link.user_id` with NO lifecycle check. A disabled user who already had
-    /// a provider link could re-authenticate and mint fresh tokens. The shared
-    /// post-resolution gate must reject them.
+    /// The existing-provider-link path reuses `link.user_id`, which is the
+    /// one branch that can authenticate a user it never read. A disabled user
+    /// who already has a link must still be rejected by the shared gate.
     #[tokio::test]
     async fn disabled_pre_linked_user_cannot_oauth_in() {
         let email = "disabled-linked@example.com";
-        let ctx = ctx_for_oauth(email, &[]).await;
+        let ctx = OauthFlow::google(email).ctx().await;
 
-        let user = users::insert(
-            &ctx,
-            users::NewUser {
-                email: email.to_string(),
-                display_name: "Disabled Linked User".to_string(),
-                avatar_url: None,
-                role: "user".to_string(),
-                email_verified: false,
-                verification_token_hash: None,
-            },
-        )
-        .await
-        .expect("seed user");
+        let user = seed_user(&ctx, email, true).await;
 
-        // Pre-existing provider link → callback takes the existing-link branch.
-        // provider_ref must match the mock userinfo `sub` ("google-user-123").
-        crate::blocks::auth::repo::provider_links::upsert(
+        // Pre-existing provider link → callback takes the existing-link
+        // branch. provider_ref must match the mock userinfo `sub`.
+        provider_links::upsert(
             &ctx,
-            crate::blocks::auth::repo::provider_links::NewLink {
+            provider_links::NewLink {
                 provider: "google",
-                provider_ref: "google-user-123",
+                provider_ref: GOOGLE_SUB,
                 user_id: &user.id,
                 provider_login: "disabled-linked",
                 access_token: "old-token",
@@ -971,10 +1644,10 @@ mod security_regression_tests {
             .await
             .expect("disable user");
 
-        let out = handle(&ctx, &callback_msg()).await;
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
         assert!(
             crate::test_support::output_is_error(out, "PermissionDenied").await,
-            "disabled pre-linked account must be rejected (regression: it logged in)"
+            "disabled pre-linked account must be rejected"
         );
         let session_rows = sessions::list_for_user(&ctx, &user.id)
             .await
@@ -989,26 +1662,14 @@ mod security_regression_tests {
     #[tokio::test]
     async fn soft_deleted_pre_linked_user_cannot_oauth_in() {
         let email = "softdel-linked@example.com";
-        let ctx = ctx_for_oauth(email, &[]).await;
+        let ctx = OauthFlow::google(email).ctx().await;
 
-        let user = users::insert(
+        let user = seed_user(&ctx, email, true).await;
+        provider_links::upsert(
             &ctx,
-            users::NewUser {
-                email: email.to_string(),
-                display_name: "Soft Deleted Linked User".to_string(),
-                avatar_url: None,
-                role: "user".to_string(),
-                email_verified: false,
-                verification_token_hash: None,
-            },
-        )
-        .await
-        .expect("seed user");
-        crate::blocks::auth::repo::provider_links::upsert(
-            &ctx,
-            crate::blocks::auth::repo::provider_links::NewLink {
+            provider_links::NewLink {
                 provider: "google",
-                provider_ref: "google-user-123",
+                provider_ref: GOOGLE_SUB,
                 user_id: &user.id,
                 provider_login: "softdel-linked",
                 access_token: "old-token",
@@ -1021,10 +1682,10 @@ mod security_regression_tests {
             .await
             .expect("soft-delete user");
 
-        let out = handle(&ctx, &callback_msg()).await;
+        let out = handle(&ctx, &callback_msg(&ctx).await).await;
         assert!(
             crate::test_support::output_is_error(out, "PermissionDenied").await,
-            "soft-deleted pre-linked account must be rejected (regression: it logged in)"
+            "soft-deleted pre-linked account must be rejected"
         );
         let session_rows = sessions::list_for_user(&ctx, &user.id)
             .await
