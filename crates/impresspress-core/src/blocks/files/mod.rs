@@ -104,7 +104,21 @@ pub(crate) mod test_wrap {
     }
 }
 
-use wafer_run::{BlockInfo, HttpMethod, InstanceMode};
+use wafer_run::{BlockInfo, ConfigVar, HttpMethod, InputType, InstanceMode};
+
+/// The config vars this block declares, for `BlockInfo::config_keys` — the
+/// admin Variables screen renders them from this list, and the validator
+/// reads the same declaration.
+fn config_vars() -> Vec<ConfigVar> {
+    vec![ConfigVar::new(
+        cloud::MAX_SHARE_EXPIRY_HOURS_KEY,
+        "Longest a public share link may live, in hours. A share created \
+         without an expiry gets this long; a longer one is refused.",
+        &cloud::DEFAULT_MAX_SHARE_EXPIRY_HOURS.to_string(),
+    )
+    .name("Max share link lifetime (hours)")
+    .input_type(InputType::Number)]
+}
 
 use super::rate_limit::{check_user_rate_limit_with, RateLimit, RateLimitOutcome, UserRateLimiter};
 use crate::{
@@ -570,6 +584,7 @@ crate::impresspress_feature_block! {
                 CollectionSchema::new(repo::shares::ACCESS_LOGS_TABLE),
                 CollectionSchema::new(repo::quota::TABLE),
             ])
+            .config_keys(config_vars())
             .category(wafer_run::BlockCategory::Feature)
             .description("File storage and management with bucket-based organization. Supports file upload, download, deletion, search, and sharing via public links with expiration and access counting. Includes per-user storage quotas.")
             .endpoints(endpoint_match::declare(ROUTES))
@@ -819,72 +834,120 @@ mod test_support {
         &js[from..from + len]
     }
 
+    /// One entry of the share modal's expiry dropdown.
+    pub(super) struct ShareModalOption {
+        /// The number the modal sends for this option.
+        pub value: i64,
+        /// The duration this option's LABEL promises the user, in hours — so
+        /// a test can catch an option offering the right field in the wrong
+        /// unit as well as one that outlives the cap.
+        pub label_hours: i64,
+        /// Whether the modal pre-selects it.
+        pub selected: bool,
+    }
+
     /// What the share modal sends when the user accepts its default expiry.
     pub(super) struct ShareModalExpiry {
         /// The JSON field the modal puts the expiry in.
         pub field: String,
         /// The number it sends for the pre-selected option.
         pub value: i64,
-        /// The duration that option's LABEL promises the user, in hours —
-        /// so a test can catch a modal sending the right field in the wrong
-        /// unit as well as the wrong field.
+        /// That option's promised duration in hours.
         pub label_hours: i64,
     }
 
-    /// Read [`ShareModalExpiry`] out of the shipped bundle.
-    pub(super) fn share_modal_expiry() -> ShareModalExpiry {
-        let js = super::assets::SOURCE;
-
-        // `const <var> = dlg.querySelector('select[name="expires"]').value;`
+    /// The name of the variable the modal reads its expiry select into.
+    fn expiry_select_var(js: &str) -> &str {
         let read = " = dlg.querySelector('select[name=\"expires\"]').value;";
         let end = js
             .find(read)
             .expect("the share modal must read its expiry select");
         let var_at = js[..end].rfind("const ").expect("read into a const") + "const ".len();
-        let var = &js[var_at..end];
+        &js[var_at..end]
+    }
 
-        // `body.<field> = Number(<var>);`
-        let assign = format!(" = Number({var});");
-        let end = js
-            .find(&assign)
-            .expect("the share modal must send the expiry it read");
-        let field_at = js[..end].rfind("body.").expect("sent as a body field") + "body.".len();
-        let field = js[field_at..end].to_string();
-
-        // The `<option … selected>` and the label beside it.
-        let selected = js
-            .find(" selected>")
-            .expect("the share modal must preselect an expiry");
-        let value_at = js[..selected]
-            .rfind("<option value=\"")
-            .expect("the selected option carries a value")
-            + "<option value=\"".len();
-        let value: i64 = js[value_at..][..js[value_at..].find('"').expect("value ends")]
-            .parse()
-            .expect("the selected option's value is a number");
-        let label = between(
-            &js[selected..],
-            " selected>",
-            "</option>",
-            "selected option label",
+    /// Every option the share modal's expiry dropdown offers, in order.
+    pub(super) fn share_modal_expiry_options() -> Vec<ShareModalOption> {
+        let js = super::assets::SOURCE;
+        let select = between(
+            js,
+            "<select name=\"expires\">",
+            "</select>",
+            "the share modal's expiry select",
         );
 
+        let mut options = Vec::new();
+        let mut rest = select;
+        while let Some(at) = rest.find("<option value=\"") {
+            rest = &rest[at + "<option value=\"".len()..];
+            let value_end = rest.find('"').expect("an option value ends");
+            let raw_value = &rest[..value_end];
+            let value: i64 = raw_value.parse().unwrap_or_else(|_| {
+                panic!(
+                    "expiry option value `{raw_value}` is not a number of hours — \
+                        a share link always has an end"
+                )
+            });
+            let selected = between(rest, "\"", ">", "an option's attributes").contains("selected");
+            let label = between(rest, ">", "</option>", "an option label");
+            options.push(ShareModalOption {
+                value,
+                label_hours: label_in_hours(label),
+                selected,
+            });
+        }
+        assert!(
+            !options.is_empty(),
+            "the share modal must offer an expiry to pick"
+        );
+        options
+    }
+
+    /// `"7 days"` ⇒ 168. The label is what the user was promised.
+    fn label_in_hours(label: &str) -> i64 {
         let (count, unit) = label
             .split_once(' ')
             .unwrap_or_else(|| panic!("expiry label `{label}` is not `<n> <unit>`"));
         let count: i64 = count
             .parse()
             .unwrap_or_else(|_| panic!("expiry label `{label}` does not start with a number"));
-        let label_hours = match unit.trim_end_matches('s') {
+        match unit.trim_end_matches('s') {
             "day" => count * 24,
             "hour" => count,
             other => panic!("expiry label `{label}` uses an unhandled unit `{other}`"),
-        };
+        }
+    }
+
+    /// Read [`ShareModalExpiry`] out of the shipped bundle.
+    pub(super) fn share_modal_expiry() -> ShareModalExpiry {
+        let js = super::assets::SOURCE;
+        let var = expiry_select_var(js);
+
+        // The field the modal sends it under — `<field>: Number(<var>)` or
+        // `body.<field> = Number(<var>)`, whichever spelling the bundle uses.
+        let call = format!("Number({var})");
+        let at = js
+            .find(&call)
+            .expect("the share modal must send the expiry it read");
+        let head = js[..at].trim_end().trim_end_matches([':', '=']).trim_end();
+        let field_at = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let field = head[field_at..].to_string();
+        assert!(
+            !field.is_empty(),
+            "the expiry must be sent under a named field"
+        );
+
+        let selected = share_modal_expiry_options()
+            .into_iter()
+            .find(|option| option.selected)
+            .expect("the share modal must preselect an expiry");
 
         ShareModalExpiry {
             field,
-            value,
-            label_hours,
+            value: selected.value,
+            label_hours: selected.label_hours,
         }
     }
 

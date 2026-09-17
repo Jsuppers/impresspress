@@ -244,11 +244,15 @@
       '<p><code></code></p>' +
       // Values are HOURS — the unit POST /b/cloudstorage/shares takes in
       // `expires_in_hours`. The labels are the days the user thinks in.
+      // There is no "never": a share link is a bearer credential, so every
+      // one of them ends. The longest option is the deployment's default
+      // ceiling (IMPRESSPRESS__FILES__MAX_SHARE_EXPIRY_HOURS), which the
+      // server applies to a request that names no expiry at all.
       '<label>Expires in <select name="expires">' +
-      '<option value="">Never</option>' +
       '<option value="24">1 day</option>' +
       '<option value="168" selected>7 days</option>' +
       '<option value="720">30 days</option>' +
+      '<option value="8760">365 days</option>' +
       '</select></label>' +
       '<label>Max accesses <input name="max" type="number" min="0" placeholder="∞" /></label>' +
       '<div class="modal-actions">' +
@@ -268,9 +272,9 @@
       const hours = dlg.querySelector('select[name="expires"]').value;
       const max = dlg.querySelector('input[name="max"]').value;
       // Only the fields the endpoint declares: it rejects unknown ones
-      // rather than minting a share that ignores them.
-      const body = { bucket: bucket, key: key };
-      if (hours) body.expires_in_hours = Number(hours);
+      // rather than minting a share that ignores them. Every option carries
+      // an expiry, so one is always sent.
+      const body = { bucket: bucket, key: key, expires_in_hours: Number(hours) };
       if (max) body.max_access_count = Number(max);
       try {
         const resp = await fetch('/b/cloudstorage/shares', {

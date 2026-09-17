@@ -108,8 +108,11 @@ pub struct NewShare<'a> {
     pub created_by: &'a str,
     /// RFC 3339 creation instant (also the base of `expires_at`).
     pub created_at: &'a str,
-    /// Optional absolute expiry (RFC 3339).
-    pub expires_at: Option<&'a str>,
+    /// Absolute expiry (RFC 3339). Not optional: every share link has an
+    /// end, and the row is the only thing that records it — the token says
+    /// nothing. A share with no expiry would be a permanently live public
+    /// link, so the type does not let one be inserted.
+    pub expires_at: &'a str,
     /// Optional access cap; `None` (or a non-positive stored value) means
     /// unlimited.
     pub max_access_count: Option<i64>,
@@ -125,12 +128,10 @@ pub async fn insert(ctx: &dyn Context, new: NewShare<'_>) -> Result<ShareRow, Wa
         "created_at": new.created_at,
         "access_count": 0,
     }));
-    if let Some(exp) = new.expires_at {
-        data.insert(
-            "expires_at".to_string(),
-            serde_json::Value::String(exp.to_string()),
-        );
-    }
+    data.insert(
+        "expires_at".to_string(),
+        serde_json::Value::String(new.expires_at.to_string()),
+    );
     if let Some(max) = new.max_access_count {
         data.insert("max_access_count".to_string(), serde_json::json!(max));
     }

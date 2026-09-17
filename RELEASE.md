@@ -222,6 +222,28 @@ and every historical share link becomes permanently public; the only signal
 is the generic `schema drift; redeploy with --run-migrations to apply`
 warning each boot logs for the files block.
 
+### Files: every share link now expires
+
+**What changes.** A public share link is an unauthenticated bearer
+credential: it is pasted into a chat or a document and never looked at
+again. From this release every one of them has an end. The share dialog no
+longer offers "Never", and a `POST /b/cloudstorage/shares` that names no
+`expires_in_hours` gets the configured maximum rather than an unexpiring
+link.
+
+**The maximum is yours to set.** `IMPRESSPRESS__FILES__MAX_SHARE_EXPIRY_HOURS`
+(Admin → Settings → Variables) defaults to `8760` — one year, the ceiling
+explicitly-supplied expiries were already held to. It is read per request,
+so raising it for a deployment that genuinely needs long-lived public links
+takes effect without a redeploy, and lowering it binds the next share
+immediately. An expiry longer than the maximum is refused with a 400, as
+before.
+
+**Who is affected.** Nobody is losing a link they were relying on: the old
+token scheme capped every link at 30 days in practice, whatever the dialog
+said. What changes is that the cap is now visible, chosen, and honest about
+itself.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one
