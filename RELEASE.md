@@ -134,6 +134,51 @@ whether or not you pass `--run-migrations`. Cloudflare and browser deployments
 are unaffected: neither seeds from a process environment, so neither has a tie
 to break, and the **Reset to environment** control does not render there.
 
+### Files: bucket names are unique (migration 002) — upgrade with `--run-migrations`
+
+**What changes.** A storage bucket's name is also its folder name in the object
+store, and the `buckets` table had no unique index on it. A second user could
+therefore create a bucket under a name someone else already held — every
+backend's `create_folder` is idempotent, so nothing refused it — and the row
+they got granted them read, overwrite and delete access to the first owner's
+objects. Bucket names are now unique, and creating one that is taken answers
+`409` with "A bucket named … already exists."
+
+**The repair.** Migration `002_bucket_name_unique` deletes duplicate bucket rows
+before creating the index, keeping the **earliest** row for each name (by
+`created_at`, `id` as the tie-break). That is the access the later rows should
+never have had; the folder and its objects stay with the one remaining owner,
+and the object-metadata rows of whoever else uploaded into it are left alone —
+those blobs are real and still charged to whoever uploaded them.
+
+**Upgrade with `--run-migrations`.** Without it the index is not created, and
+the code half alone does not close the hole: the refusal comes from the
+database, so a duplicate name is admitted exactly as before. The only signal is
+the generic `schema drift; redeploy with --run-migrations to apply` warning each
+boot logs for the files block.
+
+**If you want to see what will be deleted first**, list the collisions from the
+admin SQL explorer before upgrading:
+
+```sql
+SELECT name, COUNT(*) AS rows, GROUP_CONCAT(created_by) AS owners
+FROM impresspress__files__buckets GROUP BY name HAVING COUNT(*) > 1;
+```
+
+### Files: uploaded objects download instead of rendering
+
+**What changes.** `GET /b/storage/api/buckets/{bucket}/objects/{key}` and the
+public share link `GET /b/storage/direct/{token}` serve bytes and a content type
+an uploader chose, from the application's own origin. They now send
+`X-Content-Type-Options: nosniff` on every object, and `Content-Disposition:
+inline` only for types that cannot carry script — images (not SVG), audio,
+video, PDF and plain text. Everything else, `text/html` and `image/svg+xml`
+included, is served as an `attachment` with a sandbox `Content-Security-Policy`.
+
+Image and PDF previews are unaffected. What changes for a user is that opening
+an uploaded `.html` or `.svg` link downloads the file rather than displaying it.
+**No migration.**
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one
