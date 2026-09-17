@@ -76,7 +76,9 @@ pub async fn handle_direct_access(
     // that never expires (a SQL NULL or a stored empty string, which mean
     // the same thing here). A stored expiry we cannot parse is refused, not
     // waved through: the owner set an expiry, and an unreadable one cannot
-    // be shown to be in the future.
+    // be shown to be in the future. It is refused as a fault, not as an
+    // expiry — the row is corrupt, and "your link has expired" would be as
+    // false a reason as the "not found" this arm replaces.
     if let Some(expires) = share.expires_at.as_deref() {
         let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(expires) else {
             tracing::error!(
@@ -84,10 +86,21 @@ pub async fn handle_direct_access(
                 expires_at = %expires,
                 "share row carries an unparseable expires_at",
             );
-            return err_forbidden("Share link has expired");
+            return err_internal_no_cause("Share link is unavailable");
         };
         if exp_time < chrono::Utc::now() {
             return err_forbidden("Share link has expired");
+        }
+    }
+
+    // Refuse a share already at its cap before paying for the object. The
+    // authority is still the CAS UPDATE below — this read can be stale, and
+    // a share at `access_count = max - 1` with two requests in flight is
+    // decided there — but a share that is visibly finished must not cost a
+    // storage read per request for the rest of its life.
+    if let Some(max) = share.max_access_count {
+        if share.access_count >= max {
+            return err_forbidden("Share link access limit reached");
         }
     }
 
@@ -107,7 +120,8 @@ pub async fn handle_direct_access(
         Err(e) => return crud::db_error(e, "File not found", "Storage error"),
     };
 
-    // Spend the access. The cap lives inside the UPDATE's WHERE clause:
+    // Spend the access. The cap lives inside the UPDATE's WHERE clause —
+    // this, not the stale read above, is what decides it:
     //   UPDATE shares SET access_count = access_count + 1
     //   WHERE id = ? AND access_count < max_access_count
     // so at most one updater wins per row and rowcount 0 ⇒ cap reached; two
@@ -115,9 +129,9 @@ pub async fn handle_direct_access(
     // `None` (no cap) reaches `increment_access_count_capped` as 0, which is
     // the "unlimited" sentinel its filter is written against.
     //
-    // This statement IS the cap check, so a failure refuses the download:
-    // serving anyway would serve past the cap, and there is no earlier check
-    // to fall back on.
+    // This statement IS the cap check, so a failure refuses the download.
+    // The read above cannot stand in for it: it saw one moment, and a share
+    // one access short of its cap passes it every time.
     let max = share.max_access_count.unwrap_or(0);
     match repo::shares::increment_access_count_capped(ctx, &share.id, max).await {
         Ok(true) => {}
@@ -162,7 +176,10 @@ mod tests {
     use serde_json::json;
     use wafer_core::clients::storage as store;
 
-    use super::{super::test_support::share_ctx, *};
+    use super::{
+        super::test_support::{routed, share_ctx},
+        *,
+    };
     use crate::{
         blocks::rate_limit::UserRateLimiter,
         test_support::{anon_msg, output_is_error, FailingDbOpContext, TestContext},
@@ -188,10 +205,12 @@ mod tests {
         repo::shares::seed(ctx, data).await.expect("seed share").id
     }
 
-    /// `GET /b/storage/direct/{token}` as the public link is fetched.
+    /// `GET /b/storage/direct/{token}` as the public link is fetched: the
+    /// URL goes through the block's own route table, so `{token}` is bound
+    /// the way the router binds it rather than the way a test believes it
+    /// does.
     async fn direct_access(ctx: &dyn Context, token: &str) -> OutputStream {
-        let mut msg = anon_msg("retrieve", &format!("/b/storage/direct/{token}"));
-        msg.set_meta("req.param.token", token);
+        let msg = routed(anon_msg("retrieve", &format!("/b/storage/direct/{token}")));
         handle_direct_access(ctx, &msg, &UserRateLimiter::default()).await
     }
 
@@ -235,6 +254,109 @@ mod tests {
         );
     }
 
+    /// A share whose expiry has passed is refused — the row's clock is the
+    /// one that ends a link now that the token carries none.
+    #[tokio::test]
+    async fn an_expired_share_is_refused() {
+        let ctx = share_ctx("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"secret", "image/png")
+            .await
+            .expect("seed the object being shared");
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let id = seed_share(&ctx, &[("expires_at", json!(yesterday))]).await;
+
+        assert!(
+            output_is_error(direct_access(&ctx, OPAQUE_TOKEN).await, "PermissionDenied").await,
+            "a share past its expiry must not serve"
+        );
+        assert_eq!(
+            repo::shares::find_by_id(&ctx, &id)
+                .await
+                .expect("share row")
+                .access_count,
+            0,
+            "a refused link spends no access"
+        );
+    }
+
+    /// A token that addresses no row — never minted, or revoked since — is
+    /// a 404. Nothing else stands between a guess and the shares table now
+    /// that there is no signature to check first.
+    #[tokio::test]
+    async fn a_token_that_addresses_no_row_is_not_found() {
+        let ctx = share_ctx("photos", "alice").await;
+        let id = seed_share(&ctx, &[]).await;
+        repo::shares::delete(&ctx, &id).await.expect("revoke it");
+
+        assert!(
+            output_is_error(direct_access(&ctx, OPAQUE_TOKEN).await, "NotFound").await,
+            "a revoked share must stop serving"
+        );
+        assert!(
+            output_is_error(
+                direct_access(&ctx, "not-a-token-anyone-minted").await,
+                "NotFound"
+            )
+            .await,
+            "a guessed token must be a 404"
+        );
+    }
+
+    /// A share link minted under the old JWT token scheme stays dead.
+    ///
+    /// Its token used to carry a 30-day expiry that was checked before the
+    /// row was read, and its row carries no expiry of its own (the share
+    /// modal's expiry never reached the handler). Reading that token as the
+    /// opaque string it now is would make every such link permanently live,
+    /// so the block's `002_legacy_share_token_expiry` migration writes the
+    /// expiry the JWT used to impose. This drives the shipped migration —
+    /// through `apply_migrations`, as an operator upgrading with
+    /// `--run-migrations` does — and then the real handler.
+    #[tokio::test]
+    async fn a_legacy_jwt_share_link_stays_dead_after_its_thirty_days() {
+        let mut ctx = share_ctx("photos", "alice").await;
+        ctx.set_config(crate::migration_helper::RUN_MIGRATIONS_KEY, "1");
+        store::put(&ctx, "photos", "a.png", b"once-shared", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        // A row as the old code left it: a JWT token, minted well over 30
+        // days ago, with no expiry on the row at all.
+        const LEGACY_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoic2hhcmUifQ.sig";
+        let minted = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        let id = seed_share(
+            &ctx,
+            &[
+                ("token", json!(LEGACY_TOKEN)),
+                ("created_at", json!(minted)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            repo::shares::find_by_id(&ctx, &id)
+                .await
+                .expect("share row")
+                .expires_at,
+            None,
+            "precondition: a legacy UI-created share carries no expiry"
+        );
+
+        let repair: Vec<&str> = super::super::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .skip_while(|(name, _)| *name != super::super::migrations::LEGACY_SHARE_TOKEN_EXPIRY)
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert!(!repair.is_empty(), "the repair must be a shipped migration");
+        crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &repair, &[])
+            .await
+            .expect("apply the legacy-expiry repair");
+
+        assert!(
+            output_is_error(direct_access(&ctx, LEGACY_TOKEN).await, "PermissionDenied").await,
+            "a legacy link that is dead today must not come back to life"
+        );
+    }
+
     /// An expiry that cannot be read is not an absent expiry.
     ///
     /// The owner set one; a value the handler cannot parse cannot be shown
@@ -249,8 +371,9 @@ mod tests {
         seed_share(&ctx, &[("expires_at", json!("next tuesday"))]).await;
 
         assert!(
-            output_is_error(direct_access(&ctx, OPAQUE_TOKEN).await, "PermissionDenied").await,
-            "an expiry the handler cannot parse must refuse the link, not serve it forever"
+            output_is_error(direct_access(&ctx, OPAQUE_TOKEN).await, "Internal").await,
+            "an expiry the handler cannot parse must refuse the link as the fault it is, \
+             neither serving it forever nor telling the recipient it expired"
         );
     }
 
@@ -305,6 +428,28 @@ mod tests {
         assert_eq!(
             body, stored,
             "the one permitted access must still be available"
+        );
+    }
+
+    /// A share that is already at its cap is refused without reading the
+    /// object.
+    ///
+    /// The CAS UPDATE is still what decides a contended cap, but a finished
+    /// share must not cost a storage read per request for the rest of its
+    /// life. The object here does not exist: a handler that fetched first
+    /// would answer `NotFound`, and the cap answer is the true one.
+    #[tokio::test]
+    async fn a_finished_share_is_refused_before_the_object_is_read() {
+        let ctx = share_ctx("photos", "alice").await;
+        seed_share(
+            &ctx,
+            &[("max_access_count", json!(1)), ("access_count", json!(1))],
+        )
+        .await;
+
+        assert!(
+            output_is_error(direct_access(&ctx, OPAQUE_TOKEN).await, "PermissionDenied").await,
+            "a share at its cap must be refused as capped, without paying for a storage read"
         );
     }
 

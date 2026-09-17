@@ -23,8 +23,10 @@ pub const ACCESS_LOGS_TABLE: &str = "impresspress__files__cloud_access_logs";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ShareRow {
     pub id: String,
-    /// The signed token embedded in the public `/b/storage/direct/{token}`
-    /// URL. Unique across the table.
+    /// The opaque token embedded in the public `/b/storage/direct/{token}`
+    /// URL: random bytes, hex-encoded, asserting nothing about the share.
+    /// This row is what it addresses, and what decides whether the link
+    /// still works. Unique across the table.
     pub token: String,
     pub bucket: String,
     pub key: String,

@@ -1273,8 +1273,10 @@ export interface paths {
                                      */
                                     max_access_count: number | null;
                                     /**
-                                     * @description The signed token embedded in the public `/b/storage/direct/{token}`
-                                     *     URL. Unique across the table.
+                                     * @description The opaque token embedded in the public `/b/storage/direct/{token}`
+                                     *     URL: random bytes, hex-encoded, asserting nothing about the share.
+                                     *     This row is what it addresses, and what decides whether the link
+                                     *     still works. Unique across the table.
                                      */
                                     token: string;
                                     updated_at: string;
@@ -1424,8 +1426,10 @@ export interface paths {
                                      */
                                     max_access_count: number | null;
                                     /**
-                                     * @description The signed token embedded in the public `/b/storage/direct/{token}`
-                                     *     URL. Unique across the table.
+                                     * @description The opaque token embedded in the public `/b/storage/direct/{token}`
+                                     *     URL: random bytes, hex-encoded, asserting nothing about the share.
+                                     *     This row is what it addresses, and what decides whether the link
+                                     *     still works. Unique across the table.
                                      */
                                     token: string;
                                     updated_at: string;
@@ -1464,7 +1468,11 @@ export interface paths {
                              *     /b/cloudstorage/shares/{id}`.
                              */
                             id: string;
-                            /** @description The signed token embedded in `direct_url`. */
+                            /**
+                             * @description The opaque token embedded in `direct_url`. It carries no expiry of
+                             *     its own: the share's own `expires_at` and access cap are what end a
+                             *     link.
+                             */
                             token: string;
                         };
                     };

@@ -376,7 +376,7 @@ pub fn render_admin_shares_table(rows: &[AdminShareRow]) -> Markup {
             } }
             tbody {
                 @for r in rows {
-                    tr data-share-token=(r.token_short) {
+                    tr {
                         td data-label="Token" .text-sm { code { (r.token_short) "..." } }
                         td data-label="Bucket" .font-medium { (r.bucket) }
                         td data-label="File" .text-sm { (r.key) }

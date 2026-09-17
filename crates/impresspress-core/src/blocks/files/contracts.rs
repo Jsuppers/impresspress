@@ -208,7 +208,9 @@ pub struct ShareCreatedResponse {
     /// Row id of the new share — the `{id}` of `DELETE
     /// /b/cloudstorage/shares/{id}`.
     pub id: String,
-    /// The signed token embedded in `direct_url`.
+    /// The opaque token embedded in `direct_url`. It carries no expiry of
+    /// its own: the share's own `expires_at` and access cap are what end a
+    /// link.
     pub token: String,
     /// Path of the public share link, relative to the deployment's origin.
     pub direct_url: String,

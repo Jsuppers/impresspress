@@ -199,6 +199,29 @@ Image and PDF previews are unaffected. What changes for a user is that opening
 an uploaded `.html` or `.svg` link downloads the file rather than displaying it.
 **No migration.**
 
+### Files: legacy share links (migration 003) — upgrade with `--run-migrations`
+
+A public share link's token used to be a JWT signed with a fixed 30-day TTL,
+and the link handler verified that JWT before it read the share row — so a
+link stopped working 30 days after it was minted, whatever expiry its owner
+had picked. From this release a token is opaque entropy addressing one row,
+and the row's `expires_at` is the only thing that ends a link.
+
+That matters on upgrade because the share dialog used to post its expiry
+under a field name the server did not read, so almost every share created
+through the UI has **no expiry on the row at all**. Reading those tokens as
+opaque strings would make every one of those links live again —
+permanently, and pointing at files whose owners believe the link died weeks
+ago.
+
+Migration `003_legacy_share_token_expiry` gives each legacy row (a
+JWT-shaped token, no expiry) the 30 days its token used to impose, counted
+from when it was minted — so a link that is dead today stays dead.
+**Upgrade with `--run-migrations`.** Without it the code half lands alone
+and every historical share link becomes permanently public; the only signal
+is the generic `schema drift; redeploy with --run-migrations to apply`
+warning each boot logs for the files block.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one
