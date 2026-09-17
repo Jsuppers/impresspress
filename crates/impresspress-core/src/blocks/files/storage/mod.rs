@@ -257,14 +257,18 @@ mod test_helpers {
     pub(super) async fn ctx_with_storage_without_the_unique_index() -> (TestContext, Arc<MemStorage>)
     {
         let ctx = TestContext::with_auth().await;
-        crate::migration_helper::apply_migrations(
-            &ctx,
-            "impresspress/files",
-            &[crate::blocks::files::migrations::SQLITE_MIGRATIONS[0].1],
-            &[],
-        )
-        .await
-        .expect("001 applies");
+        // Selected by basename, not by position: `SQLITE_MIGRATIONS[0]` means
+        // "001" only for as long as 001 stays first, and a fixture that
+        // silently started applying 002 as well would be the INDEXED case
+        // while still claiming to be the un-migrated one.
+        let sql = crate::blocks::files::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .find(|(basename, _)| *basename == "001_initial_schema")
+            .map(|(_, sql)| *sql)
+            .expect("the files block still has its initial-schema migration");
+        crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &[sql], &[])
+            .await
+            .expect("001 applies");
         with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
     }
 

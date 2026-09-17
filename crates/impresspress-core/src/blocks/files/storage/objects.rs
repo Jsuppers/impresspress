@@ -133,23 +133,18 @@ pub(in crate::blocks::files) async fn handle_get_object(
     // share link uses.
     match store::get_stream(ctx, bucket, key).await {
         Ok(stream) => {
-            let content_type = resolved_content_type(stream.info());
-            let leading =
-                crate::blocks::files::serving::user_object_leading_meta(&content_type, key, &[]);
+            // The `application/octet-stream` a backend reporting no type used
+            // to get here is not applied twice: the empty string is not a
+            // media type, so `serving` substitutes it along with every other
+            // type it cannot read.
+            let leading = crate::blocks::files::serving::user_object_leading_meta(
+                &stream.info().content_type.clone(),
+                key,
+                &[],
+            );
             crate::streaming::stream_download(stream, leading)
         }
         Err(e) => crud::db_error(e, "Object not found", "Storage error"),
-    }
-}
-
-/// The object's stored content-type, falling back to `application/octet-stream`
-/// when the backend reports none (parity with the buffered `get` path, which
-/// R2/S3 default the same way).
-fn resolved_content_type(info: &store::ObjectInfo) -> String {
-    if info.content_type.is_empty() {
-        "application/octet-stream".to_string()
-    } else {
-        info.content_type.clone()
     }
 }
 

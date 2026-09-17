@@ -55,28 +55,35 @@ const SANDBOX_CSP_HEADER: (&str, &str) = (
 /// The `Content-Disposition` filename for an object with no usable key.
 const FALLBACK_FILENAME: &str = "download";
 
-/// What a content type the block does not recognise as well-formed is served
-/// as. Also `wafer_core`'s own fallback for an object whose backend reports no
-/// type, so the two agree.
+/// What an object whose content type the block cannot read is served as —
+/// including one whose backend reports no type at all, since the empty string
+/// is not a media type either. [`normalized_content_type`] is the single place
+/// that decides this, for both download paths.
 const FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// The stored content type, or [`FALLBACK_CONTENT_TYPE`] when it is not a
 /// well-formed media type.
 ///
 /// The type is whatever the uploader's client put in the multipart part
-/// header, and `multipart::split_part_headers` splits those on `\r\n` only —
-/// so a header terminated with a bare `LF` carries that byte (and anything
-/// after it) into the stored value. Echoing it back would put a control
-/// character into a response header: both wasm adapters fail closed on that
-/// today, which turns into a permanently undownloadable object rather than a
-/// header injection, but "this object cannot be fetched, ever" is not an
-/// acceptable resting place either.
+/// header, and [`crate::multipart::extract_multipart_file`] splits those
+/// headers on `\r\n` only — so a header terminated with a bare `LF` carries
+/// that byte (and anything after it) into the stored value. Echoing it back
+/// would put a control character into a response header: both wasm adapters
+/// fail closed on that today, which turns into a permanently undownloadable
+/// object rather than a header injection, but "this object cannot be fetched,
+/// ever" is not an acceptable resting place either.
 ///
-/// So the type is validated before it is echoed: `token/token` in RFC 9110
-/// token characters, and any parameters printable ASCII with no control
-/// characters. Anything else is served as [`FALLBACK_CONTENT_TYPE`], which is
-/// not on the inline allowlist — a malformed type can only ever become an
-/// attachment.
+/// So the type is validated before it is echoed, in two parts, because they
+/// fail differently:
+/// - The **essence** must be `token/token` in RFC 9110 token characters. If it
+///   is not, there is nothing left to serve and the answer is
+///   [`FALLBACK_CONTENT_TYPE`] — which is not on the inline allowlist, so a
+///   type the block could not read can only ever become an attachment.
+/// - **Parameters** must be printable ASCII. If they are not, only they are
+///   dropped: `image/png; name=café.png` is a perfectly good PNG with an
+///   unusable parameter, and discarding the essence too would demote it to an
+///   `application/octet-stream` attachment — losing the inline preview over a
+///   filename hint no part of the response needs.
 fn normalized_content_type(content_type: &str) -> String {
     /// RFC 9110 `tchar`.
     fn is_token(s: &str) -> bool {
@@ -90,15 +97,16 @@ fn normalized_content_type(content_type: &str) -> String {
         Some((essence, params)) => (essence.trim(), Some(params)),
         None => (trimmed, None),
     };
-    let well_formed = essence
+
+    if !essence
         .split_once('/')
         .is_some_and(|(top, sub)| is_token(top) && is_token(sub))
-        && params.is_none_or(|p| p.chars().all(|c| (' '..='~').contains(&c)));
-
-    if well_formed {
-        trimmed.to_string()
-    } else {
-        FALLBACK_CONTENT_TYPE.to_string()
+    {
+        return FALLBACK_CONTENT_TYPE.to_string();
+    }
+    match params {
+        Some(p) if !p.chars().all(|c| (' '..='~').contains(&c)) => essence.to_string(),
+        _ => trimmed.to_string(),
     }
 }
 
@@ -369,10 +377,10 @@ mod tests {
     }
 
     /// The stored content type comes from the uploader's multipart part
-    /// header, which `multipart::split_part_headers` terminates on `\r\n`
-    /// only — a bare `LF` carries into the value. Echoing that into a response
-    /// header makes the object permanently undownloadable on both wasm
-    /// adapters. A type that is not well-formed is served as
+    /// header, whose headers [`crate::multipart::extract_multipart_file`]
+    /// splits on `\r\n` only — a bare `LF` carries into the value. Echoing
+    /// that into a response header makes the object permanently undownloadable
+    /// on both wasm adapters. An essence that is not a media type is served as
     /// `application/octet-stream`, which is not on the inline allowlist.
     #[test]
     fn a_malformed_content_type_is_replaced_not_echoed() {
@@ -422,6 +430,33 @@ mod tests {
             normalized_content_type("  image/png  "),
             "image/png",
             "surrounding whitespace is not part of the type"
+        );
+    }
+
+    /// A good essence with an unusable parameter loses the parameter, not the
+    /// type. `image/png; name=café.png` is a perfectly good PNG; falling back
+    /// wholesale would demote it to an `application/octet-stream` attachment
+    /// and lose the inline preview over a filename hint nothing in the
+    /// response reads — the filename comes from the object key.
+    #[test]
+    fn a_bad_parameter_costs_the_parameter_not_the_type() {
+        assert_eq!(
+            normalized_content_type("image/png; name=café.png"),
+            "image/png"
+        );
+        assert_eq!(
+            normalized_content_type("text/plain; charset=utf-8\nX-Injected: 1"),
+            "text/plain"
+        );
+
+        let meta = user_object_leading_meta("image/png; name=café.png", "caf\u{e9}.png", &[]);
+        assert_eq!(
+            wafer_run::MetaGet::get(&meta, wafer_block::meta::META_RESP_CONTENT_TYPE),
+            Some("image/png"),
+        );
+        assert!(
+            header(&meta, "Content-Disposition").is_some_and(|d| d.starts_with("inline;")),
+            "the image must still preview inline: {meta:?}"
         );
     }
 

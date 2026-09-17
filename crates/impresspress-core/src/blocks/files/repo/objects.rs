@@ -200,10 +200,21 @@ pub struct Reservation {
 /// SEQUENTIAL case — a key that already held an object when the request
 /// arrived, which is every ordinary re-upload. Two requests uploading the same
 /// **new** key concurrently can still both find nothing and both insert; the
-/// unique index refuses the loser, and that request still answers 500. Closing
-/// that needs an upsert the `DatabaseService` wire protocol does not offer for
-/// a composite key, and it is a race between two writes to one key rather than
-/// the reproducible failure this function is about.
+/// unique index refuses the loser, and that request still answers 500.
+///
+/// Not because an atomic write is unavailable: `db::upsert` takes
+/// `conflict_columns`, and `idx_objects_bucket_key` is exactly the composite
+/// conflict target it wants. It is that `upsert` answers `rows_affected` and
+/// nothing else, while a reservation has to hand back two things a row count
+/// cannot carry — the row **id** that [`mark_complete`] and
+/// [`release_reservation`] address, and the replaced object's size, content
+/// type and uploader that `release_reservation` restores. Both come from
+/// reading the row, so the read stays whichever way the write is issued, and
+/// the residual race is between two writes to one key rather than the
+/// reproducible failure this function is about. Closing it means `upsert`
+/// followed by a read-back for the id — worth doing, but as its own change
+/// with a way to exercise two concurrent uploads, which this suite has no
+/// harness for.
 pub async fn reserve_upload(
     ctx: &dyn Context,
     bucket: &str,

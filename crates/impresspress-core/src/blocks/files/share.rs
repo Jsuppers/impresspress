@@ -139,13 +139,12 @@ pub async fn handle_direct_access(
     // from executing on this origin when its owner sends someone the link.
     match store::get_stream(ctx, bucket, key).await {
         Ok(stream) => {
-            let content_type = if stream.info().content_type.is_empty() {
-                "application/octet-stream".to_string()
-            } else {
-                stream.info().content_type.clone()
-            };
+            // No local fallback for a backend that reports no type: the empty
+            // string is not a media type, so `serving` substitutes
+            // `application/octet-stream` for it exactly as it does for a type
+            // it cannot read.
             let leading = super::serving::user_object_leading_meta(
-                &content_type,
+                &stream.info().content_type.clone(),
                 key,
                 &[("Cache-Control", "private, max-age=3600")],
             );
