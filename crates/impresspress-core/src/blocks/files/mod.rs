@@ -13,6 +13,7 @@ mod pages_admin;
 pub(crate) mod pages_user;
 mod quota;
 pub(crate) mod repo;
+mod serving;
 mod share;
 pub(crate) mod storage;
 

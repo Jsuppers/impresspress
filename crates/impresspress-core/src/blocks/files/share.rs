@@ -132,6 +132,11 @@ pub async fn handle_direct_access(
     // leading meta carries the streaming opt-in marker + content-type +
     // download headers so the pipeline and platform adapter take the streaming
     // response path (see `crate::streaming`).
+    //
+    // This route is unauthenticated and its bytes are whatever an uploader
+    // chose, so the headers come from [`super::serving`] — the same builder
+    // the authenticated download uses. That is what keeps an uploaded page
+    // from executing on this origin when its owner sends someone the link.
     match store::get_stream(ctx, bucket, key).await {
         Ok(stream) => {
             let content_type = if stream.info().content_type.is_empty() {
@@ -139,16 +144,10 @@ pub async fn handle_direct_access(
             } else {
                 stream.info().content_type.clone()
             };
-            let disposition = format!(
-                "inline; filename=\"{}\"",
-                key.replace(['"', '\n', '\r'], "")
-            );
-            let leading = crate::streaming::download_leading_meta(
+            let leading = super::serving::user_object_leading_meta(
                 &content_type,
-                &[
-                    ("Content-Disposition", disposition.as_str()),
-                    ("Cache-Control", "private, max-age=3600"),
-                ],
+                key,
+                &[("Cache-Control", "private, max-age=3600")],
             );
             crate::streaming::stream_download(stream, leading)
         }

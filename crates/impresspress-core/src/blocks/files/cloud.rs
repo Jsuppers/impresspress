@@ -510,6 +510,120 @@ mod tests {
         );
     }
 
+    /// Mint a share for an object stored at `key` with `content_type`, and
+    /// return the response headers `GET /b/storage/direct/{token}` serves it
+    /// with — both halves through their real handlers.
+    async fn share_link_headers(key: &str, content_type: &str) -> Vec<wafer_run::MetaEntry> {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(
+            &ctx,
+            "photos",
+            key,
+            b"<h1>uploader-chosen bytes</h1>",
+            content_type,
+        )
+        .await
+        .expect("seed the object being shared");
+
+        let create = handle_create_share(
+            &ctx,
+            &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+            InputStream::from_bytes(share_body("photos", key)),
+        )
+        .await;
+        let token = output_json(create).await["token"]
+            .as_str()
+            .expect("share creation must mint a token")
+            .to_string();
+
+        let mut msg =
+            crate::test_support::anon_msg("retrieve", &format!("/b/storage/direct/{token}"));
+        msg.set_meta("req.param.token", &token);
+        let out = super::super::share::handle_direct_access(
+            &ctx,
+            &msg,
+            &crate::blocks::rate_limit::UserRateLimiter::default(),
+        )
+        .await;
+
+        // The response headers are the LEADING meta — the frame that precedes
+        // the first body chunk, which is what makes this a streaming response.
+        let events: Vec<wafer_block::stream::StreamEvent> = futures::StreamExt::collect(out).await;
+        let first_chunk = events
+            .iter()
+            .position(|e| matches!(e, wafer_block::stream::StreamEvent::Chunk(_)))
+            .expect("a body chunk must be streamed");
+        events[..first_chunk]
+            .iter()
+            .filter_map(|e| match e {
+                wafer_block::stream::StreamEvent::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn served_header<'m>(meta: &'m [wafer_run::MetaEntry], name: &str) -> Option<&'m str> {
+        wafer_run::MetaGet::get(meta, &format!("resp.header.{name}"))
+    }
+
+    /// Stored XSS on the one route that needs no account: `/b/storage/direct/`
+    /// is public, served from the app's own origin, and both its bytes and its
+    /// content type are an uploader's. It used to send every object `inline`
+    /// with no `nosniff`, so sharing an uploaded HTML page ran its script on
+    /// this origin for whoever opened the link.
+    #[tokio::test]
+    async fn a_shared_html_object_is_served_as_an_inert_attachment() {
+        let meta = share_link_headers("payload.html", "text/html").await;
+
+        assert_eq!(
+            served_header(&meta, "Content-Disposition"),
+            Some("attachment; filename=\"payload.html\""),
+            "a shared HTML object must be downloaded, never rendered on this origin",
+        );
+        assert_eq!(
+            served_header(&meta, "X-Content-Type-Options"),
+            Some("nosniff")
+        );
+        assert!(
+            served_header(&meta, "Content-Security-Policy")
+                .is_some_and(|csp| csp.contains("sandbox")),
+            "an attachment a browser renders anyway must render sandboxed: {meta:?}",
+        );
+    }
+
+    /// An SVG is an image by content type and a document by behaviour — it can
+    /// hold `<script>` — so it is on the attachment side of the allowlist.
+    #[tokio::test]
+    async fn a_shared_svg_is_not_rendered_inline() {
+        let meta = share_link_headers("logo.svg", "image/svg+xml").await;
+
+        assert_eq!(
+            served_header(&meta, "Content-Disposition"),
+            Some("attachment; filename=\"logo.svg\"")
+        );
+    }
+
+    /// Previews still work over a share link: a raster image keeps `inline`
+    /// and its caching header, and gains `nosniff`.
+    #[tokio::test]
+    async fn a_shared_image_still_previews_inline() {
+        let meta = share_link_headers("pic.png", "image/png").await;
+
+        assert_eq!(
+            served_header(&meta, "Content-Disposition"),
+            Some("inline; filename=\"pic.png\"")
+        );
+        assert_eq!(
+            served_header(&meta, "X-Content-Type-Options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            served_header(&meta, "Cache-Control"),
+            Some("private, max-age=3600"),
+            "the share path's own header must survive alongside the security ones",
+        );
+    }
+
     /// Regression (SEC-064): the share path used to inline its own bucket/key
     /// validation that OMITTED the backslash rejection, so a share could be
     /// created for a key the upload/download path (`is_valid_storage_key`)

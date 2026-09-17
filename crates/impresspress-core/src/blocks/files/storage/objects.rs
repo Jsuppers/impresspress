@@ -126,10 +126,16 @@ pub(in crate::blocks::files) async fn handle_get_object(
     // chunk. The leading meta carries the streaming opt-in marker + the real
     // content-type so the pipeline and platform adapter take the streaming
     // response path (see `crate::streaming`).
+    //
+    // The bytes and the content type are both an uploader's, and this route is
+    // on the app's own origin, so the disposition and the security headers
+    // come from [`crate::blocks::files::serving`] — the same builder the public
+    // share link uses.
     match store::get_stream(ctx, bucket, key).await {
         Ok(stream) => {
             let content_type = resolved_content_type(stream.info());
-            let leading = crate::streaming::download_leading_meta(&content_type, &[]);
+            let leading =
+                crate::blocks::files::serving::user_object_leading_meta(&content_type, key, &[]);
             crate::streaming::stream_download(stream, leading)
         }
         Err(e) => crud::db_error(e, "Object not found", "Storage error"),
@@ -708,6 +714,118 @@ mod integration_tests {
         assert_eq!(size, body.len() as i64);
         assert_eq!(content_type, "text/plain");
         assert_eq!(status, ObjectStatus::Complete);
+    }
+
+    /// Build the message the router produces for
+    /// `GET /b/storage/api/buckets/{bucket}/objects/{key}`.
+    fn download_msg(bucket: &str, key: &str) -> Message {
+        let mut msg = auth_msg(
+            "retrieve",
+            &format!("/b/storage/api/buckets/{bucket}/objects/{key}"),
+            "alice",
+        );
+        msg.set_meta("req.param.name", bucket);
+        msg.set_meta("req.param.key", key);
+        msg
+    }
+
+    /// The response headers a download emitted, as leading meta (the frame
+    /// that precedes the first body chunk — the streaming response shape).
+    async fn download_headers(out: OutputStream) -> Vec<wafer_run::MetaEntry> {
+        use futures::StreamExt;
+        use wafer_block::stream::StreamEvent;
+
+        let events: Vec<StreamEvent> = out.collect().await;
+        let first_chunk = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Chunk(_)))
+            .expect("a body chunk must be streamed");
+        events[..first_chunk]
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn header<'m>(meta: &'m [wafer_run::MetaEntry], name: &str) -> Option<&'m str> {
+        wafer_run::MetaGet::get(meta, &format!("resp.header.{name}"))
+    }
+
+    /// Stored XSS: an uploader picks the content type, the bytes are theirs,
+    /// and this route serves both from the app's own origin. Uploading an HTML
+    /// page and opening its download URL used to render that page on the
+    /// origin — no `Content-Disposition`, no `nosniff` — so any script in it
+    /// ran with the viewer's session.
+    ///
+    /// The upload is the one a browser sends (a `multipart/form-data`
+    /// envelope with the part's own `Content-Type: text/html`), and the
+    /// download is the real handler.
+    #[tokio::test]
+    async fn an_uploaded_html_page_is_served_as_an_inert_attachment() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let boundary = "XBOUNDARYX";
+        let envelope = multipart_envelope(boundary, "payload.html", b"<h1>not a page</h1>");
+        let upload = handle_upload_object(
+            &ctx,
+            &upload_msg(
+                "assets",
+                "payload.html",
+                &format!("multipart/form-data; boundary={boundary}"),
+            ),
+            InputStream::from_bytes(envelope),
+        )
+        .await;
+        assert_eq!(
+            output_json(upload).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        let meta = download_headers(
+            handle_get_object(&ctx, &download_msg("assets", "payload.html")).await,
+        )
+        .await;
+
+        assert_eq!(
+            header(&meta, "Content-Disposition"),
+            Some("attachment; filename=\"payload.html\""),
+            "an uploaded HTML page must be downloaded, never rendered on this origin",
+        );
+        assert_eq!(
+            header(&meta, "X-Content-Type-Options"),
+            Some("nosniff"),
+            "without nosniff the declared type is only a suggestion",
+        );
+        assert!(
+            header(&meta, "Content-Security-Policy").is_some_and(|csp| csp.contains("sandbox")),
+            "an attachment a browser renders anyway must render sandboxed: {meta:?}",
+        );
+    }
+
+    /// The allowlist is what makes the fix compatible with previews: an image
+    /// is still served inline, and still with `nosniff` — which is what stops
+    /// an HTML body uploaded as `image/png` from being sniffed back into a
+    /// page.
+    #[tokio::test]
+    async fn an_image_still_previews_inline_with_nosniff() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        store::put(&ctx, "assets", "pic.png", b"PNGDATA", "image/png")
+            .await
+            .expect("seed object");
+
+        let meta =
+            download_headers(handle_get_object(&ctx, &download_msg("assets", "pic.png")).await)
+                .await;
+
+        assert_eq!(
+            header(&meta, "Content-Disposition"),
+            Some("inline; filename=\"pic.png\"")
+        );
+        assert_eq!(header(&meta, "X-Content-Type-Options"), Some("nosniff"));
     }
 
     /// A multipart upload without `?key=` falls back to the file part's
