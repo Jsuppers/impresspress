@@ -38,7 +38,12 @@ pub(super) async fn handle_create_share(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
+    // `deny_unknown_fields`: a field this struct does not know is a caller
+    // asking for something the handler will not do. Ignoring it answers 200
+    // to a request that was not honoured — a misspelled expiry field would
+    // mint a never-expiring link and report success.
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Req {
         bucket: String,
         key: String,
@@ -81,9 +86,9 @@ pub(super) async fn handle_create_share(
         return err_not_found("File not found in storage");
     }
 
-    // Generate share token
-    let token = super::share::generate_share_token(ctx, &body.bucket, &body.key).await;
-    let token = match token {
+    // Mint the token that addresses the share row. It carries no expiry of
+    // its own — the row below is the only clock on this link.
+    let token = match super::share::generate_share_token(ctx).await {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -242,7 +247,10 @@ mod tests {
     use wafer_core::{clients::storage as store, interfaces::storage::service as storage_service};
     use wafer_run::InputStream;
 
-    use super::{super::test_support::routed, *};
+    use super::{
+        super::test_support::{routed, share_modal_expiry},
+        *,
+    };
     use crate::test_support::{
         auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
     };
@@ -372,8 +380,8 @@ mod tests {
         repo::buckets::seed(ctx, data).await.expect("seed bucket");
     }
 
-    /// Build a `TestContext` with a real crypto block (share-token signing
-    /// goes through `crypto::sign`) and a fake storage block whose `get`
+    /// Build a `TestContext` with a real crypto block (a share token is
+    /// CSPRNG output drawn through it) and a fake storage block whose `get`
     /// always succeeds (the file-existence check needs *some* answer), plus
     /// one bucket owned by `owner`. This is the minimum needed to drive
     /// `handle_create_share` past bucket/key validation, the ownership
@@ -383,7 +391,7 @@ mod tests {
     ///
     /// `requires` enforcement is not opted into here: it comes with
     /// [`TestContext::with_files`], which is what makes every test in this
-    /// module run on the gate that refused `crypto::sign` in production.
+    /// module run on the gate that refused the crypto block in production.
     async fn ctx_with_owned_bucket(bucket: &str, owner: &str) -> TestContext {
         let mut ctx = TestContext::with_files().await;
 
@@ -401,27 +409,17 @@ mod tests {
 
     /// A fixture whose object store really holds bytes — the always-found
     /// fake above can prove a share was *created*, never that the shared file
-    /// comes back — wired through the production namespacing shim, plus a
-    /// real crypto block. Everything `POST /b/cloudstorage/shares` and
-    /// `GET /b/storage/direct/{token}` touch.
+    /// comes back. The block's one share fixture, shared with `share.rs`'s
+    /// tests so both ends of the round trip run on the same wiring.
     async fn ctx_for_share_round_trip(bucket: &str, owner: &str) -> TestContext {
-        let mut ctx = TestContext::with_files().await;
-        register_crypto(&mut ctx);
-        ctx.register_block(
-            "wafer-run/storage",
-            crate::blocks::files::test_wrap::storage_block(Arc::new(
-                crate::test_support::InMemoryStorageService::new(),
-            )),
-        );
-        seed_bucket(&ctx, bucket, owner).await;
-        ctx
+        super::super::test_support::share_ctx(bucket, owner).await
     }
 
     /// CRUX regression (found by driving the live app): creating a share link
     /// must succeed.
     ///
     /// `POST /b/cloudstorage/shares` 500'd on the live server because
-    /// `share::generate_share_token` calls `crypto::sign` while the block's
+    /// `share::generate_share_token` calls the crypto block while its
     /// `info().requires` named only database, storage and config — so the
     /// runtime refused the call with `PermissionDenied: block
     /// 'wafer-run/crypto' not in requires list` above every grant check. No
@@ -447,7 +445,7 @@ mod tests {
         let token = resp["token"].as_str().unwrap_or_default().to_string();
         assert!(
             !token.is_empty(),
-            "share creation must mint a signed token, got: {resp}"
+            "share creation must mint a token, got: {resp}"
         );
         assert_eq!(
             resp["direct_url"],
@@ -459,8 +457,8 @@ mod tests {
     /// The other half of the same outage: the public share link must serve
     /// the shared object's BYTES.
     ///
-    /// This crosses both bugs — the share is minted through `crypto::sign`
-    /// (bug 2) and served through `store::get_stream`, i.e.
+    /// This crosses both bugs — the share is minted through the crypto
+    /// block (bug 2) and served through `store::get_stream`, i.e.
     /// `storage.get_streaming` (bug 1) — so it is the end-to-end proof that a
     /// user can share a file and the recipient can download it.
     #[tokio::test]
@@ -756,6 +754,132 @@ mod tests {
         assert!(
             output_is_error(out, "PermissionDenied").await,
             "valid input should pass validation and hit the ownership check"
+        );
+    }
+
+    /// The expiry the share modal offers must be the expiry the endpoint
+    /// applies.
+    ///
+    /// The request body is built from `files-browser.js` itself — the field
+    /// the modal names and the value it sends for its pre-selected option —
+    /// and the assertion is against what that option's LABEL promised the
+    /// user. A modal naming a field the handler does not read, or sending
+    /// days where the handler counts hours, fails here; both are invisible
+    /// to a test that hand-writes the Rust struct's field names.
+    #[tokio::test]
+    async fn create_share_applies_the_expiry_the_share_modal_offers() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let expiry = share_modal_expiry();
+        let mut body = serde_json::Map::new();
+        body.insert("bucket".to_string(), serde_json::json!("photos"));
+        body.insert("key".to_string(), serde_json::json!("a.png"));
+        body.insert(expiry.field.clone(), serde_json::json!(expiry.value));
+        let raw = serde_json::to_vec(&serde_json::Value::Object(body)).unwrap();
+
+        let before = chrono::Utc::now();
+        let resp = output_json(
+            handle_create_share(
+                &ctx,
+                &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                InputStream::from_bytes(raw),
+            )
+            .await,
+        )
+        .await;
+        let id = resp["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("share creation must succeed, got: {resp}"))
+            .to_string();
+
+        let row = repo::shares::find_by_id(&ctx, &id)
+            .await
+            .expect("share row");
+        let expires_at = row.expires_at.as_deref().unwrap_or_else(|| {
+            panic!(
+                "the modal's `{}` expiry was dropped: the share never expires",
+                expiry.field
+            )
+        });
+        let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .expect("valid rfc3339")
+            .with_timezone(&chrono::Utc);
+        let promised = before + chrono::Duration::hours(expiry.label_hours);
+        assert!(
+            (parsed - promised).num_minutes().abs() < 60,
+            "the modal promised the user {} hours; the share expires at {expires_at}",
+            expiry.label_hours,
+        );
+    }
+
+    /// A field the handler will not honour is refused, not accepted and
+    /// dropped: `deny_unknown_fields` is what stops a 200 from meaning "your
+    /// expiry was applied" when it was not.
+    #[tokio::test]
+    async fn create_share_refuses_a_field_it_does_not_honour() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "bucket": "photos",
+            "key": "a.png",
+            "expires_days": 7,
+        }))
+        .unwrap();
+        let out = handle_create_share(
+            &ctx,
+            &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+            InputStream::from_bytes(body),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "an expiry field the handler does not read must be a 400, not a silently unexpiring share"
+        );
+    }
+
+    /// The minted token is entropy, not a dated assertion.
+    ///
+    /// A token that carries its own lifetime is a second clock on the share,
+    /// and the row is the authoritative one: a link the owner asked to keep
+    /// for a year must not stop working because the credential aged out
+    /// while its row still reads active.
+    #[tokio::test]
+    async fn the_share_token_carries_no_lifetime_of_its_own() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let resp = output_json(
+            handle_create_share(
+                &ctx,
+                &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                InputStream::from_bytes(share_body("photos", "a.png")),
+            )
+            .await,
+        )
+        .await;
+        let token = resp["token"].as_str().expect("a token").to_string();
+
+        assert!(
+            !token.contains('.'),
+            "a share token must not be a JWT — its `exp` would expire links the row still counts as live: {token}"
+        );
+        assert_eq!(
+            token.len(),
+            64,
+            "a share token is 32 random bytes, hex-encoded: {token}"
+        );
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "a share token is hex-encoded entropy: {token}"
         );
     }
 

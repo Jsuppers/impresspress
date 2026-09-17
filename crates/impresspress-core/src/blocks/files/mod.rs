@@ -262,9 +262,9 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .path_params(quota_user_id_path_schema)
     .output(response_schema_of::<contracts::RecordView<repo::quota::QuotaRow>>)
     .tags(&["cloudstorage"]),
-    // ── Public share link ── `share::handle_direct_access` verifies the
-    // token's signature, rate-limits per remote IP, and enforces expiry and
-    // the access cap itself.
+    // ── Public share link ── `share::handle_direct_access` rate-limits per
+    // remote IP, resolves the token to its share row, and enforces that
+    // row's expiry and access cap itself.
     EndpointRoute::public(
         HttpMethod::Get,
         "/b/storage/direct/{token}",
@@ -547,12 +547,11 @@ crate::impresspress_feature_block! {
 
         BlockInfo::new("impresspress/files", "0.0.1", "http-handler@v1", "File storage, sharing, quotas, and access logging")
             .instance_mode(InstanceMode::Singleton)
-            // `wafer-run/crypto`: share links are JWTs. `share::generate_share_token`
-            // signs one with `crypto::sign` and `share::handle_direct_access`
-            // checks it with `crypto::verify`. The entry was missing, so
-            // `POST /b/cloudstorage/shares` was refused at the `call_block`
-            // boundary — above every grant check — and sharing was dead on
-            // arrival.
+            // `wafer-run/crypto`: a share link's token is 256 bits of CSPRNG
+            // output, drawn by `share::generate_share_token` through
+            // `crypto::random_bytes`. Without the entry,
+            // `POST /b/cloudstorage/shares` is refused at the `call_block`
+            // boundary — above every grant check — and sharing is dead.
             .requires(vec!["wafer-run/database".into(), "wafer-run/storage".into(), "wafer-run/config".into(), "wafer-run/crypto".into()])
             // No explicit Storage grant needed. Wave 26 (c18) made WRAP
             // namespace-aware for Storage; this block self-admits its
@@ -735,7 +734,11 @@ mod grant_tests {
 
 #[cfg(test)]
 mod test_support {
+    use std::sync::Arc;
+
     use wafer_run::Message;
+
+    use crate::test_support::{InMemoryStorageService, TestContext};
 
     /// Run `msg` through the block's own route table so `{name}`, `{key}`,
     /// `{id}`, `{token}`, `{bucket}` and `{prefix}` are bound the way they
@@ -751,6 +754,48 @@ mod test_support {
             msg.path()
         );
         msg
+    }
+
+    /// A files-block fixture carrying everything a share link touches: the
+    /// real `wafer-run/crypto` block (a share token is CSPRNG output drawn
+    /// through it), the production storage shim over an object store that
+    /// really holds bytes, and one bucket owned by `owner`.
+    ///
+    /// Both halves of the round trip — `cloud::handle_create_share` and
+    /// `share::handle_direct_access` — run on this one fixture, so neither
+    /// side can be tested against wiring the other never sees.
+    pub(super) async fn share_ctx(bucket: &str, owner: &str) -> TestContext {
+        let mut ctx = TestContext::with_files().await;
+
+        let crypto_svc = Arc::new(
+            wafer_block_crypto::service::Argon2JwtCryptoService::new(
+                // ≥ 32 bytes for the HMAC-SHA256 minimum-length check.
+                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
+            )
+            .expect("test secret is long enough"),
+        );
+        ctx.register_block(
+            "wafer-run/crypto",
+            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(
+                crypto_svc,
+            )),
+        );
+        ctx.register_block(
+            "wafer-run/storage",
+            super::test_wrap::storage_block(Arc::new(InMemoryStorageService::new())),
+        );
+
+        let data = crate::util::json_map(serde_json::json!({
+            "name": bucket,
+            "public": false,
+            "created_by": owner,
+            "created_at": crate::util::now_rfc3339(),
+        }));
+        super::repo::buckets::seed(&ctx, data)
+            .await
+            .expect("seed bucket");
+
+        ctx
     }
 
     // -----------------------------------------------------------------
@@ -772,6 +817,75 @@ mod test_support {
             .find(end)
             .unwrap_or_else(|| panic!("{what}: no `{end}` after `{start}`"));
         &js[from..from + len]
+    }
+
+    /// What the share modal sends when the user accepts its default expiry.
+    pub(super) struct ShareModalExpiry {
+        /// The JSON field the modal puts the expiry in.
+        pub field: String,
+        /// The number it sends for the pre-selected option.
+        pub value: i64,
+        /// The duration that option's LABEL promises the user, in hours —
+        /// so a test can catch a modal sending the right field in the wrong
+        /// unit as well as the wrong field.
+        pub label_hours: i64,
+    }
+
+    /// Read [`ShareModalExpiry`] out of the shipped bundle.
+    pub(super) fn share_modal_expiry() -> ShareModalExpiry {
+        let js = super::assets::SOURCE;
+
+        // `const <var> = dlg.querySelector('select[name="expires"]').value;`
+        let read = " = dlg.querySelector('select[name=\"expires\"]').value;";
+        let end = js
+            .find(read)
+            .expect("the share modal must read its expiry select");
+        let var_at = js[..end].rfind("const ").expect("read into a const") + "const ".len();
+        let var = &js[var_at..end];
+
+        // `body.<field> = Number(<var>);`
+        let assign = format!(" = Number({var});");
+        let end = js
+            .find(&assign)
+            .expect("the share modal must send the expiry it read");
+        let field_at = js[..end].rfind("body.").expect("sent as a body field") + "body.".len();
+        let field = js[field_at..end].to_string();
+
+        // The `<option … selected>` and the label beside it.
+        let selected = js
+            .find(" selected>")
+            .expect("the share modal must preselect an expiry");
+        let value_at = js[..selected]
+            .rfind("<option value=\"")
+            .expect("the selected option carries a value")
+            + "<option value=\"".len();
+        let value: i64 = js[value_at..][..js[value_at..].find('"').expect("value ends")]
+            .parse()
+            .expect("the selected option's value is a number");
+        let label = between(
+            &js[selected..],
+            " selected>",
+            "</option>",
+            "selected option label",
+        );
+
+        let (count, unit) = label
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("expiry label `{label}` is not `<n> <unit>`"));
+        let count: i64 = count
+            .parse()
+            .unwrap_or_else(|_| panic!("expiry label `{label}` does not start with a number"));
+        let label_hours = match unit.trim_end_matches('s') {
+            "day" => count * 24,
+            "hour" => count,
+            other => panic!("expiry label `{label}` uses an unhandled unit `{other}`"),
+        };
+
+        ShareModalExpiry {
+            field,
+            value,
+            label_hours,
+        }
     }
 
     /// The HTML attribute the kebab's revoke button reads, derived from the
