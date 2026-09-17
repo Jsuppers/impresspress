@@ -229,8 +229,11 @@ in that gap really ran the one-year code and will be given 30 days here —
 i.e. they expire. That arm errs toward "a dead link stays dead"; re-share
 the file if one of them mattered.
 
-**Upgrade with `--run-migrations`.** Without it the code half lands alone
-and every historical share link becomes permanently public; the only signal
+**Upgrade with `--run-migrations`.** The code half refuses to serve a share
+row that records no end, so without the migration every historical share
+link answers "Share link is unavailable" — an outage for every link your
+users have already sent, not a leak. The migration is what gives each of
+them its correct remaining life back. Until it runs, the only other signal
 is the generic `schema drift; redeploy with --run-migrations to apply`
 warning each boot logs for the files block.
 

@@ -40,11 +40,11 @@ pub struct ShareRow {
     /// `None` is a SQL `NULL` or a stored empty string — one meaning, since
     /// the column is nullable and every caller treated `""` as unset. It is
     /// NOT "never expires": every share link has an end, and a row that
-    /// records none cannot be shown to be live, so
-    /// `share::handle_direct_access` refuses it. This release cannot write
-    /// one ([`NewShare::expires_at`] is not optional) and migration 002 gave
-    /// every historical row an end; a `None` here means a row that reached
-    /// the table some other way.
+    /// records none cannot be shown to be live, so the public link refuses
+    /// it. Creating a share cannot produce one — `NewShare` takes a
+    /// non-optional expiry — and migration 002 gave every historical row an
+    /// end, so a `None` here is a row that reached the table some other
+    /// way.
     pub expires_at: Option<String>,
     pub access_count: i64,
     /// Access cap, or `None` for unlimited. A non-positive stored value is

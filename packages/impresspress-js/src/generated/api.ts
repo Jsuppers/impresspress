@@ -1256,10 +1256,16 @@ export interface paths {
                                      */
                                     created_by: string;
                                     /**
-                                     * @description Absolute expiry, or `None` for a share that never expires. A SQL
-                                     *     `NULL` and a stored empty string both mean "never": the column is
-                                     *     nullable and every caller already treated `""` as unset, so the
-                                     *     distinction existed nowhere but in the decode.
+                                     * @description The end this share link records, as an RFC 3339 stamp.
+                                     *
+                                     *     `None` is a SQL `NULL` or a stored empty string — one meaning, since
+                                     *     the column is nullable and every caller treated `""` as unset. It is
+                                     *     NOT "never expires": every share link has an end, and a row that
+                                     *     records none cannot be shown to be live, so the public link refuses
+                                     *     it. Creating a share cannot produce one — `NewShare` takes a
+                                     *     non-optional expiry — and migration 002 gave every historical row an
+                                     *     end, so a `None` here is a row that reached the table some other
+                                     *     way.
                                      */
                                     expires_at: string | null;
                                     id: string;
@@ -1409,10 +1415,16 @@ export interface paths {
                                      */
                                     created_by: string;
                                     /**
-                                     * @description Absolute expiry, or `None` for a share that never expires. A SQL
-                                     *     `NULL` and a stored empty string both mean "never": the column is
-                                     *     nullable and every caller already treated `""` as unset, so the
-                                     *     distinction existed nowhere but in the decode.
+                                     * @description The end this share link records, as an RFC 3339 stamp.
+                                     *
+                                     *     `None` is a SQL `NULL` or a stored empty string — one meaning, since
+                                     *     the column is nullable and every caller treated `""` as unset. It is
+                                     *     NOT "never expires": every share link has an end, and a row that
+                                     *     records none cannot be shown to be live, so the public link refuses
+                                     *     it. Creating a share cannot produce one — `NewShare` takes a
+                                     *     non-optional expiry — and migration 002 gave every historical row an
+                                     *     end, so a `None` here is a row that reached the table some other
+                                     *     way.
                                      */
                                     expires_at: string | null;
                                     id: string;

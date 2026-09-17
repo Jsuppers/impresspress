@@ -10,10 +10,13 @@
 --
 -- Those two facts do not compose. The share dialog used to post its expiry
 -- under a field name the handler did not read, so essentially every
--- UI-created row carries no expiry at all -- and an unexpiring row plus an
--- opaque token is a permanently live public link. Before this release
--- those links could not even be revoked: the revoke button sent the token
--- to a route keyed on the row id, so every revoke answered "not found".
+-- UI-created row carries no expiry at all, and the row is now the only
+-- record of a link's life. The handler refuses a row that records no end
+-- rather than serving it, so until this runs every legacy link is refused;
+-- restoring each one's correct REMAINING life is what this repair is for.
+-- (Before this release those links could not even be revoked: the revoke
+-- button sent the token to a route keyed on the row id, so every revoke
+-- answered "not found".)
 --
 -- THE TTL CHANGED ONCE, so this repair has two arms. From the initial
 -- commit until SEC-055 landed at 2026-05-14T05:43:03Z the JWT was signed
@@ -24,6 +27,13 @@
 -- the rest get 30, each counted from `created_at`, which reproduces the
 -- lifetime the token itself imposed. 365 days from `created_at` is also
 -- within the one-year ceiling this release puts on new shares.
+--
+-- Each dialect compares the same instants: `strftime` here and the
+-- `timestamptz` cast in the postgres file both normalize the stored offset
+-- and truncate to the second, so a row inside the boundary second lands on
+-- the same arm either side. A raw TEXT compare would not -- it would also
+-- assume the offset is always `+00:00` -- and this is the one comparison
+-- the repair turns on.
 --
 -- The cutoff is the instant the code changed, not the instant a given
 -- deployment adopted it. A deployment that upgraded later has rows minted
