@@ -171,9 +171,18 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     // The two writes are `Admin`. A thread override is keyed by `thread_id`
     // alone and neither handler takes an identity, so at `Authenticated`
     // any logged-in caller could pin ANY thread to any configured backend —
-    // or delete any override — including threads they cannot read. The only
-    // caller is the admin settings page (`pages::settings_page`, itself
-    // `Admin`), which renders the form and one `hx-delete` per row.
+    // or delete any override — including threads they cannot read.
+    //
+    // The delete's only caller is the admin settings page
+    // (`pages::settings_page`, itself `Admin`), which lists the overrides
+    // read-only with one `hx-delete` per row. Nothing in this repo calls the
+    // POST at all: no page posts to it and no JS fetches it, so today it is
+    // published API surface (it carries a request schema and reaches the
+    // generated SDK) with no in-tree consumer. OPEN: either an admin UI
+    // grows a form that creates an override — the reason the endpoint
+    // exists — or the endpoint goes, and with it the only writer of
+    // `repo::settings`. `Admin` is the right tier under either answer, so
+    // that question is not settled here.
     EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/config", Route::GetConfig)
         .summary("Get default provider/model config")
         .output(response_schema_of::<contracts::LlmConfigResponse>),

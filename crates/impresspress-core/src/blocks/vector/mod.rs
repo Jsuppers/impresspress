@@ -266,26 +266,13 @@ mod table_tests {
 mod access_tests {
     use std::sync::Arc;
 
-    use super::*;
-    use crate::test_support::{admin_msg, auth_msg, output_http_status, TestContext};
+    use wafer_run::{AuthLevel, Block as _};
 
-    /// Every route this block serves, as a caller reaches it: the wire action
-    /// and a concrete path (path variables filled in), so the request goes
-    /// through the router's access gate and the block's own matcher exactly
-    /// as a browser's would.
-    const CONCRETE_ROUTES: &[(&str, &str)] = &[
-        ("retrieve", "/b/vector/"),
-        ("retrieve", "/b/vector/docs/"),
-        ("create", "/b/vector/api/indexes"),
-        ("retrieve", "/b/vector/api/indexes"),
-        ("create", "/b/vector/api/upsert"),
-        ("create", "/b/vector/api/query"),
-        ("create", "/b/vector/api/ingest"),
-        ("create", "/b/vector/api/embed"),
-        ("retrieve", "/b/vector/api/stats"),
-        ("delete", "/b/vector/api/indexes/docs"),
-        ("delete", "/b/vector/api/docs/row-1"),
-    ];
+    use super::*;
+    use crate::{
+        endpoint_match::action_for_method,
+        test_support::{admin_msg, auth_msg, output_http_status, TestContext},
+    };
 
     /// A context that routes `/b/vector/*` to the real block.
     async fn ctx() -> TestContext {
@@ -295,19 +282,55 @@ mod access_tests {
     }
 
     /// An index is a deployment-wide resource with no owner column, so
-    /// "logged in" was never an answer to "may this caller read it". Every
-    /// route — the JSON API as much as the two pages — refuses a non-admin
-    /// session.
-    ///
-    /// Driven through `dispatch`, which runs `routing::route_to_block` and
-    /// therefore the same access gate production applies; calling the
-    /// handlers directly would prove nothing about it.
+    /// "logged in" was never an answer to "may this caller read it". Asserted
+    /// on the declaration because that is what the router reads: a new row
+    /// added at a lower tier would not fail a handler test, it would publish
+    /// the corpus.
+    #[test]
+    fn every_declared_endpoint_is_admin() {
+        let endpoints = VectorBlock::new().info().endpoints;
+        assert!(!endpoints.is_empty());
+        for ep in &endpoints {
+            assert_eq!(
+                ep.auth,
+                AuthLevel::Admin,
+                "{} {} must stay admin-only",
+                ep.method,
+                ep.path
+            );
+        }
+    }
+
+    /// A concrete request path for `template`: every `{name}` / `{rest...}`
+    /// segment filled with a literal the matcher will bind. Derived rather
+    /// than hand-listed so a route added to `ROUTES` is exercised by the test
+    /// below without anyone remembering to add it.
+    fn concrete_path(template: &str) -> String {
+        template
+            .split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    "probe"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The declaration above, enforced: every route the block serves refuses
+    /// a logged-in non-admin, driven through `routing::route_to_block` --
+    /// the router's own gate, not a copy of it.
     #[tokio::test]
     async fn every_route_refuses_a_non_admin_session() {
         let ctx = ctx().await;
-        for (action, path) in CONCRETE_ROUTES {
+        for row in ROUTES {
+            let path = concrete_path(row.template);
+            let action = action_for_method(row.method);
             assert_eq!(
-                output_http_status(ctx.dispatch(auth_msg(action, path, "u-not-admin")).await).await,
+                output_http_status(ctx.dispatch(auth_msg(action, &path, "u-not-admin")).await)
+                    .await,
                 403,
                 "{action} {path} must not be reachable by a logged-in non-admin"
             );
