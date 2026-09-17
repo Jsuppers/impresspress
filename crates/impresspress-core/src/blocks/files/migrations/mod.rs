@@ -31,3 +31,83 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[SQL_001_POSTGRES, SQL_002_POSTGRES];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::{blocks::files::repo, test_support::TestContext};
+
+    /// Migration 002's repair half, on the only database that can need it:
+    /// one that already holds two rows for one bucket name.
+    ///
+    /// Every other fixture applies 001 and 002 together against an empty
+    /// table, so the `DELETE` never has a duplicate to find and a SQL error
+    /// in it would go unnoticed until a real deployment tried to upgrade —
+    /// where it fails the whole batch, leaves the index uncreated, and
+    /// re-fails on every later boot (`apply_if_blessed` tolerates only a
+    /// duplicate `ALTER … ADD COLUMN`).
+    ///
+    /// So this applies 001 alone, plants the takeover the index exists to
+    /// stop, and then applies the real migration list the way an operator
+    /// upgrading with `--run-migrations` does.
+    #[tokio::test]
+    async fn migration_002_repairs_a_database_that_already_holds_a_duplicate_name() {
+        let mut ctx = TestContext::with_auth().await;
+        crate::migration_helper::apply_migrations(
+            &ctx,
+            "impresspress/files",
+            &[SQL_001_SQLITE],
+            &[],
+        )
+        .await
+        .expect("001 applies");
+
+        // Alice's bucket, then mallory's row for the same folder — accepted
+        // before the index existed, and what an upgrading deployment holds.
+        for (owner, created_at) in [
+            ("alice", "2026-01-01T00:00:00Z"),
+            ("mallory", "2026-06-01T00:00:00Z"),
+        ] {
+            repo::buckets::seed(
+                &ctx,
+                crate::util::json_map(json!({
+                    "name": "assets",
+                    "public": false,
+                    "created_by": owner,
+                    "created_at": created_at,
+                })),
+            )
+            .await
+            .expect("seed the duplicate");
+        }
+
+        ctx.set_config(crate::migration_helper::RUN_MIGRATIONS_KEY, "1");
+        let sqlite: Vec<&str> = SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect();
+        crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &sqlite, &[])
+            .await
+            .expect("002 applies to a database holding a duplicate");
+
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "alice")
+                .await
+                .expect("bucket lookup")
+                .is_some(),
+            "the earliest creator keeps the bucket",
+        );
+        assert!(
+            repo::buckets::find_owned(&ctx, "assets", "mallory")
+                .await
+                .expect("bucket lookup")
+                .is_none(),
+            "the later claim on someone else's folder is removed",
+        );
+        assert!(
+            repo::buckets::insert(&ctx, "assets", false, "mallory")
+                .await
+                .is_err(),
+            "and the index is in place, so it cannot be made again",
+        );
+    }
+}
