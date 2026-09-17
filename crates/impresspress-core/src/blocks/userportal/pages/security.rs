@@ -212,8 +212,8 @@ pub async fn handle_unlink(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     if links.len() == 1 {
-        let has_password = match local_credentials::find_by_user_id(ctx, &user_id).await {
-            Ok(c) => c.is_some(),
+        let has_password = match local_credentials::has_password(ctx, &user_id).await {
+            Ok(has) => has,
             Err(e) => return err_internal("Could not check your sign-in methods", e),
         };
         if !has_password {

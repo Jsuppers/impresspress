@@ -369,10 +369,12 @@ Recovery is **reset, then unlink**, and it takes both halves:
    address, so only its owner can complete this. They now have a password, and
    the reset records the address proof.
 2. **Unlink the other provider** at **Account → Security → Linked accounts**.
-   The reset does *not* do this: it revokes refresh tokens, so the other party is
-   signed out, but their `provider_links` row survives and signing in with that
-   provider again would put them straight back into the account. Removing the
-   link is what evicts them.
+   The reset does *not* do this: it revokes their refresh tokens, so they lose
+   the session within the access-token lifetime
+   (`WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS`, 30 minutes by default) rather
+   than at once — but their `provider_links` row survives, and signing in with
+   that provider again would put them straight back into the account. Removing
+   the link is what evicts them.
 
 That second step is new in this release — before it, nothing anywhere in the
 product could remove a provider link. The page refuses to remove an account's

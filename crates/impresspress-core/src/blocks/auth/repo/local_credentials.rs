@@ -86,6 +86,21 @@ pub async fn update_password(
     }
 }
 
+/// Whether `user_id` has a password at all — the question "can this account
+/// sign in without its OAuth links", asked by
+/// `userportal::pages::security::handle_unlink` before it removes one.
+///
+/// A count, not a row read. The caller needs one bool and has no business
+/// holding an Argon2id digest to compute it; WRAP grants are per table, so
+/// this is the only place the surface can be narrowed, and narrowing it here
+/// means the hash never leaves the database.
+pub async fn has_password(ctx: &dyn Context, user_id: &str) -> Result<bool, WaferError> {
+    let n = db::count_by_field(ctx, TABLE, "user_id", json!(user_id))
+        .await
+        .map_err(|e| db_failed("local_credentials has_password", e))?;
+    Ok(n > 0)
+}
+
 pub async fn find_by_user_id(
     ctx: &dyn Context,
     user_id: &str,
@@ -121,6 +136,29 @@ mod typed_client_tests {
         assert_eq!(got.user_id, "user-a");
         assert_eq!(got.password_hash, "$argon2id$dummy");
         assert!(!got.must_reset);
+    }
+
+    /// The unlink guard's question, answered without materialising the row:
+    /// `handle_unlink` needs one bool and must not be handed an Argon2id
+    /// digest to compute it.
+    #[tokio::test]
+    async fn has_password_is_true_only_once_a_credential_exists() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        let ctx = ctx.with_wrap("wafer-run/auth", Vec::new(), vec![], "impresspress/admin");
+
+        assert!(
+            !has_password(&ctx, "user-a").await.unwrap(),
+            "an OAuth-only account has no password"
+        );
+        insert(&ctx, "user-a", "$argon2id$dummy", false)
+            .await
+            .unwrap();
+        assert!(has_password(&ctx, "user-a").await.unwrap());
+        assert!(
+            !has_password(&ctx, "ghost").await.unwrap(),
+            "an unknown user has no password either"
+        );
     }
 
     #[tokio::test]
