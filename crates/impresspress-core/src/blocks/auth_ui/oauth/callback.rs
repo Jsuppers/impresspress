@@ -84,8 +84,11 @@ pub async fn handle(
         return err_bad_request("OAuth state does not belong to this browser");
     }
 
-    // From here the flow is spent however it ends, so every answer carries
-    // the expiry of its binding cookie.
+    // From here the flow is spent however it ends. Every answer this handler
+    // *decides* — the 302 and each `refuse` below — carries the expiry of its
+    // binding cookie. The internal errors do not: `err_internal` says this
+    // deployment failed, the flow is unfinished rather than concluded, and
+    // the cookie expires on its own with the state it names.
     let clear_binding = super::state_binding::clear(ctx, state).await;
 
     // SEC-040: look up the server-side PKCE state by the opaque `state_id`
@@ -659,9 +662,14 @@ async fn resolve_user(
                 clear_binding,
             ))
         }
+        // Forbidden, not NotFound: this is the same refusal as the line
+        // above — the resolved account may not authenticate — and a 404 on
+        // an authentication endpoint tells a caller which accounts exist.
+        // The row is gone between resolution and this read, which is a
+        // deleted account, not a missing page.
         Ok(None) => {
             return Err(refuse(
-                ErrorCode::NotFound,
+                ErrorCode::Forbidden,
                 "Account not found",
                 clear_binding,
             ))
@@ -1576,6 +1584,65 @@ mod security_regression_tests {
                 .id,
             existing.id,
             "adoption must not duplicate the account"
+        );
+    }
+
+    /// The way out, end to end, on the default configuration.
+    ///
+    /// The account starts flag-verified and unproven, which is what
+    /// `api::signup` writes when verification is off — so it is refused
+    /// adoption. Its owner asks for a verification link and redeems it,
+    /// through the real resend and verify handlers, and the same OAuth
+    /// sign-in then succeeds. Without this the no-backfill decision would be
+    /// a dead end: every pre-existing account permanently unlinkable, fixable
+    /// only by an operator editing the database.
+    #[tokio::test]
+    async fn an_account_can_prove_its_address_later_and_then_be_adopted() {
+        let email = "recovering@example.com";
+        let (ctx, mail) = OauthFlow::google(email).ctx_and_mail().await;
+
+        signup_password_account(&ctx, email).await;
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("signup created the row");
+        assert!(user.email_verified && !user.email_is_proven());
+
+        // Refused, because nobody proved the address.
+        let refused = handle(&limiter(), &ctx, &callback_msg(&ctx).await).await;
+        assert!(
+            crate::test_support::output_is_error(refused, "AlreadyExists").await,
+            "an unproven account is not adoptable yet"
+        );
+
+        // The owner asks for a link and redeems it — the real handlers, and
+        // the real mailed token.
+        let resend = serde_json::json!({ "email": email }).to_string();
+        let (resend_limiter, resend_msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let _ = crate::blocks::auth_ui::api::verify::handle_resend(
+            &resend_limiter,
+            &ctx,
+            &resend_msg,
+            wafer_run::InputStream::from_bytes(resend.into_bytes()),
+        )
+        .await
+        .collect_buffered()
+        .await;
+        prove_address_by_email_link(&ctx, &mail, email).await;
+
+        // And now the same sign-in completes, into the same account.
+        seed_state(&ctx, STATE_ID, "google").await;
+        let status =
+            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        assert_eq!(status, 302, "a proven account is adoptable");
+        assert_eq!(
+            provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_ID)
+                .await
+                .expect("link lookup ok")
+                .expect("link written")
+                .user_id,
+            user.id,
+            "the identity joins the account that proved the address"
         );
     }
 

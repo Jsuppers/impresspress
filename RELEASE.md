@@ -317,6 +317,54 @@ image in Admin → Settings → Variables. It renders exactly as before.
 referenced them. `IMPRESSPRESS_ASSETS.logo` (the square mark) and
 `favicon.ico` are unchanged in name and now carry the new art.
 
+### Auth: OAuth sign-in now needs a *proven* address, and existing accounts have none
+
+**What changes.** An OAuth identity may only join an existing local account when
+both sides have proven the address: the provider asserts it is verified, and the
+local row records who proved it. Before this release the callback matched on the
+address alone, so anyone who could register `victim@example.com` with a password
+— on a default install that is anyone, since `WAFER_RUN__AUTH__REQUIRE_VERIFICATION`
+is off and the signup mails nothing — owned the account the victim's Google
+sign-in landed in.
+
+`users.email_verified` could not carry that decision. Signup writes it
+`!REQUIRE_VERIFICATION`, so with verification off it means "this deployment does
+not ask", not "somebody proved it". Migration 013 adds `email_verified_by`, which
+names the act: `email_token` for a redeemed verification link, `oauth.<provider>`
+for a provider that asserts verification.
+
+**The upgrade consequence.** `email_verified_by` is **not backfilled**, and it
+cannot be: a row that predates it may have been verified by a real mailed link or
+may be a default-on-signup row, and backfilling would restore the takeover for
+every squatted address. So on the first release that has it, **no existing
+account can be linked to an OAuth provider** until its address is proven again.
+Those users sign in with their passwords exactly as before, and the admin user
+list still shows them as verified — that column is the policy flag and has not
+changed meaning.
+
+**What a user does about it.** Either, without an operator:
+
+- **Ask for a verification link** — `POST /b/auth/api/resend-verification`, or
+  the "resend" link on the verify page — and open it. Both the resend and the
+  redemption key on `email_verified_by`, so an account the flag already calls
+  verified is still offered a link and still records the proof when it redeems
+  one.
+- **Reset the password.** A redeemed reset link is mailbox proof of the same
+  strength, so `POST /b/auth/api/reset-password` records it too.
+
+Either one makes the account adoptable, permanently. There is nothing for an
+operator to run, and no database edit is expected of anybody.
+
+**A related nuisance, not a vulnerability.** A provider that asserts nothing
+about the address it returns — Microsoft, whose `email` claim is a mutable tenant
+attribute — can still create a local account holding *any* address, including the
+one in `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`. That account is created
+unproven, so it is granted no admin role and cannot be adopted by anyone; what it
+does is occupy the address, and the real owner then meets "an account already uses
+this email address" when they try to link their own provider. The recovery is the
+reset-password route above: the owner receives mail at that address and the
+squatter does not.
+
 ## The release workflow has never produced a release
 
 Read this before you tag anything. No `v*` tag has ever existed in this

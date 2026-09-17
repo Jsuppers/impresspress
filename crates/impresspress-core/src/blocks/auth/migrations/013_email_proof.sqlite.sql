@@ -19,9 +19,15 @@
 -- Deliberately NOT backfilled. A row that predates this column may have been
 -- verified by a real mailed link or may be a default-on-signup row; the two
 -- are indistinguishable now, and guessing in favour of the account means
--- guessing in favour of a squatter. An existing account that never proved its
--- address simply cannot be adopted by an OAuth identity until someone does —
--- it signs in with its password exactly as before.
+-- guessing in favour of a squatter.
+--
+-- Such an account signs in with its password exactly as before; what it cannot
+-- do until someone proves the address is be joined by an OAuth identity. Two
+-- routes record the proof without operator intervention, and both are ordinary
+-- user actions: `POST /b/auth/api/resend-verification` followed by the link
+-- (the resend and the redemption both key on this column, so a flag-verified
+-- row is still offered one), or a password reset, whose link is mailbox proof
+-- of the same strength. Operators get this spelled out in RELEASE.md.
 --
 -- Nullable with no default, like every other ALTER-added column here: SQLite
 -- has no `ADD COLUMN IF NOT EXISTS`, and a re-run raises "duplicate column
