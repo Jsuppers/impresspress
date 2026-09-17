@@ -867,6 +867,55 @@ mod integration_tests {
         assert_eq!(header(&meta, "X-Content-Type-Options"), Some("nosniff"));
     }
 
+    /// Nothing restricts an object key to ASCII — `is_valid_storage_key` bans
+    /// `..`, backslash, NUL and a leading `/`, and that is all — so a
+    /// non-ASCII filename is an ordinary upload. This route had no
+    /// `Content-Disposition` at all before it gained one, and on Cloudflare
+    /// `Headers.set` throws above U+00FF, so an ASCII-only header would have
+    /// turned such a download into a 500. Round-trip one through both real
+    /// handlers and assert the header is ASCII and carries the real name.
+    #[tokio::test]
+    async fn a_non_ascii_key_downloads_with_an_ascii_header_that_still_names_it() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let key = "日本語 memo.txt";
+        let upload = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", key, "text/plain"),
+            InputStream::from_bytes(b"bytes".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(upload).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        let out = handle_get_object(&ctx, &download_msg("assets", key)).await;
+        let events: Vec<wafer_block::stream::StreamEvent> = futures::StreamExt::collect(out).await;
+        let first_chunk = events
+            .iter()
+            .position(|e| matches!(e, wafer_block::stream::StreamEvent::Chunk(_)))
+            .expect("the object must still be served, not 500");
+        let meta: Vec<wafer_run::MetaEntry> = events[..first_chunk]
+            .iter()
+            .filter_map(|e| match e {
+                wafer_block::stream::StreamEvent::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let disposition = header(&meta, "Content-Disposition").expect("a disposition");
+        assert!(
+            disposition.contains("filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E%20memo.txt"),
+            "the real name must survive as RFC 6266 `filename*`: {disposition}"
+        );
+        assert!(
+            meta.iter().all(|e| e.value.is_ascii()),
+            "every header value must be ASCII or the Workers runtime throws: {meta:?}"
+        );
+    }
+
     /// `(bucket, key)` is one object and `store::put` overwrites the blob, so
     /// re-uploading a key REPLACES what is stored there. The metadata row is
     /// the same row: inserting a second one is refused by the unique index,

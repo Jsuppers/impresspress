@@ -30,6 +30,13 @@
 //! and Chrome's PDF viewer is one, so applying it there would trade a working
 //! PDF preview for defence-in-depth on a set of types that cannot execute in
 //! the first place.
+//!
+//! Two things reach these headers from an uploader and are therefore shaped
+//! here rather than echoed: the content type, which is validated by
+//! [`normalized_content_type`] because a header value cannot carry a control
+//! character, and the filename, which [`content_disposition`] emits in both
+//! RFC 6266 forms because an object key is not restricted to ASCII and a
+//! header value is.
 
 use wafer_run::MetaEntry;
 
@@ -47,6 +54,53 @@ const SANDBOX_CSP_HEADER: (&str, &str) = (
 
 /// The `Content-Disposition` filename for an object with no usable key.
 const FALLBACK_FILENAME: &str = "download";
+
+/// What a content type the block does not recognise as well-formed is served
+/// as. Also `wafer_core`'s own fallback for an object whose backend reports no
+/// type, so the two agree.
+const FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// The stored content type, or [`FALLBACK_CONTENT_TYPE`] when it is not a
+/// well-formed media type.
+///
+/// The type is whatever the uploader's client put in the multipart part
+/// header, and `multipart::split_part_headers` splits those on `\r\n` only —
+/// so a header terminated with a bare `LF` carries that byte (and anything
+/// after it) into the stored value. Echoing it back would put a control
+/// character into a response header: both wasm adapters fail closed on that
+/// today, which turns into a permanently undownloadable object rather than a
+/// header injection, but "this object cannot be fetched, ever" is not an
+/// acceptable resting place either.
+///
+/// So the type is validated before it is echoed: `token/token` in RFC 9110
+/// token characters, and any parameters printable ASCII with no control
+/// characters. Anything else is served as [`FALLBACK_CONTENT_TYPE`], which is
+/// not on the inline allowlist — a malformed type can only ever become an
+/// attachment.
+fn normalized_content_type(content_type: &str) -> String {
+    /// RFC 9110 `tchar`.
+    fn is_token(s: &str) -> bool {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    }
+
+    let trimmed = content_type.trim();
+    let (essence, params) = match trimmed.split_once(';') {
+        Some((essence, params)) => (essence.trim(), Some(params)),
+        None => (trimmed, None),
+    };
+    let well_formed = essence
+        .split_once('/')
+        .is_some_and(|(top, sub)| is_token(top) && is_token(sub))
+        && params.is_none_or(|p| p.chars().all(|c| (' '..='~').contains(&c)));
+
+    if well_formed {
+        trimmed.to_string()
+    } else {
+        FALLBACK_CONTENT_TYPE.to_string()
+    }
+}
 
 /// Whether an object of `content_type` may be rendered **inline** by the
 /// browser.
@@ -113,6 +167,43 @@ fn disposition_filename(key: &str) -> String {
     }
 }
 
+/// The whole `Content-Disposition` value for `key`, per RFC 6266.
+///
+/// A header value has to be ASCII, and an object key is not: nothing in
+/// `is_valid_storage_key` restricts it to ASCII, so `日本語.pdf` and emoji
+/// filenames are ordinary uploads. On Cloudflare `Headers.set` throws for a
+/// code point above U+00FF, which would turn this header into a 500 on a
+/// download that worked before it existed.
+///
+/// So the value carries both forms RFC 6266 defines, which is exactly what
+/// they are for:
+/// - `filename="…"` — an ASCII fold, every non-ASCII character replaced with
+///   `_`, for a client that reads only this one.
+/// - `filename*=UTF-8''…` — the real name, percent-encoded (via
+///   [`crate::util::url_path_encode`], whose RFC 3986 unreserved set is a
+///   subset of RFC 5987's `attr-char`, so over-encoding is the only
+///   difference). Every current browser prefers this one.
+///
+/// The `filename*` parameter is emitted only when the fold actually lost
+/// something; a plain ASCII name keeps the single-parameter form.
+fn content_disposition(inline: bool, key: &str) -> String {
+    let name = disposition_filename(key);
+    let ascii: String = name
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect();
+
+    let kind = if inline { "inline" } else { "attachment" };
+    if ascii == name {
+        format!("{kind}; filename=\"{ascii}\"")
+    } else {
+        format!(
+            "{kind}; filename=\"{ascii}\"; filename*=UTF-8''{}",
+            crate::util::url_path_encode(&name)
+        )
+    }
+}
+
 /// The leading `Meta` frame for streaming a user-uploaded object: the
 /// streaming opt-in marker and content type from
 /// [`crate::streaming::download_leading_meta`], plus the disposition and
@@ -123,17 +214,18 @@ fn disposition_filename(key: &str) -> String {
 /// disposition is `inline` only for the types
 /// [`renders_inline_safely`] admits; everything else is an `attachment` and
 /// additionally carries the sandbox CSP.
+///
+/// The content type is served as [`normalized_content_type`] leaves it, and
+/// the allowlist reads the same normalized value — so a malformed stored type
+/// cannot both be echoed into a header and be judged inline.
 pub(in crate::blocks::files) fn user_object_leading_meta(
     content_type: &str,
     key: &str,
     extra_headers: &[(&str, &str)],
 ) -> Vec<MetaEntry> {
-    let inline = renders_inline_safely(content_type);
-    let disposition = format!(
-        "{}; filename=\"{}\"",
-        if inline { "inline" } else { "attachment" },
-        disposition_filename(key)
-    );
+    let content_type = normalized_content_type(content_type);
+    let inline = renders_inline_safely(&content_type);
+    let disposition = content_disposition(inline, key);
 
     let mut headers: Vec<(&str, &str)> = vec![
         ("Content-Disposition", disposition.as_str()),
@@ -143,7 +235,7 @@ pub(in crate::blocks::files) fn user_object_leading_meta(
         headers.push(SANDBOX_CSP_HEADER);
     }
     headers.extend_from_slice(extra_headers);
-    crate::streaming::download_leading_meta(content_type, &headers)
+    crate::streaming::download_leading_meta(&content_type, &headers)
 }
 
 #[cfg(test)]
@@ -242,6 +334,95 @@ mod tests {
         assert_eq!(disposition_filename("line\r\nbreak.png"), "linebreak.png");
         assert_eq!(disposition_filename("dir/"), FALLBACK_FILENAME);
         assert_eq!(disposition_filename(""), FALLBACK_FILENAME);
+    }
+
+    /// A header value is ASCII, an object key is not, and the authenticated
+    /// download had no `Content-Disposition` at all before this module. On
+    /// Cloudflare `Headers.set` throws above U+00FF, so an ASCII-only fold
+    /// would have turned `日本語.pdf` into a 500 on a download that worked
+    /// before. Both RFC 6266 forms go out: the fold for a client that reads
+    /// only `filename=`, and the percent-encoded real name for every current
+    /// browser.
+    #[test]
+    fn a_non_ascii_filename_survives_as_rfc_6266_and_the_header_stays_ascii() {
+        let meta = user_object_leading_meta("application/pdf", "docs/日本語.pdf", &[]);
+        let disposition = header(&meta, "Content-Disposition").expect("a disposition");
+
+        assert_eq!(
+            disposition,
+            "inline; filename=\"___.pdf\"; filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.pdf"
+        );
+        assert!(
+            meta.iter().all(|e| e.value.is_ascii()),
+            "every header value must be ASCII or the Workers runtime throws: {meta:?}"
+        );
+    }
+
+    /// A plain ASCII name keeps the single-parameter form — `filename*` is
+    /// for the names that need it, not noise on every response.
+    #[test]
+    fn an_ascii_filename_keeps_the_single_parameter_form() {
+        assert_eq!(
+            content_disposition(false, "report.bin"),
+            "attachment; filename=\"report.bin\""
+        );
+    }
+
+    /// The stored content type comes from the uploader's multipart part
+    /// header, which `multipart::split_part_headers` terminates on `\r\n`
+    /// only — a bare `LF` carries into the value. Echoing that into a response
+    /// header makes the object permanently undownloadable on both wasm
+    /// adapters. A type that is not well-formed is served as
+    /// `application/octet-stream`, which is not on the inline allowlist.
+    #[test]
+    fn a_malformed_content_type_is_replaced_not_echoed() {
+        for malformed in [
+            "text/html\nX-Injected: 1",
+            "text/html\r\nX-Injected: 1",
+            "text/html\u{0}",
+            "image/png\u{7f}",
+            "imagé/png",
+            "notatype",
+            "/png",
+            "image/",
+            "",
+        ] {
+            assert_eq!(
+                normalized_content_type(malformed),
+                FALLBACK_CONTENT_TYPE,
+                "{malformed:?} is not a media type this block will echo"
+            );
+        }
+
+        let meta = user_object_leading_meta("text/html\nX-Injected: 1", "a.html", &[]);
+        assert_eq!(
+            wafer_run::MetaGet::get(&meta, wafer_block::meta::META_RESP_CONTENT_TYPE),
+            Some(FALLBACK_CONTENT_TYPE),
+        );
+        assert_eq!(
+            header(&meta, "Content-Disposition"),
+            Some("attachment; filename=\"a.html\""),
+            "a type the block could not read is never inline",
+        );
+    }
+
+    /// A well-formed type keeps its parameters — normalization is a guard,
+    /// not a rewrite.
+    #[test]
+    fn a_well_formed_content_type_is_served_unchanged() {
+        for ok in [
+            "text/plain; charset=utf-8",
+            "application/pdf",
+            "image/svg+xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ] {
+            assert_eq!(normalized_content_type(ok), ok);
+        }
+        assert_eq!(
+            normalized_content_type("  image/png  "),
+            "image/png",
+            "surrounding whitespace is not part of the type"
+        );
     }
 
     /// Caller-supplied headers ride along with the security ones rather than
