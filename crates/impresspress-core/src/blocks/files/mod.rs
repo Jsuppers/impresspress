@@ -752,6 +752,61 @@ mod test_support {
         );
         msg
     }
+
+    // -----------------------------------------------------------------
+    // The browser half of the contract
+    //
+    // These read `files-browser.js` itself, so a test drives the handler
+    // with the field names, attributes and URLs the shipped bundle really
+    // uses. A test that re-types them in Rust certifies the Rust side
+    // against itself and passes while the browser talks to nothing.
+    // -----------------------------------------------------------------
+
+    /// The slice of `js` between `start` and the next `end` after it.
+    fn between<'a>(js: &'a str, start: &str, end: &str, what: &str) -> &'a str {
+        let from = js
+            .find(start)
+            .unwrap_or_else(|| panic!("{what}: no `{start}`"))
+            + start.len();
+        let len = js[from..]
+            .find(end)
+            .unwrap_or_else(|| panic!("{what}: no `{end}` after `{start}`"));
+        &js[from..from + len]
+    }
+
+    /// The HTML attribute the kebab's revoke button reads, derived from the
+    /// `dataset` key the bundle uses (`dataset.shareId` ⇒ `data-share-id`).
+    pub(super) fn revoke_id_attribute() -> String {
+        let key = between(
+            super::assets::SOURCE,
+            "revokeShare(trigger.dataset.",
+            ")",
+            "revoke button wiring",
+        );
+        let mut attr = String::from("data-");
+        for ch in key.chars() {
+            if ch.is_ascii_uppercase() {
+                attr.push('-');
+                attr.push(ch.to_ascii_lowercase());
+            } else {
+                attr.push(ch);
+            }
+        }
+        attr
+    }
+
+    /// The URL the revoke button DELETEs for the value it read out of that
+    /// attribute.
+    pub(super) fn revoke_url(id: &str) -> String {
+        let js = super::assets::SOURCE;
+        let handler = &js[js
+            .find("async function revokeShare(")
+            .expect("the bundle must define revokeShare")..];
+        format!(
+            "{}{id}",
+            between(handler, "fetch('", "'", "revoke fetch URL")
+        )
+    }
 }
 
 #[cfg(test)]

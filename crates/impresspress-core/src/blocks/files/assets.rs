@@ -20,6 +20,18 @@
 #[cfg(feature = "embed-assets")]
 const FILES_BROWSER_JS: &str = include_str!("assets/files-browser.js");
 
+/// The bundle's source, for the tests that hold the browser and the Rust
+/// handlers to one contract — the request fields the share modal sends, the
+/// `data-*` attribute the kebab reads, the URL it revokes through.
+///
+/// Those tests read the shipped file rather than a transcription of it: a
+/// transcription is what lets the two sides drift (a share modal posting
+/// `expires_days` at a handler reading `expires_in_hours`) while every test
+/// stays green. Not gated on `embed-assets`, because the contract holds
+/// whether or not this build serves the asset.
+#[cfg(test)]
+pub(super) const SOURCE: &str = include_str!("assets/files-browser.js");
+
 /// Bytes for this block's manifest assets, or `None` for a key it does not
 /// own. Called only through [`crate::blocks::static_asset_bytes`].
 #[cfg(feature = "embed-assets")]
