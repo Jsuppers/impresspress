@@ -99,6 +99,12 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // one an OAuth identity may join, and it is the recovery path for an
     // address someone else registered first.
     //
+    // `record_email_proof` sets `email_verified` along with the proof, so on a
+    // deployment that requires verification a reset also satisfies the login
+    // gate for a user who never clicked a verification link. That is correct
+    // — they just demonstrated the same control that link demonstrates — and
+    // it is stated because it is not obvious from the call.
+    //
     // Not fatal on failure: the password has already changed, the reset
     // succeeded, and the proof is recorded for the sake of a later sign-in,
     // not this one.

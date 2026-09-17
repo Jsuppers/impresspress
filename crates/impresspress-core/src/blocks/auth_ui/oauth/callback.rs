@@ -1606,7 +1606,14 @@ mod security_regression_tests {
             .await
             .expect("user lookup ok")
             .expect("signup created the row");
-        assert!(user.email_verified && !user.email_is_proven());
+        assert!(
+            user.email_verified,
+            "precondition: with verification off, signup flags the row verified"
+        );
+        assert!(
+            !user.email_is_proven(),
+            "precondition: no mail was sent, so nothing proved the address"
+        );
 
         // Refused, because nobody proved the address.
         let refused = handle(&limiter(), &ctx, &callback_msg(&ctx).await).await;

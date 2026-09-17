@@ -157,6 +157,42 @@ pub async fn list_for_user(
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
+/// Delete every link this user holds with `provider`, returning how many rows
+/// went. Scoped to `user_id` in the statement itself, so a caller cannot
+/// unlink somebody else's account by naming their provider.
+///
+/// Keyed on the provider rather than on `(provider, provider_ref)`: the
+/// account surface offers "unlink Google", and a user who has somehow bound
+/// two Google identities to one account means all of them by that. Typed
+/// `db::delete_by_filters_count` for the same reason [`list_for_user`] is
+/// typed — it is called from `userportal`, cross-block, where raw SQL is
+/// admin-only under WRAP.
+pub async fn delete_for_user(
+    ctx: &dyn Context,
+    user_id: &str,
+    provider: &str,
+) -> Result<u64, WaferError> {
+    let n = db::delete_by_filters_count(
+        ctx,
+        TABLE,
+        vec![
+            Filter {
+                field: "user_id".into(),
+                operator: FilterOp::Equal,
+                value: json!(user_id),
+            },
+            Filter {
+                field: "provider".into(),
+                operator: FilterOp::Equal,
+                value: json!(provider),
+            },
+        ],
+    )
+    .await
+    .map_err(|e| db_failed("provider_links delete_for_user", e))?;
+    Ok(n.max(0) as u64)
+}
+
 #[cfg(test)]
 mod typed_client_tests {
     use super::*;

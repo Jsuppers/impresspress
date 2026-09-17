@@ -361,9 +361,22 @@ attribute — can still create a local account holding *any* address, including 
 one in `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`. That account is created
 unproven, so it is granted no admin role and cannot be adopted by anyone; what it
 does is occupy the address, and the real owner then meets "an account already uses
-this email address" when they try to link their own provider. The recovery is the
-reset-password route above: the owner receives mail at that address and the
-squatter does not.
+this email address" when they try to link their own provider.
+
+Recovery is **reset, then unlink**, and it takes both halves:
+
+1. **Reset the password** at `/b/auth/forgot-password`. The link goes to the
+   address, so only its owner can complete this. They now have a password, and
+   the reset records the address proof.
+2. **Unlink the other provider** at **Account → Security → Linked accounts**.
+   The reset does *not* do this: it revokes refresh tokens, so the other party is
+   signed out, but their `provider_links` row survives and signing in with that
+   provider again would put them straight back into the account. Removing the
+   link is what evicts them.
+
+That second step is new in this release — before it, nothing anywhere in the
+product could remove a provider link. The page refuses to remove an account's
+last way in, so set a password (step 1) before unlinking the only link.
 
 ## The release workflow has never produced a release
 
