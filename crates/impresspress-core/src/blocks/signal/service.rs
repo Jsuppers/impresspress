@@ -171,7 +171,7 @@ async fn fetch_live(ctx: &dyn Context, code: &str) -> Result<RoomRow, RoomError>
 /// `ErrorCode::AlreadyExists` directly) — so there is nothing in the error
 /// itself to match on beyond that. The same reasoning and the same
 /// probe-after-the-write shape is already written out at
-/// `admin::ops::taken_key_or_db_error`, which this mirrors for this block's
+/// `crud::taken_key_or_db_error`, which this mirrors for this block's
 /// own error type: probing *after* the failed write, not before, is what
 /// closes the two-hosts-roll-the-same-code race — a pre-check that found
 /// the code free leaves a gap a competing create can still land in, and the
