@@ -61,7 +61,22 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     // Send the raw token in the email; the hash lives only in the DB.
-    super::send_template_email(ctx, "password_reset", &email_lower, &reset_token).await;
+    if let Err(failure) =
+        super::send_template_email(ctx, "password_reset", &email_lower, &reset_token).await
+    {
+        // `safe_msg` below is constant for every account state by design
+        // (see the DELIBERATE note above), so a send failure cannot change
+        // it without reintroducing the enumeration oracle — only a caller
+        // whose address IS registered can reach this line at all. It is
+        // logged at `error` instead: a reset mail that never left is a user
+        // locked out, and the email block's own log says which limit or
+        // provider refused it.
+        tracing::error!(
+            user_id = %user.id,
+            %failure,
+            "forgot-password: the reset email was not sent"
+        );
+    }
 
     ok_json(&MessageResponse {
         message: safe_msg.to_string(),

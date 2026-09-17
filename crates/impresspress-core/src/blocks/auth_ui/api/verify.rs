@@ -170,7 +170,18 @@ pub async fn handle_resend(ctx: &dyn Context, input: InputStream) -> OutputStrea
         return err_internal("Failed to update token", e.to_string());
     }
 
-    super::send_template_email(ctx, "verification", &email_lower, &new_token).await;
+    if let Err(failure) =
+        super::send_template_email(ctx, "verification", &email_lower, &new_token).await
+    {
+        // Same constraint as forgot-password: `constant()` is the answer for
+        // every account state, so the failure is recorded here rather than
+        // in the body.
+        tracing::error!(
+            user_id = %user.id,
+            %failure,
+            "resend-verification: the verification email was not sent"
+        );
+    }
 
     constant()
 }

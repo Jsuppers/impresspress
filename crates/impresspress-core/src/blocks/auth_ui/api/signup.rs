@@ -184,7 +184,24 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // Send verification email if required
     if require_verification {
-        super::send_template_email(ctx, "verification", &email_lower, &verification_token).await;
+        if let Err(failure) =
+            super::send_template_email(ctx, "verification", &email_lower, &verification_token).await
+        {
+            // The response below cannot carry this. It is byte-for-byte the
+            // body the "[SEC-035] email already registered" branch above
+            // returns, and a message that varied with whether mail actually
+            // went out would hand an anonymous caller the enumeration oracle
+            // that branch exists to close. The account exists and the resend
+            // endpoint can mint a fresh token, so the recoverable half is
+            // already in the user's hands; the part that was missing is this
+            // line, which names the flow and the reason an operator has to
+            // act on.
+            tracing::error!(
+                user_id = %user.id,
+                %failure,
+                "signup: the verification email was not sent"
+            );
+        }
         // Do NOT issue tokens before email is verified
         return ResponseBuilder::new()
             .status(201)
