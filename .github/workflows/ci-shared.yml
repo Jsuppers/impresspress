@@ -1458,7 +1458,7 @@ jobs:
       # re-runnable.
       - name: Migration files/002 dates legacy share links by era
         run: |
-          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__files__cloud_shares (id, token, bucket, key, created_by, expires_at, created_at, updated_at) VALUES ('old', 'eyJhbGci.eyJ0eXAi.sig1', 'photos', 'a.png', 'alice', NULL, '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('recent', 'eyJhbGci.eyJ0eXAi.sig2', 'photos', 'b.png', 'alice', NULL, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'), ('precise', 'eyJhbGci.eyJ0eXAi.sig3', 'photos', 'c.png', 'alice', '', '2026-09-08T12:34:56.123456789+00:00', '2026-09-08T12:34:56.123456789+00:00'), ('opaque', '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08', 'photos', 'd.png', 'alice', NULL, '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('chosen', 'eyJhbGci.eyJ0eXAi.sig5', 'photos', 'e.png', 'alice', '2027-06-01T00:00:00Z', '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('garbled', 'eyJhbGci.eyJ0eXAi.sig6', 'photos', 'f.png', 'alice', NULL, 'not a timestamp', 'not a timestamp')"
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__files__cloud_shares (id, token, bucket, key, created_by, expires_at, created_at, updated_at) VALUES ('old', 'eyJhbGci.eyJ0eXAi.sig1', 'photos', 'a.png', 'alice', NULL, '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('recent', 'eyJhbGci.eyJ0eXAi.sig2', 'photos', 'b.png', 'alice', NULL, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'), ('precise', 'eyJhbGci.eyJ0eXAi.sig3', 'photos', 'c.png', 'alice', '', '2026-09-08T12:34:56.123456789+00:00', '2026-09-08T12:34:56.123456789+00:00'), ('opaque', '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08', 'photos', 'd.png', 'alice', NULL, '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('chosen', 'eyJhbGci.eyJ0eXAi.sig5', 'photos', 'e.png', 'alice', '2027-06-01T00:00:00Z', '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('garbled', 'eyJhbGci.eyJ0eXAi.sig6', 'photos', 'f.png', 'alice', NULL, 'not a timestamp', 'not a timestamp'), ('boundary_in', 'eyJhbGci.eyJ0eXAi.sig7', 'photos', 'g.png', 'alice', NULL, '2026-05-14T05:43:03.5+00:00', '2026-05-14T05:43:03.5+00:00'), ('boundary_before', 'eyJhbGci.eyJ0eXAi.sig8', 'photos', 'h.png', 'alice', NULL, '2026-05-14T05:43:02.999+00:00', '2026-05-14T05:43:02.999+00:00')"
           psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/files/migrations/002_legacy_share_token_expiry.postgres.sql
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'old'")" = "2027-04-20T10:00:00Z"
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'recent'")" = "2026-07-01T00:00:00Z"
@@ -1466,6 +1466,13 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'chosen'")" = "2027-06-01T00:00:00Z"
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM impresspress__files__cloud_shares WHERE id = 'opaque' AND expires_at IS NULL")" -eq 1
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM impresspress__files__cloud_shares WHERE id = 'garbled' AND expires_at IS NOT NULL AND expires_at <= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")" -eq 1
+          # The boundary second, asserted identically by
+          # `the_boundary_second_falls_on_the_thirty_day_arm` on SQLite: a row
+          # inside it takes the 30-day arm on BOTH backends, the second before
+          # it takes the 365-day arm on both. This is the one comparison the
+          # repair turns on, and the two dialects spell it differently.
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_in'")" = "2026-06-13T05:43:03Z"
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_before'")" = "2027-05-14T05:43:02Z"
 
   audit:
     name: Security Audit
