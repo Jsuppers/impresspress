@@ -113,6 +113,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
             &DEFAULT_RATE_LIMIT_MAX.to_string(),
         )
         .name("Rate Limit (max emails per caller)")
+        .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
@@ -123,6 +124,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
             &DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX.to_string(),
         )
         .name("Rate Limit (max emails per recipient)")
+        .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS",
@@ -130,6 +132,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
             &DEFAULT_RATE_LIMIT_WINDOW_SECS.to_string(),
         )
         .name("Rate Limit Window (seconds)")
+        .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS",
@@ -600,6 +603,21 @@ where
         .unwrap_or(default)
 }
 
+/// The rate-limit bucket identity for a recipient: the address trimmed and
+/// lowercased (the normalization [`validate_recipient`] already applies
+/// before accepting it, so `" V@x.com"` and `"v@x.com"` are one mailbox and
+/// get one bucket), then hashed.
+///
+/// Hashed because this identity is persisted on Cloudflare: `UserRateLimiter`
+/// writes the composite key into the `wafer_run__auth__rate_limits` D1 table,
+/// which until now held only user ids and IPs. A recipient address is
+/// somebody's mailbox and does not belong in a table that exists to count
+/// requests — the same reason `users.reset_token_hash` stores a digest. The
+/// bucket only ever needs equality, which a digest preserves.
+fn recipient_bucket_key(to: &str) -> String {
+    crate::util::sha256_hex(to.trim().to_lowercase().as_bytes())
+}
+
 /// Outbound rate limits for one send: a per-recipient bucket and a
 /// per-calling-block ceiling. Either limit set to `0` disables that bucket.
 ///
@@ -615,10 +633,11 @@ where
 /// the shared ceiling only for mail the recipient bucket admitted caps any
 /// one address's share of it at the per-recipient limit.
 ///
-/// The recipient key is the lowercased address, so case variants of the same
-/// mailbox cannot each open their own bucket. The caller is
-/// `ctx.caller_id()`, falling back to `"unknown"` when missing (a direct
-/// entry point with no calling block).
+/// The recipient key is [`recipient_bucket_key`] — the trimmed, lowercased
+/// address, hashed — so neither case nor surrounding whitespace opens a
+/// second bucket for the same mailbox. The caller is `ctx.caller_id()`,
+/// falling back to `"unknown"` when missing (a direct entry point with no
+/// calling block).
 async fn check_send_rate_limits(
     limiter: &UserRateLimiter,
     ctx: &dyn Context,
@@ -640,7 +659,7 @@ async fn check_send_rate_limits(
     )
     .await;
     if per_recipient_max > 0 {
-        let key = UserRateLimiter::key(&to.to_lowercase(), RECIPIENT_LIMIT_CATEGORY);
+        let key = UserRateLimiter::key(&recipient_bucket_key(to), RECIPIENT_LIMIT_CATEGORY);
         let limit = RateLimit {
             max_requests: per_recipient_max,
             window,
@@ -1020,6 +1039,20 @@ mod tests {
         assert_eq!(send_status(&block, &ctx, "target@example.com").await, 200);
         assert_eq!(send_status(&block, &ctx, "target@example.com").await, 200);
         assert_eq!(send_status(&block, &ctx, "target@example.com").await, 429);
+    }
+
+    /// Neither case nor surrounding whitespace is a second mailbox --
+    /// `validate_recipient` trims before accepting the address, so the bucket
+    /// key has to trim too or `" v@x.com"` buys a fresh quota. Reachable by
+    /// any block granted `email.send`, which sets its own `to`.
+    #[tokio::test]
+    async fn the_recipient_bucket_ignores_surrounding_whitespace() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("2", "0");
+
+        assert_eq!(send_status(&block, &ctx, "bob@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "  bob@example.com ").await, 200);
+        assert_eq!(send_status(&block, &ctx, " bob@example.com").await, 429);
     }
 
     /// Case is not a second mailbox: `Alice@` and `alice@` share one bucket.
