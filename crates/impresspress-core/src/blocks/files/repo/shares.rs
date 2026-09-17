@@ -35,10 +35,16 @@ pub struct ShareRow {
     pub created_by: String,
     /// RFC 3339 creation instant.
     pub created_at: String,
-    /// Absolute expiry, or `None` for a share that never expires. A SQL
-    /// `NULL` and a stored empty string both mean "never": the column is
-    /// nullable and every caller already treated `""` as unset, so the
-    /// distinction existed nowhere but in the decode.
+    /// The end this share link records, as an RFC 3339 stamp.
+    ///
+    /// `None` is a SQL `NULL` or a stored empty string — one meaning, since
+    /// the column is nullable and every caller treated `""` as unset. It is
+    /// NOT "never expires": every share link has an end, and a row that
+    /// records none cannot be shown to be live, so
+    /// `share::handle_direct_access` refuses it. This release cannot write
+    /// one ([`NewShare::expires_at`] is not optional) and migration 002 gave
+    /// every historical row an end; a `None` here means a row that reached
+    /// the table some other way.
     pub expires_at: Option<String>,
     pub access_count: i64,
     /// Access cap, or `None` for unlimited. A non-positive stored value is
@@ -381,9 +387,9 @@ mod tests {
         );
     }
 
-    /// "Never expires" arrives as an absent key, a SQL `NULL` or a stored
-    /// empty string; every caller already treated all three the same, so the
-    /// row makes that one `None`.
+    /// An absent key, a SQL `NULL` and a stored empty string are one state
+    /// — "this row records no end" — so the decode makes all three `None`
+    /// and the serving path refuses that state once, in one place.
     #[test]
     fn expires_at_is_none_for_every_shape_of_unset() {
         assert_eq!(ShareRow::from_record(&record(&[])).expires_at, None);

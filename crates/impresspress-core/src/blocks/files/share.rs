@@ -72,25 +72,34 @@ pub async fn handle_direct_access(
     };
 
     // Check expiry against the row, which is the only place a share's
-    // lifetime is recorded. `ShareRow::expires_at` is `None` for a share
-    // that never expires (a SQL NULL or a stored empty string, which mean
-    // the same thing here). A stored expiry we cannot parse is refused, not
-    // waved through: the owner set an expiry, and an unreadable one cannot
-    // be shown to be in the future. It is refused as a fault, not as an
-    // expiry — the row is corrupt, and "your link has expired" would be as
-    // false a reason as the "not found" this arm replaces.
-    if let Some(expires) = share.expires_at.as_deref() {
-        let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(expires) else {
-            tracing::error!(
-                share_id = %share.id,
-                expires_at = %expires,
-                "share row carries an unparseable expires_at",
-            );
-            return err_internal_no_cause("Share link is unavailable");
-        };
-        if exp_time < chrono::Utc::now() {
-            return err_forbidden("Share link has expired");
-        }
+    // lifetime is recorded — the token asserts nothing.
+    //
+    // A row with NO expiry is not a link that lives forever, it is a link
+    // whose end cannot be established, and it is refused on the same terms
+    // as one whose expiry cannot be read: as a fault, not as an expiry.
+    // ("Your link has expired" would be as false a reason as the "not
+    // found" the lookup arm above no longer gives.) Nothing in this release
+    // can write such a row — `NewShare::expires_at` is not optional and the
+    // legacy repair (migration 002) gave every historical row an end — but
+    // the column is nullable, so an import, a restore or a hand-written row
+    // can still produce one, and this is what stops it being served.
+    let Some(expires) = share.expires_at.as_deref() else {
+        tracing::error!(
+            share_id = %share.id,
+            "share row records no expiry; refusing rather than serving an endless link",
+        );
+        return err_internal_no_cause("Share link is unavailable");
+    };
+    let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(expires) else {
+        tracing::error!(
+            share_id = %share.id,
+            expires_at = %expires,
+            "share row carries an unparseable expires_at",
+        );
+        return err_internal_no_cause("Share link is unavailable");
+    };
+    if exp_time < chrono::Utc::now() {
+        return err_forbidden("Share link has expired");
     }
 
     // Refuse a share already at its cap before paying for the object. The
@@ -199,6 +208,12 @@ mod tests {
         data.insert("created_by".into(), json!("alice"));
         data.insert("created_at".into(), json!(crate::util::now_rfc3339()));
         data.insert("access_count".into(), json!(0));
+        // A live expiry by default: every share link records an end, so a
+        // fixture without one is the exception a test states for itself.
+        data.insert(
+            "expires_at".into(),
+            json!((chrono::Utc::now() + chrono::Duration::days(365)).to_rfc3339()),
+        );
         for (k, v) in fields {
             data.insert((*k).to_string(), v.clone());
         }
@@ -329,6 +344,7 @@ mod tests {
             &[
                 ("token", json!(LEGACY_TOKEN)),
                 ("created_at", json!(minted)),
+                ("expires_at", json!(null)),
             ],
         )
         .await;
@@ -354,6 +370,34 @@ mod tests {
         assert!(
             output_is_error(direct_access(&ctx, LEGACY_TOKEN).await, "PermissionDenied").await,
             "a legacy link that is dead today must not come back to life"
+        );
+    }
+
+    /// A row that records no end is refused, not served forever.
+    ///
+    /// Nothing in this release writes one — `NewShare::expires_at` is not
+    /// optional — but the column is nullable, so an import, a restore or a
+    /// hand-written row can still produce one. The serving path is where
+    /// that stops, so the invariant does not rest on "no such row exists".
+    #[tokio::test]
+    async fn a_share_that_records_no_end_is_refused() {
+        let ctx = share_ctx("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"secret", "image/png")
+            .await
+            .expect("seed the object being shared");
+        let id = seed_share(&ctx, &[("expires_at", json!(null))]).await;
+        assert_eq!(
+            repo::shares::find_by_id(&ctx, &id)
+                .await
+                .expect("share row")
+                .expires_at,
+            None,
+            "precondition: the row under test records no end"
+        );
+
+        assert!(
+            output_is_error(direct_access(&ctx, OPAQUE_TOKEN).await, "Internal").await,
+            "a share with no recorded end must be refused, not served forever"
         );
     }
 

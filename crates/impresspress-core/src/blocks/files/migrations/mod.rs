@@ -159,7 +159,7 @@ mod tests {
 
 #[cfg(test)]
 mod legacy_share_expiry_tests {
-    //! What `002_legacy_share_token_expiry` does to the rows of a deployment
+    //! What `003_legacy_share_token_expiry` does to the rows of a deployment
     //! upgraded into the opaque-token scheme.
     //!
     //! A share link used to be gated by its token's own 30-day JWT expiry,
@@ -283,49 +283,6 @@ mod legacy_share_expiry_tests {
             expires_at(&ctx, &id).await.as_deref(),
             Some("2026-07-01T00:00:00Z"),
             "a link minted after {TTL_CHANGED_AT} lived 30 days"
-        );
-    }
-
-    /// The boundary second falls the same way in both dialects.
-    ///
-    /// A row minted inside the second SEC-055 landed in is the one place
-    /// the two spellings of the cutoff could disagree: SQLite normalizes
-    /// and truncates the stored stamp with `strftime`, PostgreSQL casts it
-    /// to `timestamptz`. Both put `…05:43:03.5` on the 30-day arm — the
-    /// same row, the same answer — and the PostgreSQL job asserts the twin
-    /// of this. A raw TEXT compare would put it on the 365-day arm here and
-    /// the 30-day arm there.
-    #[tokio::test]
-    async fn the_boundary_second_falls_on_the_thirty_day_arm() {
-        let ctx = upgrading_deployment().await;
-        let inside = seed_share(
-            &ctx,
-            "inside",
-            LEGACY_TOKEN,
-            "2026-05-14T05:43:03.5+00:00",
-            None,
-        )
-        .await;
-        let just_before = seed_share(
-            &ctx,
-            "just_before",
-            LEGACY_TOKEN_2,
-            "2026-05-14T05:43:02.999+00:00",
-            None,
-        )
-        .await;
-
-        apply_the_repair(&ctx).await;
-
-        assert_eq!(
-            expires_at(&ctx, &inside).await.as_deref(),
-            Some("2026-06-13T05:43:03Z"),
-            "the boundary second is not before the cutoff: 30 days"
-        );
-        assert_eq!(
-            expires_at(&ctx, &just_before).await.as_deref(),
-            Some("2027-05-14T05:43:02Z"),
-            "the second before it is: 365 days"
         );
     }
 

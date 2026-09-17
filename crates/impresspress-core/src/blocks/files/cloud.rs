@@ -50,19 +50,34 @@ pub const DEFAULT_MAX_SHARE_EXPIRY_HOURS: i64 = 24 * 365;
 /// 0.4.44), so a value this handler cannot honour falls back to the default
 /// the `ConfigVar` declares rather than being obeyed.
 async fn max_share_expiry_hours(ctx: &dyn Context) -> i64 {
-    let raw = wafer_core::clients::config::get_default(
-        ctx,
-        MAX_SHARE_EXPIRY_HOURS_KEY,
-        &DEFAULT_MAX_SHARE_EXPIRY_HOURS.to_string(),
-    )
-    .await;
+    // `get`, not `get_default`: the two ways of not having a value are not
+    // the same event. An unset key is the declared default, silently and by
+    // design. A lookup that FAILED means a deployment that lowered this
+    // ceiling is handing out the longer default while the config store is
+    // unreachable, and the operator has to be able to see that in the log.
+    let raw = match wafer_core::clients::config::get(ctx, MAX_SHARE_EXPIRY_HOURS_KEY).await {
+        Ok(value) => value,
+        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
+            return DEFAULT_MAX_SHARE_EXPIRY_HOURS
+        }
+        Err(e) => {
+            tracing::warn!(
+                key = MAX_SHARE_EXPIRY_HOURS_KEY,
+                error = %e,
+                default = DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+                "share-expiry ceiling unreadable; granting the declared default"
+            );
+            return DEFAULT_MAX_SHARE_EXPIRY_HOURS;
+        }
+    };
     match raw.trim().parse::<i64>() {
         Ok(hours) if hours > 0 && chrono::Duration::try_hours(hours).is_some() => hours,
         _ => {
             tracing::warn!(
                 key = MAX_SHARE_EXPIRY_HOURS_KEY,
                 value = %raw,
-                "unusable share-expiry ceiling; using the declared default"
+                default = DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+                "unusable share-expiry ceiling; granting the declared default"
             );
             DEFAULT_MAX_SHARE_EXPIRY_HOURS
         }
