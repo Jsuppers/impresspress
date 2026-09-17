@@ -160,15 +160,28 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/models", Route::ListModels)
         .summary("List available models (aggregated across backends)")
         .output(response_schema_of::<contracts::ModelListResponse>),
-    // Config
+    // Config.
+    //
+    // The read is `Authenticated`: it answers the two deployment-wide
+    // defaults (`IMPRESSPRESS__LLM__DEFAULT_PROVIDER` /
+    // `..._DEFAULT_MODEL`), which every caller of the `Authenticated`
+    // `/b/llm/api/chat` is already chatting against — no per-user row, no
+    // credential.
+    //
+    // The two writes are `Admin`. A thread override is keyed by `thread_id`
+    // alone and neither handler takes an identity, so at `Authenticated`
+    // any logged-in caller could pin ANY thread to any configured backend —
+    // or delete any override — including threads they cannot read. The only
+    // caller is the admin settings page (`pages::settings_page`, itself
+    // `Admin`), which renders the form and one `hx-delete` per row.
     EndpointRoute::authenticated(HttpMethod::Get, "/b/llm/api/config", Route::GetConfig)
         .summary("Get default provider/model config")
         .output(response_schema_of::<contracts::LlmConfigResponse>),
-    EndpointRoute::authenticated(HttpMethod::Post, "/b/llm/api/config", Route::PostConfig)
+    EndpointRoute::admin(HttpMethod::Post, "/b/llm/api/config", Route::PostConfig)
         .summary("Update per-thread provider/model override")
         .input(request_schema_of::<contracts::ConfigUpdateRequest>)
         .output(response_schema_of::<contracts::ConfigUpdateResponse>),
-    EndpointRoute::authenticated(
+    EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/llm/api/config/{id}",
         Route::DeleteConfig,
@@ -724,8 +737,9 @@ impl Block for LlmBlock {
         }
 
         // Auth is enforced centrally by `route_to_block` from the declared
-        // endpoint `AuthLevel` (chat/config/models-list → Authenticated; UI
-        // pages, provider CRUD, model load/unload → Admin). The block holds
+        // endpoint `AuthLevel` (chat, the config READ and models-list →
+        // Authenticated; UI pages, provider CRUD, model load/unload and the
+        // two config WRITES → Admin). The block holds
         // no `user_id`/`is_admin` preamble and the provider/model handlers no
         // longer re-check `is_admin`. `{id}`/`{backend_id}`/`{model_id}` are
         // bound into `req.param.*` for the handlers' `msg.var` readers.
@@ -1137,6 +1151,120 @@ mod config_tests {
         assert_eq!(
             out,
             serde_json::json!({ "default_provider": "openai-main", "default_model": "gpt-4o" })
+        );
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_support::{admin_msg, auth_msg, output_http_status, output_json, TestContext};
+
+    /// A context that routes `/b/llm/*` to the real block.
+    async fn ctx() -> TestContext {
+        let mut ctx = TestContext::with_llm().await;
+        ctx.register_block(
+            "impresspress/llm",
+            Arc::new(LlmBlock::new(Arc::new(provider_admin::NoopProviderAdmin))),
+        );
+        ctx
+    }
+
+    fn override_body(thread_id: &str) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "thread_id": thread_id,
+                "provider_block": "attacker-proxy",
+                "model": "gpt-4o",
+            }))
+            .expect("serialize body"),
+        )
+    }
+
+    /// A thread override is keyed by `thread_id` alone and the handler takes
+    /// no identity, so `Authenticated` meant any logged-in caller could pin
+    /// any thread — one they cannot even read — to any configured backend.
+    /// The write is admin-only, enforced by the router.
+    ///
+    /// Driven through `dispatch` (i.e. `routing::route_to_block`), so the
+    /// access gate is the one production runs.
+    #[tokio::test]
+    async fn a_non_admin_cannot_pin_a_thread_to_a_backend() {
+        let ctx = ctx().await;
+
+        assert_eq!(
+            output_http_status(
+                ctx.dispatch_with_input(
+                    auth_msg("create", "/b/llm/api/config", "u-not-admin"),
+                    override_body("someone-elses-thread"),
+                )
+                .await
+            )
+            .await,
+            403,
+        );
+        assert!(
+            repo::settings::list_all(&ctx)
+                .await
+                .expect("list overrides")
+                .is_empty(),
+            "the refused request must not have written an override"
+        );
+    }
+
+    /// The delete is the same decision from the other side: without it, any
+    /// logged-in caller could drop the admin's override for any thread.
+    #[tokio::test]
+    async fn a_non_admin_cannot_delete_an_override() {
+        let ctx = ctx().await;
+
+        let created = output_json(
+            ctx.dispatch_with_input(
+                admin_msg("create", "/b/llm/api/config"),
+                override_body("t1"),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("row id").to_string();
+
+        assert_eq!(
+            output_http_status(
+                ctx.dispatch(auth_msg(
+                    "delete",
+                    &format!("/b/llm/api/config/{id}"),
+                    "u-not-admin",
+                ))
+                .await
+            )
+            .await,
+            403,
+        );
+        assert_eq!(
+            repo::settings::list_all(&ctx)
+                .await
+                .expect("list overrides")
+                .len(),
+            1,
+            "the refused delete must have left the override in place"
+        );
+    }
+
+    /// The read stays `Authenticated`: it publishes the two deployment-wide
+    /// defaults, which every caller of the equally-`Authenticated`
+    /// `/b/llm/api/chat` is already chatting against.
+    #[tokio::test]
+    async fn the_config_read_is_still_open_to_any_logged_in_caller() {
+        let ctx = ctx().await;
+        assert_eq!(
+            output_http_status(
+                ctx.dispatch(auth_msg("retrieve", "/b/llm/api/config", "u-not-admin"))
+                    .await
+            )
+            .await,
+            200,
         );
     }
 }

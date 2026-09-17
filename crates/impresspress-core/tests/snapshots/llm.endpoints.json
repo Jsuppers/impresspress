@@ -1,5 +1,5 @@
 [
-  "DELETE /b/llm/api/config/{id} authenticated",
+  "DELETE /b/llm/api/config/{id} admin",
   "DELETE /b/llm/api/providers/{id} admin",
   "GET /b/llm/ admin",
   "GET /b/llm/api/config authenticated",
@@ -13,7 +13,7 @@
   "PATCH /b/llm/api/providers/{id} admin",
   "POST /b/llm/api/chat authenticated",
   "POST /b/llm/api/chat/stream authenticated",
-  "POST /b/llm/api/config authenticated",
+  "POST /b/llm/api/config admin",
   "POST /b/llm/api/models/{backend_id}/{model_id}/load admin",
   "POST /b/llm/api/models/{backend_id}/{model_id}/unload admin",
   "POST /b/llm/api/providers admin",
