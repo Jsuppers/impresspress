@@ -190,11 +190,20 @@ pub struct Reservation {
 /// `(bucket, key)` is UNIQUE, so a re-upload cannot get a second row: when the
 /// key already holds an object the reservation TAKES OVER that row, flipping
 /// it to [`ObjectStatus::Pending`] with the new size, content type and
-/// uploader. Inserting instead is what used to answer 500 for every re-upload
-/// of an existing key. Until the upload settles, the row charges the new
+/// uploader. Inserting instead is what used to answer 500 for a re-upload of
+/// an existing key. Until the upload settles, the row charges the new
 /// (possibly larger) size against the new uploader — the conservative
 /// direction — and [`release_reservation`] puts the old values back if the
 /// upload fails.
+///
+/// The read and the write are two steps, not one, so this fixes the
+/// SEQUENTIAL case — a key that already held an object when the request
+/// arrived, which is every ordinary re-upload. Two requests uploading the same
+/// **new** key concurrently can still both find nothing and both insert; the
+/// unique index refuses the loser, and that request still answers 500. Closing
+/// that needs an upsert the `DatabaseService` wire protocol does not offer for
+/// a composite key, and it is a race between two writes to one key rather than
+/// the reproducible failure this function is about.
 pub async fn reserve_upload(
     ctx: &dyn Context,
     bucket: &str,

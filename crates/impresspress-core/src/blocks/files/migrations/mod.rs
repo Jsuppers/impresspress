@@ -4,12 +4,39 @@
 const SQL_001_SQLITE: &str = include_str!("001_initial_schema.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_001_POSTGRES: &str = include_str!("001_initial_schema.postgres.sql");
-// 002 makes `buckets.name` unique. The name is the blob-namespace folder name
-// in `wafer-run/storage`, so two rows for one name are two owners of one
-// folder; the index is what makes the metadata insert the atomic claim
-// `storage::buckets::handle_create_bucket` answers 409 on. The file's own
-// header carries the rest, including why pre-existing duplicates are resolved
-// in favour of the earliest creator.
+// 002 makes `buckets.name` unique.
+//
+// A bucket name is not a label: it IS the blob-namespace folder name in
+// `wafer-run/storage` (`store::create_folder(name)`, `store::put(name, key)`),
+// and `repo::buckets::find_owned` grants access on the `(name, created_by)`
+// pair. Without the index a second user could insert a row for a name someone
+// else already held — `StorageService::create_folder` is idempotent on every
+// backend, so nothing refused the duplicate — and that row gave them
+// `find_owned` access to the first owner's folder: list it, read every object
+// in it, overwrite them, and on `DELETE /b/storage/api/buckets/{name}` wipe
+// the folder outright.
+//
+// With the index the metadata row is the atomic claim on the name, which is
+// why `storage::buckets::handle_create_bucket` inserts the row BEFORE it
+// creates the folder and answers 409 when the insert is refused. Creating the
+// folder first cannot be made safe: the idempotent `create_folder` succeeds
+// against the existing folder, and the compensating `delete_folder` that would
+// run when the metadata insert fails would then delete the first owner's data.
+//
+// Rows that already collide are resolved in favour of the earliest creator
+// (`created_at`, `id` as the tie-break so the result does not depend on row
+// order): the later duplicates are deleted, which is exactly the access they
+// should never have had. Their object-metadata rows are left alone — the blobs
+// they name are real, still in the folder, and still charged to whoever
+// uploaded them; only the second claim on the folder goes away. `RELEASE.md`
+// carries the operator-facing version, including that this costs the losing
+// user access to files they are still charged for.
+//
+// This reasoning lives here rather than in the .sql files because a shipped
+// migration is hash-addressed over its whole text, comments included: a rename
+// of any Rust item named above would make a comment in the .sql file false and
+// uncorrectable without a re-bless. See `crate::migration_helper`'s "A shipped
+// .sql file is immutable, comments included".
 const SQL_002_SQLITE: &str = include_str!("002_bucket_name_unique.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_002_POSTGRES: &str = include_str!("002_bucket_name_unique.postgres.sql");

@@ -108,6 +108,12 @@ pub async fn check_quota(
 /// 1 hour is a comfortable cutoff: the largest realistic upload finishes
 /// inside that window, and anything still pending afterward is almost
 /// certainly an orphan.
+///
+/// It reclaims the ROW, not the blob. A swept row whose upload had in fact
+/// reached storage leaves that object behind, unreferenced and charged to
+/// nobody — see `NICE_TO_HAVE.md`, "The files-block pending sweep does not
+/// reclaim the blob". An uploader who retries never gets there: the retry
+/// re-claims the same row and completes it.
 pub async fn sweep_stale_pending(ctx: &dyn Context, user_id: &str, older_than_seconds: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(older_than_seconds)).to_rfc3339();
     if let Err(e) = repo::objects::delete_stale_pending(ctx, user_id, &cutoff).await {

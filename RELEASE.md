@@ -151,19 +151,39 @@ never have had; the folder and its objects stay with the one remaining owner,
 and the object-metadata rows of whoever else uploaded into it are left alone —
 those blobs are real and still charged to whoever uploaded them.
 
+**Review your collisions before upgrading.** That last sentence has a
+user-visible edge: an object the losing user uploaded stays in the winner's
+bucket, so they lose access to their own file while their quota keeps being
+charged for its bytes. In the case this fixes — a takeover — that is the
+correct outcome. If a collision turns out to be two people who each meant to
+have their own bucket, sort it out *before* you run the migration: have the
+later user download what they need, or rename their bucket (create a new one
+and re-upload), because afterwards only the winner can reach the folder.
+
 **Upgrade with `--run-migrations`.** Without it the index is not created, and
 the code half alone does not close the hole: the refusal comes from the
 database, so a duplicate name is admitted exactly as before. The only signal is
 the generic `schema drift; redeploy with --run-migrations to apply` warning each
 boot logs for the files block.
 
-**If you want to see what will be deleted first**, list the collisions from the
-admin SQL explorer before upgrading:
+**To see what will be deleted**, list the collisions from the admin SQL
+explorer before upgrading. This runs on every backend — the per-owner rows come
+back one per line rather than through a backend-specific aggregate
+(SQLite/D1 has `GROUP_CONCAT`, Postgres has `string_agg`, and neither has the
+other):
 
 ```sql
-SELECT name, COUNT(*) AS rows, GROUP_CONCAT(created_by) AS owners
-FROM impresspress__files__buckets GROUP BY name HAVING COUNT(*) > 1;
+SELECT b.name, b.created_by, b.created_at, b.id
+FROM impresspress__files__buckets AS b
+WHERE EXISTS (
+    SELECT 1 FROM impresspress__files__buckets AS other
+    WHERE other.name = b.name AND other.id <> b.id
+)
+ORDER BY b.name, b.created_at, b.id;
 ```
+
+The first row of each `name` group is the one that survives; the rest are what
+the migration deletes.
 
 ### Files: uploaded objects download instead of rendering
 

@@ -20,6 +20,8 @@ Low-priority improvements identified during code review. None are blocking, but 
 
 ## Operations
 
+- **The files-block pending sweep does not reclaim the blob** — `quota::sweep_stale_pending` deletes object rows left `pending` for over an hour, but only the row. Every source of such a row now leaves a blob behind: an upload whose `mark_complete` failed answers an error with the bytes already stored, and a `release_reservation` that also failed leaves the row and (if the `put` had succeeded) the object. If the uploader retries, the reservation is re-claimed and nothing is orphaned; if they never do, the sweep removes the row and the blob stays in storage forever — unreferenced, unlisted by the SSR pages, and charged to nobody. Reclaiming it means the sweep deleting `(bucket, key)` from storage as well, which is a storage call on a best-effort path that runs on every upload, so it wants its own design rather than a line in the existing helper.
+
 - **Load/performance testing setup** — No load testing exists. A basic k6 or Artillery script targeting auth, storage, and admin endpoints would establish baseline throughput numbers and catch regressions.
 
 ## Scalability
