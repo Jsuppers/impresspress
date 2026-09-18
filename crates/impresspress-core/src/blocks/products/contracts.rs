@@ -793,9 +793,12 @@ impl OrderStatus {
     /// it filters and groups the orders table by the stored `status`
     /// spelling, so it has to name the whole set in a query. Keeping the list
     /// here — beside the enum — is what stops a second, drifting copy of it
-    /// growing inside `repo::purchases`. `status_enum_tests` holds an
-    /// exhaustive match that stops compiling when a variant is added and not
-    /// listed here.
+    /// growing inside `repo::purchases`.
+    ///
+    /// `status_enum_tests::order_status_all_lists_every_variant` keeps the
+    /// list honest: its `slot` match is exhaustive, so a seventh variant
+    /// stops that test compiling, and its assertion then checks the variant
+    /// reached this array too.
     pub const ALL: [Self; 6] = [
         Self::Pending,
         Self::CheckoutStarted,

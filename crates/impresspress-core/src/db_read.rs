@@ -245,14 +245,23 @@ pub async fn list_capped_sorted(
 /// One keyset page: up to `KEYSET_PAGE` rows matching `filters` whose `id`
 /// sorts after `after_id`, in ascending `id` order.
 ///
-/// Keyset, not `OFFSET`: every table this crate reads has `id` as its primary
-/// key, so `id > after_id ORDER BY id` walks the table exactly once. An
-/// `OFFSET` walk over the same data would re-skip the rows it already read on
-/// every page, and would silently repeat or drop rows when a concurrent
-/// insert or delete shifts the offsets under it.
+/// Keyset, not `OFFSET`: `id > after_id ORDER BY id` walks the table exactly
+/// once. An `OFFSET` walk over the same data would re-skip the rows it
+/// already read on every page, and would silently repeat or drop rows when a
+/// concurrent insert or delete shifts the offsets under it.
+///
+/// **Precondition:** `collection` must give every row a distinct, non-empty
+/// `id`. That is not true of every table this crate reads — `auth.sessions`
+/// is keyed on `family`, `signal.rooms` on `code`, and
+/// `personal_access_tokens`, `oauth_pkce_states` and `jwt_blocklist` carry a
+/// *nullable* `id` added by a later migration — so it is a condition on the
+/// caller, not a property of the schema. A row whose `id` is empty cannot be
+/// a cursor, and walking past it would silently drop every row after it;
+/// [`walk_needs_an_id`] makes that an error instead.
 ///
 /// `columns` narrows the projection when the caller only needs a few fields;
-/// `None` reads the whole row.
+/// `None` reads the whole row. Whatever `columns` says, `id` is always
+/// requested: it is the cursor.
 pub async fn page_after(
     ctx: &dyn Context,
     collection: &str,
@@ -268,6 +277,12 @@ pub async fn page_after(
             value: serde_json::Value::String(after.to_string()),
         });
     }
+    let columns = columns.map(|mut named| {
+        if !named.iter().any(|column| column == "id") {
+            named.push("id".to_string());
+        }
+        named
+    });
     let result = db::list(
         ctx,
         collection,
@@ -284,17 +299,45 @@ pub async fn page_after(
         },
     )
     .await?;
+    for record in &result.records {
+        if record.id.is_empty() {
+            return Err(walk_needs_an_id(collection));
+        }
+    }
     Ok(result.records)
 }
 
+/// A keyset walk over a table that does not give every row an `id`.
+///
+/// Loud rather than latent: the cursor is the `id`, so a blank one either
+/// stops the walk early or repeats a page forever. Either way the caller —
+/// a fraud control, a rename cascade, an export restored over live tables —
+/// would act on the wrong set, which is the exact failure this module exists
+/// to stop.
+fn walk_needs_an_id(collection: &str) -> WaferError {
+    WaferError::new(
+        ErrorCode::Internal,
+        format!(
+            "keyset walk of {collection} met a row with no id; this read pages on \
+             `id`, so the table must give every row a distinct non-empty one"
+        ),
+    )
+}
+
 /// EVERY row matching `filters`, in ascending `id` order, however many there
-/// are — [`page_after`] driven to exhaustion.
+/// are — [`page_after`] driven to exhaustion, and subject to its `id`
+/// precondition.
 ///
 /// The read is unbounded by design, so it belongs only where "all of them" is
 /// the actual requirement: a compensating write over every row a suspended
 /// seller owns, a cascade that must touch every grant of a renamed role, an
 /// export that has to round-trip the whole table. A display list wants
 /// [`list_capped`]; a total wants an aggregate.
+///
+/// It holds every matching row in memory, and the caller pays one round-trip
+/// per `KEYSET_PAGE` rows. On a memory- or subrequest-limited runtime that is
+/// a real ceiling — it is the price of being exact, and it is the reason this
+/// is the narrowest of the three shapes here.
 pub async fn list_every(
     ctx: &dyn Context,
     collection: &str,
