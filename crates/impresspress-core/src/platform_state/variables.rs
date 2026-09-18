@@ -385,8 +385,15 @@ pub async fn seed_if_absent(
 /// On an existing row this writes `value` and, when the caller says the value
 /// is sensitive and the stored flag is clear, raises `sensitive` — never
 /// lowers it. `Some(false)` and `None` therefore do the same thing there:
-/// nothing may lower a stored flag, so "plain" and "no opinion" are the same
-/// instruction. `name` and `description` describe the variable rather than the
+/// nothing reaching THIS function can lower a stored flag, so "plain" and "no
+/// opinion" are the same instruction on an update. That is a property of this
+/// path, not of the system — `PATCH /b/admin/api/settings/{key}` carrying
+/// `{"sensitive": false}` DOES clear the flag, through
+/// `admin::settings::handle_set` → `ops::update_variable` →
+/// [`VariablePatch::sensitive`], and
+/// [`crate::config_vars::is_sensitive_by_default_when_created`] relies on that
+/// being possible, since unflagging in the admin UI is how an operator makes an
+/// ad hoc row exportable. `name` and `description` describe the variable rather than the
 /// deployment, so an operator's wording survives; `sensitive` is different in
 /// kind, because it is the only thing that carries an AD HOC row's
 /// sensitivity — one the build declares no `ConfigVar` for, so
@@ -3159,7 +3166,11 @@ mod boot_tests {
 
         for (stored, exported, expected) in [("Same", "Same", 0), ("Stored", "Exported", 1)] {
             let db = migrated_db().await;
-            set_by_admin(&db, key, stored, Some(false), "admin_1")
+            // `None`: there is no row on a fresh database, and `CONFIG_SET`
+            // passes the row it read, so an admin edit that CREATES has
+            // nothing to say about the flag. Every other admin-surface
+            // fixture here stages the row first and so passes `Some(false)`.
+            set_by_admin(&db, key, stored, None, "admin_1")
                 .await
                 .expect("admin edit");
 
