@@ -19,6 +19,13 @@ impl QuotaConfig {
     /// guards against drift on the in-code side.
     pub const DEFAULT_MAX_STORAGE_BYTES: i64 = 1_073_741_824;
     /// Default single-file size cap: 100 MiB.
+    ///
+    /// This is the stored policy, not what an upload can reach: the transport
+    /// refuses a request body over
+    /// [`crate::streaming::MAX_REQUEST_BODY_BYTES`] before this block sees it,
+    /// so every read of the quota clamps to that ceiling
+    /// ([`super::quota::clamp_to_transport`]). Raise the ceiling and this
+    /// default becomes reachable without changing here or the migration.
     pub const DEFAULT_MAX_FILE_SIZE_BYTES: i64 = 104_857_600;
     /// Default per-bucket file-count cap.
     pub const DEFAULT_MAX_FILES_PER_BUCKET: i64 = 10_000;

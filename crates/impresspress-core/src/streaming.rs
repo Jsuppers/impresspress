@@ -16,6 +16,11 @@
 //!   …) is not one of the streaming families but which must still stream to
 //!   avoid buffering the whole object in the isolate.
 //!
+//! The transport byte caps live here too — response ([`MAX_BUFFERED_RESPONSE_BYTES`]),
+//! request ([`MAX_REQUEST_BODY_BYTES`]) and upstream fetch
+//! ([`MAX_NETWORK_RESPONSE_BYTES`]) — one declaration each, so an adapter and
+//! a block cannot enforce different numbers for the same limit.
+//!
 //! The buffered fallback ([`collect_capped_with_prelude`]) enforces a byte cap
 //! so a response that must be buffered (small SSR pages, JSON) cannot balloon
 //! the isolate — an over-limit body is reported as [`CappedCollect::OverLimit`]
@@ -87,6 +92,43 @@ pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 /// service construction; neither wasm adapter's unit-shaped service has config
 /// plumbing to read it from, and this is a security floor rather than a knob.
 pub const MAX_NETWORK_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Maximum **request** body the transport buffers before dispatch, in bytes.
+/// A larger body is refused with HTTP 413 and never reaches a block.
+///
+/// No transport streams request bodies: every one of the three reads the body
+/// whole before building the `(Message, InputStream)` pair. Both wasm adapters
+/// buffer it here — `impresspress-cloudflare`'s `worker_request_to_message`
+/// and `impresspress-browser`'s `request_to_message`, which is why this is a
+/// single constant rather than a literal in each — and the native listener
+/// buffers it in `wafer-block-http-listener` under its `max_body_bytes`
+/// config, whose default is this same 10 MiB — and
+/// `impresspress_native::serve::register_http_listener` configures that block
+/// with `flow` + `listen` only, so the default is what it runs. An
+/// `InputStream` carrying the request body therefore always holds bytes that
+/// are already in memory, whatever a consumer does with it.
+///
+/// It is the hard ceiling on an upload, so anything a block advertises as a
+/// per-request size limit has to be clamped to it — see
+/// [`crate::blocks::files::quota::get_user_quota`], where the files block's
+/// admin-editable per-file cap is.
+///
+/// Raising it is not a matter of changing the number: the body is held in the
+/// isolate whole (128 MB on a Cloudflare Worker, one shared linear memory in
+/// the Service Worker), and a multipart upload holds the envelope and the
+/// extracted file at once. A genuinely larger upload needs a streamed request
+/// body, which `wafer_run::InputStream` cannot carry on wasm today — its
+/// `from_stream` requires `Send` and every JS-backed byte stream
+/// (`worker::ByteStream`, `wasm_streams`) is `!Send`.
+pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// The plain-text body both wasm adapters return with their 413 when a request
+/// body exceeds [`MAX_REQUEST_BODY_BYTES`]. Shared so the two cannot describe
+/// the same refusal differently, and so the number a client is told is the
+/// number that was enforced.
+pub fn request_too_large_message() -> String {
+    format!("request body too large (limit {MAX_REQUEST_BODY_BYTES} bytes)")
+}
 
 /// True for content-types that should stream body chunks to the client as
 /// they're produced rather than buffer the entire response. Today: SSE and

@@ -28,6 +28,17 @@ use web_sys::{Headers, ResponseInit};
 // Request conversion
 // ---------------------------------------------------------------------------
 
+/// What converting a browser request produced: a message to dispatch, or the
+/// one refusal the conversion itself can decide.
+pub enum RequestConversion {
+    /// The request converted; dispatch it.
+    Ready(Message, InputStream),
+    /// The body is larger than [`streaming::MAX_REQUEST_BODY_BYTES`]. The
+    /// caller answers 413 ([`request_too_large_response`]) without
+    /// dispatching.
+    TooLarge,
+}
+
 /// Convert a browser `web_sys::Request` into a WAFER `(Message, InputStream)` pair.
 ///
 /// The protocol mapping (kind, `http.*` / `req.*` meta, method→action, header
@@ -35,9 +46,11 @@ use web_sys::{Headers, ResponseInit};
 /// the `web_sys` body/header reads and the Service-Worker cookie re-injection
 /// are browser-specific. The remote address is always `"127.0.0.1"` — in a
 /// Service Worker the request comes from the same device.
-pub async fn request_to_message(
-    request: &web_sys::Request,
-) -> Result<(Message, InputStream), JsValue> {
+///
+/// An oversized body is [`RequestConversion::TooLarge`], not an `Err`: a
+/// `JsValue` error out of here becomes the Service Worker's own failure, and
+/// the client sees a fetch that died rather than a status it can act on.
+pub async fn request_to_message(request: &web_sys::Request) -> Result<RequestConversion, JsValue> {
     let method = request.method();
     let url_str = request.url();
 
@@ -52,15 +65,14 @@ pub async fn request_to_message(
         search
     };
 
-    // Read body bytes via ArrayBuffer.
-    const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10MB
+    // Read body bytes via ArrayBuffer, under the shared transport cap.
     let body: Vec<u8> = {
         let promise = request.array_buffer()?;
         let ab_val = JsFuture::from(promise).await?;
         let ab: ArrayBuffer = ab_val.dyn_into()?;
         let arr = Uint8Array::new(&ab);
-        if arr.length() as usize > MAX_BODY_SIZE {
-            return Err(JsValue::from_str("Request body too large"));
+        if arr.length() as usize > streaming::MAX_REQUEST_BODY_BYTES {
+            return Ok(RequestConversion::TooLarge);
         }
         arr.to_vec()
     };
@@ -164,8 +176,8 @@ pub async fn request_to_message(
     }
 
     // `build_http_message` builds `kind`, `http.*` and normalized `req.*` meta
-    // from the method+path. The browser serves paths as-received (no `/api`
-    // prefix to strip, unlike the Cloudflare adapter), so no post-fixup.
+    // from the method+path. Paths are served as received; `/api` normalization
+    // is the request pipeline's, for every transport alike.
     let msg = http_codec::build_http_message(
         &method,
         &path,
@@ -174,7 +186,21 @@ pub async fn request_to_message(
         header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
     );
 
-    Ok((msg, InputStream::from_bytes(body)))
+    Ok(RequestConversion::Ready(msg, InputStream::from_bytes(body)))
+}
+
+/// The 413 answer to [`RequestConversion::TooLarge`], carrying the enforced
+/// limit ([`streaming::request_too_large_message`]) so a client is told the
+/// number it has to fit. Identical in status, headers and text to the
+/// Cloudflare adapter's.
+pub fn request_too_large_response() -> Result<web_sys::Response, JsValue> {
+    let headers = Headers::new()?;
+    headers.set("Content-Type", "text/plain; charset=utf-8")?;
+    make_response(
+        streaming::request_too_large_message().into_bytes(),
+        413,
+        headers,
+    )
 }
 
 /// The worker's own `origin` and `host`, as its global `location` reports them.

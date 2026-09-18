@@ -3,7 +3,7 @@
 use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::repo;
+use super::{models::QuotaConfig, quota, repo};
 use crate::{
     ui::{self, components, icons, shell::Crumb},
     util::format_bytes,
@@ -433,6 +433,11 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// for the table's narrow column, and the three caps it renders. It holds no
 /// decoding — the caps come off the row's `QuotaConfig`, which is where the
 /// per-field fallback to the block defaults happens.
+///
+/// The row is run through [`quota::clamp_to_transport`] on the way in, so the
+/// per-file cap this table shows is the one an upload is actually refused on
+/// — a stored 100 MiB that the transport's request-body ceiling caps at 10 MiB
+/// is shown as 10 MiB, not as a limit nobody can use.
 #[derive(Clone, Debug)]
 pub struct AdminQuotaRow {
     pub user_short: String,
@@ -443,11 +448,12 @@ pub struct AdminQuotaRow {
 
 impl From<&repo::quota::QuotaRow> for AdminQuotaRow {
     fn from(row: &repo::quota::QuotaRow) -> Self {
+        let config = quota::clamp_to_transport(row.config.clone());
         Self {
             user_short: short_id(&row.user_id),
-            max_storage_bytes: row.config.max_storage_bytes,
-            max_file_size_bytes: row.config.max_file_size_bytes,
-            max_files_per_bucket: row.config.max_files_per_bucket,
+            max_storage_bytes: config.max_storage_bytes,
+            max_file_size_bytes: config.max_file_size_bytes,
+            max_files_per_bucket: config.max_files_per_bucket,
         }
     }
 }
@@ -457,9 +463,17 @@ impl From<&repo::quota::QuotaRow> for AdminQuotaRow {
 /// first 8 chars in the loader. Pure helper.
 pub fn render_admin_quotas_table(rows: &[AdminQuotaRow]) -> Markup {
     if rows.is_empty() {
+        // Rendered from the defaults rather than written out, and through the
+        // same transport clamp the table rows take: a hand-typed "100 MB file
+        // size" is how this line came to advertise a per-file cap no upload
+        // could reach.
+        let defaults = quota::clamp_to_transport(QuotaConfig::default());
+        let storage = format_bytes(defaults.max_storage_bytes);
+        let file_size = format_bytes(defaults.max_file_size_bytes);
+        let files = defaults.max_files_per_bucket;
         return html! {
             div .empty-state {
-                p { "No custom quotas. Default: 1 GB storage, 100 MB file size, 10,000 files per bucket." }
+                p { "No custom quotas. Default: " (storage) " storage, " (file_size) " file size, " (files) " files per bucket." }
             }
         };
     }
@@ -741,7 +755,8 @@ mod tests {
 
     /// The admin quota projection cuts the user id to 8 and reads the three
     /// caps off the row's `QuotaConfig` — which is where a column that is
-    /// absent falls back to the block default, so the table shows the cap
+    /// absent falls back to the block default — then clamps the per-file cap
+    /// to the transport's request-body ceiling, so the table shows the cap
     /// that is actually enforced.
     #[test]
     fn admin_quota_projection_shapes_only_what_the_table_renders() {
@@ -759,7 +774,11 @@ mod tests {
         let projected = AdminQuotaRow::from(&row);
         assert_eq!(projected.user_short, "alice-12");
         assert_eq!(projected.max_storage_bytes, 5_000_000_000);
-        assert_eq!(projected.max_file_size_bytes, 100_000_000);
+        assert_eq!(
+            projected.max_file_size_bytes,
+            crate::streaming::MAX_REQUEST_BODY_BYTES as i64,
+            "a stored 100 MB per-file cap is shown as the transport ceiling that refuses the upload, not as a limit no request can reach",
+        );
         assert_eq!(
             projected.max_files_per_bucket,
             crate::blocks::files::models::QuotaConfig::DEFAULT_MAX_FILES_PER_BUCKET,
@@ -774,8 +793,22 @@ mod tests {
             html.contains("No custom quotas"),
             "missing empty hint: {html}"
         );
-        // Default values surfaced in the empty state copy.
-        assert!(html.contains("1 GB"), "missing 1 GB default copy: {html}");
+        // Default values surfaced in the empty state copy, rendered from the
+        // defaults themselves.
+        assert!(
+            html.contains(&format_bytes(QuotaConfig::DEFAULT_MAX_STORAGE_BYTES)),
+            "missing the default storage cap: {html}"
+        );
+        assert!(
+            html.contains(&format_bytes(
+                crate::streaming::MAX_REQUEST_BODY_BYTES as i64
+            )),
+            "the per-file copy must name the enforced ceiling, not the stored 100 MB: {html}"
+        );
+        assert!(
+            !html.contains(&format_bytes(QuotaConfig::DEFAULT_MAX_FILE_SIZE_BYTES)),
+            "a cap no upload can reach must not be advertised: {html}"
+        );
     }
 
     #[test]

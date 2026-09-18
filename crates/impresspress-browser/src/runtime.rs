@@ -91,7 +91,9 @@ pub fn restore_wafer(previous: Rc<wafer_run::Wafer>) {
 /// Convert a browser `Request` into a WAFER `Message`, dispatch through
 /// the currently active `Wafer`'s `site-main` flow, and return a browser
 /// `Response`. Returns a 503-shaped `Response` if called before
-/// `store_wafer`. Internal errors return a 500-shaped `Response`.
+/// `store_wafer`, and a 413-shaped one for a request body over
+/// `impresspress_core::streaming::MAX_REQUEST_BODY_BYTES`. Internal errors
+/// return a 500-shaped `Response`.
 ///
 /// The `Rc` is cloned synchronously (before the first `.await`), so a
 /// `replace_wafer` that lands mid-dispatch does not affect this call — it
@@ -103,7 +105,12 @@ pub async fn dispatch_request(request: web_sys::Request) -> Result<web_sys::Resp
             "impresspress-browser: runtime not initialized — call store_wafer() first",
         );
     };
-    let (msg, input) = convert::request_to_message(&request).await?;
+    // A body over the transport cap is answered here, before the runtime sees
+    // it: it is a 413 about the request, not a failed fetch.
+    let (msg, input) = match convert::request_to_message(&request).await? {
+        convert::RequestConversion::Ready(msg, input) => (msg, input),
+        convert::RequestConversion::TooLarge => return convert::request_too_large_response(),
+    };
     let output = wafer.run("site-main", msg, input).await;
     convert::output_to_response(output).await
 }
@@ -165,5 +172,43 @@ mod tests {
     fn replace_before_store_is_an_error() {
         reset();
         assert!(replace_wafer(empty_wafer()).is_err());
+    }
+
+    /// **Fails on the pre-fix tree**, where an over-cap body left
+    /// `request_to_message` as a `JsValue` error: `dispatch_request` returns
+    /// `Err`, the Service Worker's `respondWith` rejects, and the uploader's
+    /// `fetch` fails with no status at all. Now it is a 413 — the same status,
+    /// headers and text the Cloudflare adapter returns for the same body.
+    ///
+    /// The runtime is stored but never reached: the refusal is decided before
+    /// dispatch, which is the point of deciding it here.
+    #[wasm_bindgen_test]
+    async fn a_request_body_over_the_transport_cap_is_413() {
+        reset();
+        store_wafer(empty_wafer()).expect("store");
+
+        let body = js_sys::Uint8Array::new_with_length(
+            (impresspress_core::streaming::MAX_REQUEST_BODY_BYTES + 1) as u32,
+        );
+        let init = web_sys::RequestInit::new();
+        init.set_method("POST");
+        init.set_body(&body);
+        let request = web_sys::Request::new_with_str_and_init(
+            "https://dev.impresspress.org/b/storage/api/buckets/photos/objects?key=big.bin",
+            &init,
+        )
+        .expect("build request");
+
+        let response = dispatch_request(request).await.expect("dispatch");
+
+        assert_eq!(response.status(), 413);
+        let text = wasm_bindgen_futures::JsFuture::from(response.text().expect("text"))
+            .await
+            .expect("read body");
+        assert_eq!(
+            text.as_string(),
+            Some(impresspress_core::streaming::request_too_large_message()),
+            "the client is told the limit it has to fit"
+        );
     }
 }
