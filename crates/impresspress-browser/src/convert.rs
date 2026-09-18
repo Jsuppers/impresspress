@@ -7,7 +7,7 @@
 //! reading the request body/headers, the Service-Worker cookie re-injection,
 //! and building `web_sys::Response` (buffered or `ReadableStream`-backed).
 
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use impresspress_core::streaming::{self, CappedCollect};
 use js_sys::{ArrayBuffer, Uint8Array};
 use wafer_block::{
@@ -370,68 +370,42 @@ fn make_response(
 }
 
 /// Build a JS `ReadableStream` that yields `first_chunk` and then every
-/// subsequent `Chunk` event from `remaining`. Mid-body `Meta` is dropped
-/// (too late to apply to HTTP headers); any terminal closes the stream.
+/// subsequent `Chunk` event from `remaining`.
+///
+/// The framing is [`streaming::download_body_stream`] — the same function the
+/// Cloudflare adapter pipes into its Worker `ReadableStream`, so the two
+/// agree on what a terminal mid-body means: an `Error` becomes an errored
+/// stream, which aborts the response body, and every other terminal ends it.
+/// The status is already committed by then, so an error cannot be downgraded
+/// to a 413/500 — but a reader that gets an abort knows the bytes are
+/// incomplete, which a clean end-of-stream does not tell it. No file download
+/// sets `Content-Length`, so this is the client's only signal.
 fn make_streaming_body(
     first_chunk: Vec<u8>,
-    mut remaining: OutputStream,
+    remaining: OutputStream,
 ) -> wasm_streams::ReadableStream {
-    use futures::channel::mpsc;
-    let (mut tx, rx) = mpsc::channel::<Result<JsValue, JsValue>>(8);
-
-    // Channel cap is 8 and we have one item to send — try_send fits. If it
-    // fails (caller dropped the stream before consuming) we just discard.
-    let _ = tx.try_send(Ok(JsValue::from(Uint8Array::from(first_chunk.as_slice()))));
-
-    wasm_bindgen_futures::spawn_local(async move {
-        while let Some(ev) = remaining.next().await {
-            match ev {
-                StreamEvent::Chunk(bytes) => {
-                    let val: Result<JsValue, JsValue> =
-                        Ok(JsValue::from(Uint8Array::from(bytes.as_slice())));
-                    if tx.send(val).await.is_err() {
-                        // Browser dropped the response stream — stop pumping.
-                        return;
-                    }
-                }
-                // Mid-body Meta is too late to apply to HTTP headers; drop it.
-                StreamEvent::Meta(_) => {}
-                // Any terminal closes the body. Error after partial body has
-                // already streamed bytes can't change the HTTP status — log
-                // and close cleanly so the browser sees a normal end-of-body.
-                StreamEvent::Error(err) => {
-                    web_sys::console::warn_1(
-                        &format!(
-                            "impresspress-browser: streaming response aborted: {}",
-                            err.message
-                        )
-                        .into(),
-                    );
-                    return;
-                }
-                StreamEvent::Complete { .. }
-                | StreamEvent::Drop
-                | StreamEvent::Continue(_)
-                | StreamEvent::Halt { .. } => {
-                    // Mid-body Halt cannot change the HTTP status (headers
-                    // already flushed); treat it as another terminal that
-                    // closes the body cleanly. The browser sees a normal
-                    // end-of-stream.
-                    return;
-                }
-            }
-        }
+    let body = streaming::download_body_stream(first_chunk, remaining).map(|chunk| {
+        chunk
+            .map(|bytes| JsValue::from(Uint8Array::from(bytes.as_slice())))
+            .map_err(|err| {
+                JsValue::from_str(&format!(
+                    "impresspress-browser: streaming response aborted: {}",
+                    err.message
+                ))
+            })
     });
 
-    wasm_streams::ReadableStream::from_stream(rx)
+    wasm_streams::ReadableStream::from_stream(body)
 }
 
 /// Convert a WAFER `OutputStream` into a browser `web_sys::Response`.
 ///
 /// Two paths, and the choice between them is [`streaming::wants_streaming`] —
 /// the single decision the request pipeline and every other adapter consult,
-/// so the browser can no longer disagree with Cloudflare about whether a given
-/// response streams:
+/// so the browser cannot disagree with Cloudflare about whether a given
+/// response streams. The body framing of the streaming path is shared with it
+/// too ([`streaming::download_body_stream`], via [`make_streaming_body`]), so
+/// neither can they disagree about what a mid-body failure does to the body:
 /// 1. **Streaming** — for blocks that declare streaming intent in leading
 ///    `Meta` events BEFORE the first `Chunk`, either with a streaming
 ///    `resp.content_type` (SSE, `application/octet-stream`) or with the
@@ -775,7 +749,10 @@ mod response_tests {
     use impresspress_core::streaming::{
         MAX_BUFFERED_RESPONSE_BYTES, META_RESP_STREAM, STREAM_MARKER_VALUE,
     };
-    use wafer_block::{meta::META_RESP_CONTENT_TYPE, streams::output::OutputStream, MetaEntry};
+    use wafer_block::{
+        meta::META_RESP_CONTENT_TYPE, streams::output::OutputStream, ErrorCode, MetaEntry,
+        WaferError,
+    };
     use wasm_bindgen::JsValue;
     use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -941,6 +918,68 @@ mod response_tests {
             resp.headers().get("content-type").unwrap().as_deref(),
             Some("text/plain; charset=utf-8")
         );
+    }
+
+    /// **Fails on the pre-fix tree.** A download whose storage read fails
+    /// mid-body used to end the `ReadableStream` cleanly (a `console.warn` and
+    /// `return` from the hand-written pump), so the browser saw a normal
+    /// end-of-body: the partial file landed on disk looking complete. No
+    /// download path sets `Content-Length`, so the reader has no other way to
+    /// tell. Routed through `streaming::download_body_stream` — the framing
+    /// Cloudflare already used — the `Error` terminal errors the stream, and
+    /// reading the body rejects.
+    #[wasm_bindgen_test]
+    async fn a_mid_body_error_aborts_the_body_instead_of_ending_it() {
+        let stream = OutputStream::from_producer(|sink, _cancel| async move {
+            let _ = sink
+                .send_meta(meta(META_RESP_STREAM, STREAM_MARKER_VALUE))
+                .await;
+            let _ = sink
+                .send_meta(meta(META_RESP_CONTENT_TYPE, "application/pdf"))
+                .await;
+            let _ = sink.send_chunk(b"%PDF-1.7 first half".to_vec()).await;
+            let _ = sink
+                .error(WaferError::new(
+                    ErrorCode::Unavailable,
+                    "object read failed",
+                ))
+                .await;
+        });
+
+        let resp = output_to_response(stream).await.expect("build response");
+
+        // The status is already committed by the time the read fails — the
+        // signal is the aborted body, not the status.
+        assert_eq!(resp.status(), 200);
+        let read = JsFuture::from(resp.array_buffer().expect("array_buffer")).await;
+        assert!(
+            read.is_err(),
+            "a truncated download must not read back as a complete body"
+        );
+    }
+
+    /// The same path without a failure still delivers every byte — the abort
+    /// above is the error case, not a stream that drops its tail.
+    #[wasm_bindgen_test]
+    async fn a_streamed_body_delivers_every_chunk() {
+        let stream = OutputStream::from_producer(|sink, _cancel| async move {
+            let _ = sink
+                .send_meta(meta(META_RESP_STREAM, STREAM_MARKER_VALUE))
+                .await;
+            let _ = sink
+                .send_meta(meta(META_RESP_CONTENT_TYPE, "application/pdf"))
+                .await;
+            let _ = sink.send_chunk(b"one ".to_vec()).await;
+            let _ = sink.send_chunk(b"two ".to_vec()).await;
+            let _ = sink.send_chunk(b"three".to_vec()).await;
+            let _ = sink.complete(Vec::new()).await;
+        });
+
+        let resp = output_to_response(stream).await.expect("build response");
+        let text = JsFuture::from(resp.text().expect("text"))
+            .await
+            .expect("read");
+        assert_eq!(text.as_string().as_deref(), Some("one two three"));
     }
 
     /// And a body that fits is unaffected — the cap must not change the
