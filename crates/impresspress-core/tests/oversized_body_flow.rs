@@ -129,10 +129,8 @@ async fn the_413_keeps_the_headers_a_middleware_step_set() {
     let parts = run_flow("test/refuse", Arc::new(RefusingBlock)).await;
 
     assert_eq!(parts.status, 413);
-    assert_eq!(
-        String::from_utf8(parts.body.clone()).unwrap(),
-        impresspress_core::streaming::request_too_large_message(),
-    );
+    // The header first: it is the property this test exists for, so a
+    // regression should report it rather than whatever the body became.
     let header = parts
         .headers
         .iter()
@@ -144,6 +142,11 @@ async fn the_413_keeps_the_headers_a_middleware_step_set() {
         "a response terminal must carry the flow's middleware headers — without \
          this a browser reports a CORS failure instead of the 413: {:?}",
         parts.headers,
+    );
+    assert_eq!(
+        String::from_utf8(parts.body.clone()).unwrap(),
+        impresspress_core::streaming::request_too_large_message(),
+        "and the body is the plain-text limit, not an error envelope",
     );
 }
 

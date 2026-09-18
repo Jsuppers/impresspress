@@ -6,18 +6,20 @@ use crate::{
     streaming::MAX_REQUEST_BODY_BYTES,
 };
 
-/// The user's effective quota: their override row when one exists,
-/// otherwise the block defaults, with the per-file cap clamped to what the
-/// transport can actually deliver ([`clamp_to_transport`]). Only a missing row
-/// means "defaults" — any other lookup failure is returned, because treating
-/// an outage as "no override" would silently lift an admin-lowered cap.
+/// The user's effective quota: their override row when one exists, otherwise
+/// the block defaults. Only a missing row means "defaults" — any other lookup
+/// failure is returned, because treating an outage as "no override" would
+/// silently lift an admin-lowered cap.
+///
+/// Either way the per-file cap is one an upload can reach:
+/// [`repo::quota::QuotaRow::from_record`] clamps a stored row, and the
+/// defaults are clamped here, both through [`clamp_to_transport`].
 pub async fn get_user_quota(ctx: &dyn Context, user_id: &str) -> Result<QuotaConfig, WaferError> {
-    let stored = match repo::quota::find_for_user(ctx, user_id).await {
-        Ok(row) => row.config,
-        Err(e) if e.code == ErrorCode::NotFound => QuotaConfig::default(),
-        Err(e) => return Err(e),
-    };
-    Ok(clamp_to_transport(stored))
+    match repo::quota::find_for_user(ctx, user_id).await {
+        Ok(row) => Ok(row.config),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(clamp_to_transport(QuotaConfig::default())),
+        Err(e) => Err(e),
+    }
 }
 
 /// Lower `max_file_size_bytes` to [`MAX_REQUEST_BODY_BYTES`] when the stored
@@ -29,9 +31,11 @@ pub async fn get_user_quota(ctx: &dyn Context, user_id: &str) -> Result<QuotaCon
 /// no transport streams a request body today. A stored cap above it is
 /// unreachable: the upload is refused with a 413 the block never sees, so the
 /// number the block reports and the number it enforces would describe
-/// different limits. Clamping makes the advertised cap the enforced one —
-/// every caller of this function (the upload's own size check, its error
-/// message, [`check_quota`], the admin quotas table) reports the same value.
+/// different limits. Clamping makes the advertised cap the enforced one, and
+/// it happens where a stored row is decoded
+/// ([`repo::quota::QuotaRow::from_record`]) so that every reader agrees: the
+/// upload's own size check and its error message, [`check_quota`], the quota
+/// endpoint, the admin quotas table, and the row an admin update echoes back.
 ///
 /// Only the per-file cap is clamped. `max_storage_bytes` and the file count
 /// are about accumulated objects, which no single request has to carry.

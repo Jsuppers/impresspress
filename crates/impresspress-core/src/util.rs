@@ -370,6 +370,28 @@ pub fn format_bytes(bytes: i64) -> String {
     }
 }
 
+/// Group a count with thousands separators for visible text: `10_000` →
+/// `"10,000"`, `999` → `"999"`, `-1_234` → `"-1,234"`.
+///
+/// For prose and stat text that states a limit, where an ungrouped `10000`
+/// reads as a different number at a glance. Table cells that render a raw
+/// count are left alone; this is not a general number formatter.
+pub fn format_count(count: i64) -> String {
+    let negative = count < 0;
+    let digits = count.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if negative {
+        out.push('-');
+    }
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Humanize an RFC 3339 timestamp for visible table text: `"2026-07-11 19:13"`
 /// (UTC, minute precision) instead of the raw nanosecond-resolution string
 /// [`now_rfc3339`] produces. Returns the input unchanged when it doesn't
@@ -964,6 +986,17 @@ mod tests {
     fn now_rfc3339_parses() {
         let s = now_rfc3339();
         let _: chrono::DateTime<chrono::Utc> = s.parse().expect("rfc3339 round-trip");
+    }
+
+    #[test]
+    fn format_count_groups_thousands() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(10_000), "10,000");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_count(-1_234), "-1,234");
+        assert_eq!(format_count(i64::MIN), "-9,223,372,036,854,775,808");
     }
 
     #[test]

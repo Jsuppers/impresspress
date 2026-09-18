@@ -434,10 +434,10 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// decoding — the caps come off the row's `QuotaConfig`, which is where the
 /// per-field fallback to the block defaults happens.
 ///
-/// The row is run through [`quota::clamp_to_transport`] on the way in, so the
-/// per-file cap this table shows is the one an upload is actually refused on
-/// — a stored 100 MiB that the transport's request-body ceiling caps at 10 MiB
-/// is shown as 10 MiB, not as a limit nobody can use.
+/// The per-file cap this table shows is the one an upload is actually refused
+/// on: [`repo::quota::QuotaRow::from_record`] has already clamped a stored
+/// 100 MiB to the transport's request-body ceiling, so the table cannot
+/// advertise a limit nobody can use.
 #[derive(Clone, Debug)]
 pub struct AdminQuotaRow {
     pub user_short: String,
@@ -448,12 +448,29 @@ pub struct AdminQuotaRow {
 
 impl From<&repo::quota::QuotaRow> for AdminQuotaRow {
     fn from(row: &repo::quota::QuotaRow) -> Self {
-        let config = quota::clamp_to_transport(row.config.clone());
         Self {
             user_short: short_id(&row.user_id),
-            max_storage_bytes: config.max_storage_bytes,
-            max_file_size_bytes: config.max_file_size_bytes,
-            max_files_per_bucket: config.max_files_per_bucket,
+            max_storage_bytes: row.config.max_storage_bytes,
+            max_file_size_bytes: row.config.max_file_size_bytes,
+            max_files_per_bucket: row.config.max_files_per_bucket,
+        }
+    }
+}
+
+/// The note under the quotas table explaining why a per-file cap an admin
+/// types may come back smaller.
+///
+/// Without it the clamp is a silent edit: an admin sets 100 MB, the API and
+/// the table answer 10 MB, and nothing on the page accounts for the
+/// difference. Rendered whatever the table holds, because the ceiling applies
+/// to the defaults too.
+fn transport_cap_note() -> Markup {
+    let cap = format_bytes(crate::streaming::MAX_REQUEST_BODY_BYTES as i64);
+    html! {
+        p .text-muted .text-sm {
+            "A request body is capped at " (cap) " by the transport, so a "
+            "per-file quota above that is stored as written and enforced — and "
+            "shown — as " (cap) "."
         }
     }
 }
@@ -464,20 +481,22 @@ impl From<&repo::quota::QuotaRow> for AdminQuotaRow {
 pub fn render_admin_quotas_table(rows: &[AdminQuotaRow]) -> Markup {
     if rows.is_empty() {
         // Rendered from the defaults rather than written out, and through the
-        // same transport clamp the table rows take: a hand-typed "100 MB file
-        // size" is how this line came to advertise a per-file cap no upload
-        // could reach.
+        // same transport clamp every stored row takes: a hand-typed "100 MB
+        // file size" is how this line came to advertise a per-file cap no
+        // upload could reach.
         let defaults = quota::clamp_to_transport(QuotaConfig::default());
         let storage = format_bytes(defaults.max_storage_bytes);
         let file_size = format_bytes(defaults.max_file_size_bytes);
-        let files = defaults.max_files_per_bucket;
+        let files = crate::util::format_count(defaults.max_files_per_bucket);
         return html! {
             div .empty-state {
                 p { "No custom quotas. Default: " (storage) " storage, " (file_size) " file size, " (files) " files per bucket." }
+                (transport_cap_note())
             }
         };
     }
     html! {
+        (transport_cap_note())
         table .data-table {
             thead { tr {
                 th { "User" }
@@ -808,6 +827,39 @@ mod tests {
         assert!(
             !html.contains(&format_bytes(QuotaConfig::DEFAULT_MAX_FILE_SIZE_BYTES)),
             "a cap no upload can reach must not be advertised: {html}"
+        );
+        // Rendering the default rather than the old hand-typed prose lost its
+        // thousands separator: "10000 files per bucket" reads as a different
+        // number at a glance.
+        assert!(
+            html.contains("10,000 files per bucket"),
+            "the file-count default is grouped: {html}"
+        );
+        // And the clamp is explained rather than left as two numbers that
+        // merely differ.
+        assert!(
+            html.contains("capped at"),
+            "the transport-cap note must render with the empty state: {html}"
+        );
+    }
+
+    /// The note renders alongside a populated table too — an admin who set a
+    /// 100 MB per-file cap and is shown 10 MB needs the explanation most.
+    #[test]
+    fn render_admin_quotas_table_explains_the_transport_cap_with_rows() {
+        let rows = vec![AdminQuotaRow {
+            user_short: "user_1".into(),
+            max_storage_bytes: 5_000_000_000,
+            max_file_size_bytes: crate::streaming::MAX_REQUEST_BODY_BYTES as i64,
+            max_files_per_bucket: 1000,
+        }];
+        let html = render_admin_quotas_table(&rows).into_string();
+        assert!(
+            html.contains("capped at")
+                && html.contains(&format_bytes(
+                    crate::streaming::MAX_REQUEST_BODY_BYTES as i64
+                )),
+            "the note must name the enforced ceiling: {html}"
         );
     }
 
