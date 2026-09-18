@@ -113,7 +113,11 @@ pub async fn seed_and_load_variables(
         "Has Landing Page",
         "Serve a static landing page (wafer-run/web) at `/` instead of \
          redirecting anonymous visitors to the login page",
-        false,
+        // `Some(false)`, not `None`: this caller knows the key — a declared
+        // boolean naming whether `/` serves a page — so it speaks for it
+        // rather than taking the create default meant for a key nothing
+        // declares.
+        Some(false),
     )
     .await?;
 

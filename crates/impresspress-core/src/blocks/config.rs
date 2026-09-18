@@ -392,7 +392,12 @@ impl VariablesConfigBlock {
         // `_SECRET` nor `_KEY` — land unflagged, after which the settings API
         // served it verbatim and `cache_key::row_is_sensitive` judged it
         // eligible for the edge cache.
-        let sensitive = existing.as_ref().is_some_and(|row| row.sensitive);
+        //
+        // An `Option`, and a missing row is `None` rather than `Some(false)`
+        // by construction: this surface can speak for a row it just read, and
+        // about a key with no row it knows nothing, which is exactly what the
+        // create default is for.
+        let sensitive = existing.as_ref().map(|row| row.sensitive);
         // Through `set_by_admin`, so the row is stamped admin-owned and
         // `seed_and_load` stops letting the process environment overwrite it.
         // This operation has exactly one caller in the tree —
@@ -421,12 +426,13 @@ impl VariablesConfigBlock {
                 format!("config.set could not write {key}: {e}"),
             )));
         }
-        // The generation bump lives in `variables::upsert_by_key`, not here.
-        // `PATCH /b/admin/api/settings/{key}` writes the table through
-        // `ops::update_variable` without ever entering this block, so a bump
-        // placed here would leave a warm snapshot stale for the life of the
-        // process on exactly the path the admin uses — see
-        // `an_admin_write_invalidates_an_already_warm_snapshot`.
+        // The generation bump lives in the `variables` repo, not here: in
+        // `set_with_row` for the write just issued, and in `upsert_by_key` for
+        // the one `PATCH /b/admin/api/settings/{key}` issues through
+        // `ops::update_variable` without ever entering this block. A bump
+        // placed here would cover only this surface and leave a warm snapshot
+        // stale for the life of the process on exactly the path the admin uses
+        // — see `an_admin_write_invalidates_an_already_warm_snapshot`.
         Ok(())
     }
 }
@@ -608,8 +614,10 @@ mod tests {
     /// snapshot is tagged with has to be shared too. While that counter was
     /// `thread_local`, the write bumped only the writing thread: a reader on a
     /// worker whose own counter still equalled the tag served the pre-write
-    /// value for the life of the process, and one whose counter differed
-    /// re-queried the table on every single read.
+    /// value for the life of the process, and — since the tag is whichever
+    /// worker refilled the snapshot last — two workers that disagreed about
+    /// the count discarded and refetched each other's snapshot for as long as
+    /// reads kept alternating between them.
     ///
     /// Every other test here runs under `#[tokio::test]`, which is
     /// current-thread — one thread both writes and reads — which is why a suite

@@ -34,9 +34,12 @@
 //! `PATCH /b/admin/api/settings/{key}` bumped only the worker that handled it,
 //! and every other worker compared its own untouched counter against the
 //! generation stamped on the shared snapshot, found no change, and served the
-//! pre-write value for the life of the process — while the workers whose
-//! counter happened to differ re-queried the table on every single read.
-//! Counters from different threads were also compared as if they were one.
+//! pre-write value for the life of the process. The waste was the same defect
+//! read the other way round: the tag on the snapshot is whichever worker
+//! refilled it last, so once two workers disagreed about the count they
+//! discarded and refetched each other's snapshot for as long as reads kept
+//! alternating between them. Counters from different threads were compared as
+//! if they were one.
 //!
 //! [`std::sync::atomic::AtomicU64`], never a `RefCell`: Cloudflare can
 //! hard-stop a request without running destructors, and a stranded borrow flag
@@ -72,8 +75,13 @@ thread_local! {
 /// after ~19 sequential same-key puts) and the seeding it performs is exactly
 /// the case this counter has to catch.
 pub fn note_config_write() {
-    // `Release`, paired with the `Acquire` load below: a reader that observes
-    // the new generation also observes everything the writer did before it.
+    // Belt and braces. What makes a reader's next query correct is the order
+    // of the calls — every caller bumps AFTER its write has committed to the
+    // database, and the reader's own query goes back to that database — not
+    // anything this counter publishes. `Release`/`Acquire` costs nothing here
+    // and means the day some caller does hang data off the generation, it
+    // already sees the writer's stores rather than acquiring the ordering bug
+    // as well.
     CONFIG_WRITE_GENERATION.fetch_add(1, Ordering::Release);
     #[cfg(test)]
     WRITES_NOTED_HERE.with(|n| n.set(n.get().wrapping_add(1)));
@@ -88,9 +96,14 @@ pub fn config_write_generation() -> u64 {
 /// How many writes [`note_config_write`] has recorded on the calling thread.
 ///
 /// The assertion tool for "this code path wrote nothing" (or "wrote exactly
-/// once"). A `#[tokio::test]` runs its whole body on one thread, so a delta of
-/// zero here is a statement about the path under test rather than about what
-/// every other test in the binary happened to be doing.
+/// once"). A CURRENT-THREAD `#[tokio::test]` — the default flavour, and what
+/// every caller of this uses — runs its whole body on one thread, so a delta
+/// of zero here is a statement about the path under test rather than about
+/// what every other test in the binary happened to be doing. A test that opts
+/// into `flavor = "multi_thread"` spreads its work over workers and must
+/// assert on what it observes instead, the way
+/// `blocks::config::tests::an_admin_write_on_another_worker_reaches_a_warm_snapshot`
+/// does.
 #[cfg(test)]
 pub(crate) fn writes_noted_on_this_thread() -> u64 {
     WRITES_NOTED_HERE.with(std::cell::Cell::get)

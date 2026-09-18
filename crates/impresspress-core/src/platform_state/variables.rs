@@ -371,9 +371,22 @@ pub async fn seed_if_absent(
 /// `WAFER_RUN_SHARED__HAS_LANDING_PAGE = "true"` silently lost to the
 /// declared `"false"`.
 ///
+/// `sensitive` is an OPTION, and the two arms are different statements. `Some`
+/// is the caller vouching for the key — it knows what the value is — and
+/// `None` is "I have nothing to say", which is what a seeder handed a key by
+/// its environment has. They diverge only when the row has to be CREATED, where
+/// `None` takes [`crate::config_vars::is_sensitive_by_default_when_created`] —
+/// the rule that protects a key no `ConfigVar` declares — and `Some(false)`
+/// stores the plain row the caller asked for.
+/// [`NewVariable::into_row`] raises from the declaration and the
+/// `_SECRET`/`_KEY` suffix on top of either, so `Some(false)` cannot publish a
+/// key the build knows to be a secret.
+///
 /// On an existing row this writes `value` and, when the caller says the value
 /// is sensitive and the stored flag is clear, raises `sensitive` — never
-/// lowers it. `name` and `description` describe the variable rather than the
+/// lowers it. `Some(false)` and `None` therefore do the same thing there:
+/// nothing may lower a stored flag, so "plain" and "no opinion" are the same
+/// instruction. `name` and `description` describe the variable rather than the
 /// deployment, so an operator's wording survives; `sensitive` is different in
 /// kind, because it is the only thing that carries an AD HOC row's
 /// sensitivity — one the build declares no `ConfigVar` for, so
@@ -393,7 +406,7 @@ pub async fn set(
     value: &str,
     name: &str,
     description: &str,
-    sensitive: bool,
+    sensitive: Option<bool>,
 ) -> Result<Wrote, String> {
     set_with_owner(db, key, value, name, description, sensitive, None).await
 }
@@ -414,7 +427,7 @@ pub async fn set_by_admin(
     db: &Arc<dyn DatabaseService>,
     key: &str,
     value: &str,
-    sensitive: bool,
+    sensitive: Option<bool>,
     admin_id: &str,
 ) -> Result<Wrote, String> {
     set_with_owner(db, key, value, "", "", sensitive, Some(admin_id)).await
@@ -717,7 +730,7 @@ async fn set_with_owner(
     value: &str,
     name: &str,
     description: &str,
-    sensitive: bool,
+    sensitive: Option<bool>,
     updated_by: Option<&str>,
 ) -> Result<Wrote, String> {
     let existing = find_by_key(db, key).await?;
@@ -747,26 +760,24 @@ async fn set_with_row(
     value: &str,
     name: &str,
     description: &str,
-    sensitive: bool,
+    sensitive: Option<bool>,
     updated_by: Option<&str>,
     existing: Option<VariableRow>,
 ) -> Result<Wrote, String> {
     let Some(existing) = existing else {
         // Through [`VariablePatch::into_new`], the shared create default, so
         // this path protects an undeclared ad hoc key exactly as the admin PUT
-        // does. `sensitive` is a FLOOR here, not an assertion: every caller
-        // that reaches this branch passes `false` when it simply has nothing to
-        // say about the key — `seed_and_load`'s env loop says so in as many
-        // words, and `blocks::config`'s `CONFIG_SET` passes the stored row's
-        // flag, which for a key with no row is `false` — so `false` must mean
-        // "unset" and take the default rather than assert "publishable".
-        // `NewVariable::into_row` then raises from the declaration and the
-        // `_SECRET`/`_KEY` suffix on top, as it does for every other creator.
+        // does. `sensitive` is carried through as the `Option` it arrived as:
+        // `None` means the caller has nothing to say and takes
+        // `is_sensitive_by_default_when_created`, `Some` is the caller
+        // vouching for the key. `NewVariable::into_row` then raises from the
+        // declaration and the `_SECRET`/`_KEY` suffix on top of either, as it
+        // does for every other creator.
         let row = VariablePatch {
             value: Some(value.to_string()),
             name: Some(name.to_string()),
             description: Some(description.to_string()),
-            sensitive: sensitive.then_some(true),
+            sensitive,
             updated_by: Some(updated_by.unwrap_or_default().to_string()),
             ..Default::default()
         }
@@ -792,7 +803,13 @@ async fn set_with_row(
     // the create funnel: `blocks::config`'s `CONFIG_SET` passes the row's OWN
     // stored flag for an existing row, so a row already stored unflagged would
     // otherwise re-assert its own mistake forever.
-    let sensitive = sensitive || crate::config_vars::is_sensitive_for_storage(key);
+    //
+    // `None` and `Some(false)` are the same instruction here, and that is not
+    // a conflation: the flag is never lowered, so the only thing a caller can
+    // ask for is a RAISE, and both of those decline to ask for one. They part
+    // company on the create branch above, where storing a row means answering
+    // the question one way or the other.
+    let sensitive = sensitive.unwrap_or(false) || crate::config_vars::is_sensitive_for_storage(key);
     let raise_sensitive = sensitive && !existing.sensitive;
     let value_changed = existing.value != value;
     // Ownership is stamped ONLY when the value actually moved.
@@ -1224,14 +1241,16 @@ pub async fn seed_and_load(
                 continue;
             }
         }
-        // `sensitive` is settled by `set_with_row` — `VariablePatch::into_new`
-        // on a create, `NewVariable::into_row` on top — from the key's
-        // declaration and the `_SECRET`/`_KEY` suffix; `false` here asserts
-        // nothing extra. Native filters this batch to declared keys before it
-        // gets here (`cli::server_config::filter_to_declared_keys`), so the
+        // `None`, because a boot handed a key by its environment knows nothing
+        // about what the value is: `set_with_row` settles the flag from the
+        // key's declaration and the `_SECRET`/`_KEY` suffix
+        // (`VariablePatch::into_new` on a create, `NewVariable::into_row` on
+        // top of it), which is strictly more than this loop could assert.
+        // Native filters this batch to declared keys before it gets here
+        // (`cli::server_config::filter_to_declared_keys`), so the
         // undeclared-key default `into_new` applies is not what seeds a row on
         // this path.
-        match set_with_row(db, key, value, "", "", false, None, existing).await {
+        match set_with_row(db, key, value, "", "", None, None, existing).await {
             // Reached only for a row nothing has pinned, so the previous value
             // was a seeder's: a declared default, or an earlier boot's
             // environment.
@@ -2238,9 +2257,16 @@ mod boot_tests {
         assert_eq!(value_of(&db, key).await.as_deref(), Some("false"));
 
         assert_eq!(
-            set(&db, key, "true", "Has Landing Page", "declared", false)
-                .await
-                .expect("force-set"),
+            set(
+                &db,
+                key,
+                "true",
+                "Has Landing Page",
+                "declared",
+                Some(false)
+            )
+            .await
+            .expect("force-set"),
             Wrote::Replaced,
             "the value changed, so the row was written"
         );
@@ -2253,13 +2279,13 @@ mod boot_tests {
         let db = migrated_db().await;
         let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
         assert_eq!(
-            set(&db, key, "true", "n", "d", false)
+            set(&db, key, "true", "n", "d", Some(false))
                 .await
                 .expect("create"),
             Wrote::Created
         );
         assert_eq!(
-            set(&db, key, "true", "n", "d", false)
+            set(&db, key, "true", "n", "d", Some(false))
                 .await
                 .expect("re-assert"),
             Wrote::Unchanged,
@@ -2275,7 +2301,7 @@ mod boot_tests {
         let db = migrated_db().await;
         let key = "WAFER_RUN__AUTH__PROBE";
         assert_eq!(
-            set(&db, key, "true", "Probe", "d", false)
+            set(&db, key, "true", "Probe", "d", Some(false))
                 .await
                 .expect("create"),
             Wrote::Created
@@ -2307,7 +2333,7 @@ mod boot_tests {
     /// does not control. The per-thread tally counts what THIS test's
     /// `#[tokio::test]` body did, which is the claim being made.
     #[tokio::test]
-    async fn seeding_a_row_bumps_the_config_write_generation_and_a_no_op_does_not() {
+    async fn seeding_a_row_records_a_config_write_and_a_no_op_does_not() {
         let db = migrated_db().await;
         let key = "WAFER_RUN__AUTH__SEED_PROBE";
 
@@ -2319,7 +2345,7 @@ mod boot_tests {
         assert_eq!(
             after_insert,
             before + 1,
-            "a seeded row must bump the config-write generation"
+            "a seeded row must record a config write, so every memoized reader re-reads"
         );
 
         assert!(!seed_if_absent(&db, key, "other", "Probe", "d", false)
@@ -2355,7 +2381,7 @@ mod boot_tests {
             "true",
             "A Different Name",
             "different wording",
-            false,
+            Some(false),
         )
         .await
         .expect("force-set");
@@ -2451,7 +2477,7 @@ mod boot_tests {
         assert_eq!(vars.get(key).map(String::as_str), Some("Second"));
 
         // An admin edits the row through an admin surface.
-        set_by_admin(&db, key, "AdminChoice", false, "admin_1")
+        set_by_admin(&db, key, "AdminChoice", Some(false), "admin_1")
             .await
             .expect("admin edit");
         assert!(is_pinned(
@@ -2494,7 +2520,7 @@ mod boot_tests {
             &db,
             key,
             "false",
-            false,
+            Some(false),
             crate::features::USER_EDITED_SENTINEL,
         )
         .await
@@ -2542,7 +2568,7 @@ mod boot_tests {
             &db,
             key,
             "Same",
-            false,
+            Some(false),
             crate::features::USER_EDITED_SENTINEL,
         )
         .await
@@ -2643,11 +2669,11 @@ mod boot_tests {
         // field on the form is posted, including the ones they did not touch
         // (and, for a blank field, an empty value the form skips).
         let admin = crate::features::USER_EDITED_SENTINEL;
-        set_by_admin(&db, changed, "#ff0000", false, admin)
+        set_by_admin(&db, changed, "#ff0000", Some(false), admin)
             .await
             .expect("the changed field");
         for key in untouched {
-            set_by_admin(&db, key, &format!("env-{key}"), false, admin)
+            set_by_admin(&db, key, &format!("env-{key}"), Some(false), admin)
                 .await
                 .expect("a re-asserted field");
         }
@@ -3133,7 +3159,7 @@ mod boot_tests {
 
         for (stored, exported, expected) in [("Same", "Same", 0), ("Stored", "Exported", 1)] {
             let db = migrated_db().await;
-            set_by_admin(&db, key, stored, false, "admin_1")
+            set_by_admin(&db, key, stored, Some(false), "admin_1")
                 .await
                 .expect("admin edit");
 
@@ -3459,7 +3485,7 @@ mod boot_tests {
         );
 
         let db = migrated_db().await;
-        set(&db, token, "tok", "", "", false)
+        set(&db, token, "tok", "", "", Some(false))
             .await
             .expect("set-create");
         assert!(
@@ -3481,10 +3507,10 @@ mod boot_tests {
         let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
         raw_insert_unflagged(&db, key, "hunter2").await;
 
-        // `false` is what `blocks::config`'s CONFIG_SET passes for an existing
-        // row: the row's own stored flag, i.e. its own mistake.
+        // `Some(false)` is what `blocks::config`'s CONFIG_SET passes for an
+        // existing row: the row's own stored flag, i.e. its own mistake.
         assert_eq!(
-            set(&db, key, "hunter2", "", "", false)
+            set(&db, key, "hunter2", "", "", Some(false))
                 .await
                 .expect("repair"),
             Wrote::FlagRaised,
@@ -3495,7 +3521,7 @@ mod boot_tests {
         assert_eq!(row.value, "hunter2", "a repair must not move the value");
 
         assert_eq!(
-            set(&db, key, "hunter2", "", "", false)
+            set(&db, key, "hunter2", "", "", Some(false))
                 .await
                 .expect("re-assert"),
             Wrote::Unchanged,
