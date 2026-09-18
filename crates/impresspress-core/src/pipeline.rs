@@ -157,6 +157,25 @@ fn visible_to_caller(
 /// returned `OutputStream` as `StreamEvent::Error`. Request-log
 /// persistence failures are intentionally swallowed (best-effort) so a
 /// failing audit-log table never breaks the response.
+/// The routable path behind an `/api`-prefixed request, or `None` when the
+/// path does not carry that prefix.
+///
+/// Segment-bounded: `/api` and `/api/...` are prefixed, `/apiary` is a path of
+/// its own and keeps every byte. An unbounded `strip_prefix("/api")` turned it
+/// into `ary`, and turned `/api` itself into the empty resource, which routes
+/// to nothing.
+fn strip_api_prefix(resource: &str) -> Option<&str> {
+    let rest = resource.strip_prefix("/api")?;
+    match rest.as_bytes().first() {
+        // `/api` alone addresses the site root.
+        None => Some("/"),
+        Some(b'/') => Some(rest),
+        // `/apiary`, `/api.json` — a different path that merely starts the
+        // same way.
+        Some(_) => None,
+    }
+}
+
 // This is the single request-pipeline entry point; each argument is a distinct
 // piece of request/runtime context and a param-struct refactor is out of scope
 // for a lint sweep (behavior-preserving cleanup only).
@@ -175,9 +194,11 @@ pub async fn handle_request(
     // 0. (Discovery documents moved below step 2 — they are filtered by the
     //    caller's tier, which is not known here.)
 
-    // 1. Strip /api prefix from resource path
+    // 1. Strip the `/api` prefix from the resource path — the only place any
+    //    transport does, so `/api/x` and `/x` reach the same route on all of
+    //    them and stripping cannot happen twice.
     let resource = msg.path().to_string();
-    if let Some(stripped) = resource.strip_prefix("/api") {
+    if let Some(stripped) = strip_api_prefix(&resource) {
         msg.set_meta(META_REQ_RESOURCE, stripped);
     }
 
@@ -3507,6 +3528,109 @@ mod request_log_policy_tests {
         assert!(
             claim_request_log_budget(1_000 + REQUEST_LOG_WINDOW_MS),
             "a new window starts with a full budget",
+        );
+    }
+}
+
+#[cfg(test)]
+mod api_prefix_tests {
+    //! `/api` normalization: once, here, and only on a segment boundary.
+    //!
+    //! The Cloudflare adapter used to strip the prefix again on its own side,
+    //! and both strips were plain `starts_with`/`strip_prefix` — so `/apiary`
+    //! became `ary` on every transport, and `/api/api/x` reached `/x` on
+    //! Cloudflare while reaching `/api/x` everywhere else. The adapter no
+    //! longer strips at all; these drive the real pipeline to pin what the one
+    //! remaining strip does.
+
+    use std::sync::Arc;
+
+    use wafer_block::core_types::{LifecycleEvent, WaferError};
+    use wafer_run::Block as RunBlock;
+
+    use super::*;
+    use crate::{
+        features::AllEnabled,
+        routing::{ExtraRoute, RouteAccess},
+        test_support::{anon_msg, collect_or_panic, output_http_status, TestContext},
+    };
+
+    /// Answers with the `req.resource` it was dispatched with, which is what
+    /// the strip decides.
+    struct EchoPathBlock;
+
+    #[wafer_block::wafer_async_trait]
+    impl RunBlock for EchoPathBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/echo", "0.1.0", "test/echo@v1", "echoes its path")
+        }
+        async fn handle(&self, _c: &dyn Context, m: Message, _i: InputStream) -> OutputStream {
+            OutputStream::respond(m.path().as_bytes().to_vec())
+        }
+        async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
+    fn routes() -> Vec<ExtraRoute> {
+        vec![
+            ExtraRoute::new("/x", "test/echo", RouteAccess::Public),
+            ExtraRoute::new("/apiary/", "test/echo", RouteAccess::Public),
+        ]
+    }
+
+    async fn ctx() -> TestContext {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.register_block("test/echo", Arc::new(EchoPathBlock));
+        ctx
+    }
+
+    async fn drive(ctx: &TestContext, path: &str) -> OutputStream {
+        handle_request(
+            ctx,
+            anon_msg("retrieve", path),
+            InputStream::empty(),
+            None,
+            "test-secret",
+            false,
+            &AllEnabled,
+            &[],
+            &routes(),
+        )
+        .await
+    }
+
+    /// The prefix does what it is for: `/api/x` is served by the route
+    /// declared at `/x`.
+    #[tokio::test]
+    async fn an_api_prefixed_path_reaches_the_unprefixed_route() {
+        let ctx = ctx().await;
+        let body = collect_or_panic(drive(&ctx, "/api/x").await).await.body;
+        assert_eq!(String::from_utf8(body).unwrap(), "/x");
+    }
+
+    /// **Fails on the pre-fix tree**, where `strip_prefix("/api")` left
+    /// `ary/hives` — a path with no leading slash that no route can match, so
+    /// a site with an `/apiary` route answered 404 on it.
+    #[tokio::test]
+    async fn a_path_that_merely_starts_with_api_keeps_every_byte() {
+        let ctx = ctx().await;
+        let body = collect_or_panic(drive(&ctx, "/apiary/hives").await)
+            .await
+            .body;
+        assert_eq!(String::from_utf8(body).unwrap(), "/apiary/hives");
+    }
+
+    /// One strip, not a loop: the second `/api` is part of the path the route
+    /// sees. (The Cloudflare adapter's own strip made this `/x` there, and
+    /// only there.)
+    #[tokio::test]
+    async fn only_one_api_prefix_is_stripped() {
+        let ctx = ctx().await;
+        // `/api/api/x` normalizes to `/api/x`, which no route claims.
+        assert_eq!(
+            output_http_status(drive(&ctx, "/api/api/x").await).await,
+            404
         );
     }
 }
