@@ -494,7 +494,7 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
         let records = if table == PRODUCTS_COLLECTION {
             list_live_products(ctx, Vec::new()).await?
         } else {
-            db::list_all(ctx, table, Vec::new()).await?
+            crate::db_read::list_every(ctx, table, Vec::new()).await?
         };
         let rows: Vec<serde_json::Map<String, Value>> = records
             .into_iter()
