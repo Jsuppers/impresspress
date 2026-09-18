@@ -66,10 +66,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a connected provider may go without sending anything. Applies per
 /// read, so it bounds silence rather than the completion's total length: a
-/// model may legitimately stream for minutes, but a gap this long means the
-/// upstream has stopped answering and the stream must fail instead of hanging
-/// on a socket nobody will write to again.
-const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// model may legitimately stream for many minutes, but a gap this long means
+/// the upstream has stopped answering and the stream must fail instead of
+/// hanging on a socket nobody will write to again.
+///
+/// The gap that matters is time-to-first-token, which on a reasoning model
+/// thinking about a long prompt can run well past two minutes — so this is
+/// generous rather than tight. OpenAI's own SDK defaults to 600s for the
+/// whole request; this bounds silence only, so half of that still ends a dead
+/// socket long before a user waits it out.
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Redirect-hop budget, matching reqwest's built-in `Policy::limited(10)` (the
 /// default we replace). reqwest counts the initial request URL in
@@ -170,8 +176,13 @@ impl ProviderLlmService {
     /// [`try_new`](Self::try_new) with explicit timeouts. The whole-request
     /// timeout stays unset on purpose — a completion legitimately streams for
     /// minutes — so `read` is what bounds a provider that stops talking
-    /// mid-answer. Tests use it to make that bound observable in milliseconds.
-    pub fn try_with_timeouts(connect: Duration, read: Duration) -> Result<Self, LlmError> {
+    /// mid-answer.
+    ///
+    /// Private: the timeouts are a property of this client, not a knob its
+    /// callers set. It exists because the read bound is only observable in a
+    /// test that can shorten it to milliseconds, and the tests that do live
+    /// in this module.
+    fn try_with_timeouts(connect: Duration, read: Duration) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .redirect(ssrf_revalidating_redirect_policy())
             .connect_timeout(connect)
@@ -399,6 +410,11 @@ impl LlmService for ProviderLlmService {
 
             let mut body_stream = resp.bytes_stream();
             let mut decoder = Decoder::for_protocol(protocol);
+            // Whether the model has said why it stopped. Both decoders emit a
+            // `finish_reason` chunk from the provider's own terminal field,
+            // and that — not the transport sentinel that may follow it — is
+            // what says the answer is whole.
+            let mut saw_finish = false;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -409,7 +425,21 @@ impl LlmService for ProviderLlmService {
                         Some(Ok(bytes)) => {
                             let batch = decoder.push(&bytes);
                             for chunk in batch.chunks {
+                                saw_finish |= chunk.finish_reason.is_some();
                                 if tx_err.send(Ok(chunk)).await.is_err() { return; }
+                            }
+                            // Bytes the transport dropped are bytes of the
+                            // answer. Whatever arrives after them would join
+                            // onto the prefix above as if nothing were
+                            // missing, so the stream ends here instead.
+                            if batch.lost.any() {
+                                let _ = tx_err
+                                    .send(Err(LlmError::BackendError(format!(
+                                        "provider stream dropped {}; the answer is incomplete",
+                                        batch.lost
+                                    ))))
+                                    .await;
+                                return;
                             }
                             if batch.done { return; }
                         }
@@ -417,18 +447,29 @@ impl LlmService for ProviderLlmService {
                             let _ = tx_err.send(Err(LlmError::Network(e.to_string()))).await;
                             return;
                         }
-                        // The body ended without the protocol's terminal
-                        // event (`[DONE]` / `message_stop`), which `batch.done`
-                        // would have caught above. A completion the provider
-                        // cut off is not a completion: ending the stream
-                        // cleanly here would persist and display a half
-                        // answer as if the model had finished it.
+                        // End of body. The model saying why it stopped is what
+                        // makes the answer whole — `[DONE]` / `message_stop`
+                        // is a transport sentinel that OpenAI-compatible
+                        // servers and proxies are free to close without, and
+                        // failing on its absence would destroy complete
+                        // replies. With no finish reason at all, though, the
+                        // provider was cut off mid-answer, and ending cleanly
+                        // here would persist and display half a reply as if
+                        // the model had finished it.
                         None => {
-                            let _ = tx_err
-                                .send(Err(LlmError::BackendError(
-                                    "provider stream ended before the completion finished".into(),
-                                )))
-                                .await;
+                            if !saw_finish {
+                                let cut_mid_frame = if decoder.has_unparsed_input() {
+                                    " (mid-frame)"
+                                } else {
+                                    ""
+                                };
+                                let _ = tx_err
+                                    .send(Err(LlmError::BackendError(format!(
+                                        "provider stream ended{cut_mid_frame} before the model \
+                                         reported why it stopped"
+                                    ))))
+                                    .await;
+                            }
                             return;
                         }
                     }
@@ -498,6 +539,15 @@ impl Decoder {
         match self {
             Self::OpenAi(d) => d.push(bytes),
             Self::Anthropic(d) => d.push(bytes),
+        }
+    }
+
+    /// True when the decoder still holds bytes that never became a frame,
+    /// i.e. the body stopped in the middle of one.
+    fn has_unparsed_input(&self) -> bool {
+        match self {
+            Self::OpenAi(d) => d.has_unparsed_input(),
+            Self::Anthropic(d) => d.has_unparsed_input(),
         }
     }
 }
@@ -664,7 +714,21 @@ mod tests {
     /// Answer exactly one chat request on `localhost` with `body`, then behave
     /// as `then`. Returns the `http://localhost:<port>` endpoint to configure
     /// a provider with (the only plain-HTTP host `validate_url_value` allows).
+    ///
+    /// The response has neither `Content-Length` nor `Transfer-Encoding`, so
+    /// its body runs to end-of-connection. That is the shape that reaches the
+    /// decode loop's `None` arm; a provider using chunked encoding that is cut
+    /// mid-message surfaces as `Some(Err(..))` instead and is already handled
+    /// by the network-error arm above it.
     async fn fake_provider(body: &'static str, then: ThenThe) -> String {
+        fake_provider_in_pieces(body, usize::MAX, then).await
+    }
+
+    /// [`fake_provider`] that writes the body `piece` bytes at a time with a
+    /// gap between writes, so the client reads it as a sequence of transport
+    /// chunks — the only way a frame larger than the parser's buffer is
+    /// observable, since a frame that arrives whole is parsed whole.
+    async fn fake_provider_in_pieces(body: &'static str, piece: usize, then: ThenThe) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("localhost:0")
@@ -673,25 +737,65 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.expect("accept the chat request");
-            // Read the request so the client's write completes before we answer.
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf).await;
-            // No Content-Length and no chunked encoding: the body runs to
-            // end-of-connection, exactly like a streamed SSE response.
+            // Read the whole request. Stopping early can leave unread bytes in
+            // the socket, and closing on those sends an RST that discards the
+            // response we just wrote.
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !ends_request(&req) {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
             let _ = sock
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
                 .await;
-            let _ = sock.write_all(body.as_bytes()).await;
+            let bytes = body.as_bytes();
+            if piece == usize::MAX {
+                let _ = sock.write_all(bytes).await;
+            } else {
+                for part in bytes.chunks(piece) {
+                    if sock.write_all(part).await.is_err() {
+                        break;
+                    }
+                    let _ = sock.flush().await;
+                    // Let the client drain this piece before the next one, so
+                    // the reads it sees are the pieces written here.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
             let _ = sock.flush().await;
             match then {
-                ThenThe::ServerCloses => drop(sock),
+                ThenThe::ServerCloses => {
+                    // Half-close so the client sees a clean end of body rather
+                    // than a reset.
+                    let _ = sock.shutdown().await;
+                }
                 ThenThe::ServerGoesSilent => {
                     tokio::time::sleep(Duration::from_secs(30)).await;
-                    drop(sock);
                 }
             }
         });
         format!("http://localhost:{port}")
+    }
+
+    /// Whether `req` contains a complete HTTP request: headers, plus the body
+    /// named by its `content-length` (the chat POST always has one).
+    fn ends_request(req: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(req);
+        let Some(head_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
+        let len: usize = text[..head_end]
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        req.len() >= head_end + 4 + len
     }
 
     fn provider_at(endpoint: &str) -> ProviderConfig {
@@ -705,29 +809,13 @@ mod tests {
         ChatRequest::new("local-fake", "m", vec![ChatMessage::user("hi")])
     }
 
-    /// A provider that stops mid-answer must fail the stream, not finish it.
-    ///
-    /// The body ends without `[DONE]`, so the deltas that did arrive are half
-    /// an answer. Ending the stream cleanly would persist and display that
-    /// half as the model's complete reply, with nothing anywhere saying the
-    /// connection was cut.
-    #[tokio::test]
-    async fn a_body_that_ends_without_done_is_an_error_not_a_completion() {
-        let endpoint = fake_provider(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
-            ThenThe::ServerCloses,
-        )
-        .await;
-        let svc = ProviderLlmService::try_new().expect("build provider service");
-        svc.configure(vec![provider_at(&endpoint)])
-            .expect("the provider router accepts configuration");
-
+    /// Collect a stream's text deltas and its terminal item.
+    async fn drive(svc: &ProviderLlmService) -> (String, Vec<Result<ChatChunk, LlmError>>) {
         let items: Vec<_> = svc
             .chat_stream(chat_req(), CancellationToken::new())
             .await
             .collect()
             .await;
-
         let text: String = items
             .iter()
             .filter_map(|i| match i {
@@ -738,13 +826,112 @@ mod tests {
                 Err(_) => None,
             })
             .collect();
+        (text, items)
+    }
+
+    async fn service_for(endpoint: &str) -> ProviderLlmService {
+        let svc = ProviderLlmService::try_new().expect("build provider service");
+        svc.configure(vec![provider_at(endpoint)])
+            .expect("the provider router accepts configuration");
+        svc
+    }
+
+    /// A provider cut off mid-answer must fail the stream, not finish it.
+    ///
+    /// The body stops after a text delta: no finish reason, so the model never
+    /// said why it stopped. Ending the stream cleanly would persist and
+    /// display half a reply as the model's complete answer.
+    #[tokio::test]
+    async fn a_body_cut_before_any_finish_reason_is_an_error() {
+        let endpoint = fake_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
+            ThenThe::ServerCloses,
+        )
+        .await;
+        let svc = service_for(&endpoint).await;
+
+        let (text, items) = drive(&svc).await;
+
         assert_eq!(text, "half an ans", "the deltas that arrived are delivered");
         match items.last() {
             Some(Err(LlmError::BackendError(m))) => assert!(
-                m.contains("ended before"),
+                m.contains("ended"),
                 "the error must say the stream was cut, got: {m}"
             ),
             other => panic!("a cut stream must terminate in an error, got {other:?}"),
+        }
+    }
+
+    /// `[DONE]` is a transport sentinel, not the answer's terminator.
+    ///
+    /// OpenAI-compatible servers and proxies are free to close the connection
+    /// after the final `finish_reason` chunk without sending it. Treating that
+    /// as a cut stream destroys a complete reply: `handle_chat` would answer
+    /// 500 and persist nothing, and the SSE path would emit `event: error`
+    /// after the client had already rendered the whole answer.
+    #[tokio::test]
+    async fn a_finished_answer_is_delivered_even_without_the_done_sentinel() {
+        let endpoint = fake_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"whole answer\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ThenThe::ServerCloses,
+        )
+        .await;
+        let svc = service_for(&endpoint).await;
+
+        let (text, items) = drive(&svc).await;
+
+        assert_eq!(text, "whole answer");
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "a finished answer must not be failed for a missing sentinel, got {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, Ok(c) if c.finish_reason.is_some())),
+            "the finish reason is what says the answer is whole"
+        );
+    }
+
+    /// A frame too large to buffer takes part of the answer with it, so the
+    /// stream must fail rather than resume past the gap.
+    ///
+    /// Dropping the frame and carrying on would deliver the text before it
+    /// joined to the text after it — a reply with a missing middle and no
+    /// marker, which is exactly what the buffering cap exists to prevent.
+    #[tokio::test]
+    async fn an_oversized_frame_fails_the_stream_instead_of_holing_the_answer() {
+        // Leaked so the body can be `&'static str`, as the one-shot server
+        // takes; the test process ends moments later.
+        let body: &'static str = Box::leak(
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"start\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"end\"}}}}]}}\n\n\
+                 data: [DONE]\n\n",
+                "x".repeat(2 * sse::MAX_PENDING_FRAME_BYTES)
+            )
+            .into_boxed_str(),
+        );
+        // 64 KiB pieces: the frame is only oversized from the parser's point
+        // of view while its terminator has not arrived yet.
+        let endpoint = fake_provider_in_pieces(body, 64 * 1024, ThenThe::ServerCloses).await;
+        let svc = service_for(&endpoint).await;
+
+        let (text, items) = drive(&svc).await;
+
+        assert_eq!(text, "start", "the prefix that arrived is delivered");
+        assert!(
+            !text.contains("end"),
+            "text from after the gap must not be joined onto the prefix, got: {text}"
+        );
+        match items.last() {
+            Some(Err(LlmError::BackendError(m))) => assert!(
+                m.contains("oversized frame"),
+                "the error must name what was dropped, got: {m}"
+            ),
+            other => panic!("a dropped frame must fail the stream, got {other:?}"),
         }
     }
 

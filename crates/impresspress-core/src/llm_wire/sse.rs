@@ -35,29 +35,61 @@ pub struct DecodeBatch {
     /// True once the stream has terminated (e.g. OpenAI's `[DONE]` sentinel or
     /// Anthropic's `message_stop`). Callers should stop feeding once set.
     pub done: bool,
+    /// What the transport layer dropped while producing this batch. Non-empty
+    /// means part of the answer is gone, so the chunks here are a prefix of
+    /// what the model said and nothing after the loss can be trusted to join
+    /// onto them — the consumer delivers this batch and then fails the
+    /// stream rather than emitting a reply with a hole in it.
+    pub lost: FeedLoss,
 }
 
-/// What a [`feed`](SseFrameStream::feed) had to throw away, if anything. The
-/// caller turns this into its provider-tagged warning, which keeps this type
-/// free of a `tracing` dependency; the frames already buffered stay
-/// retrievable either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FeedDiscard {
-    /// The stream carried a byte sequence that is not valid UTF-8 and is not
-    /// merely an incomplete tail. The offending sequence was skipped and
-    /// decoding continued after it.
-    InvalidUtf8,
-    /// A single frame exceeded [`MAX_PENDING_FRAME_BYTES`] without a
-    /// terminating blank line. Its bytes are dropped up to and including the
-    /// next blank line, so the buffer cannot grow without bound.
-    FrameTooLarge,
+/// What a [`feed`](SseFrameStream::feed) lost, if anything.
+///
+/// Both kinds can happen in one feed, so this is a set rather than a single
+/// reason. What is lost is part of the answer, so a consumer that must not
+/// deliver a reply with a hole in it treats a non-empty loss as fatal — the
+/// native provider service (`blocks::llm::providers::service`) ends the
+/// stream with an error. Keeping this a plain value rather than a log line
+/// keeps the type free of a `tracing` dependency and leaves that decision to
+/// the consumer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeedLoss {
+    /// A byte sequence that is not valid UTF-8 and not merely an incomplete
+    /// tail was replaced with U+FFFD, and decoding continued after it. What
+    /// those bytes meant is gone even though the frame around them survives.
+    pub invalid_utf8: bool,
+    /// One frame exceeded [`MAX_PENDING_FRAME_BYTES`] without a terminating
+    /// blank line; its bytes are dropped up to and including the next blank
+    /// line so the buffer cannot grow without bound. The whole frame is gone,
+    /// which for a text delta is a missing piece of the answer.
+    pub frame_too_large: bool,
 }
 
-/// Cap on the bytes a single un-terminated frame may occupy. A provider that
-/// frames its stream in a way this parser does not recognise (or a hostile
-/// one that never terminates a frame) would otherwise grow `buf` for as long
-/// as the connection lives. Real frames are a few kilobytes at most, so a
-/// mebibyte is far above anything legitimate.
+impl FeedLoss {
+    /// True when anything at all was dropped.
+    pub fn any(self) -> bool {
+        self.invalid_utf8 || self.frame_too_large
+    }
+}
+
+impl std::fmt::Display for FeedLoss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.invalid_utf8, self.frame_too_large) {
+            (true, true) => f.write_str("invalid UTF-8 and an oversized frame"),
+            (true, false) => f.write_str("invalid UTF-8"),
+            (false, true) => f.write_str("an oversized frame"),
+            (false, false) => f.write_str("nothing"),
+        }
+    }
+}
+
+/// Cap on the bytes one un-terminated frame may occupy — the text after the
+/// last blank line, not the whole buffer, so frames the consumer has not
+/// drained yet never count against it. A provider that frames its stream in a
+/// way this parser does not recognise (or a hostile one that never terminates
+/// a frame) would otherwise grow `buf` for as long as the connection lives.
+/// Real frames are a few kilobytes at most, so a mebibyte is far above
+/// anything legitimate.
 pub const MAX_PENDING_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Incremental SSE transport parser: accumulates raw bytes and yields complete
@@ -81,6 +113,11 @@ pub struct SseFrameStream {
     /// A frame passed [`MAX_PENDING_FRAME_BYTES`] and is being discarded until
     /// the next blank line, so its tail is never parsed as a frame of its own.
     dropping_frame: bool,
+    /// While `dropping_frame`, the byte index in `buf` where that frame
+    /// starts. Everything before it is complete frames the consumer has not
+    /// drained yet, which must neither be discarded nor searched for the
+    /// separator that ends the oversized one.
+    drop_from: usize,
 }
 
 impl Default for SseFrameStream {
@@ -96,6 +133,7 @@ impl SseFrameStream {
             partial: Vec::new(),
             pending_cr: false,
             dropping_frame: false,
+            drop_from: 0,
         }
     }
 
@@ -103,11 +141,17 @@ impl SseFrameStream {
     /// UTF-8 characters and holding an incomplete trailing sequence back for
     /// the next feed.
     ///
-    /// Returns `Some` when bytes had to be discarded (see [`FeedDiscard`]);
-    /// everything decodable is buffered regardless, so the caller warns and
-    /// keeps draining frames rather than dropping the batch.
-    pub fn feed(&mut self, bytes: &[u8]) -> Option<FeedDiscard> {
-        let mut discard = None;
+    /// Returns what was lost, if anything (see [`FeedLoss`]); everything
+    /// decodable is buffered regardless, so the caller can drain the frames
+    /// that did arrive before it acts on the loss.
+    ///
+    /// Callers must drain with [`next_frame`](Self::next_frame) until it
+    /// returns `None` before the next feed. Buffered-but-undrained frames do
+    /// not count towards [`MAX_PENDING_FRAME_BYTES`] — only the unterminated
+    /// tail does — so a consumer that stops draining while the provider keeps
+    /// sending complete frames is the one case that still grows memory.
+    pub fn feed(&mut self, bytes: &[u8]) -> FeedLoss {
+        let mut loss = FeedLoss::default();
 
         // Re-attach the sequence the previous feed could not finish decoding.
         let joined: Vec<u8>;
@@ -134,11 +178,21 @@ impl SseFrameStream {
                         .expect("valid_up_to() bounds a valid UTF-8 prefix");
                     self.push_text(prefix);
                     match e.error_len() {
-                        // A genuinely invalid sequence: skip it and keep
-                        // decoding, so one bad byte costs one character
-                        // rather than the rest of the stream.
+                        // A genuinely invalid sequence: substitute the
+                        // replacement character and keep decoding, so one bad
+                        // byte costs one character rather than the rest of the
+                        // stream. Substituting rather than deleting is what
+                        // the Unicode standard's decoder does, and it keeps
+                        // the line structure the framing depends on: dropping
+                        // the bytes outright can leave a line that was not
+                        // empty looking empty, which invents a frame boundary
+                        // where the provider sent none. Routing it through
+                        // `push_text` is also what clears a pending CR — the
+                        // bytes between a CR and an LF mean they are two line
+                        // endings, not one.
                         Some(len) => {
-                            discard = Some(FeedDiscard::InvalidUtf8);
+                            loss.invalid_utf8 = true;
+                            self.push_text(char::REPLACEMENT_CHARACTER.encode_utf8(&mut [0; 4]));
                             rest = &rest[valid + len..];
                         }
                         // A character split across this chunk boundary: hold
@@ -153,9 +207,9 @@ impl SseFrameStream {
         }
 
         if self.enforce_frame_cap() {
-            discard = Some(FeedDiscard::FrameTooLarge);
+            loss.frame_too_large = true;
         }
-        discard
+        loss
     }
 
     /// Append decoded text, normalising SSE's three line endings (`\r\n`,
@@ -186,37 +240,53 @@ impl SseFrameStream {
         }
     }
 
-    /// Keep `buf` bounded. Returns true when this call started dropping an
-    /// oversized frame, so [`feed`](Self::feed) can report it once.
+    /// Bound the unterminated tail of `buf`. Returns true when this call
+    /// started dropping an oversized frame, so [`feed`](Self::feed) reports it
+    /// once rather than on every feed that follows.
     fn enforce_frame_cap(&mut self) -> bool {
         if self.dropping_frame {
-            match self.buf.find("\n\n") {
+            // Search only the tail being discarded: a separator earlier in
+            // `buf` belongs to a complete frame the consumer has yet to drain.
+            match self.buf[self.drop_from..].find("\n\n") {
                 // The oversized frame finally ended: drop it and resume.
-                Some(sep) => {
-                    self.buf.drain(..=sep + 1);
+                Some(rel) => {
+                    let end = self.drop_from + rel + 2;
+                    self.buf.replace_range(self.drop_from..end, "");
                     self.dropping_frame = false;
                 }
-                // Still inside it. Keep the final character so a separator
-                // straddling this discard is still seen.
-                None => self.truncate_to_last_char(),
+                // Still inside it.
+                None => self.shrink_dropped_frame(),
             }
             return false;
         }
-        if self.buf.len() <= MAX_PENDING_FRAME_BYTES || self.buf.contains("\n\n") {
+        let start = self.pending_frame_start();
+        if self.buf.len() - start <= MAX_PENDING_FRAME_BYTES {
             return false;
         }
-        self.truncate_to_last_char();
+        self.drop_from = start;
         self.dropping_frame = true;
+        self.shrink_dropped_frame();
         true
     }
 
-    /// Reduce `buf` to its last character, the only part that can still form a
-    /// frame separator with the bytes yet to arrive.
-    fn truncate_to_last_char(&mut self) {
-        let keep = self.buf.chars().next_back();
-        self.buf.clear();
-        if let Some(c) = keep {
-            self.buf.push(c);
+    /// Byte index where the frame still awaiting its terminator starts — just
+    /// past the last blank line, or the start of the buffer when none has
+    /// arrived yet.
+    fn pending_frame_start(&self) -> usize {
+        self.buf.rfind("\n\n").map_or(0, |i| i + 2)
+    }
+
+    /// Discard the oversized frame's buffered bytes, keeping the complete
+    /// frames before it and its own final character — which may be the first
+    /// half of the separator that ends it.
+    fn shrink_dropped_frame(&mut self) {
+        let keep_from = self
+            .buf
+            .char_indices()
+            .next_back()
+            .map_or(self.buf.len(), |(i, _)| i);
+        if keep_from > self.drop_from {
+            self.buf.replace_range(self.drop_from..keep_from, "");
         }
     }
 
@@ -227,7 +297,21 @@ impl SseFrameStream {
         let sep = self.buf.find("\n\n")?;
         let raw = self.buf[..sep].to_string();
         self.buf.drain(..=sep + 1);
+        // Draining from the front moves everything after it, including the
+        // oversized frame this stream may be discarding.
+        self.drop_from = self.drop_from.saturating_sub(sep + 2);
         Some(parse_frame(&raw))
+    }
+
+    /// Bytes received that are not yet part of any frame: an unterminated
+    /// frame, or the head of a character the stream was cut in the middle of.
+    ///
+    /// Whitespace is not counted — a provider may end its body with a stray
+    /// newline and still have said everything it had to say. Anything else
+    /// means the body stopped mid-frame, which a consumer deciding whether a
+    /// completion is whole wants to know.
+    pub fn has_unparsed_input(&self) -> bool {
+        !self.partial.is_empty() || !self.buf.trim().is_empty()
     }
 }
 
@@ -261,10 +345,10 @@ mod tests {
     fn yields_only_complete_frames() {
         let mut s = SseFrameStream::new();
         // Partial frame — no blank line yet.
-        assert_eq!(s.feed(b"data: hello"), None);
+        assert!(!s.feed(b"data: hello").any());
         assert!(s.next_frame().is_none());
         // Completing it yields exactly one frame.
-        assert_eq!(s.feed(b"\n\n"), None);
+        assert!(!s.feed(b"\n\n").any());
         let f = s.next_frame().expect("frame");
         assert_eq!(f.data, "hello");
         assert!(s.next_frame().is_none());
@@ -305,17 +389,27 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_is_skipped_without_losing_the_rest_of_the_feed() {
+    fn invalid_utf8_becomes_a_replacement_char_and_is_reported() {
         let mut s = SseFrameStream::new();
         // 0xFF is never valid in UTF-8 — and it must cost exactly itself: the
-        // frame it sits in still arrives, minus the bad byte.
+        // frame it sits in still arrives, with the bad byte replaced.
         let mut bytes = b"data: o".to_vec();
         bytes.extend_from_slice(&[0xff]);
         bytes.extend_from_slice(b"k\n\n");
-        assert_eq!(s.feed(&bytes), Some(FeedDiscard::InvalidUtf8));
-        assert_eq!(s.next_frame().expect("frame").data, "ok");
+        assert_eq!(
+            s.feed(&bytes),
+            FeedLoss {
+                invalid_utf8: true,
+                frame_too_large: false
+            }
+        );
+        assert_eq!(
+            s.next_frame().expect("frame").data,
+            "o\u{fffd}k",
+            "the corrupt byte is visible in the payload, not silently dropped"
+        );
         // A subsequent valid feed still works (buffer wasn't corrupted).
-        assert_eq!(s.feed(b"data: next\n\n"), None);
+        assert!(!s.feed(b"data: next\n\n").any());
         assert_eq!(s.next_frame().expect("frame").data, "next");
     }
 
@@ -355,12 +449,11 @@ mod tests {
             let bytes = wire.as_bytes();
             for split in 0..=bytes.len() {
                 let mut s = SseFrameStream::new();
-                assert_eq!(
-                    s.feed(&bytes[..split]),
-                    None,
+                assert!(
+                    !s.feed(&bytes[..split]).any(),
                     "a split at {split} is a chunk boundary, not a decode error"
                 );
-                assert_eq!(s.feed(&bytes[split..]), None, "second half of {split}");
+                assert!(!s.feed(&bytes[split..]).any(), "second half of {split}");
                 assert_eq!(
                     drain(&mut s),
                     payload,
@@ -377,9 +470,8 @@ mod tests {
         let wire = "data: 🙂 ok\n\n";
         let mut s = SseFrameStream::new();
         for b in wire.as_bytes() {
-            assert_eq!(
-                s.feed(&[*b]),
-                None,
+            assert!(
+                !s.feed(&[*b]).any(),
                 "byte-at-a-time feed is never a discard"
             );
         }
@@ -420,7 +512,7 @@ mod tests {
             "event: e\r\ndata: hi\n\n",
         ] {
             let mut s = SseFrameStream::new();
-            assert_eq!(s.feed(wire.as_bytes()), None);
+            assert!(!s.feed(wire.as_bytes()).any());
             let f = s
                 .next_frame()
                 .unwrap_or_else(|| panic!("{wire:?} must yield a frame"));
@@ -447,24 +539,131 @@ mod tests {
         }
     }
 
+    /// A bad byte must not invent a frame boundary.
+    ///
+    /// Deleting an invalid sequence can leave a line that carried content
+    /// looking empty, and an empty line is exactly what ends a frame — so a
+    /// single corrupt byte would split one frame into two and hand the
+    /// decoder half a payload. Substituting the replacement character keeps
+    /// the line, and keeps the CR that preceded it from swallowing the LF
+    /// that follows (those are two line endings, not one).
+    #[test]
+    fn an_invalid_byte_does_not_split_the_frame_it_lands_in() {
+        let mut s = SseFrameStream::new();
+        let mut bytes = b"data: a\r".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\ndata: b\n\n");
+        assert!(s.feed(&bytes).invalid_utf8, "the loss is reported");
+        let f = s.next_frame().expect("one frame");
+        assert_eq!(
+            f.data, "a\nb",
+            "the bad byte's line is not a blank line, so the frame is still one frame"
+        );
+        assert!(s.next_frame().is_none(), "and there is no second frame");
+    }
+
+    /// Both kinds of loss in one feed are both reported — the invalid sequence
+    /// is not hidden by the overflow that follows it.
+    #[test]
+    fn a_feed_that_loses_two_ways_reports_both() {
+        let mut s = SseFrameStream::new();
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&vec![b'x'; MAX_PENDING_FRAME_BYTES + 1]);
+        assert_eq!(
+            s.feed(&bytes),
+            FeedLoss {
+                invalid_utf8: true,
+                frame_too_large: true
+            }
+        );
+    }
+
+    /// The cap bounds one frame, not the buffer: frames the consumer has not
+    /// drained yet are its to collect, and must not be discarded as though
+    /// they were one runaway frame.
+    #[test]
+    fn undrained_complete_frames_do_not_trip_the_cap() {
+        let mut s = SseFrameStream::new();
+        // Well past the cap in total, but every frame is complete and small.
+        let frame = format!("data: {}\n\n", "y".repeat(8 * 1024));
+        let mut frames = 0;
+        while s.buf.len() < 2 * MAX_PENDING_FRAME_BYTES {
+            assert!(
+                !s.feed(frame.as_bytes()).any(),
+                "complete frames are not a loss"
+            );
+            frames += 1;
+        }
+        let mut drained = 0;
+        while let Some(f) = s.next_frame() {
+            assert_eq!(f.data.len(), 8 * 1024);
+            drained += 1;
+        }
+        assert_eq!(drained, frames, "every buffered frame is still retrievable");
+    }
+
+    /// A frame dropped for being oversized must not take the complete frames
+    /// buffered ahead of it — nor find its terminator in one of them.
+    #[test]
+    fn dropping_an_oversized_frame_spares_the_frames_before_it() {
+        let mut s = SseFrameStream::new();
+        assert!(!s.feed(b"data: keep me\n\n").any());
+        // Now an unterminated frame that runs past the cap, fed in pieces.
+        let mut tripped = false;
+        for _ in 0..20 {
+            tripped |= s.feed(&vec![b'z'; 64 * 1024]).frame_too_large;
+        }
+        assert!(tripped, "the oversized frame is reported");
+        // The frame buffered before it survives...
+        assert_eq!(
+            s.next_frame().expect("the earlier frame").data,
+            "keep me",
+            "a complete frame must not be discarded with the oversized one"
+        );
+        assert!(s.next_frame().is_none(), "the dropped frame yields nothing");
+        // ...and the stream resumes on the frame after the dropped one.
+        assert!(!s.feed(b"tail of the big one\n\ndata: ok\n\n").any());
+        assert_eq!(drain(&mut s), "ok");
+    }
+
+    /// A body that stops mid-frame or mid-character leaves bytes that never
+    /// became a frame, which is how a consumer tells a clean end from a cut.
+    #[test]
+    fn unparsed_input_reports_a_cut_body() {
+        let mut s = SseFrameStream::new();
+        assert!(!s.has_unparsed_input(), "a fresh stream holds nothing");
+        s.feed(b"data: whole\n\n");
+        while s.next_frame().is_some() {}
+        assert!(
+            !s.has_unparsed_input(),
+            "a body that ended on a frame boundary is not a cut"
+        );
+        // Trailing whitespace is not a cut either.
+        s.feed(b"\n");
+        assert!(!s.has_unparsed_input());
+        // Half a frame is.
+        s.feed(b"data: half");
+        assert!(s.has_unparsed_input());
+        // So is half a character.
+        let mut s2 = SseFrameStream::new();
+        s2.feed(&"🙂".as_bytes()[..2]);
+        assert!(s2.has_unparsed_input());
+    }
+
     /// An un-terminated frame cannot grow without bound: past the cap its
     /// bytes are dropped until the next blank line, and the stream recovers on
     /// the frame after it.
     #[test]
     fn an_unterminated_frame_is_bounded_and_the_stream_recovers() {
         let mut s = SseFrameStream::new();
-        let mut discards = Vec::new();
+        let mut overflows = 0;
         // 2 MiB of a single frame that never ends.
         for _ in 0..32 {
-            if let Some(d) = s.feed(&vec![b'x'; 64 * 1024]) {
-                discards.push(d);
+            if s.feed(&vec![b'x'; 64 * 1024]).frame_too_large {
+                overflows += 1;
             }
         }
-        assert_eq!(
-            discards,
-            vec![FeedDiscard::FrameTooLarge],
-            "the overflow is reported once, not per feed"
-        );
+        assert_eq!(overflows, 1, "the overflow is reported once, not per feed");
         assert!(
             s.buf.len() <= MAX_PENDING_FRAME_BYTES,
             "buffer stayed bounded, got {} bytes",
@@ -472,7 +671,7 @@ mod tests {
         );
         // The rest of the oversized frame is discarded, and the next frame
         // decodes normally.
-        assert_eq!(s.feed(b"more junk\n\ndata: ok\n\n"), None);
+        assert!(!s.feed(b"more junk\n\ndata: ok\n\n").any());
         assert_eq!(drain(&mut s), "ok");
     }
 }

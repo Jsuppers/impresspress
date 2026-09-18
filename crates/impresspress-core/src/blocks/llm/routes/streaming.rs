@@ -64,13 +64,19 @@ async fn send_sse_content_type(sink: &OutputSink) {
 ///
 /// Accumulation mirrors `handle_chat`: text deltas are concatenated up to
 /// [`MAX_BUFFERED_RESPONSE_BYTES`] (the first overflowing delta ends
-/// accumulation for the rest of the stream, with a warning at end-of-stream,
-/// while frames keep flowing to the client), so what is stored is a prefix of
-/// the answer rather than one with a hole in it; tool-call/empty deltas are
-/// forwarded but not accumulated. A service error or encode failure
-/// terminates the stream with an error frame and skips persistence — the same
-/// outcome as `handle_chat`, which returns a 500 without persisting when the
-/// stream errors.
+/// accumulation for the rest of the stream, while frames keep flowing to the
+/// client), so what is stored is a prefix of the answer rather than one with
+/// a hole in it; tool-call/empty deltas are forwarded but not accumulated.
+///
+/// Reporting does not mirror it. `handle_chat` returns `truncated` because
+/// the body it returns *is* the capped text; here the client has already
+/// received every frame, so its copy is complete and there is nothing to
+/// flag on the wire — only the stored copy is shorter, which is logged at
+/// end-of-stream.
+///
+/// A service error or encode failure terminates the stream with an error
+/// frame and skips persistence — the same outcome as `handle_chat`, which
+/// returns a 500 without persisting when the stream errors.
 ///
 /// Generic over the chunk stream (rather than taking
 /// [`NativeTypedFrameStream`]`<ChatChunk>` directly, whose constructor is

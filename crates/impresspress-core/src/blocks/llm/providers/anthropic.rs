@@ -273,11 +273,13 @@ impl AnthropicSseDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> DecodeBatch {
-        if let Some(discard) = self.frames.feed(bytes) {
-            // Whatever the transport mangled, the frames that did decode are
-            // still in the buffer — so warn and keep draining rather than
-            // dropping this batch.
-            tracing::warn!(?discard, "anthropic sse: stream bytes discarded");
+        let lost = self.frames.feed(bytes);
+        if lost.any() {
+            // The frames that did decode are still in the buffer, so drain
+            // them: they are the prefix of the answer that survived. `lost`
+            // travels with the batch so the consumer can end the stream
+            // instead of delivering a reply with a hole in it.
+            tracing::warn!(%lost, "anthropic sse: transport lost part of the stream");
         }
 
         let mut out = Vec::new();
@@ -292,7 +294,18 @@ impl AnthropicSseDecoder {
             }
         }
 
-        DecodeBatch { chunks: out, done }
+        DecodeBatch {
+            chunks: out,
+            done,
+            lost,
+        }
+    }
+
+    /// Bytes received that never became a frame — see
+    /// [`SseFrameStream::has_unparsed_input`]. A transport that ends while
+    /// this is true was cut mid-frame.
+    pub fn has_unparsed_input(&self) -> bool {
+        self.frames.has_unparsed_input()
     }
 
     fn decode_frame(&mut self, frame: &SseFrame) -> (Vec<ChatChunk>, bool) {
