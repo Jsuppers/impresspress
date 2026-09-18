@@ -13,6 +13,7 @@ use super::{
 };
 use crate::{
     blocks::{auth::bump_auth_version, crud},
+    db_read::{self, Bound},
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
     platform_state::user_roles::{self, Assigned},
     util::{json_map, RecordExt},
@@ -218,7 +219,16 @@ pub(super) async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> Outp
 
 /// `GET /b/admin/api/iam/permissions`.
 pub(super) async fn handle_list_permissions(ctx: &dyn Context) -> OutputStream {
-    match db::list_all(ctx, PERMISSIONS_TABLE, vec![]).await {
+    match db_read::list_bounded(
+        ctx,
+        PERMISSIONS_TABLE,
+        vec![],
+        Bound::Curated(
+            "the IAM permission catalogue — seeded by migration, extended only by an admin",
+        ),
+    )
+    .await
+    {
         Ok(records) => {
             let total_count = records.len() as i64;
             ok_json(&db::RecordList {
@@ -322,32 +332,50 @@ pub(super) async fn handle_delete_permission(ctx: &dyn Context, msg: &Message) -
 /// `GET /b/admin/api/iam/user-roles`.
 pub(super) async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.query("user_id").to_string();
-    let rows = if user_id.is_empty() {
-        user_roles::list_all(ctx).await
-    } else {
-        user_roles::list_for_user(ctx, &user_id).await
-    };
-    match rows {
-        Ok(rows) => {
-            // Echoed in the `{id, data}` record envelope this endpoint has
-            // always published; declared without a schema until it is typed.
-            let records: Vec<db::Record> = rows
-                .iter()
-                .map(|row| db::Record {
-                    id: row.id.clone(),
-                    data: row.to_data(),
-                })
-                .collect();
-            let total_count = records.len() as i64;
-            ok_json(&db::RecordList {
-                records,
-                total_count,
-                page: 1,
-                page_size: total_count,
-            })
+    // Unfiltered, this lists a table that grows with the user base, so the
+    // read is capped. `total_count` then has to come from the database rather
+    // than from `records.len()`: a `total_count` copied off a capped page
+    // would tell the client the grant list is complete when it is a prefix.
+    let (rows, total_count) = if user_id.is_empty() {
+        match user_roles::list_all(ctx).await {
+            Ok(capped) => {
+                let total = if capped.truncated {
+                    match user_roles::count_all(ctx).await {
+                        Ok(total) => total,
+                        Err(e) => return err_internal("Database error", e),
+                    }
+                } else {
+                    capped.rows.len() as i64
+                };
+                (capped.rows, total)
+            }
+            Err(e) => return err_internal("Database error", e),
         }
-        Err(e) => err_internal("Database error", e),
-    }
+    } else {
+        match user_roles::list_for_user(ctx, &user_id).await {
+            Ok(rows) => {
+                let total = rows.len() as i64;
+                (rows, total)
+            }
+            Err(e) => return err_internal("Database error", e),
+        }
+    };
+    // Echoed in the `{id, data}` record envelope this endpoint has
+    // always published; declared without a schema until it is typed.
+    let records: Vec<db::Record> = rows
+        .iter()
+        .map(|row| db::Record {
+            id: row.id.clone(),
+            data: row.to_data(),
+        })
+        .collect();
+    let page_size = records.len() as i64;
+    ok_json(&db::RecordList {
+        records,
+        total_count,
+        page: 1,
+        page_size,
+    })
 }
 
 /// `POST /b/admin/api/iam/user-roles`.
@@ -620,7 +648,7 @@ mod tests {
     /// `seed_defaults` path and return its row id.
     async fn seed_system_role(ctx: &dyn Context) -> String {
         seed_defaults(ctx).await;
-        let records = db::list_all(
+        let records = db_read::list_every(
             ctx,
             ROLES_TABLE,
             vec![Filter {
@@ -753,7 +781,7 @@ mod tests {
         .await;
         assert!(out.collect_buffered().await.is_ok(), "update must succeed");
 
-        let rows = db::list_all(
+        let rows = db_read::list_every(
             &ctx,
             super::super::logs::AUDIT_LOGS_TABLE,
             vec![Filter {
@@ -790,7 +818,7 @@ mod tests {
 
         // Verify no rename actually happened — `list` isn't intercepted, so
         // this reads the real row through the same context.
-        let records = db::list_all(
+        let records = db_read::list_every(
             &failing,
             ROLES_TABLE,
             vec![Filter {

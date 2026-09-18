@@ -462,7 +462,10 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         // Per-thread overrides
         div .card {
             h3 .card-title .mb-4 { "Per-Thread Overrides" }
-            @if overrides.is_empty() {
+            @if overrides.truncated {
+                p .form-hint { "Showing the first " (overrides.rows.len()) " overrides." }
+            }
+            @if overrides.rows.is_empty() {
                 div .empty-state {
                     "No thread overrides configured."
                 }
@@ -479,7 +482,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             }
                         }
                         tbody {
-                            @for ov in &overrides {
+                            @for ov in &overrides.rows {
                                 @let tid = ov.thread_id.as_str();
                                 @let pb = ov.provider_block.as_str();
                                 @let model = ov.model.as_str();

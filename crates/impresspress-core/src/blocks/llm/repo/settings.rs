@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::{stamp_created, stamp_updated, RecordExt};
+use crate::{
+    db_read::{self, CappedList},
+    util::{stamp_created, stamp_updated, RecordExt},
+};
 
 pub(crate) const TABLE: &str = "impresspress__llm__settings";
 
@@ -70,13 +73,17 @@ pub(crate) async fn find_for_thread(
     }
 }
 
-/// Every override, for the settings page's table.
-pub(crate) async fn list_all(ctx: &dyn Context) -> Result<Vec<ThreadSettingRow>, WaferError> {
-    Ok(db::list_all(ctx, TABLE, vec![])
+/// Overrides for the settings page's table, and whether there are more than
+/// the table lists.
+///
+/// One row per thread that pinned a provider or model, and threads are
+/// user-created, so the set grows with use.
+pub(crate) async fn list_all(
+    ctx: &dyn Context,
+) -> Result<CappedList<ThreadSettingRow>, WaferError> {
+    Ok(db_read::list_capped(ctx, TABLE, vec![])
         .await?
-        .iter()
-        .map(ThreadSettingRow::from_record)
-        .collect())
+        .map(|record| ThreadSettingRow::from_record(&record)))
 }
 
 /// Create the override for `thread_id`. Either field may be empty, which
@@ -176,7 +183,10 @@ mod tests {
             find_for_thread(&ctx, "t1").await.expect("read"),
             Some(written.clone())
         );
-        assert_eq!(list_all(&ctx).await.expect("list"), vec![written.clone()]);
+        assert_eq!(
+            list_all(&ctx).await.expect("list").rows,
+            vec![written.clone()]
+        );
 
         let empty = insert(&ctx, "t2", "", "").await.expect("insert");
         assert_eq!(empty.provider_block, "");
@@ -199,7 +209,7 @@ mod tests {
         assert_eq!(updated.model, "gpt-4o-mini");
         assert_eq!(updated.created_at, row.created_at);
 
-        assert_eq!(list_all(&ctx).await.expect("list").len(), 1);
+        assert_eq!(list_all(&ctx).await.expect("list").rows.len(), 1);
     }
 
     /// An absent row is `Ok(None)`; a failed read is `Err`. These were the
@@ -228,7 +238,7 @@ mod tests {
         let row = insert(&ctx, "t1", "", "gpt-4o").await.expect("insert");
 
         delete(&ctx, &row.id).await.expect("delete");
-        assert!(list_all(&ctx).await.expect("list").is_empty());
+        assert!(list_all(&ctx).await.expect("list").rows.is_empty());
 
         assert_eq!(
             delete(&ctx, &row.id)

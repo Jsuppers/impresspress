@@ -1098,7 +1098,6 @@ mod tests {
 /// write the audit-log row after a confirmed successful write.
 #[cfg(test)]
 mod wrap_grant_mutation_tests {
-    use wafer_core::clients::database as db;
     use wafer_run::InputStream;
 
     use super::{test_support::routed, *};
@@ -1106,7 +1105,7 @@ mod wrap_grant_mutation_tests {
 
     /// Count audit-log rows whose `action` matches.
     async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
-        db::list_all(
+        crate::db_read::list_every(
             ctx,
             AUDIT_LOGS_TABLE,
             vec![wafer_block::db::Filter {

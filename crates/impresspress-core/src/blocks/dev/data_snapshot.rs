@@ -479,6 +479,14 @@ mod variable_is_exportable_tests {
 }
 
 /// Read every [`TABLE_ALLOWLIST`] table's rows into a [`DataSnapshot`].
+///
+/// Exhaustive by requirement, not by preference: the bundle is restored with
+/// `Mode::Replace` over the live tables, so a table read only as far as some
+/// ceiling would delete every row past it on restore. The cost is that one
+/// table's rows are all in memory at once, which on a 128 MB Cloudflare
+/// isolate is the limit this hits first — an export is an operator action on
+/// a deployment whose size the operator knows, and a short bundle that looks
+/// complete is the worse failure.
 pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
     let mut tables = BTreeMap::new();
     // The ids each owning table actually exported: the live products, and the
@@ -494,7 +502,7 @@ pub async fn export(ctx: &dyn Context) -> Result<DataSnapshot, WaferError> {
         let records = if table == PRODUCTS_COLLECTION {
             list_live_products(ctx, Vec::new()).await?
         } else {
-            db::list_all(ctx, table, Vec::new()).await?
+            crate::db_read::list_every(ctx, table, Vec::new()).await?
         };
         let rows: Vec<serde_json::Map<String, Value>> = records
             .into_iter()

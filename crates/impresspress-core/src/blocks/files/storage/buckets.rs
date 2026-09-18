@@ -31,7 +31,8 @@ pub(in crate::blocks::files) async fn handle_list_buckets(
     };
     match repo::buckets::list_visible(ctx, owner).await {
         Ok(rows) => ok_json(&contracts::BucketListResponse {
-            buckets: rows.into_iter().map(|r| r.name).collect(),
+            truncated: rows.truncated,
+            buckets: rows.rows.into_iter().map(|r| r.name).collect(),
         }),
         Err(e) => err_internal("Database error", e),
     }

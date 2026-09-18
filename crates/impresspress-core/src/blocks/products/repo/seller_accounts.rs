@@ -14,6 +14,7 @@ use crate::{
     blocks::products::contracts::{
         SellerAccount, SellerApproval, SellerCapabilities, SellerStatus,
     },
+    db_read::{self, CappedList},
     util::{enum_column, wire_str, RecordExt},
 };
 
@@ -158,19 +159,30 @@ pub(crate) fn to_contract(record: &db::Record) -> Result<SellerAccount, WaferErr
     })
 }
 
-/// Every seller account, as the published [`SellerAccount`] contract.
+/// Seller accounts as the published [`SellerAccount`] contract, and whether
+/// there are more than the read returned.
 ///
 /// The admin seller list (`GET /b/products/api/admin/sellers`) and the admin
-/// sellers page rendered this from two verbatim copies of the same
-/// `db::list_all` + `to_contract` pair; a decode failure on any row is an
-/// error for the whole read, because a seller list missing the row that could
-/// not be decoded is a governance surface that silently hides an account.
-pub(crate) async fn list_contracts(ctx: &dyn Context) -> Result<Vec<SellerAccount>, WaferError> {
-    db::list_all(ctx, TABLE, vec![])
+/// sellers page rendered this from two verbatim copies of the same read plus
+/// `to_contract`; a decode failure on any row is an error for the whole read,
+/// because a seller list missing the row that could not be decoded is a
+/// governance surface that silently hides an account.
+///
+/// The table holds one row per selling user, so it grows with the platform.
+/// That is why the read is capped rather than unpaged-and-hopeful: the same
+/// argument that makes an undecodable row fatal makes a silently dropped tail
+/// unacceptable, so the caller is handed the fact that it has a prefix.
+pub(crate) async fn list_contracts(
+    ctx: &dyn Context,
+) -> Result<CappedList<SellerAccount>, WaferError> {
+    db_read::list_capped(ctx, TABLE, vec![])
         .await?
-        .iter()
-        .map(to_contract)
-        .collect()
+        .try_map(|record| to_contract(&record))
+}
+
+/// How many seller accounts exist, for the listing that shows a prefix.
+pub(crate) async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
+    db::count(ctx, TABLE, &[]).await
 }
 
 /// One seller account by its local id, as the stored row. `Ok(None)` when

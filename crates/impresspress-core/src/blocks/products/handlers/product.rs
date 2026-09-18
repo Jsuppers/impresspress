@@ -682,9 +682,10 @@ async fn slug_is_claimed(
         eq_filter("owner_id", deleted.str_field("owner_id")),
         eq_filter("slug", slug),
     ];
-    // `list_all` appends the live-only filter, so a second soft-deleted row
-    // sharing the slug is correctly not a collision.
-    Ok(!repo::products::list_all(ctx, filters).await?.is_empty())
+    // `count` appends the live-only filter, so a second soft-deleted row
+    // sharing the slug is correctly not a collision. A count, not a row read:
+    // the question is only whether the key is taken.
+    Ok(repo::products::count(ctx, &filters).await? > 0)
 }
 
 fn eq_filter(field: &str, value: &str) -> Filter {

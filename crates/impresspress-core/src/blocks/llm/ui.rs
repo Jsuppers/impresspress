@@ -15,7 +15,7 @@
 //! function directly (tests, future router changes).
 
 use maud::{html, Markup};
-use wafer_core::clients::{database as db, llm::ModelInfo};
+use wafer_core::clients::llm::ModelInfo;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{
@@ -24,6 +24,7 @@ use super::{
     LlmBlock,
 };
 use crate::{
+    db_read::{self, Bound},
     http::err_internal,
     ui::{self, components},
 };
@@ -56,14 +57,20 @@ pub(super) async fn providers_page(
 
     // Load all provider rows (both enabled and disabled) — the admin UI
     // wants the full picture, not just the in-flight set.
-    let configs: Vec<(String, ProviderConfig)> =
-        match db::list_all(ctx, PROVIDERS_TABLE, vec![]).await {
-            Ok(records) => records
-                .into_iter()
-                .filter_map(|rec| row_to_config(&rec).ok().map(|cfg| (rec.id, cfg)))
-                .collect(),
-            Err(e) => return err_internal("Database error", e),
-        };
+    let configs: Vec<(String, ProviderConfig)> = match db_read::list_bounded(
+        ctx,
+        PROVIDERS_TABLE,
+        vec![],
+        Bound::Curated("LLM providers are configured by an admin"),
+    )
+    .await
+    {
+        Ok(records) => records
+            .into_iter()
+            .filter_map(|rec| row_to_config(&rec).ok().map(|cfg| (rec.id, cfg)))
+            .collect(),
+        Err(e) => return err_internal("Database error", e),
+    };
 
     let manages = block.provider_admin.manages_providers();
 

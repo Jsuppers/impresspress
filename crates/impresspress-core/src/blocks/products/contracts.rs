@@ -787,6 +787,27 @@ pub enum OrderStatus {
 }
 
 impl OrderStatus {
+    /// Every status this contract defines, in declaration order.
+    ///
+    /// The commerce analytics needs the value set as data, not as a `match`:
+    /// it filters and groups the orders table by the stored `status`
+    /// spelling, so it has to name the whole set in a query. Keeping the list
+    /// here — beside the enum — is what stops a second, drifting copy of it
+    /// growing inside `repo::purchases`.
+    ///
+    /// `status_enum_tests::order_status_all_lists_every_variant` keeps the
+    /// list honest: its `slot` match is exhaustive, so a seventh variant
+    /// stops that test compiling, and its assertion then checks the variant
+    /// reached this array too.
+    pub const ALL: [Self; 6] = [
+        Self::Pending,
+        Self::CheckoutStarted,
+        Self::Completed,
+        Self::PartiallyRefunded,
+        Self::Refunded,
+        Self::Failed,
+    ];
+
     /// Parse the `status` column of an order row.
     pub fn from_record(record: &Record) -> Result<Self, WaferError> {
         enum_column(record, "status")
@@ -1097,6 +1118,11 @@ pub struct SellerAccount {
 #[serde(deny_unknown_fields)]
 pub struct SellerAccountList {
     pub sellers: Vec<SellerAccount>,
+    /// How many seller accounts exist, which is not `sellers.len()` when the
+    /// listing is showing a prefix.
+    pub total_count: i64,
+    /// Whether more seller accounts exist than `sellers` lists.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -3495,8 +3521,15 @@ pub struct SubscriptionStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminSellerDetail {
     pub seller: SellerAccount,
-    /// Every product owned by the seller's user, in any publication state.
+    /// The seller's live catalog — products the seller's user owns that have
+    /// not been soft-deleted, in any publication state.
     pub products: Vec<ProductView>,
+    /// Whether the seller owns more live products than `products` lists.
+    ///
+    /// Nothing caps a seller's catalog, so the listing is read up to a
+    /// ceiling; this is how a client tells a complete catalog from a prefix
+    /// of one.
+    pub truncated: bool,
 }
 
 #[cfg(test)]

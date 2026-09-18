@@ -805,6 +805,59 @@ pub(crate) fn to_wire_filters(
         .collect()
 }
 
+/// Read one aggregate output column as an exact integer, whatever JSON shape
+/// the backend's decoder produced.
+///
+/// `db::aggregate` does not hand back the same JSON type on every backend.
+/// SQLite sums an INTEGER column to a JSON integer. PostgreSQL's
+/// `sum(bigint)` is `NUMERIC`, and `wafer-block-postgres` decodes `NUMERIC`
+/// through `BigDecimal` into `f64`, so the same column arrives as a JSON
+/// float — which [`serde_json::Value::as_i64`] refuses outright. A money sum
+/// read with [`RecordExt::i64_field`] therefore answers the right figure on
+/// SQLite and `0` on PostgreSQL. `wafer-core`'s own conformance suite reads
+/// `Sum` results as `f64` for exactly this reason, and
+/// `platform_state::request_logs` already documents the float shape at its
+/// own `Avg` call site.
+///
+/// The float branch is exact for the figures this reads. Money is stored in
+/// minor units and quantities are whole, so the sum is an integer; an `f64`
+/// carries every integer up to 2^53 losslessly, and a value beyond that — or
+/// one with a fractional part, which a sum of integers cannot have — is a
+/// decode fault and is reported rather than rounded into a plausible number.
+///
+/// Not folded into [`json_as_i64`]: that one is the coercion for *stored
+/// columns*, where accepting a float would silently truncate a real
+/// fractional value. This one is for aggregate output, where a float is the
+/// backend's chosen representation of an integer.
+///
+/// Gated on `block-products` because that block is its only caller: the
+/// commerce analytics is the one place in the crate that reads a `SUM` over a
+/// money column. The lean Cloudflare Worker builds without that block and
+/// lints dead code as an error, so the gate is the honest statement of who
+/// needs this rather than an `allow`.
+#[cfg(feature = "block-products")]
+pub(crate) fn aggregate_i64(record: &Record, alias: &str) -> Result<i64, wafer_run::WaferError> {
+    let fault = |detail: &str| {
+        wafer_run::WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            format!("aggregate column {alias} is not a whole number: {detail}"),
+        )
+    };
+    let Some(value) = record.data.get(alias) else {
+        return Err(fault("the column is absent from the result row"));
+    };
+    if let Some(exact) = json_as_i64(value) {
+        return Ok(exact);
+    }
+    let Some(float) = value.as_f64() else {
+        return Err(fault(&value.to_string()));
+    };
+    if float.fract() != 0.0 || float.abs() > 9_007_199_254_740_992.0 {
+        return Err(fault(&float.to_string()));
+    }
+    Ok(float as i64)
+}
+
 /// Run ONE grouped-by-day aggregate over `table` for rows whose `created_at`
 /// is at or after `since_iso`, and return the per-day rows (one
 /// [`Record`](wafer_block::wire::database::Record) per day that has data,

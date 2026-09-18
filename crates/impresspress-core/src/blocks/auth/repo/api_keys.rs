@@ -14,6 +14,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, internal_error, map_opt_str, map_str, now_iso};
+use crate::db_read::{self, Bound};
 
 pub const TABLE: &str = "wafer_run__auth__api_keys";
 
@@ -119,7 +120,7 @@ pub async fn find_by_id(ctx: &dyn Context, id: &str) -> Result<Option<ApiKeyRow>
 /// `key_hash` is populated on the rows; callers serialising to clients must
 /// not leak it.
 pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKeyRow>, WaferError> {
-    let records = db::list_sorted(
+    let records = db_read::list_bounded_sorted(
         ctx,
         TABLE,
         vec![Filter {
@@ -131,6 +132,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKe
             field: "created_at".into(),
             desc: true,
         }],
+        Bound::OnePer("API key one user issued"),
     )
     .await
     .map_err(|e| db_failed("api_keys list_for_user", e))?;

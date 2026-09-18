@@ -580,9 +580,10 @@ async fn seller_product_publication_requires_moderation_and_protects_ownership()
         .await
     );
     assert!(
-        repo::products::list_all(&test_ctx, vec![])
+        repo::products::list_capped_live(&test_ctx, vec![])
             .await
             .unwrap()
+            .rows
             .is_empty(),
         "a refused create must not have landed a row"
     );

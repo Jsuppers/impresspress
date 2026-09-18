@@ -38,6 +38,7 @@ use crate::{
             LlmBlock,
         },
     },
+    db_read::{self, Bound},
     http::{err_bad_request, err_internal, ok_json},
 };
 
@@ -124,9 +125,14 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
     ctx: &dyn Context,
     provider_admin: &dyn ProviderAdmin,
 ) -> Result<(), String> {
-    let records = db::list_all(ctx, PROVIDERS_TABLE, vec![])
-        .await
-        .map_err(|e| format!("provider reload list failed: {e}"))?;
+    let records = db_read::list_bounded(
+        ctx,
+        PROVIDERS_TABLE,
+        vec![],
+        Bound::Curated("LLM providers are configured by an admin"),
+    )
+    .await
+    .map_err(|e| format!("provider reload list failed: {e}"))?;
     let mut configs: Vec<ProviderConfig> = Vec::with_capacity(records.len());
     for rec in &records {
         match row_to_config(rec) {
@@ -180,7 +186,14 @@ pub(in crate::blocks::llm) async fn list_providers(
     ctx: &dyn Context,
     _msg: &Message,
 ) -> OutputStream {
-    let records = match db::list_all(ctx, PROVIDERS_TABLE, vec![]).await {
+    let records = match db_read::list_bounded(
+        ctx,
+        PROVIDERS_TABLE,
+        vec![],
+        Bound::Curated("LLM providers are configured by an admin"),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return crud::db_error_internal(e, "Database error"),
     };
@@ -997,7 +1010,7 @@ mod inert_router_tests {
 
     /// The rows the providers table currently holds.
     async fn provider_rows(ctx: &dyn Context) -> Vec<wafer_core::clients::database::Record> {
-        db::list_all(ctx, PROVIDERS_TABLE, vec![])
+        db_read::list_every(ctx, PROVIDERS_TABLE, vec![])
             .await
             .expect("list providers")
     }

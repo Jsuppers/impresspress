@@ -26,6 +26,12 @@ use wafer_block::wire::database::OnConflict;
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
+use crate::{
+    blocks::products::contracts::{ApprovalStatus, ProductStatus},
+    db_read::{self, Capped},
+    util::RecordExt,
+};
+
 pub(crate) const TABLE: &str = "impresspress__products__products";
 
 // Column invariant — `deleted_at` holds exactly two kinds of value:
@@ -142,16 +148,115 @@ pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, 
     db::count(ctx, TABLE, &all).await
 }
 
-/// List every live product matching `filters`, unpaged. `filters` narrows
-/// the live set; it cannot widen it — same contract as `list_page`, for
-/// call sites (admin seller/product listings) that need the whole matching
-/// set rather than one page.
-pub(crate) async fn list_all(
+/// EVERY live product matching `filters`, however many there are. `filters`
+/// narrows the live set; it cannot widen it — same contract as `list_page`.
+///
+/// Exhaustive, for the one caller that has to round-trip the whole catalog:
+/// the dev site export, whose bundle is restored over the live tables. A
+/// listing that merely *shows* products wants [`list_capped_live`]; a figure
+/// derived from the set wants [`count`] or an aggregate.
+#[cfg(feature = "block-dev")]
+pub(crate) async fn list_every_live(
     ctx: &dyn Context,
     mut filters: Vec<Filter>,
 ) -> Result<Vec<Record>, WaferError> {
     filters.push(live_filter());
-    db::list_all(ctx, TABLE, filters).await
+    db_read::list_every(ctx, TABLE, filters).await
+}
+
+/// Live products matching `filters` for a listing, and whether more match
+/// than were returned.
+///
+/// Nothing bounds a seller's catalog —
+/// `IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS` defaults to unlimited — so a
+/// listing has to be able to say it is showing a prefix.
+pub(crate) async fn list_capped_live(
+    ctx: &dyn Context,
+    mut filters: Vec<Filter>,
+) -> Result<Capped, WaferError> {
+    filters.push(live_filter());
+    db_read::list_capped(ctx, TABLE, filters).await
+}
+
+/// Live-product counts per owner id, as one `GROUP BY` rather than a scan of
+/// every seller product on the platform.
+///
+/// One row per owner that still has a live product, so the result is the
+/// size of the seller base and not of the catalog.
+pub(crate) async fn live_counts_by_owner(
+    ctx: &dyn Context,
+    owner_kind: &str,
+) -> Result<HashMap<String, i64>, WaferError> {
+    use wafer_block::wire::database as wire;
+
+    let filters = vec![
+        Filter {
+            field: "owner_kind".to_string(),
+            operator: FilterOp::Equal,
+            value: Value::String(owner_kind.to_string()),
+        },
+        live_filter(),
+    ];
+    let req = wire::AggregateRequest {
+        collection: TABLE.to_string(),
+        select_columns: vec!["owner_id".into()],
+        aggregates: vec![wire::AggregateColumnDef::Count {
+            alias: "products".into(),
+        }],
+        filters: crate::util::to_wire_filters(&filters),
+        group_by: vec![wire::GroupByDef::Column("owner_id".into())],
+        sort: vec![],
+        limit: 0,
+    };
+    db::aggregate(ctx, req)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.str_field("owner_id").to_string(),
+                // Through `aggregate_i64`, like every other aggregate read in
+                // this block: a backend is entitled to hand an aggregate back
+                // as a JSON float, and `i64_field` reads one as 0.
+                crate::util::aggregate_i64(row, "products")?,
+            ))
+        })
+        .collect()
+}
+
+/// `owner_kind = 'user' AND status = pending_review AND approval_status =
+/// pending` — the moderation queue's own predicate, named once so the page
+/// that lists it and the count beside it cannot drift apart.
+fn pending_review_filters() -> Vec<Filter> {
+    vec![
+        Filter {
+            field: "owner_kind".to_string(),
+            operator: FilterOp::Equal,
+            value: Value::String("user".to_string()),
+        },
+        Filter {
+            field: "status".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(ProductStatus::PendingReview),
+        },
+        Filter {
+            field: "approval_status".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(ApprovalStatus::Pending),
+        },
+    ]
+}
+
+/// The moderation queue: live seller listings waiting for a decision.
+///
+/// The predicate is in the query, not in a Rust filter over every seller
+/// product on the platform — the queue is the small set, the catalog is not.
+pub(crate) async fn list_pending_review(ctx: &dyn Context) -> Result<Capped, WaferError> {
+    list_capped_live(ctx, pending_review_filters()).await
+}
+
+/// How many listings are waiting for a moderation decision.
+pub(crate) async fn count_pending_review(ctx: &dyn Context) -> Result<i64, WaferError> {
+    count(ctx, &pending_review_filters()).await
 }
 
 /// Every LIVE product `user_id` owns — a seller's catalog.
@@ -160,14 +265,11 @@ pub(crate) async fn list_all(
 /// detail endpoint, the admin seller detail page, and `sellers.rs`'s private
 /// `owned_by`); it is one query with one name now. A deleted listing is not
 /// part of a seller's catalog and does not belong in a catalog view, which is
-/// why this goes through [`list_all`] rather than
+/// why this goes through [`list_capped_live`] rather than
 /// [`list_all_including_deleted`] — suspension, which does want every row the
 /// seller owns, keeps its own read.
-pub(crate) async fn list_owned_by(
-    ctx: &dyn Context,
-    user_id: &str,
-) -> Result<Vec<Record>, WaferError> {
-    list_all(ctx, vec![owner_filter(user_id)]).await
+pub(crate) async fn list_owned_by(ctx: &dyn Context, user_id: &str) -> Result<Capped, WaferError> {
+    list_capped_live(ctx, vec![owner_filter(user_id)]).await
 }
 
 /// Every product `user_id` owns, soft-deleted ones included — what
@@ -204,13 +306,18 @@ fn owner_filter(user_id: &str) -> Filter {
 /// for.
 ///
 /// Not a general-purpose escape hatch: a read that merely *displays* products
-/// wants [`list_all`]. Use this only where "every row the owner has" is the
+/// wants [`list_capped_live`]. Use this only where "every row the owner has" is the
 /// actual requirement.
+///
+/// Exhaustive, and it has to be: the seller product cap is a config value
+/// that defaults to unlimited, so nothing bounds a seller's catalog. A row
+/// this read stopped short of is a Stripe Price and Payment Link that the
+/// suspension never archives and that goes on taking money.
 pub(crate) async fn list_all_including_deleted(
     ctx: &dyn Context,
     filters: Vec<Filter>,
 ) -> Result<Vec<Record>, WaferError> {
-    db::list_all(ctx, TABLE, filters).await
+    db_read::list_every(ctx, TABLE, filters).await
 }
 
 /// Fetch one product regardless of soft-delete state.
@@ -586,12 +693,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_all_excludes_soft_deleted_rows() {
+    async fn list_capped_live_excludes_soft_deleted_rows() {
         let ctx = TestContext::with_products().await;
         seed(&ctx, "live", None).await;
         seed(&ctx, "gone", Some("2026-09-01T00:00:00Z")).await;
-        let records = list_all(&ctx, vec![]).await.expect("list_all");
-        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        let records = list_capped_live(&ctx, vec![]).await.expect("live listing");
+        let ids: Vec<&str> = records.rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
     }
 

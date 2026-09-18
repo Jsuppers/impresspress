@@ -7230,6 +7230,14 @@ export interface paths {
                                 sync_error: string;
                                 user_id: string;
                             }[];
+                            /**
+                             * Format: int64
+                             * @description How many seller accounts exist, which is not `sellers.len()` when the
+                             *     listing is showing a prefix.
+                             */
+                            total_count: number;
+                            /** @description Whether more seller accounts exist than `sellers` lists. */
+                            truncated: boolean;
                         };
                     };
                 };
@@ -7269,7 +7277,10 @@ export interface paths {
                     };
                     content: {
                         "application/json": {
-                            /** @description Every product owned by the seller's user, in any publication state. */
+                            /**
+                             * @description The seller's live catalog — products the seller's user owns that have
+                             *     not been soft-deleted, in any publication state.
+                             */
                             products: {
                                 /**
                                  * @description Moderation state: `draft`, `pending` (submitted for review), `approved`,
@@ -7411,6 +7422,14 @@ export interface paths {
                                 sync_error: string;
                                 user_id: string;
                             };
+                            /**
+                             * @description Whether the seller owns more live products than `products` lists.
+                             *
+                             *     Nothing caps a seller's catalog, so the listing is read up to a
+                             *     ceiling; this is how a client tells a complete catalog from a prefix
+                             *     of one.
+                             */
+                            truncated: boolean;
                         };
                     };
                 };
@@ -12887,6 +12906,14 @@ export interface paths {
                              *     truth for bucket existence. Not the blob namespace's folder list.
                              */
                             buckets: string[];
+                            /**
+                             * @description Whether more buckets are visible to the caller than `buckets` names.
+                             *
+                             *     Buckets are created self-service, so the admin view of this listing
+                             *     grows with the deployment and is read up to a ceiling; this is how a
+                             *     client tells a complete list from a prefix of one.
+                             */
+                            truncated: boolean;
                         };
                     };
                 };
@@ -12981,6 +13008,14 @@ export interface paths {
                              *     truth for bucket existence. Not the blob namespace's folder list.
                              */
                             buckets: string[];
+                            /**
+                             * @description Whether more buckets are visible to the caller than `buckets` names.
+                             *
+                             *     Buckets are created self-service, so the admin view of this listing
+                             *     grows with the deployment and is read up to a ceiling; this is how a
+                             *     client tells a complete list from a prefix of one.
+                             */
+                            truncated: boolean;
                         };
                     };
                 };

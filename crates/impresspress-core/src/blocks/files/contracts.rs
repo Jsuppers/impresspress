@@ -158,6 +158,12 @@ pub struct BucketListResponse {
     /// Bucket names, from `repo::buckets::TABLE` — the single source of
     /// truth for bucket existence. Not the blob namespace's folder list.
     pub buckets: Vec<String>,
+    /// Whether more buckets are visible to the caller than `buckets` names.
+    ///
+    /// Buckets are created self-service, so the admin view of this listing
+    /// grows with the deployment and is read up to a ceiling; this is how a
+    /// client tells a complete list from a prefix of one.
+    pub truncated: bool,
 }
 
 /// `POST /b/storage/api/buckets` response body.

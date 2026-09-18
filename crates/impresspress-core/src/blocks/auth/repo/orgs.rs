@@ -14,6 +14,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, internal_error, map_bool, map_opt_str, map_str, now_iso};
+use crate::db_read::{self, Bound};
 
 pub const TABLE: &str = "wafer_run__auth__orgs";
 
@@ -66,7 +67,7 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<OrgRow, OrgsRepoError> {
 /// Look up a single org by its `name` column (UNIQUE). Returns `Ok(None)` if
 /// no such row exists.
 pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow>, OrgsRepoError> {
-    let rows = db::list_all(
+    let rows = db_read::list_bounded(
         ctx,
         TABLE,
         vec![Filter {
@@ -74,6 +75,7 @@ pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow
             operator: FilterOp::Equal,
             value: json!(name),
         }],
+        Bound::UniqueKey("orgs.name is declared UNIQUE"),
     )
     .await
     .map_err(|e| OrgsRepoError::Db(db_failed("orgs find_by_name", e)))?;
@@ -86,7 +88,7 @@ pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow
 /// Return all orgs owned by `user_id`, ordered by `created_at` ASC for
 /// stable rendering. Empty Vec if the user owns none.
 pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<OrgRow>, OrgsRepoError> {
-    let records = db::list_sorted(
+    let records = db_read::list_bounded_sorted(
         ctx,
         TABLE,
         vec![Filter {
@@ -98,6 +100,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<OrgRo
             field: "created_at".into(),
             desc: false,
         }],
+        Bound::OnePer("org one user owns"),
     )
     .await
     .map_err(|e| OrgsRepoError::Db(db_failed("orgs list_for_user", e)))?;

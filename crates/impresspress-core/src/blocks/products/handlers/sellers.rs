@@ -31,10 +31,26 @@ fn admin_error(error: WaferError, not_found: &str) -> OutputStream {
 }
 
 pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
-    match repo::seller_accounts::list_contracts(ctx).await {
-        Ok(sellers) => ok_json(&SellerAccountList { sellers }),
-        Err(error) => admin_error(error, "Seller not found"),
-    }
+    let sellers = match repo::seller_accounts::list_contracts(ctx).await {
+        Ok(sellers) => sellers,
+        Err(error) => return admin_error(error, "Seller not found"),
+    };
+    // One row per selling user, so the read is capped. `total_count` comes
+    // from the database when it is: a count taken off the returned page would
+    // report the ceiling as the platform's seller population.
+    let total_count = if sellers.truncated {
+        match repo::seller_accounts::count_all(ctx).await {
+            Ok(total) => total,
+            Err(error) => return admin_error(error, "Seller not found"),
+        }
+    } else {
+        sellers.rows.len() as i64
+    };
+    ok_json(&SellerAccountList {
+        sellers: sellers.rows,
+        total_count,
+        truncated: sellers.truncated,
+    })
 }
 
 pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -51,7 +67,9 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(products) => products,
         Err(error) => return err_internal("Could not list seller products", error),
     };
+    let truncated = products.truncated;
     let products = match products
+        .rows
         .iter()
         .map(crate::blocks::products::contracts::ProductView::from_record)
         .collect::<Result<Vec<_>, _>>()
@@ -59,7 +77,11 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(products) => products,
         Err(error) => return err_internal("Product row is outside the contract", error),
     };
-    ok_json(&AdminSellerDetail { seller, products })
+    ok_json(&AdminSellerDetail {
+        seller,
+        products,
+        truncated,
+    })
 }
 
 async fn moderate_product(ctx: &dyn Context, msg: &Message, approve: bool) -> OutputStream {

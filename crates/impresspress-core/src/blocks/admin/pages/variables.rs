@@ -2118,7 +2118,7 @@ mod tests {
 
         post_bulk_release(&ctx).await;
 
-        let rows = wafer_core::clients::database::list_all(
+        let rows = crate::db_read::list_every(
             &ctx,
             crate::blocks::admin::logs::AUDIT_LOGS_TABLE,
             vec![wafer_block::db::Filter {

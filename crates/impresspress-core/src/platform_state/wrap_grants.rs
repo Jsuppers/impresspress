@@ -18,7 +18,10 @@ use wafer_block::db::ListOptions;
 use wafer_core::{clients::database as db, interfaces::database::service::DatabaseService};
 use wafer_run::{context::Context, ErrorCode, ResourceGrant, ResourceType, WaferError};
 
-use crate::util::RecordExt;
+use crate::{
+    db_read::{self, Bound},
+    util::RecordExt,
+};
 
 pub const TABLE: &str = "impresspress__admin__wrap_grants";
 
@@ -221,7 +224,13 @@ pub(crate) async fn seed_fixture_grant(db: &Arc<dyn DatabaseService>) {
 /// custom grants in force, and a listing that hides a row it cannot read
 /// would misstate what the runtime loaded.
 pub async fn list(ctx: &dyn Context) -> Result<Vec<WrapGrantRow>, WaferError> {
-    let records = db::list_all(ctx, TABLE, vec![]).await?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        vec![],
+        Bound::Curated("custom WRAP grants are created by an operator in the admin UI"),
+    )
+    .await?;
     records
         .iter()
         .map(|r| WrapGrantRow::from_record(&r.id, &r.data).map_err(decode_error))

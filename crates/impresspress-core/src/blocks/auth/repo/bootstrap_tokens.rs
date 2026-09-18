@@ -10,7 +10,10 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, now_iso};
-use crate::util::hex_encode;
+use crate::{
+    db_read::{self, Bound},
+    util::hex_encode,
+};
 
 pub const TABLE: &str = "wafer_run__auth__bootstrap_tokens";
 
@@ -59,9 +62,14 @@ pub async fn is_valid(ctx: &dyn Context, token_hash: &[u8]) -> Result<bool, Wafe
             value: json!(now),
         },
     ];
-    let records = db::list_all(ctx, TABLE, filters)
-        .await
-        .map_err(|e| db_failed("bootstrap_tokens lookup", e))?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters,
+        Bound::UniqueKey("bootstrap_tokens.token_hash is declared UNIQUE"),
+    )
+    .await
+    .map_err(|e| db_failed("bootstrap_tokens lookup", e))?;
     Ok(!records.is_empty())
 }
 
@@ -79,9 +87,14 @@ pub async fn delete_by_hash(ctx: &dyn Context, token_hash: &[u8]) -> Result<(), 
         operator: FilterOp::Equal,
         value: json!(hex),
     }];
-    let records = db::list_all(ctx, TABLE, filters)
-        .await
-        .map_err(|e| db_failed("bootstrap_tokens lookup for delete", e))?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters,
+        Bound::UniqueKey("bootstrap_tokens.token_hash is declared UNIQUE"),
+    )
+    .await
+    .map_err(|e| db_failed("bootstrap_tokens lookup for delete", e))?;
     for record in records {
         db::delete(ctx, TABLE, &record.id)
             .await

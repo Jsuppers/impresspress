@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
+use wafer_block::{
+    db::{Filter, FilterOp, ListOptions, SortField},
+    wire::database as wire,
+};
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, WaferError};
 
@@ -15,6 +18,7 @@ use crate::{
         },
         money,
     },
+    db_read::{self, Bound},
     util::RecordExt,
 };
 
@@ -480,7 +484,7 @@ pub(crate) async fn list_line_items(
     ctx: &dyn Context,
     purchase_id: &str,
 ) -> Result<Vec<Record>, WaferError> {
-    db::list_all(
+    db_read::list_bounded(
         ctx,
         LINE_ITEMS_TABLE,
         vec![Filter {
@@ -488,6 +492,7 @@ pub(crate) async fn list_line_items(
             operator: FilterOp::Equal,
             value: serde_json::Value::String(purchase_id.to_string()),
         }],
+        Bound::OnePer("line on one order — a single checkout cart"),
     )
     .await
 }
@@ -1605,15 +1610,10 @@ fn analytics_u64(value: u128, field: &str) -> Result<u64, WaferError> {
     u64::try_from(value).map_err(|_| analytics_overflow(field))
 }
 
-/// Build currency-separated commerce analytics from immutable order and line
-/// snapshots. `seller_account_id` scopes every header before any totals or
-/// top-product rows are considered, keeping seller analytics tenant-isolated.
-/// Revenue is never added across currencies.
-pub(crate) async fn commerce_analytics(
-    ctx: &dyn Context,
-    seller_account_id: Option<&str>,
-) -> Result<Vec<CommerceAnalytics>, WaferError> {
-    let filters = seller_account_id
+/// Orders-table filter that scopes every analytics read to one seller, or to
+/// the whole platform when `seller_account_id` is absent or blank.
+fn analytics_scope(seller_account_id: Option<&str>) -> Vec<Filter> {
+    seller_account_id
         .filter(|value| !value.is_empty())
         .map(|value| {
             vec![Filter {
@@ -1622,112 +1622,396 @@ pub(crate) async fn commerce_analytics(
                 value: serde_json::json!(value),
             }]
         })
-        .unwrap_or_default();
-    let orders = db::list_all(ctx, PURCHASES_TABLE, filters).await?;
-    let mut by_currency: BTreeMap<String, AnalyticsAccumulator> = BTreeMap::new();
-    let mut paid_order_currencies = HashMap::new();
+        .unwrap_or_default()
+}
 
-    for order in orders {
+/// The stored spellings of `statuses`, as an `IN (...)` filter on `status`.
+fn status_in(statuses: impl IntoIterator<Item = OrderStatus>) -> Filter {
+    Filter {
+        field: "status".to_string(),
+        operator: FilterOp::In,
+        value: serde_json::Value::Array(
+            statuses
+                .into_iter()
+                .map(|status| serde_json::json!(status))
+                .collect(),
+        ),
+    }
+}
+
+/// A conditional count of the rows in a group whose `field` is negative —
+/// the grouped form of the per-row "this amount cannot be negative" check.
+fn negative_rows(field: &str) -> Vec<wafer_block::wire::database::FilterNode> {
+    crate::util::to_wire_filters(&[Filter {
+        field: field.to_string(),
+        operator: FilterOp::LessThan,
+        value: serde_json::json!(0),
+    }])
+}
+
+/// Read an aggregate column as a signed minor-unit amount.
+///
+/// Every aggregate output here goes through [`crate::util::aggregate_i64`]
+/// rather than `i64_field`: PostgreSQL's `sum(bigint)` is `NUMERIC` and
+/// reaches this crate as a JSON float, which `i64_field` reads as `0`. Every
+/// money column in this block's PostgreSQL schema is `BIGINT`, so every money
+/// figure on the dashboard is one of those.
+fn analytics_amount(record: &Record, alias: &str) -> Result<i128, WaferError> {
+    Ok(i128::from(crate::util::aggregate_i64(record, alias)?))
+}
+
+/// Read an aggregate column as a non-negative count.
+///
+/// A `COUNT(*)`, a conditional count or a summed quantity cannot be negative;
+/// if one comes back negative the aggregate itself is broken, and clamping
+/// would hide that behind a plausible figure.
+fn analytics_count(record: &Record, alias: &str) -> Result<u128, WaferError> {
+    let value = crate::util::aggregate_i64(record, alias)?;
+    u128::try_from(value).map_err(|_| {
+        WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            format!("commerce analytics read a negative {alias} ({value})"),
+        )
+    })
+}
+
+/// Order totals per `(currency, status)` — `COUNT(*)`, the three money sums,
+/// the number of orders carrying a refund, and one conditional count per
+/// money column for rows holding a negative amount.
+async fn order_totals(
+    ctx: &dyn Context,
+    seller_account_id: Option<&str>,
+) -> Result<Vec<Record>, WaferError> {
+    let req = wire::AggregateRequest {
+        collection: PURCHASES_TABLE.to_string(),
+        select_columns: vec!["currency".into(), "status".into()],
+        aggregates: vec![
+            wire::AggregateColumnDef::Count {
+                alias: "orders".into(),
+            },
+            wire::AggregateColumnDef::Sum {
+                field: "total_cents".into(),
+                alias: "gross".into(),
+            },
+            wire::AggregateColumnDef::Sum {
+                field: "refunded_total_cents".into(),
+                alias: "refunded".into(),
+            },
+            wire::AggregateColumnDef::Sum {
+                field: "platform_fee_cents".into(),
+                alias: "fees".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: crate::util::to_wire_filters(&[Filter {
+                    field: "refunded_total_cents".to_string(),
+                    operator: FilterOp::GreaterThan,
+                    value: serde_json::json!(0),
+                }]),
+                alias: "refunded_orders".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: negative_rows("total_cents"),
+                alias: "negative_totals".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: negative_rows("refunded_total_cents"),
+                alias: "negative_refunds".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: negative_rows("platform_fee_cents"),
+                alias: "negative_fees".into(),
+            },
+        ],
+        filters: crate::util::to_wire_filters(&analytics_scope(seller_account_id)),
+        group_by: vec![
+            wire::GroupByDef::Column("currency".into()),
+            wire::GroupByDef::Column("status".into()),
+        ],
+        sort: vec![],
+        limit: 0,
+    };
+    db::aggregate(ctx, req).await
+}
+
+/// Subscription counts per `(currency, subscription_status)`, over the orders
+/// that carry a Stripe subscription id.
+///
+/// Filtered to the statuses the contract defines, because the row scan this
+/// replaced skipped a row with an unreadable `status` before it ever looked
+/// at the subscription columns.
+async fn subscription_totals(
+    ctx: &dyn Context,
+    seller_account_id: Option<&str>,
+) -> Result<Vec<Record>, WaferError> {
+    let mut filters = analytics_scope(seller_account_id);
+    filters.push(Filter {
+        field: "stripe_subscription_id".to_string(),
+        operator: FilterOp::NotEqual,
+        value: serde_json::json!(""),
+    });
+    filters.push(status_in(OrderStatus::ALL));
+    let req = wire::AggregateRequest {
+        collection: PURCHASES_TABLE.to_string(),
+        select_columns: vec!["currency".into(), "subscription_status".into()],
+        aggregates: vec![wire::AggregateColumnDef::Count {
+            alias: "subscriptions".into(),
+        }],
+        filters: crate::util::to_wire_filters(&filters),
+        group_by: vec![
+            wire::GroupByDef::Column("currency".into()),
+            wire::GroupByDef::Column("subscription_status".into()),
+        ],
+        sort: vec![],
+        limit: 0,
+    };
+    db::aggregate(ctx, req).await
+}
+
+/// The id of every paid order, bucketed by its normalized currency.
+///
+/// The one read in the analytics that still materializes rows, because the
+/// top-products figures come from `line_items`, which carries neither the
+/// order's currency nor its paid state — and the aggregate wire has no join,
+/// so the currency has to be carried across from the header side here. Reads
+/// two columns per row and walks the paid orders by keyset, so it is exact at
+/// any table size.
+async fn paid_order_ids_by_currency(
+    ctx: &dyn Context,
+    seller_account_id: Option<&str>,
+) -> Result<BTreeMap<String, Vec<String>>, WaferError> {
+    let mut filters = analytics_scope(seller_account_id);
+    filters.push(status_in(
+        OrderStatus::ALL
+            .into_iter()
+            .filter(|status| status.is_paid()),
+    ));
+    let mut by_currency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = db_read::page_after(
+            ctx,
+            PURCHASES_TABLE,
+            filters.clone(),
+            Some(vec!["id".into(), "currency".into()]),
+            cursor.as_deref(),
+        )
+        .await?;
+        let short = (page.len() as i64) < db_read::KEYSET_PAGE;
+        cursor = page.last().map(|row| row.id.clone());
+        for row in page {
+            let currency =
+                money::normalize_currency(row.str_field("currency")).map_err(|message| {
+                    WaferError::new(
+                        wafer_run::ErrorCode::Internal,
+                        format!("order {} has invalid currency: {message}", row.id),
+                    )
+                })?;
+            by_currency.entry(currency).or_default().push(row.id);
+        }
+        if short || cursor.is_none() {
+            return Ok(by_currency);
+        }
+    }
+}
+
+/// Per-product totals over the line items of `purchase_ids` — one row per
+/// `(product_id, product_name)` the chunk touches, carrying the summed
+/// quantity and revenue plus a conditional count of rows holding a negative
+/// amount.
+///
+/// The caller passes ids that all share one currency, which is what makes a
+/// plain `GROUP BY` enough: `line_items` stores neither the order's currency
+/// nor its paid state, and the aggregate wire cannot join back to the header.
+async fn line_item_totals(
+    ctx: &dyn Context,
+    purchase_ids: &[String],
+) -> Result<Vec<Record>, WaferError> {
+    let req = wire::AggregateRequest {
+        collection: LINE_ITEMS_TABLE.to_string(),
+        select_columns: vec!["product_id".into(), "product_name".into()],
+        aggregates: vec![
+            wire::AggregateColumnDef::Sum {
+                field: "quantity".into(),
+                alias: "quantity".into(),
+            },
+            wire::AggregateColumnDef::Sum {
+                field: "total_minor".into(),
+                alias: "revenue".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: negative_rows("quantity"),
+                alias: "negative_quantities".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: negative_rows("total_minor"),
+                alias: "negative_revenue".into(),
+            },
+        ],
+        filters: crate::util::to_wire_filters(&[Filter {
+            field: "purchase_id".to_string(),
+            operator: FilterOp::In,
+            value: serde_json::Value::Array(
+                purchase_ids
+                    .iter()
+                    .map(|id| serde_json::json!(id))
+                    .collect(),
+            ),
+        }]),
+        group_by: vec![
+            wire::GroupByDef::Column("product_id".into()),
+            wire::GroupByDef::Column("product_name".into()),
+        ],
+        sort: vec![],
+        limit: 0,
+    };
+    db::aggregate(ctx, req).await
+}
+
+/// Build currency-separated commerce analytics from immutable order and line
+/// snapshots. `seller_account_id` scopes every header before any totals or
+/// top-product rows are considered, keeping seller analytics tenant-isolated.
+/// Revenue is never added across currencies.
+///
+/// Every figure is a `GROUP BY` in the database. The orders, disputes and
+/// line-item tables all grow without bound, so adding their columns up in
+/// Rust would have meant reading every row — and any unpaged read has a
+/// ceiling, which would have made the dashboard understate revenue on a busy
+/// platform with no symptom at all. The per-row integrity checks the scan
+/// used to make survive as conditional counts: a group reporting even one
+/// negative amount still fails the whole read.
+///
+/// The totals are three statements whatever the table size. The top-products
+/// half is not: it walks the paid orders a keyset page at a time and issues
+/// one aggregate per 200 ids, so its round-trip count grows with the order
+/// book. On Cloudflare that meets D1's per-request subrequest budget at
+/// roughly a hundred thousand paid orders — the price of being exact without
+/// a join, and the reason the upstream note on `line_item_totals` exists.
+pub(crate) async fn commerce_analytics(
+    ctx: &dyn Context,
+    seller_account_id: Option<&str>,
+) -> Result<Vec<CommerceAnalytics>, WaferError> {
+    let mut by_currency: BTreeMap<String, AnalyticsAccumulator> = BTreeMap::new();
+
+    for group in order_totals(ctx, seller_account_id).await? {
         let currency =
-            money::normalize_currency(order.str_field("currency")).map_err(|message| {
+            money::normalize_currency(group.str_field("currency")).map_err(|message| {
                 WaferError::new(
                     wafer_run::ErrorCode::Internal,
-                    format!("order {} has invalid currency: {message}", order.id),
+                    format!("orders carry an invalid currency: {message}"),
                 )
             })?;
-        let aggregate = by_currency.entry(currency.clone()).or_default();
-        aggregate.order_count += 1;
-        // Same reasoning as `PurchaseListResponse::from_record_list`: one row
+        let orders = analytics_count(&group, "orders")?;
+        let aggregate = by_currency.entry(currency).or_default();
+        aggregate.order_count += orders;
+        // Same reasoning as `PurchaseListResponse::from_record_list`: rows
         // whose state column is outside the contract must not take down the
-        // whole stats endpoint. It is counted in `order_count` (it is a real
-        // order) but contributes no money, and is logged for the operator.
-        let status = match OrderStatus::from_record(&order) {
+        // whole stats endpoint. They are counted in `order_count` (they are
+        // real orders) but contribute no money, and are logged for the
+        // operator.
+        let status = match OrderStatus::from_record(&group) {
             Ok(status) => status,
             Err(e) => {
                 tracing::error!(
-                    order_id = %order.id,
+                    status = %group.str_field("status"),
+                    orders,
                     error = %e,
-                    "order row is outside the published contract and was omitted from analytics"
+                    "order rows outside the published contract were omitted from analytics"
                 );
                 continue;
             }
         };
-        let paid = status.is_paid();
-        if paid {
-            let total = order.i64_field("total_cents");
-            let refunded = order.i64_field("refunded_total_cents");
-            let platform_fee = order.i64_field("platform_fee_cents");
-            if total < 0 || refunded < 0 || refunded > total || platform_fee < 0 {
+        if status.is_paid() {
+            if analytics_count(&group, "negative_totals")? > 0
+                || analytics_count(&group, "negative_refunds")? > 0
+                || analytics_count(&group, "negative_fees")? > 0
+            {
                 return Err(WaferError::new(
                     wafer_run::ErrorCode::Internal,
-                    format!("order {} has invalid analytics amounts", order.id),
+                    format!("{status:?} orders hold a negative analytics amount"),
                 ));
             }
-            aggregate.paid_order_count += 1;
-            aggregate.gross_volume_minor += i128::from(total);
-            aggregate.refunded_volume_minor += i128::from(refunded);
-            aggregate.platform_fees_minor += i128::from(platform_fee);
-            if refunded > 0 {
-                aggregate.refunded_order_count += 1;
-            }
-            paid_order_currencies.insert(order.id.clone(), currency);
+            aggregate.paid_order_count += orders;
+            aggregate.gross_volume_minor += analytics_amount(&group, "gross")?;
+            aggregate.refunded_volume_minor += analytics_amount(&group, "refunded")?;
+            aggregate.platform_fees_minor += analytics_amount(&group, "fees")?;
+            aggregate.refunded_order_count += analytics_count(&group, "refunded_orders")?;
         } else if status == OrderStatus::Failed {
-            aggregate.failed_order_count += 1;
-        }
-
-        if !order.str_field("stripe_subscription_id").is_empty() {
-            match SubscriptionStatus::from_record(&order)? {
-                SubscriptionStatus::Active => aggregate.active_subscription_count += 1,
-                SubscriptionStatus::Trialing => aggregate.trialing_subscription_count += 1,
-                SubscriptionStatus::PastDue
-                | SubscriptionStatus::Unpaid
-                | SubscriptionStatus::Paused => aggregate.past_due_subscription_count += 1,
-                SubscriptionStatus::Canceled | SubscriptionStatus::IncompleteExpired => {
-                    aggregate.canceled_subscription_count += 1
-                }
-                // An order with a Stripe subscription id whose state has
-                // not arrived yet, or one Stripe is still setting up. It
-                // belongs to no bucket the analytics page shows.
-                SubscriptionStatus::Unset | SubscriptionStatus::Incomplete => {}
-            }
+            aggregate.failed_order_count += orders;
         }
     }
 
-    for dispute in super::disputes::list_for_analytics(ctx, seller_account_id).await? {
-        let currency =
-            money::normalize_currency(dispute.str_field("currency")).map_err(|message| {
-                WaferError::new(
-                    wafer_run::ErrorCode::Internal,
-                    format!("dispute {} has invalid currency: {message}", dispute.id),
-                )
-            })?;
-        let amount = dispute.i64_field("amount_minor");
-        if amount <= 0 {
+    // The row scan also refused an order whose refunded amount exceeded its
+    // total. The aggregate wire compares a column against a literal, never
+    // against another column, so the same rule is enforced on the sums: no
+    // currency may report more refunded than it took.
+    for (currency, aggregate) in &by_currency {
+        if aggregate.refunded_volume_minor > aggregate.gross_volume_minor {
             return Err(WaferError::new(
                 wafer_run::ErrorCode::Internal,
-                format!("dispute {} has an invalid amount", dispute.id),
+                format!("{currency} orders report more refunded than gross volume"),
             ));
         }
+    }
+
+    for group in subscription_totals(ctx, seller_account_id).await? {
+        let currency =
+            money::normalize_currency(group.str_field("currency")).map_err(|message| {
+                WaferError::new(
+                    wafer_run::ErrorCode::Internal,
+                    format!("subscription orders carry an invalid currency: {message}"),
+                )
+            })?;
+        let subscriptions = analytics_count(&group, "subscriptions")?;
+        let aggregate = by_currency.entry(currency).or_default();
+        match SubscriptionStatus::from_record(&group)? {
+            SubscriptionStatus::Active => aggregate.active_subscription_count += subscriptions,
+            SubscriptionStatus::Trialing => aggregate.trialing_subscription_count += subscriptions,
+            SubscriptionStatus::PastDue
+            | SubscriptionStatus::Unpaid
+            | SubscriptionStatus::Paused => aggregate.past_due_subscription_count += subscriptions,
+            SubscriptionStatus::Canceled | SubscriptionStatus::IncompleteExpired => {
+                aggregate.canceled_subscription_count += subscriptions
+            }
+            // An order with a Stripe subscription id whose state has
+            // not arrived yet, or one Stripe is still setting up. It
+            // belongs to no bucket the analytics page shows.
+            SubscriptionStatus::Unset | SubscriptionStatus::Incomplete => {}
+        }
+    }
+
+    for group in super::disputes::analytics_totals(ctx, seller_account_id).await? {
+        let currency =
+            money::normalize_currency(group.str_field("currency")).map_err(|message| {
+                WaferError::new(
+                    wafer_run::ErrorCode::Internal,
+                    format!("disputes carry an invalid currency: {message}"),
+                )
+            })?;
+        if analytics_count(&group, "invalid_amounts")? > 0 {
+            return Err(WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("{currency} disputes hold an amount that is not positive"),
+            ));
+        }
+        let disputes = analytics_count(&group, "disputes")?;
+        let amount = analytics_amount(&group, "amount")?;
         let aggregate = by_currency.get_mut(&currency).ok_or_else(|| {
             WaferError::new(
                 wafer_run::ErrorCode::Internal,
-                format!(
-                    "dispute {} has no matching order currency aggregate",
-                    dispute.id
-                ),
+                format!("{currency} disputes have no matching order currency aggregate"),
             )
         })?;
-        match super::disputes::status_of(&dispute)? {
+        match super::disputes::status_of(&group)? {
             DisputeStatus::WarningNeedsResponse
             | DisputeStatus::WarningUnderReview
             | DisputeStatus::NeedsResponse
             | DisputeStatus::UnderReview => {
-                aggregate.open_dispute_count += 1;
-                aggregate.open_disputed_volume_minor += i128::from(amount);
+                aggregate.open_dispute_count += disputes;
+                aggregate.open_disputed_volume_minor += amount;
             }
             DisputeStatus::Lost => {
-                aggregate.lost_dispute_count += 1;
-                aggregate.lost_disputed_volume_minor += i128::from(amount);
+                aggregate.lost_dispute_count += disputes;
+                aggregate.lost_disputed_volume_minor += amount;
             }
             // Closed in the merchant's favour, prevented before it became a
             // dispute, or a warning that closed: none of them is open and
@@ -1736,46 +2020,35 @@ pub(crate) async fn commerce_analytics(
         }
     }
 
-    let paid_ids: Vec<String> = paid_order_currencies.keys().cloned().collect();
-    // Keep each IN query comfortably below common SQLite/D1 parameter limits.
-    for chunk in paid_ids.chunks(200) {
-        let lines = db::list_all(
-            ctx,
-            LINE_ITEMS_TABLE,
-            vec![Filter {
-                field: "purchase_id".to_string(),
-                operator: FilterOp::In,
-                value: serde_json::Value::Array(
-                    chunk.iter().map(|id| serde_json::json!(id)).collect(),
-                ),
-            }],
-        )
-        .await?;
-        for line in lines {
-            let Some(currency) = paid_order_currencies.get(line.str_field("purchase_id")) else {
-                continue;
-            };
-            let quantity = line.i64_field("quantity");
-            let revenue = line.i64_field("total_minor");
-            if quantity < 0 || revenue < 0 {
-                return Err(WaferError::new(
-                    wafer_run::ErrorCode::Internal,
-                    format!("line item {} has invalid analytics amounts", line.id),
-                ));
+    for (currency, paid_ids) in paid_order_ids_by_currency(ctx, seller_account_id).await? {
+        let Some(aggregate) = by_currency.get_mut(&currency) else {
+            return Err(WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("{currency} paid orders have no matching order currency aggregate"),
+            ));
+        };
+        // Keep each IN query comfortably below common SQLite/D1 parameter
+        // limits. Chunking by currency is what lets the per-product rollup be
+        // a GROUP BY: every id in a chunk shares one currency, so the group
+        // totals belong to that currency's aggregate without a join.
+        for chunk in paid_ids.chunks(200) {
+            for line in line_item_totals(ctx, chunk).await? {
+                if analytics_count(&line, "negative_quantities")? > 0
+                    || analytics_count(&line, "negative_revenue")? > 0
+                {
+                    return Err(WaferError::new(
+                        wafer_run::ErrorCode::Internal,
+                        format!("{currency} line items hold a negative analytics amount"),
+                    ));
+                }
+                let key = (
+                    line.str_field("product_id").to_string(),
+                    line.str_field("product_name").to_string(),
+                );
+                let product = aggregate.top_products.entry(key).or_default();
+                product.0 += analytics_count(&line, "quantity")?;
+                product.1 += analytics_amount(&line, "revenue")?;
             }
-            let aggregate = by_currency.get_mut(currency).ok_or_else(|| {
-                WaferError::new(
-                    wafer_run::ErrorCode::Internal,
-                    "line item currency aggregate is missing",
-                )
-            })?;
-            let key = (
-                line.str_field("product_id").to_string(),
-                line.str_field("product_name").to_string(),
-            );
-            let product = aggregate.top_products.entry(key).or_default();
-            product.0 += quantity as u128;
-            product.1 += i128::from(revenue);
         }
     }
 

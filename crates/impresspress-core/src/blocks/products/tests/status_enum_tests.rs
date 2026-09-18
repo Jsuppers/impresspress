@@ -25,8 +25,8 @@ use super::{
     super::{
         contracts::{
             ApprovalStatus, DisputeStatus, EventStatus, OfferStatus, OfferSyncStatus,
-            OperationStatus, ProductStatus, ProviderPaymentStatus, RefundStatus, SellerApproval,
-            SellerStatus, SubscriptionStatus,
+            OperationStatus, OrderStatus, ProductStatus, ProviderPaymentStatus, RefundStatus,
+            SellerApproval, SellerStatus, SubscriptionStatus,
         },
         repo,
     },
@@ -446,5 +446,62 @@ fn a_value_outside_the_set_is_an_internal_fault_naming_the_row() {
         error.message.contains("row_1") && error.message.contains("half_onboarded"),
         "the message names the row and the value: {}",
         error.message
+    );
+}
+
+/// `OrderStatus::ALL` lists every variant the enum defines.
+///
+/// The list is data, not a `match`, because the commerce analytics has to
+/// name the whole value set inside a query: `subscription_totals` filters on
+/// `status IN (ALL)` and `paid_order_ids_by_currency` filters on
+/// `ALL.filter(is_paid)`. A variant missing from `ALL` would drop out of both
+/// while `order_totals` — which has no status filter — went on counting it,
+/// so the dashboard would contradict itself with nothing failing.
+///
+/// `slot` is exhaustive on purpose. Adding a seventh variant stops this test
+/// compiling, which is the reminder to add it to `ALL` as well; the assertion
+/// then checks it actually was.
+#[test]
+fn order_status_all_lists_every_variant() {
+    fn slot(status: OrderStatus) -> usize {
+        match status {
+            OrderStatus::Pending => 0,
+            OrderStatus::CheckoutStarted => 1,
+            OrderStatus::Completed => 2,
+            OrderStatus::PartiallyRefunded => 3,
+            OrderStatus::Refunded => 4,
+            OrderStatus::Failed => 5,
+        }
+    }
+
+    let mut seen = [false; 6];
+    for status in OrderStatus::ALL {
+        assert!(
+            !std::mem::replace(&mut seen[slot(status)], true),
+            "{status:?} is listed twice in OrderStatus::ALL"
+        );
+    }
+    assert!(
+        seen.iter().all(|listed| *listed),
+        "a variant this test knows about is missing from OrderStatus::ALL: {seen:?}"
+    );
+}
+
+/// The paid subset the analytics filters on is derived from `ALL`, so it
+/// cannot drift from `is_paid` — but it does have to be the three statuses
+/// that mean money changed hands.
+#[test]
+fn the_paid_subset_of_order_status_is_the_three_that_took_money() {
+    let paid: Vec<OrderStatus> = OrderStatus::ALL
+        .into_iter()
+        .filter(|status| status.is_paid())
+        .collect();
+    assert_eq!(
+        paid,
+        vec![
+            OrderStatus::Completed,
+            OrderStatus::PartiallyRefunded,
+            OrderStatus::Refunded,
+        ]
     );
 }
