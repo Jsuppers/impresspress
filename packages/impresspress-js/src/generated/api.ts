@@ -2898,8 +2898,9 @@ export interface paths {
                              */
                             content: string;
                             /**
-                             * @description Id of the assistant entry persisted in the messages block. Empty when
-                             *     persistence failed; the reply is still returned.
+                             * @description Id of the assistant entry persisted in the messages block. Always
+                             *     populated: a reply the store refused is answered with a 500, not a
+                             *     body (see `routes::chat::handle_chat`).
                              */
                             message_id: string;
                             /**
@@ -2908,8 +2909,10 @@ export interface paths {
                              */
                             model: string;
                             /**
-                             * @description `true` when the reply exceeded the 1 MiB buffering cap; `content`
-                             *     then stops at the cap.
+                             * @description `true` when the reply exceeded the 1 MiB buffering cap. `content` is
+                             *     then a prefix of the reply — it ends at the last delta that fitted and
+                             *     nothing after it is appended, so the text is never spliced across a
+                             *     gap.
                              */
                             truncated: boolean;
                         };
