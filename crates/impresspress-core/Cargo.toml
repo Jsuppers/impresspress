@@ -260,7 +260,10 @@ sha2 = { workspace = true }
 # to feature-gate a test-only public module without leaking it into the
 # production lib build.
 impresspress-core = { path = ".", features = ["test-support"] }
-tokio = { workspace = true, features = ["macros", "rt", "time", "net"] }
+# `net` + `io-util` let the LLM provider tests answer a chat request from a
+# real socket (partial SSE body, then close or hang), which is the only way to
+# exercise the streaming client's truncation and read-timeout handling.
+tokio = { workspace = true, features = ["macros", "rt", "time", "net", "io-util"] }
 tempfile = "3"
 # Dev-dep so integration tests can drive the SQLite database service even
 # when the `native-embedding` feature (which makes wafer-block-sqlite a

@@ -8,6 +8,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -56,6 +57,19 @@ struct Inner {
     /// small (providers * models-per-provider).
     cached_models: HashMap<String, Vec<ModelInfo>>,
 }
+
+/// How long a provider may take to accept a TCP/TLS connection. reqwest has
+/// no connect timeout of its own, so without this a provider whose host
+/// blackholes SYNs holds the spawned task — and the caller's chat request —
+/// for as long as the OS retries.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connected provider may go without sending anything. Applies per
+/// read, so it bounds silence rather than the completion's total length: a
+/// model may legitimately stream for minutes, but a gap this long means the
+/// upstream has stopped answering and the stream must fail instead of hanging
+/// on a socket nobody will write to again.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Redirect-hop budget, matching reqwest's built-in `Policy::limited(10)` (the
 /// default we replace). reqwest counts the initial request URL in
@@ -144,13 +158,24 @@ fn ssrf_revalidating_redirect_policy() -> reqwest::redirect::Policy {
 // reqwest client cannot close without a resolve-before-connect hook.
 impl ProviderLlmService {
     /// Construct a service with a `reqwest` client carrying the
-    /// SSRF-revalidating redirect policy. Returns `LlmError::BackendError`
-    /// if the underlying TLS stack fails to initialize — rare in practice,
-    /// and the host treats it as a build failure: there is deliberately no
-    /// constructor that falls back to a client without the policy.
+    /// SSRF-revalidating redirect policy and the default timeouts. Returns
+    /// `LlmError::BackendError` if the underlying TLS stack fails to
+    /// initialize — rare in practice, and the host treats it as a build
+    /// failure: there is deliberately no constructor that falls back to a
+    /// client without the policy.
     pub fn try_new() -> Result<Self, LlmError> {
+        Self::try_with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT)
+    }
+
+    /// [`try_new`](Self::try_new) with explicit timeouts. The whole-request
+    /// timeout stays unset on purpose — a completion legitimately streams for
+    /// minutes — so `read` is what bounds a provider that stops talking
+    /// mid-answer. Tests use it to make that bound observable in milliseconds.
+    pub fn try_with_timeouts(connect: Duration, read: Duration) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .redirect(ssrf_revalidating_redirect_policy())
+            .connect_timeout(connect)
+            .read_timeout(read)
             .build()
             .map_err(|e| LlmError::BackendError(format!("reqwest client build: {e}")))?;
         Ok(Self {
@@ -392,7 +417,20 @@ impl LlmService for ProviderLlmService {
                             let _ = tx_err.send(Err(LlmError::Network(e.to_string()))).await;
                             return;
                         }
-                        None => return,
+                        // The body ended without the protocol's terminal
+                        // event (`[DONE]` / `message_stop`), which `batch.done`
+                        // would have caught above. A completion the provider
+                        // cut off is not a completion: ending the stream
+                        // cleanly here would persist and display a half
+                        // answer as if the model had finished it.
+                        None => {
+                            let _ = tx_err
+                                .send(Err(LlmError::BackendError(
+                                    "provider stream ended before the completion finished".into(),
+                                )))
+                                .await;
+                            return;
+                        }
                     }
                 }
             }
@@ -610,6 +648,135 @@ mod tests {
             .expect("the provider router accepts configuration");
         assert!(svc.claims_backend("local"));
         assert!(!svc.claims_backend("openai-main"));
+    }
+
+    // --- streaming transport: truncation + timeouts ------------------------
+
+    /// What the fake provider does once it has written its body.
+    enum ThenThe {
+        /// Close the connection — an EOF-terminated body, which is what a
+        /// provider that dies mid-answer leaves behind.
+        ServerCloses,
+        /// Hold the socket open and send nothing more.
+        ServerGoesSilent,
+    }
+
+    /// Answer exactly one chat request on `localhost` with `body`, then behave
+    /// as `then`. Returns the `http://localhost:<port>` endpoint to configure
+    /// a provider with (the only plain-HTTP host `validate_url_value` allows).
+    async fn fake_provider(body: &'static str, then: ThenThe) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("localhost:0")
+            .await
+            .expect("bind a loopback port");
+        let port = listener.local_addr().expect("listener address").port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept the chat request");
+            // Read the request so the client's write completes before we answer.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // No Content-Length and no chunked encoding: the body runs to
+            // end-of-connection, exactly like a streamed SSE response.
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.flush().await;
+            match then {
+                ThenThe::ServerCloses => drop(sock),
+                ThenThe::ServerGoesSilent => {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(sock);
+                }
+            }
+        });
+        format!("http://localhost:{port}")
+    }
+
+    fn provider_at(endpoint: &str) -> ProviderConfig {
+        ProviderConfig::new("local-fake", ProviderProtocol::OpenAi, endpoint)
+            .with_api_key("sk-test")
+            .with_models(vec!["m".into()])
+    }
+
+    fn chat_req() -> ChatRequest {
+        use wafer_core::interfaces::llm::service::ChatMessage;
+        ChatRequest::new("local-fake", "m", vec![ChatMessage::user("hi")])
+    }
+
+    /// A provider that stops mid-answer must fail the stream, not finish it.
+    ///
+    /// The body ends without `[DONE]`, so the deltas that did arrive are half
+    /// an answer. Ending the stream cleanly would persist and display that
+    /// half as the model's complete reply, with nothing anywhere saying the
+    /// connection was cut.
+    #[tokio::test]
+    async fn a_body_that_ends_without_done_is_an_error_not_a_completion() {
+        let endpoint = fake_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
+            ThenThe::ServerCloses,
+        )
+        .await;
+        let svc = ProviderLlmService::try_new().expect("build provider service");
+        svc.configure(vec![provider_at(&endpoint)])
+            .expect("the provider router accepts configuration");
+
+        let items: Vec<_> = svc
+            .chat_stream(chat_req(), CancellationToken::new())
+            .await
+            .collect()
+            .await;
+
+        let text: String = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(c) => match &c.delta {
+                    wafer_core::interfaces::llm::service::ChunkDelta::Text(t) => Some(t.as_str()),
+                    _ => None,
+                },
+                Err(_) => None,
+            })
+            .collect();
+        assert_eq!(text, "half an ans", "the deltas that arrived are delivered");
+        match items.last() {
+            Some(Err(LlmError::BackendError(m))) => assert!(
+                m.contains("ended before"),
+                "the error must say the stream was cut, got: {m}"
+            ),
+            other => panic!("a cut stream must terminate in an error, got {other:?}"),
+        }
+    }
+
+    /// A provider that connects and then goes silent must not hold the task
+    /// forever: the read timeout ends the stream with a network error.
+    #[tokio::test]
+    async fn a_silent_provider_trips_the_read_timeout() {
+        let endpoint = fake_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            ThenThe::ServerGoesSilent,
+        )
+        .await;
+        let svc = ProviderLlmService::try_with_timeouts(
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+        )
+        .expect("build provider service");
+        svc.configure(vec![provider_at(&endpoint)])
+            .expect("the provider router accepts configuration");
+
+        let stream = svc.chat_stream(chat_req(), CancellationToken::new()).await;
+        // The bound is the point: without it this collect never returns, so
+        // the test asserts it completes rather than waiting on the server's
+        // 30-second sleep.
+        let items: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+            .await
+            .expect("a silent provider must not hold the stream open");
+
+        match items.last() {
+            Some(Err(LlmError::Network(_))) => {}
+            other => panic!("expected a network (timeout) error, got {other:?}"),
+        }
     }
 
     // --- M1: redirect-hop revalidation (see `redirect_decision`) -----------
