@@ -165,6 +165,12 @@ impl SseFrameStream {
     /// feed is not mistaken for a second line ending — which is what would
     /// otherwise split a frame in half mid-CRLF.
     fn push_text(&mut self, text: &str) {
+        // Text with no CR needs no rewriting, so an LF-framed stream costs one
+        // copy rather than a per-character walk.
+        if !self.pending_cr && !text.contains('\r') {
+            self.buf.push_str(text);
+            return;
+        }
         for ch in text.chars() {
             match ch {
                 '\n' if self.pending_cr => self.pending_cr = false,
