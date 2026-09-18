@@ -26,9 +26,9 @@
 //! `VariablesConfigBlock` is registered once and shared by every request it
 //! serves, and it tags its memoized `variables` snapshot with the generation it
 //! read at. Native serves requests on tokio's multi-threaded runtime
-//! (`impresspress`'s `#[tokio::main]`, a task per connection, work-stealing
-//! across workers), so the thread that performs an admin write is routinely not
-//! the thread that next reads config.
+//! (`impresspress`'s `#[tokio::main]` over tokio "full", a task per connection,
+//! work-stealing across workers), so the thread that performs an admin write is
+//! routinely not the thread that next reads config.
 //!
 //! A per-thread counter therefore could not do this job: an admin's
 //! `PATCH /b/admin/api/settings/{key}` bumped only the worker that handled it,

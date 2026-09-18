@@ -595,10 +595,11 @@ mod tests {
     /// The same requirement when the write and the read happen on DIFFERENT
     /// threads, which is the only shape native ever serves.
     ///
-    /// `impresspress`'s `#[tokio::main]` runtime is multi-threaded and the
-    /// wafer-run http listener spawns a task per connection, so the worker that
-    /// handles an admin's `PATCH /b/admin/api/settings/{key}` is routinely not
-    /// the worker that renders the next page. This block is registered once and
+    /// `impresspress`'s `#[tokio::main]` runtime is multi-threaded (tokio
+    /// "full") and the wafer-run http listener serves through `axum::serve`,
+    /// which drives a task per connection, so the worker that handles an
+    /// admin's `PATCH /b/admin/api/settings/{key}` is routinely not the worker
+    /// that renders the next page. This block is registered once and
     /// its snapshot is shared by every one of them, so the generation the
     /// snapshot is tagged with has to be shared too. While that counter was
     /// `thread_local`, the write bumped only the writing thread: a reader on a
