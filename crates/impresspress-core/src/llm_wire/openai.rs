@@ -307,9 +307,11 @@ impl OpenAiSseDecoder {
     /// terminated (`[DONE]` seen). Tool-call `Complete` frames for any
     /// in-flight ids are emitted on terminal.
     pub fn push(&mut self, bytes: &[u8]) -> DecodeBatch {
-        if !self.frames.feed(bytes) {
-            tracing::warn!("openai sse: non-utf8 bytes — dropping");
-            return DecodeBatch::default();
+        if let Some(discard) = self.frames.feed(bytes) {
+            // Whatever the transport mangled, the frames that did decode are
+            // still in the buffer — so warn and keep draining rather than
+            // dropping this batch.
+            tracing::warn!(?discard, "openai sse: stream bytes discarded");
         }
 
         let mut out = Vec::new();
@@ -605,6 +607,81 @@ mod tests {
         ";
         let mut decoder = OpenAiSseDecoder::new();
         let batch = decoder.push(stream.as_bytes());
+        assert!(batch.done);
+    }
+
+    /// Concatenate every text delta the decoder produced.
+    fn text_of(chunks: &[ChatChunk]) -> String {
+        chunks
+            .iter()
+            .filter_map(|c| match &c.delta {
+                ChunkDelta::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Non-ASCII content streamed through the real decoder must survive the
+    /// network chunk boundary landing anywhere — including inside a character.
+    ///
+    /// A split code point makes both halves invalid on their own (incomplete
+    /// lead sequence, then bare continuation bytes), which cost two whole
+    /// transport chunks — several frames — and left a partial frame that
+    /// corrupted the JSON of the next one. Every byte offset is exercised
+    /// because reqwest chooses the boundary, not the provider.
+    #[test]
+    fn non_ascii_deltas_survive_a_split_at_every_byte_offset() {
+        let stream = "\
+            data: {\"choices\":[{\"delta\":{\"content\":\"héllo \"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"🙂 日本語\"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\" wörld\"}}]}\n\n\
+            data: [DONE]\n\n\
+        ";
+        let bytes = stream.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut decoder = OpenAiSseDecoder::new();
+            let mut chunks = decoder.push(&bytes[..split]).chunks;
+            chunks.extend(decoder.push(&bytes[split..]).chunks);
+            assert_eq!(
+                text_of(&chunks),
+                "héllo 🙂 日本語 wörld",
+                "content lost when the transport split at byte {split}"
+            );
+        }
+    }
+
+    /// The same stream delivered one byte at a time — the pathological case a
+    /// slow link produces — still decodes to the same text and terminates.
+    #[test]
+    fn non_ascii_deltas_survive_a_byte_at_a_time_stream() {
+        let stream = "\
+            data: {\"choices\":[{\"delta\":{\"content\":\"🙂\"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"é\"}}]}\n\n\
+            data: [DONE]\n\n\
+        ";
+        let mut decoder = OpenAiSseDecoder::new();
+        let mut chunks = Vec::new();
+        let mut done = false;
+        for b in stream.as_bytes() {
+            let batch = decoder.push(&[*b]);
+            chunks.extend(batch.chunks);
+            done |= batch.done;
+        }
+        assert_eq!(text_of(&chunks), "🙂é");
+        assert!(done, "[DONE] must still terminate the stream");
+    }
+
+    /// A provider that frames with CRLF — which SSE permits — must decode,
+    /// not accumulate bytes forever while emitting nothing.
+    #[test]
+    fn crlf_framed_stream_decodes() {
+        let stream = "\
+            data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n\
+            data: [DONE]\r\n\r\n\
+        ";
+        let mut decoder = OpenAiSseDecoder::new();
+        let batch = decoder.push(stream.as_bytes());
+        assert_eq!(text_of(&batch.chunks), "hi");
         assert!(batch.done);
     }
 

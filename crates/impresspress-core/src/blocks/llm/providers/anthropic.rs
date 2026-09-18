@@ -273,9 +273,11 @@ impl AnthropicSseDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> DecodeBatch {
-        if !self.frames.feed(bytes) {
-            tracing::warn!("anthropic sse: non-utf8 bytes — dropping");
-            return DecodeBatch::default();
+        if let Some(discard) = self.frames.feed(bytes) {
+            // Whatever the transport mangled, the frames that did decode are
+            // still in the buffer — so warn and keep draining rather than
+            // dropping this batch.
+            tracing::warn!(?discard, "anthropic sse: stream bytes discarded");
         }
 
         let mut out = Vec::new();
@@ -672,6 +674,68 @@ mod tests {
         ";
         let mut d = AnthropicSseDecoder::new();
         let batch = d.push(stream.as_bytes());
+        assert!(batch.done);
+    }
+
+    /// Concatenate every text delta the decoder produced.
+    fn text_of(chunks: &[ChatChunk]) -> String {
+        chunks
+            .iter()
+            .filter_map(|c| match &c.delta {
+                ChunkDelta::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Non-ASCII answers must survive the transport splitting a frame at any
+    /// byte offset — including inside a character, where both halves are
+    /// invalid UTF-8 on their own. That split used to cost two whole network
+    /// chunks (several frames) and left a partial frame that corrupted the
+    /// JSON of the next one, so every offset is exercised.
+    #[test]
+    fn non_ascii_text_deltas_survive_a_split_at_every_byte_offset() {
+        let stream = "\
+            event: content_block_delta\n\
+            data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"héllo \"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"🙂 日本語\"}}\n\n\
+            event: message_stop\n\
+            data: {}\n\n\
+        ";
+        let bytes = stream.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut d = AnthropicSseDecoder::new();
+            let first = d.push(&bytes[..split]);
+            let mut chunks = first.chunks;
+            let mut done = first.done;
+            if !done {
+                let second = d.push(&bytes[split..]);
+                chunks.extend(second.chunks);
+                done |= second.done;
+            }
+            assert_eq!(
+                text_of(&chunks),
+                "héllo 🙂 日本語",
+                "content lost when the transport split at byte {split}"
+            );
+            assert!(done, "message_stop must still terminate (split at {split})");
+        }
+    }
+
+    /// A CRLF-framed stream — which SSE permits — must decode rather than
+    /// accumulate bytes forever while emitting nothing.
+    #[test]
+    fn crlf_framed_stream_decodes() {
+        let stream = "\
+            event: content_block_delta\r\n\
+            data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\r\n\r\n\
+            event: message_stop\r\n\
+            data: {}\r\n\r\n\
+        ";
+        let mut d = AnthropicSseDecoder::new();
+        let batch = d.push(stream.as_bytes());
+        assert_eq!(text_of(&batch.chunks), "hi");
         assert!(batch.done);
     }
 
