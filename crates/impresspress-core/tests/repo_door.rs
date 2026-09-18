@@ -474,6 +474,11 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/migrations/mod.rs",
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/page_link_tests.rs",
+            // category 3: a catalog seeded past the unpaged read ceiling, in
+            // one `INSERT … SELECT` over a recursive CTE. Ten thousand rows
+            // through `db::create` would take a minute of service dispatch,
+            // and the size is the whole point of the test.
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -529,6 +534,9 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/repo_tests.rs",
             "blocks/products/tests/seller_governance_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
+            // seeds orders past the unpaged read ceiling in one
+            // `INSERT … SELECT`; see the note on the products door above
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -538,6 +546,9 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/purchase_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
+            // seeds a line per order past the unpaged read ceiling; see the
+            // note on the products door above
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -580,6 +591,9 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
         &[
             "blocks/products/repo/seller_accounts.rs",
             "blocks/products/migrations/mod.rs",
+            // seeds a seller population past the unpaged read ceiling; see
+            // the note on the products door above
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -929,6 +943,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/repo_tests.rs",
             "blocks/products/tests/seller_governance_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
+            // names `products::TABLE` for the witness assertion that a
+            // one-shot read of the seeded catalog stops at the ceiling — the
+            // fact the exhaustive read exists to defeat.
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -974,6 +992,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/provider_tests.rs",
             "blocks/products/tests/storefront_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
+            // names `PURCHASES_TABLE`/`LINE_ITEMS_TABLE` for the witness
+            // assertion that a one-shot read of the seeded tables stops at
+            // the ceiling.
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -982,6 +1004,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/repo/purchases.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
+            // names `LINE_ITEMS_TABLE` for the witness assertion that a
+            // one-shot read of the seeded table stops at the ceiling.
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (

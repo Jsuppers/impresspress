@@ -1,3 +1,4 @@
+mod bounded_read_tests;
 mod config_tests;
 mod error_mapping_tests;
 mod example_fixture_tests;

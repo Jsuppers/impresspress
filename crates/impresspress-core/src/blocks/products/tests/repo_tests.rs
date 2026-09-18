@@ -526,8 +526,9 @@ async fn list_contracts_equals_every_row_through_to_contract() {
     let actual = repo::seller_accounts::list_contracts(&ctx)
         .await
         .expect("list_contracts");
-    assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 2, "both seeded rows are listed");
+    assert_eq!(actual.rows, expected);
+    assert_eq!(actual.rows.len(), 2, "both seeded rows are listed");
+    assert!(!actual.truncated, "two rows is not a prefix");
 }
 
 /// A row that cannot be projected fails the whole read. A seller list quietly
@@ -609,6 +610,7 @@ async fn list_owned_by_is_the_owners_live_products_only() {
     let live: Vec<String> = repo::products::list_owned_by(&ctx, "user_a")
         .await
         .expect("live")
+        .rows
         .into_iter()
         .map(|record| record.id)
         .collect();

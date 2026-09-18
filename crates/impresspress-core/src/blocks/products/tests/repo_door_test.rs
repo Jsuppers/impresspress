@@ -262,6 +262,11 @@ const READ_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
             // pins that this read and `list_owned_by` differ in exactly the
             // deleted rows — it has to name both to say so.
             "blocks/products/tests/repo_tests.rs",
+            // pins that suspension's read is exhaustive: it seeds a catalog
+            // past the unpaged ceiling and asserts every row comes back,
+            // which is the same "covers every row the seller owns" property
+            // the `sellers.rs` entry above exists for.
+            "blocks/products/tests/bounded_read_tests.rs",
         ],
     ),
     (
@@ -323,8 +328,9 @@ fn read_side_escape_hatches_are_allowlisted() {
             "these files call `{ident}`, which reads past the soft-delete \
              filter and so can hand a soft-deleted product to a caller, \
              without being justified in READ_ESCAPE_HATCHES. Use `get` / \
-             `list_all` unless reading a deleted row is genuinely what the \
-             operation means, and say why here if it is: {offenders:?}"
+             `list_capped_live` unless reading a deleted row is genuinely \
+             what the operation means, and say why here if it is: \
+             {offenders:?}"
         );
     }
 }
