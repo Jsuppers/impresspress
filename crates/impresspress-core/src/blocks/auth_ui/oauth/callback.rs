@@ -1469,7 +1469,11 @@ mod security_regression_tests {
         msg.set_meta("http.header.cookie", cookie_header_for(&foreign));
 
         assert!(
-            crate::test_support::output_is_error(handle(&limiter(), &ctx, &msg).await, "InvalidArgument").await,
+            crate::test_support::output_is_error(
+                handle(&limiter(), &ctx, &msg).await,
+                "InvalidArgument"
+            )
+            .await,
             "a binding cookie minted for another state must not redeem this one"
         );
     }
@@ -1564,8 +1568,10 @@ mod security_regression_tests {
             .expect("user lookup ok")
             .expect("user present");
 
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302, "a proven account may be adopted");
 
         let link = provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_ID)
@@ -1639,8 +1645,10 @@ mod security_regression_tests {
 
         // And now the same sign-in completes, into the same account.
         seed_state(&ctx, STATE_ID, "google").await;
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302, "a proven account is adoptable");
         assert_eq!(
             provider_links::find_by_provider_ref(&ctx, "google", GOOGLE_ID)
@@ -1815,8 +1823,10 @@ mod security_regression_tests {
         let email = "msuser@example.com";
         let ctx = OauthFlow::microsoft(email).ctx().await;
 
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302, "a Microsoft sign-in must complete");
 
         let user = users::find_by_email(&ctx, email)
@@ -1842,8 +1852,10 @@ mod security_regression_tests {
         let email = "ghuser@example.com";
         let ctx = OauthFlow::github(email).ctx().await;
 
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302, "a GitHub sign-in must complete");
 
         let user = users::find_by_email(&ctx, email)
@@ -1869,8 +1881,10 @@ mod security_regression_tests {
             .ctx()
             .await;
 
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302);
 
         let user = users::find_by_email(&ctx, email)
@@ -1930,9 +1944,64 @@ mod security_regression_tests {
         // dead end.
         prove_address_by_email_link(&ctx, &mail, email).await;
         seed_state(&ctx, STATE_ID, "microsoft").await;
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302, "after verifying, the sign-in completes");
+    }
+
+    /// The mail the callback sends is ordinary transactional mail and spends
+    /// the deployment's outbound budget like any other. An OAuth flow with a
+    /// send of its own, outside `send_template_email`, would be the cheapest
+    /// way to drain that budget: no account, no password, no captcha — just a
+    /// provider round trip per message.
+    ///
+    /// `RATE_LIMIT_AUTH_EMAIL` is one per hour here, and the single token is
+    /// spent before the sign-in by another request from the same IP. The
+    /// callback must find the bucket empty and send nothing — not because of
+    /// the resend cooldown (this account has never been mailed) but because
+    /// the budget is the same budget.
+    #[tokio::test]
+    async fn the_callbacks_mail_spends_the_shared_outbound_budget() {
+        use crate::blocks::rate_limit::{
+            check_rate_limit, ip_identity, RateLimit, RateLimitOutcome,
+        };
+
+        let email = "budgeted@example.com";
+        let (ctx, mail) = OauthFlow::microsoft(email)
+            .require_verification()
+            .config("WAFER_RUN_SHARED__RATE_LIMIT_AUTH_EMAIL", "1/3600")
+            .ctx_and_mail()
+            .await;
+        let shared = limiter();
+
+        // Somebody on this IP sends the one message the hour allows.
+        let request = callback_msg_unbound();
+        let spent = check_rate_limit(
+            &shared,
+            &ctx,
+            &ip_identity(&request),
+            "auth_email",
+            RateLimit::AUTH_EMAIL,
+        )
+        .await;
+        assert!(
+            matches!(spent, RateLimitOutcome::Allowed(_)),
+            "precondition: the first message of the hour is allowed"
+        );
+
+        let out = handle(&shared, &ctx, &callback_msg(&ctx).await).await;
+        assert!(
+            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            "the unverified sign-in is still refused"
+        );
+        assert!(
+            mail.all().is_empty(),
+            "the callback's link must be refused by the shared budget, not sent \
+             beside it: {:?}",
+            mail.all()
+        );
     }
 
     /// And the provider's assertion satisfies that same policy: a Google
@@ -1946,8 +2015,10 @@ mod security_regression_tests {
             .ctx_and_mail()
             .await;
 
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(
             status, 302,
             "a provider-verified address satisfies the verification policy"
@@ -1996,8 +2067,10 @@ mod security_regression_tests {
         .await
         .expect("seed provider link");
 
-        let status =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(status, 302, "the linked account signs in");
         assert_eq!(
             users::find_by_id(&ctx, &user.id)
@@ -2086,8 +2159,10 @@ mod security_regression_tests {
         let email = "returning@example.com";
         let ctx = OauthFlow::google(email).ctx().await;
 
-        let first =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let first = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(first, 302);
         let user = users::find_by_email(&ctx, email)
             .await
@@ -2096,8 +2171,10 @@ mod security_regression_tests {
 
         // A second flow needs its own single-use state.
         seed_state(&ctx, STATE_ID, "google").await;
-        let second =
-            crate::test_support::output_status(handle(&limiter(), &ctx, &callback_msg(&ctx).await).await).await;
+        let second = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
         assert_eq!(second, 302, "a returning user signs in again");
 
         assert_eq!(
