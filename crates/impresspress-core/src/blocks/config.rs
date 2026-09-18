@@ -172,7 +172,11 @@ impl VariablesConfigBlock {
     /// the two invalidate together.
     ///
     /// The generation is captured BEFORE the read: a write landing while the
-    /// query is in flight must not be masked by the snapshot it raced.
+    /// query is in flight must not be masked by the snapshot it raced. That is
+    /// also what makes two workers racing this on native safe. Each stores the
+    /// generation its own rows were read at, so the loser leaves behind a
+    /// snapshot tagged older than the store is — which costs the next reader a
+    /// re-query and can never hand it rows from before a write it should see.
     ///
     /// No lock is held across the `await` — the guard is dropped before the
     /// fetch and re-taken after — so a hard-stopped request cannot strand one.
