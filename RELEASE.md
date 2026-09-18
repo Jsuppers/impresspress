@@ -134,6 +134,71 @@ whether or not you pass `--run-migrations`. Cloudflare and browser deployments
 are unaffected: neither seeds from a process environment, so neither has a tie
 to break, and the **Reset to environment** control does not render there.
 
+### Files: bucket names are unique (migration 002) — upgrade with `--run-migrations`
+
+**What changes.** A storage bucket's name is also its folder name in the object
+store, and the `buckets` table had no unique index on it. A second user could
+therefore create a bucket under a name someone else already held — every
+backend's `create_folder` is idempotent, so nothing refused it — and the row
+they got granted them read, overwrite and delete access to the first owner's
+objects. Bucket names are now unique, and creating one that is taken answers
+`409` with "A bucket named … already exists."
+
+**The repair.** Migration `002_bucket_name_unique` deletes duplicate bucket rows
+before creating the index, keeping the **earliest** row for each name (by
+`created_at`, `id` as the tie-break). That is the access the later rows should
+never have had; the folder and its objects stay with the one remaining owner,
+and the object-metadata rows of whoever else uploaded into it are left alone —
+those blobs are real and still charged to whoever uploaded them.
+
+**Review your collisions before upgrading.** That last sentence has a
+user-visible edge: an object the losing user uploaded stays in the winner's
+bucket, so they lose access to their own file while their quota keeps being
+charged for its bytes. In the case this fixes — a takeover — that is the
+correct outcome. If a collision turns out to be two people who each meant to
+have their own bucket, sort it out *before* you run the migration: have the
+later user download what they need, or rename their bucket (create a new one
+and re-upload), because afterwards only the winner can reach the folder.
+
+**Upgrade with `--run-migrations`.** Without it the index is not created, and
+the code half alone does not close the hole: the refusal comes from the
+database, so a duplicate name is admitted exactly as before. The only signal is
+the generic `schema drift; redeploy with --run-migrations to apply` warning each
+boot logs for the files block.
+
+**To see what will be deleted**, list the collisions from the admin SQL
+explorer before upgrading. This runs on every backend — the per-owner rows come
+back one per line rather than through a backend-specific aggregate
+(SQLite/D1 has `GROUP_CONCAT`, Postgres has `string_agg`, and neither has the
+other):
+
+```sql
+SELECT b.name, b.created_by, b.created_at, b.id
+FROM impresspress__files__buckets AS b
+WHERE EXISTS (
+    SELECT 1 FROM impresspress__files__buckets AS other
+    WHERE other.name = b.name AND other.id <> b.id
+)
+ORDER BY b.name, b.created_at, b.id;
+```
+
+The first row of each `name` group is the one that survives; the rest are what
+the migration deletes.
+
+### Files: uploaded objects download instead of rendering
+
+**What changes.** `GET /b/storage/api/buckets/{bucket}/objects/{key}` and the
+public share link `GET /b/storage/direct/{token}` serve bytes and a content type
+an uploader chose, from the application's own origin. They now send
+`X-Content-Type-Options: nosniff` on every object, and `Content-Disposition:
+inline` only for types that cannot carry script — images (not SVG), audio,
+video, PDF and plain text. Everything else, `text/html` and `image/svg+xml`
+included, is served as an `attachment` with a sandbox `Content-Security-Policy`.
+
+Image and PDF previews are unaffected. What changes for a user is that opening
+an uploaded `.html` or `.svg` link downloads the file rather than displaying it.
+**No migration.**
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one

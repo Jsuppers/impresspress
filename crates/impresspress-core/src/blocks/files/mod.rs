@@ -13,6 +13,7 @@ mod pages_admin;
 pub(crate) mod pages_user;
 mod quota;
 pub(crate) mod repo;
+mod serving;
 mod share;
 pub(crate) mod storage;
 
@@ -318,11 +319,14 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     // shares, quotas) is a follow-up.
     //
     // No output schema on the download: the success response is the raw
-    // object body (`Content-Type` set from the stored object's MIME type),
-    // not JSON — see `handle_get_object`'s
-    // `ResponseBuilder::new().body(data, &info.content_type)`. The path
-    // schema alone surfaces the request shape in `/openapi.json` without
-    // mislabeling the response as `application/json`.
+    // object body, not JSON. `handle_get_object` streams it with
+    // `streaming::stream_download`, under the headers
+    // `serving::user_object_leading_meta` builds — the stored MIME type once
+    // `normalized_content_type` has vetted it, `X-Content-Type-Options:
+    // nosniff`, and a `Content-Disposition` that is `inline` only for the
+    // types that cannot carry script. The path schema alone surfaces the
+    // request shape in `/openapi.json` without mislabeling the response as
+    // `application/json`.
     EndpointRoute::authenticated(
         HttpMethod::Get,
         "/b/storage/api/buckets/{name}/objects/{key...}",

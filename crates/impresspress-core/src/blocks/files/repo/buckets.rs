@@ -21,8 +21,14 @@ pub const TABLE: &str = "impresspress__files__buckets";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BucketRow {
     pub id: String,
-    /// Bucket name. Unique across the table and the blob-namespace folder
-    /// name in `wafer-run/storage`.
+    /// Bucket name, and the blob-namespace folder name in `wafer-run/storage`.
+    ///
+    /// Unique across the table, enforced by the
+    /// `impresspress__files__buckets_name_uniq` index (migration 002) rather
+    /// than by any caller: because the name IS the folder, two rows for one
+    /// name are two owners of one folder, and [`find_owned`] would hand the
+    /// second one read/write/delete access to the first one's objects. The
+    /// index is what makes [`insert`] the atomic claim on a name.
     pub name: String,
     /// Whether objects in the bucket are readable by anonymous URL.
     ///
@@ -140,8 +146,37 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Page<BucketRow
     ))
 }
 
+/// Whether a bucket named `name` exists, whoever owns it.
+///
+/// The probe [`super::super::storage::handle_create_bucket`] hands to
+/// [`crate::blocks::crud::taken_key_or_db_error`] after a refused [`insert`]:
+/// `name` is UNIQUE (migration 002), so one row is all there can be and a
+/// `NotFound` from the lookup is the "free" answer rather than a failure.
+///
+/// It is deliberately NOT owner-scoped. The question is whether the folder is
+/// already claimed, and a name held by another user is exactly the case the
+/// unique index exists to refuse.
+pub async fn name_exists(ctx: &dyn Context, name: &str) -> Result<bool, WaferError> {
+    match db::get_by_field(
+        ctx,
+        TABLE,
+        "name",
+        serde_json::Value::String(name.to_string()),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.code == wafer_run::ErrorCode::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Insert a bucket row (`created_at` stamped with
 /// [`crate::util::now_rfc3339`]) and return it.
+///
+/// This is the claim on the bucket name: `name` is UNIQUE, so the insert is
+/// what decides which of two users creating the same name gets the folder.
+/// The caller creates the storage folder only after it succeeds.
 pub async fn insert(
     ctx: &dyn Context,
     name: &str,
@@ -162,7 +197,25 @@ pub async fn insert(
     })
 }
 
-/// Delete the bucket row named `name` (bucket names are unique).
+/// Delete one bucket row by id.
+///
+/// The rollback [`super::super::storage::handle_create_bucket`] runs when the
+/// storage folder for a row it just inserted could not be created. By id, not
+/// by name: [`delete_by_name`] is only safe while the unique index exists, and
+/// a deployment that takes the code half without `--run-migrations` has the
+/// row but not the index. There, a second user's create on a taken name still
+/// inserts, and a name-scoped rollback would delete the first owner's row
+/// along with it.
+pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
+    db::delete(ctx, TABLE, id).await
+}
+
+/// Delete the bucket row named `name`.
+///
+/// One row at most: `name` is UNIQUE (the
+/// `impresspress__files__buckets_name_uniq` index from migration 002), which
+/// is what lets the bucket-delete path drop the row by name without an owner
+/// filter after its own access check has passed.
 pub async fn delete_by_name(ctx: &dyn Context, name: &str) -> Result<(), WaferError> {
     db::delete_by_field(
         ctx,

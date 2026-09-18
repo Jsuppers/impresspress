@@ -262,7 +262,7 @@ pub(super) async fn handle_create_permission(
         // line flattening a WRAP refusal to 500, which is what
         // `crud::db_error_internal` inside the helper takes care of.
         Err(e) => {
-            super::ops::taken_key_or_db_error(
+            crate::blocks::crud::taken_key_or_db_error(
                 e,
                 permission_name_taken(ctx, &body.name),
                 &format!(
@@ -270,6 +270,7 @@ pub(super) async fn handle_create_permission(
                      another name.",
                     body.name
                 ),
+                "Database error",
             )
             .await
         }
@@ -277,7 +278,8 @@ pub(super) async fn handle_create_permission(
 }
 
 /// Whether a permission called `name` exists. The probe
-/// [`handle_create_permission`] hands to [`super::ops::taken_key_or_db_error`];
+/// [`handle_create_permission`] hands to
+/// [`crate::blocks::crud::taken_key_or_db_error`];
 /// `permissions.name` is UNIQUE, so one row is all there can be and a
 /// `NotFound` from the lookup is the "free" answer rather than a failure.
 ///

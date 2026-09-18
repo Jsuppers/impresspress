@@ -544,6 +544,29 @@ mod tests {
             postgres_count, 14,
             "files postgres migration: expected 14 statements, got {postgres_count}"
         );
+
+        // 002: the duplicate-name repair and the unique index it makes
+        // creatable — two statements, and BOTH have to reach `db::ddl` or the
+        // index is never built on a database that already holds duplicates.
+        for (dialect, sql) in [
+            (
+                "sqlite",
+                include_str!("blocks/files/migrations/002_bucket_name_unique.sqlite.sql"),
+            ),
+            (
+                "postgres",
+                include_str!("blocks/files/migrations/002_bucket_name_unique.postgres.sql"),
+            ),
+        ] {
+            let count = split_statements(sql)
+                .into_iter()
+                .filter(|s| has_executable_content(s))
+                .count();
+            assert_eq!(
+                count, 2,
+                "files {dialect} migration 002: expected 2 statements, got {count}"
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use crate::{
-    http::{err_bad_request, err_internal, err_not_found, err_unauthorized},
+    http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthorized},
     util::{field_as_string, stamp_created, stamp_updated},
 };
 
@@ -135,6 +135,99 @@ fn seal(failure: DbFailure, context: &str) -> OutputStream {
     match failure {
         DbFailure::Refused(error) => OutputStream::error(error),
         DbFailure::Internal(error) => err_internal(context, error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate natural keys
+// ---------------------------------------------------------------------------
+
+/// What a failed `create` against a table with a UNIQUE natural key —
+/// `variables.key`, `roles.name`, `permissions.name`, `buckets.name` —
+/// actually means.
+///
+/// It lives here, beside [`db_error_internal`] it delegates to, because it is
+/// the same decision in every block that has such a key: the admin block
+/// (roles, permissions, variables) and the files block (bucket names) call
+/// this one function rather than each keeping the reasoning below.
+///
+/// Those inserts are refused by the database when the key is already
+/// taken, and that refusal used to ship as `err_internal("Database error", e)`:
+/// a `500 Internal server error (ref: …)` for a request that is not a fault at
+/// all. An admin who re-types a key that exists was told the server broke, and
+/// an operator reading the log could not tell that request from a corrupt row
+/// or an outage. The honest answer is **409** — the key is taken, edit it or
+/// pick another — which is what [`ErrorCode::AlreadyExists`] resolves to in
+/// `wafer_block::http_codec::error_code_to_http_status`.
+///
+/// It has to be decided by re-reading rather than by the write's own error,
+/// because no `DatabaseService` backend classifies a constraint violation:
+/// `wafer_core`'s `db_error_to_wafer` has three arms (`NotFound`, `Internal`,
+/// `Other`) and the last two both become [`ErrorCode::Internal`] with the
+/// driver's text *sanitized* away unless it is one of a few preserved
+/// substrings. So there is nothing in the error to match on, and matching on
+/// driver message text would be both magic and backend-specific. The same
+/// reasoning, and the same probe-after-the-write shape, is already written out
+/// at `products::handlers::product::restore_slug_conflict`.
+///
+/// The forward path is [`ErrorCode::AlreadyExists`]: a backend that DOES
+/// classify the violation has already answered the question the probe exists to
+/// ask, so that code short-circuits straight to the 409 and no re-read happens
+/// at all. It is wired up now rather than when such a backend lands, because
+/// sending it to [`db_error_internal`] instead — which classifies only
+/// `NotFound`, `PermissionDenied` and `ResourceExhausted`, and folds everything
+/// else into a 500 — would re-introduce this exact bug on the day the backend
+/// improved, with every test still green because the in-memory SQLite these run
+/// against answers `Internal`.
+///
+/// [`ErrorCode::Aborted`] is a probe candidate alongside `Internal` for the same
+/// reason in reverse: `error_code_to_http_status` already renders it 409, and
+/// the "concurrency conflict" it names is precisely what a unique-index
+/// collision is. If the key turns out to be taken, that is this conflict; if it
+/// does not, the write's own failure is kept.
+///
+/// Probing **after** the failed write rather than before it is what closes the
+/// race: a pre-check that found the key free leaves a gap in which a competing
+/// create can claim it, and the loser of that race is exactly the request that
+/// would still have answered 500. Re-reading afterwards has no such gap — the
+/// insert has already been refused, and the row that refused it is there to be
+/// found. It also costs the successful create nothing, since the probe only
+/// runs on the error path.
+///
+/// `probe` is the "is this key taken now?" read, passed as its own future so it
+/// is only awaited here. Three answers, not two: taken is the conflict, free is
+/// a genuine fault, and a probe that could not run is **not** "free" — "could
+/// not tell" keeps the write's own failure, so a transient read outage cannot
+/// turn a 500 into a wrong 409 or vice versa.
+///
+/// `context` is the log label every non-collision answer carries into
+/// [`db_error_internal`] — the caller's own ("Failed to create bucket"), not a
+/// generic one, so an operator reading the log still knows which write failed.
+pub async fn taken_key_or_db_error(
+    error: wafer_run::WaferError,
+    probe: impl std::future::Future<Output = Result<bool, wafer_run::WaferError>>,
+    conflict: &str,
+    context: &str,
+) -> OutputStream {
+    match error.code {
+        // Already classified by the backend — nothing left to find out.
+        ErrorCode::AlreadyExists => return err_conflict(conflict),
+        // The two codes a constraint violation can arrive as unclassified.
+        ErrorCode::Internal | ErrorCode::Aborted => {}
+        // A WRAP refusal (403) or a quota (429) is not a name collision and
+        // keeps the status `crud` gives it.
+        _ => return db_error_internal(error, context),
+    }
+    match probe.await {
+        Ok(true) => err_conflict(conflict),
+        Ok(false) => db_error_internal(error, context),
+        Err(probe_error) => {
+            tracing::warn!(
+                error = %probe_error,
+                "could not re-read the key a refused insert may have collided with",
+            );
+            db_error_internal(error, context)
+        }
     }
 }
 
@@ -709,5 +802,87 @@ mod path_var_tests {
                 other => panic!("expected an error terminal, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wafer_run::{ErrorCode, WaferError};
+
+    use super::taken_key_or_db_error;
+
+    /// A backend that DOES classify the violation short-circuits: the 409 comes
+    /// straight off `AlreadyExists` and the probe is never run.
+    ///
+    /// This is the forward path the helper documents. Before it was wired up,
+    /// `AlreadyExists` fell through to `crud::db_error_internal`, which
+    /// classifies only `NotFound` / `PermissionDenied` / `ResourceExhausted`
+    /// and folds the rest into a 500 — so the day a backend started reporting
+    /// constraint violations properly, this bug would have come back, with
+    /// every other test still green because the in-memory SQLite these run
+    /// against answers `Internal`.
+    #[tokio::test]
+    async fn a_backend_classified_already_exists_is_the_conflict_without_a_probe() {
+        let probed = std::cell::Cell::new(false);
+        let out = taken_key_or_db_error(
+            WaferError::new(ErrorCode::AlreadyExists, "duplicate key"),
+            async {
+                probed.set(true);
+                Ok(false)
+            },
+            "TAKEN already exists",
+            "Database error",
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+        assert!(
+            !probed.get(),
+            "the backend already answered; do not re-read"
+        );
+    }
+
+    /// `Aborted` is a probe candidate alongside `Internal`: it renders as 409
+    /// too, and the "concurrency conflict" it names is what a unique-index
+    /// collision is. The re-read still decides, so a free key keeps the fault.
+    #[tokio::test]
+    async fn an_aborted_write_is_classified_by_the_probe_like_an_internal_one() {
+        let taken = taken_key_or_db_error(
+            WaferError::new(ErrorCode::Aborted, "write conflict"),
+            async { Ok(true) },
+            "TAKEN already exists",
+            "Database error",
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(taken).await, 409);
+
+        let free = taken_key_or_db_error(
+            WaferError::new(ErrorCode::Aborted, "write conflict"),
+            async { Ok(false) },
+            "TAKEN already exists",
+            "Database error",
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(free).await, 500);
+    }
+
+    /// A code that is neither is not a collision candidate at all — it keeps
+    /// the status `crud` gives it, and never reaches the probe.
+    #[tokio::test]
+    async fn a_wrap_refusal_keeps_its_403_and_is_never_probed() {
+        let probed = std::cell::Cell::new(false);
+        let out = taken_key_or_db_error(
+            WaferError::new(ErrorCode::PermissionDenied, "denied"),
+            async {
+                probed.set(true);
+                Ok(true)
+            },
+            "TAKEN already exists",
+            "Database error",
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 403);
+        assert!(!probed.get(), "a WRAP refusal is not a name collision");
     }
 }

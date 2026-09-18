@@ -126,24 +126,25 @@ pub(in crate::blocks::files) async fn handle_get_object(
     // chunk. The leading meta carries the streaming opt-in marker + the real
     // content-type so the pipeline and platform adapter take the streaming
     // response path (see `crate::streaming`).
+    //
+    // The bytes and the content type are both an uploader's, and this route is
+    // on the app's own origin, so the disposition and the security headers
+    // come from [`crate::blocks::files::serving`] — the same builder the public
+    // share link uses.
     match store::get_stream(ctx, bucket, key).await {
         Ok(stream) => {
-            let content_type = resolved_content_type(stream.info());
-            let leading = crate::streaming::download_leading_meta(&content_type, &[]);
+            // The `application/octet-stream` a backend reporting no type used
+            // to get here is not applied twice: the empty string is not a
+            // media type, so `serving` substitutes it along with every other
+            // type it cannot read.
+            let leading = crate::blocks::files::serving::user_object_leading_meta(
+                &stream.info().content_type.clone(),
+                key,
+                &[],
+            );
             crate::streaming::stream_download(stream, leading)
         }
         Err(e) => crud::db_error(e, "Object not found", "Storage error"),
-    }
-}
-
-/// The object's stored content-type, falling back to `application/octet-stream`
-/// when the backend reports none (parity with the buffered `get` path, which
-/// R2/S3 default the same way).
-fn resolved_content_type(info: &store::ObjectInfo) -> String {
-    if info.content_type.is_empty() {
-        "application/octet-stream".to_string()
-    } else {
-        info.content_type.clone()
     }
 }
 
@@ -244,15 +245,41 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         (body_bytes, query_key, content_type)
     };
 
-    if let Err(r) =
-        crate::blocks::files::quota::check_quota(ctx, msg.user_id(), content.len() as i64).await
+    // An upload to a key that already holds an object REPLACES it — `(bucket,
+    // key)` is one object, and `store::put` overwrites the blob — so the
+    // quota it has to fit is the difference, not the whole file, and only when
+    // the bytes it displaces are already counted against this same user.
+    // (Admins can upload into a bucket they do not own; those bytes belong to
+    // whoever uploaded them.)
+    let existing = match repo::objects::find_by_bucket_key(ctx, bucket, &key).await {
+        Ok(row) => row,
+        // Fail closed: admitting the upload against "nothing is stored here"
+        // would charge the full size to a quota it may not fit, or skip the
+        // per-user file count for a replacement that is not one.
+        Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
+    };
+    let replaces_own_bytes = existing
+        .as_ref()
+        .filter(|row| row.uploaded_by == msg.user_id())
+        .map(|row| row.size);
+
+    if let Err(r) = crate::blocks::files::quota::check_quota(
+        ctx,
+        msg.user_id(),
+        content.len() as i64,
+        replaces_own_bytes,
+    )
+    .await
     {
         return r;
     }
 
-    // Insert a pending record BEFORE uploading so concurrent quota checks see it.
-    // This closes the TOCTOU race between check_quota and the actual upload.
-    let pending_record = match repo::objects::insert_pending(
+    // Claim the key BEFORE uploading so concurrent quota checks see the
+    // in-flight size. This closes the TOCTOU race between check_quota and the
+    // actual upload. On a re-upload the claim takes over the existing row —
+    // `(bucket, key)` is UNIQUE, so inserting a second one is refused by the
+    // database, which is what every re-upload used to answer 500 with.
+    let reservation = match repo::objects::reserve_upload(
         ctx,
         bucket,
         &key,
@@ -262,15 +289,23 @@ pub(in crate::blocks::files) async fn handle_upload_object(
     )
     .await
     {
-        Ok(record) => record,
-        Err(e) => return err_internal("Failed to reserve upload slot", e),
+        Ok(reservation) => reservation,
+        // `db_error_internal`, not a bare `err_internal`: a WRAP refusal is a
+        // 403 and a quota is a 429, and folding either into a 500 is what left
+        // an operator unable to tell a missing grant from a broken row.
+        Err(e) => return crud::db_error_internal(e, "Failed to reserve upload slot"),
     };
 
     match store::put(ctx, bucket, &key, &content, &content_type).await {
         Ok(()) => {
-            // Upload succeeded — mark the pending record as complete.
-            if let Err(e) = repo::objects::mark_complete(ctx, &pending_record.id).await {
-                tracing::warn!("Failed to mark upload as complete: {e}");
+            // The row is what charges quota and what the object listings read,
+            // so an upload that cannot be recorded is not an upload. Left as
+            // `pending` it is swept within the hour, and answering
+            // `uploaded: true` anyway is how a stored object came to be
+            // charged to nobody. Report it instead: the blob is in place, and
+            // a retry re-claims this same row and completes it.
+            if let Err(e) = repo::objects::mark_complete(ctx, &reservation.id).await {
+                return crud::db_error_internal(e, "Upload stored but could not be recorded");
             }
             ok_json(&ObjectUploadedResponse {
                 bucket: bucket.to_string(),
@@ -279,9 +314,12 @@ pub(in crate::blocks::files) async fn handle_upload_object(
             })
         }
         Err(e) => {
-            // Upload failed — delete the pending record so it doesn't block quota.
-            if let Err(del_err) = repo::objects::delete(ctx, &pending_record.id).await {
-                tracing::warn!("Failed to clean up pending record: {del_err}");
+            // Upload failed — give the claim up so it doesn't block quota. For
+            // a replacement that means putting the previous object's row back:
+            // its blob is still there (`put` failed), so it must keep being
+            // described and charged.
+            if let Err(release_err) = repo::objects::release_reservation(ctx, &reservation).await {
+                tracing::warn!("Failed to release upload reservation: {release_err}");
             }
             err_internal("Upload failed", e)
         }
@@ -332,7 +370,9 @@ pub(in crate::blocks::files) async fn handle_delete_object(
 #[cfg(test)]
 mod integration_tests {
     use super::{
-        super::test_helpers::{ctx_with_storage, seed_bucket, seed_object_row},
+        super::test_helpers::{
+            ctx_with_storage, ctx_with_storage_handle, seed_bucket, seed_object_row,
+        },
         *,
     };
     use crate::{
@@ -708,6 +748,346 @@ mod integration_tests {
         assert_eq!(size, body.len() as i64);
         assert_eq!(content_type, "text/plain");
         assert_eq!(status, ObjectStatus::Complete);
+    }
+
+    /// Build the message the router produces for
+    /// `GET /b/storage/api/buckets/{bucket}/objects/{key}`.
+    fn download_msg(bucket: &str, key: &str) -> Message {
+        let mut msg = auth_msg(
+            "retrieve",
+            &format!("/b/storage/api/buckets/{bucket}/objects/{key}"),
+            "alice",
+        );
+        msg.set_meta("req.param.name", bucket);
+        msg.set_meta("req.param.key", key);
+        msg
+    }
+
+    /// The response headers a download emitted, as leading meta (the frame
+    /// that precedes the first body chunk — the streaming response shape).
+    async fn download_headers(out: OutputStream) -> Vec<wafer_run::MetaEntry> {
+        use futures::StreamExt;
+        use wafer_block::stream::StreamEvent;
+
+        let events: Vec<StreamEvent> = out.collect().await;
+        let first_chunk = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Chunk(_)))
+            .expect("a body chunk must be streamed");
+        events[..first_chunk]
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn header<'m>(meta: &'m [wafer_run::MetaEntry], name: &str) -> Option<&'m str> {
+        wafer_run::MetaGet::get(meta, &format!("resp.header.{name}"))
+    }
+
+    /// Stored XSS: an uploader picks the content type, the bytes are theirs,
+    /// and this route serves both from the app's own origin. Uploading an HTML
+    /// page and opening its download URL used to render that page on the
+    /// origin — no `Content-Disposition`, no `nosniff` — so any script in it
+    /// ran with the viewer's session.
+    ///
+    /// The upload is the one a browser sends (a `multipart/form-data`
+    /// envelope with the part's own `Content-Type: text/html`), and the
+    /// download is the real handler.
+    #[tokio::test]
+    async fn an_uploaded_html_page_is_served_as_an_inert_attachment() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let boundary = "XBOUNDARYX";
+        let envelope = multipart_envelope(boundary, "payload.html", b"<h1>not a page</h1>");
+        let upload = handle_upload_object(
+            &ctx,
+            &upload_msg(
+                "assets",
+                "payload.html",
+                &format!("multipart/form-data; boundary={boundary}"),
+            ),
+            InputStream::from_bytes(envelope),
+        )
+        .await;
+        assert_eq!(
+            output_json(upload).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        let meta = download_headers(
+            handle_get_object(&ctx, &download_msg("assets", "payload.html")).await,
+        )
+        .await;
+
+        assert_eq!(
+            header(&meta, "Content-Disposition"),
+            Some("attachment; filename=\"payload.html\""),
+            "an uploaded HTML page must be downloaded, never rendered on this origin",
+        );
+        assert_eq!(
+            header(&meta, "X-Content-Type-Options"),
+            Some("nosniff"),
+            "without nosniff the declared type is only a suggestion",
+        );
+        assert!(
+            header(&meta, "Content-Security-Policy").is_some_and(|csp| csp.contains("sandbox")),
+            "an attachment a browser renders anyway must render sandboxed: {meta:?}",
+        );
+    }
+
+    /// The allowlist is what makes the fix compatible with previews: an image
+    /// is still served inline, and still with `nosniff` — which is what stops
+    /// an HTML body uploaded as `image/png` from being sniffed back into a
+    /// page.
+    #[tokio::test]
+    async fn an_image_still_previews_inline_with_nosniff() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        store::put(&ctx, "assets", "pic.png", b"PNGDATA", "image/png")
+            .await
+            .expect("seed object");
+
+        let meta =
+            download_headers(handle_get_object(&ctx, &download_msg("assets", "pic.png")).await)
+                .await;
+
+        assert_eq!(
+            header(&meta, "Content-Disposition"),
+            Some("inline; filename=\"pic.png\"")
+        );
+        assert_eq!(header(&meta, "X-Content-Type-Options"), Some("nosniff"));
+    }
+
+    /// Nothing restricts an object key to ASCII — `is_valid_storage_key` bans
+    /// `..`, backslash, NUL and a leading `/`, and that is all — so a
+    /// non-ASCII filename is an ordinary upload. This route had no
+    /// `Content-Disposition` at all before it gained one, and on Cloudflare
+    /// `Headers.set` throws above U+00FF, so an ASCII-only header would have
+    /// turned such a download into a 500. Round-trip one through both real
+    /// handlers and assert the header is ASCII and carries the real name.
+    #[tokio::test]
+    async fn a_non_ascii_key_downloads_with_an_ascii_header_that_still_names_it() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let key = "日本語 memo.txt";
+        let upload = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", key, "text/plain"),
+            InputStream::from_bytes(b"bytes".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(upload).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        let out = handle_get_object(&ctx, &download_msg("assets", key)).await;
+        let events: Vec<wafer_block::stream::StreamEvent> = futures::StreamExt::collect(out).await;
+        let first_chunk = events
+            .iter()
+            .position(|e| matches!(e, wafer_block::stream::StreamEvent::Chunk(_)))
+            .expect("the object must still be served, not 500");
+        let meta: Vec<wafer_run::MetaEntry> = events[..first_chunk]
+            .iter()
+            .filter_map(|e| match e {
+                wafer_block::stream::StreamEvent::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let disposition = header(&meta, "Content-Disposition").expect("a disposition");
+        assert!(
+            disposition.contains("filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E%20memo.txt"),
+            "the real name must survive as RFC 6266 `filename*`: {disposition}"
+        );
+        assert!(
+            meta.iter().all(|e| e.value.is_ascii()),
+            "every header value must be ASCII or the Workers runtime throws: {meta:?}"
+        );
+    }
+
+    /// `(bucket, key)` is one object and `store::put` overwrites the blob, so
+    /// re-uploading a key REPLACES what is stored there. The metadata row is
+    /// the same row: inserting a second one is refused by the unique index,
+    /// which every re-upload used to answer 500 with.
+    #[tokio::test]
+    async fn re_uploading_an_existing_key_replaces_the_object() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let first = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(b"version one".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(first).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        let second = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/markdown"),
+            InputStream::from_bytes(b"version two, longer".to_vec()),
+        )
+        .await;
+
+        assert_eq!(
+            output_json(second).await["uploaded"],
+            serde_json::json!(true),
+            "re-uploading a key the user already owns must replace it, not 500",
+        );
+        let (stored, info) = store::get(&ctx, "assets", "notes.txt")
+            .await
+            .expect("stored object");
+        assert_eq!(stored, b"version two, longer");
+        assert_eq!(info.content_type, "text/markdown");
+
+        let (size, content_type, status) = sole_object_row(&ctx).await;
+        assert_eq!(
+            size,
+            "version two, longer".len() as i64,
+            "the row must describe the object that is stored now",
+        );
+        assert_eq!(content_type, "text/markdown");
+        assert_eq!(status, ObjectStatus::Complete);
+    }
+
+    /// A replacement costs the DIFFERENCE, not the whole file: the bytes it
+    /// displaces are already counted in this user's usage. Charging the full
+    /// size would refuse a user who is merely editing a file in place.
+    #[tokio::test]
+    async fn a_replacement_is_charged_the_difference_not_the_whole_file() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let mut quota: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        quota.insert("user_id".into(), serde_json::json!("alice"));
+        quota.insert("max_storage_bytes".into(), serde_json::json!(24));
+        repo::quota::seed(&ctx, quota).await.expect("seed quota");
+
+        let first = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(vec![b'a'; 20]),
+        )
+        .await;
+        assert_eq!(
+            output_json(first).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        // 22 bytes replacing 20 is +2 against a 24-byte cap: admitted. The
+        // same 22 bytes charged whole against 20 already stored would be 42.
+        let replace = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(vec![b'b'; 22]),
+        )
+        .await;
+        assert_eq!(
+            output_json(replace).await["uploaded"],
+            serde_json::json!(true),
+            "a replacement that fits the cap after the displaced bytes must be admitted",
+        );
+        assert_eq!(
+            crate::blocks::files::quota::get_used_bytes(&ctx, "alice")
+                .await
+                .expect("usage"),
+            22,
+            "usage must follow the object that is stored, not the sum of every upload",
+        );
+
+        // The cap is still a cap: 30 bytes replacing 22 is 30 > 24.
+        let too_big = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(vec![b'c'; 30]),
+        )
+        .await;
+        assert!(
+            output_is_error(too_big, "InvalidArgument").await,
+            "a replacement that does not fit even after the displaced bytes must be refused",
+        );
+    }
+
+    /// When the storage write fails, the reservation that took over the
+    /// existing row has to put that row back: the previous blob is still
+    /// there, so it must keep being described and charged.
+    #[tokio::test]
+    async fn a_failed_replacement_restores_the_row_of_the_object_it_kept() {
+        let (ctx, storage) = ctx_with_storage_handle().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let stored = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(b"version one".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(stored).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        // Same context, same database — only the storage write now fails.
+        storage.refuse("put");
+        let out = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(b"much longer replacement".to_vec()),
+        )
+        .await;
+        assert!(output_is_error(out, "Internal").await);
+
+        let (size, content_type, status) = sole_object_row(&ctx).await;
+        assert_eq!(
+            size,
+            "version one".len() as i64,
+            "the surviving object's size must be restored, not left charging the failed upload's",
+        );
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(
+            status,
+            ObjectStatus::Complete,
+            "the surviving object must not be left `pending` for the sweep to delete",
+        );
+    }
+
+    /// The row is what charges quota and what the listings read, so an upload
+    /// that could not be recorded is not an upload. It used to answer
+    /// `uploaded: true` with the row still `pending`, which the one-hour sweep
+    /// then deleted — a stored object charged to nobody, and nothing said so.
+    #[tokio::test]
+    async fn an_upload_that_cannot_be_recorded_is_reported_not_claimed() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        // `mark_complete` is the only `database.update` a fresh upload issues.
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.update", repo::objects::TABLE)]);
+
+        let out = handle_upload_object(
+            &failing,
+            &upload_msg("assets", "notes.txt", "text/plain"),
+            InputStream::from_bytes(b"bytes".to_vec()),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "an upload whose row stayed `pending` must not be reported as uploaded",
+        );
+        let (_, _, status) = sole_object_row(&ctx).await;
+        assert_eq!(
+            status,
+            ObjectStatus::Pending,
+            "the row is still the reservation, which is what the uploader retries against",
+        );
     }
 
     /// A multipart upload without `?key=` falls back to the file part's

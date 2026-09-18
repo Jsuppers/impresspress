@@ -102,6 +102,32 @@ mod test_helpers {
     pub(super) struct MemStorage {
         objects: Mutex<MemObjects>,
         folders: Mutex<HashSet<String>>,
+        /// [`StorageService`] method names this double refuses, so a test can
+        /// drive the compensation a handler runs when storage fails after the
+        /// metadata row is already written — the paths that decide whether a
+        /// failure leaves an orphan row or an unrecorded blob behind.
+        ///
+        /// Switchable at runtime rather than fixed at construction, so one
+        /// context (one database) can serve the upload that succeeds and the
+        /// upload that fails: the state the compensation has to restore is
+        /// what the first one left.
+        refused: Mutex<HashSet<&'static str>>,
+    }
+
+    impl MemStorage {
+        /// Make every later call to `op` — `"put"`, `"create_folder"` — fail
+        /// with a backend-internal error.
+        pub(super) fn refuse(&self, op: &'static str) {
+            self.refused.lock().unwrap().insert(op);
+        }
+
+        fn refusal(&self, op: &str) -> Option<StorageError> {
+            self.refused
+                .lock()
+                .unwrap()
+                .contains(op)
+                .then(|| StorageError::Internal("simulated storage outage".to_string()))
+        }
     }
 
     #[async_trait]
@@ -113,6 +139,9 @@ mod test_helpers {
             data: &[u8],
             content_type: &str,
         ) -> Result<(), StorageError> {
+            if let Some(refusal) = self.refusal("put") {
+                return Err(refusal);
+            }
             self.objects.lock().unwrap().insert(
                 (folder.to_string(), key.to_string()),
                 (data.to_vec(), content_type.to_string()),
@@ -163,6 +192,9 @@ mod test_helpers {
         }
 
         async fn create_folder(&self, name: &str, _public: bool) -> Result<(), StorageError> {
+            if let Some(refusal) = self.refusal("create_folder") {
+                return Err(refusal);
+            }
             self.folders.lock().unwrap().insert(name.to_string());
             Ok(())
         }
@@ -204,11 +236,48 @@ mod test_helpers {
     /// declared `requires` plus the deployment's grants (sourced from the
     /// admin block's declaration, which is where they live in production).
     pub(super) async fn ctx_with_storage() -> TestContext {
-        let mut ctx = TestContext::with_files().await;
+        ctx_with_storage_handle().await.0
+    }
+
+    /// [`ctx_with_storage`], plus the backend behind it — so a test can make
+    /// storage start failing partway through
+    /// ([`MemStorage::refuse`]) and drive a handler's compensation path
+    /// against the database state the successful calls left.
+    pub(super) async fn ctx_with_storage_handle() -> (TestContext, Arc<MemStorage>) {
+        with_storage(TestContext::with_files().await)
+    }
+
+    /// [`ctx_with_storage_handle`] on a database that has migration 001 but
+    /// NOT 002 — a deployment that took this code without `--run-migrations`,
+    /// which `RELEASE.md` explicitly anticipates.
+    ///
+    /// `TestContext::with_files` applies every migration the block declares,
+    /// so no other fixture can reach this state, and the handler behaviour
+    /// that must not depend on the unique index would go untested.
+    pub(super) async fn ctx_with_storage_without_the_unique_index() -> (TestContext, Arc<MemStorage>)
+    {
+        let ctx = TestContext::with_auth().await;
+        // Selected by basename, not by position: `SQLITE_MIGRATIONS[0]` means
+        // "001" only for as long as 001 stays first, and a fixture that
+        // silently started applying 002 as well would be the INDEXED case
+        // while still claiming to be the un-migrated one.
+        let sql = crate::blocks::files::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .find(|(basename, _)| *basename == "001_initial_schema")
+            .map(|(_, sql)| *sql)
+            .expect("the files block still has its initial-schema migration");
+        crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &[sql], &[])
+            .await
+            .expect("001 applies");
+        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+    }
+
+    fn with_storage(mut ctx: TestContext) -> (TestContext, Arc<MemStorage>) {
+        let service = Arc::new(MemStorage::default());
         ctx.register_block(
             "wafer-run/storage",
-            crate::blocks::files::test_wrap::storage_block(Arc::new(MemStorage::default())),
+            crate::blocks::files::test_wrap::storage_block(service.clone()),
         );
-        ctx
+        (ctx, service)
     }
 }
