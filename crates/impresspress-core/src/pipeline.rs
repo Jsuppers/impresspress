@@ -9,7 +9,7 @@ use wafer_block::http_codec;
 use wafer_core::clients::config as config_client;
 use wafer_run::{
     context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockInfo, ErrorCode,
-    InputStream, Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
+    InputStream, Message, MetaEntry, OutputStream, WaferError,
 };
 
 use crate::{
@@ -142,7 +142,8 @@ fn visible_to_caller(
 /// after building a Message from the incoming HTTP request.
 ///
 /// Steps:
-/// 1. Strip `/api` prefix (CF convention — native doesn't use it)
+/// 1. Refuse a request whose body the transport would not carry
+///    ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]) with a 413
 /// 2. Validate JWT and set auth meta
 /// 3. CSRF: enforce the Fetch-Metadata/Origin policy for cookie-authenticated
 ///    unsafe-method requests (see `crate::csrf`)
@@ -157,23 +158,28 @@ fn visible_to_caller(
 /// returned `OutputStream` as `StreamEvent::Error`. Request-log
 /// persistence failures are intentionally swallowed (best-effort) so a
 /// failing audit-log table never breaks the response.
-/// The routable path behind an `/api`-prefixed request, or `None` when the
-/// path does not carry that prefix.
+/// The 413 a request whose body exceeded
+/// [`crate::streaming::MAX_REQUEST_BODY_BYTES`] is answered with.
 ///
-/// Segment-bounded: `/api` and `/api/...` are prefixed, `/apiary` is a path of
-/// its own and keeps every byte. An unbounded `strip_prefix("/api")` turned it
-/// into `ary`, and turned `/api` itself into the empty resource, which routes
-/// to nothing.
-fn strip_api_prefix(resource: &str) -> Option<&str> {
-    let rest = resource.strip_prefix("/api")?;
-    match rest.as_bytes().first() {
-        // `/api` alone addresses the site root.
-        None => Some("/"),
-        Some(b'/') => Some(rest),
-        // `/apiary`, `/api.json` — a different path that merely starts the
-        // same way.
-        Some(_) => None,
-    }
+/// A **response** terminal carrying `resp.status: 413`, not an `err_*` error
+/// terminal, and that is the load-bearing part. The site-main flow runs
+/// `wafer-run/security-headers` and `wafer-run/cors` before the router, and
+/// both do their work by setting `resp.*` meta on the *message*; the flow
+/// executor merges that meta into the final response only on the response
+/// path (`waferflow::executor` applies a block's response meta to the message
+/// and answers with `respond_with_meta(body, resp.*)`), while an error
+/// terminal under this flow's `on_error: stop` short-circuits the flow and
+/// carries none of it. An error-terminal 413 would therefore reach a
+/// cross-origin uploader with no `Access-Control-Allow-Origin` — a browser
+/// would report a CORS failure instead of the status, which is the opaque
+/// answer this whole change exists to remove.
+///
+/// `oversized_body_flow.rs` pins both halves against the real executor.
+pub fn payload_too_large_response() -> OutputStream {
+    ResponseBuilder::new().status(413).body(
+        crate::streaming::request_too_large_message().into_bytes(),
+        "text/plain; charset=utf-8",
+    )
 }
 
 // This is the single request-pipeline entry point; each argument is a distinct
@@ -193,14 +199,6 @@ pub async fn handle_request(
 ) -> OutputStream {
     // 0. (Discovery documents moved below step 2 — they are filtered by the
     //    caller's tier, which is not known here.)
-
-    // 1. Strip the `/api` prefix from the resource path — the only place any
-    //    transport does, so `/api/x` and `/x` reach the same route on all of
-    //    them and stripping cannot happen twice.
-    let resource = msg.path().to_string();
-    if let Some(stripped) = strip_api_prefix(&resource) {
-        msg.set_meta(META_REQ_RESOURCE, stripped);
-    }
 
     // 2. Validate JWT or API key and set auth meta
     if let Some(header) = auth_header {
@@ -406,8 +404,17 @@ pub async fn handle_request(
     // below exactly like a dispatched response would.
     //
     // 3. Route to block.
+    //
+    // 3b. A body the transport refused to carry never becomes a block call.
+    //     The adapter marked the message and handed over an empty body (it
+    //     cannot answer 413 itself without losing the flow's CORS and
+    //     security headers and its `request_logs` row), so the refusal is
+    //     built here — after the CSRF check, which must not be skippable by
+    //     sending a large body, and like that check through `stream` rather
+    //     than an early `return`, so it takes the audit tail below.
     let mut stream = match crate::csrf::enforce_origin_policy(&msg, cookie_authenticated) {
         Some(denied) => denied,
+        None if crate::streaming::body_too_large(&msg) => payload_too_large_response(),
         None => routing::route_to_block(ctx, msg, input, features, block_infos, extra_routes).await,
     };
 
@@ -3533,104 +3540,127 @@ mod request_log_policy_tests {
 }
 
 #[cfg(test)]
-mod api_prefix_tests {
-    //! `/api` normalization: once, here, and only on a segment boundary.
+mod oversized_body_tests {
+    //! What a body the transport refused to carry becomes.
     //!
-    //! The Cloudflare adapter used to strip the prefix again on its own side,
-    //! and both strips were plain `starts_with`/`strip_prefix` — so `/apiary`
-    //! became `ary` on every transport, and `/api/api/x` reached `/x` on
-    //! Cloudflare while reaching `/api/x` everywhere else. The adapter no
-    //! longer strips at all; these drive the real pipeline to pin what the one
-    //! remaining strip does.
-
-    use std::sync::Arc;
-
-    use wafer_block::core_types::{LifecycleEvent, WaferError};
-    use wafer_run::Block as RunBlock;
+    //! The adapter marks the message and hands over an empty body
+    //! ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]); everything after that
+    //! is here, on the real `handle_request`: the status, the shape of the
+    //! terminal (which is what decides whether the flow's CORS and security
+    //! headers survive — `tests/oversized_body_flow.rs` pins that half against
+    //! the real executor), and the audit row.
 
     use super::*;
     use crate::{
         features::AllEnabled,
+        platform_state::request_logs,
         routing::{ExtraRoute, RouteAccess},
-        test_support::{anon_msg, collect_or_panic, output_http_status, TestContext},
+        streaming::{BODY_TOO_LARGE_VALUE, META_REQ_BODY_TOO_LARGE},
+        test_support::{anon_msg, collect_or_panic, TestContext},
     };
 
-    /// Answers with the `req.resource` it was dispatched with, which is what
-    /// the strip decides.
-    struct EchoPathBlock;
+    const UPLOAD_PATH: &str = "/b/storage/api/buckets/p/objects";
 
-    #[wafer_block::wafer_async_trait]
-    impl RunBlock for EchoPathBlock {
-        fn info(&self) -> BlockInfo {
-            BlockInfo::new("test/echo", "0.1.0", "test/echo@v1", "echoes its path")
-        }
-        async fn handle(&self, _c: &dyn Context, m: Message, _i: InputStream) -> OutputStream {
-            OutputStream::respond(m.path().as_bytes().to_vec())
-        }
-        async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
-            Ok(())
-        }
+    /// A route declaration covering [`UPLOAD_PATH`], so the audit row keeps the
+    /// path instead of collapsing to [`UNMATCHED_PATH_LABEL`] — this suite
+    /// passes no `block_infos`, and an upload path nothing declares is exactly
+    /// the traffic that collapse exists for.
+    fn upload_route() -> Vec<ExtraRoute> {
+        vec![ExtraRoute::new(
+            "/b/storage/",
+            "impresspress/files",
+            RouteAccess::Public,
+        )]
     }
 
-    fn routes() -> Vec<ExtraRoute> {
-        vec![
-            ExtraRoute::new("/x", "test/echo", RouteAccess::Public),
-            ExtraRoute::new("/apiary/", "test/echo", RouteAccess::Public),
-        ]
+    fn marked(path: &str) -> Message {
+        let mut msg = anon_msg("create", path);
+        msg.set_meta(META_REQ_BODY_TOO_LARGE, BODY_TOO_LARGE_VALUE);
+        msg
     }
 
-    async fn ctx() -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
-        ctx.register_block("test/echo", Arc::new(EchoPathBlock));
-        ctx
-    }
-
-    async fn drive(ctx: &TestContext, path: &str) -> OutputStream {
+    async fn drive(ctx: &TestContext, msg: Message) -> OutputStream {
+        set_request_log_mode(RequestLogMode::Inline);
         handle_request(
             ctx,
-            anon_msg("retrieve", path),
+            msg,
             InputStream::empty(),
             None,
             "test-secret",
             false,
             &AllEnabled,
             &[],
-            &routes(),
+            &upload_route(),
         )
         .await
     }
 
-    /// The prefix does what it is for: `/api/x` is served by the route
-    /// declared at `/x`.
+    /// **Fails on the pre-fix tree**, where the adapters answered an oversized
+    /// body themselves: Cloudflare returned a `worker::Error` that `run` turned
+    /// into a 500 with a correlation id, and the browser failed the fetch with
+    /// no status at all. It is a 413 naming the limit now.
     #[tokio::test]
-    async fn an_api_prefixed_path_reaches_the_unprefixed_route() {
-        let ctx = ctx().await;
-        let body = collect_or_panic(drive(&ctx, "/api/x").await).await.body;
-        assert_eq!(String::from_utf8(body).unwrap(), "/x");
-    }
+    async fn a_marked_body_is_refused_with_413_and_the_enforced_limit() {
+        let ctx = TestContext::with_admin().await;
+        let buf = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
 
-    /// **Fails on the pre-fix tree**, where `strip_prefix("/api")` left
-    /// `ary/hives` — a path with no leading slash that no route can match, so
-    /// a site with an `/apiary` route answered 404 on it.
-    #[tokio::test]
-    async fn a_path_that_merely_starts_with_api_keeps_every_byte() {
-        let ctx = ctx().await;
-        let body = collect_or_panic(drive(&ctx, "/apiary/hives").await)
-            .await
-            .body;
-        assert_eq!(String::from_utf8(body).unwrap(), "/apiary/hives");
-    }
-
-    /// One strip, not a loop: the second `/api` is part of the path the route
-    /// sees. (The Cloudflare adapter's own strip made this `/x` there, and
-    /// only there.)
-    #[tokio::test]
-    async fn only_one_api_prefix_is_stripped() {
-        let ctx = ctx().await;
-        // `/api/api/x` normalizes to `/api/x`, which no route claims.
+        assert_eq!(http_codec::resolve_status(&buf.meta, 200), 413);
         assert_eq!(
-            output_http_status(drive(&ctx, "/api/api/x").await).await,
-            404
+            String::from_utf8(buf.body).unwrap(),
+            crate::streaming::request_too_large_message(),
+            "the client is told the number that was enforced"
         );
+    }
+
+    /// The refusal is a **response** terminal, not an error terminal. That is
+    /// the property the flow's CORS and security headers ride on: the
+    /// executor merges a response's meta into the message and answers with the
+    /// message's `resp.*`, while an error terminal short-circuits `on_error:
+    /// stop` and carries none of it. `collect_or_panic` above already refuses
+    /// an error terminal, so this states it outright rather than leaving it to
+    /// a helper's failure mode.
+    #[tokio::test]
+    async fn the_refusal_is_a_response_terminal_not_an_error() {
+        let ctx = TestContext::with_admin().await;
+        let terminal = drive(&ctx, marked(UPLOAD_PATH))
+            .await
+            .collect_buffered()
+            .await;
+        assert!(
+            terminal.is_ok(),
+            "an error terminal would lose the flow's CORS headers: {:?}",
+            terminal.err()
+        );
+    }
+
+    /// And it is audited like any other refusal — the adapters' own 413 wrote
+    /// no `request_logs` row at all, so an operator could not see that an
+    /// upload had been turned away.
+    #[tokio::test]
+    async fn the_refusal_is_logged_with_its_own_status() {
+        let ctx = TestContext::with_admin().await;
+        let _ = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
+
+        let rows = request_logs::paginated(&ctx, 1, 20, "")
+            .await
+            .expect("read request_logs")
+            .rows;
+        let row = rows
+            .iter()
+            .find(|r| r.path == UPLOAD_PATH)
+            .expect("the refused upload must be audited");
+        assert_eq!(row.status_code, 413);
+    }
+
+    /// An unmarked request is untouched — the check reads one meta key and
+    /// nothing else, so an ordinary upload cannot be refused by it.
+    #[tokio::test]
+    async fn an_unmarked_request_is_not_refused() {
+        let ctx = TestContext::with_admin().await;
+        let status = crate::test_support::output_http_status(
+            drive(&ctx, anon_msg("create", UPLOAD_PATH)).await,
+        )
+        .await;
+        assert_ne!(status, 413, "only the marker refuses");
     }
 }

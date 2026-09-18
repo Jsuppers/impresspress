@@ -690,14 +690,7 @@ async fn dispatch(
     request_services::scope(services, async move {
         // 7. Convert request → message; preserve auth header in meta.
         let auth_header = req.headers().get("authorization")?;
-        // A body over the transport cap is answered here, before the runtime
-        // sees it: it is a 413 about the request, not an internal error.
-        let (mut msg, input) = match convert::worker_request_to_message(&req).await? {
-            convert::RequestConversion::Ready(msg, input) => (msg, input),
-            convert::RequestConversion::TooLarge => {
-                return Ok(convert::request_too_large_response()?)
-            }
-        };
+        let (mut msg, input) = convert::worker_request_to_message(&req).await?;
         if let Some(ref auth) = auth_header {
             msg.set_meta("http.header.authorization", auth);
         }

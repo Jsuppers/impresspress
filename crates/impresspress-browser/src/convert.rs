@@ -28,17 +28,6 @@ use web_sys::{Headers, ResponseInit};
 // Request conversion
 // ---------------------------------------------------------------------------
 
-/// What converting a browser request produced: a message to dispatch, or the
-/// one refusal the conversion itself can decide.
-pub enum RequestConversion {
-    /// The request converted; dispatch it.
-    Ready(Message, InputStream),
-    /// The body is larger than [`streaming::MAX_REQUEST_BODY_BYTES`]. The
-    /// caller answers 413 ([`request_too_large_response`]) without
-    /// dispatching.
-    TooLarge,
-}
-
 /// Convert a browser `web_sys::Request` into a WAFER `(Message, InputStream)` pair.
 ///
 /// The protocol mapping (kind, `http.*` / `req.*` meta, method→action, header
@@ -47,10 +36,22 @@ pub enum RequestConversion {
 /// are browser-specific. The remote address is always `"127.0.0.1"` — in a
 /// Service Worker the request comes from the same device.
 ///
-/// An oversized body is [`RequestConversion::TooLarge`], not an `Err`: a
-/// `JsValue` error out of here becomes the Service Worker's own failure, and
-/// the client sees a fetch that died rather than a status it can act on.
-pub async fn request_to_message(request: &web_sys::Request) -> Result<RequestConversion, JsValue> {
+/// A body over [`streaming::MAX_REQUEST_BODY_BYTES`] is dropped rather than
+/// dispatched: the message is marked with
+/// [`streaming::META_REQ_BODY_TOO_LARGE`] and paired with an empty
+/// `InputStream`, and `impresspress_core::pipeline::handle_request` answers
+/// 413 from inside the flow — where the CORS and security headers and the
+/// `request_logs` row are. An `Err` here becomes the Service Worker's own
+/// failure and the client sees a fetch that died rather than a status; a
+/// `Response` built here would skip the flow.
+///
+/// Unlike the Cloudflare adapter there is no pre-read check to make: a
+/// `Request` handed to a Service Worker is read through `array_buffer()`, so
+/// the bytes are resident before their length can be measured. The cap
+/// changes the status, not the peak memory.
+pub async fn request_to_message(
+    request: &web_sys::Request,
+) -> Result<(Message, InputStream), JsValue> {
     let method = request.method();
     let url_str = request.url();
 
@@ -65,16 +66,18 @@ pub async fn request_to_message(request: &web_sys::Request) -> Result<RequestCon
         search
     };
 
-    // Read body bytes via ArrayBuffer, under the shared transport cap.
-    let body: Vec<u8> = {
+    // Read body bytes via ArrayBuffer, and measure them against the shared
+    // transport cap. An over-cap body is dropped here rather than copied out.
+    let (body, too_large): (Vec<u8>, bool) = {
         let promise = request.array_buffer()?;
         let ab_val = JsFuture::from(promise).await?;
         let ab: ArrayBuffer = ab_val.dyn_into()?;
         let arr = Uint8Array::new(&ab);
         if arr.length() as usize > streaming::MAX_REQUEST_BODY_BYTES {
-            return Ok(RequestConversion::TooLarge);
+            (Vec::new(), true)
+        } else {
+            (arr.to_vec(), false)
         }
-        arr.to_vec()
     };
 
     // Collect headers into (name, value) pairs for the codec.
@@ -176,9 +179,9 @@ pub async fn request_to_message(request: &web_sys::Request) -> Result<RequestCon
     }
 
     // `build_http_message` builds `kind`, `http.*` and normalized `req.*` meta
-    // from the method+path. Paths are served as received; `/api` normalization
-    // is the request pipeline's, for every transport alike.
-    let msg = http_codec::build_http_message(
+    // from the method+path. Paths are served exactly as received — nothing in
+    // the request path rewrites them.
+    let mut msg = http_codec::build_http_message(
         &method,
         &path,
         &raw_query,
@@ -186,21 +189,15 @@ pub async fn request_to_message(request: &web_sys::Request) -> Result<RequestCon
         header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
     );
 
-    Ok(RequestConversion::Ready(msg, InputStream::from_bytes(body)))
-}
+    if too_large {
+        msg.set_meta(
+            streaming::META_REQ_BODY_TOO_LARGE,
+            streaming::BODY_TOO_LARGE_VALUE,
+        );
+        return Ok((msg, InputStream::empty()));
+    }
 
-/// The 413 answer to [`RequestConversion::TooLarge`], carrying the enforced
-/// limit ([`streaming::request_too_large_message`]) so a client is told the
-/// number it has to fit. Identical in status, headers and text to the
-/// Cloudflare adapter's.
-pub fn request_too_large_response() -> Result<web_sys::Response, JsValue> {
-    let headers = Headers::new()?;
-    headers.set("Content-Type", "text/plain; charset=utf-8")?;
-    make_response(
-        streaming::request_too_large_message().into_bytes(),
-        413,
-        headers,
-    )
+    Ok((msg, InputStream::from_bytes(body)))
 }
 
 /// The worker's own `origin` and `host`, as its global `location` reports them.
@@ -399,13 +396,17 @@ fn make_response(
 /// subsequent `Chunk` event from `remaining`.
 ///
 /// The framing is [`streaming::download_body_stream`] — the same function the
-/// Cloudflare adapter pipes into its Worker `ReadableStream`, so the two
-/// agree on what a terminal mid-body means: an `Error` becomes an errored
-/// stream, which aborts the response body, and every other terminal ends it.
-/// The status is already committed by then, so an error cannot be downgraded
-/// to a 413/500 — but a reader that gets an abort knows the bytes are
-/// incomplete, which a clean end-of-stream does not tell it. No file download
-/// sets `Content-Length`, so this is the client's only signal.
+/// Cloudflare adapter pipes into its Worker `ReadableStream`, so the two agree
+/// on what a mid-body failure means: an `Error` terminal becomes an `Err`
+/// item, which errors the JS stream and aborts the response body. Every other
+/// event that is not a `Chunk` (mid-body `Meta`, and each of the non-error
+/// terminals) is filtered out rather than forwarded, and the body simply ends
+/// when the `OutputStream` does.
+///
+/// The status is already committed by the time a body read fails, so an error
+/// cannot be downgraded to a 413/500 — but a reader that gets an abort knows
+/// the bytes are incomplete, which a clean end-of-stream does not tell it. No
+/// file download sets `Content-Length`, so this is the client's only signal.
 fn make_streaming_body(
     first_chunk: Vec<u8>,
     remaining: OutputStream,

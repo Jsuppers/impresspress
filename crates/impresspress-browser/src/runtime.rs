@@ -91,9 +91,10 @@ pub fn restore_wafer(previous: Rc<wafer_run::Wafer>) {
 /// Convert a browser `Request` into a WAFER `Message`, dispatch through
 /// the currently active `Wafer`'s `site-main` flow, and return a browser
 /// `Response`. Returns a 503-shaped `Response` if called before
-/// `store_wafer`, and a 413-shaped one for a request body over
-/// `impresspress_core::streaming::MAX_REQUEST_BODY_BYTES`. Internal errors
-/// return a 500-shaped `Response`.
+/// `store_wafer`; internal errors return a 500-shaped `Response`. A request
+/// body over `impresspress_core::streaming::MAX_REQUEST_BODY_BYTES` is marked
+/// by `convert::request_to_message` and answered 413 by the flow, like any
+/// other refusal.
 ///
 /// The `Rc` is cloned synchronously (before the first `.await`), so a
 /// `replace_wafer` that lands mid-dispatch does not affect this call — it
@@ -105,12 +106,7 @@ pub async fn dispatch_request(request: web_sys::Request) -> Result<web_sys::Resp
             "impresspress-browser: runtime not initialized — call store_wafer() first",
         );
     };
-    // A body over the transport cap is answered here, before the runtime sees
-    // it: it is a 413 about the request, not a failed fetch.
-    let (msg, input) = match convert::request_to_message(&request).await? {
-        convert::RequestConversion::Ready(msg, input) => (msg, input),
-        convert::RequestConversion::TooLarge => return convert::request_too_large_response(),
-    };
+    let (msg, input) = convert::request_to_message(&request).await?;
     let output = wafer.run("site-main", msg, input).await;
     convert::output_to_response(output).await
 }
@@ -177,16 +173,13 @@ mod tests {
     /// **Fails on the pre-fix tree**, where an over-cap body left
     /// `request_to_message` as a `JsValue` error: `dispatch_request` returns
     /// `Err`, the Service Worker's `respondWith` rejects, and the uploader's
-    /// `fetch` fails with no status at all. Now it is a 413 — the same status,
-    /// headers and text the Cloudflare adapter returns for the same body.
-    ///
-    /// The runtime is stored but never reached: the refusal is decided before
-    /// dispatch, which is the point of deciding it here.
+    /// `fetch` fails with no status at all. The body is now dropped and the
+    /// message marked, and the flow answers 413 — the assertion of the status
+    /// itself lives with the code that builds it
+    /// (`impresspress_core::pipeline`'s `oversized_body_tests`), because an
+    /// empty `Wafer` has no `site-main` flow to answer through.
     #[wasm_bindgen_test]
-    async fn a_request_body_over_the_transport_cap_is_413() {
-        reset();
-        store_wafer(empty_wafer()).expect("store");
-
+    async fn an_over_cap_request_body_is_marked_and_dropped() {
         let body = js_sys::Uint8Array::new_with_length(
             (impresspress_core::streaming::MAX_REQUEST_BODY_BYTES + 1) as u32,
         );
@@ -199,16 +192,22 @@ mod tests {
         )
         .expect("build request");
 
-        let response = dispatch_request(request).await.expect("dispatch");
-
-        assert_eq!(response.status(), 413);
-        let text = wasm_bindgen_futures::JsFuture::from(response.text().expect("text"))
+        let (msg, input) = convert::request_to_message(&request)
             .await
-            .expect("read body");
-        assert_eq!(
-            text.as_string(),
-            Some(impresspress_core::streaming::request_too_large_message()),
-            "the client is told the limit it has to fit"
+            .expect("conversion must not fail the fetch");
+
+        assert!(
+            impresspress_core::streaming::body_too_large(&msg),
+            "the marker the pipeline refuses on"
+        );
+        let forwarded = futures::StreamExt::fold(input, Vec::new(), |mut acc, chunk| async move {
+            acc.extend_from_slice(&chunk);
+            acc
+        })
+        .await;
+        assert!(
+            forwarded.is_empty(),
+            "an oversized body must not reach a block"
         );
     }
 }

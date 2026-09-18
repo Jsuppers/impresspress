@@ -110,21 +110,64 @@ pub const MAX_NETWORK_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 ///
 /// It is the hard ceiling on an upload, so anything a block advertises as a
 /// per-request size limit has to be clamped to it — see
-/// [`crate::blocks::files::quota::get_user_quota`], where the files block's
-/// admin-editable per-file cap is.
+/// [`crate::blocks::files::quota::clamp_to_transport`], which the files block's
+/// admin-editable per-file cap goes through.
 ///
-/// Raising it is not a matter of changing the number: the body is held in the
-/// isolate whole (128 MB on a Cloudflare Worker, one shared linear memory in
-/// the Service Worker), and a multipart upload holds the envelope and the
-/// extracted file at once. A genuinely larger upload needs a streamed request
-/// body, which `wafer_run::InputStream` cannot carry on wasm today — its
-/// `from_stream` requires `Send` and every JS-backed byte stream
+/// # What the check does and does not buy
+///
+/// Only one of the three transports can refuse an oversized body *before* it
+/// is resident, and only conditionally: the Cloudflare adapter checks a
+/// declared `Content-Length` first and returns without reading the stream, so
+/// a well-formed oversized upload never enters the isolate. A chunked request
+/// (no length, or a lying one) is caught by the post-read check, by which time
+/// the bytes are already in the isolate — and the browser adapter reads the
+/// whole `ArrayBuffer` before it can measure it at all, so there the cap only
+/// changes the status, never the peak memory. It is a contract, not a memory
+/// guard.
+///
+/// # Why it is not simply larger
+///
+/// The body is held whole (128 MB on a Cloudflare Worker, one shared linear
+/// memory in the Service Worker), and a multipart upload holds the envelope
+/// and the extracted file at once. A genuinely larger upload needs a streamed
+/// request body, which `wafer_run::InputStream` cannot carry on wasm today —
+/// its `from_stream` requires `Send` and every JS-backed byte stream
 /// (`worker::ByteStream`, `wasm_streams`) is `!Send`.
+///
+/// # Cross-repo coupling
+///
+/// The native half of this number is not ours: `wafer-block-http-listener`
+/// owns `max_body_bytes` and its default, and that default is a **private**
+/// const in that crate, reachable only through the `ConfigVar` the block
+/// declares. If wafer-run raises it and this stays put, the clamp above would
+/// enforce *below* what native accepts.
+/// `impresspress-native/tests/transport_body_cap.rs` reads the block's own
+/// declared default and fails if the two part company.
 pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-/// The plain-text body both wasm adapters return with their 413 when a request
-/// body exceeds [`MAX_REQUEST_BODY_BYTES`]. Shared so the two cannot describe
-/// the same refusal differently, and so the number a client is told is the
+/// Meta key an adapter sets (value [`BODY_TOO_LARGE_VALUE`]) on a message
+/// whose request body exceeded [`MAX_REQUEST_BODY_BYTES`].
+///
+/// The adapter hands the runtime this marker and an **empty** body rather than
+/// building a 413 itself: a response built outside the flow carries neither
+/// the CORS and security headers `wafer-run/cors` and
+/// `wafer-run/security-headers` put on the message nor a `request_logs` row.
+/// `pipeline::handle_request` turns the marker into
+/// [`pipeline::payload_too_large_response`][crate::pipeline::payload_too_large_response]
+/// where both apply.
+pub const META_REQ_BODY_TOO_LARGE: &str = "req.body_too_large";
+
+/// The value [`META_REQ_BODY_TOO_LARGE`] carries.
+pub const BODY_TOO_LARGE_VALUE: &str = "1";
+
+/// True when an adapter marked this message's body as over
+/// [`MAX_REQUEST_BODY_BYTES`].
+pub fn body_too_large(msg: &wafer_run::Message) -> bool {
+    msg.get_meta(META_REQ_BODY_TOO_LARGE) == BODY_TOO_LARGE_VALUE
+}
+
+/// The plain-text body the 413 carries when a request body exceeds
+/// [`MAX_REQUEST_BODY_BYTES`]. Shared so the number a client is told is the
 /// number that was enforced.
 pub fn request_too_large_message() -> String {
     format!("request body too large (limit {MAX_REQUEST_BODY_BYTES} bytes)")

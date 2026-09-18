@@ -23,55 +23,52 @@ use worker::{Headers, Request, Response, ResponseBuilder, Result};
 // Request conversion
 // ---------------------------------------------------------------------------
 
-/// What converting a Worker request produced: a message to dispatch, or the
-/// one refusal the conversion itself can decide.
-pub enum RequestConversion {
-    /// The request converted; dispatch it.
-    Ready(Message, InputStream),
-    /// The body is larger than [`streaming::MAX_REQUEST_BODY_BYTES`] and was
-    /// not read into the isolate. The caller answers 413
-    /// ([`request_too_large_response`]) without dispatching.
-    TooLarge,
-}
-
 /// Convert a Cloudflare Worker Request into a WAFER `(Message, InputStream)`.
 ///
-/// The path is passed through as received: `/api` normalization belongs to
-/// `impresspress_core::pipeline::handle_request`, which every transport shares,
-/// and a second strip here made `/api/api/x` route as `/x` on this adapter
-/// alone.
+/// The path is passed through exactly as received. Nothing rewrites it: the
+/// `/api` prefix this adapter used to strip was never honoured by the
+/// site-main flow's router (which matches `/b/**`, `/health`, `/openapi.json`,
+/// `/.well-known/agent.json`, `/` and falls the rest through to
+/// `wafer-run/web`), so stripping here quietly re-pointed paths only this
+/// transport could serve.
 ///
-/// An oversized body is [`RequestConversion::TooLarge`] rather than an `Err`:
-/// a worker error reaches the client as the opaque 500 `run`'s error arm
-/// builds, and "your upload is too big" is not an internal error.
-pub async fn worker_request_to_message(req: &Request) -> Result<RequestConversion> {
+/// A body over [`streaming::MAX_REQUEST_BODY_BYTES`] is **not** read and not
+/// dispatched: the message is marked with
+/// [`streaming::META_REQ_BODY_TOO_LARGE`] and paired with an empty
+/// `InputStream`, and `impresspress_core::pipeline::handle_request` answers
+/// 413 from inside the flow — where the CORS and security headers and the
+/// `request_logs` row are. Returning a `worker::Error` here is what made an
+/// oversized upload an opaque 500 with a correlation id; building the
+/// `Response` here instead would drop the headers and the audit row.
+pub async fn worker_request_to_message(req: &Request) -> Result<(Message, InputStream)> {
     let method = req.method().to_string();
     let url = req.url()?;
     let path = url.path().to_string();
     let query = url.query().unwrap_or("").to_string();
 
-    // Reject oversized bodies on the declared Content-Length *before* buffering
-    // them into the (128 MB) Worker isolate. The post-read check below is the
-    // backstop for chunked / absent-length requests where the header can't be
-    // trusted.
-    if let Some(len) = req
+    // A declared Content-Length over the cap is refused before the body is
+    // read, so a well-formed oversized upload never enters the (128 MB)
+    // isolate at all. The post-read check below is the backstop for chunked /
+    // absent-length requests, where the header cannot be trusted and the bytes
+    // are resident by the time they can be measured.
+    let declared_too_large = req
         .headers()
         .get("content-length")
         .ok()
         .flatten()
         .and_then(|v| v.parse::<usize>().ok())
-    {
-        if len > streaming::MAX_REQUEST_BODY_BYTES {
-            return Ok(RequestConversion::TooLarge);
-        }
-    }
-    // Read the body. A read error here would otherwise be swallowed and turned
-    // into an empty body, silently corrupting POST/PUT.
-    let mut req_clone = req.clone()?;
-    let body = req_clone.bytes().await?;
-    if body.len() > streaming::MAX_REQUEST_BODY_BYTES {
-        return Ok(RequestConversion::TooLarge);
-    }
+        .is_some_and(|len| len > streaming::MAX_REQUEST_BODY_BYTES);
+
+    // Read the body unless the declared length already refused it. A read
+    // error would otherwise be swallowed and turned into an empty body,
+    // silently corrupting POST/PUT.
+    let body = if declared_too_large {
+        Vec::new()
+    } else {
+        let mut req_clone = req.clone()?;
+        req_clone.bytes().await?
+    };
+    let too_large = declared_too_large || body.len() > streaming::MAX_REQUEST_BODY_BYTES;
 
     // Extract remote address
     let remote_addr = req
@@ -82,21 +79,18 @@ pub async fn worker_request_to_message(req: &Request) -> Result<RequestConversio
         .or_else(|| req.headers().get("x-forwarded-for").ok().flatten())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let msg = http_codec::build_http_message(&method, &path, &query, &remote_addr, req.headers());
+    let mut msg =
+        http_codec::build_http_message(&method, &path, &query, &remote_addr, req.headers());
 
-    Ok(RequestConversion::Ready(msg, InputStream::from_bytes(body)))
-}
+    if too_large {
+        msg.set_meta(
+            streaming::META_REQ_BODY_TOO_LARGE,
+            streaming::BODY_TOO_LARGE_VALUE,
+        );
+        return Ok((msg, InputStream::empty()));
+    }
 
-/// The 413 answer to [`RequestConversion::TooLarge`], carrying the enforced
-/// limit ([`streaming::request_too_large_message`]) so a client is told the
-/// number it has to fit.
-pub fn request_too_large_response() -> Result<Response> {
-    let headers = Headers::new();
-    headers.set("Content-Type", "text/plain; charset=utf-8")?;
-    Ok(ResponseBuilder::new()
-        .with_status(413)
-        .with_headers(headers)
-        .fixed(streaming::request_too_large_message().into_bytes()))
+    Ok((msg, InputStream::from_bytes(body)))
 }
 
 // ---------------------------------------------------------------------------
@@ -251,19 +245,24 @@ fn parts_to_response(parts: HttpResponseParts) -> Result<Response> {
 /// They build a real `worker::Request` (a `web_sys::Request`, which Node ≥18
 /// provides) and run it through the real `worker_request_to_message`, so they
 /// exercise the header pre-check, the post-read backstop and the meta the
-/// pipeline then routes on. They need no `worker::Env`, so they run under the
+/// flow then routes on. They need no `worker::Env`, so they run under the
 /// `cloudflare-wasm-test` job like the rest of this crate's wasm tests.
+///
+/// What the marked message then *becomes* is `impresspress-core`'s: a 413
+/// through the flow, pinned by `pipeline`'s `oversized_body_tests` and
+/// `tests/oversized_body_flow.rs` on the host.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod request_tests {
-    use impresspress_core::streaming::MAX_REQUEST_BODY_BYTES;
+    use futures::StreamExt;
+    use impresspress_core::streaming::{
+        body_too_large, BODY_TOO_LARGE_VALUE, MAX_REQUEST_BODY_BYTES, META_REQ_BODY_TOO_LARGE,
+    };
     use wafer_block::meta::META_REQ_RESOURCE;
     use wasm_bindgen::JsValue;
     use wasm_bindgen_test::wasm_bindgen_test;
     use worker::{Method, RequestInit};
 
-    use super::{
-        request_too_large_response, worker_request_to_message, Request, RequestConversion,
-    };
+    use super::{worker_request_to_message, InputStream, Message, Request};
 
     /// A POST whose body is `len` bytes of zeroes.
     fn post_with_body(url: &str, len: usize) -> Request {
@@ -274,76 +273,76 @@ mod request_tests {
         Request::new_with_init(url, &init).expect("build request")
     }
 
-    fn ready(conversion: RequestConversion) -> wafer_run::Message {
-        match conversion {
-            RequestConversion::Ready(msg, _) => msg,
-            RequestConversion::TooLarge => panic!("expected a converted request"),
-        }
+    async fn convert(req: &Request) -> (Message, InputStream) {
+        worker_request_to_message(req).await.expect("convert")
+    }
+
+    /// Bytes the returned `InputStream` carries.
+    async fn drain(input: InputStream) -> Vec<u8> {
+        input
+            .fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                acc
+            })
+            .await
     }
 
     /// **Fails on the pre-fix tree**, where an over-cap body returned
     /// `Err("request body too large")` — a `worker::Error` the `run` entry
     /// point's catch-all turns into a 500 with a correlation id, telling the
     /// uploader nothing and an operator to go read the isolate log for what is
-    /// not an internal error at all.
+    /// not an internal error at all. It is now a marked message the flow
+    /// answers 413 for, and the body is dropped rather than forwarded.
     #[wasm_bindgen_test]
-    async fn a_body_over_the_cap_is_reported_as_too_large() {
+    async fn an_over_cap_body_is_marked_and_not_forwarded() {
         let req = post_with_body(
             "https://example.test/b/storage/api/buckets/photos/objects?key=big.bin",
             MAX_REQUEST_BODY_BYTES + 1,
         );
-        assert!(matches!(
-            worker_request_to_message(&req).await.expect("convert"),
-            RequestConversion::TooLarge
-        ));
-    }
+        let (msg, input) = convert(&req).await;
 
-    /// And the refusal it turns into is a 413 naming the limit.
-    #[wasm_bindgen_test]
-    fn the_too_large_refusal_is_a_413() {
-        let resp = request_too_large_response().expect("build response");
-        assert_eq!(resp.status_code(), 413);
+        assert!(body_too_large(&msg), "the marker the pipeline refuses on");
+        assert_eq!(msg.get_meta(META_REQ_BODY_TOO_LARGE), BODY_TOO_LARGE_VALUE);
+        assert!(
+            drain(input).await.is_empty(),
+            "an oversized body must not reach a block"
+        );
         assert_eq!(
-            resp.headers().get("content-type").unwrap().as_deref(),
-            Some("text/plain; charset=utf-8")
+            msg.get_meta(META_REQ_RESOURCE),
+            "/b/storage/api/buckets/photos/objects",
+            "the refusal still routes as the request it was, so it is logged as one",
         );
     }
 
-    /// A body exactly at the cap is admitted — the refusal is `>`, not `>=`,
-    /// and the boundary is the one the files block's clamped quota reports.
+    /// A body exactly at the cap is admitted, whole — the refusal is `>`, not
+    /// `>=`, and the boundary is the one the files block's clamped quota
+    /// reports.
     #[wasm_bindgen_test]
-    async fn a_body_at_the_cap_is_admitted() {
+    async fn a_body_at_the_cap_is_admitted_whole() {
         let req = post_with_body(
             "https://example.test/b/storage/api/buckets/photos/objects?key=big.bin",
             MAX_REQUEST_BODY_BYTES,
         );
-        let msg = ready(worker_request_to_message(&req).await.expect("convert"));
-        assert_eq!(
-            msg.get_meta(META_REQ_RESOURCE),
-            "/b/storage/api/buckets/photos/objects"
-        );
+        let (msg, input) = convert(&req).await;
+
+        assert!(!body_too_large(&msg));
+        assert_eq!(drain(input).await.len(), MAX_REQUEST_BODY_BYTES);
     }
 
-    /// **Fails on the pre-fix tree**: this adapter stripped `/api` itself, on
-    /// top of the pipeline's own strip, so a double prefix lost both segments
-    /// here and only one on every other transport.
+    /// **Fails on the pre-fix tree**: this adapter rewrote the path, stripping
+    /// `/api`, so a path the flow router would have served from the SPA
+    /// fallback was re-pointed at the API on this transport alone — and
+    /// `/apiary` lost its first four bytes, becoming `ary`.
     #[wasm_bindgen_test]
-    async fn a_doubled_api_prefix_keeps_the_path_the_client_sent() {
-        let req = post_with_body("https://example.test/api/api/x", 0);
-        let msg = ready(worker_request_to_message(&req).await.expect("convert"));
-        assert_eq!(
-            msg.get_meta(META_REQ_RESOURCE),
-            "/api/api/x",
-            "the adapter passes the path through; the pipeline strips one /api"
-        );
-    }
-
-    /// **Fails on the pre-fix tree**: the unbounded `starts_with("/api")`
-    /// strip turned `/apiary` into `ary`, a path no route matches.
-    #[wasm_bindgen_test]
-    async fn a_path_that_merely_starts_with_api_is_untouched() {
-        let req = post_with_body("https://example.test/apiary/hives", 0);
-        let msg = ready(worker_request_to_message(&req).await.expect("convert"));
-        assert_eq!(msg.get_meta(META_REQ_RESOURCE), "/apiary/hives");
+    async fn the_path_reaches_the_message_exactly_as_sent() {
+        for path in ["/api/b/storage", "/api/api/x", "/apiary/hives", "/api"] {
+            let req = post_with_body(&format!("https://example.test{path}"), 0);
+            let (msg, _) = convert(&req).await;
+            assert_eq!(
+                msg.get_meta(META_REQ_RESOURCE),
+                path,
+                "the adapter must not rewrite paths",
+            );
+        }
     }
 }
