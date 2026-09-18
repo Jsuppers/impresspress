@@ -178,10 +178,14 @@ async fn an_error_terminal_would_lose_those_headers() {
 // ---------------------------------------------------------------------------
 
 /// Stand-in for `wafer-run/web`: the SPA fallback the flow's `/**` route
-/// serves. It answers 200 with an `index.html` body, which is exactly what an
-/// oversized POST to an unclaimed path used to receive — and it records that
-/// it was reached, so "refused before the router" is asserted rather than
-/// inferred from a status.
+/// serves. It answers 200 — which is exactly what an oversized POST to an
+/// unclaimed path used to receive, with the site's index page as the body —
+/// and records that it was reached, so "refused before the router" is asserted
+/// rather than inferred from a status.
+///
+/// The body is a marker string rather than real markup on purpose:
+/// `scripts/grep-guard-html.sh` keeps full-page HTML out of every file outside
+/// `impresspress-core/src/ui/`, and nothing here depends on its content.
 struct SpaFallbackBlock {
     reached: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -194,7 +198,7 @@ impl Block for SpaFallbackBlock {
     async fn handle(&self, _c: &dyn Context, _m: Message, _i: InputStream) -> OutputStream {
         self.reached
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        OutputStream::respond(b"<!doctype html><html>index</html>".to_vec())
+        OutputStream::respond(b"spa-index-page".to_vec())
     }
     async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
         Ok(())
