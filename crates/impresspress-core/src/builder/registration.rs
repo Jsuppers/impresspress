@@ -448,14 +448,29 @@ impl ImpresspressBuilder {
         #[cfg(feature = "block-dev")]
         crate::blocks::dev::tools::log_selection_refusals(&block_infos);
 
-        let router = ImpresspressRouterBlock::with_extra_routes(
+        // Shared with the body-limit block below, which judges its audit
+        // rows' paths against the same declarations the router routes by.
+        let extra_routes = Arc::new(self.extra_routes);
+        let router = ImpresspressRouterBlock::with_extra_routes_arc(
             self.jwt_secret.clone(),
             feature_config,
-            block_infos,
-            self.extra_routes,
+            block_infos.clone(),
+            extra_routes.clone(),
         );
         wafer.register_block("impresspress/router", Arc::new(router))?;
         wafer.add_block_config("impresspress/router", routes_cfg);
+
+        // The site-main flow names this in a step ahead of the router, so it
+        // is registered wherever that flow runs — every target, no feature
+        // gate. No config: the cap is a constant and the marker is on the
+        // message; the declarations are only for its audit rows' paths.
+        wafer.register_block(
+            crate::blocks::body_limit::BLOCK_NAME,
+            Arc::new(crate::blocks::body_limit::BodyLimitBlock::new(
+                block_infos,
+                extra_routes,
+            )),
+        )?;
 
         // 11. Auto-discover WASM blocks from cwd/blocks/**/target/block.wasm
         //     and flow JSON files from cwd/flows/**/*.json.

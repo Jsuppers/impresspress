@@ -152,9 +152,11 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// building a 413 itself: a response built outside the flow carries neither
 /// the CORS and security headers `wafer-run/cors` and
 /// `wafer-run/security-headers` put on the message nor a `request_logs` row.
-/// `pipeline::handle_request` turns the marker into
-/// [`pipeline::payload_too_large_response`][crate::pipeline::payload_too_large_response]
-/// where both apply.
+///
+/// [`crate::blocks::body_limit`] — a flow step ahead of the router — turns the
+/// marker into that 413, so the refusal does not depend on which route the
+/// request would have matched. `pipeline::handle_request` checks it too, first
+/// thing, for a consumer flow that dispatches to the router without that step.
 pub const META_REQ_BODY_TOO_LARGE: &str = "req.body_too_large";
 
 /// The value [`META_REQ_BODY_TOO_LARGE`] carries.

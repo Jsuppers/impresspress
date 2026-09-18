@@ -56,11 +56,25 @@ impl ImpresspressRouterBlock {
         block_infos: Vec<BlockInfo>,
         extra_routes: Vec<ExtraRoute>,
     ) -> Self {
+        Self::with_extra_routes_arc(jwt_secret, features, block_infos, Arc::new(extra_routes))
+    }
+
+    /// Construct a router sharing an already-`Arc`'d route list.
+    ///
+    /// `impresspress/body-limit` is built from the same list — it judges the
+    /// path on its audit rows the way this block routes — so the builder
+    /// shares one allocation rather than cloning the vector per block.
+    pub fn with_extra_routes_arc(
+        jwt_secret: Arc<RwLock<String>>,
+        features: Arc<dyn FeatureConfig>,
+        block_infos: Vec<BlockInfo>,
+        extra_routes: Arc<Vec<ExtraRoute>>,
+    ) -> Self {
         Self {
             jwt_secret,
             features,
             block_infos,
-            extra_routes: Arc::new(extra_routes),
+            extra_routes,
         }
     }
 }
