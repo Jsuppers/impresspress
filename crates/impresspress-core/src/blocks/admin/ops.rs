@@ -1094,7 +1094,7 @@ mod tests {
             operator: FilterOp::Equal,
             value: serde_json::Value::String(action.to_string()),
         }];
-        db::list_all(ctx, super::super::logs::AUDIT_LOGS_TABLE, filters)
+        crate::db_read::list_every(ctx, super::super::logs::AUDIT_LOGS_TABLE, filters)
             .await
             .map(|r| r.len())
             .unwrap_or(0)

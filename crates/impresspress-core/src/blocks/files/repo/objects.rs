@@ -21,7 +21,10 @@ use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, WaferError};
 
 use super::{super::contracts::ObjectStatus, Page};
-use crate::util::{enum_column_or, RecordExt};
+use crate::{
+    db_read::{self, Bound},
+    util::{enum_column_or, RecordExt},
+};
 
 /// Object metadata table — one row per uploaded file (sibling of the raw
 /// storage blob in `wafer-run/storage`). Tracks size, content type, status,
@@ -138,7 +141,13 @@ pub async fn find_by_bucket_key(
     bucket: &str,
     key: &str,
 ) -> Result<Option<ObjectRow>, WaferError> {
-    let records = db::list_all(ctx, TABLE, bucket_key_filters(bucket, key)).await?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        bucket_key_filters(bucket, key),
+        Bound::UniqueKey("idx_objects_bucket_key on (bucket, key)"),
+    )
+    .await?;
     records.first().map(ObjectRow::from_record).transpose()
 }
 
@@ -483,7 +492,7 @@ pub async fn seed(
 /// Test helper: every object row, unfiltered.
 #[cfg(test)]
 pub async fn list_all(ctx: &dyn Context) -> Result<Vec<ObjectRow>, WaferError> {
-    db::list_all(ctx, TABLE, vec![])
+    db_read::list_every(ctx, TABLE, vec![])
         .await?
         .iter()
         .map(ObjectRow::from_record)

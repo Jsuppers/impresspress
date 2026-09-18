@@ -32,6 +32,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, internal_error, map_str, now_iso};
+use crate::db_read::{self, Bound};
 
 pub const TABLE: &str = "wafer_run__auth__sessions";
 
@@ -139,10 +140,11 @@ pub async fn find_for_user(
     user_id: &str,
     family: &str,
 ) -> Result<Option<SessionRow>, WaferError> {
-    let records = db::list_all(
+    let records = db_read::list_bounded(
         ctx,
         TABLE,
         vec![family_filter(family), user_filter(user_id)],
+        Bound::UniqueKey("sessions.family is the PRIMARY KEY"),
     )
     .await
     .map_err(|e| db_failed("session find_for_user", e))?;
@@ -158,7 +160,7 @@ pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,
 ) -> Result<Vec<SessionRow>, WaferError> {
-    let records = db::list_sorted(
+    let records = db_read::list_bounded_sorted(
         ctx,
         TABLE,
         vec![user_filter(user_id)],
@@ -166,6 +168,7 @@ pub async fn list_for_user(
             field: "last_used_at".into(),
             desc: true,
         }],
+        Bound::OnePer("device family one user has signed in from"),
     )
     .await
     .map_err(|e| db_failed("session list_for_user", e))?;

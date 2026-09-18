@@ -13,6 +13,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, internal_error, map_opt_str, map_str, now_iso};
+use crate::db_read::{self, Bound};
 
 pub const TABLE: &str = "wafer_run__auth__provider_links";
 
@@ -69,9 +70,14 @@ pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferErro
             value: json!(new.provider_ref),
         },
     ];
-    let existing = db::list_all(ctx, TABLE, filters.clone())
-        .await
-        .map_err(|e| db_failed("provider_links upsert lookup", e))?;
+    let existing = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters.clone(),
+        Bound::UniqueKey("provider_links UNIQUE (provider, provider_ref)"),
+    )
+    .await
+    .map_err(|e| db_failed("provider_links upsert lookup", e))?;
 
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("user_id".into(), json!(new.user_id));
@@ -116,9 +122,14 @@ pub async fn find_by_provider_ref(
             value: json!(provider_ref),
         },
     ];
-    let records = db::list_all(ctx, TABLE, filters)
-        .await
-        .map_err(|e| db_failed("provider_links find", e))?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters,
+        Bound::UniqueKey("provider_links UNIQUE (provider, provider_ref)"),
+    )
+    .await
+    .map_err(|e| db_failed("provider_links find", e))?;
     match records.first() {
         Some(r) => Ok(Some(row_from_map(&r.data)?)),
         None => Ok(None),
@@ -139,7 +150,7 @@ pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,
 ) -> Result<Vec<ProviderLink>, WaferError> {
-    let records = db::list_sorted(
+    let records = db_read::list_bounded_sorted(
         ctx,
         TABLE,
         vec![Filter {
@@ -151,6 +162,7 @@ pub async fn list_for_user(
             field: "linked_at".into(),
             desc: false,
         }],
+        Bound::OnePer("OAuth provider identity one user has linked"),
     )
     .await
     .map_err(|e| db_failed("provider_links list_for_user", e))?;

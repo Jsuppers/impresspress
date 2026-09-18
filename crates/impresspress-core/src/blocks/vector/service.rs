@@ -9,7 +9,10 @@ use wafer_block::db::SortField;
 use wafer_core::clients::{database as db, vector as vclient};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::RecordExt;
+use crate::{
+    db_read::{self, Bound},
+    util::RecordExt,
+};
 
 /// Per-row data fed to the vector index list table renderer.
 ///
@@ -164,7 +167,7 @@ async fn map_index_row(ctx: &dyn Context, rec: &db::Record) -> Option<IndexRow> 
 /// error. Per-index counts come from `vclient::count`, which degrades
 /// to 0 in `map_index_row` when the backend is absent.
 pub async fn list_index_rows(ctx: &dyn Context) -> Result<Vec<IndexRow>, WaferError> {
-    let records = db::list_sorted(
+    let records = db_read::list_bounded_sorted(
         ctx,
         REGISTRY_TABLE,
         vec![],
@@ -172,6 +175,7 @@ pub async fn list_index_rows(ctx: &dyn Context) -> Result<Vec<IndexRow>, WaferEr
             field: "prefixed_name".to_string(),
             desc: false,
         }],
+        Bound::Curated("vector indexes are registered from the vector admin surface"),
     )
     .await?;
 

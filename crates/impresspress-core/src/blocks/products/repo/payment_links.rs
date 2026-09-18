@@ -9,6 +9,7 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use crate::{
     blocks::products::contracts::{ManagedPaymentLink, PricingPreview, StorefrontPaymentLink},
+    db_read::{self, Bound},
     util::RecordExt,
 };
 
@@ -225,7 +226,13 @@ pub(crate) async fn list_for_offer(
     ctx: &dyn Context,
     offer_id: &str,
 ) -> Result<Vec<ManagedPaymentLink>, WaferError> {
-    let mut records = db::list_all(ctx, TABLE, vec![offer_filter(offer_id)]).await?;
+    let mut records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        vec![offer_filter(offer_id)],
+        Bound::OnePer("payment link on one offer"),
+    )
+    .await?;
     records.sort_by(|left, right| {
         left.data["created_at"]
             .to_string()
@@ -244,7 +251,7 @@ pub(crate) async fn find_reusable(
     preset_id: &str,
     configuration_hash: &str,
 ) -> Result<Option<ManagedPaymentLink>, WaferError> {
-    let rows = db::list_all(
+    let rows = db_read::list_bounded(
         ctx,
         TABLE,
         vec![
@@ -270,6 +277,7 @@ pub(crate) async fn find_reusable(
                 value: Value::String("synced".to_string()),
             },
         ],
+        Bound::OnePer("payment link on one offer preset"),
     )
     .await?;
     rows.into_iter()
@@ -307,7 +315,7 @@ pub(crate) async fn list_public_for_offer(
     ctx: &dyn Context,
     offer_id: &str,
 ) -> Result<Vec<StorefrontPaymentLink>, WaferError> {
-    let records = db::list_all(
+    let records = db_read::list_bounded(
         ctx,
         TABLE,
         vec![
@@ -323,6 +331,7 @@ pub(crate) async fn list_public_for_offer(
                 value: Value::String("synced".to_string()),
             },
         ],
+        Bound::OnePer("payment link on one offer"),
     )
     .await?;
     let mut public = Vec::new();

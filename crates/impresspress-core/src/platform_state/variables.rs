@@ -23,7 +23,10 @@ use wafer_block::db::{Filter, FilterOp, ListOptions};
 use wafer_core::{clients::database as db, interfaces::database::service::DatabaseService};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::RecordExt;
+use crate::{
+    db_read::{self, Bound},
+    util::RecordExt,
+};
 
 pub const TABLE: &str = "impresspress__admin__variables";
 
@@ -1812,7 +1815,8 @@ async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[Loaded
 /// Every row. A row that does not decode is skipped and warned about, the
 /// same policy [`load_all`] applies at boot.
 pub async fn list_all(ctx: &dyn Context) -> Result<Vec<VariableRow>, WaferError> {
-    let records = db::list_all(ctx, TABLE, vec![]).await?;
+    let records =
+        db_read::list_bounded(ctx, TABLE, vec![], Bound::OnePer("declared config key")).await?;
     Ok(records
         .iter()
         .filter_map(|r| match VariableRow::from_record(&r.id, &r.data) {

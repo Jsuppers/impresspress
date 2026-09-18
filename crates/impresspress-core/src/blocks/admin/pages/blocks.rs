@@ -634,7 +634,6 @@ const CONFIG_KEY_COLUMNS: [components::TableCol<'static>; 3] = [
 /// log "block.enable"/"block.disable" as if it happened.
 #[cfg(test)]
 mod toggle_feature_tests {
-    use wafer_core::clients::database as db;
 
     use super::*;
     use crate::{
@@ -682,7 +681,7 @@ mod toggle_feature_tests {
     }
 
     async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
-        db::list_all(
+        crate::db_read::list_every(
             ctx,
             crate::blocks::admin::AUDIT_LOGS_TABLE,
             vec![wafer_block::db::Filter {

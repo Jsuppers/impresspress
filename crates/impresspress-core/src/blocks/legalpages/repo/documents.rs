@@ -21,7 +21,10 @@ use super::{
     super::contracts::{DocumentStatus, DocumentType},
     Page,
 };
-use crate::util::{enum_column, json_map, now_rfc3339, RecordExt};
+use crate::{
+    db_read::{self, Bound},
+    util::{enum_column, json_map, now_rfc3339, RecordExt},
+};
 
 /// Legal documents: one row per version of a `terms` / `privacy` document.
 pub const TABLE: &str = "impresspress__legalpages__documents";
@@ -217,10 +220,11 @@ pub async fn list_published(
     ctx: &dyn Context,
     doc_type: DocumentType,
 ) -> Result<Vec<DocumentRow>, WaferError> {
-    db::list_all(
+    db_read::list_bounded(
         ctx,
         TABLE,
         of_type_with_status(doc_type, DocumentStatus::Published),
+        Bound::OnePer("published document of one type — publishing archives every other one"),
     )
     .await?
     .iter()

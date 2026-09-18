@@ -19,6 +19,8 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ConfigVar, ErrorCode, InputType, WaferError};
 
+use crate::db_read::{self, Bound};
+
 pub const TABLE: &str = "impresspress__signal__rooms";
 
 /// Characters a room code is drawn from, and how many of them there are.
@@ -144,9 +146,14 @@ struct RoomRow {
 /// deleting it on the way out, the same discipline `oauth_pkce::take` uses
 /// for its own expiry check. `Gone` covers both "no such code" and "expired".
 async fn fetch_live(ctx: &dyn Context, code: &str) -> Result<RoomRow, RoomError> {
-    let rows = db::list_all(ctx, TABLE, code_filter(code))
-        .await
-        .map_err(db_err)?;
+    let rows = db_read::list_bounded(
+        ctx,
+        TABLE,
+        code_filter(code),
+        Bound::UniqueKey("signal rooms.code is the table's PRIMARY KEY"),
+    )
+    .await
+    .map_err(db_err)?;
     let Some(record) = rows.into_iter().next() else {
         return Err(RoomError::Gone);
     };
@@ -186,7 +193,14 @@ async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> 
         // Anything else (WRAP refusal, quota, ...) is not a code collision.
         _ => return RoomError::Db(error.message),
     }
-    match db::list_all(ctx, TABLE, code_filter(code)).await {
+    match db_read::list_bounded(
+        ctx,
+        TABLE,
+        code_filter(code),
+        Bound::UniqueKey("signal rooms.code is the table's PRIMARY KEY"),
+    )
+    .await
+    {
         Ok(rows) if !rows.is_empty() => RoomError::Taken,
         _ => RoomError::Db(error.message),
     }
@@ -234,9 +248,14 @@ pub async fn open_room(
     // here for this code is live. This check narrows the race window but
     // does not close it — `create_row`'s own error mapping is what closes
     // it, for the two concurrent callers that both pass this check.
-    let existing = db::list_all(ctx, TABLE, code_filter(code))
-        .await
-        .map_err(db_err)?;
+    let existing = db_read::list_bounded(
+        ctx,
+        TABLE,
+        code_filter(code),
+        Bound::UniqueKey("signal rooms.code is the table's PRIMARY KEY"),
+    )
+    .await
+    .map_err(db_err)?;
     if !existing.is_empty() {
         return Err(RoomError::Taken);
     }

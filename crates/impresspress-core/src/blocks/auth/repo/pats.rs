@@ -8,7 +8,10 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, decode_hex, internal_error, map_opt_str, map_str, now_iso};
-use crate::util::hex_encode;
+use crate::{
+    db_read::{self, Bound},
+    util::hex_encode,
+};
 
 pub const TABLE: &str = "wafer_run__auth__personal_access_tokens";
 
@@ -108,7 +111,7 @@ pub async fn insert(ctx: &dyn Context, new: NewPat) -> Result<(), WaferError> {
 /// top". `token_hash` is returned on the row but API callers are expected to
 /// strip it before serialising to the client.
 pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<PatRow>, WaferError> {
-    let records = db::list_sorted(
+    let records = db_read::list_bounded_sorted(
         ctx,
         TABLE,
         vec![Filter {
@@ -120,6 +123,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<PatRo
             field: "created_at".into(),
             desc: true,
         }],
+        Bound::OnePer("personal access token one user issued"),
     )
     .await
     .map_err(|e| db_failed("pat list", e))?;
@@ -130,7 +134,7 @@ pub async fn find_by_token_hash(
     ctx: &dyn Context,
     hash: &[u8],
 ) -> Result<Option<PatRow>, WaferError> {
-    let rows = db::list_all(
+    let rows = db_read::list_bounded(
         ctx,
         TABLE,
         vec![Filter {
@@ -138,6 +142,7 @@ pub async fn find_by_token_hash(
             operator: FilterOp::Equal,
             value: json!(hex_encode(hash)),
         }],
+        Bound::UniqueKey("personal_access_tokens.token_hash is the PRIMARY KEY"),
     )
     .await
     .map_err(|e| db_failed("pat select", e))?;

@@ -24,6 +24,7 @@ use wafer_core::{
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use crate::{
+    db_read::{self, Bound},
     features::{
         plan_seed_decisions, BlockSettings, BlockState, ExistingRow, MigrationState, SeedDecision,
         SeedOp, USER_EDITED_SENTINEL,
@@ -380,7 +381,8 @@ async fn apply_seed_decision(
 /// Every row. A row that does not decode is skipped and warned about, the
 /// policy the boot loader applies.
 pub async fn list_all(ctx: &dyn Context) -> Result<Vec<BlockSettingsRow>, WaferError> {
-    let records = db::list_all(ctx, TABLE, vec![]).await?;
+    let records =
+        db_read::list_bounded(ctx, TABLE, vec![], Bound::OnePer("registered block")).await?;
     Ok(decode_rows(
         records.iter().map(|r| (r.id.as_str(), &r.data)),
     ))

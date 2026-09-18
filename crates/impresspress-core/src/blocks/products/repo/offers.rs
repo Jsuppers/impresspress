@@ -22,6 +22,7 @@ use crate::{
         money::normalize_currency,
         offer_pricing,
     },
+    db_read::{self, Bound},
     util::{enum_column_or, stamp_created, stamp_updated, wire_str, RecordExt},
 };
 
@@ -482,7 +483,13 @@ pub(crate) async fn list_for_product(
     ctx: &dyn Context,
     product_id: &str,
 ) -> Result<Vec<ManagedOffer>, WaferError> {
-    let mut records = db::list_all(ctx, TABLE, vec![product_filter(product_id)]).await?;
+    let mut records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        vec![product_filter(product_id)],
+        Bound::OnePer("offer on one product, authored by hand in the offer editor"),
+    )
+    .await?;
     records.sort_by(|left, right| {
         left.str_field("name")
             .cmp(right.str_field("name"))
@@ -849,7 +856,13 @@ pub(crate) async fn delete_for_product(
     ctx: &dyn Context,
     product_id: &str,
 ) -> Result<(), WaferError> {
-    let records = db::list_all(ctx, TABLE, vec![product_filter(product_id)]).await?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        vec![product_filter(product_id)],
+        Bound::OnePer("offer on one product, authored by hand in the offer editor"),
+    )
+    .await?;
     for record in records {
         offer_components::delete_for_offer(ctx, &record.id).await?;
         variables::delete_for_offer(ctx, &record.id).await?;
@@ -862,7 +875,7 @@ pub(crate) async fn list_public_for_product(
     ctx: &dyn Context,
     product_id: &str,
 ) -> Result<Vec<Offer>, WaferError> {
-    let mut records = db::list_all(
+    let mut records = db_read::list_bounded(
         ctx,
         TABLE,
         vec![
@@ -873,6 +886,7 @@ pub(crate) async fn list_public_for_product(
                 value: serde_json::json!(OfferStatus::Active),
             },
         ],
+        Bound::OnePer("offer on one product, authored by hand in the offer editor"),
     )
     .await?;
     records.sort_by(|left, right| {

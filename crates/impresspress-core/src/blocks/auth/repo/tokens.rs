@@ -23,7 +23,10 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::{db_failed, now_iso};
-use crate::util::{sha256_hex, RecordExt};
+use crate::{
+    db_read::{self, Bound},
+    util::{sha256_hex, RecordExt},
+};
 
 pub const TABLE: &str = "wafer_run__auth__tokens";
 
@@ -86,9 +89,14 @@ pub async fn find_by_token(
         operator: FilterOp::Equal,
         value: json!(hash(raw_token)),
     }];
-    let records = db::list_all(ctx, TABLE, filters)
-        .await
-        .map_err(|e| db_failed("tokens lookup", e))?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters,
+        Bound::UniqueKey("wafer_run__auth__tokens_token_hash_uniq"),
+    )
+    .await
+    .map_err(|e| db_failed("tokens lookup", e))?;
     Ok(records.into_iter().next().map(row_from_record))
 }
 
@@ -111,9 +119,16 @@ pub async fn family_has_live_row(ctx: &dyn Context, family: &str) -> Result<bool
             value: json!(false),
         },
     ];
-    let records = db::list_all(ctx, TABLE, filters)
-        .await
-        .map_err(|e| db_failed("tokens family lookup", e))?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters,
+        Bound::OnePer(
+            "live generation in one refresh-token family — rotation revokes the predecessor",
+        ),
+    )
+    .await
+    .map_err(|e| db_failed("tokens family lookup", e))?;
     Ok(!records.is_empty())
 }
 
@@ -245,7 +260,7 @@ mod tests {
             .unwrap();
 
         // No row should contain the raw token. Verify by scanning every row.
-        let records = db::list_all(&ctx, TABLE, vec![]).await.unwrap();
+        let records = db_read::list_every(&ctx, TABLE, vec![]).await.unwrap();
         assert_eq!(records.len(), 1, "exactly one row was inserted");
         let serialized = serde_json::to_string(&records[0].data).unwrap();
         assert!(

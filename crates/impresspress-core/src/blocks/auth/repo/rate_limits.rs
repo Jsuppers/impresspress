@@ -20,6 +20,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
 use super::db_failed;
+use crate::db_read::{self, Bound};
 
 pub const TABLE: &str = "wafer_run__auth__rate_limits";
 
@@ -66,7 +67,7 @@ pub async fn windowed_increment(
     .await
     .map_err(|e| prefixed(e, "rate_limits windowed upsert"))?;
 
-    let rows = db::list_all(
+    let rows = db_read::list_bounded(
         ctx,
         TABLE,
         vec![
@@ -81,6 +82,7 @@ pub async fn windowed_increment(
                 value: json!(window_cutoff),
             },
         ],
+        Bound::UniqueKey("rate_limits.key is declared UNIQUE"),
     )
     .await
     .map_err(|e| prefixed(e, "rate_limits count read-back"))?;
@@ -213,7 +215,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let left = db::list_all(&ctx, TABLE, vec![]).await.unwrap();
+        let left = db_read::list_every(&ctx, TABLE, vec![]).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, "fresh");
     }
