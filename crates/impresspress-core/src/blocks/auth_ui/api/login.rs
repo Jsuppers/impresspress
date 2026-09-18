@@ -185,7 +185,14 @@ mod tests {
     /// here, we only need the user + local_credentials rows it creates).
     async fn signup_user(ctx: &TestContext, email: &str, password: &str) {
         let body = serde_json::json!({"email": email, "password": password}).to_string();
-        let out = signup::handle(ctx, InputStream::from_bytes(body.into_bytes())).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let out = signup::handle(
+            &limiter,
+            ctx,
+            &msg,
+            InputStream::from_bytes(body.into_bytes()),
+        )
+        .await;
         collect_or_panic(out).await;
     }
 

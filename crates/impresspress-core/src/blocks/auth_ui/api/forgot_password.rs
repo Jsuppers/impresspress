@@ -1,15 +1,20 @@
 //! POST /b/auth/api/forgot-password — relocated from auth/login.rs in Task 5.
 
 use wafer_core::clients::crypto;
-use wafer_run::{context::Context, InputStream, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse},
+    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse, rate_limit::UserRateLimiter},
     http::{err_bad_request, err_internal, ok_json},
     util::{hex_encode, sha256_hex},
 };
 
-pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle(
+    limiter: &UserRateLimiter,
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     #[derive(serde::Deserialize)]
     struct Req {
         email: String,
@@ -61,7 +66,25 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     // Send the raw token in the email; the hash lives only in the DB.
-    super::send_template_email(ctx, "password_reset", &email_lower, &reset_token).await;
+    if let Err(failure) = super::send_template_email(
+        limiter,
+        ctx,
+        msg,
+        "password_reset",
+        &email_lower,
+        &reset_token,
+    )
+    .await
+    {
+        // `safe_msg` below is constant for every account state by design
+        // (see the DELIBERATE note above), so a send failure cannot change
+        // it without reintroducing the enumeration oracle — only a caller
+        // whose address IS registered can reach this line at all. It is
+        // logged at `error` instead: a reset mail that never left is a user
+        // locked out, and the email block's own log says which limit or
+        // provider refused it.
+        super::log_email_not_sent("forgot-password", &user.id, &failure);
+    }
 
     ok_json(&MessageResponse {
         message: safe_msg.to_string(),
@@ -104,9 +127,12 @@ mod tests {
         .await
         .expect("insert user");
 
-        let unregistered = output_json(handle(&ctx, body("nobody@example.com")).await).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let unregistered =
+            output_json(handle(&limiter, &ctx, &msg, body("nobody@example.com")).await).await;
         let failing = ctx.break_reads();
-        let outage = output_json(handle(&failing, body("known@example.com")).await).await;
+        let outage =
+            output_json(handle(&limiter, &failing, &msg, body("known@example.com")).await).await;
 
         assert_eq!(
             outage, unregistered,

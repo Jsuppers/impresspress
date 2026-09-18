@@ -22,9 +22,23 @@ use crate::{
     util::urlencode,
 };
 
-/// Default per-caller rate limit: 100 emails per hour.
+/// Default per-caller rate limit: 100 emails per hour. A ceiling on what one
+/// calling block can spend, not a per-recipient limit — see
+/// [`DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX`].
 const DEFAULT_RATE_LIMIT_MAX: u32 = 100;
+/// Default per-recipient rate limit: 10 emails per hour to any one address.
+///
+/// Comfortably above what a real person can trigger for themselves — signup
+/// verification, a resend or two (the resend endpoint has its own 60-second
+/// cooldown) and a password reset — and far below the per-caller ceiling, so
+/// one address can only ever spend a tenth of it.
+const DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX: u32 = 10;
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 3600;
+
+/// Rate-limit bucket category for the per-recipient limit.
+const RECIPIENT_LIMIT_CATEGORY: &str = "email_send_recipient";
+/// Rate-limit bucket category for the per-calling-block ceiling.
+const CALLER_LIMIT_CATEGORY: &str = "email_send";
 
 /// Default Mailgun API base URL (US region). EU accounts use
 /// `https://api.eu.mailgun.net`. Single source of truth for the
@@ -94,17 +108,31 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX",
-            "Maximum emails per caller per window (0 disables rate limiting)",
+            "Ceiling on emails one calling block may send per window, across \
+             all recipients (0 disables this ceiling)",
             &DEFAULT_RATE_LIMIT_MAX.to_string(),
         )
-        .name("Rate Limit (max emails)")
+        .name("Rate Limit (max emails per caller)")
+        .input_type(InputType::Number)
+        .optional(),
+        ConfigVar::new(
+            "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
+            "Maximum emails to any one recipient address per window (0 \
+             disables the per-recipient limit). Keep it well below the \
+             per-caller ceiling: it is what stops one address from spending \
+             the quota every transactional email shares.",
+            &DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX.to_string(),
+        )
+        .name("Rate Limit (max emails per recipient)")
+        .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS",
-            "Rate limit window in seconds",
+            "Rate limit window in seconds, shared by both limits above",
             &DEFAULT_RATE_LIMIT_WINDOW_SECS.to_string(),
         )
         .name("Rate Limit Window (seconds)")
+        .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS",
@@ -190,7 +218,7 @@ async fn handle_send(
     if let Err(e) = check_recipient_allowed(ctx, &req.to).await {
         return err_bad_request(&e);
     }
-    if let Err(e) = check_caller_rate_limit(limiter, ctx).await {
+    if let Err(e) = check_send_rate_limits(limiter, ctx, &req.to).await {
         return e;
     }
 
@@ -231,7 +259,7 @@ async fn handle_send_template(
     if let Err(e) = check_recipient_allowed(ctx, &req.to).await {
         return err_bad_request(&e);
     }
-    if let Err(e) = check_caller_rate_limit(limiter, ctx).await {
+    if let Err(e) = check_send_rate_limits(limiter, ctx, &req.to).await {
         return e;
     }
 
@@ -562,46 +590,129 @@ async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), Stri
     ))
 }
 
-/// Per-caller email rate limit. Caller identified by `ctx.caller_id()` —
-/// falls back to `"unknown"` when missing (e.g. direct HTTP entry point).
-async fn check_caller_rate_limit(
+/// Read a numeric config value, falling back to `default` when unset or
+/// unparseable.
+async fn numeric_config<T>(ctx: &dyn Context, key: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Copy,
+{
+    config::get_default(ctx, key, &default.to_string())
+        .await
+        .trim()
+        .parse::<T>()
+        .unwrap_or(default)
+}
+
+/// The rate-limit bucket identity for a recipient: the address trimmed,
+/// lowercased, then hashed, so `" V@x.com"` and `"v@x.com"` share one
+/// bucket.
+///
+/// The normalization is this function's own. [`validate_recipient`] trims a
+/// copy for its own checks and never lowercases, and what goes to Mailgun is
+/// the address as the caller wrote it — so a key that reused either of those
+/// spellings would let padding or capitalization buy a second quota for one
+/// mailbox.
+///
+/// Hashed because this identity is persisted on Cloudflare: `UserRateLimiter`
+/// writes the composite key into the `wafer_run__auth__rate_limits` D1 table,
+/// which until now held only user ids and IPs. A recipient address is
+/// somebody's mailbox and does not belong in a table that exists to count
+/// requests — the same reason `users.reset_token_hash` stores a digest. The
+/// bucket only ever needs equality, which a digest preserves.
+fn recipient_bucket_key(to: &str) -> String {
+    crate::util::sha256_hex(to.trim().to_lowercase().as_bytes())
+}
+
+/// Outbound rate limits for one send: a per-recipient bucket and a
+/// per-calling-block ceiling. Either limit set to `0` disables that bucket.
+///
+/// The recipient bucket is checked — and charged — FIRST, and a refusal
+/// there returns without touching the caller bucket. That ordering is the
+/// whole point. With only the caller bucket, every transactional email the
+/// auth block sends (signup verification, resend, password reset) shared one
+/// 100-per-hour quota keyed on the *sending block*, so anyone who could make
+/// that block mail an address they own — `POST /b/auth/api/forgot-password`
+/// against their own account, at the 30-per-minute rate the auth routes
+/// allow — emptied it in about four minutes, and every other user's
+/// verification and reset mail 429'd until the window rolled over. Charging
+/// the shared ceiling only for mail the recipient bucket admitted caps any
+/// one address's share of it at the per-recipient limit.
+///
+/// The recipient key is [`recipient_bucket_key`] — the trimmed, lowercased
+/// address, hashed — so neither case nor surrounding whitespace opens a
+/// second bucket for the same mailbox. The caller is `ctx.caller_id()`,
+/// falling back to `"unknown"` when missing (a direct entry point with no
+/// calling block).
+async fn check_send_rate_limits(
     limiter: &UserRateLimiter,
     ctx: &dyn Context,
+    to: &str,
 ) -> Result<(), OutputStream> {
-    let max = config::get_default(
+    let window = Duration::from_secs(
+        numeric_config(
+            ctx,
+            "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS",
+            DEFAULT_RATE_LIMIT_WINDOW_SECS,
+        )
+        .await,
+    );
+
+    let per_recipient_max = numeric_config(
+        ctx,
+        "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
+        DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX,
+    )
+    .await;
+    if per_recipient_max > 0 {
+        let key = UserRateLimiter::key(&recipient_bucket_key(to), RECIPIENT_LIMIT_CATEGORY);
+        let limit = RateLimit {
+            max_requests: per_recipient_max,
+            window,
+        };
+        if let Err(retry_after) = limiter.check(ctx, &key, limit).await {
+            // Routine, and self-inflicted by whoever is asking for the mail:
+            // this address has already had `per_recipient_max` messages this
+            // window. Nobody else's mail is affected.
+            tracing::warn!(
+                to = %to,
+                max = per_recipient_max,
+                retry_after,
+                "email send refused: recipient reached its per-window limit"
+            );
+            return Err(super::rate_limit::rate_limited_response(retry_after));
+        }
+    }
+
+    let caller_max = numeric_config(
         ctx,
         "IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX",
-        &DEFAULT_RATE_LIMIT_MAX.to_string(),
+        DEFAULT_RATE_LIMIT_MAX,
     )
-    .await
-    .trim()
-    .parse::<u32>()
-    .unwrap_or(DEFAULT_RATE_LIMIT_MAX);
-    if max == 0 {
-        // Rate limiting disabled.
-        return Ok(());
+    .await;
+    if caller_max > 0 {
+        let caller = ctx.caller_id().unwrap_or("unknown");
+        let key = UserRateLimiter::key(caller, CALLER_LIMIT_CATEGORY);
+        let limit = RateLimit {
+            max_requests: caller_max,
+            window,
+        };
+        if let Err(retry_after) = limiter.check(ctx, &key, limit).await {
+            // A different class of event entirely: the deployment-wide
+            // ceiling is gone, so transactional mail is now failing for
+            // every recipient this block serves. Logged at `error` because
+            // it needs an operator, not a retry.
+            tracing::error!(
+                caller = %caller,
+                max = caller_max,
+                retry_after,
+                "email send refused: the per-caller outbound ceiling is exhausted — \
+                 transactional mail is failing for every recipient of this caller"
+            );
+            return Err(super::rate_limit::rate_limited_response(retry_after));
+        }
     }
 
-    let window_secs = config::get_default(
-        ctx,
-        "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS",
-        &DEFAULT_RATE_LIMIT_WINDOW_SECS.to_string(),
-    )
-    .await
-    .trim()
-    .parse::<u64>()
-    .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW_SECS);
-
-    let caller = ctx.caller_id().unwrap_or("unknown");
-    let key = UserRateLimiter::key(caller, "email_send");
-    let limit = RateLimit {
-        max_requests: max,
-        window: Duration::from_secs(window_secs),
-    };
-    match limiter.check(ctx, &key, limit).await {
-        Ok(_) => Ok(()),
-        Err(retry_after) => Err(super::rate_limit::rate_limited_response(retry_after)),
-    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -852,40 +963,137 @@ mod tests {
             .is_ok());
     }
 
-    // ---- check_caller_rate_limit -------------------------------------------
+    // ---- rate limits, driven through the real `email.send_template` op ----
 
-    #[tokio::test]
-    async fn rate_limit_allows_under_threshold() {
+    /// Send one templated email through the block's real dispatch (the same
+    /// `email.send_template` op `auth_ui::api::send_template_email` calls)
+    /// and report the HTTP status it answered with. 429 = rate limited; 200
+    /// = admitted (the Mailgun call itself fails here, since `ConfigCtx`
+    /// routes no `wafer-run/network`, and that is reported in the body as
+    /// `{"sent": false}` — the distinction this assertion does not need).
+    async fn send_status(block: &EmailBlock, ctx: &ConfigCtx, to: &str) -> u16 {
+        let body = serde_json::json!({
+            "template": "verification",
+            "to": to,
+            "token": "t0ken",
+        });
+        let out = wafer_run::Block::handle(
+            block,
+            ctx,
+            Message {
+                kind: "email.send_template".to_string(),
+                meta: Vec::new(),
+            },
+            InputStream::from_bytes(serde_json::to_vec(&body).expect("serialize body")),
+        )
+        .await;
+        crate::test_support::output_http_status(out).await
+    }
+
+    fn limited_ctx(per_recipient: &str, per_caller: &str) -> ConfigCtx {
         let ctx = ConfigCtx::new();
-        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX", "3");
+        ctx.set(
+            "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
+            per_recipient,
+        );
+        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX", per_caller);
         ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS", "60");
-        let limiter = UserRateLimiter::new();
-        // First 3 are allowed.
-        for _ in 0..3 {
-            assert!(check_caller_rate_limit(&limiter, &ctx).await.is_ok());
+        ctx
+    }
+
+    /// The bug this block shipped with: one bucket keyed on the *calling*
+    /// block, so every transactional email shared one quota. An attacker
+    /// hitting forgot-password against an address they own emptied it, and
+    /// everyone else's signup verification and password-reset mail 429'd.
+    ///
+    /// Here the attacker's address is allowed 2 and then refused; the
+    /// refusals must not be charged to the shared ceiling, so an unrelated
+    /// recipient still gets through with the ceiling set to exactly the
+    /// number of sends the recipient bucket admitted plus one.
+    #[tokio::test]
+    async fn one_flooded_recipient_cannot_starve_everyone_else() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("2", "3");
+
+        assert_eq!(send_status(&block, &ctx, "attacker@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "attacker@example.com").await, 200);
+        for attempt in 0..5 {
+            assert_eq!(
+                send_status(&block, &ctx, "attacker@example.com").await,
+                429,
+                "attempt {attempt} past the per-recipient limit must be refused"
+            );
         }
+
+        assert_eq!(
+            send_status(&block, &ctx, "victim@example.com").await,
+            200,
+            "a recipient who triggered nothing must still receive mail: the \
+             refused sends above must not have been charged to the shared \
+             per-caller ceiling"
+        );
     }
 
+    /// The per-recipient limit is also a mail-bomb limit: with the caller
+    /// ceiling wide open, one address still stops at its own cap.
     #[tokio::test]
-    async fn rate_limit_blocks_over_threshold() {
-        let ctx = ConfigCtx::new();
-        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX", "2");
-        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS", "60");
-        let limiter = UserRateLimiter::new();
-        assert!(check_caller_rate_limit(&limiter, &ctx).await.is_ok());
-        assert!(check_caller_rate_limit(&limiter, &ctx).await.is_ok());
-        // 3rd send exceeds the configured cap and is rate-limited.
-        assert!(check_caller_rate_limit(&limiter, &ctx).await.is_err());
+    async fn one_recipient_cannot_be_mail_bombed() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("2", "0");
+
+        assert_eq!(send_status(&block, &ctx, "target@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "target@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "target@example.com").await, 429);
     }
 
+    /// Neither case nor surrounding whitespace is a second mailbox --
+    /// `validate_recipient` trims before accepting the address, so the bucket
+    /// key has to trim too or `" v@x.com"` buys a fresh quota. Reachable by
+    /// any block granted `email.send`, which sets its own `to`.
     #[tokio::test]
-    async fn rate_limit_disabled_when_max_is_zero() {
-        let ctx = ConfigCtx::new();
-        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX", "0");
-        let limiter = UserRateLimiter::new();
-        // Should never block.
-        for _ in 0..50 {
-            assert!(check_caller_rate_limit(&limiter, &ctx).await.is_ok());
+    async fn the_recipient_bucket_ignores_surrounding_whitespace() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("2", "0");
+
+        assert_eq!(send_status(&block, &ctx, "bob@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "  bob@example.com ").await, 200);
+        assert_eq!(send_status(&block, &ctx, " bob@example.com").await, 429);
+    }
+
+    /// Case is not a second mailbox: `Alice@` and `alice@` share one bucket.
+    #[tokio::test]
+    async fn the_recipient_bucket_is_case_insensitive() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("2", "0");
+
+        assert_eq!(send_status(&block, &ctx, "alice@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "ALICE@Example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "Alice@example.COM").await, 429);
+    }
+
+    /// The per-caller ceiling still bounds a spread-out sender — one address
+    /// each, under the per-recipient limit, and the ceiling is what stops it.
+    #[tokio::test]
+    async fn the_per_caller_ceiling_still_bounds_many_recipients() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("10", "2");
+
+        assert_eq!(send_status(&block, &ctx, "a@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "b@example.com").await, 200);
+        assert_eq!(send_status(&block, &ctx, "c@example.com").await, 429);
+    }
+
+    /// `0` disables a limit; with both at `0` nothing is ever refused.
+    #[tokio::test]
+    async fn zero_disables_a_limit() {
+        let block = EmailBlock::new();
+        let ctx = limited_ctx("0", "0");
+        for attempt in 0..25 {
+            assert_eq!(
+                send_status(&block, &ctx, "anyone@example.com").await,
+                200,
+                "attempt {attempt}"
+            );
         }
     }
 }

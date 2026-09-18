@@ -294,7 +294,11 @@ pub const ROUTES: &[Route] = &[
     // Route is open; block enforces admin for UI pages, authenticated for API
     Route::new("/b/messages", RouteAccess::Public, "impresspress/messages"),
     // LLM — chat orchestrator
-    // Route is open; block enforces admin for UI pages, authenticated for API
+    // Route is open; the tier comes from `LlmBlock::info().endpoints`:
+    // admin for the UI pages, provider CRUD, model load/unload and the two
+    // per-thread config WRITES; authenticated for chat (buffered and SSE),
+    // the config read, the aggregated model list and the per-model status
+    // probe.
     Route::new("/b/llm", RouteAccess::Public, "impresspress/llm"),
     // Vector — similarity search, hybrid retrieval, RAG ingestion.
     //
@@ -303,10 +307,13 @@ pub const ROUTES: &[Route] = &[
     // path — pure duplication, since the block does its own per-method
     // path-param matching in `pages::route`. The per-endpoint access tier
     // now comes from `VectorBlock::info().endpoints` and is enforced
-    // centrally via `declared_access` (UI pages → Admin, JSON API →
-    // Authenticated), so the coarse prefix tier is `Public` and the declared
-    // level refines it. The inspector sources endpoint granularity from the
-    // same `info().endpoints` (see [`routes_config`]).
+    // centrally via `declared_access` (every row → Admin: an index has no
+    // owner column to scope a request to, so the JSON API is admin-only for
+    // the same reason the pages are — see the `ROUTES` doc in that block),
+    // so the coarse prefix tier is `Public` and the declared level refines
+    // it. A guard test (`vector::access_tests`) keeps it that way. The
+    // inspector sources endpoint granularity from the same
+    // `info().endpoints` (see [`routes_config`]).
     Route::new("/b/vector/", RouteAccess::Public, "impresspress/vector"),
     // Signal — WebRTC room-code handshake for blockfarming's online play.
     // ONE public prefix, same reasoning as vector's: every declared endpoint

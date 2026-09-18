@@ -217,7 +217,9 @@ mod tests {
             "email": "reuse@example.com",
             "password": "correct-horse-battery",
         });
-        collect_or_panic(signup::handle(ctx, json_input(creds.clone())).await).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        collect_or_panic(signup::handle(&limiter, ctx, &msg, json_input(creds.clone())).await)
+            .await;
         let resp = output_json(login::handle(ctx, json_input(creds)).await).await;
         resp["refresh_token"]
             .as_str()

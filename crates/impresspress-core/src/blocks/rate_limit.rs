@@ -49,6 +49,21 @@ impl RateLimit {
         max_requests: 30,
         window: Duration::from_secs(60),
     };
+    /// Transactional email one requester can cause to be SENT: 10 per hour
+    /// per IP. Distinct from [`Self::AUTH`], which bounds requests to the
+    /// auth routes; this bounds the outbound mail those requests spend.
+    ///
+    /// Charged at the send site (`auth_ui::api::send_template_email`), not
+    /// per route, so a caller who mistypes an address or asks about an
+    /// unregistered one — neither of which sends anything — keeps their
+    /// budget. Without it, one requester could still empty the email block's
+    /// deployment-wide ceiling simply by naming a new address each time: the
+    /// per-recipient bucket caps one address's share of that ceiling, not one
+    /// requester's.
+    pub const AUTH_EMAIL: Self = Self {
+        max_requests: 10,
+        window: Duration::from_secs(3600),
+    };
     /// API reads: 300 requests per 60 seconds per user.
     pub const API_READ: Self = Self {
         max_requests: 300,
@@ -376,14 +391,22 @@ pub async fn check_user_rate_limit_with(
     check_rate_limit(limiter, ctx, &user_id, category, default).await
 }
 
+/// The bucket identity a request with no client IP falls back to.
+///
+/// Every such request shares this one bucket — fail-closed, so a platform
+/// that stops populating `remote_addr` cannot turn an IP-keyed limit off.
+/// The cost is that the limit then applies to the whole deployment at once,
+/// which is why a caller whose refusal was charged against this identity
+/// should say so rather than report an ordinary per-IP refusal (see
+/// `auth_ui::api::send_template_email`).
+pub const UNKNOWN_IP: &str = "unknown";
+
 /// The identity an IP-keyed rate-limit bucket uses for a request: the remote
-/// address, or `"unknown"` when the platform didn't populate one (so anonymous
-/// callers behind a missing `remote_addr` still share one bucket rather than
-/// bypassing the limit entirely).
+/// address, or [`UNKNOWN_IP`] when the platform didn't populate one.
 pub fn ip_identity(msg: &wafer_run::Message) -> String {
     let ip = msg.remote_addr();
     if ip.is_empty() {
-        "unknown".to_string()
+        UNKNOWN_IP.to_string()
     } else {
         ip.to_string()
     }

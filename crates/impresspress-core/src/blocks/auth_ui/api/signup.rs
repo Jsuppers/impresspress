@@ -1,7 +1,7 @@
 //! POST /b/auth/api/signup — relocated from auth/login.rs in Task 5.
 
 use wafer_core::clients::{config, crypto};
-use wafer_run::{context::Context, InputStream, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
     blocks::{
@@ -16,6 +16,7 @@ use crate::{
             redirect::{default_post_login_redirect, is_safe_local_redirect},
         },
         errors::{error_response, ErrorCode},
+        rate_limit::UserRateLimiter,
     },
     http::{err_bad_request, err_internal, ResponseBuilder},
     util::{hex_encode, sha256_hex},
@@ -55,7 +56,12 @@ fn pending_verification(id: String, email: String) -> SignupResponse {
     }
 }
 
-pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle(
+    limiter: &UserRateLimiter,
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     // Enforce ALLOW_SIGNUP on the API (not just the page)
     if !signup_allowed(ctx).await {
         return error_response(ErrorCode::Forbidden, "Signups are currently disabled");
@@ -184,7 +190,33 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // Send verification email if required
     if require_verification {
-        super::send_template_email(ctx, "verification", &email_lower, &verification_token).await;
+        if let Err(failure) = super::send_template_email(
+            limiter,
+            ctx,
+            msg,
+            "verification",
+            &email_lower,
+            &verification_token,
+        )
+        .await
+        {
+            // The response below cannot carry this. It answers the same
+            // message string as the "[SEC-035] email already registered"
+            // branch above, and a message that varied with whether mail
+            // actually went out would hand an anonymous caller the
+            // enumeration oracle that branch exists to close.
+            //
+            // The two bodies are NOT yet identical — this one carries
+            // `user.id` where that branch carries an empty string, which is
+            // a separate, known leak on the same response — but that is a
+            // reason to close the id divergence, not to open a second
+            // channel beside it.
+            //
+            // The account exists and the resend endpoint can mint a fresh
+            // token, so the recoverable half is already in the user's hands;
+            // the part that was missing is this line.
+            super::log_email_not_sent("signup", &user.id, &failure);
+        }
         // Do NOT issue tokens before email is verified
         return ResponseBuilder::new()
             .status(201)
@@ -267,7 +299,14 @@ mod tests {
 
     async fn signup(ctx: &TestContext, email: &str, password: &str) -> serde_json::Value {
         let body = serde_json::json!({"email": email, "password": password}).to_string();
-        let out = handle(ctx, InputStream::from_bytes(body.into_bytes())).await;
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let out = handle(
+            &limiter,
+            ctx,
+            &msg,
+            InputStream::from_bytes(body.into_bytes()),
+        )
+        .await;
         output_json(out).await
     }
 

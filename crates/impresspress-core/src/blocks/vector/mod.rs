@@ -11,9 +11,9 @@ use wafer_run::{BlockInfo, HttpMethod, InstanceMode};
 
 use crate::endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute};
 
-/// In-block dispatch targets. UI pages and the JSON API now share ONE matcher
+/// In-block dispatch targets. UI pages and the JSON API share ONE matcher
 /// table; the per-route access tier comes from the declared endpoint
-/// `AuthLevel` and is enforced centrally (UI → Admin, API → Authenticated).
+/// `AuthLevel` and is enforced centrally (every row → Admin).
 #[derive(Clone, Copy)]
 enum Route {
     IndexListPage,
@@ -35,9 +35,23 @@ enum Route {
 /// win (the old ordering invariant). The matcher binds `{name}` / `{index}`
 /// / `{id}` into `req.param.*` for the handlers' `msg.var` readers.
 ///
-/// The two SSR pages are `Admin` and the JSON API is `Authenticated`; the
-/// central router enforces that from the declaration, so the block holds no
-/// `user_id` / `is_admin` preamble.
+/// Every row is `Admin`, pages and JSON API alike, and the central router
+/// enforces that from the declaration, so the block holds no `user_id` /
+/// `is_admin` preamble.
+///
+/// `Admin` rather than `Authenticated` because an index is a deployment-wide
+/// resource, not a per-user one: the registry keys a row by `prefixed_name`
+/// alone (`migrations/001_vector_schema.sqlite.sql`), the index name is the
+/// whole namespace a query or a delete addresses, and one index pins one
+/// (model, dimensions, backend) for everyone who reads it. There is no owner
+/// to scope a request to, so `Authenticated` meant every logged-in caller
+/// could list, query, re-ingest and delete every other tenant's corpus
+/// through the JSON API while the equivalent UI stayed admin-only.
+///
+/// End-user RAG is served by a feature block calling the `wafer-run/vector`
+/// service on the user's behalf — an inter-block call, gated by that block's
+/// `requires` list and its WRAP grants — not by browsers reaching these
+/// routes, so raising the tier costs no real caller.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // UI pages
     EndpointRoute::admin(HttpMethod::Get, "/b/vector/", Route::IndexListPage)
@@ -48,7 +62,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     // an `HX-Request` header and gets the index list back as HTML. The
     // schemas describe the programmatic JSON path; the form path builds the
     // same request type through `contracts::CreateIndexRequest::from_form`.
-    EndpointRoute::authenticated(
+    EndpointRoute::admin(
         HttpMethod::Post,
         "/b/vector/api/indexes",
         Route::ApiCreateIndex,
@@ -56,35 +70,35 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .summary("Create a vector index")
     .input(request_schema_of::<contracts::CreateIndexRequest>)
     .output(response_schema_of::<contracts::CreateIndexResponse>),
-    EndpointRoute::authenticated(
+    EndpointRoute::admin(
         HttpMethod::Get,
         "/b/vector/api/indexes",
         Route::ApiListIndexes,
     )
     .summary("List indexes")
     .output(response_schema_of::<contracts::IndexListResponse>),
-    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/upsert", Route::ApiUpsert)
+    EndpointRoute::admin(HttpMethod::Post, "/b/vector/api/upsert", Route::ApiUpsert)
         .summary("Upsert pre-computed vectors")
         .input(request_schema_of::<contracts::UpsertRequest>)
         .output(response_schema_of::<contracts::AckResponse>),
-    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/query", Route::ApiQuery)
+    EndpointRoute::admin(HttpMethod::Post, "/b/vector/api/query", Route::ApiQuery)
         .summary("Search vectors")
         .input(request_schema_of::<contracts::QueryRequest>)
         .output(response_schema_of::<contracts::QueryResponse>),
-    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/ingest", Route::ApiIngest)
+    EndpointRoute::admin(HttpMethod::Post, "/b/vector/api/ingest", Route::ApiIngest)
         .summary("Chunk + embed + upsert a document")
         .input(request_schema_of::<contracts::IngestRequest>)
         .output(response_schema_of::<contracts::IngestResponse>),
-    EndpointRoute::authenticated(HttpMethod::Post, "/b/vector/api/embed", Route::ApiEmbed)
+    EndpointRoute::admin(HttpMethod::Post, "/b/vector/api/embed", Route::ApiEmbed)
         .summary("Generate embeddings for raw text")
         .input(request_schema_of::<contracts::EmbedRequest>)
         .output(response_schema_of::<contracts::EmbedResponse>),
-    EndpointRoute::authenticated(HttpMethod::Get, "/b/vector/api/stats", Route::ApiStats)
+    EndpointRoute::admin(HttpMethod::Get, "/b/vector/api/stats", Route::ApiStats)
         .summary("Index stats and usage")
         .output(response_schema_of::<contracts::IndexStatsResponse>),
     // Deletes: the specific `indexes/{name}` row before the generic
     // `{index}/{id}` row.
-    EndpointRoute::authenticated(
+    EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/vector/api/indexes/{name}",
         Route::ApiDeleteIndex,
@@ -92,7 +106,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .summary("Delete an index")
     .path_params(index_name_path_schema)
     .output(response_schema_of::<contracts::AckResponse>),
-    EndpointRoute::authenticated(
+    EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/vector/api/{index}/{id}",
         Route::ApiDeleteSingle,
@@ -193,9 +207,9 @@ crate::impresspress_feature_block! {
     },
     handle: |_this, ctx, msg, input| {
         // Auth is enforced centrally by `route_to_block` from the declared
-        // endpoint `AuthLevel` (UI pages → Admin, JSON API → Authenticated),
-        // so the block holds no `user_id`/`is_admin` preamble. The matcher
-        // binds `{name}`/`{index}`/`{id}` into `req.param.*`.
+        // endpoint `AuthLevel` (every row → Admin; see `ROUTES`), so the
+        // block holds no `user_id`/`is_admin` preamble. The matcher binds
+        // `{name}`/`{index}`/`{id}` into `req.param.*`.
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
             return crate::http::err_not_found("not found");
         };
@@ -244,6 +258,98 @@ mod table_tests {
             assert_eq!(ep.method, row.method, "{}", row.template);
             assert_eq!(ep.path, row.template);
             assert_eq!(ep.auth, row.auth, "{}", row.template);
+        }
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use std::sync::Arc;
+
+    use wafer_run::{AuthLevel, Block as _};
+
+    use super::*;
+    use crate::{
+        endpoint_match::action_for_method,
+        test_support::{admin_msg, auth_msg, output_http_status, TestContext},
+    };
+
+    /// A context that routes `/b/vector/*` to the real block.
+    async fn ctx() -> TestContext {
+        let mut ctx = TestContext::with_vector().await;
+        ctx.register_block("impresspress/vector", Arc::new(VectorBlock::new()));
+        ctx
+    }
+
+    /// An index is a deployment-wide resource with no owner column, so
+    /// "logged in" was never an answer to "may this caller read it". Asserted
+    /// on the declaration because that is what the router reads: a new row
+    /// added at a lower tier would not fail a handler test, it would publish
+    /// the corpus.
+    #[test]
+    fn every_declared_endpoint_is_admin() {
+        let endpoints = VectorBlock::new().info().endpoints;
+        assert!(!endpoints.is_empty());
+        for ep in &endpoints {
+            assert_eq!(
+                ep.auth,
+                AuthLevel::Admin,
+                "{} {} must stay admin-only",
+                ep.method,
+                ep.path
+            );
+        }
+    }
+
+    /// A concrete request path for `template`: every `{name}` / `{rest...}`
+    /// segment filled with a literal the matcher will bind. Derived rather
+    /// than hand-listed so a route added to `ROUTES` is exercised by the test
+    /// below without anyone remembering to add it.
+    fn concrete_path(template: &str) -> String {
+        template
+            .split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    "probe"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The declaration above, enforced: every route the block serves refuses
+    /// a logged-in non-admin, driven through `routing::route_to_block` --
+    /// the router's own gate, not a copy of it.
+    #[tokio::test]
+    async fn every_route_refuses_a_non_admin_session() {
+        let ctx = ctx().await;
+        for row in ROUTES {
+            let path = concrete_path(row.template);
+            let action = action_for_method(row.method);
+            assert_eq!(
+                output_http_status(ctx.dispatch(auth_msg(action, &path, "u-not-admin")).await)
+                    .await,
+                403,
+                "{action} {path} must not be reachable by a logged-in non-admin"
+            );
+        }
+    }
+
+    /// The counterpart: an admin still reaches the block. Asserted on the two
+    /// routes that answer without a `wafer-run/vector` backend registered
+    /// (both report "no indexes"), so a 200 here is the block's own answer
+    /// and not an artifact of the fixture.
+    #[tokio::test]
+    async fn an_admin_still_reaches_the_api() {
+        let ctx = ctx().await;
+        for path in ["/b/vector/api/indexes", "/b/vector/api/stats"] {
+            assert_eq!(
+                output_http_status(ctx.dispatch(admin_msg("retrieve", path)).await).await,
+                200,
+                "{path} must still serve an admin"
+            );
         }
     }
 }
