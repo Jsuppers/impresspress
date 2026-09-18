@@ -1,4 +1,4 @@
-//! Isolate-local "config tables were written" counter.
+//! Process-wide "config tables were written" counter.
 //!
 //! Exists because a runtime build both READS config and WRITES it, in that
 //! order, within one pass. `builder::boot` initializes the admin block
@@ -20,33 +20,80 @@
 //! captured. A build that seeds nothing (the overwhelmingly common case on an
 //! established database) never bumps it and never re-reads.
 //!
-//! `Cell<u64>`, never a `RefCell`: Cloudflare can hard-stop a request without
-//! running destructors, and a stranded borrow flag wedges the isolate for the
-//! rest of its life (see `impresspress_core::isolate_cell`).
+//! ## Why it is process-wide, not thread-local
+//!
+//! Every cache this counter guards is process-wide. `blocks::config`'s
+//! `VariablesConfigBlock` is registered once and shared by every request it
+//! serves, and it tags its memoized `variables` snapshot with the generation it
+//! read at. Native serves requests on tokio's multi-threaded runtime
+//! (`impresspress`'s `#[tokio::main]`, a task per connection, work-stealing
+//! across workers), so the thread that performs an admin write is routinely not
+//! the thread that next reads config.
+//!
+//! A per-thread counter therefore could not do this job: an admin's
+//! `PATCH /b/admin/api/settings/{key}` bumped only the worker that handled it,
+//! and every other worker compared its own untouched counter against the
+//! generation stamped on the shared snapshot, found no change, and served the
+//! pre-write value for the life of the process — while the workers whose
+//! counter happened to differ re-queried the table on every single read.
+//! Counters from different threads were also compared as if they were one.
+//!
+//! [`std::sync::atomic::AtomicU64`], never a `RefCell`: Cloudflare can
+//! hard-stop a request without running destructors, and a stranded borrow flag
+//! wedges the isolate for the rest of its life (see
+//! `impresspress_core::isolate_cell`). An atomic has no borrow flag and no
+//! guard to strand, so it satisfies that constraint exactly as `Cell` did. On
+//! wasm32 an isolate is single-threaded, so the atomic is never contended and
+//! the shared counter is simply the same counter every reader in that isolate
+//! already compared against.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Bumped on every write to a table whose contents a runtime bakes in at
+/// build/init time. Monotonic (wrapping) for the life of the process; the
+/// absolute value is meaningless, only changes are.
+static CONFIG_WRITE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
 thread_local! {
-    /// Bumped on every local write to a table whose contents a runtime bakes
-    /// in at build/init time. Monotonic within an isolate; the absolute value
-    /// is meaningless, only changes are.
-    static CONFIG_WRITE_GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// How many writes [`note_config_write`] recorded on THIS thread.
+    ///
+    /// Test-only, and not what any reader compares: it exists so a test can
+    /// attribute writes to the code it just ran. The generation above is
+    /// process-wide, so under `cargo test`'s parallel threads it moves for
+    /// reasons a test asserting "this path wrote nothing" has no control over.
+    static WRITES_NOTED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Record that this isolate just wrote to a config table.
+/// Record that a config table was just written.
 ///
 /// Deliberately NOT gated on whether the KV config-version stamp was also
 /// bumped: the deploy-init funnel suppresses that stamp (one explicit bump
 /// after ~19 sequential same-key puts) and the seeding it performs is exactly
 /// the case this counter has to catch.
 pub fn note_config_write() {
-    CONFIG_WRITE_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    // `Release`, paired with the `Acquire` load below: a reader that observes
+    // the new generation also observes everything the writer did before it.
+    CONFIG_WRITE_GENERATION.fetch_add(1, Ordering::Release);
+    #[cfg(test)]
+    WRITES_NOTED_HERE.with(|n| n.set(n.get().wrapping_add(1)));
 }
 
 /// The current generation. A reader that cached config alongside a previous
 /// value must re-read when this differs.
 pub fn config_write_generation() -> u64 {
-    CONFIG_WRITE_GENERATION.with(Cell::get)
+    CONFIG_WRITE_GENERATION.load(Ordering::Acquire)
+}
+
+/// How many writes [`note_config_write`] has recorded on the calling thread.
+///
+/// The assertion tool for "this code path wrote nothing" (or "wrote exactly
+/// once"). A `#[tokio::test]` runs its whole body on one thread, so a delta of
+/// zero here is a statement about the path under test rather than about what
+/// every other test in the binary happened to be doing.
+#[cfg(test)]
+pub(crate) fn writes_noted_on_this_thread() -> u64 {
+    WRITES_NOTED_HERE.with(std::cell::Cell::get)
 }
 
 /// Whether a write to `table` can change what the config snapshot holds.
@@ -71,14 +118,20 @@ mod tests {
 
     #[test]
     fn a_write_changes_the_generation_a_read_captured() {
+        let noted = writes_noted_on_this_thread();
         let before = config_write_generation();
         assert_eq!(
-            config_write_generation(),
-            before,
-            "reading must not itself advance the generation"
+            writes_noted_on_this_thread(),
+            noted,
+            "reading the generation must not itself record a config write"
         );
 
         note_config_write();
+        assert_eq!(
+            writes_noted_on_this_thread(),
+            noted + 1,
+            "a config write must be recorded once"
+        );
         assert_ne!(
             config_write_generation(),
             before,
@@ -88,6 +141,29 @@ mod tests {
         let after_one = config_write_generation();
         note_config_write();
         assert_ne!(config_write_generation(), after_one);
+    }
+
+    /// A write on one thread has to be visible to a reader on another.
+    ///
+    /// The counter guards a process-wide snapshot: `blocks::config`'s block is
+    /// registered once and read from every tokio worker, so a generation only
+    /// the writing thread can see leaves every other worker convinced its cache
+    /// is current. Two plain OS threads are enough to state that here; the
+    /// end-to-end version — an admin write on one tokio worker, a config read
+    /// on another — is
+    /// `blocks::config::tests::an_admin_write_on_another_worker_reaches_a_warm_snapshot`.
+    #[test]
+    fn a_write_on_another_thread_is_visible_here() {
+        let before = config_write_generation();
+        std::thread::spawn(note_config_write)
+            .join()
+            .expect("the writing thread finishes");
+        assert_ne!(
+            config_write_generation(),
+            before,
+            "a write on another thread must move the generation this thread reads, \
+             or a cache warmed here never learns the config store moved"
+        );
     }
 
     /// Only the table the snapshot is BUILT from may invalidate it.

@@ -2277,19 +2277,24 @@ mod boot_tests {
     /// (no KV-cached wrapper to bump on its behalf), which is exactly that
     /// case.
     ///
-    /// Deterministic despite parallel tests: the generation is `thread_local`.
+    /// Counted with `config_generation::writes_noted_on_this_thread`, not the
+    /// process-wide generation: that counter is shared by the whole process, so
+    /// under `cargo test`'s parallel threads it moves for reasons this test
+    /// does not control. The per-thread tally counts what THIS test's
+    /// `#[tokio::test]` body did, which is the claim being made.
     #[tokio::test]
     async fn seeding_a_row_bumps_the_config_write_generation_and_a_no_op_does_not() {
         let db = migrated_db().await;
         let key = "WAFER_RUN__AUTH__SEED_PROBE";
 
-        let before = crate::config_generation::config_write_generation();
+        let before = crate::config_generation::writes_noted_on_this_thread();
         assert!(seed_if_absent(&db, key, "v", "Probe", "d", false)
             .await
             .expect("seed"));
-        let after_insert = crate::config_generation::config_write_generation();
-        assert_ne!(
-            before, after_insert,
+        let after_insert = crate::config_generation::writes_noted_on_this_thread();
+        assert_eq!(
+            after_insert,
+            before + 1,
             "a seeded row must bump the config-write generation"
         );
 
@@ -2298,7 +2303,7 @@ mod boot_tests {
             .expect("re-seed"));
         assert_eq!(
             after_insert,
-            crate::config_generation::config_write_generation(),
+            crate::config_generation::writes_noted_on_this_thread(),
             "a seed that found an existing row wrote nothing and must not bump"
         );
     }
@@ -2556,7 +2561,7 @@ mod boot_tests {
         seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
 
         let ctx = ctx.break_list_reads();
-        let before = crate::config_generation::config_write_generation();
+        let before = crate::config_generation::writes_noted_on_this_thread();
         let capture = crate::test_support::MessageCapture::default();
         {
             let _guard = tracing::subscriber::set_default(capture.clone());
@@ -2573,7 +2578,7 @@ mod boot_tests {
         );
         assert_eq!(
             before,
-            crate::config_generation::config_write_generation(),
+            crate::config_generation::writes_noted_on_this_thread(),
             "an unreadable row must not be written"
         );
         assert_eq!(
@@ -3075,7 +3080,7 @@ mod boot_tests {
         raw_insert_unowned(&db, "WAFER_RUN_SHARED__APP_NAME", "Stored").await;
 
         seed_and_load(&db, &[]).await.expect("first boot");
-        let before = crate::config_generation::config_write_generation();
+        let before = crate::config_generation::writes_noted_on_this_thread();
         seed_and_load(&db, &[]).await.expect("second boot");
 
         assert!(
@@ -3087,7 +3092,7 @@ mod boot_tests {
         );
         assert_eq!(
             before,
-            crate::config_generation::config_write_generation(),
+            crate::config_generation::writes_noted_on_this_thread(),
             "and must not write at all"
         );
     }
@@ -3511,11 +3516,11 @@ mod boot_tests {
         );
 
         // Idempotent: a healthy table costs no writes.
-        let before = crate::config_generation::config_write_generation();
+        let before = crate::config_generation::writes_noted_on_this_thread();
         seed_and_load(&db, &[]).await.expect("second boot");
         assert_eq!(
             before,
-            crate::config_generation::config_write_generation(),
+            crate::config_generation::writes_noted_on_this_thread(),
             "a boot with nothing to repair must not write"
         );
     }
@@ -3764,11 +3769,11 @@ mod boot_tests {
         let env = [("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string())];
         seed_and_load(&db, &env).await.expect("first boot");
 
-        let before = crate::config_generation::config_write_generation();
+        let before = crate::config_generation::writes_noted_on_this_thread();
         seed_and_load(&db, &env).await.expect("second boot");
         assert_eq!(
             before,
-            crate::config_generation::config_write_generation(),
+            crate::config_generation::writes_noted_on_this_thread(),
             "an unchanged environment must not write a row"
         );
     }

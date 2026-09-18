@@ -597,6 +597,88 @@ mod tests {
         );
     }
 
+    /// The same requirement when the write and the read happen on DIFFERENT
+    /// threads, which is the only shape native ever serves.
+    ///
+    /// `impresspress`'s `#[tokio::main]` runtime is multi-threaded and the
+    /// wafer-run http listener spawns a task per connection, so the worker that
+    /// handles an admin's `PATCH /b/admin/api/settings/{key}` is routinely not
+    /// the worker that renders the next page. This block is registered once and
+    /// its snapshot is shared by every one of them, so the generation the
+    /// snapshot is tagged with has to be shared too. While that counter was
+    /// `thread_local`, the write bumped only the writing thread: a reader on a
+    /// worker whose own counter still equalled the tag served the pre-write
+    /// value for the life of the process, and one whose counter differed
+    /// re-queried the table on every single read.
+    ///
+    /// Every other test here runs under `#[tokio::test]`, which is
+    /// current-thread — one thread both writes and reads — which is why a suite
+    /// this size never saw it.
+    ///
+    /// The reader runs in a spawned task, so it runs on a tokio WORKER thread;
+    /// the write below runs in the test body, which `block_on` polls on the
+    /// runtime's own thread. No worker can therefore have observed the write
+    /// thread-locally, whichever worker the reader resumes on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_write_on_another_worker_reaches_a_warm_snapshot() {
+        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx.boot_config_service().await;
+
+        let first = unique_config_value();
+        variables::upsert_by_key(
+            &ctx,
+            KEY,
+            VariablePatch {
+                value: Some(first.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the first value");
+
+        let (warmed_tx, warmed_rx) = tokio::sync::oneshot::channel();
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let reader_ctx = ctx.clone();
+        let first_expected = first.clone();
+        let reader = tokio::spawn(async move {
+            let warm = wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset").await;
+            assert_eq!(
+                warm, first_expected,
+                "precondition: this read fills the shared snapshot on a worker thread"
+            );
+            warmed_tx.send(()).expect("the test is waiting for this");
+            written_rx.await.expect("the admin write happens");
+            wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset").await
+        });
+        warmed_rx.await.expect("the reader warmed the snapshot");
+
+        let second = unique_config_value();
+        variables::upsert_by_key(
+            &ctx,
+            KEY,
+            VariablePatch {
+                value: Some(second.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the admin write lands in the table");
+        written_tx.send(()).expect("the reader is waiting for this");
+
+        assert_eq!(
+            reader.await.expect("the reader task finished"),
+            second,
+            "a config write on one thread must invalidate the snapshot every \
+             other thread reads, or native serves the pre-write value until it \
+             restarts"
+        );
+    }
+
     /// The login page shows branding an admin saved, without a restart.
     ///
     /// This is the requirement read surface 2 stood for. It could not be
