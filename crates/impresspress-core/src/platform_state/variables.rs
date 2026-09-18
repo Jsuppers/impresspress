@@ -1224,9 +1224,13 @@ pub async fn seed_and_load(
                 continue;
             }
         }
-        // `sensitive` is settled by `NewVariable::into_row` and `set_with_row`
-        // from the key's declaration and the `_SECRET`/`_KEY` suffix; `false`
-        // here asserts nothing extra.
+        // `sensitive` is settled by `set_with_row` — `VariablePatch::into_new`
+        // on a create, `NewVariable::into_row` on top — from the key's
+        // declaration and the `_SECRET`/`_KEY` suffix; `false` here asserts
+        // nothing extra. Native filters this batch to declared keys before it
+        // gets here (`cli::server_config::filter_to_declared_keys`), so the
+        // undeclared-key default `into_new` applies is not what seeds a row on
+        // this path.
         match set_with_row(db, key, value, "", "", false, None, existing).await {
             // Reached only for a row nothing has pinned, so the previous value
             // was a seeder's: a declared default, or an earlier boot's
