@@ -198,10 +198,13 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     EndpointRoute::public(HttpMethod::Get, "/b/auth/bootstrap", Route::BootstrapPage)
         .summary("Bootstrap token redemption form"),
     // ── OAuth browser redirects ──
+    // Navigated to, never fetched: it answers `302` to the provider and sets
+    // the cookie binding the flow to this browser, which only a top-level
+    // navigation can store first-party. No response body, so no output
+    // schema — `oauth/start.rs` has the full rationale.
     EndpointRoute::public(HttpMethod::Get, "/b/auth/oauth/login", Route::OauthStart)
         .summary("Start OAuth flow")
         .query_params(oauth_start_query_schema)
-        .output(response_schema_of::<contracts::OauthStartResponse>)
         .tags(&["auth"]),
     // Public: the provider redirects the browser here with no session by
     // design; `oauth/callback.rs` consumes the single-use PKCE state.
@@ -509,7 +512,7 @@ crate::impresspress_feature_block! {
             Route::ResetPasswordPage => pages::reset_password::handle(ctx, &msg).await,
             Route::BootstrapPage => pages::bootstrap::handle_get(ctx, &msg).await,
             Route::OauthStart => oauth::start::handle(ctx, &msg).await,
-            Route::OauthCallback => oauth::callback::handle(ctx, &msg).await,
+            Route::OauthCallback => oauth::callback::handle(&this.limiter, ctx, &msg).await,
             Route::Login => api::login::handle(ctx, input).await,
             Route::Signup => api::signup::handle(&this.limiter, ctx, &msg, input).await,
             Route::Refresh => api::refresh::handle(ctx, input).await,

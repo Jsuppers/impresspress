@@ -31,6 +31,7 @@ enum Route {
     Sessions,
     RevokeSession,
     Security,
+    UnlinkProvider,
     Config,
     AdminSettingsPage,
     AdminSaveSettings,
@@ -67,6 +68,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .summary("Revoke session"),
     EndpointRoute::authenticated(HttpMethod::Get, "/b/userportal/security", Route::Security)
         .summary("Account security"),
+    EndpointRoute::authenticated(
+        HttpMethod::Delete,
+        "/b/userportal/security/providers/{provider}",
+        Route::UnlinkProvider,
+    )
+    .summary("Unlink an OAuth provider"),
     EndpointRoute::public(HttpMethod::Get, "/b/userportal/config", Route::Config)
         .summary("Portal configuration"),
     EndpointRoute::admin(
@@ -158,6 +165,7 @@ crate::impresspress_feature_block! {
             Route::Sessions => pages::sessions::sessions_page(ctx, &msg).await,
             Route::RevokeSession => pages::sessions::handle_revoke(ctx, &msg).await,
             Route::Security => pages::security::security_page(ctx, &msg).await,
+            Route::UnlinkProvider => pages::security::handle_unlink(ctx, &msg).await,
             Route::Config => this.handle_config(ctx, &msg).await,
             Route::AdminSettingsPage => admin_settings_page(ctx, &msg).await,
             Route::AdminSaveSettings => handle_save_settings(ctx, input).await,

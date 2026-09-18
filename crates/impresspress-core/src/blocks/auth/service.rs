@@ -259,12 +259,21 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         // ownership check that precedes it reads the session row, not this
         // table.
         wafer_run::ResourceGrant::read_write("impresspress/userportal", "wafer_run__auth__tokens"),
-        // Userportal `/b/userportal/security` lists the caller's
-        // linked OAuth providers. Read-only — unlinking goes
-        // through an auth POST endpoint, not the userportal block.
-        wafer_run::ResourceGrant::read(
+        // Userportal `/b/userportal/security` lists the caller's linked OAuth
+        // providers and removes individual ones. Read+write because the
+        // unlink deletes the row; both the list and the delete are scoped to
+        // the caller's user_id in the repo helper.
+        wafer_run::ResourceGrant::read_write(
             "impresspress/userportal",
             "wafer_run__auth__provider_links",
+        ),
+        // The same unlink refuses to remove an account's last way in, which
+        // means asking whether it has a password at all. Read-only: the
+        // userportal never writes a credential — the change-password form on
+        // that page posts to the auth block.
+        wafer_run::ResourceGrant::read(
+            "impresspress/userportal",
+            "wafer_run__auth__local_credentials",
         ),
         wafer_run::ResourceGrant::read_write("impresspress/userportal", "wafer_run__auth__users"),
         wafer_run::ResourceGrant::read("impresspress/products", "wafer_run__auth__users"),

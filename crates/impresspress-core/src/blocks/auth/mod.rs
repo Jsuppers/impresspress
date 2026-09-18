@@ -844,19 +844,34 @@ pub(crate) mod helpers {
         }
     }
 
+    /// The `; Secure` attribute, or nothing on a development deployment that
+    /// serves plain HTTP (where a `Secure` cookie would be dropped by the
+    /// browser and nothing would work).
+    ///
+    /// Every cookie this app sets shares the rule, so it is resolved here
+    /// rather than re-derived from `WAFER_RUN_SHARED__ENVIRONMENT` per cookie.
+    pub(crate) async fn cookie_secure_attribute(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> &'static str {
+        let env =
+            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
+        if env.to_lowercase() == "development" {
+            ""
+        } else {
+            "; Secure"
+        }
+    }
+
     pub(crate) async fn build_auth_cookie(
         token: &str,
         max_age: u64,
         ctx: &dyn wafer_run::context::Context,
     ) -> String {
-        let env =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
-        let secure = env.to_lowercase() != "development";
         format!(
             "auth_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
             token,
             max_age,
-            if secure { "; Secure" } else { "" }
+            cookie_secure_attribute(ctx).await
         )
     }
 

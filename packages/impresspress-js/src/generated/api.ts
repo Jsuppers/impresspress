@@ -1023,19 +1023,7 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": {
-                            /**
-                             * Format: uri
-                             * @description Absolute authorize URL at the provider, with `client_id`,
-                             *     `redirect_uri`, the single-use PKCE `state` and `code_challenge`
-                             *     already interpolated.
-                             */
-                            auth_url: string;
-                            /** @description Echo of the requested provider — one of `OAUTH_PROVIDERS`. */
-                            provider: string;
-                        };
-                    };
+                    content?: never;
                 };
             };
         };

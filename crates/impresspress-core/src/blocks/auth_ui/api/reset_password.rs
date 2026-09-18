@@ -91,6 +91,31 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         return err_internal("Failed to clear reset token", e.to_string());
     }
 
+    // A redeemed reset link is mailbox proof of exactly the same strength as
+    // a redeemed verification link: this caller received a secret sent to the
+    // address and returned it. Recording it here is what gives an account
+    // whose address nobody ever proved — every password account on a
+    // deployment that does not require verification — a route to becoming
+    // one an OAuth identity may join, and it is the recovery path for an
+    // address someone else registered first.
+    //
+    // `record_email_proof` sets `email_verified` along with the proof, so on a
+    // deployment that requires verification a reset also satisfies the login
+    // gate for a user who never clicked a verification link. That is correct
+    // — they just demonstrated the same control that link demonstrates — and
+    // it is stated because it is not obvious from the call.
+    //
+    // Not fatal on failure: the password has already changed, the reset
+    // succeeded, and the proof is recorded for the sake of a later sign-in,
+    // not this one.
+    if let Err(e) = users::record_email_proof(ctx, &user.id, users::proof::EMAIL_TOKEN).await {
+        tracing::warn!(
+            user_id = %user.id,
+            error = %e,
+            "password reset succeeded but the address proof was not recorded"
+        );
+    }
+
     // Revoke all refresh tokens — invalidate any stolen sessions.
     // SEC-032/039: mark rows revoked (don't delete) so the reuse-detection
     // tombstones survive across the password reset.
@@ -256,6 +281,48 @@ mod tests {
         assert!(
             output_is_error(out, "Internal").await,
             "a failed token lookup must not be answered as an invalid token"
+        );
+    }
+
+    /// A redeemed reset link is mailbox proof: the caller received a secret
+    /// sent to the address and returned it. Recording it is what gives an
+    /// account whose address nobody proved — every password account on a
+    /// deployment that does not require verification — a route to becoming
+    /// one an OAuth identity may join, and it is how the owner of an address
+    /// someone else registered first recovers it.
+    #[tokio::test]
+    async fn a_successful_reset_records_the_address_proof() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "gina@example.com", "original-horse-battery1").await;
+        let before = users::find_by_id(&ctx, &user_id)
+            .await
+            .unwrap()
+            .expect("row present");
+        assert!(
+            before.email_verified,
+            "precondition: verification is off, so signup flags the row verified"
+        );
+        assert!(
+            !before.email_is_proven(),
+            "precondition: nobody proved the address — no mail was ever sent"
+        );
+
+        let token = issue_reset_token(&ctx, &user_id).await;
+        let out = handle(&ctx, body(&token, "new-horse-battery-2026")).await;
+        assert_eq!(
+            output_json(out).await["message"],
+            "Password reset successfully"
+        );
+
+        assert_eq!(
+            users::find_by_id(&ctx, &user_id)
+                .await
+                .unwrap()
+                .expect("row present")
+                .email_verified_by
+                .as_deref(),
+            Some(users::proof::EMAIL_TOKEN),
+            "the reset must record the proof its link demonstrates"
         );
     }
 }

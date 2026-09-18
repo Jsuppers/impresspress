@@ -149,6 +149,86 @@ pub(crate) fn log_email_not_sent(flow: &str, user_id: &str, failure: &EmailNotSe
 ///
 /// Shared by the signup, email-verify and forgot-password handlers — every
 /// caller builds the same `email.send_template` envelope `{template, to,
+/// Seconds an account must wait between verification mails. One caller alone
+/// can be driven by whoever holds the address (the resend endpoint) or by
+/// whoever holds a provider account (an OAuth sign-in refused for want of a
+/// verified address), so the cooldown belongs beside the send, not in either
+/// caller.
+const VERIFICATION_RESEND_COOLDOWN_SECS: i64 = 60;
+
+/// What [`send_verification_email`] did, which is three outcomes and not two:
+/// a link that went out, a link nothing was minted for because the account is
+/// inside its cooldown, and a link that was minted and then not delivered.
+/// Only the third needs recording, and the caller records it under its own
+/// flow name.
+#[derive(Debug)]
+pub(crate) enum VerificationMail {
+    /// A token was minted, persisted, and handed to the email block, which
+    /// accepted it.
+    Sent,
+    /// The account is inside its resend cooldown: nothing minted, nothing
+    /// sent, and deliberately nothing said about it either.
+    WithinCooldown,
+    /// A token was minted and persisted — the link in the user's hands, if
+    /// they ever receive it, is valid — and the send did not happen.
+    NotSent(EmailNotSent),
+}
+
+/// Mint a fresh email-verification token for `user_id`, persist its digest,
+/// and mail the link — unless the account is still inside its resend
+/// cooldown, in which case nothing is minted and nothing is sent.
+///
+/// Shared by `api::verify`'s resend endpoint and `oauth::callback`, which
+/// needs it for the account a provider created without asserting anything
+/// about the address: on a deployment that requires verification, that
+/// account has no other way to ever become verified, and refusing it without
+/// offering the link would lock it out permanently.
+///
+/// Both callers reach the same outbound-mail budget, because the send goes
+/// through [`send_template_email`] like every other transactional mail: a
+/// link mailed from an OAuth callback is as spendable a resource as one
+/// mailed from the resend endpoint, and an OAuth flow that bypassed the
+/// limiter would be the cheapest way to spend the deployment's mail.
+///
+/// `Err` is the mint or its persistence failing — a backend fault the caller
+/// may surface. A mail that did not go out is not an error here: it comes
+/// back as [`VerificationMail::NotSent`] for the caller to hand to
+/// [`log_email_not_sent`], because none of these flows may vary their
+/// response with it.
+///
+/// Only the SHA-256 digest is persisted; the raw token exists only in the
+/// mail, so a row-read leak does not grant verification.
+pub(crate) async fn send_verification_email(
+    limiter: &UserRateLimiter,
+    ctx: &dyn Context,
+    msg: &Message,
+    user_id: &str,
+    email: &str,
+) -> Result<VerificationMail, wafer_run::WaferError> {
+    use crate::{
+        blocks::auth::repo::users,
+        util::{hex_encode, sha256_hex},
+    };
+
+    let last_sent = users::last_verification_sent(ctx, user_id).await?;
+    if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last_sent) {
+        let elapsed = chrono::Utc::now() - last.with_timezone(&chrono::Utc);
+        if elapsed.num_seconds() < VERIFICATION_RESEND_COOLDOWN_SECS {
+            return Ok(VerificationMail::WithinCooldown);
+        }
+    }
+
+    let token = hex_encode(&wafer_core::clients::crypto::random_bytes(ctx, 32).await?);
+    let now = crate::util::now_rfc3339();
+    users::set_verification_token(ctx, user_id, &sha256_hex(token.as_bytes()), &now).await?;
+    Ok(
+        match send_template_email(limiter, ctx, msg, "verification", email, &token).await {
+            Ok(()) => VerificationMail::Sent,
+            Err(failure) => VerificationMail::NotSent(failure),
+        },
+    )
+}
+
 /// token}` and only the template name differs.
 ///
 /// Spends this requester's [`RateLimit::AUTH_EMAIL`] budget first, keyed by

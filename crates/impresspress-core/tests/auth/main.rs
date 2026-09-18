@@ -7,7 +7,6 @@ mod migrations_001;
 mod migrations_002;
 mod migrations_008_rate_limits;
 mod migrations_012_sessions_family;
-mod oauth_callback_repo;
 mod repo_orgs;
 mod repo_pats;
 mod repo_provider_links;

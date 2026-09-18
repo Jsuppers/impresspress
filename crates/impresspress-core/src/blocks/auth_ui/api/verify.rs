@@ -2,7 +2,6 @@
 //! relocated from auth/login.rs in Task 5.
 
 use maud::html;
-use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
@@ -10,7 +9,7 @@ use crate::{
     http::{err_bad_request, err_internal, ok_json},
     ui,
     ui::{components::auth_panel, icons, templates::auth_split},
-    util::{hex_encode, sha256_hex},
+    util::sha256_hex,
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
@@ -72,7 +71,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         Err(e) => return err_internal("Could not check the verification token", e),
     };
 
-    if user.email_verified {
+    // `email_is_proven`, not `email_verified`. The flag is policy —
+    // `api::signup` writes it `!REQUIRE_VERIFICATION` — so short-circuiting on
+    // it would turn away the holder of a real link on every deployment that
+    // does not require verification, and there would be no way left to record
+    // the proof for an account that needs one to link a provider. The flag
+    // being set while nothing proved it is exactly the state this redemption
+    // exists to repair.
+    if user.email_is_proven() {
         return html_respond(
             "Email Already Verified",
             "Your email has already been verified. You can sign in now.",
@@ -84,8 +90,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         );
     }
 
-    // Mark as verified + clear token in one typed write.
-    if let Err(e) = users::mark_email_verified(ctx, &user.id).await {
+    // Record the proof + clear the token in one typed write. The holder of
+    // this link received it at the address, which is the only evidence of
+    // mailbox control this app ever collects itself.
+    if let Err(e) = users::record_email_proof(ctx, &user.id, users::proof::EMAIL_TOKEN).await {
         return err_internal("Failed to verify email", e.to_string());
     }
 
@@ -144,45 +152,27 @@ pub async fn handle_resend(
         }
     };
 
-    if user.email_verified {
+    // Same reading as the redemption above: an account whose address nobody
+    // proved may still ask for a link, whatever the policy flag says. On a
+    // deployment that does not require verification that is every account,
+    // and it is the only route by which one of them can ever become
+    // adoptable by an OAuth identity.
+    if user.email_is_proven() {
         return constant();
     }
 
-    // 60 second cooldown: inside it, neither mint a token nor say so.
-    let last_sent = users::last_verification_sent(ctx, &user.id)
-        .await
-        .unwrap_or_default();
-    if !last_sent.is_empty() {
-        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last_sent) {
-            let elapsed = chrono::Utc::now() - last.with_timezone(&chrono::Utc);
-            if elapsed.num_seconds() < 60 {
-                return constant();
-            }
-        }
-    }
-
-    // Generate new token. The raw token goes in the email link; only its
-    // SHA-256 hex digest is persisted so a row-read leak doesn't grant
-    // verification.
-    let new_token = match crypto::random_bytes(ctx, 32).await {
-        Ok(bytes) => hex_encode(&bytes),
-        Err(e) => return err_internal("Token generation failed", e),
-    };
-    let new_token_hash = sha256_hex(new_token.as_bytes());
-
-    let now = crate::util::now_rfc3339();
-    if let Err(e) = users::set_verification_token(ctx, &user.id, &new_token_hash, &now).await {
-        return err_internal("Failed to update token", e.to_string());
-    }
-
-    if let Err(failure) =
-        super::send_template_email(limiter, ctx, msg, "verification", &email_lower, &new_token)
-            .await
-    {
+    // Mint, persist and mail a fresh link — the shared path, which owns both
+    // the 60-second resend cooldown and the outbound-mail budget. Inside the
+    // cooldown nothing is minted and nothing is said.
+    match super::send_verification_email(limiter, ctx, msg, &user.id, &email_lower).await {
+        Ok(super::VerificationMail::Sent | super::VerificationMail::WithinCooldown) => {}
         // Same constraint as forgot-password: `constant()` is the answer for
         // every account state, so the failure is recorded here rather than
         // in the body.
-        super::log_email_not_sent("resend-verification", &user.id, &failure);
+        Ok(super::VerificationMail::NotSent(failure)) => {
+            super::log_email_not_sent("resend-verification", &user.id, &failure);
+        }
+        Err(e) => return err_internal("Failed to mint the verification token", e),
     }
 
     constant()
@@ -345,6 +335,27 @@ mod resend_tests {
         )
     }
 
+    /// Register an account through the real signup handler, so the row
+    /// carries what that handler writes for this deployment's configuration
+    /// rather than what a fixture would like it to carry.
+    async fn signup(ctx: &TestContext, email: &str) {
+        let payload =
+            serde_json::json!({ "email": email, "password": "correct-horse-battery" }).to_string();
+        let (signup_limiter, signup_msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let out = crate::blocks::auth_ui::api::signup::handle(
+            &signup_limiter,
+            ctx,
+            &signup_msg,
+            InputStream::from_bytes(payload.into_bytes()),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_status(out).await,
+            201,
+            "the signup fixture must succeed"
+        );
+    }
+
     async fn seed(ctx: &TestContext, email: &str, verified: bool) -> String {
         let user = users::insert(
             ctx,
@@ -446,6 +457,90 @@ mod resend_tests {
         assert_eq!(
             outage, expected,
             "a failed lookup must answer the same constant body as any other state"
+        );
+    }
+
+    /// The recovery path the OAuth adoption rule depends on.
+    ///
+    /// On a deployment that does not require verification, `api::signup`
+    /// writes `email_verified = true` and mails nothing, so every password
+    /// account is flag-verified and nobody proved its address. Gating this
+    /// endpoint on the flag made that permanent: the account could never be
+    /// offered a link, so it could never record a proof, so an OAuth identity
+    /// could never join it and only a manual database write would fix it.
+    #[tokio::test]
+    async fn a_flag_verified_account_that_nobody_proved_is_still_offered_a_link() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        signup(&ctx, "flagged@example.com").await;
+
+        let user = users::find_by_email(&ctx, "flagged@example.com")
+            .await
+            .expect("user lookup ok")
+            .expect("signup created the row");
+        assert!(
+            user.email_verified,
+            "precondition: with verification off, signup marks the row verified"
+        );
+        assert!(
+            !user.email_is_proven(),
+            "precondition: no mail was sent, so nothing proved the address"
+        );
+
+        let (limiter, request) = crate::blocks::auth_ui::api::test_mail_request();
+        let _ = handle_resend(&limiter, &ctx, &request, body("flagged@example.com"))
+            .await
+            .collect_buffered()
+            .await;
+
+        assert!(
+            !users::last_verification_sent(&ctx, &user.id)
+                .await
+                .expect("read cooldown")
+                .is_empty(),
+            "an unproven account must be able to ask for a link, whatever the flag says"
+        );
+    }
+
+    /// And redeeming that link records the proof, rather than stopping at
+    /// "Email Already Verified" — which reads the flag, and so would turn
+    /// away the one caller who can actually prove the address.
+    #[tokio::test]
+    async fn redeeming_a_link_on_a_flag_verified_account_records_the_proof() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        signup(&ctx, "flagged2@example.com").await;
+        let user = users::find_by_email(&ctx, "flagged2@example.com")
+            .await
+            .expect("user lookup ok")
+            .expect("signup created the row");
+        assert!(user.email_verified && !user.email_is_proven());
+
+        let raw = "raw-verification-token-0123456789";
+        users::set_verification_token(
+            &ctx,
+            &user.id,
+            &crate::util::sha256_hex(raw.as_bytes()),
+            &crate::util::now_rfc3339(),
+        )
+        .await
+        .expect("set token");
+
+        let mut msg = Message::new("auth.verify");
+        msg.set_meta("req.query.token", raw);
+        let page =
+            crate::test_support::output_html(handle(&ctx, &msg, InputStream::empty()).await).await;
+        assert!(
+            page.contains("Email Verified"),
+            "the link must be redeemable, not answered as already verified: {page}"
+        );
+
+        let proven = users::find_by_email(&ctx, "flagged2@example.com")
+            .await
+            .expect("user lookup ok")
+            .expect("row present");
+        assert_eq!(
+            proven.email_verified_by.as_deref(),
+            Some(users::proof::EMAIL_TOKEN),
+            "redeeming the link is what records the proof"
         );
     }
 }

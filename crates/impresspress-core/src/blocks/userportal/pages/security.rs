@@ -1,12 +1,12 @@
 //! `/b/userportal/security` — change password + linked OAuth providers
 //! + email verification status.
 
-use maud::html;
+use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::{provider_links, users},
-    http::redirect,
+    blocks::auth::repo::{local_credentials, provider_links, users},
+    http::{err_internal, redirect, ResponseBuilder},
     ui::SiteConfig,
 };
 
@@ -121,13 +121,13 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     "No external accounts linked. Sign in with GitHub, Google, or Microsoft to link one."
                 }
             } @else {
+                p .text-muted .m-0 .mb-3 .text-sm {
+                    "Anyone who can sign in to one of these can sign in to this \
+                     account. Unlink any you do not recognize."
+                }
                 ul .linked-providers-list {
                     @for l in &links {
-                        li .linked-provider {
-                            span .linked-provider__name { (l.provider) }
-                            span .linked-provider__login { (l.provider_login) }
-                            span .linked-provider__date { "linked " (l.linked_at) }
-                        }
+                        (linked_provider_row(l, None))
                     }
                 }
             }
@@ -136,6 +136,108 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let config = SiteConfig::load(ctx).await;
     super::account_page(&config, "Security", Some("/b/userportal/"), body)
+}
+
+/// One linked-provider row, optionally carrying the reason its last unlink was
+/// refused.
+///
+/// Rendered by the page and again by [`handle_unlink`], which swaps this row
+/// in place of itself: htmx does not swap a non-2xx response, so a refusal has
+/// to come back as the row it declined to remove, carrying the reason.
+fn linked_provider_row(link: &provider_links::ProviderLink, error: Option<&str>) -> Markup {
+    html! {
+        li .linked-provider {
+            span .linked-provider__name { (link.provider) }
+            span .linked-provider__login { (link.provider_login) }
+            span .linked-provider__date { "linked " (link.linked_at) }
+            button .btn .btn--ghost .btn--sm
+                type="button"
+                hx-delete=(format!("/b/userportal/security/providers/{}", link.provider))
+                hx-target="closest li"
+                hx-swap="outerHTML"
+                hx-confirm=(format!(
+                    "Unlink {}? You will no longer be able to sign in with it.",
+                    link.provider
+                ))
+            { "Unlink" }
+            @if let Some(message) = error {
+                p .form-error .m-0 { (message) }
+            }
+        }
+    }
+}
+
+/// DELETE `/b/userportal/security/providers/{provider}` — remove one of the
+/// caller's OAuth links.
+///
+/// The eviction half of account recovery. A provider that asserts nothing
+/// about the address it returns can bind itself to an account, and until this
+/// existed there was no way to undo that from anywhere in the product: the
+/// rightful owner could reset the password and prove the address, and the
+/// other identity kept a working sign-in beside them. Sessions already had
+/// this (`pages::sessions::handle_revoke`); links did not.
+///
+/// Scoped to the caller in the statement, so naming somebody else's provider
+/// deletes nothing and is answered exactly like naming one you do not have.
+///
+/// Refuses to remove the last way in. An account with no password credential
+/// and one link would be locked out of itself by a single click — and on a
+/// deployment that requires verification it could not necessarily reset its
+/// way back either. The refusal names the fix ("set a password first"), which
+/// the form directly above it performs.
+pub async fn handle_unlink(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let user_id = msg.user_id().to_string();
+    if user_id.is_empty() {
+        return ResponseBuilder::new()
+            .status(401)
+            .body(b"unauthenticated".to_vec(), "text/plain");
+    }
+    let provider = msg.var("provider").to_string();
+    if provider.is_empty() {
+        return ResponseBuilder::new()
+            .status(400)
+            .body(b"bad provider".to_vec(), "text/plain");
+    }
+
+    let links = match provider_links::list_for_user(ctx, &user_id).await {
+        Ok(l) => l,
+        Err(e) => return err_internal("Could not read your linked accounts", e),
+    };
+    let Some(target) = links.iter().find(|l| l.provider == provider) else {
+        // Not linked to this caller — indistinguishable from someone else's
+        // link, on purpose. htmx removes the row either way.
+        return ResponseBuilder::new()
+            .status(200)
+            .body(Vec::new(), "text/html");
+    };
+
+    if links.len() == 1 {
+        let has_password = match local_credentials::has_password(ctx, &user_id).await {
+            Ok(has) => has,
+            Err(e) => return err_internal("Could not check your sign-in methods", e),
+        };
+        if !has_password {
+            return ResponseBuilder::new().status(200).body(
+                linked_provider_row(
+                    target,
+                    Some(
+                        "This is the only way you can sign in. Set a password first, \
+                         then unlink it.",
+                    ),
+                )
+                .into_string()
+                .into_bytes(),
+                "text/html",
+            );
+        }
+    }
+
+    if let Err(e) = provider_links::delete_for_user(ctx, &user_id, &provider).await {
+        return err_internal("Could not unlink that account", e);
+    }
+    ResponseBuilder::new()
+        .status(200)
+        .body(Vec::new(), "text/html")
 }
 
 #[cfg(test)]
@@ -329,5 +431,141 @@ mod tests {
             .await
             .expect("auth's production grants must cover userportal provider_links read");
         assert_eq!(links.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Unlink — the eviction half of account recovery
+    // -----------------------------------------------------------------
+
+    async fn link(ctx: &TestContext, user_id: &str, provider: &str, reference: &str) {
+        upsert(
+            ctx,
+            NewLink {
+                provider,
+                provider_ref: reference,
+                user_id,
+                provider_login: "someone",
+                access_token: "tok",
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn unlink_msg(user_id: &str, provider: &str) -> Message {
+        let mut msg = auth_msg(
+            "delete",
+            &format!("/b/userportal/security/providers/{provider}"),
+            user_id,
+        );
+        msg.set_meta("req.param.provider", provider);
+        msg
+    }
+
+    /// The page has to offer the action at all — a link nobody can remove is
+    /// the state that made a squatted account unrecoverable.
+    #[tokio::test]
+    async fn the_page_offers_an_unlink_for_each_link() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        link(&ctx, "user-a", "github", "gh-1").await;
+
+        let html = output_html(
+            security_page(
+                &ctx,
+                &auth_msg("retrieve", "/b/userportal/security", "user-a"),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            html.contains("/b/userportal/security/providers/github"),
+            "the linked-accounts row must offer an unlink: {html}"
+        );
+        assert!(
+            html.contains("Unlink"),
+            "missing the unlink control: {html}"
+        );
+    }
+
+    /// Unlinking removes the row. With a password on the account this is the
+    /// owner evicting somebody else's provider identity.
+    #[tokio::test]
+    async fn unlink_removes_the_link_when_a_password_remains() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        link(&ctx, "user-a", "github", "gh-1").await;
+        local_credentials::insert(&ctx, "user-a", "hash", false)
+            .await
+            .expect("seed password");
+
+        let status =
+            output_status(handle_unlink(&ctx, &unlink_msg("user-a", "github")).await).await;
+        assert_eq!(status, 200);
+        assert!(
+            provider_links::list_for_user(&ctx, "user-a")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the link must be gone, or the other party keeps a way in"
+        );
+    }
+
+    /// Scoped to the caller: naming another user's provider deletes nothing,
+    /// and answers exactly like naming one you do not have.
+    #[tokio::test]
+    async fn unlink_cannot_reach_another_users_link() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        seed_user(&ctx, "user-b").await;
+        link(&ctx, "user-b", "github", "gh-b").await;
+        local_credentials::insert(&ctx, "user-a", "hash", false)
+            .await
+            .expect("seed password");
+
+        let status =
+            output_status(handle_unlink(&ctx, &unlink_msg("user-a", "github")).await).await;
+        assert_eq!(status, 200, "no answer that distinguishes the two cases");
+        assert_eq!(
+            provider_links::list_for_user(&ctx, "user-b")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "another user's link must survive"
+        );
+    }
+
+    /// An account whose only way in is the link cannot click itself out of
+    /// existence. The refusal comes back as the row it declined to remove —
+    /// htmx does not swap a non-2xx — carrying the fix.
+    #[tokio::test]
+    async fn unlink_refuses_to_remove_the_last_way_in() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        link(&ctx, "user-a", "github", "gh-1").await;
+        // No local_credentials row: this account has no password.
+
+        let html = output_html(handle_unlink(&ctx, &unlink_msg("user-a", "github")).await).await;
+        assert!(
+            html.contains("Set a password first"),
+            "the refusal must name the fix: {html}"
+        );
+        assert_eq!(
+            provider_links::list_for_user(&ctx, "user-a")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the last sign-in method must survive the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlink_is_unauthenticated_without_a_session() {
+        let ctx = TestContext::with_auth().await;
+        let mut msg = anon_msg("delete", "/b/userportal/security/providers/github");
+        msg.set_meta("req.param.provider", "github");
+        assert_eq!(output_status(handle_unlink(&ctx, &msg).await).await, 401);
     }
 }
