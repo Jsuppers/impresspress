@@ -17,7 +17,10 @@ use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use crate::util::RecordExt;
+use crate::{
+    db_read::{self, Bound, CappedList},
+    util::RecordExt,
+};
 
 pub const TABLE: &str = "impresspress__admin__user_roles";
 
@@ -98,15 +101,11 @@ fn eq(field: &str, value: &str) -> Filter {
     }
 }
 
-/// List with `filters`, warning about and skipping a row that does not
-/// decode — the policy the auth block's role merge and admin's bulk role
-/// fetch have always applied to a malformed row.
-async fn list_where(
-    ctx: &dyn Context,
-    filters: Vec<Filter>,
-) -> Result<Vec<UserRoleRow>, WaferError> {
-    let records = db::list_all(ctx, TABLE, filters).await?;
-    Ok(records
+/// Decode grant rows, warning about and skipping a row that does not decode
+/// — the policy the auth block's role merge and admin's bulk role fetch have
+/// always applied to a malformed row.
+fn decode_rows(records: Vec<db::Record>) -> Vec<UserRoleRow> {
+    records
         .iter()
         .filter_map(|r| match UserRoleRow::from_record(&r.id, &r.data) {
             Ok(row) => Some(row),
@@ -115,7 +114,25 @@ async fn list_where(
                 None
             }
         })
-        .collect())
+        .collect()
+}
+
+/// List the grants `filters` selects, for a filter that pins the read to one
+/// principal or one page of them.
+///
+/// One row per extra role a user holds, so the matching set is as small as
+/// the number of roles the deployment defines. The unfiltered and
+/// filtered-by-role reads are a different shape and have their own functions
+/// ([`list_all`], [`list_by_role`]) — this table's row count grows with the
+/// user base, so "every grant" is never a bounded read.
+async fn list_for_principals(
+    ctx: &dyn Context,
+    filters: Vec<Filter>,
+    bound: Bound,
+) -> Result<Vec<UserRoleRow>, WaferError> {
+    Ok(decode_rows(
+        db_read::list_bounded(ctx, TABLE, filters, bound).await?,
+    ))
 }
 
 /// Every grant `user_id` holds.
@@ -123,7 +140,12 @@ pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,
 ) -> Result<Vec<UserRoleRow>, WaferError> {
-    list_where(ctx, vec![eq("user_id", user_id)]).await
+    list_for_principals(
+        ctx,
+        vec![eq("user_id", user_id)],
+        Bound::OnePer("extra role one user holds"),
+    )
+    .await
 }
 
 /// Every grant any of `user_ids` holds, in one `In` query. The bulk lookup
@@ -139,25 +161,48 @@ pub async fn list_for_users(
         .iter()
         .map(|id| Value::String((*id).to_string()))
         .collect();
-    list_where(
+    list_for_principals(
         ctx,
         vec![Filter {
             field: "user_id".to_string(),
             operator: FilterOp::In,
             value: Value::Array(values),
         }],
+        Bound::OnePer("extra role held by one of the user ids on one admin list page"),
     )
     .await
 }
 
-/// Every grant.
-pub async fn list_all(ctx: &dyn Context) -> Result<Vec<UserRoleRow>, WaferError> {
-    list_where(ctx, vec![]).await
+/// Grants across the whole deployment, for the IAM listing, and whether
+/// there are more than the listing returned.
+///
+/// The table holds one row per extra role per user, so it grows with the user
+/// base: this read is capped and says so, rather than presenting a prefix as
+/// the complete grant list.
+pub async fn list_all(ctx: &dyn Context) -> Result<CappedList<UserRoleRow>, WaferError> {
+    let capped = db_read::list_capped(ctx, TABLE, vec![]).await?;
+    Ok(CappedList {
+        rows: decode_rows(capped.rows),
+        truncated: capped.truncated,
+    })
 }
 
-/// Every grant of `role`, for a rename to carry along.
+/// How many grants the table holds, deployment-wide — the honest
+/// `total_count` beside [`list_all`]'s capped page.
+pub async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
+    db::count(ctx, TABLE, &[]).await
+}
+
+/// EVERY grant of `role`, for a rename to carry along.
+///
+/// Exhaustive on purpose. A role rename rewrites each grant and bumps each
+/// grantee's auth version; a grant this read missed would keep naming a role
+/// that no longer exists, and its holder would keep a token minted under the
+/// old name. There is no size at which it is acceptable to stop early.
 pub async fn list_by_role(ctx: &dyn Context, role: &str) -> Result<Vec<UserRoleRow>, WaferError> {
-    list_where(ctx, vec![eq("role", role)]).await
+    Ok(decode_rows(
+        db_read::list_every(ctx, TABLE, vec![eq("role", role)]).await?,
+    ))
 }
 
 /// The grant with `id`, if any.
@@ -180,7 +225,12 @@ pub async fn assign(
     role: &str,
     assigned_by: &str,
 ) -> Result<Assigned, WaferError> {
-    let existing = list_where(ctx, vec![eq("user_id", user_id), eq("role", role)]).await?;
+    let existing = list_for_principals(
+        ctx,
+        vec![eq("user_id", user_id), eq("role", role)],
+        Bound::OnePer("grant of one role to one user"),
+    )
+    .await?;
     if !existing.is_empty() {
         return Ok(Assigned::AlreadyAssigned);
     }
@@ -313,7 +363,74 @@ mod tests {
         let renamed = list_by_role(&ctx, "editor-v2").await.expect("list");
         assert_eq!(renamed.len(), 1);
         assert_eq!(renamed[0].id, row.id);
-        assert_eq!(list_all(&ctx).await.expect("all").len(), 2);
+        assert_eq!(list_all(&ctx).await.expect("all").rows.len(), 2);
+    }
+
+    /// A role rename has to carry EVERY grant of that role, so the read
+    /// behind it is exhaustive rather than capped.
+    ///
+    /// A grant this read stopped short of would keep naming a role that no
+    /// longer exists, and its holder would keep a token minted under the old
+    /// name. The `db::list_all` assertion is the witness that the ceiling is
+    /// real at this table size — it is what the capped read this replaced
+    /// would have returned.
+    #[tokio::test]
+    async fn list_by_role_returns_every_grant_past_the_unpaged_ceiling() {
+        let ctx = TestContext::with_admin().await;
+        let past_the_ceiling = crate::db_read::UNPAGED_LIMIT + 1;
+        db::exec_raw(
+            &ctx,
+            "WITH RECURSIVE seq(n) AS ( \
+                 SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ? \
+             ) \
+             INSERT INTO impresspress__admin__user_roles \
+                 (id, user_id, role, assigned_by, assigned_at, created_at, updated_at) \
+             SELECT 'ur_' || printf('%06d', n), 'u_' || printf('%06d', n), 'editor', '', \
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' \
+             FROM seq",
+            &[json!(past_the_ceiling)],
+        )
+        .await
+        .expect("seed grants");
+
+        let editors = list_by_role(&ctx, "editor").await.expect("list");
+        assert_eq!(editors.len() as i64, past_the_ceiling);
+        let one_shot = crate::db_read::list_capped(&ctx, TABLE, vec![])
+            .await
+            .expect("one-shot read");
+        assert_eq!(one_shot.rows.len() as i64, crate::db_read::UNPAGED_LIMIT);
+        assert!(
+            one_shot.truncated,
+            "a one-shot read of this table stops one grant short, which is \
+             what the cascade used to act on"
+        );
+    }
+
+    /// The unfiltered listing is capped, and says so rather than presenting a
+    /// prefix as the whole grant list.
+    #[tokio::test]
+    async fn list_all_reports_that_it_is_a_prefix() {
+        let ctx = TestContext::with_admin().await;
+        let past_the_ceiling = crate::db_read::UNPAGED_LIMIT + 1;
+        db::exec_raw(
+            &ctx,
+            "WITH RECURSIVE seq(n) AS ( \
+                 SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ? \
+             ) \
+             INSERT INTO impresspress__admin__user_roles \
+                 (id, user_id, role, assigned_by, assigned_at, created_at, updated_at) \
+             SELECT 'ur_' || printf('%06d', n), 'u_' || printf('%06d', n), 'viewer', '', \
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' \
+             FROM seq",
+            &[json!(past_the_ceiling)],
+        )
+        .await
+        .expect("seed grants");
+
+        let listed = list_all(&ctx).await.expect("all");
+        assert!(listed.truncated);
+        assert_eq!(listed.rows.len() as i64, crate::db_read::UNPAGED_LIMIT);
+        assert_eq!(count_all(&ctx).await.expect("count"), past_the_ceiling);
     }
 
     #[tokio::test]
