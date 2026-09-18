@@ -298,8 +298,18 @@ impl SseFrameStream {
         let raw = self.buf[..sep].to_string();
         self.buf.drain(..=sep + 1);
         // Draining from the front moves everything after it, including the
-        // oversized frame this stream may be discarding.
-        self.drop_from = self.drop_from.saturating_sub(sep + 2);
+        // oversized frame this stream may be discarding. That frame always
+        // starts after this separator: `enforce_frame_cap` leaves no blank
+        // line inside the region being dropped, so the first one in the
+        // buffer is always ahead of `drop_from`.
+        if self.dropping_frame {
+            debug_assert!(
+                self.drop_from >= sep + 2,
+                "the dropped frame starts at {} but a separator was found at {sep}",
+                self.drop_from
+            );
+            self.drop_from = self.drop_from.saturating_sub(sep + 2);
+        }
         Some(parse_frame(&raw))
     }
 
@@ -545,12 +555,16 @@ mod tests {
     /// looking empty, and an empty line is exactly what ends a frame — so a
     /// single corrupt byte would split one frame into two and hand the
     /// decoder half a payload. Substituting the replacement character keeps
-    /// the line, and keeps the CR that preceded it from swallowing the LF
-    /// that follows (those are two line endings, not one).
+    /// the line, so the frame stays whole.
     #[test]
     fn an_invalid_byte_does_not_split_the_frame_it_lands_in() {
         let mut s = SseFrameStream::new();
-        let mut bytes = b"data: a\r".to_vec();
+        // The bad byte is the whole of its line, between two LFs: delete it
+        // and that line is empty, which ends the frame. This is the input that
+        // separates substitution from deletion — with a CR before the bad byte
+        // the two agree by accident, because a surviving pending CR would eat
+        // the LF after it and rejoin what deletion had split.
+        let mut bytes = b"data: a\n".to_vec();
         bytes.push(0xff);
         bytes.extend_from_slice(b"\ndata: b\n\n");
         assert!(s.feed(&bytes).invalid_utf8, "the loss is reported");
@@ -580,7 +594,10 @@ mod tests {
 
     /// The cap bounds one frame, not the buffer: frames the consumer has not
     /// drained yet are its to collect, and must not be discarded as though
-    /// they were one runaway frame.
+    /// they were one runaway frame. This guards the naive whole-buffer cap
+    /// rather than a bug that shipped — the implementation this replaced let
+    /// the same case through for a different reason (it skipped the cap
+    /// entirely whenever the buffer held any separator at all).
     #[test]
     fn undrained_complete_frames_do_not_trip_the_cap() {
         let mut s = SseFrameStream::new();
