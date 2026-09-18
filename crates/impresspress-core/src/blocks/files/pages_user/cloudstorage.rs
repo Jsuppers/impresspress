@@ -6,6 +6,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::files::repo,
+    db_read::CappedList,
     ui::{self, shell::Crumb, templates::list_page},
 };
 
@@ -124,9 +125,10 @@ pub fn render_shares_table(rows: &[ShareRow]) -> Markup {
 async fn list_shares_for_user(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Vec<ShareRow>, wafer_run::WaferError> {
-    let rows = repo::shares::list_all_for_user(ctx, user_id).await?;
-    Ok(rows.iter().map(ShareRow::from).collect())
+) -> Result<CappedList<ShareRow>, wafer_run::WaferError> {
+    Ok(repo::shares::list_all_for_user(ctx, user_id)
+        .await?
+        .map(|row| ShareRow::from(&row)))
 }
 
 /// GET `/b/cloudstorage/` — share list with quota card.
@@ -161,7 +163,10 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     };
 
     let shares_with_js = html! {
-        (render_shares_table(&shares))
+        @if shares.truncated {
+            p .text-muted .text-sm { "Showing the first " (shares.rows.len()) " share links." }
+        }
+        (render_shares_table(&shares.rows))
         (super::render_bootstrap_script("", ""))
     };
 

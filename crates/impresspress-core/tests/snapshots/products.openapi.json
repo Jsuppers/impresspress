@@ -6826,10 +6826,21 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "total_count": {
+                    "description": "How many seller accounts exist, which is not `sellers.len()` when the\nlisting is showing a prefix.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "truncated": {
+                    "description": "Whether more seller accounts exist than `sellers` lists.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
-                  "sellers"
+                  "sellers",
+                  "total_count",
+                  "truncated"
                 ],
                 "title": "SellerAccountList",
                 "type": "object"
@@ -6873,7 +6884,7 @@
                 "description": "Response body of `GET /b/products/api/admin/sellers/{id}`.",
                 "properties": {
                   "products": {
-                    "description": "Every product owned by the seller's user, in any publication state.",
+                    "description": "The seller's live catalog — products the seller's user owns that have\nnot been soft-deleted, in any publication state.",
                     "items": {
                       "description": "A product row as published to its owner and to administrators: every\ncolumn of the products table.",
                       "properties": {
@@ -7181,11 +7192,16 @@
                       "last_synced_at"
                     ],
                     "type": "object"
+                  },
+                  "truncated": {
+                    "description": "Whether the seller owns more live products than `products` lists.\n\nNothing caps a seller's catalog, so the listing is read up to a\nceiling; this is how a client tells a complete catalog from a prefix\nof one.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
                   "seller",
-                  "products"
+                  "products",
+                  "truncated"
                 ],
                 "title": "AdminSellerDetail",
                 "type": "object"

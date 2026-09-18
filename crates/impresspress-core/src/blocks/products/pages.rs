@@ -1,7 +1,5 @@
 //! SSR pages for the products block (admin + user views).
 
-use std::collections::HashMap;
-
 use maud::{html, Markup};
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
@@ -719,35 +717,34 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(sellers) => sellers,
         Err(error) => return crate::http::err_internal("Could not list sellers", error),
     };
-    let seller_products = match repo::products::list_all(
-        ctx,
-        vec![Filter {
-            field: "owner_kind".into(),
-            operator: FilterOp::Equal,
-            value: serde_json::json!("user"),
-        }],
-    )
-    .await
-    {
-        Ok(products) => products,
+    let seller_total = if sellers.truncated {
+        match repo::seller_accounts::count_all(ctx).await {
+            Ok(total) => total,
+            Err(error) => return crate::http::err_internal("Could not count sellers", error),
+        }
+    } else {
+        sellers.rows.len() as i64
+    };
+    // A GROUP BY, not a scan: the listing count beside each seller is derived
+    // from every seller product on the platform, and that table grows without
+    // bound.
+    let product_counts = match repo::products::live_counts_by_owner(ctx, "user").await {
+        Ok(counts) => counts,
+        Err(error) => return crate::http::err_internal("Could not count seller products", error),
+    };
+    // The queue's predicate goes into the query for the same reason. The
+    // total comes from a COUNT so the heading states how many listings are
+    // waiting even when the table below shows only the first of them.
+    let pending_total = match repo::products::count_pending_review(ctx).await {
+        Ok(total) => total,
+        Err(error) => {
+            return crate::http::err_internal("Could not count the moderation queue", error)
+        }
+    };
+    let pending = match repo::products::list_pending_review(ctx).await {
+        Ok(pending) => pending,
         Err(error) => return crate::http::err_internal("Could not list seller products", error),
     };
-    let mut product_counts = HashMap::<String, usize>::new();
-    for product in &seller_products {
-        *product_counts
-            .entry(product.str_field("owner_id").to_string())
-            .or_default() += 1;
-    }
-    // The stored spellings against the variants' own, not a decode: every
-    // products SSR page renders whatever a row holds, and one row outside the
-    // contract must not cost the administrator the whole page.
-    let pending: Vec<_> = seller_products
-        .iter()
-        .filter(|product| {
-            product.str_field("status") == commerce_wire(&ProductStatus::PendingReview)
-                && product.str_field("approval_status") == commerce_wire(&ApprovalStatus::Pending)
-        })
-        .collect();
     let selling_enabled = super::handlers::user_products_enabled(ctx).await;
 
     let content = html! {
@@ -766,19 +763,25 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
         section .products-section {
             div .products-section__head {
-                div { h2 { "Moderation queue" } p .text-muted .text-sm { (pending.len()) " listing(s) waiting for a decision." } }
+                div {
+                    h2 { "Moderation queue" }
+                    p .text-muted .text-sm {
+                        (pending_total) " listing(s) waiting for a decision."
+                        @if pending.truncated { " Showing the first " (pending.rows.len()) "." }
+                    }
+                }
             }
-            @if pending.is_empty() {
+            @if pending.rows.is_empty() {
                 (components::empty_state(icons::info(), "Queue clear", "No seller listings are waiting for review.", None))
             } @else {
-                @let row_hrefs: Vec<String> = pending.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
+                @let row_hrefs: Vec<String> = pending.rows.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
                 @let cols = [
                     components::TableCol { label: "Product", width: None },
                     components::TableCol { label: "Seller", width: None },
                     components::TableCol { label: "Submitted", width: None },
                     components::TableCol { label: "Status", width: None },
                 ];
-                @let rows: Vec<Vec<Markup>> = pending.iter().map(|product| vec![
+                @let rows: Vec<Vec<Markup>> = pending.rows.iter().map(|product| vec![
                     html! { span .font-medium { (product.str_field("name")) } },
                     html! { span .text-muted .text-sm { (product.str_field("owner_id")) } },
                     html! { span .text-muted .text-sm { (product.str_field("submitted_at").get(..10).unwrap_or("—")) } },
@@ -789,12 +792,18 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
         section .products-section {
             div .products-section__head {
-                div { h2 { "Seller accounts" } p .text-muted .text-sm { "Open a seller to review payment readiness and their products." } }
+                div {
+                    h2 { "Seller accounts" }
+                    p .text-muted .text-sm {
+                        "Open a seller to review payment readiness and their products."
+                        @if sellers.truncated { " Showing the first " (sellers.rows.len()) " of " (seller_total) "." }
+                    }
+                }
             }
-            @if sellers.is_empty() {
+            @if sellers.rows.is_empty() {
                 (components::empty_state(icons::link(), "No sellers yet", "Seller accounts appear here after a user starts Stripe onboarding.", None))
             } @else {
-                @let row_hrefs: Vec<String> = sellers.iter().map(|seller| format!("/b/products/admin/sellers/{}", seller.id)).collect();
+                @let row_hrefs: Vec<String> = sellers.rows.iter().map(|seller| format!("/b/products/admin/sellers/{}", seller.id)).collect();
                 @let cols = [
                     components::TableCol { label: "Seller", width: None },
                     components::TableCol { label: "Selling", width: None },
@@ -803,7 +812,7 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     components::TableCol { label: "Listings", width: None },
                     components::TableCol { label: "Needs action", width: None },
                 ];
-                @let rows: Vec<Vec<Markup>> = sellers.iter().map(|seller| vec![
+                @let rows: Vec<Vec<Markup>> = sellers.rows.iter().map(|seller| vec![
                     html! { span .font-medium { (&seller.user_id) } },
                     components::status_badge(&commerce_wire(&seller.status)),
                     components::status_badge(if seller.capabilities.charges_enabled { "enabled" } else { "disabled" }),
@@ -899,17 +908,20 @@ pub async fn admin_seller_detail(
         }
         section .products-section {
             h2 { "Owned products" }
-            @if products.is_empty() {
+            @if products.truncated {
+                p .text-muted .text-sm { "Showing the first " (products.rows.len()) " of this seller's live products." }
+            }
+            @if products.rows.is_empty() {
                 (components::empty_state(icons::package(), "No products", "This seller has not created any products.", None))
             } @else {
-                @let row_hrefs: Vec<String> = products.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
+                @let row_hrefs: Vec<String> = products.rows.iter().map(|product| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&product.id))).collect();
                 @let cols = [
                     components::TableCol { label: "Product", width: None },
                     components::TableCol { label: "Status", width: None },
                     components::TableCol { label: "Approval", width: None },
                     components::TableCol { label: "Updated", width: None },
                 ];
-                @let rows: Vec<Vec<Markup>> = products.iter().map(|product| vec![
+                @let rows: Vec<Vec<Markup>> = products.rows.iter().map(|product| vec![
                     html! { span .font-medium { (product.str_field("name")) } },
                     components::status_badge(product.str_field("status")),
                     components::status_badge(product.str_field("approval_status")),

@@ -895,7 +895,7 @@ mod config_tests {
         let rows = repo::settings::list_all(&ctx)
             .await
             .expect("list overrides");
-        assert!(rows.is_empty(), "the override row must be gone");
+        assert!(rows.rows.is_empty(), "the override row must be gone");
     }
 
     fn body(value: serde_json::Value) -> InputStream {
@@ -1024,7 +1024,7 @@ mod config_tests {
             .await
             .expect("list overrides");
         assert!(
-            rows.is_empty(),
+            rows.rows.is_empty(),
             "an acknowledgement must not have written an override"
         );
     }
@@ -1080,7 +1080,7 @@ mod config_tests {
                 .await
                 .expect("list overrides");
             assert!(
-                rows.is_empty(),
+                rows.rows.is_empty(),
                 "{value}: a refused request must not have written an override"
             );
         }
@@ -1133,7 +1133,7 @@ mod config_tests {
             .await
             .expect("list overrides");
         assert_eq!(
-            rows.len(),
+            rows.rows.len(),
             1,
             "the failed lookup must not have created a second override for t1"
         );
@@ -1218,6 +1218,7 @@ mod access_tests {
             repo::settings::list_all(&ctx)
                 .await
                 .expect("list overrides")
+                .rows
                 .is_empty(),
             "the refused request must not have written an override"
         );
@@ -1255,6 +1256,7 @@ mod access_tests {
             repo::settings::list_all(&ctx)
                 .await
                 .expect("list overrides")
+                .rows
                 .len(),
             1,
             "the refused delete must have left the override in place"

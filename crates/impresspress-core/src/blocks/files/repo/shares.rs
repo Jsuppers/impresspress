@@ -11,7 +11,10 @@ use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, WaferError};
 
 use super::Page;
-use crate::util::RecordExt;
+use crate::{
+    db_read::{self, CappedList},
+    util::RecordExt,
+};
 
 /// Public share-link table — one row per generated token.
 pub const TABLE: &str = "impresspress__files__cloud_shares";
@@ -196,13 +199,16 @@ pub async fn list_for_user(
     ))
 }
 
-/// ALL of `user_id`'s shares, newest first, unpaginated (the SSR shares
-/// page).
+/// `user_id`'s shares, newest first, for the SSR shares page — and whether
+/// there are more than the page lists.
+///
+/// A user can share every object they own, so the set grows with their
+/// storage; the page has to be able to say it is showing a prefix.
 pub async fn list_all_for_user(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Vec<ShareRow>, WaferError> {
-    let records = db::list_sorted(
+) -> Result<CappedList<ShareRow>, WaferError> {
+    let records = db_read::list_capped_sorted(
         ctx,
         TABLE,
         vec![Filter {
@@ -216,7 +222,7 @@ pub async fn list_all_for_user(
         }],
     )
     .await?;
-    Ok(records.iter().map(ShareRow::from_record).collect())
+    Ok(records.map(|record| ShareRow::from_record(&record)))
 }
 
 /// Newest shares across ALL users (admin listing).

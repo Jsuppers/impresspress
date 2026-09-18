@@ -734,10 +734,15 @@
                       "type": "string"
                     },
                     "type": "array"
+                  },
+                  "truncated": {
+                    "description": "Whether more buckets are visible to the caller than `buckets` names.\n\nBuckets are created self-service, so the admin view of this listing\ngrows with the deployment and is read up to a ceiling; this is how a\nclient tells a complete list from a prefix of one.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
-                  "buckets"
+                  "buckets",
+                  "truncated"
                 ],
                 "title": "BucketListResponse",
                 "type": "object"
@@ -822,10 +827,15 @@
                       "type": "string"
                     },
                     "type": "array"
+                  },
+                  "truncated": {
+                    "description": "Whether more buckets are visible to the caller than `buckets` names.\n\nBuckets are created self-service, so the admin view of this listing\ngrows with the deployment and is read up to a ceiling; this is how a\nclient tells a complete list from a prefix of one.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
-                  "buckets"
+                  "buckets",
+                  "truncated"
                 ],
                 "title": "BucketListResponse",
                 "type": "object"

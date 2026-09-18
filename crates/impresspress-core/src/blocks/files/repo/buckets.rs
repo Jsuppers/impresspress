@@ -12,7 +12,10 @@ use wafer_core::clients::database::{self as db, Record};
 use wafer_run::{context::Context, WaferError};
 
 use super::Page;
-use crate::util::RecordExt;
+use crate::{
+    db_read::{self, Bound, CappedList},
+    util::RecordExt,
+};
 
 /// Buckets table — user-created storage containers (one row per bucket).
 pub const TABLE: &str = "impresspress__files__buckets";
@@ -92,23 +95,33 @@ pub async fn find_owned(
         },
         created_by_filter(user_id),
     ];
-    let records = db::list_all(ctx, TABLE, filters).await?;
+    let records = db_read::list_bounded(
+        ctx,
+        TABLE,
+        filters,
+        Bound::UniqueKey("buckets.name is declared UNIQUE"),
+    )
+    .await?;
     Ok(records.first().map(BucketRow::from_record))
 }
 
 /// List bucket rows visible to `owner`: `Some(user_id)` restricts to that
 /// user's buckets (`created_by` filter), `None` returns every bucket (the
-/// admin view). Unsorted, unpaginated — mirrors the JSON API listing.
+/// admin view). Unsorted — mirrors the JSON API listing.
+///
+/// Capped, and it says so: buckets are created self-service, so the admin
+/// view (`owner = None`) lists a set that grows with the deployment.
 pub async fn list_visible(
     ctx: &dyn Context,
     owner: Option<&str>,
-) -> Result<Vec<BucketRow>, WaferError> {
+) -> Result<CappedList<BucketRow>, WaferError> {
     let filters = match owner {
         Some(user_id) => vec![created_by_filter(user_id)],
         None => Vec::new(),
     };
-    let records = db::list_all(ctx, TABLE, filters).await?;
-    Ok(records.iter().map(BucketRow::from_record).collect())
+    Ok(db_read::list_capped(ctx, TABLE, filters)
+        .await?
+        .map(|record| BucketRow::from_record(&record)))
 }
 
 /// List `user_id`'s buckets sorted by `name` ascending (the SSR bucket-list
@@ -116,8 +129,8 @@ pub async fn list_visible(
 pub async fn list_owned_sorted(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Vec<BucketRow>, WaferError> {
-    let records = db::list_sorted(
+) -> Result<CappedList<BucketRow>, WaferError> {
+    let records = db_read::list_capped_sorted(
         ctx,
         TABLE,
         vec![created_by_filter(user_id)],
@@ -127,7 +140,7 @@ pub async fn list_owned_sorted(
         }],
     )
     .await?;
-    Ok(records.iter().map(BucketRow::from_record).collect())
+    Ok(records.map(|record| BucketRow::from_record(&record)))
 }
 
 /// Most recently created buckets, newest first (admin listing).

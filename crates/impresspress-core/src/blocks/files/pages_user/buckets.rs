@@ -6,6 +6,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::files::repo,
+    db_read::CappedList,
     ui::{
         self,
         components::{button, BtnVariant, CtrlSize},
@@ -136,25 +137,30 @@ pub fn render_new_bucket_modal() -> Markup {
 pub async fn list_buckets_for_user(
     ctx: &dyn Context,
     user_id: &str,
-) -> Result<Vec<BucketRow>, wafer_run::WaferError> {
+) -> Result<CappedList<BucketRow>, wafer_run::WaferError> {
     use std::collections::HashMap;
 
     let owned = repo::buckets::list_owned_sorted(ctx, user_id).await?;
+    let truncated = owned.truncated;
 
     // Restrict the GROUP BY to the buckets this user owns so the count
     // matches the previous per-bucket count semantics exactly (which
     // counted all objects in the bucket regardless of `uploaded_by`).
-    let bucket_names: Vec<String> = owned.iter().map(|r| r.name.clone()).collect();
+    let bucket_names: Vec<String> = owned.rows.iter().map(|r| r.name.clone()).collect();
     let counts_by_bucket: HashMap<String, i64> =
         repo::objects::count_by_bucket(ctx, &bucket_names).await?;
 
-    Ok(owned
-        .iter()
-        .map(|row| {
-            let count = counts_by_bucket.get(&row.name).copied().unwrap_or(0);
-            BucketRow::from((row, count))
-        })
-        .collect())
+    Ok(CappedList {
+        truncated,
+        rows: owned
+            .rows
+            .iter()
+            .map(|row| {
+                let count = counts_by_bucket.get(&row.name).copied().unwrap_or(0);
+                BucketRow::from((row, count))
+            })
+            .collect(),
+    })
 }
 
 /// GET `/b/storage/` — bucket list for the calling user.
@@ -184,7 +190,10 @@ pub async fn bucket_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream 
     // shelled response without needing a new template parameter.
     let js_url = crate::blocks::files::assets::files_browser_js_url();
     let table_with_modal = html! {
-        (render_buckets_table(&rows))
+        @if rows.truncated {
+            p .text-muted .text-sm { "Showing the first " (rows.rows.len()) " buckets." }
+        }
+        (render_buckets_table(&rows.rows))
         (render_new_bucket_modal())
         script src=(js_url) defer {}
     };
@@ -462,9 +471,10 @@ mod outage_tests {
         let rows = list_buckets_for_user(&ctx, "admin_1")
             .await
             .expect("a healthy read succeeds");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.rows.len(), 2);
         assert_eq!(
-            rows.iter()
+            rows.rows
+                .iter()
                 .find(|r| r.name == "photos")
                 .expect("photos bucket")
                 .object_count,
