@@ -829,6 +829,13 @@ pub(crate) fn to_wire_filters(
 /// columns*, where accepting a float would silently truncate a real
 /// fractional value. This one is for aggregate output, where a float is the
 /// backend's chosen representation of an integer.
+///
+/// Gated on `block-products` because that block is its only caller: the
+/// commerce analytics is the one place in the crate that reads a `SUM` over a
+/// money column. The lean Cloudflare Worker builds without that block and
+/// lints dead code as an error, so the gate is the honest statement of who
+/// needs this rather than an `allow`.
+#[cfg(feature = "block-products")]
 pub(crate) fn aggregate_i64(record: &Record, alias: &str) -> Result<i64, wafer_run::WaferError> {
     let fault = |detail: &str| {
         wafer_run::WaferError::new(
