@@ -339,7 +339,7 @@
                               "type": "string"
                             },
                             "expires_at": {
-                              "description": "The end this share link records, as an RFC 3339 stamp.\n\n`None` is a SQL `NULL` or a stored empty string — one meaning, since\nthe column is nullable and every caller treated `\"\"` as unset. It is\nNOT \"never expires\": every share link has an end, and a row that\nrecords none cannot be shown to be live, so the public link refuses\nit. Creating a share cannot produce one — `NewShare` takes a\nnon-optional expiry — and migration 002 gave every historical row an\nend, so a `None` here is a row that reached the table some other\nway.",
+                              "description": "The end this share link records, as an RFC 3339 stamp.\n\n`None` is a SQL `NULL` or a stored empty string — one meaning, since\nthe column is nullable and every caller treated `\"\"` as unset. It is\nNOT \"never expires\": every share link has an end, and a row that\nrecords none cannot be shown to be live, so the public link refuses\nit. Creating a share cannot produce one — `NewShare` takes a\nnon-optional expiry — and migration 003 gave every historical row an\nend, so a `None` here is a row that reached the table some other\nway.",
                               "type": [
                                 "string",
                                 "null"
@@ -544,7 +544,7 @@
                               "type": "string"
                             },
                             "expires_at": {
-                              "description": "The end this share link records, as an RFC 3339 stamp.\n\n`None` is a SQL `NULL` or a stored empty string — one meaning, since\nthe column is nullable and every caller treated `\"\"` as unset. It is\nNOT \"never expires\": every share link has an end, and a row that\nrecords none cannot be shown to be live, so the public link refuses\nit. Creating a share cannot produce one — `NewShare` takes a\nnon-optional expiry — and migration 002 gave every historical row an\nend, so a `None` here is a row that reached the table some other\nway.",
+                              "description": "The end this share link records, as an RFC 3339 stamp.\n\n`None` is a SQL `NULL` or a stored empty string — one meaning, since\nthe column is nullable and every caller treated `\"\"` as unset. It is\nNOT \"never expires\": every share link has an end, and a row that\nrecords none cannot be shown to be live, so the public link refuses\nit. Creating a share cannot produce one — `NewShare` takes a\nnon-optional expiry — and migration 003 gave every historical row an\nend, so a `None` here is a row that reached the table some other\nway.",
                               "type": [
                                 "string",
                                 "null"

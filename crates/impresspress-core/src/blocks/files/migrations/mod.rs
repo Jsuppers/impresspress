@@ -2,7 +2,7 @@
 //! [`crate::migration_helper::lifecycle_init`].
 
 const SQL_001_SQLITE: &str = include_str!("001_initial_schema.sqlite.sql");
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", test))]
 const SQL_001_POSTGRES: &str = include_str!("001_initial_schema.postgres.sql");
 // 002 makes `buckets.name` unique.
 //

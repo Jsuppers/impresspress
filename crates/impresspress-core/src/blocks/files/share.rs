@@ -80,7 +80,7 @@ pub async fn handle_direct_access(
     // ("Your link has expired" would be as false a reason as the "not
     // found" the lookup arm above no longer gives.) Nothing in this release
     // can write such a row — `NewShare::expires_at` is not optional and the
-    // legacy repair (migration 002) gave every historical row an end — but
+    // legacy repair (migration 003) gave every historical row an end — but
     // the column is nullable, so an import, a restore or a hand-written row
     // can still produce one, and this is what stops it being served.
     let Some(expires) = share.expires_at.as_deref() else {
@@ -323,7 +323,7 @@ mod tests {
     /// row was read, and its row carries no expiry of its own (the share
     /// modal's expiry never reached the handler). Reading that token as the
     /// opaque string it now is would make every such link permanently live,
-    /// so the block's `002_legacy_share_token_expiry` migration writes the
+    /// so the block's `003_legacy_share_token_expiry` migration writes the
     /// expiry the JWT used to impose. This drives the shipped migration —
     /// through `apply_migrations`, as an operator upgrading with
     /// `--run-migrations` does — and then the real handler.

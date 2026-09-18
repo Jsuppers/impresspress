@@ -1263,7 +1263,7 @@ export interface paths {
                                      *     NOT "never expires": every share link has an end, and a row that
                                      *     records none cannot be shown to be live, so the public link refuses
                                      *     it. Creating a share cannot produce one — `NewShare` takes a
-                                     *     non-optional expiry — and migration 002 gave every historical row an
+                                     *     non-optional expiry — and migration 003 gave every historical row an
                                      *     end, so a `None` here is a row that reached the table some other
                                      *     way.
                                      */
@@ -1422,7 +1422,7 @@ export interface paths {
                                      *     NOT "never expires": every share link has an end, and a row that
                                      *     records none cannot be shown to be live, so the public link refuses
                                      *     it. Creating a share cannot produce one — `NewShare` takes a
-                                     *     non-optional expiry — and migration 002 gave every historical row an
+                                     *     non-optional expiry — and migration 003 gave every historical row an
                                      *     end, so a `None` here is a row that reached the table some other
                                      *     way.
                                      */
