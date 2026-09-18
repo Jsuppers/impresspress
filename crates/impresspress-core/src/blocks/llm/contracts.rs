@@ -75,14 +75,17 @@ pub struct ChatResponse {
     /// The assistant's reply: every text delta the model produced,
     /// concatenated.
     pub content: String,
-    /// Id of the assistant entry persisted in the messages block. Empty when
-    /// persistence failed; the reply is still returned.
+    /// Id of the assistant entry persisted in the messages block. Always
+    /// populated: a reply the store refused is answered with a 500, not a
+    /// body (see `routes::chat::handle_chat`).
     pub message_id: String,
     /// The model the request was served by, after per-thread and default
     /// resolution.
     pub model: String,
-    /// `true` when the reply exceeded the 1 MiB buffering cap; `content`
-    /// then stops at the cap.
+    /// `true` when the reply exceeded the 1 MiB buffering cap. `content` is
+    /// then a prefix of the reply — it ends at the last delta that fitted and
+    /// nothing after it is appended, so the text is never spliced across a
+    /// gap.
     pub truncated: bool,
 }
 

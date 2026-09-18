@@ -23,7 +23,7 @@ use wafer_core::interfaces::llm::service::{
     ResponseFormat, TokenUsage, ToolCall, ToolDefinition,
 };
 
-use super::sse::{DecodeBatch, SseFrameStream};
+use super::sse::{DecodeBatch, FeedLoss, SseFrameStream};
 
 /// Serialize `req` into an OpenAI `/chat/completions` request body.
 ///
@@ -307,9 +307,13 @@ impl OpenAiSseDecoder {
     /// terminated (`[DONE]` seen). Tool-call `Complete` frames for any
     /// in-flight ids are emitted on terminal.
     pub fn push(&mut self, bytes: &[u8]) -> DecodeBatch {
-        if !self.frames.feed(bytes) {
-            tracing::warn!("openai sse: non-utf8 bytes — dropping");
-            return DecodeBatch::default();
+        let lost = self.frames.feed(bytes);
+        if lost.any() {
+            // The frames that did decode are still in the buffer, so drain
+            // them: they are the prefix of the answer that survived. `lost`
+            // travels with the batch so the consumer can end the stream
+            // instead of delivering a reply with a hole in it.
+            tracing::warn!(%lost, "openai sse: transport lost part of the stream");
         }
 
         let mut out = Vec::new();
@@ -324,7 +328,18 @@ impl OpenAiSseDecoder {
             }
         }
 
-        DecodeBatch { chunks: out, done }
+        DecodeBatch {
+            chunks: out,
+            done,
+            lost,
+        }
+    }
+
+    /// Bytes received that never became a frame — see
+    /// [`SseFrameStream::has_unparsed_input`]. A transport that ends while
+    /// this is true was cut mid-frame.
+    pub fn has_unparsed_input(&self) -> bool {
+        self.frames.has_unparsed_input()
     }
 
     /// Decode one already-de-framed `data:` payload — the body of a single SSE
@@ -347,12 +362,14 @@ impl OpenAiSseDecoder {
             return DecodeBatch {
                 chunks: self.close_open_tool_calls(),
                 done: true,
+                lost: FeedLoss::default(),
             };
         }
         match serde_json::from_str::<OpenAiStreamFrame>(data) {
             Ok(parsed) => DecodeBatch {
                 chunks: self.translate(parsed),
                 done: false,
+                lost: FeedLoss::default(),
             },
             Err(e) => {
                 tracing::warn!(error = %e, payload = %data, "openai sse: decode failed");
@@ -605,6 +622,108 @@ mod tests {
         ";
         let mut decoder = OpenAiSseDecoder::new();
         let batch = decoder.push(stream.as_bytes());
+        assert!(batch.done);
+    }
+
+    /// Concatenate every text delta the decoder produced.
+    fn text_of(chunks: &[ChatChunk]) -> String {
+        chunks
+            .iter()
+            .filter_map(|c| match &c.delta {
+                ChunkDelta::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Non-ASCII content streamed through the real decoder must survive the
+    /// network chunk boundary landing anywhere — including inside a character.
+    ///
+    /// A split code point makes both halves invalid on their own (incomplete
+    /// lead sequence, then bare continuation bytes), which cost two whole
+    /// transport chunks — several frames — and left a partial frame that
+    /// corrupted the JSON of the next one. Every byte offset is exercised
+    /// because reqwest chooses the boundary, not the provider.
+    #[test]
+    fn non_ascii_deltas_survive_a_split_at_every_byte_offset() {
+        let stream = "\
+            data: {\"choices\":[{\"delta\":{\"content\":\"héllo \"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"🙂 日本語\"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\" wörld\"}}]}\n\n\
+            data: [DONE]\n\n\
+        ";
+        let bytes = stream.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut decoder = OpenAiSseDecoder::new();
+            let mut chunks = decoder.push(&bytes[..split]).chunks;
+            chunks.extend(decoder.push(&bytes[split..]).chunks);
+            assert_eq!(
+                text_of(&chunks),
+                "héllo 🙂 日本語 wörld",
+                "content lost when the transport split at byte {split}"
+            );
+        }
+    }
+
+    /// The same stream delivered one byte at a time — the pathological case a
+    /// slow link produces — still decodes to the same text and terminates.
+    #[test]
+    fn non_ascii_deltas_survive_a_byte_at_a_time_stream() {
+        let stream = "\
+            data: {\"choices\":[{\"delta\":{\"content\":\"🙂\"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"é\"}}]}\n\n\
+            data: [DONE]\n\n\
+        ";
+        let mut decoder = OpenAiSseDecoder::new();
+        let mut chunks = Vec::new();
+        let mut done = false;
+        for b in stream.as_bytes() {
+            let batch = decoder.push(&[*b]);
+            chunks.extend(batch.chunks);
+            done |= batch.done;
+        }
+        assert_eq!(text_of(&chunks), "🙂é");
+        assert!(done, "[DONE] must still terminate the stream");
+    }
+
+    /// A loss travels on the batch, not just into a log line.
+    ///
+    /// The frames that survived are still decoded — they are the prefix of
+    /// the answer — but `lost` is what lets the consumer end the stream
+    /// instead of joining the text after the gap onto the text before it.
+    #[test]
+    fn an_oversized_frame_is_reported_on_the_batch_it_breaks() {
+        let mut decoder = OpenAiSseDecoder::new();
+        let first = decoder
+            .push("data: {\"choices\":[{\"delta\":{\"content\":\"before\"}}]}\n\n".as_bytes());
+        assert_eq!(text_of(&first.chunks), "before");
+        assert!(!first.lost.any(), "a complete frame is not a loss");
+
+        // An unterminated frame arriving in pieces, past the cap.
+        let mut reported = 0;
+        for _ in 0..20 {
+            let batch = decoder.push(&vec![b'z'; 64 * 1024]);
+            if batch.lost.frame_too_large {
+                reported += 1;
+            }
+        }
+        assert_eq!(
+            reported, 1,
+            "the loss is reported once, on the batch that lost it"
+        );
+    }
+
+    /// A provider that frames with CRLF — which SSE permits — must decode,
+    /// not accumulate bytes forever while emitting nothing.
+    #[test]
+    fn crlf_framed_stream_decodes() {
+        let stream = "\
+            data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n\
+            data: [DONE]\r\n\r\n\
+        ";
+        let mut decoder = OpenAiSseDecoder::new();
+        let batch = decoder.push(stream.as_bytes());
+        assert_eq!(text_of(&batch.chunks), "hi");
         assert!(batch.done);
     }
 

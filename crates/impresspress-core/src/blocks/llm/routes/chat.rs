@@ -251,9 +251,14 @@ pub(in crate::blocks::llm) async fn handle_chat(
         };
         match chunk.delta {
             ChunkDelta::Text(s) => {
-                if content.len() + s.len() > MAX_BUFFERED_RESPONSE_BYTES {
-                    // Stop appending but keep draining so the stream can
-                    // close cleanly and any usage frame still flows through.
+                if truncated || content.len() + s.len() > MAX_BUFFERED_RESPONSE_BYTES {
+                    // Stop appending — for good, not just for this delta — but
+                    // keep draining so the stream can close cleanly and any
+                    // usage frame still flows through. Resuming on the next
+                    // delta that happens to fit would splice the tail of the
+                    // answer onto its head with the middle missing, which
+                    // reads as a complete (and wrong) reply rather than a
+                    // truncated one.
                     truncated = true;
                     continue;
                 }
@@ -395,9 +400,26 @@ mod tests {
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        use std::sync::Arc;
-
         use wafer_core::clients::llm::FinishReason;
+
+        chat_fixture_answering(vec![
+            ChatChunk::text("Hel"),
+            ChatChunk::text("lo"),
+            ChatChunk::finish(FinishReason::Stop, None),
+        ])
+        .await
+    }
+
+    /// [`chat_fixture`] with the stub provider's answer scripted by the
+    /// caller, for the tests that care what the deltas look like.
+    async fn chat_fixture_answering(
+        chat_chunks: Vec<ChatChunk>,
+    ) -> (
+        crate::test_support::TestContext,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::Arc;
 
         use crate::blocks::llm::{
             routes::test_support::StubLlmServiceBlock, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
@@ -411,11 +433,7 @@ mod tests {
         ctx.register_block(
             "wafer-run/llm",
             Arc::new(StubLlmServiceBlock {
-                chat_chunks: vec![
-                    ChatChunk::text("Hel"),
-                    ChatChunk::text("lo"),
-                    ChatChunk::finish(FinishReason::Stop, None),
-                ],
+                chat_chunks,
                 chat_calls: chat_calls.clone(),
                 ..Default::default()
             }),
@@ -444,6 +462,48 @@ mod tests {
             }))
             .expect("body"),
         )
+    }
+
+    /// Once the reply passes the buffering cap, nothing after it is kept.
+    ///
+    /// The check was per delta, so a delta that overflowed was skipped and the
+    /// *next, smaller* one was appended again — the stored and returned
+    /// `content` then joined the head of the answer to a later fragment with
+    /// the middle missing, and read as a complete reply. What is published
+    /// must be a prefix of what the model said.
+    #[tokio::test]
+    async fn text_after_the_cap_is_never_spliced_back_on() {
+        // Fits; then a delta that overflows; then one small enough to fit in
+        // the room the overflowing delta did not use.
+        let head = "a".repeat(MAX_BUFFERED_RESPONSE_BYTES - 10);
+        let (ctx, thread_id, _chat_calls) = chat_fixture_answering(vec![
+            ChatChunk::text(head.clone()),
+            ChatChunk::text("B".repeat(100)),
+            ChatChunk::text("tail"),
+        ])
+        .await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        let content = body["content"].as_str().expect("content is a string");
+        assert_eq!(
+            content, head,
+            "content must stop at the last delta that fitted"
+        );
+        assert!(
+            !content.contains("tail"),
+            "a delta after the cap must not be spliced onto the prefix"
+        );
+        assert_eq!(body["truncated"], true, "and the reply says it is partial");
     }
 
     /// A user turn the store refused must not be followed by a model call.
