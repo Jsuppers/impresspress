@@ -63,12 +63,14 @@ async fn send_sse_content_type(sink: &OutputSink) {
 /// client that refetches history on `[DONE]` sees the new message).
 ///
 /// Accumulation mirrors `handle_chat`: text deltas are concatenated up to
-/// [`MAX_BUFFERED_RESPONSE_BYTES`] (an overflowing delta stops accumulation
-/// with a warning at end-of-stream, while frames keep flowing to the
-/// client), and tool-call/empty deltas are forwarded but not accumulated. A
-/// service error or encode failure terminates the stream with an error frame
-/// and skips persistence — the same outcome as `handle_chat`, which returns
-/// a 500 without persisting when the stream errors.
+/// [`MAX_BUFFERED_RESPONSE_BYTES`] (the first overflowing delta ends
+/// accumulation for the rest of the stream, with a warning at end-of-stream,
+/// while frames keep flowing to the client), so what is stored is a prefix of
+/// the answer rather than one with a hole in it; tool-call/empty deltas are
+/// forwarded but not accumulated. A service error or encode failure
+/// terminates the stream with an error frame and skips persistence — the same
+/// outcome as `handle_chat`, which returns a 500 without persisting when the
+/// stream errors.
 ///
 /// Generic over the chunk stream (rather than taking
 /// [`NativeTypedFrameStream`]`<ChatChunk>` directly, whose constructor is
@@ -99,10 +101,13 @@ where
                 return;
             };
             if let ChunkDelta::Text(s) = &chunk.delta {
-                if content.len() + s.len() > MAX_BUFFERED_RESPONSE_BYTES {
-                    // Stop accumulating (same skip-the-delta semantics as
-                    // `handle_chat`) but keep forwarding frames — the client
-                    // still receives the full stream.
+                if truncated || content.len() + s.len() > MAX_BUFFERED_RESPONSE_BYTES {
+                    // Stop accumulating for the rest of the stream (same
+                    // stop-for-good semantics as `handle_chat`) but keep
+                    // forwarding frames — the client still receives the full
+                    // stream. Accepting a later delta that happens to fit
+                    // would store the end of the answer joined to its
+                    // beginning with the middle missing.
                     truncated = true;
                 } else {
                     content.push_str(s);
@@ -323,6 +328,53 @@ mod tests {
         assert!(
             !body.contains("[DONE]"),
             "[DONE] is what a client refetches history on, got: {body}"
+        );
+    }
+
+    /// The persisted turn is a prefix of the answer, never a splice.
+    ///
+    /// The cap was checked per delta, so an overflowing delta was skipped and
+    /// a later, smaller one was appended anyway — the stored message then read
+    /// as a complete answer whose middle was missing. The client still sees
+    /// every frame; it is the stored text that must not lie.
+    #[tokio::test]
+    async fn sse_chat_response_stops_persisting_after_the_first_overflow() {
+        let ctx = RecordingCtx::default();
+        let msg = Message::new("create:/b/llm/api/chat/stream");
+        let head = "a".repeat(MAX_BUFFERED_RESPONSE_BYTES - 10);
+        let chunks: Vec<Result<ChatChunk, wafer_run::WaferError>> = vec![
+            Ok(ChatChunk::text(head.clone())),
+            // Overflows the remaining 10 bytes...
+            Ok(ChatChunk::text("B".repeat(100))),
+            // ...and this one would still fit, which is the bug.
+            Ok(ChatChunk::text("tail")),
+        ];
+
+        let out = sse_chat_response(
+            futures::stream::iter(chunks),
+            ctx.clone_arc(),
+            msg,
+            "thread-1".to_string(),
+        );
+        let buf = out.collect_buffered().await.expect("stream completes");
+        let body = String::from_utf8(buf.body).expect("SSE body is utf8");
+        assert!(
+            body.contains("tail"),
+            "every frame is still forwarded to the client"
+        );
+
+        let calls = ctx.calls();
+        assert_eq!(calls.len(), 1, "exactly one persistence call");
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&calls[0].body).expect("persistence body is JSON");
+        let content = body_json["content"].as_str().expect("content is a string");
+        assert_eq!(
+            content, head,
+            "the stored turn stops at the last delta that fitted"
+        );
+        assert!(
+            !content.contains("tail"),
+            "a delta after the cap must not be spliced onto the prefix"
         );
     }
 
