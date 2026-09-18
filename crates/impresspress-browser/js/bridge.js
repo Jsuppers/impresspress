@@ -902,7 +902,13 @@ globalThis.__impresspressCompleteEmbedMessage = _completeEmbedMessage;
  * @returns {Promise<string>}
  */
 export async function readCookieHeader() {
-    if (typeof self.cookieStore === 'undefined' || !self.cookieStore.getAll) {
+    // `typeof self` first: `self` is a worker/window global, and a bare
+    // reference to it throws ReferenceError wherever there is none — a plain
+    // Node host, or any main-thread caller. The Rust side already treats
+    // "no worker global" as a normal case (see `convert::worker_location`),
+    // and the answer is the same one a worker with no CookieStore gets: no
+    // cookies.
+    if (typeof self === 'undefined' || typeof self.cookieStore === 'undefined' || !self.cookieStore.getAll) {
         return '';
     }
     try {
