@@ -208,16 +208,19 @@ pub(crate) async fn live_counts_by_owner(
         sort: vec![],
         limit: 0,
     };
-    Ok(db::aggregate(ctx, req)
+    db::aggregate(ctx, req)
         .await?
         .iter()
         .map(|row| {
-            (
+            Ok((
                 row.str_field("owner_id").to_string(),
-                row.i64_field("products"),
-            )
+                // Through `aggregate_i64`, like every other aggregate read in
+                // this block: a backend is entitled to hand an aggregate back
+                // as a JSON float, and `i64_field` reads one as 0.
+                crate::util::aggregate_i64(row, "products")?,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 /// `owner_kind = 'user' AND status = pending_review AND approval_status =

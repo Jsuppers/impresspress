@@ -1879,6 +1879,100 @@ impl Context for FailingDbOpContext {
     }
 }
 
+/// Wraps a [`Context`] and re-decodes every `database.aggregate` result the
+/// way `wafer-block-postgres` does: whole numbers come back as JSON floats.
+///
+/// This is not a hypothetical shape. PostgreSQL's `sum(bigint)` is `NUMERIC`,
+/// and `wafer-block-postgres` decodes `NUMERIC` through `BigDecimal` into
+/// `f64`, so a money column declared `BIGINT` — which every one of them is in
+/// the products block's `.postgres.sql` schema — arrives as `1000.0` rather
+/// than `1000`. `serde_json::Value::as_i64` refuses that outright, so a
+/// caller reading a sum with `i64_field` reports `0` on PostgreSQL and the
+/// right figure on SQLite.
+///
+/// The `Tests (postgres feature)` CI job cannot see this: the `postgres`
+/// feature is a pure cfg flag and that job runs no server. The real-server
+/// job (`PostgreSQL migrations`) pins the premise — that `sum` of a money
+/// column really is `NUMERIC` there — in SQL; this wrapper is what lets a
+/// Rust test drive the real analytics code against the shape that produces.
+#[derive(Clone)]
+pub struct FloatAggregateContext {
+    inner: Arc<dyn Context>,
+}
+
+impl FloatAggregateContext {
+    /// Wrap `inner`. Every op but `database.aggregate` passes through
+    /// untouched.
+    pub fn new(inner: impl Context + 'static) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Context for FloatAggregateContext {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+        let rewrites = name == "wafer-run/database" && msg.action() == "database.aggregate";
+        if !rewrites {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let out = self.inner.call_block(name, msg, input).await;
+        let buf = match out.collect_buffered().await {
+            Ok(buf) => buf,
+            Err(TerminalNotResponse::Error(e)) => return OutputStream::error(e),
+            Err(other) => {
+                return OutputStream::error(WaferError::new(
+                    ErrorCode::Internal,
+                    format!("float-aggregate wrapper saw a non-response terminal: {other:?}"),
+                ))
+            }
+        };
+        let mut records: Vec<wafer_block::wire::database::Record> =
+            match wafer_block::codec::decode(&buf.body) {
+                Ok(records) => records,
+                Err(e) => return OutputStream::error(e),
+            };
+        for record in &mut records {
+            for value in record.data.values_mut() {
+                if let Some(whole) = value.as_i64() {
+                    *value = serde_json::json!(whole as f64);
+                }
+            }
+        }
+        match wafer_block::codec::encode(&records) {
+            Ok(bytes) => OutputStream::respond(bytes),
+            Err(e) => OutputStream::error(e),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
 /// Wraps a [`TestContext`] and strips the COLUMNS off every record a
 /// `database.create` or `database.update` answers with, leaving the
 /// `{id, data}` envelope's `data` empty. The write still lands in the real

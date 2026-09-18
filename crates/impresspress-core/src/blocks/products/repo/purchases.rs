@@ -1649,13 +1649,24 @@ fn negative_rows(field: &str) -> Vec<wafer_block::wire::database::FilterNode> {
     }])
 }
 
+/// Read an aggregate column as a signed minor-unit amount.
+///
+/// Every aggregate output here goes through [`crate::util::aggregate_i64`]
+/// rather than `i64_field`: PostgreSQL's `sum(bigint)` is `NUMERIC` and
+/// reaches this crate as a JSON float, which `i64_field` reads as `0`. Every
+/// money column in this block's PostgreSQL schema is `BIGINT`, so every money
+/// figure on the dashboard is one of those.
+fn analytics_amount(record: &Record, alias: &str) -> Result<i128, WaferError> {
+    Ok(i128::from(crate::util::aggregate_i64(record, alias)?))
+}
+
 /// Read an aggregate column as a non-negative count.
 ///
-/// A `COUNT(*)` or a conditional count cannot be negative; if one comes back
-/// negative the aggregate itself is broken, and clamping would hide that
-/// behind a plausible figure.
+/// A `COUNT(*)`, a conditional count or a summed quantity cannot be negative;
+/// if one comes back negative the aggregate itself is broken, and clamping
+/// would hide that behind a plausible figure.
 fn analytics_count(record: &Record, alias: &str) -> Result<u128, WaferError> {
-    let value = record.i64_field(alias);
+    let value = crate::util::aggregate_i64(record, alias)?;
     u128::try_from(value).map_err(|_| {
         WaferError::new(
             wafer_run::ErrorCode::Internal,
@@ -1868,6 +1879,13 @@ async fn line_item_totals(
 /// platform with no symptom at all. The per-row integrity checks the scan
 /// used to make survive as conditional counts: a group reporting even one
 /// negative amount still fails the whole read.
+///
+/// The totals are three statements whatever the table size. The top-products
+/// half is not: it walks the paid orders a keyset page at a time and issues
+/// one aggregate per 200 ids, so its round-trip count grows with the order
+/// book. On Cloudflare that meets D1's per-request subrequest budget at
+/// roughly a hundred thousand paid orders — the price of being exact without
+/// a join, and the reason the upstream note on `line_item_totals` exists.
 pub(crate) async fn commerce_analytics(
     ctx: &dyn Context,
     seller_account_id: Option<&str>,
@@ -1913,9 +1931,9 @@ pub(crate) async fn commerce_analytics(
                 ));
             }
             aggregate.paid_order_count += orders;
-            aggregate.gross_volume_minor += i128::from(group.i64_field("gross"));
-            aggregate.refunded_volume_minor += i128::from(group.i64_field("refunded"));
-            aggregate.platform_fees_minor += i128::from(group.i64_field("fees"));
+            aggregate.gross_volume_minor += analytics_amount(&group, "gross")?;
+            aggregate.refunded_volume_minor += analytics_amount(&group, "refunded")?;
+            aggregate.platform_fees_minor += analytics_amount(&group, "fees")?;
             aggregate.refunded_order_count += analytics_count(&group, "refunded_orders")?;
         } else if status == OrderStatus::Failed {
             aggregate.failed_order_count += orders;
@@ -1976,7 +1994,7 @@ pub(crate) async fn commerce_analytics(
             ));
         }
         let disputes = analytics_count(&group, "disputes")?;
-        let amount = i128::from(group.i64_field("amount"));
+        let amount = analytics_amount(&group, "amount")?;
         let aggregate = by_currency.get_mut(&currency).ok_or_else(|| {
             WaferError::new(
                 wafer_run::ErrorCode::Internal,
@@ -2029,7 +2047,7 @@ pub(crate) async fn commerce_analytics(
                 );
                 let product = aggregate.top_products.entry(key).or_default();
                 product.0 += analytics_count(&line, "quantity")?;
-                product.1 += i128::from(line.i64_field("revenue"));
+                product.1 += analytics_amount(&line, "revenue")?;
             }
         }
     }
