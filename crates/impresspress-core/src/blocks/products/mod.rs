@@ -34,7 +34,8 @@ mod tests;
 // build warning-free.
 #[cfg(feature = "block-dev")]
 pub(crate) use repo::products::{
-    list_all as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot, TABLE,
+    list_every_live as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot,
+    TABLE,
 };
 // `stripe_events` has two non-production readers and no production one, so
 // its re-export carries both of their cfgs rather than claiming the name is
