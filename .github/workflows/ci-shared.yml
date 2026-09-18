@@ -385,11 +385,21 @@ jobs:
       - name: Check impresspress-browser + minimal-browser (wasm32)
         run: cargo check --locked -p impresspress-browser -p minimal-browser --target wasm32-unknown-unknown
 
-      # Compile the browser adapter's shared DatabaseService conformance
-      # assertion (wafer-run #319). It lives in a `#[cfg(all(test,
-      # target_arch = "wasm32"))]` module, so `--tests` is required to pull the
-      # wasm32 dev-dep `conformance` feature and typecheck it — the plain check
-      # above (no `--tests`) does not compile it. Unconditional on purpose. On
+      # Lint the browser adapter's wasm32-only test modules, and with them
+      # compile its shared DatabaseService conformance assertion (wafer-run
+      # #319). Both live in `#[cfg(all(test, target_arch = "wasm32"))]`
+      # modules, so `--tests` is required to pull the wasm32 dev-dep
+      # `conformance` feature and typecheck them — the plain check above (no
+      # `--tests`) does not compile them.
+      #
+      # `clippy -D warnings` rather than `check`: this crate's test modules are
+      # RUN by the `browser-wasm-test` job below (`wasm-pack test --node`) and
+      # were LINTED by nothing. The host clippy job cannot reach them — the
+      # crate is wasm32-only — and the `cloudflare` job's own clippy step
+      # selects `-p impresspress-cloudflare`, so `--all-targets` there covers
+      # that crate's test code and not this one's. Same `--all-targets`
+      # reasoning as that step, narrowed to `--tests` because this crate has no
+      # other extra target. Unconditional on purpose. On
       # the pull-request side the dedicated `browser-wasm-test` job runs only
       # when its diff gate sees a change under crates/impresspress-browser/,
       # crates/impresspress-core/, `Cargo.toml` or `Cargo.lock`, so a change
@@ -400,8 +410,8 @@ jobs:
       # correct. Note a wafer-run pin bump specifically DOES reach that job, via
       # `Cargo.lock` — see the gate's own comment further down this file; this
       # step is the cheap unconditional typecheck, not the pin-bump backstop.
-      - name: Check impresspress-browser conformance wiring (wasm32)
-        run: cargo check --locked --tests -p impresspress-browser --target wasm32-unknown-unknown
+      - name: Clippy impresspress-browser tests + conformance wiring (wasm32)
+        run: cargo clippy --locked --tests -p impresspress-browser --target wasm32-unknown-unknown -- -D warnings
 
   # impresspress-browser's `#[wasm_bindgen_test]`s (storage.rs, bridge.rs,
   # network.rs — the wasm32-only-gated modules) previously only got

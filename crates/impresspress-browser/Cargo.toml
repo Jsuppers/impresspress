@@ -81,6 +81,11 @@ uuid = { version = "1", features = ["v4", "js"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+# `RequestInit` is test-only: the adapter reads the `Request` the Service
+# Worker hands it and never builds one. The request-side wasm tests do build
+# one (a real `web_sys::Request` driven through `request_to_message`), so the
+# feature is declared for the test build rather than the shipped one.
+web-sys = { version = "0.3", features = ["RequestInit"] }
 # Enable the shared, backend-agnostic `DatabaseService` conformance suite
 # (`wafer_core::interfaces::database::conformance::run_conformance`) for the
 # `database.rs` conformance-wiring test module. Same crate as the normal

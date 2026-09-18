@@ -1,18 +1,50 @@
 use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 
 use super::{contracts::QuotaUsageView, models::QuotaConfig, repo};
-use crate::http::{err_bad_request, err_internal};
+use crate::{
+    http::{err_bad_request, err_internal},
+    streaming::MAX_REQUEST_BODY_BYTES,
+};
 
-/// The user's effective quota: their override row when one exists,
-/// otherwise the block defaults. Only a missing row means "defaults" — any
-/// other lookup failure is returned, because treating an outage as "no
-/// override" would silently lift an admin-lowered cap.
+/// The user's effective quota: their override row when one exists, otherwise
+/// the block defaults. Only a missing row means "defaults" — any other lookup
+/// failure is returned, because treating an outage as "no override" would
+/// silently lift an admin-lowered cap.
+///
+/// Either way the per-file cap is one an upload can reach:
+/// [`repo::quota::QuotaRow::from_record`] clamps a stored row, and
+/// [`QuotaConfig::effective_default`] is the clamped form of the defaults.
 pub async fn get_user_quota(ctx: &dyn Context, user_id: &str) -> Result<QuotaConfig, WaferError> {
     match repo::quota::find_for_user(ctx, user_id).await {
         Ok(row) => Ok(row.config),
-        Err(e) if e.code == ErrorCode::NotFound => Ok(QuotaConfig::default()),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(QuotaConfig::effective_default()),
         Err(e) => Err(e),
     }
+}
+
+/// Lower `max_file_size_bytes` to [`MAX_REQUEST_BODY_BYTES`] when the stored
+/// policy asks for more than an upload can carry.
+///
+/// The stored cap — default 100 MiB, admin-editable per user — is a policy
+/// about stored objects; [`MAX_REQUEST_BODY_BYTES`] is the hard ceiling on a
+/// request body, enforced by the transport before this block is reached, and
+/// no transport streams a request body today. A stored cap above it is
+/// unreachable: the upload is refused with a 413 the block never sees, so the
+/// number the block reports and the number it enforces would describe
+/// different limits. Clamping makes the advertised cap the enforced one, and
+/// it happens where a stored row is decoded
+/// ([`repo::quota::QuotaRow::from_record`]) so that every reader agrees: the
+/// upload's own size check and its error message, [`check_quota`], the quota
+/// endpoint, the admin quotas table, and the row an admin update echoes back.
+///
+/// Only the per-file cap is clamped. `max_storage_bytes` and the file count
+/// are about accumulated objects, which no single request has to carry.
+pub fn clamp_to_transport(mut config: QuotaConfig) -> QuotaConfig {
+    let transport_ceiling = MAX_REQUEST_BODY_BYTES as i64;
+    if config.max_file_size_bytes > transport_ceiling {
+        config.max_file_size_bytes = transport_ceiling;
+    }
+    config
 }
 
 /// Total bytes used by `user_id`, computed as `SUM(size)` over the user's
@@ -154,10 +186,52 @@ mod tests {
         assert_eq!(quota.max_storage_bytes, 2048);
         // Fields without an explicit override keep the defaults. (The
         // migration declares DB-side column defaults, so a full row insert
-        // materializes them; either way the value matches the const.)
+        // materializes them; either way the value matches the const.) The
+        // per-file default is above the transport's request-body ceiling, so
+        // what comes back is the ceiling — see
+        // `the_per_file_cap_is_clamped_to_what_a_request_body_can_carry`.
         assert_eq!(
-            quota.max_file_size_bytes,
-            QuotaConfig::DEFAULT_MAX_FILE_SIZE_BYTES
+            quota.max_file_size_bytes, MAX_REQUEST_BODY_BYTES as i64,
+            "the default 100 MiB is clamped to the transport ceiling"
+        );
+    }
+
+    /// **Fails on the pre-fix tree.** The block advertised a 100 MiB per-file
+    /// cap that no request body could reach: every transport buffers the body
+    /// under `streaming::MAX_REQUEST_BODY_BYTES` and refuses anything larger
+    /// before this block runs. Reading the quota now yields the enforced
+    /// number, so the upload check, its error message and the admin table all
+    /// describe the same limit.
+    #[tokio::test]
+    async fn the_per_file_cap_is_clamped_to_what_a_request_body_can_carry() {
+        let ctx = TestContext::with_files().await;
+        let mut row: HashMap<String, serde_json::Value> = HashMap::new();
+        row.insert("user_id".into(), json!("u1"));
+        // An admin raising the cap cannot raise the transport's.
+        row.insert("max_file_size_bytes".into(), json!(500 * 1024 * 1024));
+        repo::quota::seed(&ctx, row).await.expect("seed quota");
+
+        let quota = get_user_quota(&ctx, "u1").await.expect("quota lookup");
+        assert_eq!(quota.max_file_size_bytes, MAX_REQUEST_BODY_BYTES as i64);
+    }
+
+    /// A cap BELOW the ceiling is policy and is left alone — clamping is a
+    /// ceiling, not a floor, and an admin-lowered limit still lowers.
+    #[tokio::test]
+    async fn a_cap_below_the_transport_ceiling_is_untouched() {
+        let ctx = TestContext::with_files().await;
+        let mut row: HashMap<String, serde_json::Value> = HashMap::new();
+        row.insert("user_id".into(), json!("u1"));
+        row.insert("max_file_size_bytes".into(), json!(4096));
+        repo::quota::seed(&ctx, row).await.expect("seed quota");
+
+        let quota = get_user_quota(&ctx, "u1").await.expect("quota lookup");
+        assert_eq!(quota.max_file_size_bytes, 4096);
+        // And the other caps are about accumulated storage, not one request,
+        // so the transport ceiling has nothing to say about them.
+        assert_eq!(
+            quota.max_storage_bytes,
+            QuotaConfig::DEFAULT_MAX_STORAGE_BYTES
         );
     }
 

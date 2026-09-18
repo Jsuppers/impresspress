@@ -9,7 +9,7 @@ use wafer_block::http_codec;
 use wafer_core::clients::config as config_client;
 use wafer_run::{
     context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockInfo, ErrorCode,
-    InputStream, Message, MetaEntry, OutputStream, WaferError, META_REQ_RESOURCE,
+    InputStream, Message, MetaEntry, OutputStream, WaferError,
 };
 
 use crate::{
@@ -142,7 +142,11 @@ fn visible_to_caller(
 /// after building a Message from the incoming HTTP request.
 ///
 /// Steps:
-/// 1. Strip `/api` prefix (CF convention — native doesn't use it)
+/// 1. Refuse a request whose body the transport would not carry
+///    ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]) with a 413 — before
+///    everything else, including the discovery/WebMCP early returns, because
+///    its body is already gone. In the site-main flow
+///    [`crate::blocks::body_limit`] has answered before this function runs.
 /// 2. Validate JWT and set auth meta
 /// 3. CSRF: enforce the Fetch-Metadata/Origin policy for cookie-authenticated
 ///    unsafe-method requests (see `crate::csrf`)
@@ -157,6 +161,98 @@ fn visible_to_caller(
 /// returned `OutputStream` as `StreamEvent::Error`. Request-log
 /// persistence failures are intentionally swallowed (best-effort) so a
 /// failing audit-log table never breaks the response.
+/// The 413 a request whose body exceeded
+/// [`crate::streaming::MAX_REQUEST_BODY_BYTES`] is answered with.
+///
+/// A **`Halt`** terminal, and each half of that is load-bearing.
+///
+/// *Halt, not a plain response*: a response terminal does not short-circuit a
+/// flow. The executor stores its body, applies its meta to the message and
+/// runs the next step, so a refusal built that way ahead of the router is
+/// followed by the router serving its own body over it — measured, not
+/// assumed: `an_oversized_body_to_an_unrouted_path_is_413_not_the_spa` caught
+/// exactly that, with the `wafer-run/web` fallback reached and its
+/// `index.html` served under a 413 status. `Halt` is the terminal that stops
+/// the flow *and* reaches the wire.
+///
+/// *Halt, not an `err_*` error*: this flow is `on_error: stop`, so an error
+/// terminal short-circuits by returning the error stream itself, carrying
+/// none of the message's meta. The `Access-Control-Allow-Origin` and the
+/// security headers that `wafer-run/cors` and `wafer-run/security-headers`
+/// set are on the *message*, so an error-terminal 413 would reach a
+/// cross-origin uploader with no CORS headers — a browser would report a CORS
+/// failure instead of the status, which is the opaque answer this change set
+/// out to remove.
+///
+/// Carrying `msg.meta` through the halt is what preserves those headers;
+/// `wafer-block-cors` does the same for its own preflight 204, for the same
+/// reason. Non-`resp.*` entries ride along inert —
+/// `http_codec::response_meta_parts` honours only the canonical response keys.
+///
+/// `oversized_body_flow.rs` pins all of it against the real executor, the real
+/// `site-main` flow and the real middleware blocks.
+///
+/// [`refuse_oversized_body`] is what callers want: this builds the answer,
+/// that one also records it.
+pub fn payload_too_large_response(msg: &Message) -> OutputStream {
+    let mut meta = msg.meta.clone();
+    let mut set = |key: &str, value: &str| {
+        meta.retain(|e: &MetaEntry| e.key != key);
+        meta.push(MetaEntry {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    };
+    set(wafer_run::META_RESP_STATUS, "413");
+    set("resp.content_type", "text/plain; charset=utf-8");
+
+    OutputStream::halt(
+        crate::streaming::request_too_large_message().into_bytes(),
+        meta,
+    )
+}
+
+/// Refuse a request whose body the transport would not carry: the 413 from
+/// [`payload_too_large_response`], plus the `request_logs` row any other
+/// refusal would have written.
+///
+/// Two callers, and they cannot both fire for one request:
+/// [`crate::blocks::body_limit::BodyLimitBlock`] is a flow step ahead of the
+/// router, so in the site-main flow it answers first and
+/// `impresspress/router` never runs; [`handle_request`]'s own check covers a
+/// consumer whose flow dispatches to the router without that step.
+///
+/// The row carries no user id when the block answers: it runs before JWT
+/// validation, and a refusal that never reached authentication has no
+/// authenticated caller to name. Everything else — method, path, client IP,
+/// the 413, the duration — is what a routed refusal records, and
+/// `block_infos` / `extra_routes` are what keep the path out of the
+/// `<unmatched>` collapse.
+pub async fn refuse_oversized_body(
+    ctx: &dyn Context,
+    msg: &Message,
+    block_infos: &[BlockInfo],
+    extra_routes: &[ExtraRoute],
+) -> OutputStream {
+    write_request_log(
+        ctx,
+        NewRequestLog {
+            method: msg.action(),
+            path: msg.path(),
+            status_label: "ERROR",
+            status_code: 413,
+            error_message: "",
+            duration_ms: 0,
+            client_ip: msg.remote_addr(),
+            user_id: msg.user_id(),
+        },
+        block_infos,
+        extra_routes,
+    )
+    .await;
+    payload_too_large_response(msg)
+}
+
 // This is the single request-pipeline entry point; each argument is a distinct
 // piece of request/runtime context and a param-struct refactor is out of scope
 // for a lint sweep (behavior-preserving cleanup only).
@@ -175,10 +271,21 @@ pub async fn handle_request(
     // 0. (Discovery documents moved below step 2 — they are filtered by the
     //    caller's tier, which is not known here.)
 
-    // 1. Strip /api prefix from resource path
-    let resource = msg.path().to_string();
-    if let Some(stripped) = resource.strip_prefix("/api") {
-        msg.set_meta(META_REQ_RESOURCE, stripped);
+    // 1. A body the transport refused to carry never becomes a block call.
+    //    The adapter marked the message and handed over an empty body, so
+    //    every route below would be answering a request whose body is gone —
+    //    including the four early returns further down, which would otherwise
+    //    serve a discovery document or the WebMCP asset as if nothing had
+    //    happened. First, therefore, and before authentication, which a
+    //    request with no body to act on does not need.
+    //
+    //    In the site-main flow this is unreachable: `impresspress/body-limit`
+    //    is a step ahead of the router and answers first, which is what
+    //    extends the refusal to the paths that never reach this function
+    //    (`wafer-run/web`'s `/**` fallback). This is the same refusal for a
+    //    consumer flow that routes here without that step.
+    if crate::streaming::body_too_large(&msg) {
+        return refuse_oversized_body(ctx, &msg, block_infos, extra_routes).await;
     }
 
     // 2. Validate JWT or API key and set auth meta
@@ -3508,5 +3615,143 @@ mod request_log_policy_tests {
             claim_request_log_budget(1_000 + REQUEST_LOG_WINDOW_MS),
             "a new window starts with a full budget",
         );
+    }
+}
+
+#[cfg(test)]
+mod oversized_body_tests {
+    //! What a body the transport refused to carry becomes.
+    //!
+    //! The adapter marks the message and hands over an empty body
+    //! ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]); everything after that
+    //! is here, on the real `handle_request`: the status, the shape of the
+    //! terminal (which is what decides whether the flow's CORS and security
+    //! headers survive — `tests/oversized_body_flow.rs` pins that half against
+    //! the real executor), and the audit row.
+
+    use wafer_run::streams::output::TerminalNotResponse;
+
+    use super::*;
+    use crate::{
+        features::AllEnabled,
+        platform_state::request_logs,
+        routing::{ExtraRoute, RouteAccess},
+        streaming::{BODY_TOO_LARGE_VALUE, META_REQ_BODY_TOO_LARGE},
+        test_support::{anon_msg, collect_or_panic, TestContext},
+    };
+
+    const UPLOAD_PATH: &str = "/b/storage/api/buckets/p/objects";
+
+    /// A route declaration covering [`UPLOAD_PATH`], so the audit row keeps the
+    /// path instead of collapsing to [`UNMATCHED_PATH_LABEL`] — this suite
+    /// passes no `block_infos`, and an upload path nothing declares is exactly
+    /// the traffic that collapse exists for.
+    fn upload_route() -> Vec<ExtraRoute> {
+        vec![ExtraRoute::new(
+            "/b/storage/",
+            "impresspress/files",
+            RouteAccess::Public,
+        )]
+    }
+
+    fn marked(path: &str) -> Message {
+        let mut msg = anon_msg("create", path);
+        msg.set_meta(META_REQ_BODY_TOO_LARGE, BODY_TOO_LARGE_VALUE);
+        msg
+    }
+
+    async fn drive(ctx: &TestContext, msg: Message) -> OutputStream {
+        set_request_log_mode(RequestLogMode::Inline);
+        handle_request(
+            ctx,
+            msg,
+            InputStream::empty(),
+            None,
+            "test-secret",
+            false,
+            &AllEnabled,
+            &[],
+            &upload_route(),
+        )
+        .await
+    }
+
+    /// **Fails on the pre-fix tree**, where the adapters answered an oversized
+    /// body themselves: Cloudflare returned a `worker::Error` that `run` turned
+    /// into a 500 with a correlation id, and the browser failed the fetch with
+    /// no status at all. It is a 413 naming the limit now.
+    #[tokio::test]
+    async fn a_marked_body_is_refused_with_413_and_the_enforced_limit() {
+        let ctx = TestContext::with_admin().await;
+        let buf = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
+
+        assert_eq!(http_codec::resolve_status(&buf.meta, 200), 413);
+        assert_eq!(
+            String::from_utf8(buf.body).unwrap(),
+            crate::streaming::request_too_large_message(),
+            "the client is told the number that was enforced"
+        );
+    }
+
+    /// The refusal is a `Halt` carrying the message's meta — not an error
+    /// terminal (which `on_error: stop` would short-circuit with none of the
+    /// flow's CORS or security headers) and not a plain response (which does
+    /// not short-circuit a flow at all, so a later step would serve its own
+    /// body over it). `tests/oversized_body_flow.rs` proves both consequences
+    /// against the real executor; this pins the terminal kind at the source.
+    #[tokio::test]
+    async fn the_refusal_is_a_halt_carrying_the_requests_meta() {
+        let ctx = TestContext::with_admin().await;
+        let mut msg = marked(UPLOAD_PATH);
+        msg.set_meta(
+            "resp.header.Access-Control-Allow-Origin",
+            "https://app.example",
+        );
+
+        match drive(&ctx, msg).await.collect_buffered().await {
+            Err(TerminalNotResponse::Halt(buf)) => {
+                assert_eq!(http_codec::resolve_status(&buf.meta, 200), 413);
+                assert!(
+                    buf.meta
+                        .iter()
+                        .any(|e| e.key == "resp.header.Access-Control-Allow-Origin"
+                            && e.value == "https://app.example"),
+                    "the halt must carry the middleware's headers: {:?}",
+                    buf.meta
+                );
+            }
+            other => panic!("expected a Halt terminal, got {other:?}"),
+        }
+    }
+
+    /// And it is audited like any other refusal — the adapters' own 413 wrote
+    /// no `request_logs` row at all, so an operator could not see that an
+    /// upload had been turned away.
+    #[tokio::test]
+    async fn the_refusal_is_logged_with_its_own_status() {
+        let ctx = TestContext::with_admin().await;
+        let _ = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
+
+        let rows = request_logs::paginated(&ctx, 1, 20, "")
+            .await
+            .expect("read request_logs")
+            .rows;
+        let row = rows
+            .iter()
+            .find(|r| r.path == UPLOAD_PATH)
+            .expect("the refused upload must be audited");
+        assert_eq!(row.status_code, 413);
+    }
+
+    /// An unmarked request is untouched — the check reads one meta key and
+    /// nothing else, so an ordinary upload cannot be refused by it.
+    #[tokio::test]
+    async fn an_unmarked_request_is_not_refused() {
+        let ctx = TestContext::with_admin().await;
+        let status = crate::test_support::output_http_status(
+            drive(&ctx, anon_msg("create", UPLOAD_PATH)).await,
+        )
+        .await;
+        assert_ne!(status, 413, "only the marker refuses");
     }
 }

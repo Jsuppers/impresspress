@@ -24,9 +24,14 @@ use crate::{
 };
 
 /// Collect an `InputStream` into `Vec<u8>` with a hard size cap. Errors out
-/// as soon as the running total exceeds `cap_bytes`, so a multi-GB body
-/// can't OOM the process before we check quota. Returns `Err(())` when
-/// the cap is exceeded.
+/// as soon as the running total exceeds `cap_bytes`, so the copy this makes is
+/// never larger than the cap. Returns `Err(())` when the cap is exceeded.
+///
+/// The transport-level ceiling on a request body is
+/// [`crate::streaming::MAX_REQUEST_BODY_BYTES`], enforced before dispatch;
+/// this cap is the caller's quota, which
+/// [`crate::blocks::files::quota::get_user_quota`] has already clamped to that
+/// ceiling.
 async fn collect_with_cap(
     mut input: wafer_run::InputStream,
     cap_bytes: i64,
@@ -181,16 +186,23 @@ pub(in crate::blocks::files) async fn handle_upload_object(
     // and lock them out. 1h cutoff.
     crate::blocks::files::quota::sweep_stale_pending(ctx, msg.user_id(), 3600).await;
 
-    // Stream the upload body chunk-by-chunk so an attacker who streams a
-    // multi-GB body can't OOM us before quota check fires. Two bounds:
+    // Read the upload body under the user's quota. Two bounds:
     //   - per-file `max_file_size_bytes` (cheap to check on the running
-    //     total; abort as soon as the chunked total exceeds it)
+    //     total; abort as soon as the collected total exceeds it)
     //   - total `max_storage_bytes` (depends on current usage; checked once
     //     after we know the body's full size)
-    // The chunked check uses the user's *file-size* cap as a hard ceiling
+    // The per-chunk check uses the user's *file-size* cap as a hard ceiling
     // since that's the smaller of the two. For multipart bodies the cap
     // applies to the envelope — a slight over-estimate (the extracted file
     // is always smaller than its envelope), never an under-estimate.
+    //
+    // This is not a streaming upload and it is not a defence against a
+    // multi-GB body: the transport has already read the whole request body
+    // into memory under `streaming::MAX_REQUEST_BODY_BYTES` (and refused
+    // anything larger with a 413), so the `InputStream` here replays bytes
+    // that are already resident. `get_user_quota` clamps the per-file cap to
+    // that same ceiling, so the size this refuses on is one an upload can
+    // actually reach.
     let quota = match crate::blocks::files::quota::get_user_quota(ctx, msg.user_id()).await {
         Ok(quota) => quota,
         // Fail closed: reading the body against the default cap during an
@@ -908,6 +920,43 @@ mod integration_tests {
         assert!(
             meta.iter().all(|e| e.value.is_ascii()),
             "every header value must be ASCII or the Workers runtime throws: {meta:?}"
+        );
+    }
+
+    /// **Fails on the pre-fix tree.** The stored per-file quota is 100 MiB and
+    /// no transport will carry a request body over
+    /// `streaming::MAX_REQUEST_BODY_BYTES` (10 MiB), so an upload between the
+    /// two was refused by the transport — as an opaque 500 with a correlation
+    /// id on Cloudflare — while this handler, and everything that reports the
+    /// limit, still described 100 MiB as allowed. `get_user_quota` now clamps
+    /// the per-file cap to the transport ceiling, so the size the block
+    /// refuses on and the size it advertises are the same number.
+    #[tokio::test]
+    async fn an_upload_over_the_transport_cap_is_refused_against_the_enforced_limit() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let body = vec![b'x'; crate::streaming::MAX_REQUEST_BODY_BYTES + 1];
+        let out = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "big.bin", "application/octet-stream"),
+            InputStream::from_bytes(body),
+        )
+        .await;
+
+        let rendered = crate::test_support::output_http_json(out).await;
+        assert_eq!(rendered["error"], serde_json::json!("InvalidArgument"));
+        assert_eq!(
+            rendered["message"],
+            serde_json::json!(format!(
+                "File exceeds maximum size of {} bytes",
+                crate::streaming::MAX_REQUEST_BODY_BYTES
+            )),
+            "the refusal must name the limit that is enforced, not the stored 100 MiB: {rendered}"
+        );
+        assert!(
+            store::get(&ctx, "assets", "big.bin").await.is_err(),
+            "nothing may be stored for a refused upload"
         );
     }
 

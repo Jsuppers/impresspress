@@ -46,25 +46,34 @@ impl QuotaRow {
     /// unparseable) column falls back to the block default. Reading them with
     /// a bare `as_i64()` used to silently replace an admin-lowered cap with
     /// the 1 GiB default.
+    ///
+    /// The decoded config is then put through
+    /// [`quota::clamp_to_transport`](crate::blocks::files::quota::clamp_to_transport),
+    /// so a stored per-file cap above the request-body ceiling is reported as
+    /// the ceiling by every reader of this row — the upload check, the quota
+    /// endpoint, the admin table, and the row an admin update echoes back.
+    /// Clamping in one reader and not another is what let an operator be told
+    /// 100 MB by the write and 10 MB by the table.
     pub fn from_record(rec: &Record) -> Self {
         let defaults = QuotaConfig::default();
+        let config = crate::blocks::files::quota::clamp_to_transport(QuotaConfig {
+            max_storage_bytes: rec
+                .opt_i64_field("max_storage_bytes")
+                .unwrap_or(defaults.max_storage_bytes),
+            max_file_size_bytes: rec
+                .opt_i64_field("max_file_size_bytes")
+                .unwrap_or(defaults.max_file_size_bytes),
+            max_files_per_bucket: rec
+                .opt_i64_field("max_files_per_bucket")
+                .unwrap_or(defaults.max_files_per_bucket),
+            reset_period_days: rec
+                .opt_i64_field("reset_period_days")
+                .unwrap_or(defaults.reset_period_days),
+        });
         Self {
             id: rec.id.clone(),
             user_id: rec.str_field("user_id").to_string(),
-            config: QuotaConfig {
-                max_storage_bytes: rec
-                    .opt_i64_field("max_storage_bytes")
-                    .unwrap_or(defaults.max_storage_bytes),
-                max_file_size_bytes: rec
-                    .opt_i64_field("max_file_size_bytes")
-                    .unwrap_or(defaults.max_file_size_bytes),
-                max_files_per_bucket: rec
-                    .opt_i64_field("max_files_per_bucket")
-                    .unwrap_or(defaults.max_files_per_bucket),
-                reset_period_days: rec
-                    .opt_i64_field("reset_period_days")
-                    .unwrap_or(defaults.reset_period_days),
-            },
+            config,
             created_at: rec.str_field("created_at").to_string(),
             updated_at: rec.str_field("updated_at").to_string(),
         }
@@ -208,12 +217,37 @@ mod tests {
         assert_eq!(row.config.max_file_size_bytes, 2048);
     }
 
+    /// A missing or unparseable column falls back to the block default — and
+    /// the decoded row is the *effective* quota, so the per-file default comes
+    /// back clamped to the transport's request-body ceiling. Asserting the raw
+    /// `QuotaConfig::default()` here would be asserting a cap no upload can
+    /// reach.
     #[test]
     fn from_record_defaults_missing_and_junk_fields() {
         let row = QuotaRow::from_record(&record_with(&[(
             "max_storage_bytes",
             json!("not-a-number"),
         )]));
-        assert_eq!(row.config, QuotaConfig::default());
+        assert_eq!(row.config, QuotaConfig::effective_default());
+        assert_eq!(
+            row.config.max_storage_bytes,
+            QuotaConfig::DEFAULT_MAX_STORAGE_BYTES
+        );
+    }
+
+    /// The clamp is applied where a row is decoded, so the number an admin
+    /// update echoes back is the number the upload check will enforce. Before
+    /// it moved here, the PATCH response said 100 MB while the table beside it
+    /// said 10 MB.
+    #[test]
+    fn a_stored_cap_above_the_transport_ceiling_decodes_as_the_ceiling() {
+        let row = QuotaRow::from_record(&record_with(&[(
+            "max_file_size_bytes",
+            json!(500 * 1024 * 1024),
+        )]));
+        assert_eq!(
+            row.config.max_file_size_bytes,
+            crate::streaming::MAX_REQUEST_BODY_BYTES as i64
+        );
     }
 }

@@ -16,6 +16,11 @@
 //!   …) is not one of the streaming families but which must still stream to
 //!   avoid buffering the whole object in the isolate.
 //!
+//! The transport byte caps live here too — response ([`MAX_BUFFERED_RESPONSE_BYTES`]),
+//! request ([`MAX_REQUEST_BODY_BYTES`]) and upstream fetch
+//! ([`MAX_NETWORK_RESPONSE_BYTES`]) — one declaration each, so an adapter and
+//! a block cannot enforce different numbers for the same limit.
+//!
 //! The buffered fallback ([`collect_capped_with_prelude`]) enforces a byte cap
 //! so a response that must be buffered (small SSR pages, JSON) cannot balloon
 //! the isolate — an over-limit body is reported as [`CappedCollect::OverLimit`]
@@ -87,6 +92,88 @@ pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 /// service construction; neither wasm adapter's unit-shaped service has config
 /// plumbing to read it from, and this is a security floor rather than a knob.
 pub const MAX_NETWORK_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Maximum **request** body the transport buffers before dispatch, in bytes.
+/// A larger body is refused with HTTP 413 and never reaches a block.
+///
+/// No transport streams request bodies: every one of the three reads the body
+/// whole before building the `(Message, InputStream)` pair. Both wasm adapters
+/// buffer it here — `impresspress-cloudflare`'s `worker_request_to_message`
+/// and `impresspress-browser`'s `request_to_message`, which is why this is a
+/// single constant rather than a literal in each — and the native listener
+/// buffers it in `wafer-block-http-listener` under its `max_body_bytes`
+/// config, whose default is this same 10 MiB — and
+/// `impresspress_native::serve::register_http_listener` configures that block
+/// with `flow` + `listen` only, so the default is what it runs. An
+/// `InputStream` carrying the request body therefore always holds bytes that
+/// are already in memory, whatever a consumer does with it.
+///
+/// It is the hard ceiling on an upload, so anything a block advertises as a
+/// per-request size limit has to be clamped to it — see
+/// [`crate::blocks::files::quota::clamp_to_transport`], which the files block's
+/// admin-editable per-file cap goes through.
+///
+/// # What the check does and does not buy
+///
+/// Only one of the three transports can refuse an oversized body *before* it
+/// is resident, and only conditionally: the Cloudflare adapter checks a
+/// declared `Content-Length` first and returns without reading the stream, so
+/// a well-formed oversized upload never enters the isolate. A chunked request
+/// (no length, or a lying one) is caught by the post-read check, by which time
+/// the bytes are already in the isolate — and the browser adapter reads the
+/// whole `ArrayBuffer` before it can measure it at all, so there the cap only
+/// changes the status, never the peak memory. It is a contract, not a memory
+/// guard.
+///
+/// # Why it is not simply larger
+///
+/// The body is held whole (128 MB on a Cloudflare Worker, one shared linear
+/// memory in the Service Worker), and a multipart upload holds the envelope
+/// and the extracted file at once. A genuinely larger upload needs a streamed
+/// request body, which `wafer_run::InputStream` cannot carry on wasm today —
+/// its `from_stream` requires `Send` and every JS-backed byte stream
+/// (`worker::ByteStream`, `wasm_streams`) is `!Send`.
+///
+/// # Cross-repo coupling
+///
+/// The native half of this number is not ours: `wafer-block-http-listener`
+/// owns `max_body_bytes` and its default, and that default is a **private**
+/// const in that crate, reachable only through the `ConfigVar` the block
+/// declares. If wafer-run raises it and this stays put, the clamp above would
+/// enforce *below* what native accepts.
+/// `impresspress-native/tests/transport_body_cap.rs` reads the block's own
+/// declared default and fails if the two part company.
+pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Meta key an adapter sets (value [`BODY_TOO_LARGE_VALUE`]) on a message
+/// whose request body exceeded [`MAX_REQUEST_BODY_BYTES`].
+///
+/// The adapter hands the runtime this marker and an **empty** body rather than
+/// building a 413 itself: a response built outside the flow carries neither
+/// the CORS and security headers `wafer-run/cors` and
+/// `wafer-run/security-headers` put on the message nor a `request_logs` row.
+///
+/// [`crate::blocks::body_limit`] — a flow step ahead of the router — turns the
+/// marker into that 413, so the refusal does not depend on which route the
+/// request would have matched. `pipeline::handle_request` checks it too, first
+/// thing, for a consumer flow that dispatches to the router without that step.
+pub const META_REQ_BODY_TOO_LARGE: &str = "req.body_too_large";
+
+/// The value [`META_REQ_BODY_TOO_LARGE`] carries.
+pub const BODY_TOO_LARGE_VALUE: &str = "1";
+
+/// True when an adapter marked this message's body as over
+/// [`MAX_REQUEST_BODY_BYTES`].
+pub fn body_too_large(msg: &wafer_run::Message) -> bool {
+    msg.get_meta(META_REQ_BODY_TOO_LARGE) == BODY_TOO_LARGE_VALUE
+}
+
+/// The plain-text body the 413 carries when a request body exceeds
+/// [`MAX_REQUEST_BODY_BYTES`]. Shared so the number a client is told is the
+/// number that was enforced.
+pub fn request_too_large_message() -> String {
+    format!("request body too large (limit {MAX_REQUEST_BODY_BYTES} bytes)")
+}
 
 /// True for content-types that should stream body chunks to the client as
 /// they're produced rather than buffer the entire response. Today: SSE and

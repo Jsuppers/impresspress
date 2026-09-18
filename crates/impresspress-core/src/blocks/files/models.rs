@@ -19,11 +19,33 @@ impl QuotaConfig {
     /// guards against drift on the in-code side.
     pub const DEFAULT_MAX_STORAGE_BYTES: i64 = 1_073_741_824;
     /// Default single-file size cap: 100 MiB.
+    ///
+    /// This is the stored policy, not what an upload can reach: the transport
+    /// refuses a request body over
+    /// [`crate::streaming::MAX_REQUEST_BODY_BYTES`] before this block sees it,
+    /// so every read of the quota clamps to that ceiling
+    /// ([`super::quota::clamp_to_transport`]). Raise the ceiling and this
+    /// default becomes reachable without changing here or the migration.
     pub const DEFAULT_MAX_FILE_SIZE_BYTES: i64 = 104_857_600;
     /// Default per-bucket file-count cap.
     pub const DEFAULT_MAX_FILES_PER_BUCKET: i64 = 10_000;
     /// Default reset period (0 = never).
     pub const DEFAULT_RESET_PERIOD_DAYS: i64 = 0;
+}
+
+impl QuotaConfig {
+    /// The block defaults as they are actually enforced: [`Default::default`]
+    /// with the per-file cap clamped to the transport's request-body ceiling
+    /// ([`super::quota::clamp_to_transport`]).
+    ///
+    /// Every path that produces defaults rather than decoding a stored row
+    /// goes through this — the quota lookup for a user with no override row,
+    /// and the admin table's empty state — so a fourth one cannot quietly
+    /// advertise the unreachable 100 MiB. A decoded row is clamped where it is
+    /// decoded ([`super::repo::quota::QuotaRow::from_record`]).
+    pub fn effective_default() -> Self {
+        super::quota::clamp_to_transport(Self::default())
+    }
 }
 
 impl Default for QuotaConfig {

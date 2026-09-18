@@ -134,6 +134,41 @@ whether or not you pass `--run-migrations`. Cloudflare and browser deployments
 are unaffected: neither seeds from a process environment, so neither has a tie
 to break, and the **Reset to environment** control does not render there.
 
+### Routing: the `/api` prefix is gone (Cloudflare deployments only)
+
+**What changes.** A Cloudflare deployment used to accept an `/api`-prefixed
+copy of every route: the Worker adapter stripped the prefix before dispatch, so
+`POST /api/b/storage/api/buckets/photos/objects` reached the same handler as
+`POST /b/storage/api/buckets/photos/objects`. That stripping is removed, and
+`/api/...` now falls through to the SPA like any other unclaimed path.
+
+**Why.** The prefix only ever worked on Cloudflare. The site-main flow's router
+matches the path as received — `/`, `/b/**`, `/health`, `/openapi.json`,
+`/.well-known/agent.json`, everything else to `wafer-run/web` — so on the
+native and browser transports an `/api/...` request was served the SPA, and the
+pipeline's own `/api` strip (which ran after routing) could never see one.
+Neither strip was segment-bounded either: `/apiary/hives` became `ary/hives` on
+every transport, and `/api/api/x` reached `/x` on Cloudflare and `/api/x`
+elsewhere. One transport honouring a prefix the others do not is a routing
+difference between deployments of the same app, which is worse than not having
+the prefix.
+
+**Who is affected.** Only a Cloudflare deployment with a client that calls
+`/api/...` by hand. Nothing in this repository or in the TypeScript SDK does —
+the SDK's README states there is no `/api/*` surface, and every block route
+already carries its own `/b/<block>/api/...` path, which is untouched.
+
+**What to do.** Drop the `/api` prefix from any such caller: `/api/b/x` →
+`/b/x`. There is no migration and no config toggle.
+
+Routing alone does not bring it back, either: adding `{ "path": "/api/**",
+"block": "impresspress/router" }` to the flow's routes hands the router a
+`req.resource` of `/api/b/x`, and `routing::route_to_block` matches prefixes
+like `/b/storage/` against that string, so every such request answers 404. A
+consumer who genuinely needs the prefix has to strip it before the router sees
+it — a flow step of their own ahead of `wafer-run/router` that rewrites
+`req.resource` — which is the piece this release removes.
+
 ### Files: bucket names are unique (migration 002) — upgrade with `--run-migrations`
 
 **What changes.** A storage bucket's name is also its folder name in the object

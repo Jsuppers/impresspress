@@ -2680,6 +2680,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenvy",
+ "impresspress-core",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
