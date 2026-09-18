@@ -172,7 +172,11 @@ impl VariablesConfigBlock {
     /// the two invalidate together.
     ///
     /// The generation is captured BEFORE the read: a write landing while the
-    /// query is in flight must not be masked by the snapshot it raced.
+    /// query is in flight must not be masked by the snapshot it raced. That is
+    /// also what makes two workers racing this on native safe. Each stores the
+    /// generation its own rows were read at, so the loser leaves behind a
+    /// snapshot tagged older than the store is — which costs the next reader a
+    /// re-query and can never hand it rows from before a write it should see.
     ///
     /// No lock is held across the `await` — the guard is dropped before the
     /// fetch and re-taken after — so a hard-stopped request cannot strand one.
@@ -271,24 +275,19 @@ impl VariablesConfigBlock {
         // deliberately covering more than this guard does because it cannot
         // read the flag this one reads.
         //
-        // KNOWN GAP, recorded rather than fixed: the parity stops at the
-        // create path. `variables::set`'s create branch builds its own
-        // `NewVariable` and so bypasses `VariablePatch::into_new`, which is
-        // where `is_sensitive_by_default_when_created` protects an undeclared,
-        // suffix-less ad hoc key. A `config.set` creating one therefore stores
-        // it unflagged where the admin PUT would flag it.
-        //
-        // Not reachable through THIS operation's only caller: every var
-        // `ui::settings_form` renders comes from a `ConfigVar` allowlist, and a
-        // declared key is settled by `into_row`. Note that "declared" has to
-        // mean what `config_vars::collect_all_config_vars` says it means —
+        // The parity covers the create path too: `variables::set`'s create
+        // branch builds its row through `VariablePatch::into_new`, so a
+        // `config.set` that creates an undeclared, suffix-less ad hoc key
+        // stores it flagged exactly as the admin PUT would — this operation is
+        // reachable by any block, and a key nothing declares is one nothing
+        // here can vouch for. Note that "declared" has to mean what
+        // `config_vars::collect_all_config_vars` says it means —
         // `auth_ui::pages::settings` renders
         // `auth::config::auth_identity_config_vars`, which belongs to no
         // `BlockInfo`, and an earlier version of that collector missed them and
-        // so called two ordinary admin toggles ad hoc. The gap is latent
-        // because of the allowlist, not because nothing undeclared can reach a
-        // settings form. The
-        // runtime-owned refusal below is deliberately NOT symmetric: this
+        // so called two ordinary admin toggles ad hoc.
+        //
+        // The runtime-owned refusal below is deliberately NOT symmetric: this
         // surface refuses the JWT secret (no caller legitimately writes it
         // here — `ui::settings_form` writes declared block and shared vars
         // only), while the admin variables API accepts it, because on native
@@ -393,7 +392,12 @@ impl VariablesConfigBlock {
         // `_SECRET` nor `_KEY` — land unflagged, after which the settings API
         // served it verbatim and `cache_key::row_is_sensitive` judged it
         // eligible for the edge cache.
-        let sensitive = existing.as_ref().is_some_and(|row| row.sensitive);
+        //
+        // An `Option`, and a missing row is `None` rather than `Some(false)`
+        // by construction: this surface can speak for a row it just read, and
+        // about a key with no row it knows nothing, which is exactly what the
+        // create default is for.
+        let sensitive = existing.as_ref().map(|row| row.sensitive);
         // Through `set_by_admin`, so the row is stamped admin-owned and
         // `seed_and_load` stops letting the process environment overwrite it.
         // This operation has exactly one caller in the tree —
@@ -422,12 +426,13 @@ impl VariablesConfigBlock {
                 format!("config.set could not write {key}: {e}"),
             )));
         }
-        // The generation bump lives in `variables::upsert_by_key`, not here.
-        // `PATCH /b/admin/api/settings/{key}` writes the table through
-        // `ops::update_variable` without ever entering this block, so a bump
-        // placed here would leave a warm snapshot stale for the life of the
-        // process on exactly the path the admin uses — see
-        // `an_admin_write_invalidates_an_already_warm_snapshot`.
+        // The generation bump lives in the `variables` repo, not here: in
+        // `set_with_row` for the write just issued, and in `upsert_by_key` for
+        // the one `PATCH /b/admin/api/settings/{key}` issues through
+        // `ops::update_variable` without ever entering this block. A bump
+        // placed here would cover only this surface and leave a warm snapshot
+        // stale for the life of the process on exactly the path the admin uses
+        // — see `an_admin_write_invalidates_an_already_warm_snapshot`.
         Ok(())
     }
 }
@@ -594,6 +599,91 @@ mod tests {
             second,
             "an admin write must invalidate a warm config snapshot, or the \
              change stays invisible for the life of the process"
+        );
+    }
+
+    /// The same requirement when the write and the read happen on DIFFERENT
+    /// threads, which is the only shape native ever serves.
+    ///
+    /// `impresspress`'s `#[tokio::main]` runtime is multi-threaded (tokio
+    /// "full") and the wafer-run http listener serves through `axum::serve`,
+    /// which drives a task per connection, so the worker that handles an
+    /// admin's `PATCH /b/admin/api/settings/{key}` is routinely not the worker
+    /// that renders the next page. This block is registered once and
+    /// its snapshot is shared by every one of them, so the generation the
+    /// snapshot is tagged with has to be shared too. While that counter was
+    /// `thread_local`, the write bumped only the writing thread: a reader on a
+    /// worker whose own counter still equalled the tag served the pre-write
+    /// value for the life of the process, and — since the tag is whichever
+    /// worker refilled the snapshot last — two workers that disagreed about
+    /// the count discarded and refetched each other's snapshot for as long as
+    /// reads kept alternating between them.
+    ///
+    /// Every other test here runs under `#[tokio::test]`, which is
+    /// current-thread — one thread both writes and reads — which is why a suite
+    /// this size never saw it.
+    ///
+    /// The reader runs in a spawned task, so it runs on a tokio WORKER thread;
+    /// the write below runs in the test body, which `block_on` polls on the
+    /// runtime's own thread. No worker can therefore have observed the write
+    /// thread-locally, whichever worker the reader resumes on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_write_on_another_worker_reaches_a_warm_snapshot() {
+        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+        let mut ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        ctx.boot_config_service().await;
+
+        let first = unique_config_value();
+        variables::upsert_by_key(
+            &ctx,
+            KEY,
+            VariablePatch {
+                value: Some(first.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the first value");
+
+        let (warmed_tx, warmed_rx) = tokio::sync::oneshot::channel();
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let reader_ctx = ctx.clone();
+        let first_expected = first.clone();
+        let reader = tokio::spawn(async move {
+            let warm = wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset").await;
+            assert_eq!(
+                warm, first_expected,
+                "precondition: this read fills the shared snapshot on a worker thread"
+            );
+            warmed_tx.send(()).expect("the test is waiting for this");
+            written_rx.await.expect("the admin write happens");
+            wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset").await
+        });
+        warmed_rx.await.expect("the reader warmed the snapshot");
+
+        let second = unique_config_value();
+        variables::upsert_by_key(
+            &ctx,
+            KEY,
+            VariablePatch {
+                value: Some(second.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the admin write lands in the table");
+        written_tx.send(()).expect("the reader is waiting for this");
+
+        assert_eq!(
+            reader.await.expect("the reader task finished"),
+            second,
+            "a config write on one thread must invalidate the snapshot every \
+             other thread reads, or native serves the pre-write value until it \
+             restarts"
         );
     }
 
@@ -846,6 +936,59 @@ mod boot_owned_key_tests {
                 .expect("the row is still there")
                 .value,
             crate::util::MASKED_VALUE,
+        );
+    }
+
+    /// A row this operation CREATES for a key nothing declares is stored
+    /// sensitive, exactly as `PATCH /b/admin/api/settings/{key}` would store
+    /// it.
+    ///
+    /// `CONFIG_SET` is reachable by any block through
+    /// `wafer_core::clients::config::set`, and about an undeclared,
+    /// suffix-less key the build knows nothing — so the create default has to
+    /// be the protective one on this surface too. It used to build its own
+    /// `NewVariable`, which raises the flag only from the declaration or the
+    /// `_SECRET`/`_KEY` spelling, so the same ad hoc key was masked when
+    /// created through the admin API and published when created here.
+    #[tokio::test]
+    async fn config_set_creating_an_undeclared_key_stores_it_sensitive() {
+        const KEY: &str = "WAFER_RUN_SHARED__MY_SERVICE_TOKEN";
+        let ctx = booted_with(&[]).await;
+
+        wafer_core::clients::config::set(&ctx, KEY, "ad-hoc-value")
+            .await
+            .expect("an undeclared key is storable config");
+
+        assert!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row was created")
+                .sensitive,
+            "a key no `ConfigVar` declares must be created flagged: nothing here \
+             knows what it holds, and the admin PUT already protects it"
+        );
+    }
+
+    /// …and the default does not spill onto a key the build DOES know is
+    /// plain: a declared, non-`Password` var is still created unflagged, so it
+    /// stays readable in the settings API and exportable in a seed bundle.
+    #[tokio::test]
+    async fn config_set_creating_a_declared_plain_key_stores_it_unflagged() {
+        const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+        let ctx = booted_with(&[]).await;
+
+        wafer_core::clients::config::set(&ctx, KEY, "Acme")
+            .await
+            .expect("a declared shared var is storable config");
+
+        assert!(
+            !variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row was created")
+                .sensitive,
+            "a declared plain var must not be masked by the ad hoc default"
         );
     }
 
