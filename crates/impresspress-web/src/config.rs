@@ -36,9 +36,20 @@ pub async fn seed_and_load_variables(
     db: &Arc<dyn DatabaseService>,
     mode: SandboxMode,
 ) -> Result<HashMap<String, String>, String> {
-    // Browser-only defaults. These are not declared `ConfigVar`s (so the
-    // auto-gen pass won't seed them) and there's no env to source them from —
-    // the browser build ships a self-contained local admin + WebLLM wiring.
+    // Browser-only defaults. All three keys ARE declared — the bootstrap pair
+    // by `auth::config::auth_config_vars`, `EMBEDDED_SCRIPTS` by
+    // `config_vars::shared_config_vars` — but every one of them declares an
+    // EMPTY default, so nothing else supplies a value: `admin::settings::
+    // seed_defaults` skips an empty declared default, `seed_auto_generated`
+    // seeds only `auto_generate` vars, and the browser has no process
+    // environment to source one from. It ships a self-contained local admin +
+    // WebLLM wiring instead, so it seeds those values here.
+    //
+    // A stated flag rather than the create default, and the declarations are
+    // why that is safe: `seed_if_absent` builds the `NewVariable` itself, and
+    // `into_row` raises the password's flag from its `InputType::Password`
+    // declaration whatever is passed.
+    //
     // `INSERT OR IGNORE`: a prior boot or admin-UI edit always wins.
     impresspress_core::platform_state::variables::seed_if_absent(
         db,
