@@ -10,7 +10,11 @@
 use wafer_core::clients::database as db;
 
 use super::harness::*;
-use crate::{blocks::products::repo, db_read, test_support::TestContext};
+use crate::{
+    blocks::products::repo,
+    db_read,
+    test_support::{FloatAggregateContext, TestContext},
+};
 
 /// One more row than a single unpaged read can return.
 const PAST_THE_CEILING: i64 = db_read::UNPAGED_LIMIT + 1;
@@ -208,5 +212,97 @@ async fn the_seller_listing_reports_that_it_is_a_prefix() {
     assert_eq!(
         repo::seller_accounts::count_all(&ctx).await.expect("count"),
         PAST_THE_CEILING
+    );
+}
+
+/// Every money figure survives a backend that hands its sums back as floats.
+///
+/// PostgreSQL's `sum(bigint)` is `NUMERIC`, and `wafer-block-postgres`
+/// decodes `NUMERIC` through `f64`, so on a PostgreSQL deployment every money
+/// column in this block — all of them `BIGINT` in the `.postgres.sql` schema
+/// — reaches the analytics as a JSON float. `serde_json::Value::as_i64`
+/// refuses one, so reading a sum with `i64_field` answered `0` there while
+/// answering correctly on SQLite, and no SQLite test could see it.
+///
+/// `FloatAggregateContext` reproduces exactly that decode over the real
+/// in-memory database, so this drives the real `commerce_analytics` rather
+/// than a copy of its arithmetic.
+#[tokio::test]
+async fn money_figures_survive_a_backend_that_sums_into_floats() {
+    let ctx = ctx().await;
+    db::exec_raw(
+        &ctx,
+        "INSERT INTO impresspress__products__purchases \
+             (id, user_id, status, currency, total_cents, refunded_total_cents, \
+              platform_fee_cents, created_at, updated_at) \
+         VALUES ('ord_1', 'buyer', 'completed', 'USD', 2500, 400, 75, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), \
+                ('ord_2', 'buyer', 'refunded', 'USD', 1500, 1500, 45, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        &[],
+    )
+    .await
+    .expect("seed orders");
+    db::exec_raw(
+        &ctx,
+        "INSERT INTO impresspress__products__line_items \
+             (id, purchase_id, product_id, product_name, quantity, total_minor, \
+              created_at, updated_at) \
+         VALUES ('li_1', 'ord_1', 'prod_1', 'Widget', 2, 2500, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        &[],
+    )
+    .await
+    .expect("seed line items");
+
+    let float_ctx = FloatAggregateContext::new(ctx);
+    let analytics = repo::purchases::commerce_analytics(&float_ctx, None)
+        .await
+        .expect("analytics");
+
+    assert_eq!(analytics.len(), 1, "one currency");
+    let usd = &analytics[0];
+    assert_eq!(usd.gross_volume_minor, 4000);
+    assert_eq!(usd.refunded_volume_minor, 1900);
+    assert_eq!(usd.net_volume_minor, 2100);
+    assert_eq!(usd.platform_fees_minor, 120);
+    assert_eq!(usd.paid_order_count, 2);
+    assert_eq!(usd.refunded_order_count, 2);
+    assert_eq!(usd.top_products.len(), 1);
+    assert_eq!(usd.top_products[0].quantity, 2);
+    assert_eq!(usd.top_products[0].revenue_minor, 2500);
+}
+
+/// A keyset walk over a table whose rows do not all carry an `id` fails
+/// loudly instead of stopping where the blank one sits.
+///
+/// The precondition is on the caller, not the schema: `auth.sessions` is
+/// keyed on `family` and `signal.rooms` on `code`, and three auth tables
+/// carry a nullable `id` bolted on by a later migration. No current caller
+/// walks one of those, so this is the guard that keeps the next one from
+/// being a silent short read in a fraud control, a rename cascade or an
+/// export.
+#[tokio::test]
+async fn a_keyset_walk_refuses_a_row_with_no_id() {
+    let ctx = ctx().await;
+    db::exec_raw(
+        &ctx,
+        "INSERT INTO impresspress__products__products \
+             (id, name, status, owner_kind, owner_id, created_at, updated_at) \
+         VALUES ('', 'Nameless', 'active', 'user', 'seller_1', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        &[],
+    )
+    .await
+    .expect("seed a row with a blank id");
+
+    let error = repo::products::list_owned_by_including_deleted(&ctx, "seller_1")
+        .await
+        .expect_err("a blank id cannot be a cursor");
+    assert_eq!(error.code, wafer_run::ErrorCode::Internal);
+    assert!(
+        error.message.contains("no id"),
+        "the message has to name the cause: {}",
+        error.message
     );
 }
