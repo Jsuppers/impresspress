@@ -228,10 +228,7 @@ mod tests {
             "max_storage_bytes",
             json!("not-a-number"),
         )]));
-        assert_eq!(
-            row.config,
-            crate::blocks::files::quota::clamp_to_transport(QuotaConfig::default())
-        );
+        assert_eq!(row.config, QuotaConfig::effective_default());
         assert_eq!(
             row.config.max_storage_bytes,
             QuotaConfig::DEFAULT_MAX_STORAGE_BYTES

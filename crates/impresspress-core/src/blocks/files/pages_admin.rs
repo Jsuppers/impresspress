@@ -3,7 +3,7 @@
 use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{models::QuotaConfig, quota, repo};
+use super::{models::QuotaConfig, repo};
 use crate::{
     ui::{self, components, icons, shell::Crumb},
     util::format_bytes,
@@ -480,11 +480,10 @@ fn transport_cap_note() -> Markup {
 /// first 8 chars in the loader. Pure helper.
 pub fn render_admin_quotas_table(rows: &[AdminQuotaRow]) -> Markup {
     if rows.is_empty() {
-        // Rendered from the defaults rather than written out, and through the
-        // same transport clamp every stored row takes: a hand-typed "100 MB
-        // file size" is how this line came to advertise a per-file cap no
-        // upload could reach.
-        let defaults = quota::clamp_to_transport(QuotaConfig::default());
+        // Rendered from the defaults rather than written out, and from the
+        // *effective* ones: a hand-typed "100 MB file size" is how this line
+        // came to advertise a per-file cap no upload could reach.
+        let defaults = QuotaConfig::effective_default();
         let storage = format_bytes(defaults.max_storage_bytes);
         let file_size = format_bytes(defaults.max_file_size_bytes);
         let files = crate::util::format_count(defaults.max_files_per_bucket);

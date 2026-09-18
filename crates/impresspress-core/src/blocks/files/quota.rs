@@ -12,12 +12,12 @@ use crate::{
 /// silently lift an admin-lowered cap.
 ///
 /// Either way the per-file cap is one an upload can reach:
-/// [`repo::quota::QuotaRow::from_record`] clamps a stored row, and the
-/// defaults are clamped here, both through [`clamp_to_transport`].
+/// [`repo::quota::QuotaRow::from_record`] clamps a stored row, and
+/// [`QuotaConfig::effective_default`] is the clamped form of the defaults.
 pub async fn get_user_quota(ctx: &dyn Context, user_id: &str) -> Result<QuotaConfig, WaferError> {
     match repo::quota::find_for_user(ctx, user_id).await {
         Ok(row) => Ok(row.config),
-        Err(e) if e.code == ErrorCode::NotFound => Ok(clamp_to_transport(QuotaConfig::default())),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(QuotaConfig::effective_default()),
         Err(e) => Err(e),
     }
 }

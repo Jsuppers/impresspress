@@ -33,6 +33,21 @@ impl QuotaConfig {
     pub const DEFAULT_RESET_PERIOD_DAYS: i64 = 0;
 }
 
+impl QuotaConfig {
+    /// The block defaults as they are actually enforced: [`Default::default`]
+    /// with the per-file cap clamped to the transport's request-body ceiling
+    /// ([`super::quota::clamp_to_transport`]).
+    ///
+    /// Every path that produces defaults rather than decoding a stored row
+    /// goes through this — the quota lookup for a user with no override row,
+    /// and the admin table's empty state — so a fourth one cannot quietly
+    /// advertise the unreachable 100 MiB. A decoded row is clamped where it is
+    /// decoded ([`super::repo::quota::QuotaRow::from_record`]).
+    pub fn effective_default() -> Self {
+        super::quota::clamp_to_transport(Self::default())
+    }
+}
+
 impl Default for QuotaConfig {
     fn default() -> Self {
         Self {

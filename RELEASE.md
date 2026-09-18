@@ -158,11 +158,16 @@ the prefix.
 the SDK's README states there is no `/api/*` surface, and every block route
 already carries its own `/b/<block>/api/...` path, which is untouched.
 
-**What to do.** Drop the `/api` prefix from any such caller: `/api/b/x` → `/b/x`.
-There is no migration and no config toggle; a consumer that wants the prefix
-back can add `{ "path": "/api/**", "block": "impresspress/router" }` to the
-routes it passes the site-main flow, which makes it work on every transport
-rather than one.
+**What to do.** Drop the `/api` prefix from any such caller: `/api/b/x` →
+`/b/x`. There is no migration and no config toggle.
+
+Routing alone does not bring it back, either: adding `{ "path": "/api/**",
+"block": "impresspress/router" }` to the flow's routes hands the router a
+`req.resource` of `/api/b/x`, and `routing::route_to_block` matches prefixes
+like `/b/storage/` against that string, so every such request answers 404. A
+consumer who genuinely needs the prefix has to strip it before the router sees
+it — a flow step of their own ahead of `wafer-run/router` that rewrites
+`req.resource` — which is the piece this release removes.
 
 ### Files: bucket names are unique (migration 002) — upgrade with `--run-migrations`
 
