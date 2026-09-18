@@ -53,7 +53,7 @@
                     "type": "string"
                   },
                   "message_id": {
-                    "description": "Id of the assistant entry persisted in the messages block. Empty when\npersistence failed; the reply is still returned.",
+                    "description": "Id of the assistant entry persisted in the messages block. Always\npopulated: a reply the store refused is answered with a 500, not a\nbody (see `routes::chat::handle_chat`).",
                     "type": "string"
                   },
                   "model": {
@@ -61,7 +61,7 @@
                     "type": "string"
                   },
                   "truncated": {
-                    "description": "`true` when the reply exceeded the 1 MiB buffering cap; `content`\nthen stops at the cap.",
+                    "description": "`true` when the reply exceeded the 1 MiB buffering cap. `content` is\nthen a prefix of the reply — it ends at the last delta that fitted and\nnothing after it is appended, so the text is never spliced across a\ngap.",
                     "type": "boolean"
                   }
                 },
