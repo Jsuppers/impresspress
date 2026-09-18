@@ -858,6 +858,11 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // `("database.list", shares::TABLE)` — the cloudstorage page's
             // outage test, scoped so the quota reads beside it still land
             "blocks/files/pages_user/cloudstorage.rs",
+            // `("database.list"/"database.increment_field_where",
+            // shares::TABLE)` — the public link's outage tests: a lookup
+            // that failed must not read as a revoked link, and an access
+            // the counter could not record must not be served
+            "blocks/files/share.rs",
         ],
     ),
     (

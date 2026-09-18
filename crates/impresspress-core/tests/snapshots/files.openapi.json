@@ -339,7 +339,7 @@
                               "type": "string"
                             },
                             "expires_at": {
-                              "description": "Absolute expiry, or `None` for a share that never expires. A SQL\n`NULL` and a stored empty string both mean \"never\": the column is\nnullable and every caller already treated `\"\"` as unset, so the\ndistinction existed nowhere but in the decode.",
+                              "description": "The end this share link records, as an RFC 3339 stamp.\n\n`None` is a SQL `NULL` or a stored empty string — one meaning, since\nthe column is nullable and every caller treated `\"\"` as unset. It is\nNOT \"never expires\": every share link has an end, and a row that\nrecords none cannot be shown to be live, so the public link refuses\nit. Creating a share cannot produce one — `NewShare` takes a\nnon-optional expiry — and migration 003 gave every historical row an\nend, so a `None` here is a row that reached the table some other\nway.",
                               "type": [
                                 "string",
                                 "null"
@@ -360,7 +360,7 @@
                               ]
                             },
                             "token": {
-                              "description": "The signed token embedded in the public `/b/storage/direct/{token}`\nURL. Unique across the table.",
+                              "description": "The opaque token embedded in the public `/b/storage/direct/{token}`\nURL: random bytes, hex-encoded, asserting nothing about the share.\nThis row is what it addresses, and what decides whether the link\nstill works. Unique across the table.",
                               "type": "string"
                             },
                             "updated_at": {
@@ -544,7 +544,7 @@
                               "type": "string"
                             },
                             "expires_at": {
-                              "description": "Absolute expiry, or `None` for a share that never expires. A SQL\n`NULL` and a stored empty string both mean \"never\": the column is\nnullable and every caller already treated `\"\"` as unset, so the\ndistinction existed nowhere but in the decode.",
+                              "description": "The end this share link records, as an RFC 3339 stamp.\n\n`None` is a SQL `NULL` or a stored empty string — one meaning, since\nthe column is nullable and every caller treated `\"\"` as unset. It is\nNOT \"never expires\": every share link has an end, and a row that\nrecords none cannot be shown to be live, so the public link refuses\nit. Creating a share cannot produce one — `NewShare` takes a\nnon-optional expiry — and migration 003 gave every historical row an\nend, so a `None` here is a row that reached the table some other\nway.",
                               "type": [
                                 "string",
                                 "null"
@@ -565,7 +565,7 @@
                               ]
                             },
                             "token": {
-                              "description": "The signed token embedded in the public `/b/storage/direct/{token}`\nURL. Unique across the table.",
+                              "description": "The opaque token embedded in the public `/b/storage/direct/{token}`\nURL: random bytes, hex-encoded, asserting nothing about the share.\nThis row is what it addresses, and what decides whether the link\nstill works. Unique across the table.",
                               "type": "string"
                             },
                             "updated_at": {
@@ -644,7 +644,7 @@
                     "type": "string"
                   },
                   "token": {
-                    "description": "The signed token embedded in `direct_url`.",
+                    "description": "The opaque token embedded in `direct_url`. It carries no expiry of\nits own: the share's own `expires_at` and access cap are what end a\nlink.",
                     "type": "string"
                   }
                 },

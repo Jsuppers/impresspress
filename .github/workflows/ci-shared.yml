@@ -255,7 +255,7 @@ jobs:
   # Every `#[cfg(feature = "postgres")]` assertion in the repo — the seven
   # migration tests that check each block's `*.postgres.sql` twin is the one
   # its Rust list actually references — was dead code in CI: nothing anywhere
-  # ran `cargo test` with that feature on. `products-postgres` below does not
+  # ran `cargo test` with that feature on. `postgres-migrations` below does not
   # cover them; it globs the `.sql` files through `psql`, which proves the SQL
   # parses and runs but says nothing about whether any Rust constant points at
   # it. A migration wired into `SQLITE_MIGRATIONS` and forgotten in
@@ -265,7 +265,7 @@ jobs:
   # impresspress-core (`postgres = []`), and on impresspress-native it only
   # pulls `wafer-block-postgres` in as a dependency. Nothing under it opens a
   # connection at test time — the assertions are all against embedded SQL text.
-  # `products-postgres` is where a real server belongs, and it has one.
+  # `postgres-migrations` is where a real server belongs, and it has one.
   #
   # impresspress-native is built alongside impresspress-core because it holds
   # the only non-test postgres-gated Rust (`make_postgres_database_service`),
@@ -1384,8 +1384,8 @@ jobs:
             examples/test-results/
           retention-days: 7
 
-  products-postgres:
-    name: Products PostgreSQL migrations
+  postgres-migrations:
+    name: PostgreSQL migrations
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -1410,11 +1410,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply all Products PostgreSQL migrations in order
+      # Every block that ships a `.postgres.sql` belongs in this loop. A
+      # dialect file nothing executes is a typo waiting to brick a Postgres
+      # deployment for good: the error aborts the batch, `apply_if_blessed`
+      # never stamps the hash, and every later boot re-runs and re-fails.
+      - name: Apply all PostgreSQL migrations in order
         run: |
-          for migration in crates/impresspress-core/src/blocks/products/migrations/*.postgres.sql; do
-            echo "applying ${migration}"
-            psql --set ON_ERROR_STOP=1 --file "${migration}"
+          for block in products files; do
+            for migration in crates/impresspress-core/src/blocks/${block}/migrations/*.postgres.sql; do
+              echo "applying ${migration}"
+              psql --set ON_ERROR_STOP=1 --file "${migration}"
+            done
           done
 
       - name: Verify commerce schema and deterministic templates
@@ -1440,6 +1446,33 @@ jobs:
           psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/products/migrations/020_normalize_blank_deleted_at.postgres.sql
           test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at IS NULL")" = "blank_noslug,blank_scarf,live_jacket,live_noslug"
           test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at = ''")" = "blank_hat_a,blank_hat_b,blank_jacket"
+
+      # Files 003 gives every legacy (JWT-shaped, unexpiring) share row the
+      # lifetime its token used to impose: 365 days for one minted before
+      # SEC-055 shortened the TTL, 30 days after, and the migration's own
+      # instant when `created_at` cannot be read. Getting either arm wrong
+      # silently revokes links that still work or revives links that are
+      # dead — neither of which a schema-shape check would catch, so the
+      # rows are asserted. `blocks/files/migrations` pins the same on
+      # SQLite. 003 already ran above against an empty table and is
+      # re-runnable.
+      - name: Migration files/003 dates legacy share links by era
+        run: |
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__files__cloud_shares (id, token, bucket, key, created_by, expires_at, created_at, updated_at) VALUES ('old', 'eyJhbGci.eyJ0eXAi.sig1', 'photos', 'a.png', 'alice', NULL, '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('recent', 'eyJhbGci.eyJ0eXAi.sig2', 'photos', 'b.png', 'alice', NULL, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z'), ('precise', 'eyJhbGci.eyJ0eXAi.sig3', 'photos', 'c.png', 'alice', '', '2026-09-08T12:34:56.123456789+00:00', '2026-09-08T12:34:56.123456789+00:00'), ('opaque', '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08', 'photos', 'd.png', 'alice', NULL, '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('chosen', 'eyJhbGci.eyJ0eXAi.sig5', 'photos', 'e.png', 'alice', '2027-06-01T00:00:00Z', '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z'), ('garbled', 'eyJhbGci.eyJ0eXAi.sig6', 'photos', 'f.png', 'alice', NULL, 'not a timestamp', 'not a timestamp'), ('boundary_in', 'eyJhbGci.eyJ0eXAi.sig7', 'photos', 'g.png', 'alice', NULL, '2026-05-14T05:43:03.5+00:00', '2026-05-14T05:43:03.5+00:00'), ('boundary_before', 'eyJhbGci.eyJ0eXAi.sig8', 'photos', 'h.png', 'alice', NULL, '2026-05-14T05:43:02.999+00:00', '2026-05-14T05:43:02.999+00:00')"
+          psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/files/migrations/003_legacy_share_token_expiry.postgres.sql
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'old'")" = "2027-04-20T10:00:00Z"
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'recent'")" = "2026-07-01T00:00:00Z"
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'precise'")" = "2026-10-08T12:34:56Z"
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'chosen'")" = "2027-06-01T00:00:00Z"
+          test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM impresspress__files__cloud_shares WHERE id = 'opaque' AND expires_at IS NULL")" -eq 1
+          test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM impresspress__files__cloud_shares WHERE id = 'garbled' AND expires_at IS NOT NULL AND expires_at <= to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")" -eq 1
+          # The boundary second, asserted identically by
+          # `the_boundary_second_falls_on_the_thirty_day_arm` on SQLite: a row
+          # inside it takes the 30-day arm on BOTH backends, the second before
+          # it takes the 365-day arm on both. This is the one comparison the
+          # repair turns on, and the two dialects spell it differently.
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_in'")" = "2026-06-13T05:43:03Z"
+          test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_before'")" = "2027-05-14T05:43:02Z"
 
   audit:
     name: Security Audit

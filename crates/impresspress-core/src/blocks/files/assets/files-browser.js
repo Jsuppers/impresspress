@@ -179,11 +179,11 @@
     closeAllKebabs();
     const popup = document.createElement('div');
     popup.className = 'kebab-popup';
-    if (trigger.dataset.token) {
+    if (trigger.dataset.shareId) {
       // Shares table kebab.
       popup.innerHTML = '<button type="button" data-action="revoke">Revoke share</button>';
       popup.querySelector('[data-action="revoke"]').addEventListener('click', () => {
-        revokeShare(trigger.dataset.token);
+        revokeShare(trigger.dataset.shareId);
       });
     } else if (trigger.dataset.key) {
       // Object table kebab.
@@ -215,10 +215,13 @@
     document.body.appendChild(popup);
   }
 
-  async function revokeShare(token) {
+  // `shareId` is the share row's id (rendered as `data-share-id`), which is
+  // what DELETE /b/cloudstorage/shares/{id} is keyed on — not the public
+  // token in the link.
+  async function revokeShare(shareId) {
     if (!window.confirm('Revoke this share link?')) return;
     try {
-      const resp = await fetch('/b/cloudstorage/shares/' + encodeURIComponent(token), {
+      const resp = await fetch('/b/cloudstorage/shares/' + encodeURIComponent(shareId), {
         method: 'DELETE',
       });
       if (resp.ok) {
@@ -239,11 +242,17 @@
       '<form method="dialog">' +
       '<h3>Create share link</h3>' +
       '<p><code></code></p>' +
+      // Values are HOURS — the unit POST /b/cloudstorage/shares takes in
+      // `expires_in_hours`. The labels are the days the user thinks in.
+      // There is no "never": a share link is a bearer credential, so every
+      // one of them ends. The longest option is the deployment's default
+      // ceiling (IMPRESSPRESS__FILES__MAX_SHARE_EXPIRY_HOURS), which the
+      // server applies to a request that names no expiry at all.
       '<label>Expires in <select name="expires">' +
-      '<option value="">Never</option>' +
-      '<option value="1">1 day</option>' +
-      '<option value="7" selected>7 days</option>' +
-      '<option value="30">30 days</option>' +
+      '<option value="24">1 day</option>' +
+      '<option value="168" selected>7 days</option>' +
+      '<option value="720">30 days</option>' +
+      '<option value="8760">365 days</option>' +
       '</select></label>' +
       '<label>Max accesses <input name="max" type="number" min="0" placeholder="∞" /></label>' +
       '<div class="modal-actions">' +
@@ -260,10 +269,12 @@
       dlg.remove();
     });
     dlg.querySelector('[data-action="create"]').addEventListener('click', async () => {
-      const days = dlg.querySelector('select[name="expires"]').value;
+      const hours = dlg.querySelector('select[name="expires"]').value;
       const max = dlg.querySelector('input[name="max"]').value;
-      const body = { bucket: bucket, key: key };
-      if (days) body.expires_days = Number(days);
+      // Only the fields the endpoint declares: it rejects unknown ones
+      // rather than minting a share that ignores them. Every option carries
+      // an expiry, so one is always sent.
+      const body = { bucket: bucket, key: key, expires_in_hours: Number(hours) };
       if (max) body.max_access_count = Number(max);
       try {
         const resp = await fetch('/b/cloudstorage/shares', {

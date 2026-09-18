@@ -1211,7 +1211,9 @@ quotes, the three gated jobs get a shallow clone on the pull-request side and th
 ### Eight jobs are now transitively gated on `build-wasm` — latency AND reporting
 
 On `main` these eight carried **no `needs:` at all**: `audit`, `sdk`,
-`test-postgres`, `products-browser`, `product-examples`, `products-postgres`,
+`test-postgres`, `products-browser`, `product-examples`, `products-postgres`
+(since renamed `postgres-migrations`, which now runs the files block's
+dialect files too),
 `cloudflare-wasm-test` and `browser-wasm-test`. (The last two were missed in the
 first version of this note and in the comment in `ci.yml`; neither downloads the
 wasm artifact, and both moved from start+~1 s to start+~258 s in the two merge
@@ -1228,10 +1230,10 @@ eight wait.
   `ci-main.yml`'s twenty-three. A dependency bump that both breaks the wasm
   build and introduces a security advisory used to surface two red jobs; now it
   surfaces one, and the advisory is invisible until the build is fixed and CI
-  re-runs. Same for a client-library (`sdk`) or migration (`products-postgres`)
-  regression. Not a false green today — `build-wasm` is genuinely red when it
-  fails, and the fork has no required checks — but a **skipped required check
-  reports as passing**, so if required checks are ever configured on the
+  re-runs. Same for a client-library (`sdk`) or migration
+  (`postgres-migrations`) regression. Not a false green today — `build-wasm`
+  is genuinely red when it fails, and the fork has no required checks — but a
+  **skipped required check reports as passing**, so if required checks are ever configured on the
   prefixed names, sixteen of twenty-three would report green on a build
   failure. Make `build-wasm` required alongside them, or accept that.
 

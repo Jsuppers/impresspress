@@ -1256,10 +1256,16 @@ export interface paths {
                                      */
                                     created_by: string;
                                     /**
-                                     * @description Absolute expiry, or `None` for a share that never expires. A SQL
-                                     *     `NULL` and a stored empty string both mean "never": the column is
-                                     *     nullable and every caller already treated `""` as unset, so the
-                                     *     distinction existed nowhere but in the decode.
+                                     * @description The end this share link records, as an RFC 3339 stamp.
+                                     *
+                                     *     `None` is a SQL `NULL` or a stored empty string — one meaning, since
+                                     *     the column is nullable and every caller treated `""` as unset. It is
+                                     *     NOT "never expires": every share link has an end, and a row that
+                                     *     records none cannot be shown to be live, so the public link refuses
+                                     *     it. Creating a share cannot produce one — `NewShare` takes a
+                                     *     non-optional expiry — and migration 003 gave every historical row an
+                                     *     end, so a `None` here is a row that reached the table some other
+                                     *     way.
                                      */
                                     expires_at: string | null;
                                     id: string;
@@ -1273,8 +1279,10 @@ export interface paths {
                                      */
                                     max_access_count: number | null;
                                     /**
-                                     * @description The signed token embedded in the public `/b/storage/direct/{token}`
-                                     *     URL. Unique across the table.
+                                     * @description The opaque token embedded in the public `/b/storage/direct/{token}`
+                                     *     URL: random bytes, hex-encoded, asserting nothing about the share.
+                                     *     This row is what it addresses, and what decides whether the link
+                                     *     still works. Unique across the table.
                                      */
                                     token: string;
                                     updated_at: string;
@@ -1407,10 +1415,16 @@ export interface paths {
                                      */
                                     created_by: string;
                                     /**
-                                     * @description Absolute expiry, or `None` for a share that never expires. A SQL
-                                     *     `NULL` and a stored empty string both mean "never": the column is
-                                     *     nullable and every caller already treated `""` as unset, so the
-                                     *     distinction existed nowhere but in the decode.
+                                     * @description The end this share link records, as an RFC 3339 stamp.
+                                     *
+                                     *     `None` is a SQL `NULL` or a stored empty string — one meaning, since
+                                     *     the column is nullable and every caller treated `""` as unset. It is
+                                     *     NOT "never expires": every share link has an end, and a row that
+                                     *     records none cannot be shown to be live, so the public link refuses
+                                     *     it. Creating a share cannot produce one — `NewShare` takes a
+                                     *     non-optional expiry — and migration 003 gave every historical row an
+                                     *     end, so a `None` here is a row that reached the table some other
+                                     *     way.
                                      */
                                     expires_at: string | null;
                                     id: string;
@@ -1424,8 +1438,10 @@ export interface paths {
                                      */
                                     max_access_count: number | null;
                                     /**
-                                     * @description The signed token embedded in the public `/b/storage/direct/{token}`
-                                     *     URL. Unique across the table.
+                                     * @description The opaque token embedded in the public `/b/storage/direct/{token}`
+                                     *     URL: random bytes, hex-encoded, asserting nothing about the share.
+                                     *     This row is what it addresses, and what decides whether the link
+                                     *     still works. Unique across the table.
                                      */
                                     token: string;
                                     updated_at: string;
@@ -1464,7 +1480,11 @@ export interface paths {
                              *     /b/cloudstorage/shares/{id}`.
                              */
                             id: string;
-                            /** @description The signed token embedded in `direct_url`. */
+                            /**
+                             * @description The opaque token embedded in `direct_url`. It carries no expiry of
+                             *     its own: the share's own `expires_at` and access cap are what end a
+                             *     link.
+                             */
                             token: string;
                         };
                     };

@@ -104,7 +104,21 @@ pub(crate) mod test_wrap {
     }
 }
 
-use wafer_run::{BlockInfo, HttpMethod, InstanceMode};
+use wafer_run::{BlockInfo, ConfigVar, HttpMethod, InputType, InstanceMode};
+
+/// The config vars this block declares, for `BlockInfo::config_keys` — the
+/// admin Variables screen renders them from this list, and the validator
+/// reads the same declaration.
+fn config_vars() -> Vec<ConfigVar> {
+    vec![ConfigVar::new(
+        cloud::MAX_SHARE_EXPIRY_HOURS_KEY,
+        "Longest a public share link may live, in hours. A share created \
+         without an expiry gets this long; a longer one is refused.",
+        &cloud::DEFAULT_MAX_SHARE_EXPIRY_HOURS.to_string(),
+    )
+    .name("Max share link lifetime (hours)")
+    .input_type(InputType::Number)]
+}
 
 use super::rate_limit::{check_user_rate_limit_with, RateLimit, RateLimitOutcome, UserRateLimiter};
 use crate::{
@@ -262,9 +276,9 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .path_params(quota_user_id_path_schema)
     .output(response_schema_of::<contracts::RecordView<repo::quota::QuotaRow>>)
     .tags(&["cloudstorage"]),
-    // ── Public share link ── `share::handle_direct_access` verifies the
-    // token's signature, rate-limits per remote IP, and enforces expiry and
-    // the access cap itself.
+    // ── Public share link ── `share::handle_direct_access` rate-limits per
+    // remote IP, resolves the token to its share row, and enforces that
+    // row's expiry and access cap itself.
     EndpointRoute::public(
         HttpMethod::Get,
         "/b/storage/direct/{token}",
@@ -547,12 +561,11 @@ crate::impresspress_feature_block! {
 
         BlockInfo::new("impresspress/files", "0.0.1", "http-handler@v1", "File storage, sharing, quotas, and access logging")
             .instance_mode(InstanceMode::Singleton)
-            // `wafer-run/crypto`: share links are JWTs. `share::generate_share_token`
-            // signs one with `crypto::sign` and `share::handle_direct_access`
-            // checks it with `crypto::verify`. The entry was missing, so
-            // `POST /b/cloudstorage/shares` was refused at the `call_block`
-            // boundary — above every grant check — and sharing was dead on
-            // arrival.
+            // `wafer-run/crypto`: a share link's token is 256 bits of CSPRNG
+            // output, drawn by `share::generate_share_token` through
+            // `crypto::random_bytes`. Without the entry,
+            // `POST /b/cloudstorage/shares` is refused at the `call_block`
+            // boundary — above every grant check — and sharing is dead.
             .requires(vec!["wafer-run/database".into(), "wafer-run/storage".into(), "wafer-run/config".into(), "wafer-run/crypto".into()])
             // No explicit Storage grant needed. Wave 26 (c18) made WRAP
             // namespace-aware for Storage; this block self-admits its
@@ -571,6 +584,7 @@ crate::impresspress_feature_block! {
                 CollectionSchema::new(repo::shares::ACCESS_LOGS_TABLE),
                 CollectionSchema::new(repo::quota::TABLE),
             ])
+            .config_keys(config_vars())
             .category(wafer_run::BlockCategory::Feature)
             .description("File storage and management with bucket-based organization. Supports file upload, download, deletion, search, and sharing via public links with expiration and access counting. Includes per-user storage quotas.")
             .endpoints(endpoint_match::declare(ROUTES))
@@ -735,7 +749,11 @@ mod grant_tests {
 
 #[cfg(test)]
 mod test_support {
+    use std::sync::Arc;
+
     use wafer_run::Message;
+
+    use crate::test_support::{InMemoryStorageService, TestContext};
 
     /// Run `msg` through the block's own route table so `{name}`, `{key}`,
     /// `{id}`, `{token}`, `{bucket}` and `{prefix}` are bound the way they
@@ -751,6 +769,220 @@ mod test_support {
             msg.path()
         );
         msg
+    }
+
+    /// A files-block fixture carrying everything a share link touches: the
+    /// real `wafer-run/crypto` block (a share token is CSPRNG output drawn
+    /// through it), the production storage shim over an object store that
+    /// really holds bytes, and one bucket owned by `owner`.
+    ///
+    /// Both halves of the round trip — `cloud::handle_create_share` and
+    /// `share::handle_direct_access` — run on this one fixture, so neither
+    /// side can be tested against wiring the other never sees.
+    pub(super) async fn share_ctx(bucket: &str, owner: &str) -> TestContext {
+        let mut ctx = TestContext::with_files().await;
+
+        let crypto_svc = Arc::new(
+            wafer_block_crypto::service::Argon2JwtCryptoService::new(
+                // ≥ 32 bytes for the HMAC-SHA256 minimum-length check.
+                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
+            )
+            .expect("test secret is long enough"),
+        );
+        ctx.register_block(
+            "wafer-run/crypto",
+            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(
+                crypto_svc,
+            )),
+        );
+        ctx.register_block(
+            "wafer-run/storage",
+            super::test_wrap::storage_block(Arc::new(InMemoryStorageService::new())),
+        );
+
+        let data = crate::util::json_map(serde_json::json!({
+            "name": bucket,
+            "public": false,
+            "created_by": owner,
+            "created_at": crate::util::now_rfc3339(),
+        }));
+        super::repo::buckets::seed(&ctx, data)
+            .await
+            .expect("seed bucket");
+
+        ctx
+    }
+
+    // -----------------------------------------------------------------
+    // The browser half of the contract
+    //
+    // These read `files-browser.js` itself, so a test drives the handler
+    // with the field names, attributes and URLs the shipped bundle really
+    // uses. A test that re-types them in Rust certifies the Rust side
+    // against itself and passes while the browser talks to nothing.
+    // -----------------------------------------------------------------
+
+    /// The slice of `js` between `start` and the next `end` after it.
+    fn between<'a>(js: &'a str, start: &str, end: &str, what: &str) -> &'a str {
+        let from = js
+            .find(start)
+            .unwrap_or_else(|| panic!("{what}: no `{start}`"))
+            + start.len();
+        let len = js[from..]
+            .find(end)
+            .unwrap_or_else(|| panic!("{what}: no `{end}` after `{start}`"));
+        &js[from..from + len]
+    }
+
+    /// One entry of the share modal's expiry dropdown.
+    pub(super) struct ShareModalOption {
+        /// The number the modal sends for this option.
+        pub value: i64,
+        /// The duration this option's LABEL promises the user, in hours — so
+        /// a test can catch an option offering the right field in the wrong
+        /// unit as well as one that outlives the cap.
+        pub label_hours: i64,
+        /// Whether the modal pre-selects it.
+        pub selected: bool,
+    }
+
+    /// What the share modal sends when the user accepts its default expiry.
+    pub(super) struct ShareModalExpiry {
+        /// The JSON field the modal puts the expiry in.
+        pub field: String,
+        /// The number it sends for the pre-selected option.
+        pub value: i64,
+        /// That option's promised duration in hours.
+        pub label_hours: i64,
+    }
+
+    /// The name of the variable the modal reads its expiry select into.
+    fn expiry_select_var(js: &str) -> &str {
+        let read = " = dlg.querySelector('select[name=\"expires\"]').value;";
+        let end = js
+            .find(read)
+            .expect("the share modal must read its expiry select");
+        let var_at = js[..end].rfind("const ").expect("read into a const") + "const ".len();
+        &js[var_at..end]
+    }
+
+    /// Every option the share modal's expiry dropdown offers, in order.
+    pub(super) fn share_modal_expiry_options() -> Vec<ShareModalOption> {
+        let js = super::assets::SOURCE;
+        let select = between(
+            js,
+            "<select name=\"expires\">",
+            "</select>",
+            "the share modal's expiry select",
+        );
+
+        let mut options = Vec::new();
+        let mut rest = select;
+        while let Some(at) = rest.find("<option value=\"") {
+            rest = &rest[at + "<option value=\"".len()..];
+            let value_end = rest.find('"').expect("an option value ends");
+            let raw_value = &rest[..value_end];
+            let value: i64 = raw_value.parse().unwrap_or_else(|_| {
+                panic!(
+                    "expiry option value `{raw_value}` is not a number of hours — \
+                        a share link always has an end"
+                )
+            });
+            let selected = between(rest, "\"", ">", "an option's attributes").contains("selected");
+            let label = between(rest, ">", "</option>", "an option label");
+            options.push(ShareModalOption {
+                value,
+                label_hours: label_in_hours(label),
+                selected,
+            });
+        }
+        assert!(
+            !options.is_empty(),
+            "the share modal must offer an expiry to pick"
+        );
+        options
+    }
+
+    /// `"7 days"` ⇒ 168. The label is what the user was promised.
+    fn label_in_hours(label: &str) -> i64 {
+        let (count, unit) = label
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("expiry label `{label}` is not `<n> <unit>`"));
+        let count: i64 = count
+            .parse()
+            .unwrap_or_else(|_| panic!("expiry label `{label}` does not start with a number"));
+        match unit.trim_end_matches('s') {
+            "day" => count * 24,
+            "hour" => count,
+            other => panic!("expiry label `{label}` uses an unhandled unit `{other}`"),
+        }
+    }
+
+    /// Read [`ShareModalExpiry`] out of the shipped bundle.
+    pub(super) fn share_modal_expiry() -> ShareModalExpiry {
+        let js = super::assets::SOURCE;
+        let var = expiry_select_var(js);
+
+        // The field the modal sends it under — `<field>: Number(<var>)` or
+        // `body.<field> = Number(<var>)`, whichever spelling the bundle uses.
+        let call = format!("Number({var})");
+        let at = js
+            .find(&call)
+            .expect("the share modal must send the expiry it read");
+        let head = js[..at].trim_end().trim_end_matches([':', '=']).trim_end();
+        let field_at = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let field = head[field_at..].to_string();
+        assert!(
+            !field.is_empty(),
+            "the expiry must be sent under a named field"
+        );
+
+        let selected = share_modal_expiry_options()
+            .into_iter()
+            .find(|option| option.selected)
+            .expect("the share modal must preselect an expiry");
+
+        ShareModalExpiry {
+            field,
+            value: selected.value,
+            label_hours: selected.label_hours,
+        }
+    }
+
+    /// The HTML attribute the kebab's revoke button reads, derived from the
+    /// `dataset` key the bundle uses (`dataset.shareId` ⇒ `data-share-id`).
+    pub(super) fn revoke_id_attribute() -> String {
+        let key = between(
+            super::assets::SOURCE,
+            "revokeShare(trigger.dataset.",
+            ")",
+            "revoke button wiring",
+        );
+        let mut attr = String::from("data-");
+        for ch in key.chars() {
+            if ch.is_ascii_uppercase() {
+                attr.push('-');
+                attr.push(ch.to_ascii_lowercase());
+            } else {
+                attr.push(ch);
+            }
+        }
+        attr
+    }
+
+    /// The URL the revoke button DELETEs for the value it read out of that
+    /// attribute.
+    pub(super) fn revoke_url(id: &str) -> String {
+        let js = super::assets::SOURCE;
+        let handler = &js[js
+            .find("async function revokeShare(")
+            .expect("the bundle must define revokeShare")..];
+        format!(
+            "{}{id}",
+            between(handler, "fetch('", "'", "revoke fetch URL")
+        )
     }
 }
 

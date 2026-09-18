@@ -42,7 +42,11 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
+    // `deny_unknown_fields`: an unknown key is a caller asking for a bucket
+    // property this handler does not set, and answering 200 would claim it
+    // was applied.
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Req {
         name: String,
         #[serde(default)]

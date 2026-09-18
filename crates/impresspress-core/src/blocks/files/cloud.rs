@@ -25,20 +25,76 @@ pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> Outp
     }
 }
 
-/// Upper bound on `expires_in_hours` for a share link (one year). Caller
-/// input is otherwise unbounded, and both `chrono::Duration::hours` and
-/// `DateTime + Duration` panic on overflow in chrono 0.4.44 — a huge value
-/// (e.g. `i64::MAX`) would panic the handler on this reachable request path.
-/// Non-positive values are rejected too since they'd mint an
-/// already-expired share.
-const MAX_SHARE_EXPIRY_HOURS: i64 = 24 * 365;
+/// How long a share link may live, in hours — the ceiling on
+/// `expires_in_hours` AND the lifetime a request that names none receives.
+///
+/// A share link is an unauthenticated bearer credential: it is pasted into a
+/// chat or a document and never looked at again. A cap that is too short is
+/// a visible annoyance with an obvious remedy (re-share), where "no expiry"
+/// fails silently and without bound. So every link has an end, and an
+/// operator who genuinely needs longer-lived public links raises this key
+/// rather than reaching for a sentinel that means forever.
+///
+/// Read per request rather than compiled in, so that change takes effect
+/// without a redeploy.
+pub const MAX_SHARE_EXPIRY_HOURS_KEY: &str = "IMPRESSPRESS__FILES__MAX_SHARE_EXPIRY_HOURS";
+
+/// Default for [`MAX_SHARE_EXPIRY_HOURS_KEY`]: one year.
+pub const DEFAULT_MAX_SHARE_EXPIRY_HOURS: i64 = 24 * 365;
+
+/// The configured ceiling, or the default when the key is unset or unusable.
+///
+/// A non-positive or unparseable value would mint an already-expired share
+/// (or, for a huge one, overflow the chrono arithmetic below — both
+/// `Duration::hours` and `DateTime + Duration` panic on overflow in chrono
+/// 0.4.44), so a value this handler cannot honour falls back to the default
+/// the `ConfigVar` declares rather than being obeyed.
+async fn max_share_expiry_hours(ctx: &dyn Context) -> i64 {
+    // `get`, not `get_default`: the two ways of not having a value are not
+    // the same event. An unset key is the declared default, silently and by
+    // design. A lookup that FAILED means a deployment that lowered this
+    // ceiling is handing out the longer default while the config store is
+    // unreachable, and the operator has to be able to see that in the log.
+    let raw = match wafer_core::clients::config::get(ctx, MAX_SHARE_EXPIRY_HOURS_KEY).await {
+        Ok(value) => value,
+        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
+            return DEFAULT_MAX_SHARE_EXPIRY_HOURS
+        }
+        Err(e) => {
+            tracing::warn!(
+                key = MAX_SHARE_EXPIRY_HOURS_KEY,
+                error = %e,
+                default = DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+                "share-expiry ceiling unreadable; granting the declared default"
+            );
+            return DEFAULT_MAX_SHARE_EXPIRY_HOURS;
+        }
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(hours) if hours > 0 && chrono::Duration::try_hours(hours).is_some() => hours,
+        _ => {
+            tracing::warn!(
+                key = MAX_SHARE_EXPIRY_HOURS_KEY,
+                value = %raw,
+                default = DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+                "unusable share-expiry ceiling; granting the declared default"
+            );
+            DEFAULT_MAX_SHARE_EXPIRY_HOURS
+        }
+    }
+}
 
 pub(super) async fn handle_create_share(
     ctx: &dyn Context,
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
+    // `deny_unknown_fields`: a field this struct does not know is a caller
+    // asking for something the handler will not do. Ignoring it answers 200
+    // to a request that was not honoured — a misspelled expiry field would
+    // mint a never-expiring link and report success.
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Req {
         bucket: String,
         key: String,
@@ -81,36 +137,39 @@ pub(super) async fn handle_create_share(
         return err_not_found("File not found in storage");
     }
 
-    // Generate share token
-    let token = super::share::generate_share_token(ctx, &body.bucket, &body.key).await;
-    let token = match token {
+    // Mint the token that addresses the share row. It carries no expiry of
+    // its own — the row below is the only clock on this link.
+    let token = match super::share::generate_share_token(ctx).await {
         Ok(t) => t,
         Err(r) => return r,
     };
 
     let now = chrono::Utc::now();
-    let expires_at = match body.expires_in_hours {
-        None => None,
-        Some(h) if !(1..=MAX_SHARE_EXPIRY_HOURS).contains(&h) => {
+    // Every share link has an end. A request that names no expiry gets the
+    // configured ceiling — the longest life this deployment grants — rather
+    // than an unexpiring link.
+    let max_hours = max_share_expiry_hours(ctx).await;
+    let hours = match body.expires_in_hours {
+        None => max_hours,
+        Some(h) if !(1..=max_hours).contains(&h) => {
             return err_bad_request(&format!(
-                "expires_in_hours must be between 1 and {MAX_SHARE_EXPIRY_HOURS}"
+                "expires_in_hours must be between 1 and {max_hours}"
             ));
         }
-        Some(h) => {
-            // `try_hours` + `checked_add_signed` instead of `Duration::hours`
-            // + `+` — both of the latter panic on overflow in chrono 0.4.44.
-            // The range check above already excludes anything that would
-            // overflow; these keep the arithmetic itself panic-free even if
-            // that bound is ever loosened.
-            let Some(duration) = chrono::Duration::try_hours(h) else {
-                return err_bad_request("expires_in_hours out of range");
-            };
-            let Some(expiry) = now.checked_add_signed(duration) else {
-                return err_bad_request("expires_in_hours out of range");
-            };
-            Some(expiry.to_rfc3339())
-        }
+        Some(h) => h,
     };
+    // `try_hours` + `checked_add_signed` instead of `Duration::hours` + `+` —
+    // both of the latter panic on overflow in chrono 0.4.44. The ceiling
+    // already excludes anything that would overflow (`max_share_expiry_hours`
+    // refuses a value chrono cannot represent); these keep the arithmetic
+    // itself panic-free regardless.
+    let Some(duration) = chrono::Duration::try_hours(hours) else {
+        return err_bad_request("expires_in_hours out of range");
+    };
+    let Some(expiry) = now.checked_add_signed(duration) else {
+        return err_bad_request("expires_in_hours out of range");
+    };
+    let expires_at = expiry.to_rfc3339();
 
     let created_at = now.to_rfc3339();
     let new_share = repo::shares::NewShare {
@@ -119,7 +178,7 @@ pub(super) async fn handle_create_share(
         key: &body.key,
         created_by: msg.user_id(),
         created_at: &created_at,
-        expires_at: expires_at.as_deref(),
+        expires_at: &expires_at,
         max_access_count: body.max_access_count,
     };
     match repo::shares::insert(ctx, new_share).await {
@@ -242,7 +301,10 @@ mod tests {
     use wafer_core::{clients::storage as store, interfaces::storage::service as storage_service};
     use wafer_run::InputStream;
 
-    use super::{super::test_support::routed, *};
+    use super::{
+        super::test_support::{routed, share_modal_expiry, share_modal_expiry_options},
+        *,
+    };
     use crate::test_support::{
         auth_msg, output_is_error, output_json, FailingDbOpContext, TestContext,
     };
@@ -257,7 +319,7 @@ mod tests {
                 key: "a.png",
                 created_by: owner,
                 created_at: "2026-09-05T00:00:00Z",
-                expires_at: None,
+                expires_at: "2027-09-05T00:00:00Z",
                 max_access_count: None,
             },
         )
@@ -372,8 +434,8 @@ mod tests {
         repo::buckets::seed(ctx, data).await.expect("seed bucket");
     }
 
-    /// Build a `TestContext` with a real crypto block (share-token signing
-    /// goes through `crypto::sign`) and a fake storage block whose `get`
+    /// Build a `TestContext` with a real crypto block (a share token is
+    /// CSPRNG output drawn through it) and a fake storage block whose `get`
     /// always succeeds (the file-existence check needs *some* answer), plus
     /// one bucket owned by `owner`. This is the minimum needed to drive
     /// `handle_create_share` past bucket/key validation, the ownership
@@ -383,7 +445,7 @@ mod tests {
     ///
     /// `requires` enforcement is not opted into here: it comes with
     /// [`TestContext::with_files`], which is what makes every test in this
-    /// module run on the gate that refused `crypto::sign` in production.
+    /// module run on the gate that refused the crypto block in production.
     async fn ctx_with_owned_bucket(bucket: &str, owner: &str) -> TestContext {
         let mut ctx = TestContext::with_files().await;
 
@@ -401,27 +463,17 @@ mod tests {
 
     /// A fixture whose object store really holds bytes — the always-found
     /// fake above can prove a share was *created*, never that the shared file
-    /// comes back — wired through the production namespacing shim, plus a
-    /// real crypto block. Everything `POST /b/cloudstorage/shares` and
-    /// `GET /b/storage/direct/{token}` touch.
+    /// comes back. The block's one share fixture, shared with `share.rs`'s
+    /// tests so both ends of the round trip run on the same wiring.
     async fn ctx_for_share_round_trip(bucket: &str, owner: &str) -> TestContext {
-        let mut ctx = TestContext::with_files().await;
-        register_crypto(&mut ctx);
-        ctx.register_block(
-            "wafer-run/storage",
-            crate::blocks::files::test_wrap::storage_block(Arc::new(
-                crate::test_support::InMemoryStorageService::new(),
-            )),
-        );
-        seed_bucket(&ctx, bucket, owner).await;
-        ctx
+        super::super::test_support::share_ctx(bucket, owner).await
     }
 
     /// CRUX regression (found by driving the live app): creating a share link
     /// must succeed.
     ///
     /// `POST /b/cloudstorage/shares` 500'd on the live server because
-    /// `share::generate_share_token` calls `crypto::sign` while the block's
+    /// `share::generate_share_token` calls the crypto block while its
     /// `info().requires` named only database, storage and config — so the
     /// runtime refused the call with `PermissionDenied: block
     /// 'wafer-run/crypto' not in requires list` above every grant check. No
@@ -447,7 +499,7 @@ mod tests {
         let token = resp["token"].as_str().unwrap_or_default().to_string();
         assert!(
             !token.is_empty(),
-            "share creation must mint a signed token, got: {resp}"
+            "share creation must mint a token, got: {resp}"
         );
         assert_eq!(
             resp["direct_url"],
@@ -459,8 +511,8 @@ mod tests {
     /// The other half of the same outage: the public share link must serve
     /// the shared object's BYTES.
     ///
-    /// This crosses both bugs — the share is minted through `crypto::sign`
-    /// (bug 2) and served through `store::get_stream`, i.e.
+    /// This crosses both bugs — the share is minted through the crypto
+    /// block (bug 2) and served through `store::get_stream`, i.e.
     /// `storage.get_streaming` (bug 1) — so it is the end-to-end proof that a
     /// user can share a file and the recipient can download it.
     #[tokio::test]
@@ -757,6 +809,276 @@ mod tests {
             output_is_error(out, "PermissionDenied").await,
             "valid input should pass validation and hit the ownership check"
         );
+    }
+
+    /// The expiry the share modal offers must be the expiry the endpoint
+    /// applies.
+    ///
+    /// The request body is built from `files-browser.js` itself — the field
+    /// the modal names and the value it sends for its pre-selected option —
+    /// and the assertion is against what that option's LABEL promised the
+    /// user. A modal naming a field the handler does not read, or sending
+    /// days where the handler counts hours, fails here; both are invisible
+    /// to a test that hand-writes the Rust struct's field names.
+    #[tokio::test]
+    async fn create_share_applies_the_expiry_the_share_modal_offers() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let expiry = share_modal_expiry();
+        let mut body = serde_json::Map::new();
+        body.insert("bucket".to_string(), serde_json::json!("photos"));
+        body.insert("key".to_string(), serde_json::json!("a.png"));
+        body.insert(expiry.field.clone(), serde_json::json!(expiry.value));
+        let raw = serde_json::to_vec(&serde_json::Value::Object(body)).unwrap();
+
+        let before = chrono::Utc::now();
+        let resp = output_json(
+            handle_create_share(
+                &ctx,
+                &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                InputStream::from_bytes(raw),
+            )
+            .await,
+        )
+        .await;
+        let id = resp["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("share creation must succeed, got: {resp}"))
+            .to_string();
+
+        let row = repo::shares::find_by_id(&ctx, &id)
+            .await
+            .expect("share row");
+        let expires_at = row.expires_at.as_deref().unwrap_or_else(|| {
+            panic!(
+                "the modal's `{}` expiry was dropped: the share never expires",
+                expiry.field
+            )
+        });
+        let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .expect("valid rfc3339")
+            .with_timezone(&chrono::Utc);
+        let promised = before + chrono::Duration::hours(expiry.label_hours);
+        assert!(
+            (parsed - promised).num_minutes().abs() < 60,
+            "the modal promised the user {} hours; the share expires at {expires_at}",
+            expiry.label_hours,
+        );
+    }
+
+    /// A field the handler will not honour is refused, not accepted and
+    /// dropped: `deny_unknown_fields` is what stops a 200 from meaning "your
+    /// expiry was applied" when it was not.
+    #[tokio::test]
+    async fn create_share_refuses_a_field_it_does_not_honour() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "bucket": "photos",
+            "key": "a.png",
+            "expires_days": 7,
+        }))
+        .unwrap();
+        let out = handle_create_share(
+            &ctx,
+            &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+            InputStream::from_bytes(body),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "an expiry field the handler does not read must be a 400, not a silently unexpiring share"
+        );
+    }
+
+    /// The minted token is entropy, not a dated assertion.
+    ///
+    /// A token that carries its own lifetime is a second clock on the share,
+    /// and the row is the authoritative one: a link the owner asked to keep
+    /// for a year must not stop working because the credential aged out
+    /// while its row still reads active.
+    #[tokio::test]
+    async fn the_share_token_carries_no_lifetime_of_its_own() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let resp = output_json(
+            handle_create_share(
+                &ctx,
+                &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                InputStream::from_bytes(share_body("photos", "a.png")),
+            )
+            .await,
+        )
+        .await;
+        let token = resp["token"].as_str().expect("a token").to_string();
+
+        assert!(
+            !token.contains('.'),
+            "a share token must not be a JWT — its `exp` would expire links the row still counts as live: {token}"
+        );
+        assert_eq!(
+            token.len(),
+            64,
+            "a share token is 32 random bytes, hex-encoded: {token}"
+        );
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "a share token is hex-encoded entropy: {token}"
+        );
+    }
+
+    /// How far out `expires_at` landed on the share `resp` created.
+    async fn persisted_lifetime_hours(
+        ctx: &TestContext,
+        resp: &serde_json::Value,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> i64 {
+        let id = resp["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("share creation must succeed, got: {resp}"));
+        let row = repo::shares::find_by_id(ctx, id).await.expect("share row");
+        let expires_at = row
+            .expires_at
+            .as_deref()
+            .expect("every share link has an end");
+        let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .expect("valid rfc3339")
+            .with_timezone(&chrono::Utc);
+        (parsed - from).num_minutes().div_euclid(60)
+    }
+
+    /// A share created without an expiry gets the configured ceiling, not
+    /// forever.
+    ///
+    /// A public share link is an unauthenticated bearer credential — it is
+    /// pasted into a chat and never revisited — so an unexpiring one fails
+    /// silently and without bound. The longest life this deployment grants
+    /// is what a request that names no expiry receives.
+    #[tokio::test]
+    async fn a_share_created_without_an_expiry_gets_the_configured_maximum() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+
+        let before = chrono::Utc::now();
+        let resp = output_json(
+            handle_create_share(
+                &ctx,
+                &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                InputStream::from_bytes(share_body("photos", "a.png")),
+            )
+            .await,
+        )
+        .await;
+
+        let hours = persisted_lifetime_hours(&ctx, &resp, before).await;
+        assert_eq!(
+            hours, DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+            "an omitted expiry must mean the ceiling, not an unexpiring link"
+        );
+    }
+
+    /// The ceiling is an operator's decision, read per request: raising or
+    /// lowering the key changes both the life an expiry-less share gets and
+    /// the value an explicit one is refused above.
+    #[tokio::test]
+    async fn the_configured_ceiling_is_what_bounds_a_share() {
+        let mut ctx = ctx_for_share_round_trip("photos", "alice").await;
+        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("seed the object being shared");
+        ctx.set_config(MAX_SHARE_EXPIRY_HOURS_KEY, "48");
+
+        let before = chrono::Utc::now();
+        let resp = output_json(
+            handle_create_share(
+                &ctx,
+                &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                InputStream::from_bytes(share_body("photos", "a.png")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            persisted_lifetime_hours(&ctx, &resp, before).await,
+            48,
+            "the configured ceiling is the life an expiry-less share gets"
+        );
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "bucket": "photos",
+            "key": "a.png",
+            "expires_in_hours": 49,
+        }))
+        .unwrap();
+        let out = handle_create_share(
+            &ctx,
+            &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+            InputStream::from_bytes(body),
+        )
+        .await;
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "an expiry past the configured ceiling must be refused"
+        );
+
+        // And the year that was legal a moment ago is not legal now — the
+        // bound is read per request, not compiled in.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "bucket": "photos",
+            "key": "a.png",
+            "expires_in_hours": DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+        }))
+        .unwrap();
+        assert!(
+            output_is_error(
+                handle_create_share(
+                    &ctx,
+                    &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+                    InputStream::from_bytes(body),
+                )
+                .await,
+                "InvalidArgument"
+            )
+            .await,
+            "lowering the ceiling must bind immediately"
+        );
+    }
+
+    /// The share modal cannot offer a link that outlives the cap, and cannot
+    /// offer "never" at all.
+    ///
+    /// Read off the shipped bundle: a dropdown entry with no value, or one
+    /// longer than the default ceiling, would be a promise the endpoint
+    /// refuses.
+    #[tokio::test]
+    async fn the_share_modal_offers_no_expiry_that_outlives_the_cap() {
+        for option in share_modal_expiry_options() {
+            assert!(
+                option.value > 0,
+                "every expiry option is a real duration — there is no `never`"
+            );
+            assert_eq!(
+                option.value, option.label_hours,
+                "an option must send what its label promises"
+            );
+            assert!(
+                option.value <= DEFAULT_MAX_SHARE_EXPIRY_HOURS,
+                "the modal offers {} hours, past the {DEFAULT_MAX_SHARE_EXPIRY_HOURS}-hour ceiling",
+                option.value,
+            );
+        }
     }
 
     /// SB-4: `expires_in_hours` used to be fed straight into

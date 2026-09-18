@@ -23,8 +23,10 @@ pub const ACCESS_LOGS_TABLE: &str = "impresspress__files__cloud_access_logs";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ShareRow {
     pub id: String,
-    /// The signed token embedded in the public `/b/storage/direct/{token}`
-    /// URL. Unique across the table.
+    /// The opaque token embedded in the public `/b/storage/direct/{token}`
+    /// URL: random bytes, hex-encoded, asserting nothing about the share.
+    /// This row is what it addresses, and what decides whether the link
+    /// still works. Unique across the table.
     pub token: String,
     pub bucket: String,
     pub key: String,
@@ -33,10 +35,16 @@ pub struct ShareRow {
     pub created_by: String,
     /// RFC 3339 creation instant.
     pub created_at: String,
-    /// Absolute expiry, or `None` for a share that never expires. A SQL
-    /// `NULL` and a stored empty string both mean "never": the column is
-    /// nullable and every caller already treated `""` as unset, so the
-    /// distinction existed nowhere but in the decode.
+    /// The end this share link records, as an RFC 3339 stamp.
+    ///
+    /// `None` is a SQL `NULL` or a stored empty string — one meaning, since
+    /// the column is nullable and every caller treated `""` as unset. It is
+    /// NOT "never expires": every share link has an end, and a row that
+    /// records none cannot be shown to be live, so the public link refuses
+    /// it. Creating a share cannot produce one — `NewShare` takes a
+    /// non-optional expiry — and migration 003 gave every historical row an
+    /// end, so a `None` here is a row that reached the table some other
+    /// way.
     pub expires_at: Option<String>,
     pub access_count: i64,
     /// Access cap, or `None` for unlimited. A non-positive stored value is
@@ -106,8 +114,11 @@ pub struct NewShare<'a> {
     pub created_by: &'a str,
     /// RFC 3339 creation instant (also the base of `expires_at`).
     pub created_at: &'a str,
-    /// Optional absolute expiry (RFC 3339).
-    pub expires_at: Option<&'a str>,
+    /// Absolute expiry (RFC 3339). Not optional: every share link has an
+    /// end, and the row is the only thing that records it — the token says
+    /// nothing. A share with no expiry would be a permanently live public
+    /// link, so the type does not let one be inserted.
+    pub expires_at: &'a str,
     /// Optional access cap; `None` (or a non-positive stored value) means
     /// unlimited.
     pub max_access_count: Option<i64>,
@@ -123,12 +134,10 @@ pub async fn insert(ctx: &dyn Context, new: NewShare<'_>) -> Result<ShareRow, Wa
         "created_at": new.created_at,
         "access_count": 0,
     }));
-    if let Some(exp) = new.expires_at {
-        data.insert(
-            "expires_at".to_string(),
-            serde_json::Value::String(exp.to_string()),
-        );
-    }
+    data.insert(
+        "expires_at".to_string(),
+        serde_json::Value::String(new.expires_at.to_string()),
+    );
     if let Some(max) = new.max_access_count {
         data.insert("max_access_count".to_string(), serde_json::json!(max));
     }
@@ -378,9 +387,9 @@ mod tests {
         );
     }
 
-    /// "Never expires" arrives as an absent key, a SQL `NULL` or a stored
-    /// empty string; every caller already treated all three the same, so the
-    /// row makes that one `None`.
+    /// An absent key, a SQL `NULL` and a stored empty string are one state
+    /// — "this row records no end" — so the decode makes all three `None`
+    /// and the serving path refuses that state once, in one place.
     #[test]
     fn expires_at_is_none_for_every_shape_of_unset() {
         assert_eq!(ShareRow::from_record(&record(&[])).expires_at, None);

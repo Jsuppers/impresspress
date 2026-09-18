@@ -199,6 +199,67 @@ Image and PDF previews are unaffected. What changes for a user is that opening
 an uploaded `.html` or `.svg` link downloads the file rather than displaying it.
 **No migration.**
 
+### Files: legacy share links (migration 003) — upgrade with `--run-migrations`
+
+A public share link's token used to be a JWT, and the link handler verified
+it before it read the share row — so a link stopped working when its JWT
+aged out, whatever expiry its owner had picked. From this release a token
+is opaque entropy addressing one row, and the row's `expires_at` is the
+only thing that ends a link.
+
+That matters on upgrade because the share dialog used to post its expiry
+under a field name the server did not read, so almost every share created
+through the UI has **no expiry on the row at all**. Reading those tokens as
+opaque strings would make every one of those links live again —
+permanently, and pointing at files whose owners believe the link is long
+gone.
+
+**The JWT's life changed once, so the repair has two arms.** Until
+2026-05-14 the share JWT was signed for 365 days; SEC-055 shortened it to
+30. Migration `003_legacy_share_token_expiry` gives a legacy row (a
+JWT-shaped token, no expiry) 365 days from when it was minted if it
+predates that change and 30 days if it does not — reproducing the lifetime
+its token actually imposed. A link that is dead today stays dead; a link
+minted in the one-year era and still working keeps working to its original
+date.
+
+The cutoff is the instant the code changed, not the instant your deployment
+adopted it. If you upgraded past 2026-05-14 some time later, shares minted
+in that gap really ran the one-year code and will be given 30 days here —
+i.e. they expire. That arm errs toward "a dead link stays dead"; re-share
+the file if one of them mattered.
+
+**Upgrade with `--run-migrations`.** The code half refuses to serve a share
+row that records no end, so without the migration every historical share
+link answers "Share link is unavailable" — an outage for every link your
+users have already sent, not a leak. The migration is what gives each of
+them its correct remaining life back. Until it runs, the only other signal
+is the generic `schema drift; redeploy with --run-migrations to apply`
+warning each boot logs for the files block.
+
+### Files: every share link now expires
+
+**What changes.** A public share link is an unauthenticated bearer
+credential: it is pasted into a chat or a document and never looked at
+again. From this release every one of them has an end. The share dialog no
+longer offers "Never", and a `POST /b/cloudstorage/shares` that names no
+`expires_in_hours` gets the configured maximum rather than an unexpiring
+link. A share row that somehow carries no expiry — an import, a restore, a
+hand-written row — is refused by the public link rather than served.
+
+**The maximum is yours to set.** `IMPRESSPRESS__FILES__MAX_SHARE_EXPIRY_HOURS`
+(Admin → Settings → Variables) defaults to `8760` — one year, the ceiling
+explicitly-supplied expiries were already held to. It is read per request,
+so raising it for a deployment that genuinely needs long-lived public links
+takes effect without a redeploy, and lowering it binds the next share
+immediately. Links already issued keep the expiry they were given. An
+expiry longer than the maximum is refused with a 400, as before.
+
+**Who is affected.** Anyone who picked "Never" in the share dialog: those
+links now get the configured maximum instead. Existing links are unchanged
+by this — what bounds them is the repair above, which reproduces the
+lifetime their token already had.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one

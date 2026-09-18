@@ -21,6 +21,10 @@ pub struct QuotaInfo {
 /// table renders, with no decoding of its own.
 #[derive(Clone, Debug)]
 pub struct ShareRow {
+    /// The share row's primary key — what `DELETE /b/cloudstorage/shares/{id}`
+    /// is keyed on, and therefore what the revoke button has to carry. The
+    /// token is the public credential, not the resource's name.
+    pub id: String,
     pub token: String,
     pub bucket: String,
     pub key: String,
@@ -32,6 +36,7 @@ pub struct ShareRow {
 impl From<&repo::shares::ShareRow> for ShareRow {
     fn from(row: &repo::shares::ShareRow) -> Self {
         Self {
+            id: row.id.clone(),
             token: row.token.clone(),
             bucket: row.bucket.clone(),
             key: row.key.clone(),
@@ -82,7 +87,7 @@ pub fn render_shares_table(rows: &[ShareRow]) -> Markup {
             } }
             tbody {
                 @for r in rows {
-                    tr data-share-token=(r.token) {
+                    tr data-share-id=(r.id) {
                         td data-label="Token" { code { (r.token) } }
                         td data-label="Source" { (r.bucket) "/" (r.key) }
                         td data-label="Created" { (r.created_at) }
@@ -91,10 +96,16 @@ pub fn render_shares_table(rows: &[ShareRow]) -> Markup {
                         }
                         td data-label="Accesses" { (r.access_count) }
                         td {
+                            // `data-share-id`, not the token: the revoke
+                            // button's only action is
+                            // `DELETE /b/cloudstorage/shares/{id}`, which is
+                            // keyed on the row id. It also doubles as the
+                            // marker that tells `files-browser.js`'s kebab
+                            // this is the shares table.
                             button .kebab-trigger
                                 type="button"
                                 data-action-menu
-                                data-token=(r.token)
+                                data-share-id=(r.id)
                                 aria-label={"Actions for share " (r.token)}
                             { "⋯" }
                         }
@@ -248,6 +259,7 @@ mod tests {
     #[test]
     fn render_shares_table_with_rows() {
         let rows = vec![ShareRow {
+            id: "s1".into(),
             token: "abc12345".into(),
             bucket: "photos".into(),
             key: "a.png".into(),
@@ -351,6 +363,57 @@ mod integration_tests {
         let body = output_html(cloudstorage_page(&ctx, &msg).await).await;
         assert!(body.contains("mine"), "own share missing: {body}");
         assert!(!body.contains("theirs"), "other-user share leaked: {body}");
+    }
+
+    /// The revoke button must carry what the revoke route is keyed on.
+    ///
+    /// Nothing here is re-typed from either side: the attribute comes from
+    /// the `dataset` key `files-browser.js` reads, its value is taken out of
+    /// the rendered page, and the URL is the one the bundle builds from it.
+    /// That value then goes through the block's real route table into the
+    /// real handler — so a page rendering the share TOKEN where the route
+    /// wants the row id fails here, as a revoke that 404s in the browser.
+    #[tokio::test]
+    async fn the_revoke_button_carries_what_the_delete_route_is_keyed_on() {
+        use crate::{
+            blocks::files::{
+                cloud,
+                test_support::{revoke_id_attribute, revoke_url, routed},
+            },
+            test_support::{auth_msg, output_json},
+        };
+
+        let ctx = TestContext::with_files().await;
+        let mut share: HashMap<String, serde_json::Value> = HashMap::new();
+        share.insert("token".into(), json!("tok123abc"));
+        share.insert("bucket".into(), json!("photos"));
+        share.insert("key".into(), json!("a.png"));
+        share.insert("created_by".into(), json!("admin_1"));
+        let seeded = repo::shares::seed(&ctx, share).await.expect("seed share");
+
+        let body =
+            output_html(cloudstorage_page(&ctx, &admin_msg("retrieve", "/b/cloudstorage/")).await)
+                .await;
+
+        // The value the kebab hands `revokeShare`, read off the page.
+        let attr = format!("{}=\"", revoke_id_attribute());
+        let at = body.find(&attr).unwrap_or_else(|| {
+            panic!("the shares table renders no `{attr}` for the kebab to read: {body}")
+        }) + attr.len();
+        let revoke_key = &body[at..at + body[at..].find('"').expect("attribute value ends")];
+
+        let msg = routed(auth_msg("delete", &revoke_url(revoke_key), "admin_1"));
+        let out = cloud::handle_delete_share(&ctx, &msg).await;
+
+        assert_eq!(
+            output_json(out).await["deleted"],
+            json!(true),
+            "the value the revoke button carries must address the share on the delete route"
+        );
+        assert!(
+            repo::shares::find_by_id(&ctx, &seeded.id).await.is_err(),
+            "the share must be gone after the button's request"
+        );
     }
 
     #[tokio::test]
