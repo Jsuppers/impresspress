@@ -157,8 +157,13 @@ impl NewVariable {
     ///
     /// It does NOT cover a key the build has never heard of: it raises from the
     /// declaration or the suffix, and an ad hoc key is neither. That case is
-    /// [`VariablePatch::into_new`]'s default, which is the create path an
-    /// admin PUT takes.
+    /// [`VariablePatch::into_new`]'s default, which is how both write surfaces
+    /// that create a row for a key they were merely handed reach this
+    /// function: the admin PUT ([`upsert_by_key`]) and [`set`]'s create branch,
+    /// which is what `blocks::config`'s `CONFIG_SET` writes through. A caller
+    /// that builds a [`NewVariable`] itself — [`seed_if_absent`], seeding a key
+    /// it chose — is stating the flag rather than omitting it, and keeps what
+    /// it stated.
     pub fn into_row(self) -> VariableRow {
         let now = crate::util::now_rfc3339();
         let sensitive = self.sensitive || crate::config_vars::is_sensitive_for_storage(&self.key);
@@ -232,6 +237,12 @@ impl VariablePatch {
     ///
     /// A caller that means it still wins by saying so — `dev::seed::record_failure`
     /// passes an explicit `Some(false)` for its diagnostic row.
+    ///
+    /// [`set_with_row`]'s create branch builds one of these too, so
+    /// `blocks::config`'s `CONFIG_SET` and the admin PUT create a row by the
+    /// same rule. Its `sensitive` argument is a floor rather than an assertion
+    /// — `false` there means the caller has nothing to say and takes this
+    /// default — which is why it maps to `None` and not to `Some(false)`.
     fn into_new(self, key: &str) -> NewVariable {
         NewVariable {
             key: key.to_string(),
@@ -741,16 +752,25 @@ async fn set_with_row(
     existing: Option<VariableRow>,
 ) -> Result<Wrote, String> {
     let Some(existing) = existing else {
-        let row = NewVariable {
-            key: key.to_string(),
-            value: value.to_string(),
-            name: name.to_string(),
-            description: description.to_string(),
-            warning: String::new(),
-            sensitive,
-            updated_by: updated_by.unwrap_or_default().to_string(),
-            block: block_for_key(key),
+        // Through [`VariablePatch::into_new`], the shared create default, so
+        // this path protects an undeclared ad hoc key exactly as the admin PUT
+        // does. `sensitive` is a FLOOR here, not an assertion: every caller
+        // that reaches this branch passes `false` when it simply has nothing to
+        // say about the key — `seed_and_load`'s env loop says so in as many
+        // words, and `blocks::config`'s `CONFIG_SET` passes the stored row's
+        // flag, which for a key with no row is `false` — so `false` must mean
+        // "unset" and take the default rather than assert "publishable".
+        // `NewVariable::into_row` then raises from the declaration and the
+        // `_SECRET`/`_KEY` suffix on top, as it does for every other creator.
+        let row = VariablePatch {
+            value: Some(value.to_string()),
+            name: Some(name.to_string()),
+            description: Some(description.to_string()),
+            sensitive: sensitive.then_some(true),
+            updated_by: Some(updated_by.unwrap_or_default().to_string()),
+            ..Default::default()
         }
+        .into_new(key)
         .into_row();
         db.create(TABLE, row.to_data())
             .await

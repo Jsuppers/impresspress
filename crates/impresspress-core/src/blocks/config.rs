@@ -271,24 +271,19 @@ impl VariablesConfigBlock {
         // deliberately covering more than this guard does because it cannot
         // read the flag this one reads.
         //
-        // KNOWN GAP, recorded rather than fixed: the parity stops at the
-        // create path. `variables::set`'s create branch builds its own
-        // `NewVariable` and so bypasses `VariablePatch::into_new`, which is
-        // where `is_sensitive_by_default_when_created` protects an undeclared,
-        // suffix-less ad hoc key. A `config.set` creating one therefore stores
-        // it unflagged where the admin PUT would flag it.
-        //
-        // Not reachable through THIS operation's only caller: every var
-        // `ui::settings_form` renders comes from a `ConfigVar` allowlist, and a
-        // declared key is settled by `into_row`. Note that "declared" has to
-        // mean what `config_vars::collect_all_config_vars` says it means —
+        // The parity covers the create path too: `variables::set`'s create
+        // branch builds its row through `VariablePatch::into_new`, so a
+        // `config.set` that creates an undeclared, suffix-less ad hoc key
+        // stores it flagged exactly as the admin PUT would — this operation is
+        // reachable by any block, and a key nothing declares is one nothing
+        // here can vouch for. Note that "declared" has to mean what
+        // `config_vars::collect_all_config_vars` says it means —
         // `auth_ui::pages::settings` renders
         // `auth::config::auth_identity_config_vars`, which belongs to no
         // `BlockInfo`, and an earlier version of that collector missed them and
-        // so called two ordinary admin toggles ad hoc. The gap is latent
-        // because of the allowlist, not because nothing undeclared can reach a
-        // settings form. The
-        // runtime-owned refusal below is deliberately NOT symmetric: this
+        // so called two ordinary admin toggles ad hoc.
+        //
+        // The runtime-owned refusal below is deliberately NOT symmetric: this
         // surface refuses the JWT secret (no caller legitimately writes it
         // here — `ui::settings_form` writes declared block and shared vars
         // only), while the admin variables API accepts it, because on native
@@ -928,6 +923,59 @@ mod boot_owned_key_tests {
                 .expect("the row is still there")
                 .value,
             crate::util::MASKED_VALUE,
+        );
+    }
+
+    /// A row this operation CREATES for a key nothing declares is stored
+    /// sensitive, exactly as `PATCH /b/admin/api/settings/{key}` would store
+    /// it.
+    ///
+    /// `CONFIG_SET` is reachable by any block through
+    /// `wafer_core::clients::config::set`, and about an undeclared,
+    /// suffix-less key the build knows nothing — so the create default has to
+    /// be the protective one on this surface too. It used to build its own
+    /// `NewVariable`, which raises the flag only from the declaration or the
+    /// `_SECRET`/`_KEY` spelling, so the same ad hoc key was masked when
+    /// created through the admin API and published when created here.
+    #[tokio::test]
+    async fn config_set_creating_an_undeclared_key_stores_it_sensitive() {
+        const KEY: &str = "WAFER_RUN_SHARED__MY_SERVICE_TOKEN";
+        let ctx = booted_with(&[]).await;
+
+        wafer_core::clients::config::set(&ctx, KEY, "ad-hoc-value")
+            .await
+            .expect("an undeclared key is storable config");
+
+        assert!(
+            variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row was created")
+                .sensitive,
+            "a key no `ConfigVar` declares must be created flagged: nothing here \
+             knows what it holds, and the admin PUT already protects it"
+        );
+    }
+
+    /// …and the default does not spill onto a key the build DOES know is
+    /// plain: a declared, non-`Password` var is still created unflagged, so it
+    /// stays readable in the settings API and exportable in a seed bundle.
+    #[tokio::test]
+    async fn config_set_creating_a_declared_plain_key_stores_it_unflagged() {
+        const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+        let ctx = booted_with(&[]).await;
+
+        wafer_core::clients::config::set(&ctx, KEY, "Acme")
+            .await
+            .expect("a declared shared var is storable config");
+
+        assert!(
+            !variables::get_by_key(&ctx, KEY)
+                .await
+                .expect("read back")
+                .expect("the row was created")
+                .sensitive,
+            "a declared plain var must not be masked by the ad hoc default"
         );
     }
 
