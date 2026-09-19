@@ -81,6 +81,29 @@ pub fn config_into_row(cfg: ProviderConfig) -> HashMap<String, serde_json::Value
     row
 }
 
+/// Encode only the `models` column, for the discovery path.
+///
+/// `db::update` builds its `SET` list from the keys it is handed, so a
+/// one-key map is a one-column write. Discovery learns nothing about a
+/// provider except its model list, and it learns it across an await on the
+/// provider's own HTTP endpoint — re-encoding the whole config there would
+/// write every other column back at the value it held *before* that await,
+/// undoing a concurrent edit to any of them.
+pub fn models_row(models: &[String]) -> HashMap<String, serde_json::Value> {
+    let mut row = HashMap::new();
+    row.insert(
+        "models".to_string(),
+        serde_json::Value::Array(
+            models
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    row
+}
+
 /// Decode a database [`Record`] into a [`ProviderConfig`].
 ///
 /// The returned `api_key` is always `None` — the reload path

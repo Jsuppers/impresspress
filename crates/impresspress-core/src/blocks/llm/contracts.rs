@@ -207,8 +207,10 @@ pub struct CreateProviderRequest {
 // for the same reason: an inline `api_key` on the patch must be refused by
 // name, not dropped.
 /// `PATCH /b/llm/api/providers/{id}` request body. Every field is optional
-/// and only the ones present are applied. An empty `key_var` clears the
-/// variable; an empty `name` or `endpoint` is ignored.
+/// and only the ones present are applied. The two fields a provider can hold
+/// as `null` — `key_var` and `max_tokens_field` — are cleared by sending
+/// `null` (`key_var` also by an empty string); an empty `name` or `endpoint`
+/// is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateProviderRequest {
@@ -216,18 +218,30 @@ pub struct UpdateProviderRequest {
     pub protocol: Option<ProviderProtocol>,
     /// Re-validated on every change: must resolve to a public address.
     pub endpoint: Option<String>,
-    pub key_var: Option<String>,
-    // The one field on this body where a present `null` differs from an
-    // absent key: `null` unsets the override, absent leaves it alone. The
-    // schema is that of the value being patched, `MaxTokensField | null` —
-    // the extra `Option` is how Rust holds "was it sent at all", not a second
-    // level of nesting on the wire.
-    /// Which field carries the output-token budget, or `null` to go back to
-    /// the one `protocol` implies.
+    // `key_var` and `max_tokens_field` are the two fields on this body where a
+    // present `null` differs from an absent key, because they are the two the
+    // provider itself can hold as `null` and so the two an admin has to be
+    // able to clear. Both take the same `present_as_some` treatment rather
+    // than one convention each: the schema stays that of the value being
+    // patched (`string | null`, `MaxTokensField | null`) and the extra
+    // `Option` is how Rust holds "was it sent at all", not a second level of
+    // nesting on the wire. The remaining fields are not nullable on a
+    // provider, so for them `null` and absent mean the same thing.
     //
     // `skip_serializing_if` keeps the derived `Serialize` telling the same
     // story: an absent field stays absent rather than going back out as the
     // `null` that means "clear it".
+    /// Name of the admin configuration variable holding the API key, or
+    /// `null` (or `""`) to leave the provider unauthenticated.
+    #[serde(
+        default,
+        deserialize_with = "present_as_some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub key_var: Option<Option<String>>,
+    /// Which field carries the output-token budget, or `null` to go back to
+    /// the one `protocol` implies.
     #[serde(
         default,
         deserialize_with = "present_as_some",

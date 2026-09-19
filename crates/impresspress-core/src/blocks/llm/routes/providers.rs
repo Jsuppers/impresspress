@@ -34,7 +34,7 @@ use crate::{
             },
             provider_admin::ProviderAdmin,
             providers::config::ProviderConfig,
-            schema::{config_to_row, row_to_config, TABLE as PROVIDERS_TABLE},
+            schema::{config_to_row, models_row, row_to_config, TABLE as PROVIDERS_TABLE},
             LlmBlock,
         },
     },
@@ -271,12 +271,17 @@ fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, Strin
 /// field, so `providers::anthropic`'s encoder never reads the override.
 /// Storing one there would be a setting an admin can see in the row and on
 /// `GET /b/llm/api/providers` and that changes nothing on the wire, which is
-/// worth a 400 rather than a shrug.
+/// worth a 400 rather than a shrug. Both call sites check the configuration
+/// they are about to store — on the patch route that is the *patched* one — so
+/// the message names the way out an admin actually has: clearing the override
+/// in the very request that switches the protocol is accepted.
 fn check_max_tokens_field(cfg: &ProviderConfig) -> Result<(), String> {
     match cfg.max_tokens_field {
         Some(field) if !cfg.protocol.accepts_max_tokens_field() => Err(format!(
             "`max_tokens_field` ({}) does not apply to the `{}` protocol: its \
-             request body has a single budget field",
+             request body has a single budget field — omit the field, or send \
+             `\"max_tokens_field\": null` in this same request to clear an \
+             override the row already holds",
             field.as_str(),
             cfg.protocol.as_str()
         )),
@@ -399,11 +404,14 @@ pub(in crate::blocks::llm) async fn update_provider(
         }
         cfg.endpoint = e;
     }
+    // Both nullable fields: present at all — `null` included — replaces the
+    // stored value; a body that omits the key leaves it alone. An empty
+    // `key_var` string clears it too, which is what it means to the create
+    // form; this route takes JSON only, and the admin page has no edit form.
+    // See `UpdateProviderRequest`.
     if let Some(k) = body.key_var {
-        cfg.key_var = if k.is_empty() { None } else { Some(k) };
+        cfg.key_var = k.filter(|s| !s.is_empty());
     }
-    // Present at all — `null` included — replaces the stored override; a body
-    // that omits the key leaves it alone. See `UpdateProviderRequest`.
     if let Some(f) = body.max_tokens_field {
         cfg.max_tokens_field = f;
     }
@@ -463,6 +471,11 @@ pub(in crate::blocks::llm) async fn delete_provider(
 /// `POST /b/llm/api/providers/:id/discover-models` — call the provider's
 /// `/v1/models` endpoint, persist the discovered list back to the row, and
 /// return the new model list. Admin-only.
+///
+/// The write is a one-column write (`models`, via [`models_row`]) and
+/// not a re-encode of the row this handler read: the provider's HTTP endpoint
+/// is awaited in between, and an admin editing the same provider across that
+/// window would otherwise have their change written back at its stale value.
 pub(in crate::blocks::llm) async fn discover_models(
     block: &LlmBlock,
     ctx: &dyn Context,
@@ -504,7 +517,7 @@ pub(in crate::blocks::llm) async fn discover_models(
     };
     cfg.models = models.into_iter().map(|m| m.model_id).collect();
 
-    let mut data = config_to_row(&cfg);
+    let mut data = models_row(&cfg.models);
     crate::util::stamp_updated(&mut data);
     if let Err(e) = db::update(ctx, PROVIDERS_TABLE, &id, data).await {
         return err_internal("Database error", e);
@@ -1069,6 +1082,172 @@ mod tests {
             stored_rows(&ctx, &block).await[0]["key_var"],
             serde_json::Value::Null,
             "the reply said the variable was cleared; the row has to agree"
+        );
+    }
+
+    /// `key_var` and `max_tokens_field` are the two fields a provider can hold
+    /// as `null`, and they clear the same way: a present `null`. Sending one
+    /// used to be a 200 that changed nothing, which is the worst answer of the
+    /// three available.
+    #[tokio::test]
+    async fn a_null_key_var_clears_it_and_an_absent_one_does_not() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        assert_eq!(created["key_var"], KEY_VAR);
+
+        let untouched = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "enabled": false })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            untouched["key_var"], KEY_VAR,
+            "a patch that does not mention the field must not change it"
+        );
+
+        let cleared = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "key_var": null })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(cleared["key_var"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["key_var"],
+            serde_json::Value::Null,
+            "a present `null` clears the variable in the row, not only in the reply"
+        );
+    }
+
+    /// A `ProviderAdmin` that edits the provider row from *inside*
+    /// `discover_models` — the admin who changes `key_var` between the read at
+    /// the top of the handler and the write at the bottom. `discover_models`
+    /// awaits the provider's HTTP endpoint at exactly this point, so the
+    /// window is real rather than contrived.
+    struct EditsTheRowDuringDiscovery {
+        ctx: std::sync::Mutex<Option<Arc<dyn Context>>>,
+        id: std::sync::Mutex<String>,
+    }
+
+    /// The variable name the concurrent edit sets, distinct from `KEY_VAR` so
+    /// the row can only hold it if the edit survived.
+    const CONCURRENT_KEY_VAR: &str = "IMPRESSPRESS__LLM__ROTATED_KEY";
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl ProviderAdmin for EditsTheRowDuringDiscovery {
+        fn manages_providers(&self) -> bool {
+            true
+        }
+
+        fn configure(&self, _providers: Vec<ProviderConfig>) -> Result<(), LlmError> {
+            Ok(())
+        }
+
+        fn providers_snapshot(&self) -> Vec<ProviderConfig> {
+            Vec::new()
+        }
+
+        async fn discover_models(
+            &self,
+            provider_name: &str,
+        ) -> Result<Vec<wafer_core::interfaces::llm::service::ModelInfo>, LlmError> {
+            let ctx = self
+                .ctx
+                .lock()
+                .expect("ctx lock")
+                .clone()
+                .expect("ctx handed to the fixture");
+            let id = self.id.lock().expect("id lock").clone();
+            let mut data = std::collections::HashMap::new();
+            data.insert(
+                "key_var".to_string(),
+                serde_json::Value::String(CONCURRENT_KEY_VAR.to_string()),
+            );
+            db::update(ctx.as_ref(), PROVIDERS_TABLE, &id, data)
+                .await
+                .expect("concurrent key_var edit");
+            Ok(vec![wafer_core::interfaces::llm::service::ModelInfo::new(
+                provider_name,
+                "gpt-4o",
+                "GPT-4o",
+            )])
+        }
+    }
+
+    /// Discovery learns a model list and nothing else, so it writes one
+    /// column. Re-encoding the whole config would write every other column
+    /// back at the value it held before the provider call, silently reverting
+    /// an edit that landed in that window.
+    #[tokio::test]
+    async fn discovery_does_not_write_back_columns_it_did_not_learn() {
+        let mut ctx = TestContext::with_llm().await;
+        ctx.set_config(KEY_VAR, SECRET);
+        let admin = Arc::new(EditsTheRowDuringDiscovery {
+            ctx: std::sync::Mutex::new(None),
+            id: std::sync::Mutex::new(String::new()),
+        });
+        let block = LlmBlock::new(admin.clone());
+
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        assert_eq!(created["key_var"], KEY_VAR);
+
+        *admin.ctx.lock().expect("ctx lock") = Some(ctx.clone_arc());
+        *admin.id.lock().expect("id lock") = id.clone();
+
+        let discovered = output_json(
+            discover_models(
+                &block,
+                &ctx,
+                &routed(admin_msg(
+                    "create",
+                    &format!("/b/llm/api/providers/{id}/discover-models"),
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(discovered, serde_json::json!({ "models": ["gpt-4o"] }));
+
+        let row = &stored_rows(&ctx, &block).await[0];
+        assert_eq!(
+            row["models"],
+            serde_json::json!(["gpt-4o"]),
+            "the discovered list is the one column discovery does own"
+        );
+        assert_eq!(
+            row["key_var"], CONCURRENT_KEY_VAR,
+            "an edit that landed while the provider was being queried must \
+             survive discovery's write"
         );
     }
 

@@ -3611,6 +3611,10 @@ export interface paths {
                         enabled?: boolean | null;
                         /** @description Re-validated on every change: must resolve to a public address. */
                         endpoint?: string | null;
+                        /**
+                         * @description Name of the admin configuration variable holding the API key, or
+                         *     `null` (or `""`) to leave the provider unauthenticated.
+                         */
                         key_var?: string | null;
                         /**
                          * @description Which field carries the output-token budget, or `null` to go back to

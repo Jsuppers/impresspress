@@ -163,10 +163,10 @@ jobs:
       #
       # `-D warnings` arrives as `RUSTFLAGS` rather than as a `cargo clippy
       # -- -D warnings` step because clippy would have to reach the *lib test*
-      # target, and the only cargo flag that builds it (`--tests`) also builds
-      # the `tests/` integration targets, which assume the default block set
-      # and do not compile here. `RUSTFLAGS` reaches the same lib test target
-      # the run already compiles. It matters: this is the one lane that
+      # target, and every cargo flag that builds it (`--tests`, `--all-targets`)
+      # also builds the `tests/` integration targets, which assume the default
+      # block set and do not compile here. `RUSTFLAGS` reaches the same lib test
+      # target the run already compiles. It matters: this is the one lane that
       # compiles this feature shape, so it is also the one lane where a stale
       # `#[cfg]` or a helper left behind by a gated test is visible at all.
       - name: Test the vector block without the llm backend (no default features)

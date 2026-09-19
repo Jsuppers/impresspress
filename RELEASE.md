@@ -557,6 +557,18 @@ every chat turn came back `400`. Providers now carry an optional
 means "follow the protocol", which is what every configured provider was
 already doing. There is no backfill.
 
+**The provider table has no edit form**, only add / discover / delete, so the
+new field is reachable from the admin page when you *create* a provider. An
+Azure provider that already exists is changed through
+`PATCH /b/llm/api/providers/{id}` (or by re-creating it) until an edit form
+exists.
+
+**One admin-API change to know about if you script against it.** On
+`PATCH /b/llm/api/providers/{id}`, sending `"key_var": null` used to be
+accepted and do nothing; it now clears the variable, the same as the empty
+string already did and the same as `"max_tokens_field": null` does. Omitting
+the key still leaves the stored value alone.
+
 **Upgrade with `--run-migrations`** to add the column. Cloudflare deploys run
 the block's migrations through `/_deploy/init` on every deploy, so a Cloudflare
 deployment gets it without doing anything. A native deployment that skips the
