@@ -208,9 +208,56 @@ pub(in crate::blocks::llm) async fn list_providers(
     ok_json(&ProviderListResponse { providers })
 }
 
+/// Parse the create-provider body as JSON or as the admin page's
+/// URL-encoded form.
+///
+/// A leading `{` is JSON and deserializes into the contract directly, with no
+/// coercions — a string where the schema says array or bool is a 400, as the
+/// published schema promises. Anything else is a form body: the add-provider
+/// form is a plain htmx `hx-post`, so it sends
+/// `application/x-www-form-urlencoded` and every field arrives as a string.
+///
+/// The form values that are not strings in the contract are coerced here, and
+/// only here: `models` is one comma-separated text input, and `enabled` is a
+/// checkbox, which posts nothing at all when the admin unticks it. The rest
+/// of the map is handed to serde untouched, so `deny_unknown_fields` still
+/// refuses an `api_key` by name on the form path too — which is the whole
+/// point of that attribute (see [`CreateProviderRequest`]).
+fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, String> {
+    if raw.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
+        return serde_json::from_slice(raw).map_err(|e| format!("Invalid body: {e}"));
+    }
+    let form = crate::util::parse_form_body(raw);
+    let mut fields = serde_json::Map::new();
+    for (key, value) in &form {
+        if key == "models" || key == "enabled" {
+            continue;
+        }
+        fields.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+    if let Some(models) = form.get("models") {
+        let models: Vec<serde_json::Value> = models
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| serde_json::Value::String(m.to_string()))
+            .collect();
+        fields.insert("models".to_string(), serde_json::Value::Array(models));
+    }
+    fields.insert(
+        "enabled".to_string(),
+        serde_json::Value::Bool(crate::config_vars::form_bool(&form, "enabled")),
+    );
+    serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|e| format!("Invalid body: {e}"))
+}
+
 /// `POST /b/llm/api/providers` — create. The typed body requires `name`,
 /// `protocol` (one of the `ProviderProtocol` tokens) and `endpoint`;
 /// `key_var`, `models`, `enabled` are optional. Admin-only.
+///
+/// Accepts the admin page's form body as well as JSON — see
+/// [`parse_create_provider_body`].
 pub(in crate::blocks::llm) async fn create_provider(
     block: &LlmBlock,
     ctx: &dyn Context,
@@ -224,9 +271,9 @@ pub(in crate::blocks::llm) async fn create_provider(
     }
 
     let raw = input.collect_to_bytes().await;
-    let body: CreateProviderRequest = match serde_json::from_slice(&raw) {
+    let body: CreateProviderRequest = match parse_create_provider_body(&raw) {
         Ok(b) => b,
-        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+        Err(e) => return err_bad_request(&e),
     };
 
     // Presence is enforced by the type; emptiness still has to be, because
@@ -1310,5 +1357,151 @@ mod discovery_error_shape_tests {
             e.message
         );
         assert!(!e.message.contains("internal.corp"), "{}", e.message);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the add-provider form's own bytes.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod form_body_tests {
+    //! The add-provider form on `/b/llm/providers` is a plain htmx `hx-post`,
+    //! so every submit arrives as `application/x-www-form-urlencoded` with
+    //! every field a string. These tests post those bytes — percent-encoded,
+    //! `+` for space — rather than a Rust struct serialized to JSON, because
+    //! the difference between the two is the whole bug.
+
+    use std::sync::Arc;
+
+    use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
+
+    use super::*;
+    use crate::{
+        blocks::llm::{routes::test_support::admin_msg, LlmBlock},
+        test_support::{output_json, TestContext},
+    };
+
+    /// The block whose provider-admin handle manages providers, over a
+    /// context with the llm migrations applied.
+    async fn fixture() -> (TestContext, LlmBlock) {
+        let ctx = TestContext::with_llm().await;
+        let block = LlmBlock::new(Arc::new(
+            crate::blocks::llm::routes::test_support::RecordingProviderAdmin::default(),
+        ));
+        (ctx, block)
+    }
+
+    /// The exact body htmx builds from the rendered form when the admin fills
+    /// in every field and leaves the "Enabled" box ticked. `enabled=true` is
+    /// the checkbox's own `value` attribute; the endpoint is percent-encoded
+    /// as a browser encodes it.
+    const TICKED_FORM: &str = "name=openai-main&protocol=open_ai\
+&endpoint=https%3A%2F%2Fapi.openai.com%2Fv1\
+&key_var=IMPRESSPRESS__LLM__OPENAI_KEY\
+&models=gpt-4o%2C+gpt-4o-mini\
+&enabled=true";
+
+    async fn create_from_form(body: &str) -> OutputStream {
+        let (ctx, block) = fixture().await;
+        create_provider(
+            &block,
+            &ctx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            InputStream::from_bytes(body.as_bytes().to_vec()),
+        )
+        .await
+    }
+
+    async fn refusal(out: OutputStream) -> (ErrorCode, String) {
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => (e.code, e.message),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_form_submit_creates_the_provider() {
+        let created = output_json(create_from_form(TICKED_FORM).await).await;
+
+        assert_eq!(created["name"], "openai-main");
+        assert_eq!(created["protocol"], "open_ai");
+        assert_eq!(
+            created["endpoint"], "https://api.openai.com/v1",
+            "the endpoint must be form-decoded"
+        );
+        assert_eq!(created["key_var"], "IMPRESSPRESS__LLM__OPENAI_KEY");
+        assert_eq!(
+            created["models"],
+            serde_json::json!(["gpt-4o", "gpt-4o-mini"]),
+            "the one comma-separated text input becomes the contract's array"
+        );
+        assert_eq!(created["enabled"], true);
+    }
+
+    /// An unticked checkbox posts nothing at all, which is the only way the
+    /// form can say "disabled" — reading an absent `enabled` as the
+    /// contract's `true` default would ignore the admin.
+    #[tokio::test]
+    async fn an_unticked_enabled_box_disables_the_provider() {
+        let body = TICKED_FORM
+            .strip_suffix("&enabled=true")
+            .expect("the ticked body ends with the checkbox");
+        let created = output_json(create_from_form(body).await).await;
+        assert_eq!(created["enabled"], false);
+    }
+
+    /// The models input is optional: the form hint tells the admin to leave
+    /// it empty and use "Discover models" instead, and an empty text input
+    /// still posts its (empty) value.
+    #[tokio::test]
+    async fn an_empty_models_input_is_no_models() {
+        let body = TICKED_FORM.replace("models=gpt-4o%2C+gpt-4o-mini", "models=");
+        let created = output_json(create_from_form(&body).await).await;
+        assert_eq!(created["models"], serde_json::json!([]));
+    }
+
+    /// `deny_unknown_fields` is on `CreateProviderRequest` so an inline
+    /// `api_key` is refused by name rather than silently dropped. The form
+    /// path builds the same typed body, so it inherits that refusal — a form
+    /// path that assembled the struct field by field would not.
+    #[tokio::test]
+    async fn a_form_body_cannot_smuggle_an_inline_api_key() {
+        let body = format!("{TICKED_FORM}&api_key=sk-live-should-be-refused");
+        let (code, message) = refusal(create_from_form(&body).await).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("api_key"),
+            "the refusal must name the field, got: {message}"
+        );
+    }
+
+    /// The enum still types `protocol` on the form path, so a wrong token is
+    /// refused with the list of accepted ones rather than stored.
+    #[tokio::test]
+    async fn a_form_body_with_an_unknown_protocol_is_refused() {
+        let body = TICKED_FORM.replace("protocol=open_ai", "protocol=openai");
+        let (code, message) = refusal(create_from_form(&body).await).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("open_ai_compatible"),
+            "the refusal must name the accepted values, got: {message}"
+        );
+    }
+
+    /// SSRF validation is on the value, not on the encoding: the same gate
+    /// the JSON path passes through runs for a form-encoded endpoint.
+    #[tokio::test]
+    async fn a_form_body_cannot_point_at_internal_infrastructure() {
+        let body = TICKED_FORM.replace(
+            "endpoint=https%3A%2F%2Fapi.openai.com%2Fv1",
+            "endpoint=https%3A%2F%2F169.254.169.254%2Flatest",
+        );
+        let (code, message) = refusal(create_from_form(&body).await).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("endpoint"),
+            "the refusal must name the field, got: {message}"
+        );
     }
 }

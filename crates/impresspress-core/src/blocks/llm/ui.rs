@@ -86,9 +86,8 @@ pub(super) async fn providers_page(
         ))
 
         @if manages {
-            // Add-provider form. Posts JSON via htmx json-enc so the existing
-            // `POST /b/llm/api/providers` handler accepts the body without any
-            // form-urlencoded translation layer.
+            // Add-provider form. Posts `application/x-www-form-urlencoded`,
+            // which `POST /b/llm/api/providers` accepts alongside JSON.
             div .card .mb-6 {
                 h3 .card-title .mb-3 { "Add provider" }
                 (add_provider_form())
@@ -142,11 +141,19 @@ fn cannot_manage_providers_notice() -> Markup {
 /// Render the add-provider form. Separated out so the top-level page
 /// composition stays flat and the form markup is swappable without editing
 /// the outer shell.
+///
+/// A plain htmx form: it posts `application/x-www-form-urlencoded`, which is
+/// what the handler parses. Nothing here reshapes the body in the browser —
+/// the `models` text input and the `enabled` checkbox are coerced by
+/// `routes::providers::parse_create_provider_body`, so a submit with
+/// JavaScript disabled carries the same meaning as one without.
+///
+/// `hx-swap="none"` because the response is the created provider as JSON for
+/// SDK callers; the page picks up the new row by reloading.
 fn add_provider_form() -> Markup {
     html! {
         form
             hx-post="/b/llm/api/providers"
-            hx-ext="json-enc"
             hx-target="body"
             hx-swap="none"
             hx-on--after-request="if(event.detail.successful){location.reload()}"
@@ -194,10 +201,8 @@ fn add_provider_form() -> Markup {
                 }
                 div .form-group .col-span-full {
                     label .form-label for="new-models" { "Models (comma-separated)" }
-                    // htmx's json-enc extension turns this into a plain string;
-                    // the server expects a JSON array, so we transform on
-                    // submit via the form's `hx-on::config-request` hook
-                    // below. Bare form post keeps the control accessible.
+                    // One text input; the handler splits it into the contract's
+                    // `models` array.
                     input
                         .form-input
                         type="text"
@@ -218,34 +223,9 @@ fn add_provider_form() -> Markup {
             div .flex .justify-end .mt-3 {
                 button .btn.btn--primary type="submit" { "Add provider" }
             }
-            // Normalize `models` CSV → JSON array, and coerce `enabled`
-            // checkbox to a bool before htmx serialises. Both transforms
-            // live on `htmx:config-request` so json-enc sees the final
-            // shape. No DOM surgery — just dict mutation on the event.
-            script {
-                (maud::PreEscaped(ADD_PROVIDER_JS))
-            }
         }
     }
 }
-
-/// `htmx:config-request` hook that normalises the add-provider form body.
-///
-/// `htmx json-enc` serialises form fields verbatim: `models` arrives as
-/// a CSV string and `enabled` as either `"true"` or `undefined`. The
-/// server wants `models: string[]` and `enabled: bool`, so we transform
-/// in place before the request is sent. Keeps the JSON contract consistent
-/// with the `/api/providers` handler without adding server-side
-/// translation.
-const ADD_PROVIDER_JS: &str = r#"
-document.currentScript.closest('form').addEventListener('htmx:configRequest', function(ev) {
-    var p = ev.detail.parameters;
-    if (typeof p.models === 'string') {
-        p.models = p.models.split(',').map(function(s){return s.trim();}).filter(Boolean);
-    }
-    p.enabled = (p.enabled === 'true' || p.enabled === true || p.enabled === 'on');
-});
-"#;
 
 /// Render the providers table. Pure function of the loaded configs — used
 /// directly by `providers_page` and by the unit tests that assert shape.
