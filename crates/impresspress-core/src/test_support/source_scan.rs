@@ -8,10 +8,11 @@
 //! `.rs` file under a root, and a view of that file with its prose removed so
 //! a gate's own explanation of what it bans is not itself a violation.
 //!
-//! Those two things were written out four times, once per gate, with four
-//! slightly different sets of bugs available to them. This module is the
-//! single copy. A gate states its root and its exemptions and gets back
-//! [`SourceFile`]s; it picks a comment policy from the two below.
+//! The walk was written out four times, once per gate, and the comment
+//! stripper three times, with independent sets of bugs available to each.
+//! This module is the single copy. A gate states its root and its exemptions
+//! and gets back [`SourceFile`]s; it picks a comment policy from the two
+//! below.
 //!
 //! ## Why there are two comment policies and not one
 //!
@@ -29,11 +30,15 @@
 //! counted it would fail on every line of documentation that names the
 //! function it bans.
 //!
-//! Neither is a Rust parser. A `//` inside a string literal ends the line for
-//! [`code_before_comment`], and a block comment (`/* .. */`) is invisible to
-//! both. Every gate here matches tokens that would be flagged, at worst,
-//! one line too few — stated so the limit is written down rather than
-//! implied.
+//! Neither comment policy is a Rust parser. A `//` inside a string literal
+//! ends the line for [`code_before_comment`], and a block comment (`/* .. */`)
+//! is invisible to both. Both err the same way — a gate matching a token sees
+//! at worst one line too few, so it can only under-report, never invent a
+//! violation.
+//!
+//! [`strip_test_modules`] does not get that luxury and so does lex: its
+//! mistakes delete production code from the haystack, which is silent. Its doc
+//! says why, and which direction is dangerous.
 
 use std::{
     fs,
@@ -170,17 +175,328 @@ pub fn code_before_comment(line: &str) -> &str {
     line.split("//").next().unwrap_or(line)
 }
 
-/// `src` up to its first `#[cfg(test)]` attribute.
+/// `src` with every `#[cfg(test)]` item removed, and the production code
+/// around them kept.
 ///
-/// A test asserting on a shape is not a handler producing it. Truncating —
-/// rather than tracking braces — is the honest version: the attribute is
-/// always the last thing in these files, and a gate that guessed at nesting
-/// would be a second, worse Rust parser.
+/// A test asserting on a shape is not a handler producing it, so a gate over
+/// production code has to drop the test modules. What it must not do is drop
+/// everything *after* the first one: `#[cfg(test)]` is not only the trailing
+/// `mod tests`. In seventeen files of this crate the first one sits on a `use`
+/// (`blocks/files/mod.rs`), a `pub(in ..) mod test_support;`
+/// (`blocks/llm/routes/mod.rs`), a `thread_local!` (`config_generation.rs`), a
+/// fixture `const` (`ui/components/badge.rs`) or a `pub(crate)`/`pub`/
+/// `pub(super)` fixture fn. A gate that truncated there saw 15 of
+/// `blocks/products/mod.rs`'s 422 lines and 621 of
+/// `blocks/products/repo/purchases.rs`'s 2203 — 3,466 lines of block code
+/// across `src/blocks` that the error door examines now and could not before.
+/// (That figure is the gate's own view: `strip_line_comments` over this
+/// function's output, minus the same over a truncating one, summed across the
+/// 284 files it walks. Counted on the raw text, before comments are dropped,
+/// the same difference is 4,851 lines.)
+///
+/// So the attribute is followed to the end of the item it applies to: a
+/// braced item ends when its braces balance, an unbraced one at its `;`. The
+/// scan starts at the text *after* the attribute on its own line, not at the
+/// next line, so a single-line `#[cfg(test)] mod tests { .. }` ends on that
+/// line instead of opening a hunt that eats the production code below it.
+///
+/// ## Why the braces are lexed and not just counted
+///
+/// Counting `{` and `}` in the raw text is wrong in two directions, and they
+/// are not equally harmful:
+///
+/// * A stray `}` — `"}"`, `'}'`, or one in a doc comment — balances the item
+///   early, so the scan resumes inside the test module and keeps its remaining
+///   lines. The gate then sees test code as production and can only report
+///   *more* than it should. That is a false failure: loud, and self-correcting.
+/// * A stray `{` never balances, so the scan runs to end of file and drops
+///   every production line below it. The gate sees *less* than it should and
+///   goes quiet — the identical silent blindness this function exists to fix,
+///   just arrived at from the other side.
+///
+/// The second is not hypothetical here: seven files in this crate
+/// (`ui/mod.rs`, `ui/assets.rs`, `util.rs`, `kv.rs`, `blocks/dev/page.rs`,
+/// `blocks/dev/workspace.rs`, `blocks/llm/routes/chat.rs`) have an unbalanced
+/// brace inside a string in their test module. Today each of those modules is
+/// the file's last item, so running to end of file happens to lose nothing —
+/// the bug is live but currently harmless, which is the worst state to leave
+/// it in, because it becomes real the moment someone adds a function below.
+///
+/// So [`code_braces`] lexes instead: it skips braces inside line and block
+/// comments (block comments nest, as they do in Rust), string literals, raw
+/// strings of any hash count, and char literals — distinguishing `'{'` from a
+/// lifetime. [`tests::no_file_in_this_crate_is_stripped_to_end_of_file`] then
+/// holds over the real tree, which is what makes that a checked claim.
 pub fn strip_test_modules(src: &str) -> String {
-    src.lines()
-        .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let (kept, _) = strip_test_modules_reporting(src);
+    kept
+}
+
+/// [`strip_test_modules`], plus whether any item ran to end of file without
+/// its braces balancing — the over-strip direction, which is silent.
+fn strip_test_modules_reporting(src: &str) -> (String, bool) {
+    let lines: Vec<&str> = src.lines().collect();
+    let braces = code_braces(src);
+    let mut kept: Vec<&str> = Vec::new();
+    let mut ran_off_the_end = false;
+    let mut at = 0;
+    while at < lines.len() {
+        let Some(tail_col) = test_only_attr_tail(lines[at]).map(|t| lines[at].len() - t.len())
+        else {
+            kept.push(lines[at]);
+            at += 1;
+            continue;
+        };
+        // Start on the attribute's OWN line, at the text after it. An attribute
+        // alone on its line contributes nothing and the scan moves on; an item
+        // written inline is closed by this first segment.
+        let mut from = tail_col;
+        let mut depth: i32 = 0;
+        let mut braced = false;
+        let mut closed = false;
+        loop {
+            for (_, delta) in braces[at].iter().filter(|(col, _)| *col >= from) {
+                depth += delta;
+                braced |= *delta > 0;
+            }
+            if braced && depth <= 0 {
+                closed = true;
+                at += 1;
+                break;
+            }
+            let unbraced_end = !braced && lines[at][from..].trim_end().ends_with(';');
+            at += 1;
+            if unbraced_end {
+                closed = true;
+                break;
+            }
+            if at >= lines.len() {
+                break;
+            }
+            from = 0;
+        }
+        ran_off_the_end |= !closed && braced;
+    }
+    (kept.join("\n"), ran_off_the_end)
+}
+
+/// Every brace that is really code, as `(byte column, +1 | -1)` per line.
+///
+/// Braces inside line comments, (nesting) block comments, string literals, raw
+/// strings and char literals are not code and are left out. See
+/// [`strip_test_modules`] for why counting them instead is a live bug.
+fn code_braces(src: &str) -> Vec<Vec<(usize, i32)>> {
+    enum Lex {
+        Code,
+        Line,
+        Block(u32),
+        Str,
+        Raw(usize),
+        Ch,
+    }
+
+    let b = src.as_bytes();
+    let mut out: Vec<Vec<(usize, i32)>> = vec![Vec::new(); src.lines().count().max(1)];
+    let (mut i, mut line, mut col) = (0usize, 0usize, 0usize);
+    let mut state = Lex::Code;
+    // Advance over an escape pair without letting it swallow a newline.
+    macro_rules! skip_escape {
+        () => {{
+            if b.get(i + 1) == Some(&b'\n') {
+                line += 1;
+                col = 0;
+                i += 2;
+            } else {
+                i += 2;
+                col += 2;
+            }
+            continue;
+        }};
+    }
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\n' {
+            if matches!(state, Lex::Line) {
+                state = Lex::Code;
+            }
+            line += 1;
+            col = 0;
+            i += 1;
+            continue;
+        }
+        match state {
+            Lex::Code => {
+                if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                    state = Lex::Line;
+                } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                    state = Lex::Block(1);
+                } else if c == b'"' {
+                    state = Lex::Str;
+                } else if c == b'r' {
+                    let mut j = i + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'"') {
+                        state = Lex::Raw(j - i - 1);
+                        col += j + 1 - i;
+                        i = j + 1;
+                        continue;
+                    }
+                } else if c == b'\'' && is_char_literal(b, i) {
+                    state = Lex::Ch;
+                } else if c == b'{' || c == b'}' {
+                    out[line].push((col, if c == b'{' { 1 } else { -1 }));
+                }
+                // The two-byte openers above consume their second byte here.
+                if matches!(state, Lex::Line | Lex::Block(_)) {
+                    i += 2;
+                    col += 2;
+                    continue;
+                }
+            }
+            Lex::Line => {}
+            Lex::Block(d) => {
+                if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                    state = Lex::Block(d + 1);
+                    i += 2;
+                    col += 2;
+                    continue;
+                }
+                if c == b'*' && b.get(i + 1) == Some(&b'/') {
+                    state = if d == 1 { Lex::Code } else { Lex::Block(d - 1) };
+                    i += 2;
+                    col += 2;
+                    continue;
+                }
+            }
+            Lex::Str => {
+                if c == b'\\' {
+                    skip_escape!();
+                }
+                if c == b'"' {
+                    state = Lex::Code;
+                }
+            }
+            Lex::Raw(hashes) => {
+                if c == b'"' {
+                    let mut j = i + 1;
+                    let mut seen = 0;
+                    while seen < hashes && b.get(j) == Some(&b'#') {
+                        j += 1;
+                        seen += 1;
+                    }
+                    if seen == hashes {
+                        state = Lex::Code;
+                        col += j - i;
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            Lex::Ch => {
+                if c == b'\\' {
+                    skip_escape!();
+                }
+                if c == b'\'' {
+                    state = Lex::Code;
+                }
+            }
+        }
+        i += 1;
+        col += 1;
+    }
+    out
+}
+
+/// Does the `'` at `i` open a char literal rather than a lifetime?
+///
+/// `'{'` is a brace that must not be counted; `'a` in `&'a str` is not a
+/// literal at all. A lifetime never starts with a backslash, and a one-char
+/// literal always has its closing quote two bytes along.
+fn is_char_literal(b: &[u8], i: usize) -> bool {
+    match b.get(i + 1) {
+        Some(b'\\') => true,
+        Some(_) => b.get(i + 2) == Some(&b'\''),
+        None => false,
+    }
+}
+
+/// The text after a `#[cfg(..)]` on this line, if the attribute's predicate is
+/// false whenever `test` is false — i.e. the item it applies to is compiled
+/// *only* under `cfg(test)`.
+///
+/// That is a narrower rule than "a cfg mentioning `test`", deliberately.
+/// `#[cfg(all(test, feature = "llm"))]` (`blocks/llm/providers/mod.rs`) is
+/// test-only and is stripped. `#[cfg(any(feature = "postgres", test))]` is
+/// **not**: those 25 items and the one `#[cfg(any(feature = "block-dev",
+/// test))]` compile into the real `--features postgres` / `--features
+/// block-dev` builds, which is what CI's "Tests (postgres feature)" job builds.
+/// Stripping them would hide 26 pieces of live repo code from every gate here
+/// — the blindness this module exists to remove, reintroduced by a matcher
+/// that was merely more generous.
+fn test_only_attr_tail(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("#[cfg(")?;
+    let close = matching_paren(rest)?;
+    let tail = rest[close + 1..].strip_prefix(']')?;
+    is_test_only(&rest[..close]).then_some(tail)
+}
+
+/// The index in `s` of the `)` closing an already-open `(`.
+fn matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Is this `cfg` predicate false whenever `test` is false?
+///
+/// True for `test` and for an `all(..)` with a test-only operand. Everything
+/// else — `any(..)`, `not(..)`, a bare `feature = ".."` — is not, because the
+/// item can be compiled without `cfg(test)`.
+fn is_test_only(pred: &str) -> bool {
+    let pred = pred.trim();
+    if pred == "test" {
+        return true;
+    }
+    match pred
+        .strip_prefix("all(")
+        .and_then(|inner| Some(&inner[..matching_paren(inner)?]))
+    {
+        Some(inner) => top_level_operands(inner).any(is_test_only),
+        None => false,
+    }
+}
+
+/// Split a predicate list on its depth-zero commas.
+fn top_level_operands(inner: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut out = Vec::new();
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&inner[start..]);
+    out.into_iter()
 }
 
 #[cfg(test)]
@@ -204,9 +520,77 @@ mod tests {
     }
 
     #[test]
-    fn strip_test_modules_cuts_at_the_attribute() {
+    fn strip_test_modules_drops_the_module_and_keeps_the_rest() {
         let src = "pub fn f() {}\n\n#[cfg(test)]\nmod tests {\n    fn g() {}\n}\n";
         assert_eq!(strip_test_modules(src), "pub fn f() {}\n");
+    }
+
+    /// The whole reason this is not a truncation: production code lives after
+    /// a `#[cfg(test)]` item in seventeen files of this crate, and a gate that
+    /// stopped at the attribute never saw it.
+    #[test]
+    fn strip_test_modules_keeps_production_code_after_a_test_item() {
+        let src = "#[cfg(test)]\nmod test_support;\n\npub fn handler() {}\n";
+        assert_eq!(strip_test_modules(src), "\npub fn handler() {}");
+
+        let src = "#[cfg(test)]\nmod tests {\n    fn g() { let m = maud! { p {} }; }\n}\n\npub fn after() {}\n";
+        assert_eq!(strip_test_modules(src), "\npub fn after() {}");
+
+        let src = "#[cfg(test)]\npub(crate) fn fixture() -> u8 {\n    1\n}\n\npub fn after() {}\n";
+        assert_eq!(strip_test_modules(src), "\npub fn after() {}");
+    }
+
+    /// An item written entirely on the attribute's line ends on that line.
+    ///
+    /// Latent when this landed — no such line exists in this crate today — but
+    /// it is the same failure as the truncating stripper this replaced: the
+    /// scan would start on the line *below*, at `depth = 0`, and swallow
+    /// production code, to end of file in the `mod` case.
+    #[test]
+    fn strip_test_modules_closes_an_item_written_on_the_attribute_line() {
+        let src = "#[cfg(test)] mod tests { fn g() {} }\n\npub fn after() {}\n";
+        assert_eq!(strip_test_modules(src), "\npub fn after() {}");
+
+        let src = "#[cfg(test)] use std::sync::Arc;\n\npub fn after() {}\n";
+        assert_eq!(strip_test_modules(src), "\npub fn after() {}");
+    }
+
+    /// `all(test, ..)` is test-only and goes; `any(.., test)` is not and stays.
+    #[test]
+    fn strip_test_modules_keeps_items_that_compile_outside_cfg_test() {
+        let src = "#[cfg(all(test, feature = \"llm\"))]\nmod fake_provider {\n    fn f() {}\n}\n\npub fn after() {}\n";
+        assert_eq!(strip_test_modules(src), "\npub fn after() {}");
+
+        // Compiled by `--features postgres`, so it is production code and the
+        // gates must keep seeing it.
+        let src = "#[cfg(any(feature = \"postgres\", test))]\npub fn pg_only() {}\n";
+        assert_eq!(strip_test_modules(src), src.trim_end());
+
+        // `not(test)` is production by definition.
+        let src = "#[cfg(not(test))]\npub fn real() {}\n";
+        assert_eq!(strip_test_modules(src), src.trim_end());
+    }
+
+    /// The over-strip direction is silent, so it is measured, not assumed.
+    ///
+    /// A `{` inside a string literal or block comment would run a scan to end
+    /// of file and drop every production line below it — invisible to a gate,
+    /// which would simply report less. This fails if that happens anywhere in
+    /// this crate.
+    #[test]
+    fn no_file_in_this_crate_is_stripped_to_end_of_file() {
+        let offenders: Vec<String> = SourceWalk::crate_src()
+            .least(100)
+            .collect()
+            .into_iter()
+            .filter(|f| strip_test_modules_reporting(&f.text).1)
+            .map(|f| f.rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a `#[cfg(test)]` item ran to end of file with unbalanced braces, \
+             so every production line below it is invisible to the gates: {offenders:?}"
+        );
     }
 
     /// The walk descends, honours both exemptions, and reads only Rust.

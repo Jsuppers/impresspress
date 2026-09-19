@@ -6,9 +6,8 @@
 //! one of those has to be the same bytes. Today 113 distinct keys are spelled
 //! as string literals in 425 places across 57 files, so a rename is a
 //! whole-repo find-and-replace that compiles perfectly if you miss one and
-//! fails at runtime, silently, as "the setting has no effect" — which is the
-//! hardest class of bug this codebase has, because a config read that finds
-//! nothing looks exactly like a config nobody set.
+//! fails at runtime, silently, as "the setting has no effect" — a config read
+//! that finds nothing is indistinguishable from a config nobody set.
 //!
 //! The rule the crate already states (`config_vars.rs`: "Shared
 //! (`WAFER_RUN_SHARED__`) variables are defined here — the single source of
@@ -31,7 +30,7 @@
 //!
 //! A string literal whose whole content is `WAFER_RUN_SHARED__…`,
 //! `IMPRESSPRESS__…` or `IMPRESSPRESS_…` followed only by `A-Z`, `0-9` and
-//! `_` — the three namespaces `impresspress/CLAUDE.md` defines
+//! `_` — the three namespaces the repo's `CLAUDE.md` defines
 //! (`WAFER_RUN_SHARED__*` shared, `{ORG}__{BLOCK}__*` block-scoped,
 //! `IMPRESSPRESS_*` infrastructure). It finds the key at any quote, so a key
 //! embedded in a longer raw string (`r#"name="WAFER_RUN_SHARED__APP_NAME""#`)
@@ -86,8 +85,9 @@ use impresspress_core::test_support::source_scan::{strip_line_comments, SourceWa
 ///     the name is defined.
 ///  2. **Readers that could name the constant.** The large majority: a page,
 ///     a handler or a service calling `config::get_default(ctx, "…", …)` with
-///     the key written out — `ui/mod.rs`'s `SiteConfig::load` reads ten that
-///     way. Every one of these is a mechanical replacement.
+///     the key written out — `ui/mod.rs`'s `SiteConfig::load` reads seven
+///     that way (the file spells ten in all). Every one of these is a
+///     mechanical replacement.
 ///  3. **Serialisation and rendering surfaces.** `ui/settings_form.rs`,
 ///     `blocks/admin/pages/*`, `blocks/dev/data_snapshot.rs` — places where
 ///     the key is the name of a form field, a JSON member or an exported row.
@@ -192,6 +192,11 @@ fn is_config_key(literal: &str) -> bool {
 /// scan that pairs quotes across the file: one raw string carrying a `"` of
 /// its own (`r#"name="…""#` in `ui/settings_form.rs`) desynchronises a
 /// pairing scan and hides every literal after it — which it did, by 32.
+///
+/// An escaped quote closes a key too. `"name=\"WAFER_RUN_SHARED__APP_NAME\""`
+/// is the non-raw spelling of the very `name=` attribute this gate says has to
+/// agree with the constant, so a matcher that only accepted a bare `"` would
+/// be blind to exactly the case it argues about.
 fn config_keys_in(code: &str) -> Vec<&str> {
     let mut found = Vec::new();
     let mut at = 0;
@@ -202,7 +207,8 @@ fn config_keys_in(code: &str) -> Vec<&str> {
         let end = tail
             .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
             .unwrap_or(tail.len());
-        if tail[end..].starts_with('"') && is_config_key(&tail[..end]) {
+        let closed = tail[end..].starts_with('"') || tail[end..].starts_with("\\\"");
+        if closed && is_config_key(&tail[..end]) {
             found.push(&tail[..end]);
         }
     }
@@ -270,6 +276,10 @@ fn the_matcher_recognises_the_keys_it_bans() {
         r#"env.secret("IMPRESSPRESS_DEPLOY_TOKEN")"#,
         r##"assert!(s.contains(r#"name="WAFER_RUN_SHARED__APP_NAME""#));"##,
         r#"json!({"IMPRESSPRESS__EMAIL__FROM": "a@b.c"})"#,
+        // the non-raw spelling of the `name=` attribute, closed by an
+        // ESCAPED quote — the case the raw-string one above only covers
+        // when the author happened to reach for `r#".."#`
+        r#"write!(f, "name=\"WAFER_RUN_SHARED__APP_NAME\"")"#,
     ] {
         assert_eq!(
             config_keys_in(banned).len(),

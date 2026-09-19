@@ -58,8 +58,14 @@ const BANNED: [&str; 2] = ["list_all", "list_sorted"];
 
 /// The walk this guard runs over, stated once so its self-test below plants
 /// its offender behind the same filters the real scan uses.
+///
+/// The floor lives here rather than at the call site, so a second caller
+/// inherits it instead of having to remember it.
 fn scan() -> SourceWalk {
-    SourceWalk::crate_src().skip_dir(TEST_DIR).skip_file(OWNER)
+    SourceWalk::crate_src()
+        .skip_dir(TEST_DIR)
+        .skip_file(OWNER)
+        .least(100)
 }
 
 /// Whether `source` reaches the banned read. One hit per line at most — the
@@ -135,7 +141,7 @@ const REMEDY: &str = "these call `db::list_all` / `db::list_sorted`, which trunc
 
 #[test]
 fn no_unpaged_database_read_outside_db_read() {
-    let found = offenders(&scan().least(100));
+    let found = offenders(&scan());
     assert!(found.is_empty(), "{REMEDY}\n  {}", found.join("\n  "));
 }
 

@@ -24,10 +24,10 @@
 //!
 //! Scope: every `.rs` file under `src/blocks/`, with full-line comments
 //! removed first (prose describing the shape is not the shape — this file's
-//! own doc comment would otherwise fail it) and with everything from the
-//! first `#[cfg(test)]` onwards removed (a test asserting on the old
-//! behaviour is not a handler producing it). Trailing comments on code lines
-//! are kept, so nothing hides behind a `//` on the same line as code.
+//! own doc comment would otherwise fail it) and with every `#[cfg(test)]`
+//! item removed (a test asserting on the old behaviour is not a handler
+//! producing it). Trailing comments on code lines are kept, so nothing hides
+//! behind a `//` on the same line as code.
 //!
 //! What the gate does NOT see, stated so it is not mistaken for more than it
 //! is: a handler that writes the `NotFound` arm and the `err_internal` tail
@@ -114,8 +114,8 @@ fn scan() -> SourceWalk {
     SourceWalk::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks")).least(100)
 }
 
-/// `src` as production code: full-line comments dropped, and everything from
-/// the first `#[cfg(test)]` attribute onwards dropped with it.
+/// `src` as production code: every `#[cfg(test)]` item dropped, and full-line
+/// comments with it.
 fn production_code(src: &str) -> Vec<String> {
     strip_line_comments(&strip_test_modules(src))
         .lines()
@@ -250,6 +250,27 @@ fn the_gate_catches_the_shape_it_is_looking_for() {
         "#,
     );
     assert!(!hand_maps_a_database_error(&in_a_test));
+
+    // …but a handler BELOW one still is. `#[cfg(test)]` is not only the
+    // trailing `mod tests`: seventeen files in this crate carry it on an early
+    // `mod test_support;`, a `use` or a fixture `fn`, and a scope that ran to
+    // the first attribute and stopped saw 15 of `blocks/products/mod.rs`'s 422
+    // lines. Everything past it was un-gated, and this is the case that says
+    // so.
+    let after_a_test_module = production_code(
+        r#"
+        #[cfg(test)]
+        mod tests {
+            fn nothing() {}
+        }
+
+        pub fn handler() {
+            Err(e) if e.code == ErrorCode::NotFound => err_not_found("x"),
+            Err(e) => err_internal("Database error", e),
+        }
+        "#,
+    );
+    assert!(hand_maps_a_database_error(&after_a_test_module));
 }
 
 /// The *walk* reaches a planted offender, and the door it exempts is the only
