@@ -1,37 +1,20 @@
 //! Provider-links repo — exercise upsert idempotency and find lookup
 //! against in-memory SQLite after applying migration 001.
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{provider_links, users},
+use impresspress_core::{
+    blocks::auth::{migrations, repo::provider_links},
+    test_support::seed_user,
 };
 
 use crate::common::MigrationTestCtx;
-
-async fn mk_user(ctx: &MigrationTestCtx, email: &str) -> String {
-    users::insert(
-        ctx,
-        users::NewUser {
-            email: email.into(),
-            display_name: email.into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("insert user")
-    .id
-}
 
 #[tokio::test]
 async fn upsert_insert_then_update_same_provider_ref() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let uid1 = mk_user(&ctx, "a@example.com").await;
-    let uid2 = mk_user(&ctx, "b@example.com").await;
-    let uid3 = mk_user(&ctx, "c@example.com").await;
+    let uid1 = seed_user("a@example.com").insert(&ctx).await.id;
+    let uid2 = seed_user("b@example.com").insert(&ctx).await.id;
+    let uid3 = seed_user("c@example.com").insert(&ctx).await.id;
 
     // First call: no prior link → inserts.
     provider_links::upsert(
@@ -122,8 +105,8 @@ async fn find_missing_is_none() {
 async fn provider_axis_is_independent() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let uid_gh = mk_user(&ctx, "gh@example.com").await;
-    let uid_goog = mk_user(&ctx, "goog@example.com").await;
+    let uid_gh = seed_user("gh@example.com").insert(&ctx).await.id;
+    let uid_goog = seed_user("goog@example.com").insert(&ctx).await.id;
 
     provider_links::upsert(
         &ctx,

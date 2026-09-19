@@ -1,32 +1,15 @@
 //! Orgs repo — exercise `find_by_name` + `upsert_claimed` against in-memory
 //! SQLite after applying migration 001 (+ 002 which seeds reserved orgs).
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{
-        orgs::{self, NewClaim, OrgsRepoError},
-        users,
+use impresspress_core::{
+    blocks::auth::{
+        migrations,
+        repo::orgs::{self, NewClaim, OrgsRepoError},
     },
+    test_support::seed_user,
 };
 
 use crate::common::MigrationTestCtx;
-
-async fn mk_user(ctx: &MigrationTestCtx, email: &str) -> String {
-    users::insert(
-        ctx,
-        users::NewUser {
-            email: email.into(),
-            display_name: email.into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("insert user")
-    .id
-}
 
 #[tokio::test]
 async fn find_by_name_returns_none_for_unknown() {
@@ -40,7 +23,7 @@ async fn find_by_name_returns_none_for_unknown() {
 async fn upsert_claimed_inserts_then_finds() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let uid = mk_user(&ctx, "u@x.com").await;
+    let uid = seed_user("u@x.com").insert(&ctx).await.id;
     let row = orgs::upsert_claimed(
         &ctx,
         NewClaim {
@@ -69,8 +52,8 @@ async fn upsert_claimed_inserts_then_finds() {
 async fn upsert_claimed_conflict_on_name() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let a = mk_user(&ctx, "a@x.com").await;
-    let b = mk_user(&ctx, "b@x.com").await;
+    let a = seed_user("a@x.com").insert(&ctx).await.id;
+    let b = seed_user("b@x.com").insert(&ctx).await.id;
     orgs::upsert_claimed(
         &ctx,
         NewClaim {
@@ -100,8 +83,8 @@ async fn upsert_claimed_conflict_on_name() {
 async fn upsert_claimed_conflict_on_verified_ref() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let a = mk_user(&ctx, "a@x.com").await;
-    let b = mk_user(&ctx, "b@x.com").await;
+    let a = seed_user("a@x.com").insert(&ctx).await.id;
+    let b = seed_user("b@x.com").insert(&ctx).await.id;
     orgs::upsert_claimed(
         &ctx,
         NewClaim {
@@ -135,7 +118,7 @@ async fn reserved_orgs_do_not_block_claiming_same_provider_ref() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
     // Migration 002 seeded 'wafer-run' as reserved with NULL verified_ref.
-    let uid = mk_user(&ctx, "u@x.com").await;
+    let uid = seed_user("u@x.com").insert(&ctx).await.id;
     let row = orgs::upsert_claimed(
         &ctx,
         NewClaim {

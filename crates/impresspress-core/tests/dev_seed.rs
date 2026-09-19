@@ -19,7 +19,7 @@ use impresspress_core::{
         control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind},
         repo::{self, generations::GenerationCause, runtime_state},
         seed::{self, SeedBlock, SeedManifest},
-        test_support::{seed_file as file, FakeControl, MapFetch},
+        test_support::{hello_info, seed_file as file, FakeControl, MapFetch},
         validation, workspace,
     },
     test_support::TestContext,
@@ -50,28 +50,18 @@ fn hello_spec() -> DynamicBlockSpec {
     }
 }
 
-/// The `BlockInfo` the seeded `hello` artifact reports through
-/// [`FakeControl::inspect`].
+/// A control whose `inspect` reports the shared `hello` guest — what the
+/// bundle fixture below describes.
 ///
-/// A seed import now runs the four rules that read the guest's own report
-/// (name, endpoints inside the route prefix, agent tool names, capabilities
-/// against `requires`), so a fixture whose control reported nothing useful
-/// would refuse every bundle below for a reason none of them is about. The
-/// declared spec has to be exactly what those rules produce from this, which
-/// is why the endpoint is under `/b/hello/` and the name is `site/hello`.
-fn hello_info() -> BlockInfo {
-    BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "hello").endpoints(vec![
-        BlockEndpoint::get("/b/hello/")
-            .auth(AuthLevel::Public)
-            .summary("hello"),
-    ])
-}
-
-/// A control whose `inspect` reports [`hello_info`] — the guest the bundle
-/// fixture below describes.
+/// A seed import runs the four rules that read the guest's own report (name,
+/// endpoints inside the route prefix, agent tool names, capabilities against
+/// `requires`), so a fixture whose control reported nothing useful would
+/// refuse every bundle below for a reason none of them is about. The declared
+/// spec has to be exactly what those rules produce from `hello_info`, which is
+/// why the endpoint is under `/b/hello/` and the name is `site/hello`.
 fn hello_control() -> Arc<FakeControl> {
     let control = FakeControl::new();
-    control.set_validated_info(hello_info());
+    control.set_validated_info(hello_info("site/hello"));
     control
 }
 

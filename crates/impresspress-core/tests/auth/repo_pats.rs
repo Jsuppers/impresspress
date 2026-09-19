@@ -1,9 +1,9 @@
 //! Personal access tokens repo — insert / find / touch against in-memory
 //! SQLite after applying migration 001.
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{pats, users},
+use impresspress_core::{
+    blocks::auth::{migrations, repo::pats},
+    test_support::seed_user,
 };
 
 use crate::common::MigrationTestCtx;
@@ -13,19 +13,10 @@ async fn pat_insert_find_with_scopes() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
 
-    let u = users::insert(
-        &ctx,
-        users::NewUser {
-            email: "p@example.com".into(),
-            display_name: "P".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("p@example.com")
+        .display_name("P")
+        .insert(&ctx)
+        .await;
 
     let hash = [3u8; 32];
     pats::insert(
@@ -65,19 +56,10 @@ async fn pat_insert_with_multi_scope_and_expiry() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
 
-    let u = users::insert(
-        &ctx,
-        users::NewUser {
-            email: "m@example.com".into(),
-            display_name: "M".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("m@example.com")
+        .display_name("M")
+        .insert(&ctx)
+        .await;
 
     let hash = [4u8; 32];
     pats::insert(
@@ -128,19 +110,10 @@ async fn pat_token_hash_is_stored_as_hex_string_not_json_byte_array() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
 
-    let u = users::insert(
-        &ctx,
-        users::NewUser {
-            email: "hex@example.com".into(),
-            display_name: "Hex".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("hex@example.com")
+        .display_name("Hex")
+        .insert(&ctx)
+        .await;
 
     let raw_hash = [0xab_u8; 32];
     pats::insert(

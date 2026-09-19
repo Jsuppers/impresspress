@@ -11,7 +11,7 @@ use impresspress_core::{
         activation::{self, ActivationIntent},
         blobs, gc, paths,
         repo::generations::GenerationCause,
-        test_support::{FakeControl, FakeShell},
+        test_support::{dev_post, FakeControl, FakeShell},
         workspace, DevBlock, DevShared,
     },
     test_support::{
@@ -20,16 +20,11 @@ use impresspress_core::{
     },
 };
 use serde_json::json;
-use wafer_run::{Block as _, Message, OutputStream};
+use wafer_run::{Block as _, Message};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// `POST` a JSON body to a `/b/dev` route as an admin, through the router.
-async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
-}
 
 /// `GET /b/dev/api/files`, optionally with a `?prefix=` filter.
 ///

@@ -32,7 +32,7 @@ use impresspress_core::{
         data_snapshot::DataSnapshot,
         repo::generations::GenerationCause,
         seed::{self, SeedManifest},
-        test_support::{FakeControl, FakeShell},
+        test_support::{dev_post, hello_info, FakeControl, FakeShell},
     },
     platform_state::variables,
     test_support::{
@@ -42,7 +42,6 @@ use impresspress_core::{
 };
 use serde_json::json;
 use wafer_core::clients::database as db;
-use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, OutputStream};
 
 // ---------------------------------------------------------------------------
 // Table names this crate keeps private, restated here
@@ -65,19 +64,6 @@ const SHOP_HTML: &[u8] = b"<h1>shop</h1>";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
-}
-
-/// The `BlockInfo` the `hello` fixture guest reports.
-fn hello_info() -> BlockInfo {
-    BlockInfo::new("site/hello", "0.1.0", "http-handler@v1", "hello").endpoints(vec![
-        BlockEndpoint::get("/b/hello/")
-            .auth(AuthLevel::Public)
-            .summary("hello"),
-    ])
-}
 
 /// Standard base64 with padding — how an artifact travels in JSON.
 fn b64(bytes: &[u8]) -> String {
@@ -213,7 +199,7 @@ fn sorted(entries: &HashMap<String, Vec<u8>>) -> Vec<String> {
 /// A sandbox with the products block, a shop page, one compiled block and one
 /// product — the state the scenario in design §16 leaves behind.
 async fn shop_instance(control: &std::sync::Arc<FakeControl>) -> TestContext {
-    control.set_validated_info(hello_info());
+    control.set_validated_info(hello_info("site/hello"));
     // `with_auth_added`: the data snapshot's allowlist spans products, admin
     // AND auth (`users`, `local_credentials`, `user_roles` — the visitor's own
     // accounts, `Mode::Replace`d as a set). A fixture without auth's tables
@@ -405,7 +391,7 @@ async fn export_zip_contains_shell_seed_sources_and_data_with_dev_off() {
 #[tokio::test]
 async fn the_compiler_tree_and_the_deployments_own_seed_are_never_copied() {
     let control = FakeControl::new();
-    control.set_validated_info(hello_info());
+    control.set_validated_info(hello_info("site/hello"));
     let shell = FakeShell::new()
         .with("__impresspress_dev/compiler/manifest.json", b"{}")
         .with("seed/manifest.json", b"{\"schema_version\":1}")
@@ -592,7 +578,7 @@ async fn the_exported_sw_drops_the_compiler_bypass_and_keeps_the_seed_one() {
 #[tokio::test]
 async fn a_shell_with_no_compiler_bypass_is_exported_unchanged() {
     let control = FakeControl::new();
-    control.set_validated_info(hello_info());
+    control.set_validated_info(hello_info("site/hello"));
     let plain_sw = "const DEV_ENABLED = true;\n\
                     if (url.pathname.startsWith('/seed/')) { return; }\n";
     let shell = FakeShell::new().with("sw.js", plain_sw.as_bytes());
@@ -658,7 +644,7 @@ async fn the_readme_says_whether_each_blocks_sources_match_its_artifact() {
 #[tokio::test]
 async fn a_recorded_source_digest_is_compared_against_the_workspace() {
     let control = FakeControl::new();
-    control.set_validated_info(hello_info());
+    control.set_validated_info(hello_info("site/hello"));
     let ctx = TestContext::with_admin()
         .await
         .with_dev_added_and_shell(control.clone(), std::sync::Arc::new(FakeShell::new()))
@@ -957,7 +943,7 @@ async fn an_exported_seed_imports_into_a_fresh_instance() {
     let fetch = ArchiveFetch { archive };
 
     let b_control = FakeControl::new();
-    b_control.set_validated_info(hello_info());
+    b_control.set_validated_info(hello_info("site/hello"));
     let b = TestContext::with_products()
         .await
         .with_auth_added()

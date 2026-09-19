@@ -9,22 +9,18 @@
 use base64ct::{Base64, Encoding};
 use impresspress_core::{
     blocks::dev::{
-        blobs, paths, scaffold::Template, test_support::FakeControl, workspace, RuntimeControl,
-        WAFER_GUEST_VERSION,
+        blobs, paths,
+        scaffold::Template,
+        test_support::{dev_post, hello_info, FakeControl},
+        workspace, RuntimeControl, WAFER_GUEST_VERSION,
     },
     test_support::{admin_msg, output_http_status, output_json, TestContext},
 };
 use serde_json::json;
-use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, OutputStream};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// `POST` a JSON body to a `/b/dev` route as an admin, through the router.
-async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
-}
 
 /// Read one workspace file's content back through the files API.
 async fn read_file(ctx: &TestContext, path: &str) -> String {
@@ -34,15 +30,6 @@ async fn read_file(ctx: &TestContext, path: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("read {path} returned no content: {body}"))
         .to_string()
-}
-
-/// The `BlockInfo` a well-behaved `hello` guest reports.
-fn hello_info(name: &str) -> BlockInfo {
-    BlockInfo::new(name, "0.1.0", "http-handler@v1", "hello").endpoints(vec![BlockEndpoint::get(
-        "/b/hello/",
-    )
-    .auth(AuthLevel::Public)
-    .summary("hello")])
 }
 
 // ---------------------------------------------------------------------------

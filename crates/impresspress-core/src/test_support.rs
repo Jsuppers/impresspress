@@ -10,6 +10,12 @@
 //!
 //! Additional capabilities (message helpers, auth state, extra block dispatch)
 //! are added in subsequent tasks.
+//!
+//! [`source_scan`] is the other half: the shared walk and comment strippers
+//! the crate's source gates are built on, so a gate states its root and its
+//! exemptions instead of hand-rolling a fourth `read_dir` recursion.
+
+pub mod source_scan;
 
 use std::{
     collections::HashMap,
@@ -2120,6 +2126,83 @@ impl TestContext {
     }
 }
 
+/// Seed an account through the production `repo::users::insert`.
+///
+/// Every auth test that needs a user wants the same row: an unverified
+/// address with no verification token and no avatar, differing only in the
+/// email, the display name and the role. Spelled as a `NewUser` literal that
+/// is seventeen copies of the same six fields across `tests/auth/`, and
+/// seventeen places to edit when the struct gains a field.
+///
+/// The insert is the real one, so a test still exercises the column set and
+/// the defaults the repo writes; only the fields nobody is asserting on are
+/// hidden. Anything a case does assert on it sets:
+///
+/// ```ignore
+/// let user = seed_user("p@e.com").display_name("P").role("admin").insert(&ctx).await;
+/// ```
+///
+/// The two fields that are *not* here — `email_verified` and
+/// `verification_token_hash` — are `false`/`None` at every current call site.
+/// A case that needs either is asserting on verification itself and should
+/// say so with `users::insert` directly, rather than reaching for a builder
+/// default it then has to remember to override.
+pub struct SeedUser<'a> {
+    email: &'a str,
+    display_name: &'a str,
+    avatar_url: Option<&'a str>,
+    role: &'a str,
+}
+
+/// A user to seed: `email`, a display name that defaults to the email, no
+/// avatar, and the `user` role. See [`SeedUser`].
+pub fn seed_user(email: &str) -> SeedUser<'_> {
+    SeedUser {
+        email,
+        display_name: email,
+        avatar_url: None,
+        role: "user",
+    }
+}
+
+impl<'a> SeedUser<'a> {
+    /// The profile name, when the case asserts on it or on its absence.
+    pub fn display_name(mut self, name: &'a str) -> Self {
+        self.display_name = name;
+        self
+    }
+
+    /// The avatar URL, when the case asserts it round-trips.
+    pub fn avatar_url(mut self, url: &'a str) -> Self {
+        self.avatar_url = Some(url);
+        self
+    }
+
+    /// The inline `users.role` column — `"admin"` is what makes an account an
+    /// admin, not a `user_roles` row (see `repo::users::NewUser::role`).
+    pub fn role(mut self, role: &'a str) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Insert the row, panicking on failure the way a fixture should.
+    pub async fn insert(self, ctx: &dyn Context) -> crate::blocks::auth::repo::users::UserRow {
+        crate::blocks::auth::repo::users::insert(
+            ctx,
+            crate::blocks::auth::repo::users::NewUser {
+                email: self.email.to_string(),
+                display_name: self.display_name.to_string(),
+                avatar_url: self.avatar_url.map(str::to_string),
+                role: self.role.to_string(),
+                email_verified: false,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed user {}: {e:?}", self.email))
+    }
+}
+
 /// Build an anonymous request `Message`. No `auth.user_id` meta set.
 pub fn anon_msg(action: &str, path: &str) -> Message {
     let mut m = Message::new("http.request");
@@ -2135,7 +2218,6 @@ pub fn auth_msg(action: &str, path: &str, user_id: &str) -> Message {
     m
 }
 
-/// Build an admin request `Message` (user_id `"admin_1"`, role `admin`).
 /// A config value no process environment can be holding.
 ///
 /// `EnvConfigService::get` falls through to `std::env::var` when it has no
@@ -2155,6 +2237,7 @@ pub fn unique_config_value() -> String {
     )
 }
 
+/// Build an admin request `Message` (user_id `"admin_1"`, role `admin`).
 pub fn admin_msg(action: &str, path: &str) -> Message {
     let mut m = auth_msg(action, path, "admin_1");
     m.set_meta("auth.user_roles", "admin");

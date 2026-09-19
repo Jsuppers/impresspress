@@ -1,12 +1,15 @@
 //! `bootstrap::run` — covers email+password, token, empty-config, and
 //! already-seeded paths.
 
-use impresspress_core::blocks::auth::{
-    bootstrap,
-    config::AuthConfig,
-    migrations,
-    repo::{bootstrap_tokens, local_credentials, users},
-    service::hash_token,
+use impresspress_core::{
+    blocks::auth::{
+        bootstrap,
+        config::AuthConfig,
+        migrations,
+        repo::{bootstrap_tokens, local_credentials, users},
+        service::hash_token,
+    },
+    test_support::seed_user,
 };
 
 use crate::common::MigrationTestCtx;
@@ -97,19 +100,10 @@ async fn skipped_when_users_already_exist() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migrations");
 
-    users::insert(
-        &ctx,
-        users::NewUser {
-            email: "existing@x.io".into(),
-            display_name: "E".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed existing user");
+    seed_user("existing@x.io")
+        .display_name("E")
+        .insert(&ctx)
+        .await;
 
     bootstrap::run(&ctx, &cfg_email_pw("new@x.io", "pw"))
         .await

@@ -1,5 +1,6 @@
 //! Test doubles for the [`RuntimeControl`], [`ShellSource`] and
-//! [`seed::SeedFetch`] seams.
+//! [`seed::SeedFetch`] seams, plus the request helpers every `dev_*.rs`
+//! integration file needs to reach the block at all.
 //!
 //! Exposed under `test-support` (as well as `cfg(test)`) so the `tests/`
 //! integration crates and downstream consumers can drive the dev block without
@@ -13,12 +14,53 @@ use std::{
     },
 };
 
+use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, OutputStream};
+
 use super::{
     blobs,
     control::{DynamicBlockSpec, RuntimeControl, ShellSource, ValidationFailure, ValidationStage},
     paths, seed,
     seed::{SeedFetch, SeedFile},
 };
+use crate::test_support::{admin_msg, output_json, TestContext};
+
+// ---------------------------------------------------------------------------
+// Reaching the block
+// ---------------------------------------------------------------------------
+
+/// `POST` a JSON body to a `/b/dev` route as an admin, through the router.
+///
+/// Every `/b/dev` API is admin-only and takes its argument as a JSON body, so
+/// this is how each of the six `dev_*.rs` integration files opened every
+/// request it makes.
+pub async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
+    ctx.dispatch_json(admin_msg("create", path), &body).await
+}
+
+/// `GET` a `/b/dev` route as an admin, through the router.
+pub async fn dev_get(ctx: &TestContext, path: &str) -> OutputStream {
+    ctx.dispatch(admin_msg("retrieve", path)).await
+}
+
+/// The `/b/dev/api/status` projection — the generation, the block set and the
+/// store sizes, as the page reads them.
+pub async fn dev_status(ctx: &TestContext) -> serde_json::Value {
+    output_json(dev_get(ctx, "/b/dev/api/status").await).await
+}
+
+/// The `BlockInfo` a well-behaved `hello` guest reports: one public `GET` on
+/// its own prefix and nothing else.
+///
+/// The name is a parameter because half the rules under test are about the
+/// name (a guest outside its namespace, a hyphen, a reserved prefix); the
+/// endpoint is not, because no rule reads it.
+pub fn hello_info(name: &str) -> BlockInfo {
+    BlockInfo::new(name, "0.1.0", "http-handler@v1", "hello").endpoints(vec![BlockEndpoint::get(
+        "/b/hello/",
+    )
+    .auth(AuthLevel::Public)
+    .summary("hello")])
+}
 
 /// A [`RuntimeControl`] that records what it was asked to do instead of
 /// building anything.
