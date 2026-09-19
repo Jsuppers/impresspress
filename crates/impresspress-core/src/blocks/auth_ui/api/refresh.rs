@@ -211,10 +211,14 @@ enum NotLive {
 /// raced inside one rotation window, and the overwhelmingly common source of
 /// that is one legitimate client refreshing twice at once — two tabs, a retry
 /// — for which burning the family would sign the user out of a session that
-/// was never compromised. What it gives up is bounded: a thief racing the
-/// victim inside that same window keeps nothing durable, because their next
-/// attempt reads a revoked row and lands in `RevokedAtRead`, which burns the
-/// family as it always has.
+/// was never compromised.
+///
+/// What it gives up is bounded. Whoever loses the race is left holding a token
+/// the winner has permanently revoked, and cannot reach the successor, which
+/// only the winner was handed. Presenting that token again reads a revoked row
+/// and lands in `RevokedAtRead`, which burns the family as it always has — so
+/// a thief gains only the silent refusals of the burst itself, whichever side
+/// of it they were on.
 async fn refuse_not_live(
     ctx: &dyn Context,
     row: &tokens::TokenRow,
@@ -529,11 +533,13 @@ mod tests {
             "the family holds the rotated-away row and ONE successor, not two: {rows:?}"
         );
 
-        // The winner's session survives. In THIS interleaving that holds
-        // either way — the loser reaches its family check before the winner
-        // has inserted, so there is no live sibling to burn even on code that
-        // would burn one. `losing_the_claim_behind_a_completed_rotation_\
-        // leaves_the_session_alone` is the test that forces the other order.
+        // The winner's session survives. On this code that holds however the
+        // two requests interleave, so it does not pin the decision not to burn
+        // the family on a lost claim: nothing here forces the loser to reach
+        // its family check after the winner's insert, which is the ordering
+        // that would tell the policies apart.
+        // `losing_the_claim_behind_a_completed_rotation_leaves_the_session_alone`
+        // forces it.
         let winner = bodies
             .iter()
             .find(|b| b["refresh_token"].is_string())
