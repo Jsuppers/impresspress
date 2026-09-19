@@ -522,6 +522,7 @@ mod tests {
     }
 
     /// Relative luminance per WCAG 2.1.
+    #[cfg(feature = "embed-assets")]
     fn luminance(hex: &str) -> f64 {
         let h = hex.trim_start_matches('#');
         let ch = |i| {
@@ -535,6 +536,7 @@ mod tests {
         0.2126 * ch(0) + 0.7152 * ch(2) + 0.0722 * ch(4)
     }
 
+    #[cfg(feature = "embed-assets")]
     fn contrast(a: &str, b: &str) -> f64 {
         let (x, y) = (luminance(a), luminance(b));
         let (hi, lo) = if x > y { (x, y) } else { (y, x) };
@@ -653,6 +655,7 @@ mod tests {
     /// `{`/`}` characters in prose (several exist in this bundle, e.g.
     /// base.css's "`hidden` attribute" comment) would otherwise corrupt
     /// `css_leaf_blocks`'s brace-depth scan.
+    #[cfg(feature = "embed-assets")]
     fn strip_css_comments(s: &str) -> String {
         let mut without_comments = String::with_capacity(s.len());
         let mut rest = s;
@@ -673,6 +676,7 @@ mod tests {
     /// contains `{` after being popped off the brace stack is a container
     /// (e.g. the `@media` wrapper itself) and is skipped -- its children
     /// are captured on their own pop.
+    #[cfg(feature = "embed-assets")]
     fn css_leaf_blocks(s: &str) -> Vec<(String, String)> {
         let without_comments = strip_css_comments(s);
         let s = without_comments.as_str();
@@ -721,12 +725,14 @@ mod tests {
     // `black`/`transparent` -- to actual RGBA by walking `tokens.css`'s
     // live `:root` values, so the single test below computes real WCAG
     // contrast instead of matching names.
+    #[cfg(feature = "embed-assets")]
     type Rgba = (u8, u8, u8, u8);
 
     /// Parses the assembled bundle's `:root { ... }` custom-property
     /// declarations into a `name -> raw value` map, e.g. `"--primary-color"
     /// -> "#fd3534"`. `styles/tokens.css` is first in build.rs's
     /// `CSS_FILES` order and the only file with a `:root` block.
+    #[cfg(feature = "embed-assets")]
     fn parse_root_tokens(s: &str) -> std::collections::HashMap<String, String> {
         let without_comments = strip_css_comments(s);
         let s = without_comments.as_str();
@@ -765,6 +771,7 @@ mod tests {
     /// var(--y))` fallback and a `color-mix(in srgb, c1 p1%, c2 p2%)`
     /// argument list can contain commas one level deeper than the ones
     /// that actually separate arguments.
+    #[cfg(feature = "embed-assets")]
     fn split_top_level(s: &str) -> Vec<&str> {
         let mut parts = Vec::new();
         let mut depth = 0i32;
@@ -784,11 +791,13 @@ mod tests {
         parts
     }
 
+    #[cfg(feature = "embed-assets")]
     fn hex_byte(s: &str) -> Option<u8> {
         u8::from_str_radix(s, 16).ok()
     }
 
     /// Parses a `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa` literal.
+    #[cfg(feature = "embed-assets")]
     fn parse_hex(h: &str) -> Option<Rgba> {
         let h = h.trim_start_matches('#');
         let double = |c: char| -> Option<u8> { hex_byte(&format!("{c}{c}")) };
@@ -836,6 +845,7 @@ mod tests {
     /// this bundle today, checked by grep while writing this) -- callers
     /// treat `None` as "can't verify this rule" and skip it rather than
     /// assuming compliance.
+    #[cfg(feature = "embed-assets")]
     fn resolve_color(
         value: &str,
         tokens: &std::collections::HashMap<String, String>,
@@ -915,6 +925,7 @@ mod tests {
     /// Alpha-composites `fg` over an opaque `base` -- e.g. a translucent
     /// tint like the old `--accent-info-bg`'s `#fd353419` over the page's
     /// white surface.
+    #[cfg(feature = "embed-assets")]
     fn composite_over(fg: Rgba, base: (u8, u8, u8)) -> (u8, u8, u8) {
         let (r, g, b, a) = fg;
         if a == 255 {
@@ -928,6 +939,7 @@ mod tests {
         (mix(r, base.0), mix(g, base.1), mix(b, base.2))
     }
 
+    #[cfg(feature = "embed-assets")]
     fn hex_of(rgb: (u8, u8, u8)) -> String {
         format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2)
     }
@@ -1037,6 +1049,7 @@ mod tests {
 
     /// Selectors this contrast guard does not hold to the 4.5:1 text floor,
     /// each with its own reason -- not a silent pass.
+    #[cfg(feature = "embed-assets")]
     const CONTRAST_EXEMPT_SELECTORS: &[&str] = &[
         // `.db-table-group__icon` wraps `icons::package()`/`icons::database()`
         // (database.rs) -- an SVG icon, not text; `color` only feeds the
@@ -1060,6 +1073,7 @@ mod tests {
     /// genuinely checked instead of waved through -- the navy panels are the
     /// only place in the bundle where text sits on a non-white surface set by
     /// a parent.
+    #[cfg(feature = "embed-assets")]
     const ANCESTOR_BACKGROUNDS: &[(&str, &str)] = &[
         // `.sidebar`'s navy slab is painted by `.sidebar__nav` in
         // components/nav.css (`background: var(--bg-sidebar)`); every
@@ -1480,7 +1494,6 @@ mod tests {
     #[cfg(not(feature = "embed-assets"))]
     #[test]
     fn no_embed_build_has_no_asset_bytes_only_the_manifest() {
-        assert!(!cfg!(feature = "embed-assets"));
         assert!(
             !super::ASSETS.is_empty(),
             "build.rs still populates the manifest without embed-assets"

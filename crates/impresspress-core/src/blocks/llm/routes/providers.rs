@@ -524,12 +524,14 @@ mod tests {
     use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
 
     use super::*;
+    // Read only by `reload_provider_service_resolves_key_var_into_api_key`,
+    // which needs the concrete `ProviderLlmService` and so carries the same
+    // gate.
+    #[cfg(feature = "llm")]
+    use crate::blocks::llm::providers::config::ProviderProtocol;
     use crate::{
-        blocks::llm::{
-            providers::config::ProviderProtocol,
-            routes::test_support::{
-                admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
-            },
+        blocks::llm::routes::test_support::{
+            admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
         },
         test_support::{output_json, TestContext},
     };
