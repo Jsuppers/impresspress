@@ -54,3 +54,6 @@ tempfile = "3"
 # `max_body_bytes` default declared by the listener this crate registers. The
 # library itself has no core dependency and does not gain one here.
 impresspress-core = { path = "../impresspress-core", default-features = false }
+
+[lints]
+workspace = true
