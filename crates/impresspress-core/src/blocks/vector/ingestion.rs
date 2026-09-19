@@ -544,19 +544,19 @@ mod contextual_retrieval_tests {
     #[tokio::test]
     async fn a_contextual_ingest_reaches_an_anthropic_provider() {
         use crate::blocks::llm::{
-            provider_admin::NoopProviderAdmin,
-            providers::fake_anthropic::{FakeAnthropic, BACKEND_ID, MODEL},
+            provider_admin::NoopProviderAdmin, providers::fake_provider::FakeProvider,
             DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
         };
 
+        let fake = FakeProvider::anthropic("A report about widget sales.").await;
         let mut ctx = TestContext::with_vector().await.with_wrap(
             "impresspress/admin",
             Vec::new(),
             Vec::new(),
             "impresspress/admin",
         );
-        ctx.set_config(DEFAULT_PROVIDER_VAR, BACKEND_ID);
-        ctx.set_config(DEFAULT_MODEL_VAR, MODEL);
+        ctx.set_config(DEFAULT_PROVIDER_VAR, fake.backend_id());
+        ctx.set_config(DEFAULT_MODEL_VAR, fake.model());
         ctx.set_config(DEFAULT_MAX_TOKENS_VAR, "321");
         ctx.register_block(
             "impresspress/llm",
@@ -564,7 +564,6 @@ mod contextual_retrieval_tests {
                 NoopProviderAdmin,
             ))),
         );
-        let fake = FakeAnthropic::answering("A report about widget sales.").await;
         ctx.register_block("wafer-run/llm", fake.llm_service_block());
 
         let out = add_context(&ctx, "the document", vec!["one".into()])

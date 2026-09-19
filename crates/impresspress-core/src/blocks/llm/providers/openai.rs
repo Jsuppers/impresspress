@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use wafer_core::interfaces::llm::service::ChatRequest;
 
 use super::config::ProviderConfig;
-use crate::llm_wire::openai::encode_chat_body;
 pub use crate::llm_wire::openai::OpenAiSseDecoder;
+use crate::llm_wire::openai::{encode_chat_body, MaxTokensField};
 
 /// `(url, headers, body)` triple produced by the encoder.
 pub type EncodedRequest = (String, HashMap<String, String>, Vec<u8>);
@@ -23,10 +23,35 @@ pub type EncodedRequest = (String, HashMap<String, String>, Vec<u8>);
 /// `api_key` — we never silently omit `Authorization` on the OpenAI native
 /// protocol, unlike `openai_compatible` which may. The body itself is
 /// [`encode_chat_body`], shared with every other consumer of the format.
+///
+/// The output-token budget goes out as `max_completion_tokens`: on OpenAI's
+/// own API `max_tokens` is the deprecated spelling, and the reasoning models
+/// — reachable here because `/v1/models` discovery lists them like any other
+/// — refuse a request carrying it with `unsupported_parameter`.
 pub fn encode_chat_request(
     req: &ChatRequest,
     provider: &ProviderConfig,
     resolved_api_key: Option<&str>,
+) -> Result<EncodedRequest, EncodeError> {
+    encode_chat_request_as(
+        req,
+        provider,
+        resolved_api_key,
+        MaxTokensField::MaxCompletionTokens,
+    )
+}
+
+/// [`encode_chat_request`] with the budget's spelling named by the caller.
+///
+/// `openai_compatible` is the other caller and passes
+/// [`MaxTokensField::MaxTokens`]: the URL, the header policy and the body are
+/// otherwise identical across the two protocols, and this keeps that one
+/// difference a parameter instead of a second copy of the encoder.
+pub(super) fn encode_chat_request_as(
+    req: &ChatRequest,
+    provider: &ProviderConfig,
+    resolved_api_key: Option<&str>,
+    max_tokens_field: MaxTokensField,
 ) -> Result<EncodedRequest, EncodeError> {
     let url = format!(
         "{}/chat/completions",
@@ -42,7 +67,8 @@ pub fn encode_chat_request(
         None => return Err(EncodeError::MissingApiKey),
     }
 
-    let bytes = encode_chat_body(req).map_err(|e| EncodeError::Serialize(e.to_string()))?;
+    let bytes = encode_chat_body(req, max_tokens_field)
+        .map_err(|e| EncodeError::Serialize(e.to_string()))?;
     Ok((url, headers, bytes))
 }
 
@@ -121,7 +147,10 @@ mod tests {
         let (_, _, body) = encode_chat_request(&req, &openai_provider(), Some("sk")).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["temperature"], 0.3);
-        assert_eq!(json["max_tokens"], 512);
+        // OpenAI's own spelling. `max_tokens` is deprecated there and the
+        // reasoning models refuse it outright — see
+        // `the_native_protocol_sends_only_max_completion_tokens`.
+        assert_eq!(json["max_completion_tokens"], 512);
         assert_eq!(json["top_p"], 0.9);
         assert_eq!(json["seed"], 42);
         assert_eq!(json["stop"][0], "END");
@@ -148,6 +177,30 @@ mod tests {
         assert_eq!(
             json["tools"][0]["function"]["parameters"]["properties"]["x"]["type"],
             "string"
+        );
+    }
+
+    /// The native OpenAI protocol sends `max_completion_tokens` and nothing
+    /// else.
+    ///
+    /// `max_tokens` is the deprecated spelling on OpenAI's own API, and its
+    /// reasoning models refuse a request that carries it with
+    /// `unsupported_parameter` — a 400 on every chat. Those models are
+    /// reachable here: `discover_models` lists whatever `/v1/models` returns,
+    /// so an operator selects one like any other. Sending both spellings is
+    /// not a fix either; this asserts the old one is absent.
+    #[test]
+    fn the_native_protocol_sends_only_max_completion_tokens() {
+        let mut req = ChatRequest::new("openai-main", "o3", vec![ChatMessage::user("hi")]);
+        req.params.max_tokens = Some(4096);
+
+        let (_, _, body) = encode_chat_request(&req, &openai_provider(), Some("sk")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["max_completion_tokens"], 4096);
+        assert!(
+            json.get("max_tokens").is_none(),
+            "a reasoning model 400s on `max_tokens`, got: {json}"
         );
     }
 

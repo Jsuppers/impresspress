@@ -511,26 +511,20 @@ mod tests {
     const FIXTURE_REPLY: &str = "Hi there";
 
     /// A chat fixture whose `wafer-run/llm` is the production service block
-    /// wrapping a real [`ProviderLlmService`], routed to a loopback
-    /// Anthropic-protocol provider. Returns the thread id and the fake, whose
-    /// recorded request bodies are what the assertions read.
+    /// wrapping a real [`ProviderLlmService`], routed to `fake` — a loopback
+    /// provider speaking one of the three wire protocols. Returns the thread
+    /// id; the fake's recorded request bodies are what the assertions read.
     #[cfg(feature = "llm")]
-    async fn anthropic_fixture() -> (
-        crate::test_support::TestContext,
-        String,
-        crate::blocks::llm::providers::fake_anthropic::FakeAnthropic,
-    ) {
-        use crate::blocks::llm::{
-            providers::fake_anthropic::{FakeAnthropic, BACKEND_ID, MODEL},
-            DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
-        };
+    async fn fixture_for(
+        fake: &crate::blocks::llm::providers::fake_provider::FakeProvider,
+    ) -> (crate::test_support::TestContext, String) {
+        use crate::blocks::llm::{DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR};
 
         let mut ctx = crate::test_support::TestContext::with_llm().await;
         register_messages_block(&mut ctx).await;
-        ctx.set_config(DEFAULT_PROVIDER_VAR, BACKEND_ID);
-        ctx.set_config(DEFAULT_MODEL_VAR, MODEL);
+        ctx.set_config(DEFAULT_PROVIDER_VAR, fake.backend_id());
+        ctx.set_config(DEFAULT_MODEL_VAR, fake.model());
         ctx.set_config(DEFAULT_MAX_TOKENS_VAR, &FIXTURE_MAX_TOKENS.to_string());
-        let fake = FakeAnthropic::answering(FIXTURE_REPLY).await;
         ctx.register_block("wafer-run/llm", fake.llm_service_block());
         let thread = crate::blocks::messages::service::create_context(
             &ctx,
@@ -544,7 +538,22 @@ mod tests {
         )
         .await
         .expect("seed a thread");
-        (ctx, thread.id, fake)
+        (ctx, thread.id)
+    }
+
+    /// [`fixture_for`] an Anthropic-protocol provider, the one that refuses a
+    /// request with no budget at all.
+    #[cfg(feature = "llm")]
+    async fn anthropic_fixture() -> (
+        crate::test_support::TestContext,
+        String,
+        crate::blocks::llm::providers::fake_provider::FakeProvider,
+    ) {
+        use crate::blocks::llm::providers::fake_provider::FakeProvider;
+
+        let fake = FakeProvider::anthropic(FIXTURE_REPLY).await;
+        let (ctx, thread_id) = fixture_for(&fake).await;
+        (ctx, thread_id, fake)
     }
 
     /// A chat through an Anthropic-protocol provider answers, and the request
@@ -690,6 +699,87 @@ mod tests {
             .expect("the history read succeeds")
             .is_empty(),
             "the refused turn must not be stored"
+        );
+    }
+
+    /// The budget reaches an OpenAI-protocol provider as
+    /// `max_completion_tokens`, and `max_tokens` is nowhere on the wire.
+    ///
+    /// This is the field the same fix would otherwise have broken: making the
+    /// budget always present means an OpenAI *reasoning* model — selectable
+    /// from `/v1/models` discovery like any other — starts refusing every
+    /// chat with `unsupported_parameter` if the deprecated spelling goes out.
+    /// The encoder tests pin the body; this pins that a real chat request
+    /// travelling through the real provider service arrives that way.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_chat_to_an_openai_provider_sends_max_completion_tokens() {
+        use crate::blocks::llm::providers::fake_provider::FakeProvider;
+
+        let fake = FakeProvider::openai(FIXTURE_REPLY).await;
+        let (ctx, thread_id) = fixture_for(&fake).await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], FIXTURE_REPLY);
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(requests[0]["max_completion_tokens"], FIXTURE_MAX_TOKENS);
+        assert!(
+            requests[0].get("max_tokens").is_none(),
+            "OpenAI's reasoning models refuse `max_tokens`, got: {}",
+            requests[0]
+        );
+    }
+
+    /// The inverse for an OpenAI-*compatible* server: `max_tokens` is the
+    /// spelling Ollama, vLLM and the hosted gateways know, and a budget that
+    /// landed in a field they ignore would be an uncapped reply with no sign
+    /// anything was wrong.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_chat_to_an_openai_compatible_provider_sends_max_tokens() {
+        use crate::blocks::llm::providers::fake_provider::FakeProvider;
+
+        let fake = FakeProvider::openai_compatible(FIXTURE_REPLY).await;
+        let (ctx, thread_id) = fixture_for(&fake).await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], FIXTURE_REPLY);
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(requests[0]["max_tokens"], FIXTURE_MAX_TOKENS);
+        assert!(
+            requests[0].get("max_completion_tokens").is_none(),
+            "a compatible server gets the only spelling it knows, got: {}",
+            requests[0]
         );
     }
 

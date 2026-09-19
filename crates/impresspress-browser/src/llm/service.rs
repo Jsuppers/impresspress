@@ -2,7 +2,7 @@
 //! running in the page via the SW↔page postMessage bridge.
 
 use futures::{channel::mpsc, sink::SinkExt, stream::BoxStream};
-use impresspress_core::llm_wire::openai::{encode_chat_body, OpenAiSseDecoder};
+use impresspress_core::llm_wire::openai::{encode_chat_body, MaxTokensField, OpenAiSseDecoder};
 use tokio_util::sync::CancellationToken;
 use wafer_core::interfaces::llm::service::{
     ChatChunk, ChatRequest, LlmError, LlmService, ModelInfo, ModelStatus,
@@ -66,7 +66,12 @@ impl LlmService for BrowserLlmService {
         // `stream`, the sampling params) cost a few bytes on a postMessage and
         // buy the browser the encoder's multimodal support, which the deleted
         // copy refused outright.
-        let body_json = match encode_chat_body(&req) {
+        //
+        // The budget is spelled `max_tokens` because that is the original
+        // OpenAI field and the bridge is not OpenAI's API. WebLLM reads
+        // neither spelling, so the choice costs nothing here and keeps the
+        // browser body identical to the OpenAI-compatible servers'.
+        let body_json = match encode_chat_body(&req, MaxTokensField::MaxTokens) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(e) => {

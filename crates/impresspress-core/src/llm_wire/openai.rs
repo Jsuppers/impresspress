@@ -25,14 +25,44 @@ use wafer_core::interfaces::llm::service::{
 
 use super::sse::{DecodeBatch, FeedLoss, SseFrameStream};
 
-/// Serialize `req` into an OpenAI `/chat/completions` request body.
+/// Which field carries the output-token budget in a `/chat/completions` body.
+///
+/// The two spellings are mutually exclusive, and which one a server accepts is
+/// a property of the wire format it implements, not of the model string. So
+/// the caller names it — the protocol a provider is declared under is the
+/// operator's explicit statement of that format, and it is the only signal in
+/// the system that does not have to be inferred from a model id.
+///
+/// * [`MaxCompletionTokens`](Self::MaxCompletionTokens) — OpenAI's own API.
+///   `max_tokens` is deprecated there and is **rejected outright**
+///   (`unsupported_parameter`) by the reasoning models, which are selectable
+///   from `/v1/models` discovery like any other.
+/// * [`MaxTokens`](Self::MaxTokens) — the OpenAI-*compatible* servers
+///   (Ollama, llama.cpp, vLLM, LM Studio, Groq, Together, OpenRouter, …),
+///   which accept the original spelling and mostly do not know the new one.
+///
+/// Never both: a body carrying the two fields is an implicit mapping between
+/// them, and upstreams do not reliably accept it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensField {
+    /// `max_tokens` — the original spelling.
+    MaxTokens,
+    /// `max_completion_tokens` — OpenAI's current spelling.
+    MaxCompletionTokens,
+}
+
+/// Serialize `req` into an OpenAI `/chat/completions` request body, spelling
+/// the output-token budget as `max_tokens_field` says.
 ///
 /// The transport half — endpoint URL, `Authorization` — belongs to whoever is
 /// sending it (see `blocks::llm::providers::openai::encode_chat_request` on
 /// native); a consumer that already holds a channel to a model, like the
 /// browser's WebLLM bridge, needs only this.
-pub fn encode_chat_body(req: &ChatRequest) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&OpenAiRequest::from_chat_request(req))
+pub fn encode_chat_body(
+    req: &ChatRequest,
+    max_tokens_field: MaxTokensField,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&OpenAiRequest::from_chat_request(req, max_tokens_field))
 }
 
 // ---------- Wire format types ----------
@@ -44,8 +74,13 @@ struct OpenAiRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// Set only under [`MaxTokensField::MaxTokens`]; exactly one of this and
+    /// `max_completion_tokens` is ever populated.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Set only under [`MaxTokensField::MaxCompletionTokens`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +104,14 @@ struct StreamOptions {
 }
 
 impl<'a> OpenAiRequest<'a> {
-    fn from_chat_request(req: &'a ChatRequest) -> Self {
+    fn from_chat_request(req: &'a ChatRequest, max_tokens_field: MaxTokensField) -> Self {
+        // Exactly one spelling, chosen by the caller's wire format. Both
+        // fields skip serializing when `None`, so the body carries the one
+        // the server understands and no trace of the other.
+        let (max_tokens, max_completion_tokens) = match max_tokens_field {
+            MaxTokensField::MaxTokens => (req.params.max_tokens, None),
+            MaxTokensField::MaxCompletionTokens => (None, req.params.max_tokens),
+        };
         let stop = if req.params.stop_sequences.is_empty() {
             None
         } else {
@@ -87,7 +129,8 @@ impl<'a> OpenAiRequest<'a> {
             messages: req.messages.iter().map(encode_message).collect(),
             stream: true,
             temperature: req.params.temperature,
-            max_tokens: req.params.max_tokens,
+            max_tokens,
+            max_completion_tokens,
             top_p: req.params.top_p,
             seed: req.params.seed,
             stop,
@@ -1150,10 +1193,17 @@ mod encode_body {
         ChatContent, ChatMessage, ChatRequest, ChatRole, ContentPart, ToolCall, ToolDefinition,
     };
 
-    use super::encode_chat_body;
+    use super::{encode_chat_body, MaxTokensField};
 
+    /// The body as the OpenAI-compatible servers (and the browser bridge)
+    /// receive it. The budget's spelling is the one thing the two protocols
+    /// disagree on, and it has its own tests below.
     fn body(req: &ChatRequest) -> serde_json::Value {
-        serde_json::from_slice(&encode_chat_body(req).expect("encode")).expect("valid JSON")
+        body_as(req, MaxTokensField::MaxTokens)
+    }
+
+    fn body_as(req: &ChatRequest, field: MaxTokensField) -> serde_json::Value {
+        serde_json::from_slice(&encode_chat_body(req, field).expect("encode")).expect("valid JSON")
     }
 
     #[test]
@@ -1227,6 +1277,47 @@ mod encode_body {
             v["tools"][0]["function"]["description"],
             "Look something up"
         );
+    }
+
+    /// The two spellings are exclusive, and the caller's protocol picks.
+    ///
+    /// OpenAI's own API rejects `max_tokens` on its reasoning models with
+    /// `unsupported_parameter`, and the OpenAI-compatible servers mostly do
+    /// not know `max_completion_tokens` at all — so a body carrying both, or
+    /// the wrong one, is a 400 from one side or the other.
+    #[test]
+    fn the_budget_is_spelled_the_way_the_protocol_asks_and_never_both_ways() {
+        let mut req = ChatRequest::new("p", "m", vec![ChatMessage::user("hi")]);
+        req.params.max_tokens = Some(321);
+
+        let native = body_as(&req, MaxTokensField::MaxCompletionTokens);
+        assert_eq!(native["max_completion_tokens"], 321);
+        assert!(
+            native.get("max_tokens").is_none(),
+            "OpenAI's reasoning models refuse a body carrying `max_tokens`, got: {native}"
+        );
+
+        let compatible = body_as(&req, MaxTokensField::MaxTokens);
+        assert_eq!(compatible["max_tokens"], 321);
+        assert!(
+            compatible.get("max_completion_tokens").is_none(),
+            "a compatible server is sent the only spelling it knows, got: {compatible}"
+        );
+    }
+
+    /// No budget, no field — under either spelling. The request the browser
+    /// bridge builds for a model with no cap must not grow a `null`.
+    #[test]
+    fn neither_spelling_appears_when_the_request_names_no_budget() {
+        let req = ChatRequest::new("p", "m", vec![ChatMessage::user("hi")]);
+        for field in [
+            MaxTokensField::MaxTokens,
+            MaxTokensField::MaxCompletionTokens,
+        ] {
+            let v = body_as(&req, field);
+            assert!(v.get("max_tokens").is_none(), "{field:?}: {v}");
+            assert!(v.get("max_completion_tokens").is_none(), "{field:?}: {v}");
+        }
     }
 
     /// **Behaviour change for the browser.** Its deleted copy answered
