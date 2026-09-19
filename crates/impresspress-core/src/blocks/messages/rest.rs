@@ -11,11 +11,14 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{AddEntryRequest, CreateContextRequest, UpdateContextRequest},
+    pages,
     service::{self, ListContextsParams, ListEntriesParams},
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, ok_json},
+    http::{err_bad_request, err_internal, ok_json},
+    ui,
+    util::parse_body_value,
 };
 
 /// Convert empty string to None (msg.query() returns "" for missing params).
@@ -71,10 +74,18 @@ pub async fn list_contexts(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
-// create_context takes &Message to read the authenticated owner.
+/// `POST /b/messages/api/contexts` — create a context.
+///
+/// Takes `&Message` to read the authenticated owner, and to tell the two
+/// callers apart. The new-context form on `/b/messages/` is a plain htmx
+/// `hx-post`, so it sends `application/x-www-form-urlencoded`; SDK callers
+/// send JSON. [`parse_body_value`] accepts either. The form targets
+/// `#context-list` with `hx-swap="afterbegin"`, so an `HX-Request` gets the
+/// row back as HTML — a JSON body would be swapped into the list as markup
+/// and render as its own source text.
 pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let raw = input.collect_to_bytes().await;
-    let body: CreateContextRequest = match serde_json::from_slice(&raw) {
+    let body: CreateContextRequest = match serde_json::from_value(parse_body_value(&raw)) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -90,6 +101,7 @@ pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream
     )
     .await
     {
+        Ok(record) if ui::is_htmx(msg) => ui::html_response(pages::context_card(&record)),
         Ok(record) => ok_json(&record),
         Err(e) => crud::db_error_internal(e, "create_context failed"),
     }
@@ -157,13 +169,20 @@ pub async fn list_entries(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
+/// `POST /b/messages/api/contexts/{id}/entries` — append an entry.
+///
+/// Both composers on the context detail page are plain htmx `hx-post` forms
+/// sending `application/x-www-form-urlencoded`; SDK callers send JSON.
+/// [`parse_body_value`] accepts either. The composers target `#entries-list`
+/// with `hx-swap="beforeend"`, so an `HX-Request` gets the entry back as the
+/// same card the page renders rather than a JSON record.
 pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let context_id = match owned_record(ctx, msg, service::CONTEXTS_TABLE, "Context").await {
         Ok(record) => record.id,
         Err(resp) => return resp,
     };
     let raw = input.collect_to_bytes().await;
-    let body: AddEntryRequest = match serde_json::from_slice(&raw) {
+    let body: AddEntryRequest = match serde_json::from_value(parse_body_value(&raw)) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -180,6 +199,10 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
     )
     .await
     {
+        Ok(record) if ui::is_htmx(msg) => match pages::entry_card(&record) {
+            Ok(markup) => ui::html_response(markup),
+            Err(e) => err_internal("add_entry card render failed", e),
+        },
         Ok(record) => ok_json(&record),
         Err(e) => crud::db_error_internal(e, "add_entry failed"),
     }
@@ -245,10 +268,56 @@ mod tests {
         (msg, InputStream::from_bytes(data))
     }
 
+    /// Build the request one of the block's own htmx forms produces.
+    ///
+    /// `body` is the raw `application/x-www-form-urlencoded` payload a
+    /// browser sends — percent-encoded, `+` for space — not a Rust struct
+    /// serialized to JSON, because the bug these tests pin was exactly the
+    /// difference between the two. `htmx` is whether the submit carries the
+    /// `HX-Request` header htmx sets on every request it makes; a form client
+    /// that is not htmx sends the same body without it.
+    fn form_request(
+        action: &str,
+        path: &str,
+        user_id: &str,
+        body: &str,
+        htmx: bool,
+    ) -> (Message, InputStream) {
+        let mut msg = Message::new("http.request");
+        msg.set_meta("req.action", action);
+        msg.set_meta("req.resource", path);
+        msg.set_meta(
+            "http.header.content-type",
+            "application/x-www-form-urlencoded",
+        );
+        if htmx {
+            msg.set_meta("http.header.hx-request", "true");
+        }
+        if !user_id.is_empty() {
+            msg.set_meta("auth.user_id", user_id);
+        }
+        (msg, InputStream::from_bytes(body.as_bytes().to_vec()))
+    }
+
     /// Dispatch through the real block `handle()` — same in-block routing
     /// (`endpoint_match::dispatch` + the `Route` match) production uses.
     async fn dispatch(ctx: &TestContext, msg: Message, input: InputStream) -> OutputStream {
         MessagesBlock::new().handle(ctx, msg, input).await
+    }
+
+    /// Status, `Content-Type` and body of a response, rendered the way the
+    /// HTTP boundary renders it — so an error terminal reports its real
+    /// status here instead of panicking.
+    async fn http_parts(out: OutputStream) -> (u16, String, String) {
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        let content_type = parts
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        let body = String::from_utf8(parts.body).expect("response body was not valid UTF-8");
+        (parts.status, content_type, body)
     }
 
     /// Resolve an `OutputStream`'s HTTP status, including error terminals
@@ -676,5 +745,154 @@ mod tests {
                 "filter {filter:?} must still match the stored entry"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The block's own htmx forms, posting the bytes a browser posts
+    // -----------------------------------------------------------------
+
+    /// The new-context form on `/b/messages/` carries no `hx-ext`, so htmx
+    /// submits it with the browser's default encoding:
+    /// `application/x-www-form-urlencoded`. The handler parsed JSON only, so
+    /// every submit was a 400 and no context could be created from the UI.
+    ///
+    /// The field names and the URL are the ones
+    /// `pages::context_list_page` renders — pinned there by
+    /// `the_new_context_form_posts_what_create_context_reads`.
+    #[tokio::test]
+    async fn the_new_context_form_submit_creates_the_context() {
+        let ctx = messages_ctx().await;
+
+        let (msg, input) = form_request(
+            "create",
+            "/b/messages/api/contexts",
+            "user-a",
+            "type=conversation&title=Deploy+planning",
+            true,
+        );
+        let (status, content_type, body) = http_parts(dispatch(&ctx, msg, input).await).await;
+
+        assert_eq!(status, 200, "form submit was refused: {body}");
+        // The form swaps the response into `#context-list`, so a JSON body
+        // would be inserted into the page as markup and read as its own
+        // source text.
+        assert!(
+            content_type.starts_with("text/html"),
+            "an htmx submit must be answered with HTML, got {content_type}: {body}"
+        );
+        assert!(
+            body.contains("messages-list__item"),
+            "the swapped fragment must be the list row, got: {body}"
+        );
+        assert!(
+            body.contains("Deploy planning"),
+            "the title must be form-decoded (`+` is a space), got: {body}"
+        );
+
+        // …and the row really landed, so the fragment is not being rendered
+        // out of the request body.
+        let listed = list_as(&ctx, "user-a").await;
+        assert_eq!(listed_ids(&listed).len(), 1, "one context must be stored");
+        assert_eq!(listed["records"][0]["data"]["title"], "Deploy planning");
+        assert_eq!(listed["records"][0]["data"]["type"], "conversation");
+    }
+
+    /// Both composers on the context detail page are plain htmx forms too.
+    /// The default view sends `kind`/`role`/`content`; the conversation
+    /// composer sends the same three with `kind` and `role` as hidden inputs.
+    #[tokio::test]
+    async fn the_entry_composer_submit_appends_the_entry() {
+        let ctx = messages_ctx().await;
+        let created = create_as(&ctx, "user-a", serde_json::json!({"type": "conversation"})).await;
+        let cid = created["id"].as_str().expect("id").to_string();
+
+        let (msg, input) = form_request(
+            "create",
+            &format!("/b/messages/api/contexts/{cid}/entries"),
+            "user-a",
+            "kind=message&role=user&content=ship+it",
+            true,
+        );
+        let (status, content_type, body) = http_parts(dispatch(&ctx, msg, input).await).await;
+
+        assert_eq!(status, 200, "composer submit was refused: {body}");
+        assert!(
+            content_type.starts_with("text/html"),
+            "the composer swaps into `#entries-list`, so the answer must be \
+             HTML, got {content_type}: {body}"
+        );
+        assert!(
+            body.contains("message-card"),
+            "the swapped fragment must be the entry card, got: {body}"
+        );
+        assert!(
+            body.contains("ship it"),
+            "the content must be form-decoded, got: {body}"
+        );
+
+        let listed =
+            crate::test_support::output_json(list_entries_as(&ctx, "user-a", &cid).await).await;
+        assert_eq!(listed["records"].as_array().expect("records").len(), 1);
+        assert_eq!(listed["records"][0]["data"]["content"], "ship it");
+        assert_eq!(listed["records"][0]["data"]["role"], "user");
+    }
+
+    /// The HTML answer is for the htmx swap, not for the encoding: the same
+    /// form bytes without an `HX-Request` header — a curl or an SDK posting a
+    /// form — still get the JSON record, and a JSON body still gets JSON.
+    #[tokio::test]
+    async fn only_the_htmx_caller_gets_html_back() {
+        let ctx = messages_ctx().await;
+
+        let (msg, input) = form_request(
+            "create",
+            "/b/messages/api/contexts",
+            "user-a",
+            "type=task&title=No+htmx+here",
+            false,
+        );
+        let (status, content_type, body) = http_parts(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(status, 200, "a non-htmx form post was refused: {body}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "a caller that did not ask for a swap keeps the JSON record, got \
+             {content_type}: {body}"
+        );
+        let record: serde_json::Value = serde_json::from_str(&body).expect("JSON record");
+        assert_eq!(record["data"]["title"], "No htmx here");
+
+        // The JSON path is untouched.
+        let json_created = create_as(
+            &ctx,
+            "user-a",
+            serde_json::json!({"type": "task", "title": "SDK"}),
+        )
+        .await;
+        assert_eq!(json_created["data"]["title"], "SDK");
+    }
+
+    /// A body that is neither JSON nor a form the contract accepts is still a
+    /// 400 — accepting form encoding must not turn a malformed request into a
+    /// row with default values everywhere.
+    #[tokio::test]
+    async fn a_form_body_missing_the_required_field_is_still_refused() {
+        let ctx = messages_ctx().await;
+
+        let (msg, input) = form_request(
+            "create",
+            "/b/messages/api/contexts",
+            "user-a",
+            "title=no+type+field",
+            true,
+        );
+        assert_eq!(
+            status_of(dispatch(&ctx, msg, input).await).await,
+            400,
+            "`type` is required by the contract"
+        );
+        assert!(
+            listed_ids(&list_as(&ctx, "user-a").await).is_empty(),
+            "a refused create must store nothing"
+        );
     }
 }

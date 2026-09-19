@@ -18,6 +18,34 @@ use crate::{
     util::{enum_column_or, wire_str, RecordExt},
 };
 
+/// Render one context as the list page's row.
+///
+/// Shared with `rest::create_context`, which answers the new-context form's
+/// htmx post with this same row so the swapped-in markup is the markup a
+/// reload would render. A second, fragment-only copy of it would be free to
+/// drift from the list it is prepended to.
+pub fn context_card(record: &db::Record) -> Markup {
+    let id = record.id.as_str();
+    let title = record.str_field("title");
+    let context_type = record.str_field("type");
+    let status = record.str_field("status");
+    let updated_at = record.str_field("updated_at");
+    let date = updated_at.get(..10).unwrap_or(updated_at);
+
+    html! {
+        a .messages-list__item href={"/b/messages/contexts/" (id)} {
+            span .badge .messages-list__type { (context_type) }
+            span .messages-list__title {
+                @if title.is_empty() { "Untitled" } @else { (title) }
+            }
+            span .messages-list__status .badge { (status) }
+            @if !date.is_empty() {
+                span .messages-list__date .text-muted { (date) }
+            }
+        }
+    }
+}
+
 /// Render one entry.
 ///
 /// `kind` and `role` are decoded through the crate's one enum door, so a
@@ -129,22 +157,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
                 }
             } @else {
                 @for context in &contexts {
-                    @let id = context.id.as_str();
-                    @let title = context.str_field("title");
-                    @let context_type = context.str_field("type");
-                    @let status = context.str_field("status");
-                    @let updated_at = context.str_field("updated_at");
-                    @let date = updated_at.get(..10).unwrap_or(updated_at);
-                    a .messages-list__item href={"/b/messages/contexts/" (id)} {
-                        span .badge .messages-list__type { (context_type) }
-                        span .messages-list__title {
-                            @if title.is_empty() { "Untitled" } @else { (title) }
-                        }
-                        span .messages-list__status .badge { (status) }
-                        @if !date.is_empty() {
-                            span .messages-list__date .text-muted { (date) }
-                        }
-                    }
+                    (context_card(context))
                 }
             }
         }
@@ -733,6 +746,86 @@ mod outage_tests {
         assert_eq!(
             output_http_status(context_detail_page(&failing, &msg).await).await,
             500
+        );
+    }
+}
+
+#[cfg(test)]
+mod form_contract_tests {
+    //! What the block's three htmx forms put on the wire.
+    //!
+    //! None of them declares an encoding — and no encoding extension is
+    //! shipped with the chrome, so declaring one would change nothing — which
+    //! means htmx submits them as `application/x-www-form-urlencoded` with
+    //! these field names. `rest.rs`'s handler tests post exactly these bytes;
+    //! this module is what keeps the two halves of that contract from
+    //! drifting apart.
+
+    use super::*;
+    use crate::{
+        blocks::messages::test_support::{ctx_with_messages, routed},
+        test_support::{admin_msg, output_html},
+    };
+
+    fn task_context() -> db::Record {
+        let mut record = db::Record {
+            id: "ctx-1".to_string(),
+            data: std::collections::HashMap::new(),
+        };
+        record
+            .data
+            .insert("type".to_string(), serde_json::json!("task"));
+        record
+    }
+
+    fn assert_posts_form_fields(html: &str, post_url: &str, fields: &[&str]) {
+        assert!(
+            html.contains(&format!(r#"hx-post="{post_url}""#)),
+            "form must post to {post_url}; got: {html}"
+        );
+        assert!(
+            !html.contains("hx-ext"),
+            "an encoding extension would be inert — none is shipped — so the \
+             body is form-encoded either way; got: {html}"
+        );
+        for field in fields {
+            assert!(
+                html.contains(&format!(r#"name="{field}""#)),
+                "form must send `{field}`; got: {html}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_new_context_form_posts_the_fields_create_context_reads() {
+        let ctx = ctx_with_messages().await;
+        let html = output_html(
+            context_list_page(&ctx, &routed(admin_msg("retrieve", "/b/messages/"))).await,
+        )
+        .await;
+        assert_posts_form_fields(&html, "/b/messages/api/contexts", &["type", "title"]);
+    }
+
+    #[test]
+    fn the_conversation_composer_posts_the_fields_add_entry_reads() {
+        let html =
+            render_conversation_composer("/b/messages/api/contexts/ctx-1/entries").into_string();
+        assert_posts_form_fields(
+            &html,
+            "/b/messages/api/contexts/ctx-1/entries",
+            &["kind", "role", "content"],
+        );
+    }
+
+    #[test]
+    fn the_default_view_composer_posts_the_fields_add_entry_reads() {
+        let html = render_context_detail_body(&task_context(), &[], &[], "ctx-1")
+            .expect("the fixture row decodes")
+            .into_string();
+        assert_posts_form_fields(
+            &html,
+            "/b/messages/api/contexts/ctx-1/entries",
+            &["kind", "role", "content"],
         );
     }
 }
