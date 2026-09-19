@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Fail when a tracked file outside the documentation tree cites a
+# Two guards on what comments claim. Both run; the exit status covers both.
+#
+#   1. A cited repo-relative documentation path must resolve.
+#   2. A comment must describe current behaviour, not the change that
+#      produced it. See the second block, below the first guard.
+#
+# Guard 1: fail when a tracked file outside the documentation tree cites a
 # repo-relative documentation path that does not resolve in this repo.
 #
 # The invariant: a repo-relative path written in a source comment must name a
@@ -51,46 +57,46 @@ mapfile -t candidates < <(
   git grep -I -l -e "${ROOT_DIR}/" -- ":!${ROOT_DIR}/" ":!**/migrations/*.sql" || true
 )
 
-if [ "${#candidates[@]}" -eq 0 ]; then
-  echo "check-doc-pointers: no citations found."
-  exit 0
-fi
-
 # Emit one `status<TAB>file<TAB>line<TAB>path` record per citation.
 # status is WRAPPED for a citation broken across lines, else CHECK.
-records=$(
-  awk -v dir="$ROOT_DIR" '
-    BEGIN {
-      # Preceding char must not be alphanumeric, "/" or "." — plus start-of-line.
-      re = "(^|[^A-Za-z0-9/.])" dir "/[A-Za-z0-9_./-]+"
-    }
-    {
-      line = $0
-      rest = line
-      consumed = 0
-      while (match(rest, re)) {
-        tok = substr(rest, RSTART, RLENGTH)
-        endpos = consumed + RSTART + RLENGTH - 1
-        consumed += RSTART + RLENGTH - 1
-        rest = substr(rest, RSTART + RLENGTH)
-        # Drop the preceding separator the pattern had to consume.
-        if (substr(tok, 1, 1) != substr(dir, 1, 1)) tok = substr(tok, 2)
-        # A path that runs to end-of-line and stops on a joiner is continued on
-        # the next line. Both joiners count: `-` inside a dated filename, and
-        # `/` between segments. The `/` shape is the dangerous one — the token
-        # left behind is a real directory, so a bare existence check passes and
-        # the broken citation ships silently.
-        if (tok ~ /[-\/]$/ && endpos == length(line)) {
-          printf "WRAPPED\t%s\t%d\t%s\n", FILENAME, FNR, tok
-          continue
-        }
-        # Trailing sentence punctuation is not part of the path.
-        sub(/[.-]+$/, "", tok)
-        printf "CHECK\t%s\t%d\t%s\n", FILENAME, FNR, tok
+# No candidate files means no records; awk with no file arguments would read
+# stdin and hang, so it is not run at all.
+records=""
+if [ "${#candidates[@]}" -gt 0 ]; then
+  records=$(
+    awk -v dir="$ROOT_DIR" '
+      BEGIN {
+        # Preceding char must not be alphanumeric, "/" or "." — plus start-of-line.
+        re = "(^|[^A-Za-z0-9/.])" dir "/[A-Za-z0-9_./-]+"
       }
-    }
-  ' "${candidates[@]}"
-)
+      {
+        line = $0
+        rest = line
+        consumed = 0
+        while (match(rest, re)) {
+          tok = substr(rest, RSTART, RLENGTH)
+          endpos = consumed + RSTART + RLENGTH - 1
+          consumed += RSTART + RLENGTH - 1
+          rest = substr(rest, RSTART + RLENGTH)
+          # Drop the preceding separator the pattern had to consume.
+          if (substr(tok, 1, 1) != substr(dir, 1, 1)) tok = substr(tok, 2)
+          # A path that runs to end-of-line and stops on a joiner is continued on
+          # the next line. Both joiners count: `-` inside a dated filename, and
+          # `/` between segments. The `/` shape is the dangerous one — the token
+          # left behind is a real directory, so a bare existence check passes and
+          # the broken citation ships silently.
+          if (tok ~ /[-\/]$/ && endpos == length(line)) {
+            printf "WRAPPED\t%s\t%d\t%s\n", FILENAME, FNR, tok
+            continue
+          }
+          # Trailing sentence punctuation is not part of the path.
+          sub(/[.-]+$/, "", tok)
+          printf "CHECK\t%s\t%d\t%s\n", FILENAME, FNR, tok
+        }
+      }
+    ' "${candidates[@]}"
+  )
+fi
 
 failures=0
 checked=0
@@ -117,7 +123,169 @@ done <<< "$records"
 if [ "$failures" -gt 0 ]; then
   echo
   echo "check-doc-pointers: $failures unresolvable citation(s) out of $checked checked."
-  exit 1
+else
+  echo "check-doc-pointers: $checked citation(s), all resolve."
 fi
 
-echo "check-doc-pointers: $checked citation(s), all resolve."
+# ===========================================================================
+# Second guard: comments that narrate the change that produced them.
+#
+# A comment describing what a change DID — the pull request it landed under,
+# the batch of work it belonged to, what the code held before it — is true
+# only on the day it is written. The code moves on; the sentence does not, so
+# the narration outlives what it described and becomes a false statement about
+# current behaviour sitting in the file. That is where the false comments
+# found in review came from. Describe what the code does now; the history is
+# in `git log`, where it stays accurate and where a reader can see which parts
+# of it are still live.
+#
+# The shapes matched are spelled in NARRATION_RE below: a reference to a
+# numbered pull request or batch, and a sentence opening on the capitalised
+# adverb for "before now". Lower-case `previously` is deliberately NOT matched
+# — "a previously published document" describes the data, not a past edit of
+# this file.
+#
+# Only comment bodies are scanned, in file types whose comment opener is
+# unambiguous on a single line. The opener is located on the line and the
+# match must fall after it, so a trailing comment counts and code does not.
+# Documentation and commit messages are not scanned at all: narrating history
+# is their job.
+#
+# Two exemptions, both structural:
+#   * `.sql` under `migrations/` — hash-addressed and immutable, for the
+#     reason written out above.
+#   * vendored third-party sources — not ours to rewrite.
+#
+# NARRATION_ALLOWLIST is a ratchet, not an exemption. One line per file that
+# carries narration today, `<count><TAB><path>`, counting comment LINES: a
+# line is reported once however many of the shapes it carries. A file that is NOT listed
+# must have none, so a new file cannot narrate its way in. A listed file may
+# not exceed its recorded count, and when the count drops the line must come
+# down with it, so every listed file can only shrink. Delete the line when the
+# last one is gone.
+NARRATION_ALLOWLIST="scripts/history-narration-allowlist.txt"
+NARRATION_RE='(Previously|[Ww]ave [0-9]+|[Tt]his (PR|commit)|PRs? #?[0-9]+)'
+
+mapfile -t sources < <(
+  git ls-files \
+    '*.rs' '*.ts' '*.tsx' '*.js' '*.mjs' '*.cjs' '*.go' '*.sh' '*.sql' '*.toml' '*.yml' '*.yaml' \
+    ':!:**/migrations/*.sql' ':!:**/vendor/**' ':!:**/node_modules/**'
+)
+
+# One `file<TAB>line<TAB>phrase` record per narrating comment line. As above,
+# awk with no file arguments would read stdin, so it is not run on an empty
+# list.
+narration=""
+if [ "${#sources[@]}" -gt 0 ]; then
+  narration=$(
+    awk -v re="$NARRATION_RE" '
+      function opener(name) {
+        if (name ~ /\.(rs|ts|tsx|js|mjs|cjs|go)$/) return "slash"
+        if (name ~ /\.(sh|toml|ya?ml)$/) return "hash"
+        if (name ~ /\.sql$/) return "dash"
+        return ""
+      }
+      {
+        kind = opener(FILENAME)
+        if (kind == "") next
+        if (kind == "slash") {
+          i = index($0, "//")
+          j = index($0, "/*")
+          if (i == 0 || (j > 0 && j < i)) i = j
+        } else if (kind == "hash") {
+          i = index($0, "#")
+        } else {
+          i = index($0, "--")
+        }
+        if (i == 0) next
+        body = substr($0, i)
+        if (match(body, re))
+          printf "%s\t%d\t%s\n", FILENAME, FNR, substr(body, RSTART, RLENGTH)
+      }
+    ' "${sources[@]}"
+  )
+fi
+
+declare -A narration_count=()
+declare -A narration_detail=()
+narration_total=0
+
+while IFS=$'\t' read -r file line phrase; do
+  [ -n "${file:-}" ] || continue
+  narration_count["$file"]=$(( ${narration_count["$file"]:-0} + 1 ))
+  narration_detail["$file"]+="    $file:$line: \"$phrase\"
+"
+  narration_total=$((narration_total + 1))
+done <<< "$narration"
+
+declare -A narration_budget=()
+while IFS= read -r entry || [ -n "$entry" ]; do
+  case "$entry" in '' | '#'*) continue ;; esac
+  count=${entry%%$'\t'*}
+  path=${entry#*$'\t'}
+  if [ "$count" = "$entry" ] || [ -z "$path" ] || ! [ "$count" -ge 0 ] 2>/dev/null; then
+    echo "$NARRATION_ALLOWLIST: malformed entry \"$entry\" — expected <count><TAB><path>."
+    exit 1
+  fi
+  narration_budget["$path"]=$count
+done < "$NARRATION_ALLOWLIST"
+
+narration_failures=0
+
+# A file over its budget, listed or not. Sorted, so the report reads the same
+# on every run.
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  found=${narration_count["$file"]}
+  budget=${narration_budget["$file"]:-0}
+  if [ "$found" -le "$budget" ]; then
+    continue
+  fi
+  narration_failures=$((narration_failures + 1))
+  if [ "$budget" -eq 0 ]; then
+    printf '%s: %d comment line(s) narrate change history rather than behaviour:\n' \
+      "$file" "$found"
+  else
+    printf '%s: %d narrating comment line(s), %d allowed — the file may not gain more:\n' \
+      "$file" "$found" "$budget"
+  fi
+  printf '%s' "${narration_detail["$file"]}"
+  printf '    Say what the code does now. The history belongs in the commit message.\n'
+done < <(printf '%s\n' "${!narration_count[@]}" | sort)
+
+# The other direction: an entry that is no longer earned. Without this the
+# budget survives the comment it was granted for and can be spent again by the
+# next edit, which is how an allowlist stops shrinking.
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  budget=${narration_budget["$file"]}
+  found=${narration_count["$file"]:-0}
+  if [ ! -e "$file" ]; then
+    narration_failures=$((narration_failures + 1))
+    printf '%s: listed in %s but not in the tree — delete the line.\n' \
+      "$file" "$NARRATION_ALLOWLIST"
+    continue
+  fi
+  if [ "$found" -lt "$budget" ]; then
+    narration_failures=$((narration_failures + 1))
+    printf '%s: %s allows %d narrating comment line(s), the file has %d.\n' \
+      "$file" "$NARRATION_ALLOWLIST" "$budget" "$found"
+    if [ "$found" -eq 0 ]; then
+      printf '    Delete the line: the allowlist is a ratchet and this file is clean.\n'
+    else
+      printf '    Lower the count to %d so the budget cannot be spent again.\n' "$found"
+    fi
+  fi
+done < <(printf '%s\n' "${!narration_budget[@]}" | sort)
+
+if [ "$narration_failures" -gt 0 ]; then
+  echo
+  echo "check-doc-pointers: $narration_failures file(s) with unallowed history narration."
+else
+  echo "check-doc-pointers: ${#sources[@]} source file(s) scanned, $narration_total" \
+    "narrating comment line(s), all within the allowlist."
+fi
+
+if [ "$failures" -gt 0 ] || [ "$narration_failures" -gt 0 ]; then
+  exit 1
+fi

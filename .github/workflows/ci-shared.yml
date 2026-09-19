@@ -77,7 +77,7 @@ jobs:
       - name: Lint — no full-page html! outside ui/
         run: bash scripts/grep-guard-html.sh
 
-      - name: Lint — cited documentation paths resolve
+      - name: Lint — cited doc paths resolve, comments describe behaviour
         run: bash scripts/check-doc-pointers.sh
 
       - name: Lint — WRAP-grant coverage on cross-block db::* callsites
