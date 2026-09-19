@@ -94,7 +94,11 @@ fn phase_four_producer_surface_is_pinned() {
     // #328: the forwarder macro and the `async_trait` re-export its generated
     // `impl` needs. `macro_rules!` has no value form, so existence is pinned
     // by naming the path; the KV-cache decorator writes the ledger in PR 6.
-    #[allow(unused_imports)]
+    #[expect(
+        unused_imports,
+        reason = "naming the path is the only way to pin a `macro_rules!` export; \
+                  nothing here expands it"
+    )]
     use wafer_core::{forward_database_service, wafer_async_trait};
 
     // #330: `fuse` discards the fused RRF score, which is why the browser

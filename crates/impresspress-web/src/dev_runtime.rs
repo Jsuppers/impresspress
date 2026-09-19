@@ -35,7 +35,7 @@
 //! is unbounded on `wasm32`. `Rc`, `Cell` and `RefCell` therefore cross those
 //! boundaries without an `unsafe` marker impl; the only cost is
 //! `clippy::arc_with_non_send_sync`, which the crate-level
-//! `allow(clippy::arc_with_non_send_sync)` in `lib.rs` turns off for wasm32
+//! `expect(clippy::arc_with_non_send_sync)` in `lib.rs` turns off for wasm32
 //! and only wasm32.
 //!
 //! It fires at three sites here — both `Context::clone_arc` impls and

@@ -195,10 +195,11 @@ pub async fn update_ticket(
     db::update(ctx, TICKETS, id, data).await
 }
 
-// One row per timeline entry, and the row has eight columns the caller
-// chooses. Grouping them into a struct would move the same eight names one
-// level down and buy nothing.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`ctx` plus one argument for each value a timeline row records; a \
+              struct would move the same names one level down"
+)]
 pub async fn append_event(
     ctx: &dyn Context,
     ticket_id: &str,

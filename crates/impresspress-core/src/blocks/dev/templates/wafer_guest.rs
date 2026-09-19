@@ -49,7 +49,10 @@
 //! storage folders / config keys imply), so the declaration and the code are
 //! one artifact — there is no separate manifest to keep in step.
 
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "this is the whole guest ABI; a block uses the part it needs"
+)]
 
 /// ABI version of this vendored module.
 ///

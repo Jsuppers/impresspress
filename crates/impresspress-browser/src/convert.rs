@@ -312,10 +312,18 @@ fn fetch_site_for(
         // `"cors" | "no-cors"` above is the same shape and clippy does not
         // flag it — not because an or-pattern cannot carry a guard (it can:
         // `"cors" | "no-cors" if cond => ..` compiles), simply because the
-        // lint does not fire there. Nor does it fire on older stable at all:
-        // measured absent on 1.94.0 and present on 1.98.0, so this allow reads
-        // as inert to anyone checking on a toolchain behind CI's.
-        #[allow(clippy::collapsible_match)]
+        // lint does not fire there.
+        //
+        // The lint itself is toolchain-dependent: measured absent on 1.94.0
+        // and present on 1.98.0. On a toolchain that does not fire it the
+        // `expect` below reports itself as unfulfilled, which is the honest
+        // signal — an `allow` would have read as inert instead.
+        #[expect(
+            clippy::collapsible_match,
+            reason = "the suggested guard leaves the refusal as a fall-through to \
+                      whatever arm sits last; keeping it adjacent to its condition \
+                      is what makes the verdict independent of arm order"
+        )]
         "navigate" => {
             if !referrer.is_empty() && origin_of(referrer) == self_origin {
                 "same-origin"

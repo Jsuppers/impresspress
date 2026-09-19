@@ -357,7 +357,14 @@ impl RuntimeFactory {
         // The `mut` on this and on `builder` only bites under
         // `browser-devtools`; without the feature there is no sandbox branch
         // to widen either of them.
-        #[cfg_attr(not(feature = "browser-devtools"), allow(unused_mut))]
+        #[cfg_attr(
+            not(feature = "browser-devtools"),
+            expect(
+                unused_mut,
+                reason = "only the sandbox branch widens it, and that branch is \
+                          `feature = \"browser-devtools\"`-gated"
+            )
+        )]
         let mut security_headers = serde_json::json!({ "csp": self.csp() });
 
         // Both config surfaces, empty today. The browser is the one target that
@@ -384,7 +391,14 @@ impl RuntimeFactory {
             |map| (builder::fill_config_service(config_svc, map), ()),
         );
 
-        #[cfg_attr(not(feature = "browser-devtools"), allow(unused_mut))]
+        #[cfg_attr(
+            not(feature = "browser-devtools"),
+            expect(
+                unused_mut,
+                reason = "only the sandbox branch extends it, and that branch is \
+                          `feature = \"browser-devtools\"`-gated"
+            )
+        )]
         let mut builder = with_config
             .crypto(crypto_svc)
             .network(impresspress_browser::make_network_service())

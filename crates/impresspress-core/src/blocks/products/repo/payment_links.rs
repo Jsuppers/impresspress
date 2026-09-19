@@ -81,7 +81,11 @@ fn offer_filter(offer_id: &str) -> Filter {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`ctx` plus one argument for each value the pending payment-link \
+              row records"
+)]
 pub(crate) async fn create_pending(
     ctx: &dyn Context,
     offer_id: &str,

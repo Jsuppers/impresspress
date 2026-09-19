@@ -240,7 +240,11 @@ pub(crate) struct RequestServices {
 }
 
 impl RequestServices {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per service handle the caller already owns; a bundle \
+                  struct would be this list with a name on it"
+    )]
     pub(crate) fn new(
         environment: &crate::environment::CfEnvironment,
         database: Arc<dyn DatabaseService>,

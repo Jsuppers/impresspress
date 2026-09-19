@@ -614,7 +614,11 @@ pub(crate) mod test_support {
     /// `CfEnvironment` and forgotten here fails
     /// `every_captured_field_is_covered_by_the_identity_table` on the field
     /// count rather than passing silently.
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the setter table is written out in full on purpose; a type alias \
+                  would hide the shape the field-count assertion reads"
+    )]
     pub(crate) fn mutators() -> Vec<(&'static str, fn(&mut CfEnvironment))> {
         vec![
             ("worker_version", |e| {

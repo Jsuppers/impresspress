@@ -585,7 +585,6 @@ mod conformance {
     /// `run_conformance` requires — is what enforces the trait-surface
     /// conformance; awaiting it here would need the sql.js/OPFS bridge, which
     /// the module doc explains is unavailable under `wasm-pack test --node`.
-    #[allow(dead_code)]
     async fn _browser_adapter_is_conformable(svc: &BrowserDatabaseService) {
         run_conformance(svc as &dyn DatabaseService).await;
     }
