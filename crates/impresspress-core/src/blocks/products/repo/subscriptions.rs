@@ -14,6 +14,30 @@ use crate::{
 /// Platform-billing subscription table — one row per user.
 pub(crate) const SUBSCRIPTIONS_TABLE: &str = "impresspress__products__subscriptions";
 
+/// Each add-on total: the Stripe per-price metadata key that carries it, and
+/// the column [`set_addon_totals`] writes it to.
+///
+/// The metadata keys are names the platform stamps on its own Stripe prices,
+/// not operator settings — they arrive on the price object inside every
+/// `customer.subscription.updated` payload, so renaming one means re-creating
+/// prices in Stripe, which no configuration value can do. Keeping the pair in
+/// one table is what makes the reader (`stripe.rs`, which sums item metadata)
+/// and the writer (below) agree on order.
+pub(crate) const ADDON_TOTALS: [(&str, &str); 4] = [
+    ("extra_projects", "addon_projects"),
+    ("extra_requests", "addon_requests"),
+    ("extra_r2_bytes", "addon_r2_bytes"),
+    ("extra_d1_bytes", "addon_d1_bytes"),
+];
+
+/// Every wire spelling a terminal `status` can hold. Two variants are terminal
+/// ([`SubscriptionStatus::is_terminal`]) and one of them is stored under two
+/// spellings: [`cancel_and_reset_addons`] writes `cancelled`, while every
+/// Stripe-sourced write spells it `canceled`. Excluding a status by name needs
+/// all three, which is why this is a list of spellings rather than of
+/// variants.
+const TERMINAL_STATUS_SPELLINGS: [&str; 3] = ["canceled", "cancelled", "incomplete_expired"];
+
 fn platform_update_data(
     stripe_customer_id: &str,
     stripe_subscription_id: &str,
@@ -421,10 +445,9 @@ pub(crate) async fn cancel_and_reset_addons(
     let now = chrono::Utc::now().to_rfc3339();
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
     data.insert("status".into(), serde_json::json!("cancelled"));
-    data.insert("addon_projects".into(), serde_json::json!(0));
-    data.insert("addon_requests".into(), serde_json::json!(0));
-    data.insert("addon_r2_bytes".into(), serde_json::json!(0));
-    data.insert("addon_d1_bytes".into(), serde_json::json!(0));
+    for (_, column) in ADDON_TOTALS {
+        data.insert(column.into(), serde_json::json!(0));
+    }
     data.insert("updated_at".into(), serde_json::json!(&now));
     data.insert(
         "stripe_event_created".into(),
@@ -450,42 +473,42 @@ pub(crate) async fn cancel_and_reset_addons(
     .await
 }
 
-/// Set the addon column totals for a user's active subscription. The caller
-/// (stripe.rs) parses Stripe subscription-item metadata into the four totals;
-/// this writes them. Returns rows affected.
+/// Set the add-on column totals on a user's subscription, in the order of
+/// [`ADDON_TOTALS`]. The caller (stripe.rs) sums Stripe subscription-item
+/// metadata into the totals; this writes them. Returns rows affected.
+///
+/// A terminal row is not written. `customer.subscription.updated` can be
+/// delivered (or redelivered) after `customer.subscription.deleted`, and
+/// [`cancel_and_reset_addons`] has already zeroed the columns by then — an
+/// unfiltered write would hand the cancelled account its add-on quota back.
+/// Every non-terminal status is written, including `trialing` and `past_due`:
+/// these columns are a projection of what Stripe reports, and which of those
+/// states earns the quota is the reading platform's decision, not this
+/// block's. Filtering them out here instead lost an add-on bought during a
+/// trial until the next `updated` delivery, and one bought while past due
+/// until whenever the item set next changed.
 pub(crate) async fn set_addon_totals(
     ctx: &dyn Context,
     user_id: &str,
-    projects: i64,
-    requests: i64,
-    r2_bytes: i64,
-    d1_bytes: i64,
+    totals: [i64; ADDON_TOTALS.len()],
 ) -> Result<i64, WaferError> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-    data.insert("addon_projects".into(), serde_json::json!(projects));
-    data.insert("addon_requests".into(), serde_json::json!(requests));
-    data.insert("addon_r2_bytes".into(), serde_json::json!(r2_bytes));
-    data.insert("addon_d1_bytes".into(), serde_json::json!(d1_bytes));
+    for ((_, column), total) in ADDON_TOTALS.iter().zip(totals) {
+        data.insert((*column).into(), serde_json::json!(total));
+    }
     data.insert("updated_at".into(), serde_json::json!(now));
-    db::update_by_filters_count(
-        ctx,
-        SUBSCRIPTIONS_TABLE,
-        vec![
-            Filter {
-                field: "user_id".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(user_id),
-            },
-            Filter {
-                field: "status".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(SubscriptionStatus::Active),
-            },
-        ],
-        data,
-    )
-    .await
+    let mut filters = vec![Filter {
+        field: "user_id".into(),
+        operator: FilterOp::Equal,
+        value: serde_json::json!(user_id),
+    }];
+    filters.extend(TERMINAL_STATUS_SPELLINGS.iter().map(|spelling| Filter {
+        field: "status".into(),
+        operator: FilterOp::NotEqual,
+        value: serde_json::json!(spelling),
+    }));
+    db::update_by_filters_count(ctx, SUBSCRIPTIONS_TABLE, filters, data).await
 }
 
 /// Look up the user_id owning a Stripe subscription. `Ok(None)` is "no row

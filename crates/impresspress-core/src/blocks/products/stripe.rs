@@ -3352,10 +3352,9 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 );
             }
 
-            // Sync addon totals from Stripe subscription items metadata.
-            // Each addon subscription item has metadata fields: extra_projects,
-            // extra_requests, extra_r2_bytes, extra_d1_bytes (set when creating
-            // the subscription item via Stripe API).
+            // Sync add-on totals from the metadata of the subscription's
+            // items. `repo::subscriptions::ADDON_TOTALS` names the metadata
+            // keys the platform stamps on its add-on prices.
             let user_id =
                 match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await {
                     Ok(user_id) => user_id,
@@ -3370,7 +3369,16 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 };
             if let Some(ref uid) = user_id {
                 if let Some(items) = data_object.get("items") {
-                    sync_addon_totals_from_items(ctx, uid, items).await;
+                    // A failed sync used to be logged and nothing else, so the
+                    // delivery still sealed the event as processed and Stripe
+                    // had nothing to retry: the subscriber kept paying for
+                    // add-ons their row never recorded.
+                    if let Err(error) = sync_addon_totals_from_items(ctx, uid, items).await {
+                        fail_webhook!(
+                            err_internal("Failed to synchronize add-on totals", error),
+                            "add-on total synchronization failed"
+                        );
+                    }
                 }
             }
 
@@ -4209,16 +4217,24 @@ async fn user_owns_product(
     repo::purchases::line_item_exists_for_product(ctx, purchase_ids, product_id).await
 }
 
-/// Sync addon column totals from Stripe subscription items.
+/// Sum the add-on totals a Stripe subscription's items report and write them
+/// to the subscriber's row.
 ///
-/// Reads addon values from item metadata (set by the platform when creating
-/// subscription items). This keeps the products block plan-agnostic — it
-/// doesn't need to know what addon packs exist, just what Stripe reports.
-async fn sync_addon_totals_from_items(ctx: &dyn Context, user_id: &str, items: &serde_json::Value) {
-    let mut total_projects: i64 = 0;
-    let mut total_requests: i64 = 0;
-    let mut total_r2: i64 = 0;
-    let mut total_d1: i64 = 0;
+/// The per-unit amounts are read from item metadata, which the platform stamps
+/// on the prices it sells; [`repo::subscriptions::ADDON_TOTALS`] owns the
+/// metadata key for each total and the column it feeds. The block never needs
+/// a list of the add-on packs that exist — only the totals Stripe reports.
+///
+/// The totals come from a payload, so every product and sum is checked: an
+/// amount or a quantity large enough to wrap would otherwise write a negative
+/// quota. Both that and a failed write are errors, and the caller answers
+/// Stripe with one so the delivery is retried.
+async fn sync_addon_totals_from_items(
+    ctx: &dyn Context,
+    user_id: &str,
+    items: &serde_json::Value,
+) -> Result<(), WaferError> {
+    let mut totals = [0i64; repo::subscriptions::ADDON_TOTALS.len()];
 
     if let Some(data) = items.get("data").and_then(|v| v.as_array()) {
         for item in data {
@@ -4244,25 +4260,27 @@ async fn sync_addon_totals_from_items(ctx: &dyn Context, user_id: &str, items: &
                     })
                     .unwrap_or(0)
             };
-            total_projects += parse("extra_projects") * qty;
-            total_requests += parse("extra_requests") * qty;
-            total_r2 += parse("extra_r2_bytes") * qty;
-            total_d1 += parse("extra_d1_bytes") * qty;
+            for (total, (metadata_key, _)) in
+                totals.iter_mut().zip(repo::subscriptions::ADDON_TOTALS)
+            {
+                *total = parse(metadata_key)
+                    .checked_mul(qty)
+                    .and_then(|line| total.checked_add(line))
+                    .ok_or_else(|| {
+                        WaferError::new(
+                            wafer_run::ErrorCode::InvalidArgument,
+                            format!(
+                                "Stripe subscription item metadata overflows the \
+                                 {metadata_key} add-on total"
+                            ),
+                        )
+                    })?;
+            }
         }
     }
 
-    if let Err(e) = repo::subscriptions::set_addon_totals(
-        ctx,
-        user_id,
-        total_projects,
-        total_requests,
-        total_r2,
-        total_d1,
-    )
-    .await
-    {
-        tracing::error!(error = %e, user_id = %user_id, "syncing addon totals failed");
-    }
+    repo::subscriptions::set_addon_totals(ctx, user_id, totals).await?;
+    Ok(())
 }
 
 #[cfg(test)]

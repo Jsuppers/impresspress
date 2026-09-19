@@ -6258,3 +6258,255 @@ async fn a_delivery_signed_during_a_secret_roll_is_accepted_whichever_v1_comes_l
         "a header with no signature from the configured secret must be rejected"
     );
 }
+
+/// Seed a platform-billing subscription row that a
+/// `customer.subscription.updated` delivery can be matched against.
+async fn seed_platform_subscription(
+    ctx: &crate::test_support::TestContext,
+    stripe_subscription_id: &str,
+    user_id: &str,
+    status: &str,
+) {
+    seed(
+        ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        stripe_subscription_id,
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!(user_id)),
+            (
+                "stripe_subscription_id".to_string(),
+                serde_json::json!(stripe_subscription_id),
+            ),
+            ("status".to_string(), serde_json::json!(status)),
+            ("plan".to_string(), serde_json::json!("pro")),
+            ("stripe_event_created".to_string(), serde_json::json!(100)),
+            ("addon_r2_bytes".to_string(), serde_json::json!(5)),
+        ]),
+    )
+    .await;
+}
+
+/// A `customer.subscription.updated` event whose single add-on item reports
+/// `extra_r2_bytes` per unit at `quantity`.
+fn subscription_updated_with_addon(
+    event_id: &str,
+    stripe_subscription_id: &str,
+    status: &str,
+    extra_r2_bytes: &str,
+    quantity: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": event_id,
+        "type": "customer.subscription.updated",
+        "created": 200,
+        "livemode": false,
+        "data": {"object": {
+            "id": stripe_subscription_id,
+            "status": status,
+            "items": {"data": [{
+                "quantity": quantity,
+                "price": {"metadata": {
+                    "addon_id": "storage_pack",
+                    "extra_r2_bytes": extra_r2_bytes
+                }}
+            }]}
+        }}
+    })
+}
+
+/// The add-on totals are summed from payload numbers, so an amount or a
+/// quantity big enough to wrap would write a negative quota — a subscriber
+/// billed for storage handed less than none. The delivery fails instead.
+#[tokio::test]
+async fn an_addon_total_that_would_wrap_fails_the_delivery_instead_of_being_written() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_addon_overflow", "owner_overflow", "active").await;
+
+    let event = subscription_updated_with_addon(
+        "evt_addon_overflow",
+        "sub_addon_overflow",
+        "active",
+        &i64::MAX.to_string(),
+        2,
+    );
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert!(
+        output_is_error(
+            stripe::handle_webhook(&ctx, &msg, input).await,
+            ErrorCode::Internal,
+        )
+        .await,
+        "an add-on total that cannot be represented must not be answered with a success"
+    );
+
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_addon_overflow",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["status"], "failed");
+    assert_eq!(
+        event_row.data["last_error"], "add-on total synchronization failed",
+        "the failure has to name the sync, not a downstream symptom"
+    );
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_addon_overflow",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subscription.data["addon_r2_bytes"], 5,
+        "the stored total must be left alone, not replaced by a wrapped one"
+    );
+}
+
+/// The write that records the totals is the point of the arm. Failing it used
+/// to be logged and nothing else, so the arm ran on to `mark_event_processed`
+/// and Stripe was told the delivery had succeeded — the subscriber kept paying
+/// for add-ons no row recorded, and nothing retried.
+#[tokio::test]
+async fn an_addon_total_write_that_fails_does_not_report_success() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_addon_write", "owner_write", "active").await;
+
+    let event =
+        subscription_updated_with_addon("evt_addon_write", "sub_addon_write", "active", "1024", 3);
+
+    // The status/plan write lands first on the same table; only the add-on
+    // total write after it is failed.
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![(
+            "database.update_where_count",
+            repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        )],
+    )
+    .after_passing(1);
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert!(
+        output_is_error(
+            stripe::handle_webhook(&failing, &msg, input).await,
+            ErrorCode::Internal,
+        )
+        .await,
+        "an add-on total write that could not run must make Stripe redeliver"
+    );
+
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_addon_write",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["status"], "failed");
+    assert_eq!(
+        event_row.data["last_error"],
+        "add-on total synchronization failed"
+    );
+}
+
+/// The add-on columns are a projection of what Stripe reports, and Stripe
+/// reports add-on items on a trialing subscription exactly as it does on an
+/// active one. Writing only `active` rows dropped an add-on bought during a
+/// trial; which lifecycle states earn the quota is the reading platform's
+/// decision, made from the `status` it is served beside them.
+#[tokio::test]
+async fn addon_totals_are_recorded_for_a_subscription_that_is_not_yet_active() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_addon_trial", "owner_trial", "trialing").await;
+
+    let event = subscription_updated_with_addon(
+        "evt_addon_trial",
+        "sub_addon_trial",
+        "trialing",
+        "1024",
+        3,
+    );
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_addon_trial",
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription.data["status"], "trialing");
+    assert_eq!(
+        subscription.data["addon_r2_bytes"], 3072,
+        "a trialing subscriber's add-on purchase has to reach the row"
+    );
+}
+
+/// The one row the totals must never reach is a cancelled one:
+/// `cancel_and_reset_addons` zeroes the columns on cancellation, and a
+/// `customer.subscription.updated` redelivered afterwards would otherwise hand
+/// the cancelled account its quota back. The seeded totals are non-zero so
+/// that "nothing was written" is distinguishable from "zero was written".
+#[tokio::test]
+async fn addon_totals_are_not_written_back_onto_a_cancelled_subscription() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    // The platform-billing projection stores the British spelling; every
+    // Stripe-sourced column stores `canceled`. Both have to be excluded.
+    for (index, spelling) in ["cancelled", "canceled"].into_iter().enumerate() {
+        let subscription_id = format!("sub_addon_cancelled_{index}");
+        seed_platform_subscription(
+            &ctx,
+            &subscription_id,
+            &format!("owner_cancelled_{index}"),
+            spelling,
+        )
+        .await;
+
+        let event = subscription_updated_with_addon(
+            &format!("evt_addon_cancelled_{index}"),
+            &subscription_id,
+            "active",
+            "1024",
+            3,
+        );
+        let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+        assert_eq!(
+            output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+            true
+        );
+
+        let subscription = db::get(
+            &ctx,
+            repo::subscriptions::SUBSCRIPTIONS_TABLE,
+            &subscription_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            subscription.data["addon_r2_bytes"], 5,
+            "a {spelling} subscription must keep the totals it was cancelled with"
+        );
+    }
+}
