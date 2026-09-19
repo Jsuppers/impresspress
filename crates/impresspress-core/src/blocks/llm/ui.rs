@@ -201,6 +201,24 @@ fn add_provider_form() -> Markup {
                         "Admin variable name holding the API key. Leave empty for providers that don't need auth."
                     }
                 }
+                div .form-group {
+                    label .form-label for="new-max-tokens-field" { "Token budget field" }
+                    // The empty option is the ordinary case. A select always
+                    // posts something, so `create_provider`'s form parser
+                    // drops the empty value rather than handing serde a token
+                    // the contract does not have.
+                    select .form-select name="max_tokens_field" id="new-max-tokens-field" {
+                        option value="" selected { "Follow the protocol" }
+                        option value="max_tokens" { "max_tokens" }
+                        option value="max_completion_tokens" { "max_completion_tokens" }
+                    }
+                    p .form-hint {
+                        "Only for an OpenAI-shaped endpoint that wants the other \
+                         spelling than its protocol's — an Azure OpenAI reasoning \
+                         deployment on open_ai_compatible needs \
+                         max_completion_tokens. The anthropic protocol refuses this."
+                    }
+                }
                 div .form-group .col-span-full {
                     label .form-label for="new-models" { "Models (comma-separated)" }
                     // One text input; the handler splits it into the contract's
@@ -259,6 +277,7 @@ fn render_providers_table(configs: &[(String, ProviderConfig)], manages: bool) -
                             th { "Protocol" }
                             th { "Endpoint" }
                             th { "Key var" }
+                            th { "Budget field" }
                             th { "Models" }
                             th { "Enabled" }
                             @if manages { th { "Actions" } }
@@ -300,6 +319,13 @@ fn provider_row(id: &str, cfg: &ProviderConfig, manages: bool) -> Markup {
                     code .text-xs { (kv) }
                 } @else {
                     span .text-muted .text-xs { "(none)" }
+                }
+            }
+            td {
+                @if let Some(field) = cfg.max_tokens_field {
+                    code .text-xs { (field.as_str()) }
+                } @else {
+                    span .text-muted .text-xs { "(protocol)" }
                 }
             }
             td .text-xs .truncate .llm-cell--models {
@@ -549,7 +575,13 @@ mod tests {
             "the form must post to the create endpoint; got: {m}"
         );
         for field in [
-            "name", "protocol", "endpoint", "key_var", "models", "enabled",
+            "name",
+            "protocol",
+            "endpoint",
+            "key_var",
+            "max_tokens_field",
+            "models",
+            "enabled",
         ] {
             assert!(
                 m.contains(&format!(r#"name="{field}""#)),

@@ -47,6 +47,7 @@ use super::{
     providers::config::{ProviderConfig, ProviderProtocol},
     repo::settings::ThreadSettingRow,
 };
+use crate::llm_wire::openai::MaxTokensField;
 
 // ---------------------------------------------------------------------------
 // POST /b/llm/api/chat, POST /b/llm/api/chat/stream
@@ -136,6 +137,9 @@ pub struct ProviderView {
     /// key, or `null` for a provider that runs unauthenticated. The key
     /// itself is never published.
     pub key_var: Option<String>,
+    /// Which field carries the output-token budget in this provider's chat
+    /// bodies, or `null` to send the one its `protocol` implies.
+    pub max_tokens_field: Option<MaxTokensField>,
     /// Explicit model list. Empty means the models are discovered from the
     /// provider's `/v1/models`.
     pub models: Vec<String>,
@@ -152,6 +156,7 @@ impl ProviderView {
             protocol: cfg.protocol,
             endpoint: cfg.endpoint.clone(),
             key_var: cfg.key_var.clone(),
+            max_tokens_field: cfg.max_tokens_field,
             models: cfg.models.clone(),
             enabled: cfg.enabled,
         }
@@ -184,6 +189,11 @@ pub struct CreateProviderRequest {
     /// Name of the admin configuration variable holding the API key. Omit,
     /// or send an empty string, for a provider that needs no key.
     pub key_var: Option<String>,
+    /// Which field carries the output-token budget in this provider's chat
+    /// bodies. Omit to send the one `protocol` implies, which is what all but
+    /// a handful of endpoints want. Refused on the `anthropic` protocol,
+    /// whose wire format has only one such field.
+    pub max_tokens_field: Option<MaxTokensField>,
     /// Explicit model list. Omitted or empty means the models are discovered
     /// from the provider's `/v1/models`.
     pub models: Option<Vec<String>>,
@@ -197,8 +207,10 @@ pub struct CreateProviderRequest {
 // for the same reason: an inline `api_key` on the patch must be refused by
 // name, not dropped.
 /// `PATCH /b/llm/api/providers/{id}` request body. Every field is optional
-/// and only the ones present are applied. An empty `key_var` clears the
-/// variable; an empty `name` or `endpoint` is ignored.
+/// and only the ones present are applied. The two fields a provider can hold
+/// as `null` — `key_var` and `max_tokens_field` — are cleared by sending
+/// `null` (`key_var` also by an empty string); an empty `name` or `endpoint`
+/// is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateProviderRequest {
@@ -206,9 +218,52 @@ pub struct UpdateProviderRequest {
     pub protocol: Option<ProviderProtocol>,
     /// Re-validated on every change: must resolve to a public address.
     pub endpoint: Option<String>,
-    pub key_var: Option<String>,
+    // `key_var` and `max_tokens_field` are the two fields on this body where a
+    // present `null` differs from an absent key, because they are the two the
+    // provider itself can hold as `null` and so the two an admin has to be
+    // able to clear. Both take the same `present_as_some` treatment rather
+    // than one convention each: the schema stays that of the value being
+    // patched (`string | null`, `MaxTokensField | null`) and the extra
+    // `Option` is how Rust holds "was it sent at all", not a second level of
+    // nesting on the wire. The remaining fields are not nullable on a
+    // provider, so for them `null` and absent mean the same thing.
+    //
+    // `skip_serializing_if` keeps the derived `Serialize` telling the same
+    // story: an absent field stays absent rather than going back out as the
+    // `null` that means "clear it".
+    /// Name of the admin configuration variable holding the API key, or
+    /// `null` (or `""`) to leave the provider unauthenticated.
+    #[serde(
+        default,
+        deserialize_with = "present_as_some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub key_var: Option<Option<String>>,
+    /// Which field carries the output-token budget, or `null` to go back to
+    /// the one `protocol` implies.
+    #[serde(
+        default,
+        deserialize_with = "present_as_some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<MaxTokensField>")]
+    pub max_tokens_field: Option<Option<MaxTokensField>>,
     pub models: Option<Vec<String>>,
     pub enabled: Option<bool>,
+}
+
+/// Deserialize a *present* field into `Some(..)`, `null` included.
+///
+/// `Option<Option<T>>` under plain `#[serde(default)]` collapses an absent key
+/// and an explicit `null` into the same `None`, so a patch type built that way
+/// can set a value but never clear one.
+fn present_as_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// `DELETE /b/llm/api/providers/{id}` response body.
@@ -481,7 +536,16 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["enabled", "endpoint", "id", "key_var", "models", "name", "protocol"]
+            [
+                "enabled",
+                "endpoint",
+                "id",
+                "key_var",
+                "max_tokens_field",
+                "models",
+                "name",
+                "protocol"
+            ]
         );
         assert!(
             !value.to_string().contains("sk-resolved-plaintext"),

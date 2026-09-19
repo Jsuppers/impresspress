@@ -1057,7 +1057,19 @@ fn replay_buffered(body: Vec<u8>, meta: Vec<MetaEntry>) -> OutputStream {
     OutputStream::respond_with_meta(body, meta)
 }
 
-#[cfg(test)]
+// Every test here asserts on the document generated from
+// `test_support::real_block_infos()`, which is itself gated on the full block
+// set: a build missing one of those blocks would be asserting about a
+// different document than the one this module describes.
+#[cfg(all(
+    test,
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
+))]
 mod discovery_tests {
     //! Covers the two OpenAPI/agent-card fixes:
     //!  1. `info.title` (and the agent-card `name`) comes from
@@ -2927,7 +2939,18 @@ mod request_log_mode_tests {
     }
 }
 
-#[cfg(test)]
+// Driven through `test_support::real_block_infos()` — see `discovery_tests`
+// for why that needs the full block set. The route whose token must not be
+// logged is the files block's `/b/storage/direct/{token}`.
+#[cfg(all(
+    test,
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
+))]
 mod secret_path_redaction_tests {
     //! A capability that travels in the URL path must not be copied into the
     //! audit log.
@@ -3535,6 +3558,16 @@ mod request_log_policy_tests {
         );
     }
 
+    // The only test in this module driven through the real block set — see
+    // `discovery_tests` for why that needs every block compiled.
+    #[cfg(all(
+        feature = "block-files",
+        feature = "block-messages",
+        feature = "block-products",
+        feature = "block-tickets",
+        feature = "block-llm",
+        feature = "block-vector"
+    ))]
     #[tokio::test]
     async fn repro_site_root_is_not_collapsed() {
         let ctx = ctx_with(Some("all")).await;

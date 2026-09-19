@@ -259,7 +259,17 @@ sha2 = { workspace = true }
 # harness) instead of re-implementing it. A self dev-dep is the standard way
 # to feature-gate a test-only public module without leaking it into the
 # production lib build.
-impresspress-core = { path = ".", features = ["test-support"] }
+#
+# `default-features = false` because a dev-dependency's features are unified
+# into the package's own build whenever a test target is compiled. Spelled
+# without it, this line re-enables `default` — and so `llm` — in every
+# `cargo test --no-default-features` run, including the CI lane whose whole
+# purpose is to compile the vector block with the llm backend absent. The
+# features a run asks for on the command line still apply; this only stops the
+# dev-dep from adding `default` back on top of them.
+impresspress-core = { path = ".", default-features = false, features = [
+    "test-support",
+] }
 # `net` + `io-util` let the LLM provider tests answer a chat request from a
 # real socket (partial SSE body, then close or hang), which is the only way to
 # exercise the streaming client's truncation and read-timeout handling.

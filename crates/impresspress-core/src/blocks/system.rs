@@ -82,15 +82,23 @@ crate::impresspress_feature_block! {
 
 #[cfg(test)]
 mod tests {
-    use wafer_run::{
-        context::Context, Block, InputStream, Message, OutputStream, META_RESP_CONTENT_TYPE,
-    };
+    // Read only by the asset-serving tests below (and by the `NopCtx` those
+    // tests call `handle` with), and `serve_asset` answers 404 without
+    // `embed-assets`, so those tests are gated on it.
+    #[cfg(feature = "embed-assets")]
+    use wafer_run::{context::Context, InputStream, OutputStream, META_RESP_CONTENT_TYPE};
+    use wafer_run::{Block, Message};
 
     use super::*;
+    #[cfg(feature = "embed-assets")]
     use crate::ui::assets;
 
+    // The only thing that ever passes a context to `SystemBlock::handle` is an
+    // asset-serving test, and those are gated on `embed-assets`.
+    #[cfg(feature = "embed-assets")]
     #[derive(Clone)]
     struct NopCtx;
+    #[cfg(feature = "embed-assets")]
     #[async_trait::async_trait]
     impl Context for NopCtx {
         async fn call_block(

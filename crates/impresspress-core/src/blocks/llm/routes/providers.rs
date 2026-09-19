@@ -34,7 +34,7 @@ use crate::{
             },
             provider_admin::ProviderAdmin,
             providers::config::ProviderConfig,
-            schema::{config_to_row, row_to_config, TABLE as PROVIDERS_TABLE},
+            schema::{config_to_row, models_row, row_to_config, TABLE as PROVIDERS_TABLE},
             LlmBlock,
         },
     },
@@ -218,8 +218,12 @@ pub(in crate::blocks::llm) async fn list_providers(
 /// `application/x-www-form-urlencoded` and every field arrives as a string.
 ///
 /// The form values that are not strings in the contract are coerced here, and
-/// only here: `models` is one comma-separated text input, and `enabled` is a
-/// checkbox, which posts nothing at all when the admin unticks it. `models` is
+/// only here: `models` is one comma-separated text input, `enabled` is a
+/// checkbox, which posts nothing at all when the admin unticks it, and
+/// `max_tokens_field` is a select whose "follow the protocol" option has no
+/// token to post — a `<select>` always sends *something*, and `""` is not one
+/// of the two wire spellings, so an empty one is dropped and the contract
+/// sees the field omitted. `models` is
 /// read through [`crate::util::form_values`] rather than the last-wins map, so
 /// a client that spells the list as a repeated key (`models=a&models=b`, which
 /// is how urlencoded serialisation writes an array) is understood to mean both
@@ -235,6 +239,9 @@ fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, Strin
     let mut fields = serde_json::Map::new();
     for (key, value) in &form {
         if key == "models" || key == "enabled" {
+            continue;
+        }
+        if key == "max_tokens_field" && value.is_empty() {
             continue;
         }
         fields.insert(key.clone(), serde_json::Value::String(value.clone()));
@@ -256,6 +263,30 @@ fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, Strin
     );
     serde_json::from_value(serde_json::Value::Object(fields))
         .map_err(|e| format!("Invalid body: {e}"))
+}
+
+/// Refuse a `max_tokens_field` on a protocol that has no use for one.
+///
+/// The Anthropic Messages API carries the budget in a single `max_tokens`
+/// field, so `providers::anthropic`'s encoder never reads the override.
+/// Storing one there would be a setting an admin can see in the row and on
+/// `GET /b/llm/api/providers` and that changes nothing on the wire, which is
+/// worth a 400 rather than a shrug. Both call sites check the configuration
+/// they are about to store — on the patch route that is the *patched* one — so
+/// the message names the way out an admin actually has: clearing the override
+/// in the very request that switches the protocol is accepted.
+fn check_max_tokens_field(cfg: &ProviderConfig) -> Result<(), String> {
+    match cfg.max_tokens_field {
+        Some(field) if !cfg.protocol.accepts_max_tokens_field() => Err(format!(
+            "`max_tokens_field` ({}) does not apply to the `{}` protocol: its \
+             request body has a single budget field — omit the field, or send \
+             `\"max_tokens_field\": null` in this same request to clear an \
+             override the row already holds",
+            field.as_str(),
+            cfg.protocol.as_str()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `POST /b/llm/api/providers` — create. The typed body requires `name`,
@@ -301,11 +332,15 @@ pub(in crate::blocks::llm) async fn create_provider(
     if let Some(k) = body.key_var.filter(|s| !s.is_empty()) {
         cfg.key_var = Some(k);
     }
+    cfg.max_tokens_field = body.max_tokens_field;
     if let Some(m) = body.models {
         cfg.models = m;
     }
     if let Some(e) = body.enabled {
         cfg.enabled = e;
+    }
+    if let Err(e) = check_max_tokens_field(&cfg) {
+        return err_bad_request(&e);
     }
 
     let mut data = config_to_row(&cfg);
@@ -369,14 +404,28 @@ pub(in crate::blocks::llm) async fn update_provider(
         }
         cfg.endpoint = e;
     }
+    // Both nullable fields: present at all — `null` included — replaces the
+    // stored value; a body that omits the key leaves it alone. An empty
+    // `key_var` string clears it too, which is what it means to the create
+    // form; this route takes JSON only, and the admin page has no edit form.
+    // See `UpdateProviderRequest`.
     if let Some(k) = body.key_var {
-        cfg.key_var = if k.is_empty() { None } else { Some(k) };
+        cfg.key_var = k.filter(|s| !s.is_empty());
+    }
+    if let Some(f) = body.max_tokens_field {
+        cfg.max_tokens_field = f;
     }
     if let Some(m) = body.models {
         cfg.models = m;
     }
     if let Some(e) = body.enabled {
         cfg.enabled = e;
+    }
+    // Checked on the patched config, not on the body: switching a provider to
+    // `anthropic` while an override is stored produces the same unusable
+    // pairing as sending both in one body.
+    if let Err(e) = check_max_tokens_field(&cfg) {
+        return err_bad_request(&e);
     }
 
     let mut data = config_to_row(&cfg);
@@ -422,6 +471,11 @@ pub(in crate::blocks::llm) async fn delete_provider(
 /// `POST /b/llm/api/providers/:id/discover-models` — call the provider's
 /// `/v1/models` endpoint, persist the discovered list back to the row, and
 /// return the new model list. Admin-only.
+///
+/// The write is a one-column write (`models`, via [`models_row`]) and
+/// not a re-encode of the row this handler read: the provider's HTTP endpoint
+/// is awaited in between, and an admin editing the same provider across that
+/// window would otherwise have their change written back at its stale value.
 pub(in crate::blocks::llm) async fn discover_models(
     block: &LlmBlock,
     ctx: &dyn Context,
@@ -463,7 +517,7 @@ pub(in crate::blocks::llm) async fn discover_models(
     };
     cfg.models = models.into_iter().map(|m| m.model_id).collect();
 
-    let mut data = config_to_row(&cfg);
+    let mut data = models_row(&cfg.models);
     crate::util::stamp_updated(&mut data);
     if let Err(e) = db::update(ctx, PROVIDERS_TABLE, &id, data).await {
         return err_internal("Database error", e);
@@ -483,12 +537,14 @@ mod tests {
     use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
 
     use super::*;
+    // Read only by `reload_provider_service_resolves_key_var_into_api_key`,
+    // which needs the concrete `ProviderLlmService` and so carries the same
+    // gate.
+    #[cfg(feature = "llm")]
+    use crate::blocks::llm::providers::config::ProviderProtocol;
     use crate::{
-        blocks::llm::{
-            providers::config::ProviderProtocol,
-            routes::test_support::{
-                admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
-            },
+        blocks::llm::routes::test_support::{
+            admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
         },
         test_support::{output_json, TestContext},
     };
@@ -764,7 +820,16 @@ mod tests {
         got.sort_unstable();
         assert_eq!(
             got,
-            ["enabled", "endpoint", "id", "key_var", "models", "name", "protocol"],
+            [
+                "enabled",
+                "endpoint",
+                "id",
+                "key_var",
+                "max_tokens_field",
+                "models",
+                "name",
+                "protocol"
+            ],
             "{label}: the wire field set must equal ProviderView's, or the published \
              schema describes something the handler does not emit"
         );
@@ -844,6 +909,428 @@ mod tests {
                 "{label} published an api_key field: {raw}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The per-provider output-token budget field
+    // -----------------------------------------------------------------
+
+    /// Refusals from these handlers, as `(code, message)`.
+    async fn provider_refusal(out: OutputStream) -> (ErrorCode, String) {
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => (e.code, e.message),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The stored rows, re-read through `GET /b/llm/api/providers` — the only
+    /// way to tell a write that persisted from one the handler merely echoed
+    /// back out of the config it had in hand.
+    async fn stored_rows(ctx: &TestContext, block: &LlmBlock) -> Vec<serde_json::Value> {
+        let listed = output_json(
+            list_providers(block, ctx, &admin_msg("retrieve", "/b/llm/api/providers")).await,
+        )
+        .await;
+        listed["providers"]
+            .as_array()
+            .expect("providers array")
+            .clone()
+    }
+
+    async fn create_azure_style(
+        ctx: &TestContext,
+        block: &LlmBlock,
+    ) -> (String, serde_json::Value) {
+        let created = output_json(
+            create_provider(
+                block,
+                ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                json_input(serde_json::json!({
+                    "name": "azure-reasoning",
+                    "protocol": "open_ai_compatible",
+                    "endpoint": "https://example.openai.azure.com/openai/v1",
+                    "max_tokens_field": "max_completion_tokens",
+                })),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        (id, created)
+    }
+
+    /// The configuration this whole field exists for: an Azure OpenAI
+    /// reasoning deployment, which speaks `open_ai_compatible` but accepts
+    /// only `max_completion_tokens`. It survives to the stored row, not just
+    /// the create response.
+    #[tokio::test]
+    async fn a_declared_max_tokens_field_is_stored_and_published() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (_id, created) = create_azure_style(&ctx, &block).await;
+
+        assert_eq!(created["max_tokens_field"], "max_completion_tokens");
+        let rows = stored_rows(&ctx, &block).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["max_tokens_field"], "max_completion_tokens",
+            "the row must carry it, not only the create echo"
+        );
+    }
+
+    /// Omitted means "follow the protocol", and that is what the row says —
+    /// `null`, never a spelling chosen on the admin's behalf.
+    #[tokio::test]
+    async fn an_omitted_max_tokens_field_stays_null() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(created["max_tokens_field"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["max_tokens_field"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A present `null` on the patch clears the override; an absent key
+    /// leaves it alone. Both re-read from the store, because `update_provider`
+    /// answers out of the config it just built either way.
+    #[tokio::test]
+    async fn a_null_max_tokens_field_clears_it_and_an_absent_one_does_not() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (id, _) = create_azure_style(&ctx, &block).await;
+
+        let untouched = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "enabled": false })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            untouched["max_tokens_field"], "max_completion_tokens",
+            "a patch that does not mention the field must not change it"
+        );
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["max_tokens_field"],
+            "max_completion_tokens"
+        );
+
+        let cleared = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "max_tokens_field": null })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(cleared["max_tokens_field"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["max_tokens_field"],
+            serde_json::Value::Null,
+            "the cleared override must be gone from the row, not only the reply"
+        );
+    }
+
+    /// `UpdateProviderRequest` documents an empty `key_var` as clearing the
+    /// variable. The row is what has to say so: `config_to_row` feeds
+    /// `db::update`, which sets only the columns it is handed, so a `key_var`
+    /// the encoder omitted left the old variable name in place under a reply
+    /// that said `null`.
+    #[tokio::test]
+    async fn an_emptied_key_var_is_cleared_in_the_stored_row() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        assert_eq!(created["key_var"], KEY_VAR);
+
+        let updated = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "key_var": "" })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(updated["key_var"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["key_var"],
+            serde_json::Value::Null,
+            "the reply said the variable was cleared; the row has to agree"
+        );
+    }
+
+    /// `key_var` and `max_tokens_field` are the two fields a provider can hold
+    /// as `null`, and they clear the same way: a present `null`. Sending one
+    /// used to be a 200 that changed nothing, which is the worst answer of the
+    /// three available.
+    #[tokio::test]
+    async fn a_null_key_var_clears_it_and_an_absent_one_does_not() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        assert_eq!(created["key_var"], KEY_VAR);
+
+        let untouched = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "enabled": false })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            untouched["key_var"], KEY_VAR,
+            "a patch that does not mention the field must not change it"
+        );
+
+        let cleared = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "key_var": null })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(cleared["key_var"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["key_var"],
+            serde_json::Value::Null,
+            "a present `null` clears the variable in the row, not only in the reply"
+        );
+    }
+
+    /// A `ProviderAdmin` that edits the provider row from *inside*
+    /// `discover_models` — the admin who changes `key_var` between the read at
+    /// the top of the handler and the write at the bottom. `discover_models`
+    /// awaits the provider's HTTP endpoint at exactly this point, so the
+    /// window is real rather than contrived.
+    struct EditsTheRowDuringDiscovery {
+        ctx: std::sync::Mutex<Option<Arc<dyn Context>>>,
+        id: std::sync::Mutex<String>,
+    }
+
+    /// The variable name the concurrent edit sets, distinct from `KEY_VAR` so
+    /// the row can only hold it if the edit survived.
+    const CONCURRENT_KEY_VAR: &str = "IMPRESSPRESS__LLM__ROTATED_KEY";
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl ProviderAdmin for EditsTheRowDuringDiscovery {
+        fn manages_providers(&self) -> bool {
+            true
+        }
+
+        fn configure(&self, _providers: Vec<ProviderConfig>) -> Result<(), LlmError> {
+            Ok(())
+        }
+
+        fn providers_snapshot(&self) -> Vec<ProviderConfig> {
+            Vec::new()
+        }
+
+        async fn discover_models(
+            &self,
+            provider_name: &str,
+        ) -> Result<Vec<wafer_core::interfaces::llm::service::ModelInfo>, LlmError> {
+            let ctx = self
+                .ctx
+                .lock()
+                .expect("ctx lock")
+                .clone()
+                .expect("ctx handed to the fixture");
+            let id = self.id.lock().expect("id lock").clone();
+            let mut data = std::collections::HashMap::new();
+            data.insert(
+                "key_var".to_string(),
+                serde_json::Value::String(CONCURRENT_KEY_VAR.to_string()),
+            );
+            db::update(ctx.as_ref(), PROVIDERS_TABLE, &id, data)
+                .await
+                .expect("concurrent key_var edit");
+            Ok(vec![wafer_core::interfaces::llm::service::ModelInfo::new(
+                provider_name,
+                "gpt-4o",
+                "GPT-4o",
+            )])
+        }
+    }
+
+    /// Discovery learns a model list and nothing else, so it writes one
+    /// column. Re-encoding the whole config would write every other column
+    /// back at the value it held before the provider call, silently reverting
+    /// an edit that landed in that window.
+    #[tokio::test]
+    async fn discovery_does_not_write_back_columns_it_did_not_learn() {
+        let mut ctx = TestContext::with_llm().await;
+        ctx.set_config(KEY_VAR, SECRET);
+        let admin = Arc::new(EditsTheRowDuringDiscovery {
+            ctx: std::sync::Mutex::new(None),
+            id: std::sync::Mutex::new(String::new()),
+        });
+        let block = LlmBlock::new(admin.clone());
+
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        assert_eq!(created["key_var"], KEY_VAR);
+
+        *admin.ctx.lock().expect("ctx lock") = Some(ctx.clone_arc());
+        *admin.id.lock().expect("id lock") = id.clone();
+
+        let discovered = output_json(
+            discover_models(
+                &block,
+                &ctx,
+                &routed(admin_msg(
+                    "create",
+                    &format!("/b/llm/api/providers/{id}/discover-models"),
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(discovered, serde_json::json!({ "models": ["gpt-4o"] }));
+
+        let row = &stored_rows(&ctx, &block).await[0];
+        assert_eq!(
+            row["models"],
+            serde_json::json!(["gpt-4o"]),
+            "the discovered list is the one column discovery does own"
+        );
+        assert_eq!(
+            row["key_var"], CONCURRENT_KEY_VAR,
+            "an edit that landed while the provider was being queried must \
+             survive discovery's write"
+        );
+    }
+
+    /// Anthropic's Messages API has one budget field, so an override there is
+    /// a setting that cannot do anything. It is refused by name rather than
+    /// stored and ignored.
+    #[tokio::test]
+    async fn an_anthropic_provider_may_not_declare_a_max_tokens_field() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let out = create_provider(
+            &block,
+            &ctx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            json_input(serde_json::json!({
+                "name": "anthropic-main",
+                "protocol": "anthropic",
+                "endpoint": "https://api.anthropic.com/v1",
+                "max_tokens_field": "max_completion_tokens",
+            })),
+        )
+        .await;
+
+        let (code, message) = provider_refusal(out).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("max_tokens_field") && message.contains("anthropic"),
+            "the refusal must name the field and the protocol, got: {message}"
+        );
+        assert!(
+            stored_rows(&ctx, &block).await.is_empty(),
+            "a refused create must leave no row behind"
+        );
+    }
+
+    /// The same pairing reached the other way round — switching an existing
+    /// provider to `anthropic` while its override is still stored — is refused
+    /// on the patched configuration, and the stored row is untouched.
+    #[tokio::test]
+    async fn switching_a_provider_with_an_override_to_anthropic_is_refused() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (id, _) = create_azure_style(&ctx, &block).await;
+
+        let out = update_provider(
+            &block,
+            &ctx,
+            &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+            json_input(serde_json::json!({ "protocol": "anthropic" })),
+        )
+        .await;
+
+        let (code, message) = provider_refusal(out).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("max_tokens_field"), "got: {message}");
+        let rows = stored_rows(&ctx, &block).await;
+        assert_eq!(rows[0]["protocol"], "open_ai_compatible");
+        assert_eq!(rows[0]["max_tokens_field"], "max_completion_tokens");
+    }
+
+    /// Clearing the override and switching protocol in one body is accepted —
+    /// the check reads the patched configuration, so the two changes are
+    /// judged together rather than as the body's field order happens to fall.
+    #[tokio::test]
+    async fn clearing_the_override_in_the_same_patch_that_switches_to_anthropic_is_accepted() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (id, _) = create_azure_style(&ctx, &block).await;
+
+        let updated = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({
+                    "protocol": "anthropic",
+                    "max_tokens_field": null,
+                    "endpoint": "https://api.anthropic.com/v1",
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(updated["protocol"], "anthropic");
+        assert_eq!(updated["max_tokens_field"], serde_json::Value::Null);
     }
 
     /// Every provider endpoint publishes the one row projection, and the
@@ -942,6 +1429,12 @@ mod tests {
     /// a row whose `key_var` resolves gets its `api_key` populated, a row
     /// without `key_var` stays unauthenticated, and an unresolvable
     /// `key_var` degrades to no key (warn) instead of failing the reload.
+    ///
+    /// Needs `feature = "llm"` for the concrete `ProviderLlmService` whose
+    /// snapshot the assertions read; a build without it has no router to
+    /// reload into, which `the_no_op_handle_refuses_configure_and_says_so`
+    /// covers instead.
+    #[cfg(feature = "llm")]
     #[tokio::test]
     async fn reload_provider_service_resolves_key_var_into_api_key() {
         use wafer_core::{
@@ -1399,12 +1892,15 @@ mod form_body_tests {
     }
 
     /// The exact body htmx builds from the rendered form when the admin fills
-    /// in every field and leaves the "Enabled" box ticked. `enabled=true` is
-    /// the checkbox's own `value` attribute; the endpoint is percent-encoded
-    /// as a browser encodes it.
+    /// in every field, leaves the "Enabled" box ticked and leaves the budget
+    /// field on "Follow the protocol". `enabled=true` is the checkbox's own
+    /// `value` attribute; `max_tokens_field=` is what a select whose chosen
+    /// option has an empty value posts — a select always sends something; the
+    /// endpoint is percent-encoded as a browser encodes it.
     const TICKED_FORM: &str = "name=openai-main&protocol=open_ai\
 &endpoint=https%3A%2F%2Fapi.openai.com%2Fv1\
 &key_var=IMPRESSPRESS__LLM__OPENAI_KEY\
+&max_tokens_field=\
 &models=gpt-4o%2C+gpt-4o-mini\
 &enabled=true";
 
@@ -1482,6 +1978,47 @@ mod form_body_tests {
         assert_eq!(
             created["models"],
             serde_json::json!(["gpt-4o", "gpt-4o-mini"])
+        );
+    }
+
+    /// The budget-field select's "Follow the protocol" option has no token to
+    /// post, so it posts the empty string — which is not one of the two wire
+    /// spellings. Handing it to serde as-is would 400 every ordinary submit,
+    /// so the parser drops it and the contract sees the field omitted.
+    #[tokio::test]
+    async fn an_empty_budget_field_select_leaves_the_provider_on_its_protocol() {
+        let created = output_json(create_from_form(TICKED_FORM).await).await;
+        assert_eq!(created["max_tokens_field"], serde_json::Value::Null);
+    }
+
+    /// And a chosen option arrives as the override — the Azure reasoning
+    /// deployment, configured the way the form configures it.
+    #[tokio::test]
+    async fn a_chosen_budget_field_reaches_the_stored_provider() {
+        let body = TICKED_FORM
+            .replace("protocol=open_ai&", "protocol=open_ai_compatible&")
+            .replace(
+                "max_tokens_field=",
+                "max_tokens_field=max_completion_tokens",
+            );
+        let created = output_json(create_from_form(&body).await).await;
+        assert_eq!(created["protocol"], "open_ai_compatible");
+        assert_eq!(created["max_tokens_field"], "max_completion_tokens");
+    }
+
+    /// A token the enum does not have is refused rather than stored, the same
+    /// way a wrong `protocol` is — the select's options are the only two.
+    #[tokio::test]
+    async fn a_form_body_with_an_unknown_budget_field_is_refused() {
+        let body = TICKED_FORM.replace("max_tokens_field=", "max_tokens_field=maxTokens");
+        let (code, message) = refusal(create_from_form(&body).await).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("maxTokens")
+                && message.contains("max_completion_tokens")
+                && message.contains("max_tokens"),
+            "the refusal must name the rejected token and both accepted ones, \
+             got: {message}"
         );
     }
 

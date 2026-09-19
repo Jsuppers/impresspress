@@ -24,10 +24,11 @@ pub type EncodedRequest = (String, HashMap<String, String>, Vec<u8>);
 /// protocol, unlike `openai_compatible` which may. The body itself is
 /// [`encode_chat_body`], shared with every other consumer of the format.
 ///
-/// The output-token budget goes out as `max_completion_tokens`: on OpenAI's
-/// own API `max_tokens` is the deprecated spelling, and the reasoning models
-/// — reachable here because `/v1/models` discovery lists them like any other
-/// — refuse a request carrying it with `unsupported_parameter`.
+/// The output-token budget goes out as `max_completion_tokens` unless the
+/// provider declares a `max_tokens_field` override: on OpenAI's own API
+/// `max_tokens` is the deprecated spelling, and the reasoning models —
+/// reachable here because `/v1/models` discovery lists them like any other —
+/// refuse a request carrying it with `unsupported_parameter`.
 pub fn encode_chat_request(
     req: &ChatRequest,
     provider: &ProviderConfig,
@@ -41,7 +42,10 @@ pub fn encode_chat_request(
     )
 }
 
-/// [`encode_chat_request`] with the budget's spelling named by the caller.
+/// [`encode_chat_request`] with the *protocol's* budget spelling named by the
+/// caller. `provider.max_tokens_field`, when the operator set one, wins over
+/// it — that is the one place the override is applied, so both protocols get
+/// it from one line.
 ///
 /// `openai_compatible` is the other caller and passes
 /// [`MaxTokensField::MaxTokens`]: the URL, the header policy and the body are
@@ -51,8 +55,11 @@ pub(super) fn encode_chat_request_as(
     req: &ChatRequest,
     provider: &ProviderConfig,
     resolved_api_key: Option<&str>,
-    max_tokens_field: MaxTokensField,
+    protocol_max_tokens_field: MaxTokensField,
 ) -> Result<EncodedRequest, EncodeError> {
+    let max_tokens_field = provider
+        .max_tokens_field
+        .unwrap_or(protocol_max_tokens_field);
     let url = format!(
         "{}/chat/completions",
         provider.endpoint.trim_end_matches('/')
@@ -201,6 +208,25 @@ mod tests {
         assert!(
             json.get("max_tokens").is_none(),
             "a reasoning model 400s on `max_tokens`, got: {json}"
+        );
+    }
+
+    /// The same override on the native protocol, in the other direction —
+    /// which is what makes it a property of the configured provider rather
+    /// than a rule about reasoning models wearing a different name.
+    #[test]
+    fn a_declared_max_tokens_field_overrides_the_protocols_spelling() {
+        let provider = openai_provider().with_max_tokens_field(MaxTokensField::MaxTokens);
+        let mut req = ChatRequest::new("openai-main", "gpt-4o", vec![ChatMessage::user("hi")]);
+        req.params.max_tokens = Some(512);
+
+        let (_, _, body) = encode_chat_request(&req, &provider, Some("sk")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["max_tokens"], 512);
+        assert!(
+            json.get("max_completion_tokens").is_none(),
+            "the override replaces the protocol's spelling, got: {json}"
         );
     }
 

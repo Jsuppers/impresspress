@@ -1890,6 +1890,9 @@ mod tests {
     /// `POST /b/products/webhooks` public and the router reads that
     /// declaration; driven with the block's real `info()`, an anonymous
     /// POST reaches dispatch.
+    // Driven with `ProductsBlock::new().info()` — the real declaration is
+    // the point, so the test exists only where that block is compiled.
+    #[cfg(feature = "block-products")]
     #[tokio::test]
     async fn stripe_webhook_stays_reachable_with_no_session() {
         use wafer_run::Block as _;
@@ -1926,6 +1929,7 @@ mod tests {
     /// `endpoint_auth` and `declared_access` resolve
     /// `POST /b/products/webhooks` to `Public` from
     /// `ProductsBlock::new().info()` alone, with no router entry involved.
+    #[cfg(feature = "block-products")]
     #[test]
     fn stripe_webhook_is_public_from_the_products_declaration_alone() {
         use wafer_run::{AuthLevel, Block as _};
@@ -2003,6 +2007,7 @@ mod tests {
     /// drives the same router against the REAL block for both restore
     /// routes; it lives there because it needs the products database
     /// harness.
+    #[cfg(feature = "block-products")]
     #[tokio::test]
     async fn restore_product_endpoint_is_admin_only_end_to_end() {
         use wafer_run::Block;
@@ -2352,6 +2357,7 @@ mod tests {
     /// template)` row, so those shapes are undeclared, fall to the
     /// `Authenticated` default, and are denied before dispatch. Driven with
     /// the real declarations of the three blocks that used to be carved out.
+    #[cfg(feature = "block-products")]
     #[tokio::test]
     async fn a_declaration_admits_its_template_where_a_carve_out_admitted_a_prefix() {
         use wafer_run::Block as _;
