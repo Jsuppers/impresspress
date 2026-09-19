@@ -4,12 +4,13 @@
 //! reuse-detection pattern (SEC-039):
 //!
 //! 1. Hash the incoming refresh token, look up the row by `token_hash` (SEC-032).
-//! 2. If the row is `revoked = 1`, that token was already rotated away — a
+//! 2. If the row is already revoked, that token was rotated away — a
 //!    legitimate client would only have the *current* token. Revoke the
 //!    entire family.
 //! 3. If the row is live, claim it with a compare-and-set revoke. The claim
 //!    is what keeps two concurrent refreshes of one token from both minting a
-//!    successor: exactly one wins, and the loser is answered as step 2.
+//!    successor: exactly one wins. The loser is refused with the same answer
+//!    step 2 gives, but its family is left alone — see [`refuse_not_live`].
 //! 4. The winner inserts a new row under the same family ID with
 //!    `generation + 1` and returns the new access + refresh pair.
 
@@ -86,7 +87,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     };
 
     if row.revoked {
-        return refuse_rotated_away(ctx, &row).await;
+        return refuse_not_live(ctx, &row, NotLive::RevokedAtRead).await;
     }
 
     // Get user and verify account is still active. Use the typed repo so
@@ -138,13 +139,12 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // Claim the row before minting the replacement, so a family never holds
     // two live generations. The claim is a compare-and-set
     // ([`tokens::revoke_if_live`]): losing it means another request rotated
-    // this very token first, which is the same situation a replayed token is
-    // in and gets the same answer. If issuance then fails the user is logged
-    // out — recoverable, and the alternative is a live token nobody can
-    // account for.
+    // this very token first, and this one is refused with the same answer a
+    // replayed token gets. If issuance then fails the user is logged out —
+    // recoverable, and the alternative is a live token nobody can account for.
     match tokens::revoke_if_live(ctx, &row.id).await {
         Ok(true) => {}
-        Ok(false) => return refuse_rotated_away(ctx, &row).await,
+        Ok(false) => return refuse_not_live(ctx, &row, NotLive::CasLoss).await,
         // The claim is the gate on minting a successor. A write that could
         // not run leaves the presented token live, so issuing anyway would
         // put a second live generation in the family — refuse, and say it was
@@ -183,33 +183,70 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         })
 }
 
-/// Refuse a refresh token that is no longer its family's live generation, and
-/// burn the family if one still is (SEC-039).
+/// How a refresh token turned out not to be its family's live generation.
 ///
-/// Two ways in: the row was already `revoked` when it was read — a replay of a
-/// rotated-away token — or the compare-and-set claim on a live row lost to a
-/// concurrent rotation of the same token. Both mean someone is refreshing with
-/// a token that is not the current one, and neither can tell a stolen token
-/// from a client that sent two requests at once, so both get the same answer.
+/// The client is told the same thing either way — it presented a token that is
+/// no longer current, and the two are indistinguishable from outside — but
+/// what the deployment does about it differs.
+enum NotLive {
+    /// The row was already `revoked` when it was read: this token was rotated
+    /// away at some earlier point and is being presented again.
+    RevokedAtRead,
+    /// The row was live when it was read and the compare-and-set claim still
+    /// lost, so another request rotated this same token in the window between.
+    CasLoss,
+}
+
+/// Refuse a refresh token that is not its family's live generation.
 ///
-/// A live sibling in the family is what makes it an attack rather than a stale
-/// tab: the legitimate client holds the successor, so anyone presenting the
-/// predecessor has a copy. Both steps fail closed — an outage on the live-row
-/// check or on the family revoke would leave the replayed family usable, so it
-/// surfaces as an error rather than as the ordinary "revoked" rejection.
-async fn refuse_rotated_away(ctx: &dyn Context, row: &tokens::TokenRow) -> OutputStream {
-    let family_live = match tokens::family_has_live_row(ctx, &row.family).await {
-        Ok(live) => live,
-        Err(e) => return err_internal("Refresh could not check the token family", e),
-    };
-    if family_live {
-        tracing::warn!(
-            user_id = %row.user_id,
-            family = %row.family,
-            "refresh: token reuse detected; revoking entire family"
-        );
-        if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
-            return err_internal("Refresh could not revoke the token family", e);
+/// [`NotLive::RevokedAtRead`] is the SEC-039 replay case and burns the family
+/// when one is still live: the legitimate client holds the successor, so
+/// whoever presents the predecessor after the fact has a copy. Both steps fail
+/// closed — an outage on the live-row check or on the family revoke would
+/// leave the replayed family usable, so it surfaces as an error rather than as
+/// the ordinary "revoked" rejection.
+///
+/// [`NotLive::CasLoss`] refuses and stops there. The family is deliberately
+/// NOT burned: the row was live when THIS request read it, so the two requests
+/// raced inside one rotation window, and the overwhelmingly common source of
+/// that is one legitimate client refreshing twice at once — two tabs, a retry
+/// — for which burning the family would sign the user out of a session that
+/// was never compromised. What it gives up is bounded: a thief racing the
+/// victim inside that same window keeps nothing durable, because their next
+/// attempt reads a revoked row and lands in `RevokedAtRead`, which burns the
+/// family as it always has.
+async fn refuse_not_live(
+    ctx: &dyn Context,
+    row: &tokens::TokenRow,
+    cause: NotLive,
+) -> OutputStream {
+    match cause {
+        NotLive::CasLoss => {
+            // Deliberately not `warn`: "reuse detected" is the line operators
+            // alert on, and a double-clicked refresh must not raise it.
+            tracing::info!(
+                user_id = %row.user_id,
+                family = %row.family,
+                cause = "cas_loss",
+                "refresh: lost the rotation claim to a concurrent refresh of the same token"
+            );
+        }
+        NotLive::RevokedAtRead => {
+            let family_live = match tokens::family_has_live_row(ctx, &row.family).await {
+                Ok(live) => live,
+                Err(e) => return err_internal("Refresh could not check the token family", e),
+            };
+            if family_live {
+                tracing::warn!(
+                    user_id = %row.user_id,
+                    family = %row.family,
+                    cause = "revoked_at_read",
+                    "refresh: token reuse detected; revoking entire family"
+                );
+                if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
+                    return err_internal("Refresh could not revoke the token family", e);
+                }
+            }
         }
     }
     error_response(ErrorCode::InvalidToken, "Refresh token has been revoked")
@@ -217,20 +254,13 @@ async fn refuse_rotated_away(ctx: &dyn Context, row: &tokens::TokenRow) -> Outpu
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-
-    use wafer_run::{BlockInfo, Message, ResourceType, WaferError};
-
     use super::*;
     use crate::{
         blocks::auth_ui::api::{login, signup},
         db_read,
         test_support::{
             collect_or_panic, output_http_json, output_is_error, output_json, FailingDbOpContext,
-            TestContext,
+            RendezvousDbOpContext, TestContext,
         },
     };
 
@@ -416,109 +446,17 @@ mod tests {
         );
     }
 
-    /// Wraps a [`TestContext`] and holds the first `n` refresh-token LOOKUPS
-    /// open until all `n` have arrived.
-    ///
-    /// Rotation is a read of the row followed by a write claiming it, and the
-    /// bug this pins lives in the window between them. Two plain concurrent
-    /// requests do not reliably open that window — the first can finish its
-    /// whole rotation before the second reads — so the rendezvous puts both
-    /// requests past the read, holding the same live row, before either is
-    /// allowed to claim it.
-    ///
-    /// Only the first `n` matching calls are held; every later one (the
-    /// loser's family check, for instance) passes straight through, so the
-    /// barrier is never waited on by a third arrival that has no partner.
-    #[derive(Clone)]
-    struct RendezvousOnTokenLookup {
-        inner: TestContext,
-        /// Matching calls still to be held. Shared across clones — the
-        /// handler's `clone_arc` must see the same countdown.
-        holds_left: Arc<AtomicUsize>,
-        barrier: Arc<tokio::sync::Barrier>,
-    }
-
-    /// Every `wafer-run/database` request carries a `collection`; the rest of
-    /// the fields are irrelevant here and serde drops them.
-    #[derive(serde::Deserialize)]
-    struct CollectionPeek {
-        collection: String,
-    }
-
-    impl RendezvousOnTokenLookup {
-        fn new(inner: TestContext, n: usize) -> Self {
-            Self {
-                inner,
-                holds_left: Arc::new(AtomicUsize::new(n)),
-                barrier: Arc::new(tokio::sync::Barrier::new(n)),
-            }
-        }
-
-        /// Claim one of the holds. `true` while any are left.
-        fn take_hold(&self) -> bool {
-            self.holds_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Context for RendezvousOnTokenLookup {
-        fn check_resource_access(
-            &self,
-            resource: &str,
-            resource_type: ResourceType,
-            is_write: bool,
-        ) -> Result<(), WaferError> {
-            self.inner
-                .check_resource_access(resource, resource_type, is_write)
-        }
-
-        async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
-            if !(name == "wafer-run/database" && msg.action() == "database.list") {
-                return self.inner.call_block(name, msg, input).await;
-            }
-            let bytes = input.collect_to_bytes().await;
-            let on_tokens = wafer_block::codec::decode::<CollectionPeek>(&bytes)
-                .map(|p| p.collection == tokens::TABLE)
-                .unwrap_or(false);
-            let out = self
-                .inner
-                .call_block(name, msg, InputStream::from_bytes(bytes))
-                .await;
-            // Park AFTER the read has been answered: the row is in hand and no
-            // database lock is held while we wait for the other request.
-            if on_tokens && self.take_hold() {
-                self.barrier.wait().await;
-            }
-            out
-        }
-
-        fn is_cancelled(&self) -> bool {
-            self.inner.is_cancelled()
-        }
-
-        fn registered_blocks(&self) -> &[BlockInfo] {
-            self.inner.registered_blocks()
-        }
-
-        fn config_get(&self, key: &str) -> Option<&str> {
-            self.inner.config_get(key)
-        }
-
-        fn clone_arc(&self) -> Arc<dyn Context> {
-            Arc::new(self.clone())
-        }
-    }
-
     /// Two requests presenting the SAME live refresh token, each on its own
     /// worker thread, both past the row read before either claims it.
     ///
     /// Only one may rotate. The claim is a compare-and-set, so the loser is
-    /// told its token is gone instead of being handed a second live
-    /// generation in the family — which is what an unconditional revoke gave
-    /// it, leaving a stolen token that refreshes forever and never trips
-    /// reuse detection.
+    /// told its token is gone instead of being handed a second live generation
+    /// in the family — which is what an unconditional revoke gave it, leaving a
+    /// stolen token that refreshes forever and never trips reuse detection.
+    ///
+    /// The winner's pair must still work afterwards. Losing the claim is not
+    /// evidence of theft — one client refreshing twice at once produces it —
+    /// so the loser's refusal must not take the session with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_concurrent_refreshes_of_one_token_mint_one_pair() {
         let ctx = TestContext::with_auth_and_crypto().await;
@@ -528,7 +466,9 @@ mod tests {
             .expect("token lookup")
             .expect("the login's row")
             .family;
-        let gated = RendezvousOnTokenLookup::new(ctx.clone(), 2);
+        // Signup and login are already done, so the only `database.list` calls
+        // on the tokens table left to hold are the two racers' own lookups.
+        let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", tokens::TABLE, 2);
 
         let racers: Vec<_> = (0..2)
             .map(|_| {
@@ -540,15 +480,15 @@ mod tests {
             })
             .collect();
 
-        let mut bodies = Vec::new();
-        for racer in racers {
-            bodies.push(
-                tokio::time::timeout(std::time::Duration::from_secs(30), racer)
-                    .await
-                    .expect("both requests must reach the rendezvous and finish")
-                    .expect("refresh task panicked"),
-            );
-        }
+        // Joined, not awaited one after the other: a rendezvous that never
+        // releases then costs the suite one timeout rather than two.
+        let bodies: Vec<serde_json::Value> = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both requests must reach the rendezvous and finish")
+        .expect("refresh task panicked");
 
         let minted = bodies
             .iter()
@@ -564,7 +504,7 @@ mod tests {
             .expect("one request must lose the claim");
         assert_eq!(
             loser["message"], "Refresh token has been revoked",
-            "the request that lost the claim gets the reuse answer: {loser}"
+            "the request that lost the claim is refused: {loser}"
         );
 
         let rows = db_read::list_every(
@@ -582,6 +522,22 @@ mod tests {
             rows.len(),
             2,
             "the family holds the rotated-away row and ONE successor, not two: {rows:?}"
+        );
+
+        // The assertions above hold whether or not the loser burned the
+        // family, because a burn only flips `revoked` on rows that already
+        // exist. This is the one that tells them apart: the winner's pair has
+        // to survive the loser's refusal.
+        let winner = bodies
+            .iter()
+            .find(|b| b["refresh_token"].is_string())
+            .expect("one request must win the claim");
+        let winner_token = winner["refresh_token"].as_str().expect("a string token");
+        let again = output_http_json(handle(&ctx, refresh_with(winner_token)).await).await;
+        assert!(
+            again["refresh_token"].is_string(),
+            "the winner's session must survive the loser's refusal, \
+             which it does not if losing the claim burns the family: {again}"
         );
     }
 }

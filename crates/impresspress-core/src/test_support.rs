@@ -1779,9 +1779,13 @@ pub struct FailingDbOpContext {
 /// Request-body shape shared by every `wafer-run/database` wire request:
 /// they all carry a `collection` field, and serde ignores the other
 /// (irrelevant) fields on decode.
+///
+/// `pub(crate)` so every context decorator that has to route on the table —
+/// not just [`FailingDbOpContext`] — decodes the field through one
+/// declaration.
 #[derive(serde::Deserialize)]
-struct CollectionPeek {
-    collection: String,
+pub(crate) struct CollectionPeek {
+    pub collection: String,
 }
 
 impl FailingDbOpContext {
@@ -1873,6 +1877,114 @@ impl Context for FailingDbOpContext {
     }
 
     fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Test double that wraps a [`TestContext`] and holds the first `n` calls
+/// matching `(op, collection)` open until all `n` of them have arrived,
+/// releasing them together.
+///
+/// It is how a test pins a read-then-write race. A handler that reads a row
+/// and then writes based on what it read has a window between the two, and two
+/// plain concurrent requests do not reliably land inside it — the first can
+/// finish its whole sequence before the second reads, and the test then passes
+/// on code that has no interlock at all. Rendezvousing on the READ puts every
+/// racer past it, holding the same pre-write state, before any of them is
+/// allowed to write.
+///
+/// The hold is applied AFTER the inner call has answered, so no database lock
+/// is held while a request waits for its partners. Only the first `n` matching
+/// calls are held; later ones pass straight through, so a request that comes
+/// back for a second matching call cannot park on a barrier with no partner
+/// left to release it.
+///
+/// `#[cfg(test)]`, unlike its sibling decorators: the barrier is
+/// `tokio::sync::Barrier`, and tokio is an OPTIONAL dependency of this crate.
+/// It is present as a dev-dependency in the test profile, but not in a
+/// `--features test-support` library build — which is what the `tests/`
+/// integration crates and the wasm targets compile — so a non-`cfg(test)`
+/// version of this would have to add tokio to that feature and push it into
+/// builds that must not carry it.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct RendezvousDbOpContext {
+    inner: TestContext,
+    op: &'static str,
+    collection: &'static str,
+    /// Matching calls still to be held. Shared across clones, so a handler's
+    /// `clone_arc` sees the same countdown.
+    holds_left: Arc<std::sync::atomic::AtomicUsize>,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl RendezvousDbOpContext {
+    /// Wrap `inner`, holding the first `n` `"wafer-run/database"` calls whose
+    /// `(msg.action(), request.collection)` is `(op, collection)`.
+    pub fn new(inner: TestContext, op: &'static str, collection: &'static str, n: usize) -> Self {
+        Self {
+            inner,
+            op,
+            collection,
+            holds_left: Arc::new(std::sync::atomic::AtomicUsize::new(n)),
+            barrier: Arc::new(tokio::sync::Barrier::new(n)),
+        }
+    }
+
+    /// Claim one of the holds. `true` while any are left.
+    fn take_hold(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.holds_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Context for RendezvousDbOpContext {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+        if !(name == "wafer-run/database" && msg.action() == self.op) {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let matches = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|p| p.collection == self.collection)
+            .unwrap_or(false);
+        let out = self
+            .inner
+            .call_block(name, msg, InputStream::from_bytes(bytes))
+            .await;
+        if matches && self.take_hold() {
+            self.barrier.wait().await;
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[BlockInfo] {
         self.inner.registered_blocks()
     }
 

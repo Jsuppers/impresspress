@@ -5,7 +5,7 @@
 //!
 //! - `token_hash` — `sha256_hex(raw_refresh_jwt)`, the lookup key on refresh.
 //! - `family` — stable across rotations, lets us detect reuse: if a request
-//!   arrives with a refresh token whose row is `revoked = 1` but the family
+//!   arrives with a refresh token whose row is revoked but the family
 //!   still has any live row, the attacker is using a stolen-and-rotated
 //!   token. We revoke the whole family.
 //! - `generation` — increments on each rotation. The first token in a family
@@ -13,7 +13,7 @@
 //! - `revoked` — set when a token rotates (don't delete, the row is needed
 //!   for reuse detection) or when an entire family is invalidated.
 //!
-//! See `migrations/003_refresh_tokens.{sqlite,postgres}.sql` for the schema.
+//! See `migrations/004_refresh_tokens.{sqlite,postgres}.sql` for the schema.
 
 use std::collections::HashMap;
 
@@ -141,12 +141,14 @@ pub async fn family_has_live_row(ctx: &dyn Context, family: &str) -> Result<bool
 /// `true` when this caller is the one that revoked the row, `false` when the
 /// row was already revoked by the time the statement ran (or has gone).
 ///
-/// `false` is the SEC-039 reuse signal. Rotation is a read-then-write, and
-/// nothing in the schema stops two live generations in a family — the UNIQUE
-/// index covers `token_hash` alone. Without the condition, two requests
-/// carrying the same refresh token both read a live row, both revoke it, and
-/// both mint a successor, so the family ends up with two live tokens and the
-/// stolen one refreshes forever without ever surfacing as reuse.
+/// `false` is what stops a second successor being minted. Rotation is a
+/// read-then-write, and nothing in the schema stops two live generations in a
+/// family — the UNIQUE index covers `token_hash` alone. Without the condition,
+/// two requests carrying the same refresh token both read a live row, both
+/// revoke it, and both mint a successor, so the family ends up with two live
+/// tokens and a stolen one refreshes forever without ever surfacing as reuse.
+/// What the caller does with `false` is its own decision; see
+/// `auth_ui::api::refresh::refuse_not_live`.
 pub async fn revoke_if_live(ctx: &dyn Context, id: &str) -> Result<bool, WaferError> {
     let filters = vec![
         Filter {
