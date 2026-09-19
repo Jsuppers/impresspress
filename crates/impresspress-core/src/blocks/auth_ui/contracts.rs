@@ -144,6 +144,9 @@ pub struct SignupResponse {
 /// /b/auth/api/logout`, `/change-password`, `/forgot-password`,
 /// `/reset-password` and `/resend-verification`.
 ///
+/// `/change-password` answers it to JSON callers; that one endpoint answers a
+/// browser form with HTML instead.
+///
 /// One type because it is one shape. The *text* differs per endpoint and is
 /// deliberately constant per endpoint rather than per outcome — the
 /// password-reset and verification pair answer the same sentence whatever
@@ -151,6 +154,12 @@ pub struct SignupResponse {
 /// response (`api::verify::resend_tests` pins that). A per-endpoint copy of
 /// this struct would publish five schemas that must be kept identical by
 /// hand.
+// Which HTML, and where the branch is: `api::change_password`'s
+// `changed_response` and `refused` answer an htmx caller with markup for the
+// `#change-pw-result` slot it posts from, success and refusal alike. That
+// detail stays out of the doc comment above because schemars publishes it as
+// this schema's `description`, inlined at all five endpoints — the same
+// reason the note on `MeUser` below is not a doc comment either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageResponse {
     pub message: String,
