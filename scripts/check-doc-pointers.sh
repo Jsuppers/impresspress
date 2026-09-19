@@ -128,7 +128,7 @@ else
 fi
 
 # ===========================================================================
-# Second guard: comments that narrate the change that produced them.
+# Guard 2: comments that narrate the change that produced them.
 #
 # A comment describing what a change DID — the pull request it landed under,
 # the batch of work it belonged to, what the code held before it — is true
@@ -139,36 +139,63 @@ fi
 # in `git log`, where it stays accurate and where a reader can see which parts
 # of it are still live.
 #
-# The shapes matched are spelled in NARRATION_RE below: a reference to a
-# numbered pull request or batch, and a sentence opening on the capitalised
-# adverb for "before now". Lower-case `previously` is deliberately NOT matched
-# — "a previously published document" describes the data, not a past edit of
-# this file.
+# NARRATION_RE below matches two shapes: a reference to a numbered pull
+# request or batch of work, and a sentence opening on the capitalised adverb
+# for "before now".
 #
-# Only comment bodies are scanned, in file types whose comment opener is
-# unambiguous on a single line. The opener is located on the line and the
-# match must fall after it, so a trailing comment counts and code does not.
-# Documentation and commit messages are not scanned at all: narrating history
-# is their job.
+# What is NOT matched, and why. The same adverb in lower case ("read-through
+# previously always PUT") and the phrase for "formerly" ("that branch used to
+# be a removal") are narration just as often — a read of all 58 lower-case
+# occurrences found roughly 47 of them narrating, and a 15-line sample of the
+# 348 occurrences of the phrase found 14. They are left out on VOLUME, not
+# because they are clean: together they are ~400 more lines across ~200 files,
+# which is a ratchet of its own to land and shrink, and the "formerly" phrase
+# additionally has a live "employed to" sense ("the subject used to key the
+# token") that has to be read per hit rather than counted. Widening to them is
+# a follow-up wave, not a tightening of this one.
+#
+# What counts as a comment. A block comment that OPENS a line (`/*`, `<!--`)
+# puts every following line into the comment until its terminator, which is
+# what makes a continuation line and a wrapped sentence visible. Otherwise the
+# first opener-looking token on the line starts the comment. "Opener-looking"
+# is the honest word: the scan is textual, so three classes can be read as a
+# comment when they are not —
+#   * a string or URL containing the line-comment token before the match;
+#   * a shell parameter expansion, where the substitution sigil is not a
+#     comment at all;
+#   * a value in a config file carrying the same sigil.
+# There are none in the tree today. A future one fails CI on a line that is
+# not a comment, so the message points here: move the text out of the literal,
+# or add the file to the allowlist with a note.
 #
 # Two exemptions, both structural:
 #   * `.sql` under `migrations/` — hash-addressed and immutable, for the
 #     reason written out above.
 #   * vendored third-party sources — not ours to rewrite.
+# Documentation and commit messages are not scanned at all: narrating history
+# is their job.
 #
 # NARRATION_ALLOWLIST is a ratchet, not an exemption. One line per file that
 # carries narration today, `<count><TAB><path>`, counting comment LINES: a
-# line is reported once however many of the shapes it carries. A file that is NOT listed
-# must have none, so a new file cannot narrate its way in. A listed file may
-# not exceed its recorded count, and when the count drops the line must come
-# down with it, so every listed file can only shrink. Delete the line when the
-# last one is gone.
+# line is reported once however many of the shapes it carries. A file that is
+# NOT listed must have none, so a new file cannot narrate its way in. A listed
+# file may not exceed its recorded count, and when the count drops the line
+# must come down with it, so every listed file can only shrink. A count of
+# zero is rejected: the line is deleted instead.
 NARRATION_ALLOWLIST="scripts/history-narration-allowlist.txt"
-NARRATION_RE='(Previously|[Ww]ave [0-9]+|[Tt]his (PR|commit)|PRs? #?[0-9]+)'
+
+# The substitution sigil, which is also this file's own comment opener. Held
+# in a variable, like ROOT_DIR above, so no line of this script contains both
+# a comment opener and a shape the guard matches — otherwise the guard flags
+# its own pattern, and the exemption would be an accident of how the
+# alternation happens to be ordered.
+NARRATION_HASH='#'
+NARRATION_RE="(Previously|[Ww]ave [0-9]+|[Tt]his (PR|commit)|PRs? ${NARRATION_HASH}?[0-9]+)"
 
 mapfile -t sources < <(
   git ls-files \
-    '*.rs' '*.ts' '*.tsx' '*.js' '*.mjs' '*.cjs' '*.go' '*.sh' '*.sql' '*.toml' '*.yml' '*.yaml' \
+    '*.rs' '*.ts' '*.tsx' '*.js' '*.mjs' '*.cjs' '*.go' '*.css' '*.html' '*.htm' '*.tmpl' \
+    '*.sh' '*.sql' '*.toml' '*.yml' '*.yaml' \
     ':!:**/migrations/*.sql' ':!:**/vendor/**' ':!:**/node_modules/**'
 )
 
@@ -178,27 +205,61 @@ mapfile -t sources < <(
 narration=""
 if [ "${#sources[@]}" -gt 0 ]; then
   narration=$(
-    awk -v re="$NARRATION_RE" '
-      function opener(name) {
-        if (name ~ /\.(rs|ts|tsx|js|mjs|cjs|go)$/) return "slash"
-        if (name ~ /\.(sh|toml|ya?ml)$/) return "hash"
-        if (name ~ /\.sql$/) return "dash"
+    awk -v re="$NARRATION_RE" -v hash="$NARRATION_HASH" '
+      # `x.html.tmpl` is HTML; the generated suffix says nothing about syntax.
+      function family(name,   base) {
+        base = name
+        sub(/\.tmpl$/, "", base)
+        if (base ~ /\.(rs|ts|tsx|js|mjs|cjs|go|css)$/) return "slash"
+        if (base ~ /\.(html|htm)$/) return "angle"
+        if (base ~ /\.(sh|toml|ya?ml)$/) return "sigil"
+        if (base ~ /\.sql$/) return "dash"
         return ""
       }
+      FNR == 1 { in_block = 0; kind = family(FILENAME) }
+      kind == "" { next }
       {
-        kind = opener(FILENAME)
-        if (kind == "") next
-        if (kind == "slash") {
+        body = ""
+        if (in_block) {
+          # Inside a block that opened on an earlier line: everything up to
+          # the terminator is comment text.
+          e = index($0, closer)
+          if (e == 0) {
+            body = $0
+          } else {
+            body = substr($0, 1, e - 1)
+            in_block = 0
+          }
+        } else if (kind == "slash" && $0 ~ /^[ \t]*\/\*/) {
+          in_block = 1
+          closer = "*/"
+          match($0, /\/\*/)
+          body = substr($0, RSTART + 2)
+          e = index(body, closer)
+          if (e > 0) { body = substr(body, 1, e - 1); in_block = 0 }
+        } else if (kind == "angle" && $0 ~ /^[ \t]*<!--/) {
+          in_block = 1
+          closer = "-->"
+          match($0, /<!--/)
+          body = substr($0, RSTART + 4)
+          e = index(body, closer)
+          if (e > 0) { body = substr(body, 1, e - 1); in_block = 0 }
+        } else if (kind == "slash") {
           i = index($0, "//")
           j = index($0, "/*")
           if (i == 0 || (j > 0 && j < i)) i = j
-        } else if (kind == "hash") {
-          i = index($0, "#")
+          if (i > 0) body = substr($0, i)
+        } else if (kind == "angle") {
+          i = index($0, "<!--")
+          if (i > 0) body = substr($0, i)
+        } else if (kind == "sigil") {
+          i = index($0, hash)
+          if (i > 0) body = substr($0, i)
         } else {
           i = index($0, "--")
+          if (i > 0) body = substr($0, i)
         }
-        if (i == 0) next
-        body = substr($0, i)
+        if (body == "") next
         if (match(body, re))
           printf "%s\t%d\t%s\n", FILENAME, FNR, substr(body, RSTART, RLENGTH)
       }
@@ -220,11 +281,13 @@ done <<< "$narration"
 
 declare -A narration_budget=()
 while IFS= read -r entry || [ -n "$entry" ]; do
-  case "$entry" in '' | '#'*) continue ;; esac
+  case "$entry" in '' | "$NARRATION_HASH"*) continue ;; esac
   count=${entry%%$'\t'*}
   path=${entry#*$'\t'}
-  if [ "$count" = "$entry" ] || [ -z "$path" ] || ! [ "$count" -ge 0 ] 2>/dev/null; then
-    echo "$NARRATION_ALLOWLIST: malformed entry \"$entry\" — expected <count><TAB><path>."
+  if [ "$count" = "$entry" ] || [ -z "$path" ] || ! [ "$count" -ge 1 ] 2>/dev/null; then
+    printf '%s: malformed entry "%s" — expected <count><TAB><path>, count 1 or more.\n' \
+      "$NARRATION_ALLOWLIST" "$entry"
+    printf '    A file with none left has no line here; delete it.\n'
     exit 1
   fi
   narration_budget["$path"]=$count
@@ -251,6 +314,8 @@ while IFS= read -r file; do
   fi
   printf '%s' "${narration_detail["$file"]}"
   printf '    Say what the code does now. The history belongs in the commit message.\n'
+  printf '    If the line is not a comment at all, see the false-positive classes in %s.\n' \
+    "$(basename "$0")"
 done < <(printf '%s\n' "${!narration_count[@]}" | sort)
 
 # The other direction: an entry that is no longer earned. Without this the
