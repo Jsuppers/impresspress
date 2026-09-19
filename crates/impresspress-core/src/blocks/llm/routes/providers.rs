@@ -942,6 +942,12 @@ mod tests {
     /// a row whose `key_var` resolves gets its `api_key` populated, a row
     /// without `key_var` stays unauthenticated, and an unresolvable
     /// `key_var` degrades to no key (warn) instead of failing the reload.
+    ///
+    /// Needs `feature = "llm"` for the concrete `ProviderLlmService` whose
+    /// snapshot the assertions read; a build without it has no router to
+    /// reload into, which `the_no_op_handle_refuses_configure_and_says_so`
+    /// covers instead.
+    #[cfg(feature = "llm")]
     #[tokio::test]
     async fn reload_provider_service_resolves_key_var_into_api_key() {
         use wafer_core::{

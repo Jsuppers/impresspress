@@ -82,11 +82,14 @@ crate::impresspress_feature_block! {
 
 #[cfg(test)]
 mod tests {
-    use wafer_run::{
-        context::Context, Block, InputStream, Message, OutputStream, META_RESP_CONTENT_TYPE,
-    };
+    // Both are read only by the asset-serving tests below, and `serve_asset`
+    // answers 404 without `embed-assets`, so those tests are gated on it.
+    #[cfg(feature = "embed-assets")]
+    use wafer_run::META_RESP_CONTENT_TYPE;
+    use wafer_run::{context::Context, Block, InputStream, Message, OutputStream};
 
     use super::*;
+    #[cfg(feature = "embed-assets")]
     use crate::ui::assets;
 
     #[derive(Clone)]
