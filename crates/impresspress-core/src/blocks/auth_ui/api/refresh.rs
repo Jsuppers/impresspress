@@ -254,6 +254,11 @@ async fn refuse_not_live(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
     use super::*;
     use crate::{
         blocks::auth_ui::api::{login, signup},
@@ -524,10 +529,11 @@ mod tests {
             "the family holds the rotated-away row and ONE successor, not two: {rows:?}"
         );
 
-        // The assertions above hold whether or not the loser burned the
-        // family, because a burn only flips `revoked` on rows that already
-        // exist. This is the one that tells them apart: the winner's pair has
-        // to survive the loser's refusal.
+        // The winner's session survives. In THIS interleaving that holds
+        // either way — the loser reaches its family check before the winner
+        // has inserted, so there is no live sibling to burn even on code that
+        // would burn one. `losing_the_claim_behind_a_completed_rotation_\
+        // leaves_the_session_alone` is the test that forces the other order.
         let winner = bodies
             .iter()
             .find(|b| b["refresh_token"].is_string())
@@ -536,8 +542,146 @@ mod tests {
         let again = output_http_json(handle(&ctx, refresh_with(winner_token)).await).await;
         assert!(
             again["refresh_token"].is_string(),
-            "the winner's session must survive the loser's refusal, \
-             which it does not if losing the claim burns the family: {again}"
+            "the winner's session must survive the loser's refusal: {again}"
+        );
+    }
+
+    /// Runs one COMPLETE competing rotation of the same token — through the
+    /// real handler, on the undecorated context — at the moment the request
+    /// under test reaches its own rotation claim.
+    ///
+    /// That is the interleaving the multi-thread race cannot pin: it forces
+    /// the loser to arrive with the winner's successor already inserted, so
+    /// the family has a live row when the loser looks. Without it the loser
+    /// checks too early, finds nothing live, and code that burns the family
+    /// on a lost claim looks identical to code that does not.
+    ///
+    /// It carries its own `Context` delegation rather than reusing a
+    /// `test_support` decorator because what it injects is a call to THIS
+    /// module's handler.
+    #[derive(Clone)]
+    struct RotateBeforeTheClaim {
+        inner: TestContext,
+        token: String,
+        /// The competing rotation's refresh token, for the caller to check
+        /// afterwards. `None` until it has run.
+        winner: Arc<Mutex<Option<String>>>,
+        already_ran: Arc<AtomicBool>,
+    }
+
+    impl RotateBeforeTheClaim {
+        fn new(inner: TestContext, token: String) -> Self {
+            Self {
+                inner,
+                token,
+                winner: Arc::new(Mutex::new(None)),
+                already_ran: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn winner_token(&self) -> String {
+            self.winner
+                .lock()
+                .expect("winner mutex poisoned")
+                .clone()
+                .expect("the competing rotation must have run")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Context for RotateBeforeTheClaim {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(
+            &self,
+            name: &str,
+            msg: wafer_run::Message,
+            input: InputStream,
+        ) -> OutputStream {
+            if !(name == "wafer-run/database" && msg.action() == "database.update_where_count") {
+                return self.inner.call_block(name, msg, input).await;
+            }
+            let bytes = input.collect_to_bytes().await;
+            let on_tokens =
+                wafer_block::codec::decode::<crate::test_support::CollectionPeek>(&bytes)
+                    .map(|p| p.collection == tokens::TABLE)
+                    .unwrap_or(false);
+            if on_tokens && !self.already_ran.swap(true, Ordering::SeqCst) {
+                // The competing request runs on the INNER context, so its own
+                // claim does not re-enter this branch.
+                let resp = output_json(handle(&self.inner, refresh_with(&self.token)).await).await;
+                let minted = resp["refresh_token"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("the competing rotation must succeed: {resp}"))
+                    .to_string();
+                *self.winner.lock().expect("winner mutex poisoned") = Some(minted);
+            }
+            self.inner
+                .call_block(name, msg, InputStream::from_bytes(bytes))
+                .await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> Arc<dyn Context> {
+            Arc::new(self.clone())
+        }
+    }
+
+    /// Losing the claim to a rotation that has ALREADY landed is refused, and
+    /// nothing else.
+    ///
+    /// Burning the family here would be indefensible: the row was live when
+    /// this request read it, so the two overlapped inside one rotation window
+    /// — which is what one client refreshing twice at once (two tabs, a retry)
+    /// produces — and the answer to that cannot be signing the client out of
+    /// the pair it just received.
+    ///
+    /// A genuine replay is still caught: a thief who races the victim gets
+    /// nothing durable, because the next attempt reads a revoked row and takes
+    /// the branch `replaying_a_rotated_token_burns_the_whole_family` covers.
+    #[tokio::test]
+    async fn losing_the_claim_behind_a_completed_rotation_leaves_the_session_alone() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        let racer = RotateBeforeTheClaim::new(ctx.clone(), token.clone());
+
+        let loser = output_http_json(handle(&racer, refresh_with(&token)).await).await;
+
+        assert!(
+            !loser["refresh_token"].is_string(),
+            "the request that lost the claim must not be handed a second live \
+             generation: {loser}"
+        );
+        assert_eq!(
+            loser["message"], "Refresh token has been revoked",
+            "it is refused with the answer a token that is no longer current gets: {loser}"
+        );
+
+        let winner_token = racer.winner_token();
+        let again = output_http_json(handle(&ctx, refresh_with(&winner_token)).await).await;
+        assert!(
+            again["refresh_token"].is_string(),
+            "the rotation that WON must still refresh; burning the family on a \
+             lost claim kills the pair it had just minted: {again}"
         );
     }
 }
