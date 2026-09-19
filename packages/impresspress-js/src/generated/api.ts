@@ -3454,7 +3454,11 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
-                        /** @description Whether chat requests may route to this provider. Defaults to `true`. */
+                        /**
+                         * @description Whether chat requests may route to this provider. Defaults to `true`
+                         *     when the JSON body omits it; an unticked checkbox on the form path is
+                         *     `false`, because that is the only thing an absent checkbox can mean.
+                         */
                         enabled?: boolean | null;
                         /**
                          * @description Base URL of the provider's API. Must resolve to a public address:

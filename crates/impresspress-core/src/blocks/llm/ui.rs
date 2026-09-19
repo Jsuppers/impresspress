@@ -86,9 +86,8 @@ pub(super) async fn providers_page(
         ))
 
         @if manages {
-            // Add-provider form. Posts JSON via htmx json-enc so the existing
-            // `POST /b/llm/api/providers` handler accepts the body without any
-            // form-urlencoded translation layer.
+            // Add-provider form. Posts `application/x-www-form-urlencoded`,
+            // which `POST /b/llm/api/providers` accepts alongside JSON.
             div .card .mb-6 {
                 h3 .card-title .mb-3 { "Add provider" }
                 (add_provider_form())
@@ -142,12 +141,22 @@ fn cannot_manage_providers_notice() -> Markup {
 /// Render the add-provider form. Separated out so the top-level page
 /// composition stays flat and the form markup is swappable without editing
 /// the outer shell.
+///
+/// A plain htmx form: it posts `application/x-www-form-urlencoded`, which is
+/// what the handler parses. Nothing here reshapes the body in the browser —
+/// the `models` text input and the `enabled` checkbox are coerced by
+/// `routes::providers::parse_create_provider_body`, which is one description
+/// of the field shapes instead of two.
+///
+/// Like every control on this page it needs htmx: there is no `action` or
+/// `method`, so the submit is htmx's or it is nothing.
+///
+/// `hx-swap="none"` because the response is the created provider as JSON for
+/// SDK callers; the page picks up the new row by reloading.
 fn add_provider_form() -> Markup {
     html! {
         form
             hx-post="/b/llm/api/providers"
-            hx-ext="json-enc"
-            hx-target="body"
             hx-swap="none"
             hx-on--after-request="if(event.detail.successful){location.reload()}"
         {
@@ -194,10 +203,8 @@ fn add_provider_form() -> Markup {
                 }
                 div .form-group .col-span-full {
                     label .form-label for="new-models" { "Models (comma-separated)" }
-                    // htmx's json-enc extension turns this into a plain string;
-                    // the server expects a JSON array, so we transform on
-                    // submit via the form's `hx-on::config-request` hook
-                    // below. Bare form post keeps the control accessible.
+                    // One text input; the handler splits it into the contract's
+                    // `models` array.
                     input
                         .form-input
                         type="text"
@@ -218,34 +225,9 @@ fn add_provider_form() -> Markup {
             div .flex .justify-end .mt-3 {
                 button .btn.btn--primary type="submit" { "Add provider" }
             }
-            // Normalize `models` CSV → JSON array, and coerce `enabled`
-            // checkbox to a bool before htmx serialises. Both transforms
-            // live on `htmx:config-request` so json-enc sees the final
-            // shape. No DOM surgery — just dict mutation on the event.
-            script {
-                (maud::PreEscaped(ADD_PROVIDER_JS))
-            }
         }
     }
 }
-
-/// `htmx:config-request` hook that normalises the add-provider form body.
-///
-/// `htmx json-enc` serialises form fields verbatim: `models` arrives as
-/// a CSV string and `enabled` as either `"true"` or `undefined`. The
-/// server wants `models: string[]` and `enabled: bool`, so we transform
-/// in place before the request is sent. Keeps the JSON contract consistent
-/// with the `/api/providers` handler without adding server-side
-/// translation.
-const ADD_PROVIDER_JS: &str = r#"
-document.currentScript.closest('form').addEventListener('htmx:configRequest', function(ev) {
-    var p = ev.detail.parameters;
-    if (typeof p.models === 'string') {
-        p.models = p.models.split(',').map(function(s){return s.trim();}).filter(Boolean);
-    }
-    p.enabled = (p.enabled === 'true' || p.enabled === true || p.enabled === 'on');
-});
-"#;
 
 /// Render the providers table. Pure function of the loaded configs — used
 /// directly by `providers_page` and by the unit tests that assert shape.
@@ -539,6 +521,81 @@ mod tests {
     // non-admin rejection is pinned at the enforcement point in
     // `tests/extra_routes_test.rs` (llm_admin_ui_*), not here, so these page
     // renderers no longer carry their own `is_admin` re-check.
+
+    /// The add-provider form is submitted with the browser's own encoding,
+    /// and `routes::providers::create_provider` parses that.
+    ///
+    /// The form used to declare `hx-ext="json-enc"` and carry a script that
+    /// reshaped the parameters for it. Neither did anything: no json-enc
+    /// extension is shipped with the chrome — asserted below against the
+    /// bytes actually served — and htmx silently ignores an extension it was
+    /// never given, so the body went out form-encoded either way and the
+    /// handler answered 400 to every submit.
+    #[test]
+    fn the_add_provider_form_declares_no_encoding_extension() {
+        let m = add_provider_form().into_string();
+
+        assert!(
+            !m.contains("hx-ext"),
+            "no htmx extension is shipped, so declaring one only misdescribes \
+             the request; got: {m}"
+        );
+        assert!(
+            !m.contains("<script"),
+            "the field coercions are the handler's, not the browser's; got: {m}"
+        );
+        assert!(
+            m.contains(r#"hx-post="/b/llm/api/providers""#),
+            "the form must post to the create endpoint; got: {m}"
+        );
+        for field in [
+            "name", "protocol", "endpoint", "key_var", "models", "enabled",
+        ] {
+            assert!(
+                m.contains(&format!(r#"name="{field}""#)),
+                "the form must send `{field}` — `routes::providers`'s form tests \
+                 post exactly these; got: {m}"
+            );
+        }
+    }
+
+    /// What makes the assertion above true rather than merely asserted: no
+    /// script this deployment serves mentions json-enc, so nothing can be
+    /// registering it. Scanning htmx alone would have missed a
+    /// `htmx.defineExtension('json-enc', …)` in the shared chrome or in a
+    /// block's own bundle, which is exactly where a hand-rolled one would go.
+    ///
+    /// Ship an extension and this test is the place that says `hx-ext` may be
+    /// used again.
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn no_shipped_script_registers_a_json_enc_extension() {
+        let mut scanned: Vec<&str> = Vec::new();
+        for asset in crate::ui::assets::ASSETS {
+            if !asset.logical.ends_with(".js") {
+                continue;
+            }
+            // A block's bundle is in the manifest even when that block is not
+            // compiled into this build; only the embedded ones can be read.
+            let Some(bytes) = crate::ui::assets::bytes(asset.logical) else {
+                continue;
+            };
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("json-enc"),
+                "{} mentions json-enc — check whether an extension is now \
+                 registered before trusting `hx-ext`",
+                asset.logical
+            );
+            scanned.push(asset.logical);
+        }
+        // Without this the scan passes whether it read anything or not.
+        for required in ["htmx.min.js", "chrome.js"] {
+            assert!(
+                scanned.contains(&required),
+                "the scan must reach {required}; it read {scanned:?}"
+            );
+        }
+    }
 
     #[test]
     fn render_providers_table_empty_shows_hint() {

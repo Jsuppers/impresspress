@@ -18,6 +18,34 @@ use crate::{
     util::{enum_column_or, wire_str, RecordExt},
 };
 
+/// Render one context as the list page's row.
+///
+/// Shared with `rest::create_context`, which answers the new-context form's
+/// htmx post with this same row so the swapped-in markup is the markup a
+/// reload would render. A second, fragment-only copy of it would be free to
+/// drift from the list it is prepended to.
+pub fn context_card(record: &db::Record) -> Markup {
+    let id = record.id.as_str();
+    let title = record.str_field("title");
+    let context_type = record.str_field("type");
+    let status = record.str_field("status");
+    let updated_at = record.str_field("updated_at");
+    let date = updated_at.get(..10).unwrap_or(updated_at);
+
+    html! {
+        a .messages-list__item href={"/b/messages/contexts/" (id)} {
+            span .badge .messages-list__type { (context_type) }
+            span .messages-list__title {
+                @if title.is_empty() { "Untitled" } @else { (title) }
+            }
+            span .messages-list__status .badge { (status) }
+            @if !date.is_empty() {
+                span .messages-list__date .text-muted { (date) }
+            }
+        }
+    }
+}
+
 /// Render one entry.
 ///
 /// `kind` and `role` are decoded through the crate's one enum door, so a
@@ -103,7 +131,12 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
                     hx-post="/b/messages/api/contexts"
                     hx-target="#context-list"
                     hx-swap="afterbegin"
-                    hx-on--after-request="if(event.detail.successful){this.reset()}"
+                    // The swap has just put a row in the list, so the empty
+                    // state is now false. It is removed here rather than
+                    // re-rendered server-side: the response is one row, and
+                    // re-sending the whole list to delete one sentence would
+                    // cost every reader the scroll position.
+                    hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('context-list-empty')?.remove();}"
                 {
                     div .form-group {
                         label .form-label for="new-context-type" { "Type" }
@@ -124,27 +157,12 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
 
         div #context-list .messages-list {
             @if contexts.is_empty() {
-                div .messages-list__empty {
+                div #context-list-empty .messages-list__empty {
                     p { "No contexts yet — create one above." }
                 }
             } @else {
                 @for context in &contexts {
-                    @let id = context.id.as_str();
-                    @let title = context.str_field("title");
-                    @let context_type = context.str_field("type");
-                    @let status = context.str_field("status");
-                    @let updated_at = context.str_field("updated_at");
-                    @let date = updated_at.get(..10).unwrap_or(updated_at);
-                    a .messages-list__item href={"/b/messages/contexts/" (id)} {
-                        span .badge .messages-list__type { (context_type) }
-                        span .messages-list__title {
-                            @if title.is_empty() { "Untitled" } @else { (title) }
-                        }
-                        span .messages-list__status .badge { (status) }
-                        @if !date.is_empty() {
-                            span .messages-list__date .text-muted { (date) }
-                        }
-                    }
+                    (context_card(context))
                 }
             }
         }
@@ -367,7 +385,7 @@ fn render_default_view(
 
         div #entries-list .entries-list--scroll .mb-6 {
             @if entries.is_empty() {
-                div .text-center .text-muted .p-8 {
+                div #entries-empty .text-center .text-muted .p-8 {
                     "No entries yet. Add one below."
                 }
             } @else {
@@ -385,7 +403,9 @@ fn render_default_view(
                 hx-post=(post_url)
                 hx-target="#entries-list"
                 hx-swap="beforeend"
-                hx-on--after-request="if(event.detail.successful){this.reset();var list=document.getElementById('entries-list');list.scrollTop=list.scrollHeight;}"
+                // `#entries-empty` is the "No entries yet" line, now
+                // contradicted by the entry this swap appended.
+                hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('entries-empty')?.remove();var list=document.getElementById('entries-list');list.scrollTop=list.scrollHeight;}"
             {
                 div .flex .gap-2 .mb-2 {
                     select .form-input .w-auto name="kind" {
@@ -477,7 +497,7 @@ fn render_conversation_messages(entries: &[db::Record]) -> Result<Markup, WaferE
     Ok(html! {
         div #entries-list {
             @if cards.is_empty() {
-                div .text-center .text-muted .p-8 {
+                div #entries-empty .text-center .text-muted .p-8 {
                     "No messages yet. Send the first one below."
                 }
             } @else {
@@ -498,7 +518,9 @@ fn render_conversation_composer(post_url: &str) -> Markup {
             // Scroll the parent `.chat-messages` (the chat_page template's
             // pane wrapper) — `#entries-list` itself is no longer a scroll
             // container in the conversation view (see render_conversation_messages).
-            hx-on--after-request="if(event.detail.successful){this.reset();var list=document.getElementById('entries-list').parentElement;list.scrollTop=list.scrollHeight;}"
+            // `#entries-empty` is the "No messages yet" line, now
+            // contradicted by the message this swap appended.
+            hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('entries-empty')?.remove();var list=document.getElementById('entries-list').parentElement;list.scrollTop=list.scrollHeight;}"
         {
             // Hidden defaults: kind=message, role=user. Conversation lens is
             // an opinionated view — composers below the fold (settings page,
@@ -734,5 +756,107 @@ mod outage_tests {
             output_http_status(context_detail_page(&failing, &msg).await).await,
             500
         );
+    }
+}
+
+#[cfg(test)]
+mod form_contract_tests {
+    //! What the block's three htmx forms put on the wire.
+    //!
+    //! None of them declares an encoding — and no encoding extension is
+    //! shipped with the chrome, so declaring one would change nothing — which
+    //! means htmx submits them as `application/x-www-form-urlencoded` with
+    //! these field names. `rest.rs`'s handler tests post exactly these bytes;
+    //! this module is what keeps the two halves of that contract from
+    //! drifting apart.
+
+    use super::*;
+    use crate::{
+        blocks::messages::test_support::{ctx_with_messages, routed},
+        test_support::{admin_msg, output_html},
+    };
+
+    fn context_of_type(context_type: &str) -> db::Record {
+        let mut record = db::Record {
+            id: "ctx-1".to_string(),
+            data: std::collections::HashMap::new(),
+        };
+        record
+            .data
+            .insert("type".to_string(), serde_json::json!(context_type));
+        record
+    }
+
+    /// The empty state an empty list renders, and the handler that removes it,
+    /// name the same element.
+    ///
+    /// A successful swap has just put a row into the list, so the sentence
+    /// saying there is none is false from that moment until the next page
+    /// load. Asserted on both ends because an id that only one side spells is
+    /// exactly how this stops working.
+    fn assert_drops_empty_state(html: &str, id: &str) {
+        assert!(
+            html.contains(&format!(r#"id="{id}""#)),
+            "an empty list must render #{id}; got: {html}"
+        );
+        assert!(
+            html.contains(&format!("getElementById('{id}')?.remove()")),
+            "the form that fills the list must drop #{id}; got: {html}"
+        );
+    }
+
+    fn assert_posts_form_fields(html: &str, post_url: &str, fields: &[&str]) {
+        assert!(
+            html.contains(&format!(r#"hx-post="{post_url}""#)),
+            "form must post to {post_url}; got: {html}"
+        );
+        assert!(
+            !html.contains("hx-ext"),
+            "an encoding extension would be inert — none is shipped — so the \
+             body is form-encoded either way; got: {html}"
+        );
+        for field in fields {
+            assert!(
+                html.contains(&format!(r#"name="{field}""#)),
+                "form must send `{field}`; got: {html}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_new_context_form_posts_the_fields_create_context_reads() {
+        let ctx = ctx_with_messages().await;
+        let html = output_html(
+            context_list_page(&ctx, &routed(admin_msg("retrieve", "/b/messages/"))).await,
+        )
+        .await;
+        assert_posts_form_fields(&html, "/b/messages/api/contexts", &["type", "title"]);
+        assert_drops_empty_state(&html, "context-list-empty");
+    }
+
+    #[test]
+    fn the_conversation_composer_posts_the_fields_add_entry_reads() {
+        let html = render_context_detail_body(&context_of_type("conversation"), &[], &[], "ctx-1")
+            .expect("the fixture row decodes")
+            .into_string();
+        assert_posts_form_fields(
+            &html,
+            "/b/messages/api/contexts/ctx-1/entries",
+            &["kind", "role", "content"],
+        );
+        assert_drops_empty_state(&html, "entries-empty");
+    }
+
+    #[test]
+    fn the_default_view_composer_posts_the_fields_add_entry_reads() {
+        let html = render_context_detail_body(&context_of_type("task"), &[], &[], "ctx-1")
+            .expect("the fixture row decodes")
+            .into_string();
+        assert_posts_form_fields(
+            &html,
+            "/b/messages/api/contexts/ctx-1/entries",
+            &["kind", "role", "content"],
+        );
+        assert_drops_empty_state(&html, "entries-empty");
     }
 }

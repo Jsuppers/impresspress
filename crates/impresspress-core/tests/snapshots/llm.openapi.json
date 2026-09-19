@@ -756,7 +756,7 @@
               "description": "`POST /b/llm/api/providers` request body.",
               "properties": {
                 "enabled": {
-                  "description": "Whether chat requests may route to this provider. Defaults to `true`.",
+                  "description": "Whether chat requests may route to this provider. Defaults to `true`\nwhen the JSON body omits it; an unticked checkbox on the form path is\n`false`, because that is the only thing an absent checkbox can mean.",
                   "type": [
                     "boolean",
                     "null"

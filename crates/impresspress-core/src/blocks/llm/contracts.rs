@@ -187,7 +187,9 @@ pub struct CreateProviderRequest {
     /// Explicit model list. Omitted or empty means the models are discovered
     /// from the provider's `/v1/models`.
     pub models: Option<Vec<String>>,
-    /// Whether chat requests may route to this provider. Defaults to `true`.
+    /// Whether chat requests may route to this provider. Defaults to `true`
+    /// when the JSON body omits it; an unticked checkbox on the form path is
+    /// `false`, because that is the only thing an absent checkbox can mean.
     pub enabled: Option<bool>,
 }
 

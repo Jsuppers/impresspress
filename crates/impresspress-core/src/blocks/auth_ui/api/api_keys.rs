@@ -71,7 +71,10 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
         expires_at: Option<String>,
     }
     let raw = input.collect_to_bytes().await;
-    let parsed = crate::util::parse_body_value(&raw);
+    let parsed = match crate::util::parse_body_value(&raw) {
+        Ok(value) => value,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
     let body: CreateKeyReq = match serde_json::from_value(parsed) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
