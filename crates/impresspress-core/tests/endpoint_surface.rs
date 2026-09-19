@@ -71,10 +71,17 @@ fn surface_block_infos() -> Vec<BlockInfo> {
 /// committed baseline must be compared, or the gate is passing for free and
 /// the test fails to say so.
 ///
-/// The gate is per row, and the row's own `cfg!` is the whole of it. A
-/// cfg-gated pair of slices spells the same decision twice and the copies can
-/// drift; one bool for the whole list would excuse a row gated on some other
-/// feature in every run that has that feature off.
+/// The gate is per row: the row's own `cfg!` decides that row and no other, so
+/// an entry gated on some different feature cannot be excused by this one's
+/// being off — which is what one bool for the whole list would do, silently.
+///
+/// What a row does not do is compile the block in; `surface_block_infos` above
+/// carries its own `#[cfg]` for that, because a `const` cannot produce a
+/// `BlockInfo`. So the same decision is written twice in this file and the two
+/// spellings can disagree. Both disagreements fail loudly, because a baseline
+/// that is neither compared nor excused is exactly what the check below
+/// reports: a row without a block is caught when its feature is ON, a block
+/// without a row when its feature is OFF.
 const FEATURE_GATED_BASELINES: &[(&str, bool)] = &[("dev", cfg!(feature = "block-dev"))];
 
 #[test]

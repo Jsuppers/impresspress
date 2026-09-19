@@ -145,21 +145,30 @@ fi
 #
 # What is NOT matched, and why. The same adverb in lower case ("read-through
 # previously always PUT") and the phrase for "formerly" ("that branch used to
-# be a removal") are narration just as often — a read of all 58 lower-case
-# occurrences found roughly 47 of them narrating, and a 15-line sample of the
-# 348 occurrences of the phrase found 14. They are left out on VOLUME, not
-# because they are clean: together they are ~400 more lines across ~200 files,
-# which is a ratchet of its own to land and shrink, and the "formerly" phrase
-# additionally has a live "employed to" sense ("the subject used to key the
-# token") that has to be read per hit rather than counted. Widening to them is
-# a follow-up wave, not a tightening of this one.
+# be a removal") are narration just as often — a read of all 64 lower-case
+# occurrences found roughly 52 of them narrating, and a 15-line sample of the
+# 388 occurrences of the phrase found 14. They are left out on VOLUME, not
+# because they are clean: together they are 451 more comment lines in 175
+# further files, which is a ratchet of its own to land and shrink, and the
+# "formerly" phrase additionally has a live "employed to" sense ("the subject
+# used to key the token") that has to be read per hit rather than counted.
+# Widening to them is a follow-up wave, not a tightening of this one.
+#
+# Those counts are this scan's own, not hand-collected. To reproduce one, run
+# this script with the pattern substituted and the allowlist emptied:
+#
+#   sed -e "s@^NARRATION_RE=.*@NARRATION_RE='(^|[^A-Za-z])used to'@" \
+#       -e 's@^NARRATION_ALLOWLIST=.*@NARRATION_ALLOWLIST=/dev/null@' \
+#       scripts/check-doc-pointers.sh | bash
 #
 # What counts as a comment. A block comment that OPENS a line (`/*`, `<!--`)
 # puts every following line into the comment until its terminator, which is
 # what makes a continuation line and a wrapped sentence visible. Otherwise the
-# first opener-looking token on the line starts the comment. "Opener-looking"
-# is the honest word: the scan is textual, so three classes can be read as a
-# comment when they are not —
+# first opener-looking token on the line starts the comment, among the openers
+# that file type actually has — a stylesheet has the block form only, so a
+# `url(...)` is not read as a comment. "Opener-looking" is still the honest
+# word: the scan is textual, so three classes can be read as a comment when
+# they are not —
 #   * a string or URL containing the line-comment token before the match;
 #   * a shell parameter expansion, where the substitution sigil is not a
 #     comment at all;
@@ -210,7 +219,10 @@ if [ "${#sources[@]}" -gt 0 ]; then
       function family(name,   base) {
         base = name
         sub(/\.tmpl$/, "", base)
-        if (base ~ /\.(rs|ts|tsx|js|mjs|cjs|go|css)$/) return "slash"
+        if (base ~ /\.(rs|ts|tsx|js|mjs|cjs|go)$/) return "slash"
+        # CSS has the block form and NOT the line form: a `//` in a stylesheet
+        # is inside a `url(...)`, never a comment.
+        if (base ~ /\.css$/) return "block"
         if (base ~ /\.(html|htm)$/) return "angle"
         if (base ~ /\.(sh|toml|ya?ml)$/) return "sigil"
         if (base ~ /\.sql$/) return "dash"
@@ -230,7 +242,7 @@ if [ "${#sources[@]}" -gt 0 ]; then
             body = substr($0, 1, e - 1)
             in_block = 0
           }
-        } else if (kind == "slash" && $0 ~ /^[ \t]*\/\*/) {
+        } else if ((kind == "slash" || kind == "block") && $0 ~ /^[ \t]*\/\*/) {
           in_block = 1
           closer = "*/"
           match($0, /\/\*/)
@@ -248,6 +260,9 @@ if [ "${#sources[@]}" -gt 0 ]; then
           i = index($0, "//")
           j = index($0, "/*")
           if (i == 0 || (j > 0 && j < i)) i = j
+          if (i > 0) body = substr($0, i)
+        } else if (kind == "block") {
+          i = index($0, "/*")
           if (i > 0) body = substr($0, i)
         } else if (kind == "angle") {
           i = index($0, "<!--")
