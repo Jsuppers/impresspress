@@ -52,6 +52,10 @@
 //! before a handler ever saw it. PR 2 folded it into `WaferError`, and those
 //! sites classify like every other one now.
 
+use impresspress_core::test_support::source_scan::{
+    strip_line_comments, strip_test_modules, SourceWalk,
+};
+
 /// Files still carrying the shape. **Empty**, and the history of how it got
 /// there, because each entry was a place a WRAP refusal shipped as a 500 and
 /// the order they came off in is the argument for keeping it at zero.
@@ -104,39 +108,17 @@ const STILL_HAND_MAPPED: &[(&str, &str)] = &[];
 /// The one file allowed to contain the mapping, because it IS the mapping.
 const THE_DOOR: &str = "crud.rs";
 
-fn block_sources() -> Vec<(String, String)> {
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks"));
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read source dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("under root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read_to_string(&path).expect("read source")));
-            }
-        }
-    }
-    assert!(
-        out.len() > 100,
-        "the scan walks every block; {} files means it lost its way",
-        out.len()
-    );
-    out
+/// The walk this gate runs over: every block source, with a floor so an empty
+/// scan cannot pass as a clean one.
+fn scan() -> SourceWalk {
+    SourceWalk::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks")).least(100)
 }
 
 /// `src` as production code: full-line comments dropped, and everything from
 /// the first `#[cfg(test)]` attribute onwards dropped with it.
 fn production_code(src: &str) -> Vec<String> {
-    src.lines()
-        .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
-        .filter(|line| !line.trim_start().starts_with("//"))
+    strip_line_comments(&strip_test_modules(src))
+        .lines()
         .map(str::to_string)
         .collect()
 }
@@ -169,27 +151,37 @@ fn hand_maps_a_database_error(lines: &[String]) -> bool {
     })
 }
 
-#[test]
-fn only_crud_maps_a_database_error_by_hand() {
+/// The files that carry the shape and are not allowed to, and the entries on
+/// the list that no longer carry it — the gate's whole verdict, over whatever
+/// tree `walk` reaches.
+fn verdict(walk: &SourceWalk) -> (Vec<String>, Vec<String>) {
     let allowed: std::collections::HashMap<&str, &str> =
         STILL_HAND_MAPPED.iter().copied().collect();
 
     let mut unexpected = Vec::new();
     let mut clean_but_listed = Vec::new();
 
-    for (rel, src) in block_sources() {
-        if rel == THE_DOOR {
+    for file in walk.collect() {
+        if file.rel == THE_DOOR {
             continue;
         }
-        let hits = hand_maps_a_database_error(&production_code(&src));
-        match (hits, allowed.contains_key(rel.as_str())) {
-            (true, false) => unexpected.push(rel),
-            (false, true) => clean_but_listed.push(rel),
+        let hits = hand_maps_a_database_error(&production_code(&file.text));
+        match (hits, allowed.contains_key(file.rel.as_str())) {
+            (true, false) => unexpected.push(file.rel),
+            (false, true) => clean_but_listed.push(file.rel),
             _ => {}
         }
     }
 
     unexpected.sort();
+    clean_but_listed.sort();
+    (unexpected, clean_but_listed)
+}
+
+#[test]
+fn only_crud_maps_a_database_error_by_hand() {
+    let (unexpected, clean_but_listed) = verdict(&scan());
+
     assert!(
         unexpected.is_empty(),
         "these files hand-map a database error instead of calling \
@@ -203,7 +195,6 @@ fn only_crud_maps_a_database_error_by_hand() {
          STILL_HAND_MAPPED with the PR that converts it."
     );
 
-    clean_but_listed.sort();
     assert!(
         clean_but_listed.is_empty(),
         "these files are on STILL_HAND_MAPPED but no longer hand-map \
@@ -259,4 +250,36 @@ fn the_gate_catches_the_shape_it_is_looking_for() {
         "#,
     );
     assert!(!hand_maps_a_database_error(&in_a_test));
+}
+
+/// The *walk* reaches a planted offender, and the door it exempts is the only
+/// thing it lets through.
+///
+/// `the_gate_catches_the_shape_it_is_looking_for` proves the predicate works;
+/// it says nothing about whether the walk ever opens a file. A root that moved
+/// or an extension filter that broke would leave the gate above passing on an
+/// empty scan — green, and blind to the one thing it exists to catch.
+#[test]
+fn the_walk_reaches_the_files_it_claims_to_scan() {
+    const SHAPE: &str = "match db::get(ctx, TABLE, id).await {\n\
+         Err(e) if e.code == ErrorCode::NotFound => err_not_found(\"x\"),\n\
+         Err(e) => err_internal(\"Database error\", e),\n\
+         }\n";
+
+    let root = std::env::temp_dir().join(format!("error-door-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("nested")).expect("temp tree");
+    std::fs::write(root.join("nested/offender.rs"), SHAPE).expect("offender");
+    std::fs::write(root.join(THE_DOOR), SHAPE).expect("the door");
+    std::fs::write(root.join("notes.txt"), SHAPE).expect("non-rust");
+
+    let (unexpected, clean_but_listed) = verdict(&SourceWalk::new(&root));
+    std::fs::remove_dir_all(&root).expect("clean up");
+
+    assert_eq!(
+        unexpected,
+        vec!["nested/offender.rs".to_string()],
+        "expected exactly the planted offender"
+    );
+    assert!(clean_but_listed.is_empty(), "{clean_but_listed:?}");
 }

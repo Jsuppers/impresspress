@@ -44,7 +44,7 @@
 //! they just wrote, several of them *as* the witness that the raw read
 //! truncates, and none of them ships.
 
-use std::{fs, path::Path};
+use impresspress_core::test_support::source_scan::{code_before_comment, SourceWalk};
 
 /// The module that owns the replacement, and so the one file allowed to hold
 /// the pattern (in prose — it does not call either function).
@@ -55,6 +55,12 @@ const OWNER: &str = "db_read.rs";
 const TEST_DIR: &str = "tests";
 
 const BANNED: [&str; 2] = ["list_all", "list_sorted"];
+
+/// The walk this guard runs over, stated once so its self-test below plants
+/// its offender behind the same filters the real scan uses.
+fn scan() -> SourceWalk {
+    SourceWalk::crate_src().skip_dir(TEST_DIR).skip_file(OWNER)
+}
 
 /// Whether `source` reaches the banned read. One hit per line at most — the
 /// line number is the useful part, not how many ways it offends.
@@ -67,7 +73,7 @@ const BANNED: [&str; 2] = ["list_all", "list_sorted"];
 fn offending_lines(source: &str) -> Vec<usize> {
     let mut hits = Vec::new();
     for (index, line) in source.lines().enumerate() {
-        let code = line.split("//").next().unwrap_or(line);
+        let code = code_before_comment(line);
         let is_use = {
             let head = code.trim_start();
             head.starts_with("use ") || head.starts_with("pub use ")
@@ -111,26 +117,15 @@ fn segment_at(code: &str, name: &str, is_use: bool) -> bool {
     false
 }
 
-fn walk(dir: &Path, found: &mut Vec<String>) {
-    for entry in fs::read_dir(dir).expect("read source dir") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == TEST_DIR) {
-                continue;
-            }
-            walk(&path, found);
-            continue;
-        }
-        if path.extension().is_none_or(|ext| ext != "rs")
-            || path.file_name().is_some_and(|name| name == OWNER)
-        {
-            continue;
-        }
-        let source = fs::read_to_string(&path).expect("read source file");
-        for line in offending_lines(&source) {
-            found.push(format!("{}:{}", path.display(), line));
+/// Every `<path>:<line>` the walk finds, in the form the failure prints.
+fn offenders(walk: &SourceWalk) -> Vec<String> {
+    let mut found = Vec::new();
+    for file in walk.collect() {
+        for line in offending_lines(&file.text) {
+            found.push(format!("{}:{}", file.path.display(), line));
         }
     }
+    found
 }
 
 const REMEDY: &str = "these call `db::list_all` / `db::list_sorted`, which truncate at a fixed \
@@ -140,9 +135,7 @@ const REMEDY: &str = "these call `db::list_all` / `db::list_sorted`, which trunc
 
 #[test]
 fn no_unpaged_database_read_outside_db_read() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found = Vec::new();
-    walk(&src, &mut found);
+    let found = offenders(&scan().least(100));
     assert!(found.is_empty(), "{REMEDY}\n  {}", found.join("\n  "));
 }
 
@@ -187,35 +180,34 @@ fn the_matcher_recognises_the_calls_it_bans() {
 /// claims.
 ///
 /// `the_matcher_recognises_the_calls_it_bans` proves the predicate works; it
-/// says nothing about whether `walk` ever reaches a file. If the directory
+/// says nothing about whether the walk ever reaches a file. If the directory
 /// filter or the extension filter broke so that nothing was scanned, the
 /// guard above would pass on an empty result — green, and blind to exactly
 /// the thing it exists to catch.
 #[test]
 fn the_walk_reaches_the_files_it_claims_to_scan() {
     let root = std::env::temp_dir().join(format!("db-read-guard-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("blocks/tests")).expect("temp tree");
-    fs::write(
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("blocks/tests")).expect("temp tree");
+    std::fs::write(
         root.join("blocks/offender.rs"),
         "async fn f() { db::list_all(ctx, T, vec![]).await }\n",
     )
     .expect("offender");
-    fs::write(
+    std::fs::write(
         root.join("blocks/tests/fixture.rs"),
         "async fn f() { db::list_all(ctx, T, vec![]).await }\n",
     )
     .expect("exempt test module");
-    fs::write(
+    std::fs::write(
         root.join(OWNER),
         "//! db::list_all and db::list_sorted are what this module replaces.\n",
     )
     .expect("owner");
-    fs::write(root.join("notes.txt"), "db::list_all(ctx, T, vec![])\n").expect("non-rust");
+    std::fs::write(root.join("notes.txt"), "db::list_all(ctx, T, vec![])\n").expect("non-rust");
 
-    let mut found = Vec::new();
-    walk(&root, &mut found);
-    fs::remove_dir_all(&root).expect("clean up");
+    let found = offenders(&SourceWalk::new(&root).skip_dir(TEST_DIR).skip_file(OWNER));
+    std::fs::remove_dir_all(&root).expect("clean up");
 
     assert_eq!(
         found.len(),

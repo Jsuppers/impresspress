@@ -28,31 +28,12 @@
 //!     itself here; but nothing re-checks that a listed file's reads are
 //!     still fixture setup rather than production reads.
 
-fn crate_sources() -> Vec<(String, String)> {
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read source dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("under root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read_to_string(&path).expect("read source")));
-            }
-        }
-    }
-    assert!(
-        out.len() > 100,
-        "the scan walks the whole crate; {} files means it lost its way",
-        out.len()
-    );
-    out
+use crate::test_support::source_scan::SourceWalk;
+
+/// The walk this gate runs over: every `.rs` file in the crate, with a floor
+/// so an empty scan cannot pass as a clean one.
+fn scan() -> SourceWalk {
+    SourceWalk::crate_src().least(100)
 }
 
 /// Whether `path` (relative to `src`) matches one of `allowlist`'s entries.
@@ -62,6 +43,18 @@ fn crate_sources() -> Vec<(String, String)> {
 /// `handlers/mod.rs`, etc.
 fn matches_allowlist(path: &str, allowlist: &[&str]) -> bool {
     allowlist.contains(&path)
+}
+
+/// The files, outside `allowlist`, that name `ident` — the shape both scans
+/// below run, stated once so the walk's own self-test drives the same filter
+/// over a planted tree.
+fn callers(walk: &SourceWalk, ident: &str, allowlist: &[&str]) -> Vec<String> {
+    walk.collect()
+        .into_iter()
+        .filter(|file| !matches_allowlist(&file.rel, allowlist))
+        .filter(|file| file.text.contains(ident))
+        .map(|file| file.rel)
+        .collect()
 }
 
 /// The crate-level door test proves that nothing *names the products table*
@@ -129,14 +122,9 @@ const WRITE_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
 
 #[test]
 fn write_side_escape_hatches_are_allowlisted() {
-    let sources = crate_sources();
+    let walk = scan();
     for (ident, allowlist) in WRITE_ESCAPE_HATCHES {
-        let offenders: Vec<&String> = sources
-            .iter()
-            .filter(|(path, _)| !matches_allowlist(path, allowlist))
-            .filter(|(_, src)| src.contains(ident))
-            .map(|(path, _)| path)
-            .collect();
+        let offenders = callers(&walk, ident, allowlist);
         assert!(
             offenders.is_empty(),
             "these files call `{ident}`, which writes past the soft-delete \
@@ -154,7 +142,7 @@ fn write_side_escape_hatches_are_allowlisted() {
 /// the identifiers only in order to scan for them).
 #[test]
 fn no_write_escape_hatch_allowlist_entry_is_dead() {
-    let sources = crate_sources();
+    let sources = scan().collect();
     for (ident, allowlist) in WRITE_ESCAPE_HATCHES {
         for entry in *allowlist {
             if *entry == "blocks/products/tests/repo_door_test.rs" {
@@ -162,7 +150,7 @@ fn no_write_escape_hatch_allowlist_entry_is_dead() {
             }
             let uses = sources
                 .iter()
-                .any(|(path, src)| path == entry && src.contains(ident));
+                .any(|file| &file.rel == entry && file.text.contains(ident));
             assert!(
                 uses,
                 "`{entry}` is allowlisted for `{ident}` but no longer calls it; \
@@ -315,14 +303,9 @@ const READ_ESCAPE_HATCHES: &[(&str, &[&str])] = &[
 
 #[test]
 fn read_side_escape_hatches_are_allowlisted() {
-    let sources = crate_sources();
+    let walk = scan();
     for (ident, allowlist) in READ_ESCAPE_HATCHES {
-        let offenders: Vec<&String> = sources
-            .iter()
-            .filter(|(path, _)| !matches_allowlist(path, allowlist))
-            .filter(|(_, src)| src.contains(ident))
-            .map(|(path, _)| path)
-            .collect();
+        let offenders = callers(&walk, ident, allowlist);
         assert!(
             offenders.is_empty(),
             "these files call `{ident}`, which reads past the soft-delete \
@@ -340,7 +323,7 @@ fn read_side_escape_hatches_are_allowlisted() {
 /// pre-approves whatever that file does next.
 #[test]
 fn no_read_escape_hatch_allowlist_entry_is_dead() {
-    let sources = crate_sources();
+    let sources = scan().collect();
     for (ident, allowlist) in READ_ESCAPE_HATCHES {
         for entry in *allowlist {
             if *entry == "blocks/products/tests/repo_door_test.rs" {
@@ -348,7 +331,7 @@ fn no_read_escape_hatch_allowlist_entry_is_dead() {
             }
             let uses = sources
                 .iter()
-                .any(|(path, src)| path == entry && src.contains(ident));
+                .any(|file| &file.rel == entry && file.text.contains(ident));
             assert!(
                 uses,
                 "`{entry}` is allowlisted for `{ident}` but no longer calls it; \
@@ -356,4 +339,41 @@ fn no_read_escape_hatch_allowlist_entry_is_dead() {
             );
         }
     }
+}
+
+/// The *walk* reaches a planted caller, honours an allowlist entry, and reads
+/// only Rust.
+///
+/// Both scans above prove what they match; neither proves the walk ever
+/// opened a file. A root that moved or an extension filter that broke would
+/// leave them passing on an empty list — green, and blind to the call site
+/// they exist to catch. The floor on [`scan`] is the other half: it fails
+/// when the real tree comes back short.
+#[test]
+fn the_walk_reaches_the_files_it_claims_to_scan() {
+    const IDENT: &str = "products::purge";
+
+    let root = std::env::temp_dir().join(format!("products-repo-door-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("handlers")).expect("temp tree");
+    std::fs::write(
+        root.join("handlers/caller.rs"),
+        format!("async fn f() {{ repo::{IDENT}(ctx, id).await }}\n"),
+    )
+    .expect("caller");
+    std::fs::write(
+        root.join("allowlisted.rs"),
+        format!("async fn f() {{ repo::{IDENT}(ctx, id).await }}\n"),
+    )
+    .expect("allowlisted caller");
+    std::fs::write(root.join("notes.txt"), IDENT).expect("non-rust");
+
+    let found = callers(&SourceWalk::new(&root), IDENT, &["allowlisted.rs"]);
+    std::fs::remove_dir_all(&root).expect("clean up");
+
+    assert_eq!(
+        found,
+        vec!["handlers/caller.rs".to_string()],
+        "expected exactly the planted caller"
+    );
 }
