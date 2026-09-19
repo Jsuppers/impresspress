@@ -150,7 +150,7 @@ crate::impresspress_feature_block! {
         // been running, not the other way round.
         .default_enabled(true)
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         // Auth is enforced centrally by `route_to_block` from each row's
         // declared `AuthLevel`; the block holds no `user_id` / `is_admin`
         // preamble. `{family}` / `{id}` are bound into `req.param.*` for the

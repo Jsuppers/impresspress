@@ -253,10 +253,11 @@ pub async fn refuse_oversized_body(
     payload_too_large_response(msg)
 }
 
-// This is the single request-pipeline entry point; each argument is a distinct
-// piece of request/runtime context and a param-struct refactor is out of scope
-// for a lint sweep (behavior-preserving cleanup only).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the single request-pipeline entry point: each argument is a distinct \
+              piece of request or runtime context, none derivable here from another"
+)]
 pub async fn handle_request(
     ctx: &dyn Context,
     mut msg: Message,

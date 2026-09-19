@@ -2307,7 +2307,10 @@ pub async fn output_is_error(out: OutputStream, code: &str) -> bool {
     feature = "block-vector"
 ))]
 pub fn real_block_infos() -> Vec<BlockInfo> {
-    #[allow(unused_mut)]
+    #[cfg_attr(
+        not(any(feature = "block-legalpages", feature = "block-dev")),
+        expect(unused_mut, reason = "only the two feature-gated pushes below need it")
+    )]
     let mut infos = vec![
         crate::blocks::auth_ui::AuthUiBlock::new().info(),
         crate::blocks::files::FilesBlock::new().info(),

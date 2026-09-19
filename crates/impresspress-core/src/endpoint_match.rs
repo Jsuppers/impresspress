@@ -917,7 +917,6 @@ mod tests {
     /// different `required` lists. The probe carries one so these tests
     /// cannot pass by both producers happening to agree.
     #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-    #[allow(dead_code)]
     struct ContractProbe {
         id: String,
         #[serde(default)]

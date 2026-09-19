@@ -1076,7 +1076,11 @@ where
 // was added to fix — a compiler-enforced parameter cannot be forgotten, a
 // follow-up call can. Bundling the existing seven into a struct would add
 // indirection to a private function with four call sites and hide that.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a blind window a caller forgets to record is the defect the eighth \
+              parameter exists to catch; an argument cannot be forgotten"
+)]
 async fn hydrate_prepared_runtime<F, G>(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,
@@ -1162,7 +1166,11 @@ where
 /// distinct enough to diagnose from the deploy gate's output.
 // Eight arguments, for the same reason `build_runtime` has eight: the captured
 // environment travels rather than being re-read here.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the captured environment travels as a parameter rather than being \
+              re-read here, exactly as in `build_runtime`"
+)]
 async fn hydrate_transient_dynamic_runtime<F, G>(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,

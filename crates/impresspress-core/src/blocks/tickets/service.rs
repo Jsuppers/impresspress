@@ -533,9 +533,11 @@ fn ticket_data(
     }))
 }
 
-// A thin forwarder to `repo::append_event`, so it carries that call's
-// arguments verbatim.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a thin forwarder to `repo::append_event`, so it carries that \
+              call's arguments verbatim"
+)]
 async fn append_event_best_effort(
     ctx: &dyn Context,
     ticket_id: &str,

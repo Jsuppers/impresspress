@@ -25,3 +25,6 @@ target-cloudflare = ["dep:impresspress-cloudflare", "dep:worker", "dep:wasm-bind
 impresspress-cloudflare = { path = "../../crates/impresspress-cloudflare", optional = true, default-features = false, features = ["block-products"] }
 worker = { workspace = true, optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+
+[lints]
+workspace = true

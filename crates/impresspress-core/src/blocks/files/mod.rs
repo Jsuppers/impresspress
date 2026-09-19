@@ -591,7 +591,7 @@ crate::impresspress_feature_block! {
             .admin_url("/b/storage/admin/")
             .can_disable(true)
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         // Auth is enforced centrally by `route_to_block` from each row's
         // declared `AuthLevel`; the matcher binds the path variables the
         // handlers read through `msg.var(..)`.
@@ -634,17 +634,17 @@ crate::impresspress_feature_block! {
             Route::AdminListQuotas => cloud::handle_admin_quotas(ctx, &msg).await,
             Route::AdminUpdateQuota => cloud::handle_update_quota(ctx, &msg, input).await,
             Route::DirectAccess => share::handle_direct_access(ctx, &msg, &this.limiter).await,
-            Route::BucketListPage => pages_user::bucket_list_page(ctx, &msg).await,
+            Route::BucketListPage => pages_user::buckets::bucket_list_page(ctx, &msg).await,
             Route::ObjectListPage => {
-                pages_user::object_list_page(ctx, &msg, msg.var("bucket"), "").await
+                pages_user::objects::object_list_page(ctx, &msg, msg.var("bucket"), "").await
             }
             Route::FolderListPage => {
                 // The bound prefix carries no trailing slash; the page's
                 // prefix convention is `dir/`.
                 let prefix = format!("{}/", msg.var("prefix"));
-                pages_user::object_list_page(ctx, &msg, msg.var("bucket"), &prefix).await
+                pages_user::objects::object_list_page(ctx, &msg, msg.var("bucket"), &prefix).await
             }
-            Route::CloudStoragePage => pages_user::cloudstorage_page(ctx, &msg).await,
+            Route::CloudStoragePage => pages_user::cloudstorage::cloudstorage_page(ctx, &msg).await,
             Route::ListBuckets => storage::handle_list_buckets(ctx, &msg).await,
             Route::CreateBucket => storage::handle_create_bucket(ctx, &msg, input).await,
             Route::DeleteBucket => storage::handle_delete_bucket(ctx, &msg).await,

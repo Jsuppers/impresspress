@@ -41,7 +41,14 @@
 // accurate, and this allow does not apply — which is why it is `cfg_attr`'d on
 // the same `target_arch = "wasm32"` predicate `wafer_block::compat` itself
 // switches on, and not a blanket allow.
-#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+#![cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::arc_with_non_send_sync,
+        reason = "on this single-threaded target the `Arc` is forced by the \
+                  trait-object bounds, not chosen over an `Rc`"
+    )
+)]
 
 pub mod blocks;
 pub mod builder;

@@ -19,10 +19,19 @@ pub struct SseFrame {
     /// (reqwest + tokio, neither of which builds for wasm32). OpenAI's wire
     /// ignores `event:` entirely, so in a build that carries only the OpenAI
     /// consumer — `impresspress-browser` takes this crate with no default
-    /// features — the field is parsed and never read. The `allow` is scoped to
-    /// exactly that configuration so a genuinely dead field still warns in the
-    /// build that has both readers.
-    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    /// features — the field is parsed and never read. The suppression is scoped
+    /// to exactly that configuration so a genuinely dead field still warns in
+    /// the build that has both readers. `not(test)` is part of that scope: the
+    /// module's own tests assert on `event`, so in a test build of the
+    /// no-`llm` shape the field has a reader and the lint is silent.
+    #[cfg_attr(
+        all(not(feature = "llm"), not(test)),
+        expect(
+            dead_code,
+            reason = "outside the tests only the Anthropic decoder reads it, and \
+                      that decoder is `feature = \"llm\"`-gated"
+        )
+    )]
     pub event: Option<String>,
     pub data: String,
 }

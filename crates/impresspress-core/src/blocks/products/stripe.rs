@@ -787,7 +787,11 @@ fn payment_link_shipping_supported(offer: &Offer) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Stripe form is assembled from independently-sourced values — \
+              offer, pricing preview, URLs, tax and fee settings"
+)]
 fn build_offer_checkout_form(
     offer: &Offer,
     preview: &crate::blocks::products::contracts::PricingPreview,
@@ -1942,7 +1946,11 @@ pub(crate) async fn archive_offer_catalog(
     repo::offers::archive(ctx, product_id, offer_id).await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Stripe form is assembled from independently-sourced values — \
+              offer, pricing preview, completion URL, tax and fee settings"
+)]
 fn payment_link_form(
     offer: &Offer,
     preview: &crate::blocks::products::contracts::PricingPreview,

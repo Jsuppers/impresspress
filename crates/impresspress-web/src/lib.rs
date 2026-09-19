@@ -26,7 +26,14 @@
 // that is the actual precondition: on a native target the same bounds resolve
 // to real `Send + Sync`, the lint is accurate again, and this allow must not
 // silence it.
-#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+#![cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::arc_with_non_send_sync,
+        reason = "on this single-threaded target the `Arc` is forced by the \
+                  trait-object bounds, not chosen over an `Rc`"
+    )
+)]
 
 use std::sync::Arc;
 

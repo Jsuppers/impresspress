@@ -38,9 +38,11 @@ fn maybe_eq(field: &str, value: Option<&str>) -> Option<Filter> {
 // Context operations
 // ---------------------------------------------------------------------------
 
-// The context row's columns, one argument each — the same shape
-// `send_message` below already carries an allow for.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`ctx` plus one argument for each context-row value the caller \
+              supplies; a struct would be this list with a name on it"
+)]
 pub async fn create_context(
     ctx: &dyn Context,
     owner_id: &str,
@@ -160,9 +162,11 @@ pub async fn delete_context(ctx: &dyn Context, id: &str) -> Result<(), WaferErro
 // Entry operations
 // ---------------------------------------------------------------------------
 
-// One argument per message field the caller must supply; a param-struct
-// refactor is out of scope for a lint sweep (behavior-preserving cleanup only).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`ctx` plus one argument for each entry-row value the caller \
+              supplies; a struct would be this list with a name on it"
+)]
 pub async fn add_entry(
     ctx: &dyn Context,
     owner_id: &str,

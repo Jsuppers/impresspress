@@ -488,7 +488,7 @@ crate::impresspress_feature_block! {
         .config_keys(config_vars())
         .admin_url("/b/auth/admin/settings")
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         if msg.kind == MAINTENANCE_MESSAGE_KIND {
             return ok_json(&crate::blocks::auth::maintenance::sweep(ctx).await);
         }

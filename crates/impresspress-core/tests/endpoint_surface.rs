@@ -54,7 +54,10 @@ fn surface_lines(info: &BlockInfo) -> Vec<String> {
 /// the manifest blocks plus `llm`; `dev` has its own constructor and joins
 /// only when compiled in.
 fn surface_block_infos() -> Vec<BlockInfo> {
-    #[allow(unused_mut)]
+    #[cfg_attr(
+        not(feature = "block-dev"),
+        expect(unused_mut, reason = "only the `block-dev` extend below needs it")
+    )]
     let mut infos = impresspress_core::blocks::all_block_infos();
     #[cfg(feature = "block-dev")]
     infos.extend(

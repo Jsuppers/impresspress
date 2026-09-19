@@ -32,7 +32,6 @@ fn selected_thread(msg: &Message) -> Option<&str> {
 /// the optional active thread id, returns the inner page Markup. Kept
 /// pure (sync, no `Context`) so the selector-preservation contract can be
 /// verified in unit tests without mocking the database client.
-#[allow(clippy::too_many_arguments)]
 fn render_page_body(
     threads: &[ContextView],
     entries: &[serde_json::Value],

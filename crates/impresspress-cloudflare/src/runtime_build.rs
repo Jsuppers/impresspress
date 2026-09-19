@@ -223,7 +223,11 @@ pub(crate) async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<Bo
 // than something re-derived from `env` here: reading a var twice per request is
 // exactly what `CfEnvironment` exists to stop, and a function that could reach
 // for `env.var` on its own would put that back.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the captured environment travels as a parameter so nothing here can \
+              re-read `env.var` per request"
+)]
 pub(crate) async fn build_runtime<F, G>(
     env: &worker::Env,
     environment: &CfEnvironment,

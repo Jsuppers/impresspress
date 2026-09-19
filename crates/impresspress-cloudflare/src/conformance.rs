@@ -76,14 +76,12 @@ use crate::{database::D1DatabaseService, kv_cached_db::KvCachedD1DatabaseService
 /// Compile-time proof (never executed) that the D1 adapter is a valid argument
 /// to the shared conformance suite. See the module doc for what this enforces
 /// and why a live run is infeasible without a workerd D1 binding.
-#[allow(dead_code)]
 async fn _d1_adapter_is_conformable(svc: &D1DatabaseService) {
     run_conformance(svc as &dyn DatabaseService).await;
 }
 
 /// Compile-time proof (never executed) that the KV-cached wrapper is a valid
 /// argument to the shared conformance suite. See the module doc.
-#[allow(dead_code)]
 async fn _kv_cached_adapter_is_conformable(svc: &KvCachedD1DatabaseService) {
     run_conformance(svc as &dyn DatabaseService).await;
 }

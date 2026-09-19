@@ -67,7 +67,14 @@
 // actual precondition: were it ever built for a native target, the same bounds
 // would resolve to real `Send + Sync`, the lint would be accurate again, and
 // this allow must not silence it.
-#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+#![cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::arc_with_non_send_sync,
+        reason = "on this single-threaded target the `Arc` is forced by the \
+                  trait-object bounds, not chosen over an `Rc`"
+    )
+)]
 
 mod boot_hooks;
 pub mod config_service;

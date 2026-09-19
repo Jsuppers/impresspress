@@ -1235,7 +1235,11 @@ pub(crate) async fn sync_payment_intent(
 /// projection and compare-and-swap on the exact (timestamp, status) pair that
 /// was read, so two workers racing with old/new events cannot let the older
 /// or less-terminal projection win after both read the same previous row.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the compare-and-swap needs both the incoming projection and the \
+              exact (timestamp, status) pair the caller read"
+)]
 pub(crate) async fn sync_commerce_subscription(
     ctx: &dyn Context,
     stripe_subscription_id: &str,

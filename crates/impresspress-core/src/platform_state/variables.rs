@@ -763,7 +763,11 @@ async fn set_with_owner(
 /// deciding to write; without this it would then pay a second `list` per key
 /// inside the write — 40-160 extra round trips on a native cold start, for
 /// rows it is holding already.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the already-read row is a parameter so the env seed loop does not \
+              pay a second `list` per key"
+)]
 async fn set_with_row(
     db: &Arc<dyn DatabaseService>,
     key: &str,

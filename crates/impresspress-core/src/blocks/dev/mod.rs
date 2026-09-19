@@ -503,7 +503,7 @@ impl DevShared {
     /// live `Rc<Wafer>` and its factory. The `Arc` this returns is therefore
     /// not `Send`/`Sync` on that target, and on a single-threaded one it does
     /// not need to be; see the crate-level
-    /// `allow(clippy::arc_with_non_send_sync)` in `lib.rs` for why the lint
+    /// `expect(clippy::arc_with_non_send_sync)` in `lib.rs` for why the lint
     /// that says so is off for wasm32 only.
     pub fn new(control: Arc<dyn RuntimeControl>, shell: Arc<dyn ShellSource>) -> Arc<Self> {
         Arc::new(Self {

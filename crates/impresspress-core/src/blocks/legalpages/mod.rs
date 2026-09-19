@@ -678,7 +678,7 @@ crate::impresspress_feature_block! {
             // an admin has not toggled.
             .default_enabled(true)
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         // Auth is enforced centrally by `route_to_block` from the declared
         // endpoint `AuthLevel` (public reads, admin everything else) — the
         // block holds no `is_admin` preamble. Dispatch matches the same

@@ -8,36 +8,16 @@
 //! - [`objects`] — `/b/storage/{bucket}/[{prefix}/]` object/folder browsing.
 //! - [`cloudstorage`] — the `/b/cloudstorage/` share-list + quota page.
 //!
-//! Every item that was previously `pub` at `pages_user::*` is re-exported
-//! here so external callers (`blocks/files/mod.rs`, `pages_admin.rs`) keep
-//! using the same paths unchanged.
+//! Callers reach a page through the domain module that owns it
+//! (`pages_user::buckets::bucket_list_page`, …). There is no flat re-export
+//! layer: it would have to name every item whether or not anything consumes
+//! it, and the names with no consumer would be invisible.
 
-mod buckets;
-mod cloudstorage;
-mod objects;
+pub(crate) mod buckets;
+pub(crate) mod cloudstorage;
+pub(crate) mod objects;
 
-// Only `bucket_list_page`, `object_list_page`, `cloudstorage_page`, and
-// `render_new_bucket_modal` currently cross the `pages_user::` boundary
-// (see `blocks/files/mod.rs` route dispatch + `pages_admin.rs`'s modal
-// reuse). The rest were `pub` before this domain split too, just never
-// consumed outside the (then single) file; re-exporting keeps every
-// pre-split `pages_user::*` path reachable, so `unused_imports` fires on
-// the ones with no current external caller.
-#[allow(unused_imports)]
-pub use buckets::{
-    bucket_list_page, list_buckets_for_user, render_buckets_table, render_new_bucket_modal,
-    BucketRow,
-};
-#[allow(unused_imports)]
-pub use cloudstorage::{
-    cloudstorage_page, render_quota_card, render_shares_table, QuotaInfo, ShareRow,
-};
 use maud::{html, Markup, PreEscaped};
-#[allow(unused_imports)]
-pub use objects::{
-    group_objects_by_prefix, object_list_page, render_breadcrumbs, render_objects_table,
-    FolderListing, ObjectRow,
-};
 
 /// Render the bootstrap JSON in a script tag, escaping `<` through
 /// [`crate::ui::script_json`] so a `</script>` sequence cannot terminate the
