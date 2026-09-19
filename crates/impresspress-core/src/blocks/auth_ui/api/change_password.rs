@@ -89,7 +89,11 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     // `/b/auth/change-password` and programmatic clients send JSON.
     // `parse_body_value` reads either, as `api_keys::handle_create` does for
     // the admin block's key form.
-    let body: ChangePwReq = match serde_json::from_value(parse_body_value(&raw)) {
+    let parsed = match parse_body_value(&raw) {
+        Ok(value) => value,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
+    let body: ChangePwReq = match serde_json::from_value(parsed) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
