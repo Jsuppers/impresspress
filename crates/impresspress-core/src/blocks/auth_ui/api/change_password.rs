@@ -28,11 +28,6 @@ use crate::{
 /// [`MessageResponse`] envelope. Same split as
 /// [`super::api_keys::handle_create`].
 ///
-/// A refusal needs no such branch: it travels as the error envelope, which
-/// the `htmx:responseError` listener in `ui/assets/chrome.js` turns into a
-/// toast carrying its `message` — htmx does not swap a non-2xx response, and
-/// that listener is what keeps a refusal from being silent.
-///
 /// The htmx wording names the consequence, because the caller is about to
 /// meet it: the change revokes every refresh token AND bumps the user's
 /// `auth_version`, which retires the access token the page itself is holding
@@ -48,6 +43,33 @@ fn changed_response(msg: &Message) -> OutputStream {
     ok_json(&MessageResponse {
         message: "Password changed successfully".to_string(),
     })
+}
+
+/// A refusal the caller can act on, in the shape that caller can read.
+///
+/// htmx does not swap a non-2xx response, so an error terminal reaches an
+/// htmx caller only as a toast — `ui/assets/chrome.js`'s `htmx:responseError`
+/// listener — and leaves `#change-pw-result`, the slot the form declares for
+/// exactly this answer, empty. The sibling handler on that same page,
+/// [`crate::blocks::userportal::pages::security::handle_unlink`], already
+/// answers its refusal as 200 markup carrying the reason, so this one does
+/// too: one page, one convention, and the sentence naming a wrong password
+/// stays on screen instead of expiring with a four-second toast.
+///
+/// Only refusals travel this way. A read that could not run or a write that
+/// did not land is not a sentence the caller can act on, and stays an error
+/// terminal so the status is honest and [`err_internal`]'s correlation id
+/// reaches the logs — the same split `handle_unlink` makes.
+///
+/// JSON callers are untouched: `/b/auth/change-password`'s `fetch` reads
+/// `r.ok` and the SDK reads the status, so they keep the refusal codes
+/// [`error_response`] maps (`401` for a wrong current password, `400` for a
+/// password the policy declines).
+fn refused(msg: &Message, code: ErrorCode, reason: &str) -> OutputStream {
+    if is_htmx(msg) {
+        return html_response(html! { p .form-error .m-0 { (reason) } });
+    }
+    error_response(code, reason)
 }
 
 pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
@@ -75,7 +97,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     if let Err((code, reason)) =
         super::password_policy::validate_new_password(ctx, &body.new_password).await
     {
-        return error_response(code, &reason);
+        return refused(msg, code, &reason);
     }
 
     // Verify user exists. The credential lookup four lines below has always
@@ -92,7 +114,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     let cred = match local_credentials::find_by_user_id(ctx, user_id).await {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return error_response(
+            return refused(
+                msg,
                 ErrorCode::InvalidCredentials,
                 "No password set for this account",
             )
@@ -104,7 +127,8 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         .await
         .is_err()
     {
-        return error_response(
+        return refused(
+            msg,
             ErrorCode::InvalidCredentials,
             "Current password is incorrect",
         );
@@ -304,10 +328,15 @@ mod tests {
         );
     }
 
-    /// A wrong current password is the form's most likely mistake, and the
-    /// sentence naming it is what `ui/assets/chrome.js` toasts. While the
-    /// body did not parse, every one of those attempts was reported as a
+    /// A wrong current password is the form's most likely mistake, and until
+    /// the body parsed every one of those attempts was reported as a
     /// malformed request instead.
+    ///
+    /// It comes back as markup, not as an error terminal: htmx does not swap
+    /// a non-2xx, so a refusal answered as one leaves `#change-pw-result`
+    /// empty and says its piece only in a toast that expires. The sibling
+    /// handler on that page (`userportal::pages::security::handle_unlink`)
+    /// already answers a refusal as 200 markup.
     #[tokio::test]
     async fn a_form_post_with_the_wrong_current_password_says_so() {
         let ctx = TestContext::with_auth_and_crypto().await;
@@ -323,9 +352,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(parts.status, 401);
-        let json: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
-        assert_eq!(json["message"], "Current password is incorrect");
+        assert_eq!(
+            parts.status, 200,
+            "a refusal htmx will not swap never reaches the page"
+        );
+        let html = String::from_utf8(parts.body).expect("body was not valid UTF-8");
+        assert!(
+            html.contains("Current password is incorrect") && html.contains("form-error"),
+            "the fragment must name the refusal, got {html:?}"
+        );
 
         // The credential is untouched: the account still signs in with what
         // it had.
@@ -345,7 +380,7 @@ mod tests {
     }
 
     /// Same for a new password the policy refuses: the caller is told which
-    /// rule it broke, not that their request was malformed.
+    /// rule it broke, in the page, not that their request was malformed.
     #[tokio::test]
     async fn a_form_post_the_policy_refuses_names_the_rule() {
         let ctx = TestContext::with_auth_and_crypto().await;
@@ -361,12 +396,49 @@ mod tests {
         )
         .await;
 
-        assert_eq!(parts.status, 400);
-        let json: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
-        let message = json["message"].as_str().unwrap_or_default();
+        assert_eq!(parts.status, 200);
+        let html = String::from_utf8(parts.body).expect("body was not valid UTF-8");
         assert!(
-            message.contains("at least"),
-            "the refusal must name the length rule, got {message:?}"
+            html.contains("at least") && html.contains("form-error"),
+            "the fragment must name the length rule, got {html:?}"
+        );
+    }
+
+    /// The markup branch is the htmx caller's alone. A JSON client — the
+    /// `fetch` on `/b/auth/change-password`, the SDK — reads the status, so
+    /// its refusals keep the codes and the envelope they have always had.
+    #[tokio::test]
+    async fn a_json_caller_still_receives_the_refusal_codes() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let user_id = signup_user(&ctx, "ivan@example.com", "original-horse-battery1").await;
+        let msg = auth_msg("update", "/b/auth/api/change-password", &user_id);
+
+        let wrong = wafer_block::http_codec::collect_http_response(
+            handle(
+                &ctx,
+                &msg,
+                body("not-the-current-password", "new-horse-battery-2026"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(wrong.status, 401);
+        let json: serde_json::Value = serde_json::from_slice(&wrong.body).unwrap_or_default();
+        assert_eq!(json["message"], "Current password is incorrect");
+
+        let refused_by_policy = wafer_block::http_codec::collect_http_response(
+            handle(&ctx, &msg, body("original-horse-battery1", "123456")).await,
+        )
+        .await;
+        assert_eq!(refused_by_policy.status, 400);
+        let json: serde_json::Value =
+            serde_json::from_slice(&refused_by_policy.body).unwrap_or_default();
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("at least"),
+            "a JSON caller keeps the sentence too, got {json}"
         );
     }
 

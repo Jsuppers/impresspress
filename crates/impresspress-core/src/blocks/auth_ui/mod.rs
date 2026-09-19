@@ -157,7 +157,11 @@ fn oauth_start_query_schema() -> serde_json::Value {
 /// four api-key rows, `GET`/`POST /b/auth/api/verify`,
 /// `GET /b/auth/api/oauth/providers` and `POST /b/auth/api/bootstrap`
 /// publish no schema at all; the password-reset and change-password rows
-/// publish a response schema but not their request bodies.
+/// publish a response schema but not their request bodies. The
+/// change-password row's published response covers its JSON branch only —
+/// the same endpoint answers an htmx caller with an HTML fragment
+/// (`api::change_password`), which is a browser affordance rather than part
+/// of the JSON API this document describes.
 const ROUTES: &[EndpointRoute<Route>] = &[
     // ── Admin settings ── declared `Admin` so the central router enforces the
     // tier; the handler re-checks nothing. (The auth-ui prefix route is

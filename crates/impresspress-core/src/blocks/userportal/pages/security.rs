@@ -69,10 +69,18 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let body = html! {
         section .account-section {
             h2 .account-section__title { "Password" }
+            // A refusal comes back as markup for `#change-pw-result`
+            // (`auth_ui::api::change_password::refused`), so the only
+            // responses that reach the `htmx:responseError` listener are the
+            // ones with no sentence of their own — a dead session, an outage.
+            // `data-error-label` is what stops those from being toasted as
+            // "Request failed (401)"; see the label rule in
+            // `ui/assets/chrome.js`.
             form
                 hx-post="/b/auth/api/change-password"
                 hx-target="#change-pw-result"
                 hx-swap="innerHTML"
+                data-error-label="Could not change your password"
             {
                 div .form-group {
                     label .form-label for="current-password" { "Current password" }
@@ -325,6 +333,13 @@ mod tests {
         assert!(html.contains("/b/auth/api/change-password"));
         assert!(html.contains("name=\"current_password\""));
         assert!(html.contains("name=\"new_password\""));
+        // The responses that reach the `htmx:responseError` listener are the
+        // ones carrying no sentence for this form — a dead session, an
+        // outage. Without a label they are toasted as the status alone.
+        assert!(
+            html.contains(r#"data-error-label="Could not change your password""#),
+            "the form must name itself for the error toast"
+        );
     }
 
     /// The form and the endpoint it posts to are one surface, and asserting

@@ -144,6 +144,12 @@ pub struct SignupResponse {
 /// /b/auth/api/logout`, `/change-password`, `/forgot-password`,
 /// `/reset-password` and `/resend-verification`.
 ///
+/// `/change-password` answers it to JSON callers. An htmx caller — the user
+/// portal's Security form — is answered with the markup its `hx-swap`
+/// target expects instead, success and refusal alike (see
+/// [`super::api::change_password`]); this stays the shape of the JSON API and
+/// of the schema the route publishes.
+///
 /// One type because it is one shape. The *text* differs per endpoint and is
 /// deliberately constant per endpoint rather than per outcome — the
 /// password-reset and verification pair answer the same sentence whatever
