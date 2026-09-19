@@ -36,6 +36,8 @@ use wafer_block::wire::llm::{
 use wafer_core::clients::llm;
 use wafer_run::{context::Context, InputStream, Message, WaferError};
 
+use crate::llm_target::{DefaultTarget, ResolvedTarget, TargetGap};
+
 /// Approximate max tokens per chunk. We use whitespace-split as a proxy
 /// for tokenization — close enough for bge-m3 / MiniLM at this
 /// granularity, and avoids pulling a tokenizer crate into the ingest path.
@@ -96,11 +98,20 @@ pub fn chunk(text: &str, chunk_tokens: usize, overlap_ratio: f32) -> Vec<String>
 /// when:
 ///   * no LLM is configured (`IMPRESSPRESS__LLM__DEFAULT_MODEL` empty, or the
 ///     llm block is not registered at all),
+///   * the llm block published a target carrying no usable output-token
+///     budget (see [`default_llm_target`], which logs the three cases apart),
 ///   * the chat call errors (transport failure, backend refusal, …),
 ///   * the LLM returns no text (empty stream).
 ///
 /// The ingest must not fail because the contextual step couldn't run; the
 /// raw chunks are still useful for retrieval.
+///
+/// The summary is asked for under the deployment's whole chat budget
+/// (`IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS`), not a smaller one of its own: a
+/// budget is a ceiling, the prompt asks for one or two sentences, and a
+/// second variable for the same quantity is a knob whose only job is to be
+/// out of step with the first. What the model bills for is the tokens it
+/// actually emits.
 ///
 /// Not gated on the `llm` cargo feature. It used to be, with a no-op twin
 /// under `cfg(not(feature = "llm"))`, so a build without that feature — every
@@ -120,8 +131,10 @@ pub async fn add_context(
     if chunks.is_empty() {
         return Ok(chunks);
     }
+    // `default_llm_target` has already logged which of its three cases this
+    // is; a second line here could only repeat one of them, and the one it
+    // used to repeat was wrong for two.
     let Some(target) = default_llm_target(ctx).await else {
-        tracing::debug!("contextual retrieval skipped: no default LLM model configured");
         return Ok(chunks);
     };
 
@@ -184,27 +197,26 @@ pub async fn add_context(
         .collect())
 }
 
-/// The default LLM target the llm block publishes: which backend and model to
-/// call, and the output-token budget to call them with.
-struct LlmTarget {
-    provider: String,
-    model: String,
-    max_tokens: u32,
-}
-
 /// Fetch the default LLM target via the llm block's internal discovery route.
-/// Returns `None` when no model is configured or when the llm block isn't
-/// registered — both cases trigger the same degradation in `add_context`,
-/// which logs before returning the chunks unchanged.
+///
+/// Returns `None` in three cases, each logged as the thing it actually is:
+/// the llm block is not registered or refused, no provider/model is
+/// configured, or the block answered with a target carrying no usable
+/// output-token budget. All three degrade the same way in [`add_context`] —
+/// raw chunks, no failure — so the log line is the only place the difference
+/// survives, and "no default LLM model configured" was being written for all
+/// of them.
 ///
 /// Going through `ctx.call_block(...)` rather than a direct in-process
 /// function call is what keeps the vector block independent of the llm block
 /// at the type/dep level — and it is why this whole path needs no cargo
 /// feature: the edge is a runtime dispatch, resolved against what is
-/// registered. The budget travels with the target for the same reason: it is
-/// the llm block's configuration variable, so it is read by the llm block.
-async fn default_llm_target(ctx: &dyn Context) -> Option<LlmTarget> {
-    let resource = "/b/llm/api/internal/default-target";
+/// registered. [`DefaultTarget`] is the shape of the answer, shared with the
+/// publisher because it depends on neither block. The budget travels inside
+/// it because it is the llm block's own configuration variable — read there,
+/// under that block's identity.
+async fn default_llm_target(ctx: &dyn Context) -> Option<ResolvedTarget> {
+    let resource = DefaultTarget::RESOURCE;
     let mut msg = Message::new(format!("retrieve:{resource}"));
     msg.set_meta("req.action", "retrieve");
     msg.set_meta("req.resource", resource);
@@ -214,19 +226,44 @@ async fn default_llm_target(ctx: &dyn Context) -> Option<LlmTarget> {
     let out = ctx
         .call_block("impresspress/llm", msg, InputStream::empty())
         .await;
-    let buf = out.collect_buffered().await.ok()?;
-    let body: serde_json::Value = serde_json::from_slice(&buf.body).ok()?;
-    let provider = body.get("provider")?.as_str()?.to_string();
-    let model = body.get("model")?.as_str()?.to_string();
-    let max_tokens = u32::try_from(body.get("max_tokens")?.as_u64()?).ok()?;
-    if provider.is_empty() || model.is_empty() || max_tokens == 0 {
-        return None;
+    let buf = match out.collect_buffered().await {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::debug!(
+                error = ?e,
+                "contextual retrieval skipped: the llm block is not registered or refused"
+            );
+            return None;
+        }
+    };
+    let target: DefaultTarget = match serde_json::from_slice(&buf.body) {
+        Ok(target) => target,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "contextual retrieval skipped: the llm block's default-target body did not decode"
+            );
+            return None;
+        }
+    };
+    match target.resolve() {
+        Ok(resolved) => Some(resolved),
+        Err(TargetGap::NotConfigured) => {
+            tracing::debug!("contextual retrieval skipped: no default LLM model configured");
+            None
+        }
+        Err(TargetGap::MissingBudget) => {
+            // Not an operator's misconfiguration: the route always publishes a
+            // budget. Reported as what it is — the two sides of this contract
+            // disagreeing — rather than as a variable nobody has to set.
+            tracing::warn!(
+                var = "IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS",
+                "contextual retrieval skipped: the llm block published a target with no usable \
+                 max-token budget"
+            );
+            None
+        }
     }
-    Some(LlmTarget {
-        provider,
-        model,
-        max_tokens,
-    })
 }
 
 const CONTEXTUAL_SYSTEM_PROMPT: &str = "\
@@ -323,19 +360,26 @@ mod contextual_retrieval_tests {
         )
     }
 
-    /// Output-token budget the stub target publishes, mirroring the real
-    /// block's `max_tokens` field. A stub that omitted it would make every
-    /// test here take the no-target degradation, so the field is not optional
-    /// on this side either — `a_contextual_ingest_reaches_an_anthropic_provider`
-    /// is what checks the stub still describes the real block.
+    /// Output-token budget the stub target publishes. Any positive number:
+    /// which one reaches the provider is
+    /// `a_contextual_ingest_reaches_an_anthropic_provider`'s question, and it
+    /// asks the real block.
     const STUB_MAX_TOKENS: u32 = 4096;
 
     /// Stub `impresspress/llm` feature block. `default_llm_target` reads one
     /// internal route off it and nothing else; anything else errors loudly so
     /// a test cannot silently exercise an unscripted path.
+    ///
+    /// It answers with [`DefaultTarget`] — the same type the real block
+    /// serializes — rather than a hand-written JSON literal. A test double
+    /// that describes the body in its own words is free to describe it
+    /// differently, and this one did: the field the route grew was missing
+    /// here, and every test in this module would have gone on passing while
+    /// reporting a cause that was not true.
     struct StubDefaultTargetBlock {
-        /// `None` renders a body with empty strings, which is how a runtime
-        /// with the llm block registered but no model configured answers.
+        /// `None` publishes [`DefaultTarget::unconfigured`], which is how a
+        /// runtime with the llm block registered but no model configured
+        /// answers.
         target: Option<(&'static str, &'static str)>,
     }
 
@@ -356,16 +400,14 @@ mod contextual_retrieval_tests {
             msg: Message,
             _input: InputStream,
         ) -> OutputStream {
-            assert_eq!(msg.path(), "/b/llm/api/internal/default-target");
-            let (provider, model) = self.target.unwrap_or(("", ""));
-            OutputStream::respond(
-                serde_json::to_vec(&serde_json::json!({
-                    "provider": provider,
-                    "model": model,
-                    "max_tokens": STUB_MAX_TOKENS,
-                }))
-                .expect("serialize default-target body"),
-            )
+            assert_eq!(msg.path(), DefaultTarget::RESOURCE);
+            let body = match self.target {
+                Some((provider, model)) => {
+                    DefaultTarget::configured(provider, model, STUB_MAX_TOKENS)
+                }
+                None => DefaultTarget::unconfigured(),
+            };
+            OutputStream::respond(serde_json::to_vec(&body).expect("serialize default-target body"))
         }
 
         async fn lifecycle(

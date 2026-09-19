@@ -25,6 +25,7 @@ use crate::{
     },
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
+    llm_target::DefaultTarget,
 };
 
 /// In-block dispatch targets, one per declared HTTP endpoint.
@@ -547,17 +548,15 @@ impl LlmBlock {
 
     // --- Config ---
 
-    /// Inter-block discovery: returns the default `(provider, model,
-    /// max_tokens)` target other blocks should use when they have no
-    /// caller-supplied preference.
+    /// Inter-block discovery: returns the default target other blocks should
+    /// use when they have no caller-supplied preference, as a
+    /// [`DefaultTarget`] — the one type both sides of this route serde, so
+    /// the body cannot be described differently at each end.
     ///
-    /// Wire format:
-    /// * `200 {"provider": "...", "model": "...", "max_tokens": N}` when
-    ///   configured
-    /// * `200 {"provider": null, "model": null, "max_tokens": null}` when no
-    ///   model is configured (callers should take a degraded path — same
-    ///   contract as the previous in-process `default_target()` returning
-    ///   `None`).
+    /// Answers `200` either way: [`DefaultTarget::unconfigured`] when no
+    /// provider or model is set, which callers take a degraded path on (the
+    /// same contract as the previous in-process `default_target()` returning
+    /// `None`).
     ///
     /// `max_tokens` travels with the target rather than being read by the
     /// caller: [`DEFAULT_MAX_TOKENS_VAR`] is this block's own variable, and a
@@ -567,17 +566,13 @@ impl LlmBlock {
         let provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
         let model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
         if model.is_empty() || provider.is_empty() {
-            return ok_json(&serde_json::json!({
-                "provider": serde_json::Value::Null,
-                "model": serde_json::Value::Null,
-                "max_tokens": serde_json::Value::Null,
-            }));
+            return ok_json(&DefaultTarget::unconfigured());
         }
-        ok_json(&serde_json::json!({
-            "provider": provider,
-            "model": model,
-            "max_tokens": default_max_tokens(ctx).await,
-        }))
+        ok_json(&DefaultTarget::configured(
+            &provider,
+            &model,
+            default_max_tokens(ctx).await,
+        ))
     }
 
     async fn handle_get_config(&self, ctx: &dyn Context) -> OutputStream {
@@ -772,7 +767,10 @@ impl Block for LlmBlock {
                  budget of its own may generate. Anthropic-protocol providers \
                  refuse a request without one; OpenAI-protocol providers are \
                  capped by it too, where the field's absence would otherwise \
-                 leave the reply unbounded.",
+                 leave the reply unbounded. The usable ceiling belongs to the \
+                 model, not to this setting: a value above what the configured \
+                 model accepts is refused by the provider (Anthropic answers \
+                 400), so raise it against the model you actually run.",
                 &DEFAULT_MAX_TOKENS.to_string(),
             )
             .name("Default Max Tokens")
@@ -795,7 +793,7 @@ impl Block for LlmBlock {
         // declared HTTP endpoint (declaring it would publish it), so it stays
         // a handler-owned guard ahead of the matcher; this is the one path
         // read in this block outside `endpoint_match::dispatch`.
-        if msg.action() == "retrieve" && msg.path() == "/b/llm/api/internal/default-target" {
+        if msg.action() == "retrieve" && msg.path() == DefaultTarget::RESOURCE {
             if ctx.caller_id().is_none() {
                 return crate::http::err_not_found("not found");
             }

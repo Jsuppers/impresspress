@@ -12,7 +12,7 @@ use futures::StreamExt;
 use wafer_core::clients::{
     llm::{
         self as llm_client, ChatChunk, ChatContent, ChatMessage, ChatParams, ChatRequest, ChatRole,
-        ChunkDelta,
+        ChunkDelta, FinishReason,
     },
     NativeTypedFrameStream,
 };
@@ -266,11 +266,17 @@ pub(in crate::blocks::llm) async fn handle_chat(
     // bytes into the assistant reply. Propagate any error terminal as a 500.
     let mut content = String::new();
     let mut truncated = false;
+    // The model stopped because it hit the output-token budget, not because
+    // it had finished. Both decoders report it (`FinishReason::Length`), and
+    // it is the other way a published reply can be a fragment — invisible
+    // from the text alone, which ends mid-sentence but looks like an answer.
+    let mut budget_exhausted = false;
     while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(c) => c,
             Err(e) => return err_internal("llm service error", e.message),
         };
+        budget_exhausted |= chunk.finish_reason == Some(FinishReason::Length);
         match chunk.delta {
             ChunkDelta::Text(s) => {
                 if truncated || content.len() + s.len() > MAX_BUFFERED_RESPONSE_BYTES {
@@ -299,6 +305,16 @@ pub(in crate::blocks::llm) async fn handle_chat(
             "llm buffered response exceeded cap — truncated"
         );
     }
+    if budget_exhausted {
+        tracing::warn!(
+            "llm reply stopped at the output-token budget \
+             (IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS or the request's own max_tokens)"
+        );
+    }
+    // One flag for "what you are reading is not the whole answer", whichever
+    // ceiling ended it: the 1 MiB buffering cap here, or the model's own
+    // token budget upstream.
+    let truncated = truncated || budget_exhausted;
 
     // Persist the assistant reply. The model has already answered and has
     // already been paid for, but no status line has been written yet, so this
@@ -823,6 +839,63 @@ mod tests {
             "a delta after the cap must not be spliced onto the prefix"
         );
         assert_eq!(body["truncated"], true, "and the reply says it is partial");
+    }
+
+    /// A reply the model cut at the budget says so.
+    ///
+    /// The budget this PR introduces is a ceiling every chat now carries, so
+    /// hitting it is an ordinary outcome — and `handle_chat` read only
+    /// `chunk.delta`, dropping the `finish_reason` beside it. The answer came
+    /// back `truncated: false`: a fragment ending mid-sentence, published as
+    /// a complete reply, with nothing anywhere to say otherwise. Both
+    /// decoders already produce `FinishReason::Length` from the provider's
+    /// own terminal field.
+    #[tokio::test]
+    async fn a_reply_stopped_by_the_token_budget_is_reported_as_truncated() {
+        use wafer_core::clients::llm::FinishReason;
+
+        let (ctx, thread_id, _chat_calls) = chat_fixture_answering(vec![
+            ChatChunk::text("The three causes are, first"),
+            ChatChunk::finish(FinishReason::Length, None),
+        ])
+        .await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], "The three causes are, first");
+        assert_eq!(
+            body["truncated"], true,
+            "a reply cut at the budget is not a complete answer"
+        );
+    }
+
+    /// The flag stays off for a reply the model finished on its own, so
+    /// `truncated` keeps meaning something.
+    #[tokio::test]
+    async fn a_reply_the_model_finished_is_not_reported_as_truncated() {
+        let (ctx, thread_id, _chat_calls) = chat_fixture().await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["truncated"], false);
     }
 
     /// A user turn the store refused must not be followed by a model call.

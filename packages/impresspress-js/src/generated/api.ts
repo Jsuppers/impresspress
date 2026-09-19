@@ -2872,6 +2872,16 @@ export interface paths {
                          *     deployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every
                          *     request reaches the provider with a budget, because
                          *     Anthropic-protocol providers refuse one that carries none.
+                         *
+                         *     Must be at least 1: zero asks for no answer at all and is answered
+                         *     `400` here rather than by the provider. There is no upper bound on
+                         *     this side, deliberately — the real ceiling is the model's, it differs
+                         *     per model and per provider, and the provider is the only party that
+                         *     knows it. A value the model will not accept comes back as that
+                         *     provider's own error rather than one invented here. (The configured
+                         *     default is treated differently: a value that is not a positive integer
+                         *     falls back with a warning, because an operator's typo must not break
+                         *     every chat on the deployment at once.)
                          */
                         max_tokens?: number | null;
                         /** @description The user's message. */
@@ -2917,10 +2927,17 @@ export interface paths {
                              */
                             model: string;
                             /**
-                             * @description `true` when the reply exceeded the 1 MiB buffering cap. `content` is
-                             *     then a prefix of the reply — it ends at the last delta that fitted and
-                             *     nothing after it is appended, so the text is never spliced across a
-                             *     gap.
+                             * @description `true` when `content` is a prefix of the answer rather than the whole
+                             *     of it. Two ceilings can do that, and the flag does not distinguish
+                             *     them because a caller's response to either is the same — ask again,
+                             *     or ask for less:
+                             *
+                             *     * the model stopped at its output-token budget (the request's own
+                             *       `max_tokens`, or `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS`), which it
+                             *       reports as a `length` finish reason;
+                             *     * the reply exceeded the 1 MiB buffering cap of this endpoint, in
+                             *       which case the text ends at the last delta that fitted and nothing
+                             *       after it is appended, so it is never spliced across a gap.
                              */
                             truncated: boolean;
                         };
@@ -2960,6 +2977,16 @@ export interface paths {
                          *     deployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every
                          *     request reaches the provider with a budget, because
                          *     Anthropic-protocol providers refuse one that carries none.
+                         *
+                         *     Must be at least 1: zero asks for no answer at all and is answered
+                         *     `400` here rather than by the provider. There is no upper bound on
+                         *     this side, deliberately — the real ceiling is the model's, it differs
+                         *     per model and per provider, and the provider is the only party that
+                         *     knows it. A value the model will not accept comes back as that
+                         *     provider's own error rather than one invented here. (The configured
+                         *     default is treated differently: a value that is not a positive integer
+                         *     falls back with a warning, because an operator's typo must not break
+                         *     every chat on the deployment at once.)
                          */
                         max_tokens?: number | null;
                         /** @description The user's message. */
