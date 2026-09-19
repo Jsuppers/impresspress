@@ -6286,15 +6286,39 @@ async fn seed_platform_subscription(
     .await;
 }
 
+/// Which Stripe object the platform stamped the add-on metadata on.
+///
+/// Stripe always serialises a subscription item's own `metadata`, as `{}` when
+/// it is unset, so a price-stamped add-on arrives with an empty object at item
+/// level beside the populated one on the price. A fixture that omits item
+/// `metadata` altogether is not a shape Stripe sends, and it hides a reader
+/// that tests the item object for presence rather than for the marker.
+#[derive(Clone, Copy)]
+enum AddonStamp {
+    Item,
+    Price,
+}
+
 /// A `customer.subscription.updated` event whose single add-on item reports
-/// `extra_r2_bytes` per unit at `quantity`.
+/// `extra_r2_bytes` per unit at `quantity`, stamped on the object `stamp`
+/// names and with the other object carrying the empty metadata Stripe sends.
 fn subscription_updated_with_addon(
     event_id: &str,
     stripe_subscription_id: &str,
     status: &str,
     extra_r2_bytes: &str,
     quantity: i64,
+    stamp: AddonStamp,
 ) -> serde_json::Value {
+    let addon_metadata = serde_json::json!({
+        "addon_id": "storage_pack",
+        "extra_r2_bytes": extra_r2_bytes
+    });
+    let empty = serde_json::json!({});
+    let (item_metadata, price_metadata) = match stamp {
+        AddonStamp::Item => (&addon_metadata, &empty),
+        AddonStamp::Price => (&empty, &addon_metadata),
+    };
     serde_json::json!({
         "id": event_id,
         "type": "customer.subscription.updated",
@@ -6305,13 +6329,124 @@ fn subscription_updated_with_addon(
             "status": status,
             "items": {"data": [{
                 "quantity": quantity,
-                "price": {"metadata": {
-                    "addon_id": "storage_pack",
-                    "extra_r2_bytes": extra_r2_bytes
-                }}
+                "metadata": item_metadata,
+                "price": {"id": "price_storage_pack", "metadata": price_metadata}
             }]}
         }}
     })
+}
+
+/// Both stamping conventions are read.
+///
+/// The platform may carry the add-on metadata on the subscription item or on
+/// the price the item points at, and this block cannot see which it chose —
+/// nothing here creates those items any more (see `ADDON_ITEM_MARKER`). The
+/// reader looked at `item.metadata` and fell back to the price only when that
+/// key was absent, which on a real payload it never is: a price-stamped add-on
+/// read as `{}`, counted as nothing, and wrote zero quota to a paying
+/// subscriber. Testing the marker rather than the object's presence is what
+/// makes the fallback reachable.
+#[tokio::test]
+async fn addon_totals_are_read_from_whichever_object_carries_the_marker() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+
+    for (index, stamp) in [AddonStamp::Item, AddonStamp::Price]
+        .into_iter()
+        .enumerate()
+    {
+        let subscription_id = format!("sub_addon_stamp_{index}");
+        seed_platform_subscription(
+            &ctx,
+            &subscription_id,
+            &format!("owner_stamp_{index}"),
+            "active",
+        )
+        .await;
+
+        let event = subscription_updated_with_addon(
+            &format!("evt_addon_stamp_{index}"),
+            &subscription_id,
+            "active",
+            "1024",
+            3,
+            stamp,
+        );
+        let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+        assert_eq!(
+            output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+            true
+        );
+
+        let subscription = db::get(
+            &ctx,
+            repo::subscriptions::SUBSCRIPTIONS_TABLE,
+            &subscription_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            subscription.data["addon_r2_bytes"],
+            3072,
+            "the add-on is stamped on the {} and must still be counted",
+            match stamp {
+                AddonStamp::Item => "item",
+                AddonStamp::Price => "price",
+            }
+        );
+    }
+}
+
+/// An item marked on neither object is the base plan and contributes nothing —
+/// the marker test must not turn "no add-on here" into "read the price
+/// anyway".
+#[tokio::test]
+async fn a_base_plan_item_contributes_no_addon_total() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_addon_base", "owner_base", "active").await;
+
+    let event = serde_json::json!({
+        "id": "evt_addon_base",
+        "type": "customer.subscription.updated",
+        "created": 200,
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_addon_base",
+            "status": "active",
+            "items": {"data": [{
+                "quantity": 1,
+                "metadata": {},
+                "price": {"id": "price_pro", "lookup_key": "pro", "metadata": {
+                    // No marker: a plan price may carry metadata of its own.
+                    "extra_r2_bytes": "999999"
+                }}
+            }]}
+        }}
+    });
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_addon_base",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subscription.data["addon_r2_bytes"], 0,
+        "an unmarked item must contribute nothing, so the totals write zeroes"
+    );
 }
 
 /// The add-on totals are summed from payload numbers, so an amount or a
@@ -6332,6 +6467,7 @@ async fn an_addon_total_that_would_wrap_fails_the_delivery_instead_of_being_writ
         "active",
         &i64::MAX.to_string(),
         2,
+        AddonStamp::Item,
     );
     let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
     assert!(
@@ -6382,8 +6518,14 @@ async fn an_addon_total_write_that_fails_does_not_report_success() {
     .await;
     seed_platform_subscription(&ctx, "sub_addon_write", "owner_write", "active").await;
 
-    let event =
-        subscription_updated_with_addon("evt_addon_write", "sub_addon_write", "active", "1024", 3);
+    let event = subscription_updated_with_addon(
+        "evt_addon_write",
+        "sub_addon_write",
+        "active",
+        "1024",
+        3,
+        AddonStamp::Item,
+    );
 
     // The status/plan write lands first on the same table; only the add-on
     // total write after it is failed.
@@ -6476,6 +6618,7 @@ async fn addon_totals_reach_every_live_subscription_state_and_no_terminal_one() 
             reported,
             "1024",
             3,
+            AddonStamp::Item,
         );
         let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
         assert_eq!(
@@ -6527,8 +6670,14 @@ async fn a_stale_redelivery_does_not_overwrite_newer_addon_totals() {
     .await
     .expect("advance the row past the stale event");
 
-    let event =
-        subscription_updated_with_addon("evt_addon_stale", "sub_addon_stale", "active", "1024", 3);
+    let event = subscription_updated_with_addon(
+        "evt_addon_stale",
+        "sub_addon_stale",
+        "active",
+        "1024",
+        3,
+        AddonStamp::Item,
+    );
     let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
     assert_eq!(
         output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
@@ -6581,6 +6730,7 @@ async fn a_negative_addon_amount_or_quantity_fails_the_delivery() {
             "active",
             amount,
             quantity,
+            AddonStamp::Item,
         );
         let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
         assert!(

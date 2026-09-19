@@ -15,10 +15,13 @@ use crate::{
 pub(crate) const SUBSCRIPTIONS_TABLE: &str = "impresspress__products__subscriptions";
 
 /// The metadata key marking a Stripe subscription item as an add-on. An item
-/// without it is the base plan, and none of [`ADDON_TOTALS`] is read from it.
+/// carrying it on neither its own metadata nor its price's is the base plan,
+/// and none of [`ADDON_TOTALS`] is read from it.
 ///
 /// It sits beside the value keys because the two halves are one contract: this
 /// decides whether an item counts at all, and those say what it contributes.
+/// It is also what picks the object to read the values from, so the reader in
+/// `stripe.rs` tests for it on each in turn.
 pub(crate) const ADDON_ITEM_MARKER: &str = "addon_id";
 
 /// Each add-on total: the Stripe metadata key that carries it, and the column
@@ -26,12 +29,18 @@ pub(crate) const ADDON_ITEM_MARKER: &str = "addon_id";
 ///
 /// The metadata keys are names the platform stamps on its own Stripe objects,
 /// not operator settings — they arrive inside every
-/// `customer.subscription.updated` payload, on the subscription item where the
-/// platform set them per-subscription and on its price otherwise (the reader in
-/// `stripe.rs` prefers the item and falls back to the price). Renaming one
-/// means rewriting those objects in Stripe, which no configuration value can
-/// do. Keeping the pair in one table is what makes that reader and the writer
-/// below agree on order.
+/// `customer.subscription.updated` payload, on the subscription item or on its
+/// price, whichever the platform stamped. Renaming one means rewriting those
+/// objects in Stripe, which no configuration value can do. Keeping the pair in
+/// one table is what makes the reader and the writer below agree on order.
+///
+/// Which object the platform stamps is not decidable here: nothing in this
+/// repository creates add-on subscription items any more. The one thing that
+/// did — `products/addons.rs`, deleted in `1f6489d8` because it depended on a
+/// plan table — posted `metadata[addon_id]` to `/v1/subscription_items`, so
+/// item-level is the convention this reader was written against, and the
+/// per-price form is the other shape it has always claimed to accept. Both are
+/// read, because the block cannot see which one the platform chose.
 pub(crate) const ADDON_TOTALS: [(&str, &str); 4] = [
     ("extra_projects", "addon_projects"),
     ("extra_requests", "addon_requests"),

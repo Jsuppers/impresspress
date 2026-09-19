@@ -4223,12 +4223,17 @@ async fn user_owns_product(
 /// to the subscriber's row.
 ///
 /// The per-unit amounts are read from the metadata the platform stamps on its
-/// add-on objects — on the subscription item where it set them per
-/// subscription, on the item's price otherwise.
-/// [`repo::subscriptions::ADDON_ITEM_MARKER`] is what makes an item an add-on
-/// at all, and [`repo::subscriptions::ADDON_TOTALS`] owns the metadata key for
-/// each total and the column it feeds. The block never needs a list of the
-/// add-on packs that exist — only the totals Stripe reports.
+/// add-on objects. [`repo::subscriptions::ADDON_ITEM_MARKER`] is what makes an
+/// item an add-on at all, and [`repo::subscriptions::ADDON_TOTALS`] owns the
+/// metadata key for each total and the column it feeds. The block never needs a
+/// list of the add-on packs that exist — only the totals Stripe reports.
+///
+/// The marker decides which object to read, not just whether to read one:
+/// Stripe always serialises a subscription item's own `metadata`, as `{}` when
+/// it is unset, so testing the item object for presence rather than for the
+/// marker meant the price was never consulted and a price-stamped add-on
+/// counted as zero. Whichever object carries the marker supplies the amounts
+/// too — the objects are not merged.
 ///
 /// The totals are quotas, so a quantity or an amount that is negative, or a
 /// product or sum too large to represent, is refused rather than written: each
@@ -4251,18 +4256,18 @@ async fn sync_addon_totals_from_items(
 
     if let Some(data) = items.get("data").and_then(|v| v.as_array()) {
         for item in data {
+            let marked = |meta: &serde_json::Value| {
+                meta.get(repo::subscriptions::ADDON_ITEM_MARKER).is_some()
+            };
             let meta = item
                 .get("metadata")
-                .or_else(|| item.pointer("/price/metadata"));
+                .filter(|meta| marked(meta))
+                .or_else(|| item.pointer("/price/metadata").filter(|meta| marked(meta)));
+            // The base plan item carries the marker on neither object and
+            // contributes nothing to the totals.
             let Some(meta) = meta else {
                 continue;
             };
-
-            // The base plan item carries no add-on marker and contributes
-            // nothing to the totals.
-            if meta.get(repo::subscriptions::ADDON_ITEM_MARKER).is_none() {
-                continue;
-            }
 
             let qty = item.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
             if qty < 0 {
