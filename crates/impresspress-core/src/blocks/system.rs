@@ -69,7 +69,7 @@ crate::impresspress_feature_block! {
             .description("Core system services including health checks and embedded static assets (CSS, JavaScript).")
             .endpoints(endpoint_match::declare(ROUTES))
     },
-    handle: |_this, _ctx, msg, _input| {
+    handle: |_this, _ctx, mut msg, _input| {
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
             return err_not_found("not found");
         };

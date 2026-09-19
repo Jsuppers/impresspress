@@ -214,7 +214,7 @@ crate::impresspress_feature_block! {
         .can_disable(true)
         .default_enabled(true)
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         // Public and unauthenticated by necessity — the game has no account
         // — so the bucket is the remote address rather than a user, and it
         // is checked before dispatch so a flood cannot reach the store at

@@ -591,7 +591,7 @@ crate::impresspress_feature_block! {
             .admin_url("/b/storage/admin/")
             .can_disable(true)
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         // Auth is enforced centrally by `route_to_block` from each row's
         // declared `AuthLevel`; the matcher binds the path variables the
         // handlers read through `msg.var(..)`.

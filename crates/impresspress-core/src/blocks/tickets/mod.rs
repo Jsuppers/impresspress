@@ -321,7 +321,7 @@ crate::impresspress_feature_block! {
         .can_disable(true)
         .default_enabled(false)
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         if msg.kind == "tickets.maintenance" {
             return ok_json(&maintenance::prune(ctx).await);
         }

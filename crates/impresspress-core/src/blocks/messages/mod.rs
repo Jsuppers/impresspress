@@ -264,7 +264,7 @@ crate::impresspress_feature_block! {
         .can_disable(true)
         .default_enabled(true)
     },
-    handle: |_this, ctx, msg, input| {
+    handle: |_this, ctx, mut msg, input| {
         // Auth is enforced centrally by `route_to_block` from the declared
         // endpoint `AuthLevel` (UI pages → Admin, API → Authenticated), so no
         // per-handler `user_id`/`is_admin` preamble is needed here. Dispatch

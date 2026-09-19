@@ -604,7 +604,7 @@ crate::impresspress_feature_block! {
             .description("Administration panel for managing users, roles, variables, blocks, and logs. Provides SSR dashboard with stats, user management with role assignment, IAM (roles and API keys), environment variables editor, block management with feature toggles, and system/audit log viewer.")
             .endpoints(endpoint_match::declare(ROUTES))
     },
-    handle: |this, ctx, msg, input| {
+    handle: |this, ctx, mut msg, input| {
         // Auth is enforced centrally by `route_to_block` from the `Admin`
         // prefix tier and each row's declared level (both `Admin`). The
         // matcher binds `{id}`, `{key}` and `{name}` into `req.param.*` for
