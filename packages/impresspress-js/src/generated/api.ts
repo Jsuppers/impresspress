@@ -3419,6 +3419,11 @@ export interface paths {
                                  */
                                 key_var: string | null;
                                 /**
+                                 * @description Which field carries the output-token budget in this provider's chat
+                                 *     bodies, or `null` to send the one its `protocol` implies.
+                                 */
+                                max_tokens_field: ("max_tokens" | "max_completion_tokens") | null;
+                                /**
                                  * @description Explicit model list. Empty means the models are discovered from the
                                  *     provider's `/v1/models`.
                                  */
@@ -3471,6 +3476,13 @@ export interface paths {
                          */
                         key_var?: string | null;
                         /**
+                         * @description Which field carries the output-token budget in this provider's chat
+                         *     bodies. Omit to send the one `protocol` implies, which is what all but
+                         *     a handful of endpoints want. Refused on the `anthropic` protocol,
+                         *     whose wire format has only one such field.
+                         */
+                        max_tokens_field?: ("max_tokens" | "max_completion_tokens") | null;
+                        /**
                          * @description Explicit model list. Omitted or empty means the models are discovered
                          *     from the provider's `/v1/models`.
                          */
@@ -3511,6 +3523,11 @@ export interface paths {
                              *     itself is never published.
                              */
                             key_var: string | null;
+                            /**
+                             * @description Which field carries the output-token budget in this provider's chat
+                             *     bodies, or `null` to send the one its `protocol` implies.
+                             */
+                            max_tokens_field: ("max_tokens" | "max_completion_tokens") | null;
                             /**
                              * @description Explicit model list. Empty means the models are discovered from the
                              *     provider's `/v1/models`.
@@ -3595,6 +3612,11 @@ export interface paths {
                         /** @description Re-validated on every change: must resolve to a public address. */
                         endpoint?: string | null;
                         key_var?: string | null;
+                        /**
+                         * @description Which field carries the output-token budget, or `null` to go back to
+                         *     the one `protocol` implies.
+                         */
+                        max_tokens_field?: ("max_tokens" | "max_completion_tokens") | null;
                         models?: string[] | null;
                         name?: string | null;
                         /**
@@ -3631,6 +3653,11 @@ export interface paths {
                              *     itself is never published.
                              */
                             key_var: string | null;
+                            /**
+                             * @description Which field carries the output-token budget in this provider's chat
+                             *     bodies, or `null` to send the one its `protocol` implies.
+                             */
+                            max_tokens_field: ("max_tokens" | "max_completion_tokens") | null;
                             /**
                              * @description Explicit model list. Empty means the models are discovered from the
                              *     provider's `/v1/models`.

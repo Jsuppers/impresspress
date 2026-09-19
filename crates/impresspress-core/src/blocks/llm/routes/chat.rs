@@ -727,6 +727,9 @@ mod tests {
     /// chat with `unsupported_parameter` if the deprecated spelling goes out.
     /// The encoder tests pin the body; this pins that a real chat request
     /// travelling through the real provider service arrives that way.
+    ///
+    /// The fixture's provider declares no `max_tokens_field`, so this is also
+    /// what "no override" means: the protocol decides.
     #[cfg(feature = "llm")]
     #[tokio::test]
     async fn a_chat_to_an_openai_provider_sends_max_completion_tokens() {
@@ -764,7 +767,7 @@ mod tests {
     /// The inverse for an OpenAI-*compatible* server: `max_tokens` is the
     /// spelling Ollama, vLLM and the hosted gateways know, and a budget that
     /// landed in a field they ignore would be an uncapped reply with no sign
-    /// anything was wrong.
+    /// anything was wrong. No `max_tokens_field` is declared here either.
     #[cfg(feature = "llm")]
     #[tokio::test]
     async fn a_chat_to_an_openai_compatible_provider_sends_max_tokens() {
@@ -795,6 +798,92 @@ mod tests {
         assert!(
             requests[0].get("max_completion_tokens").is_none(),
             "a compatible server gets the only spelling it knows, got: {}",
+            requests[0]
+        );
+    }
+
+    /// The protocol is the default, not the whole answer: a provider that
+    /// declares `max_tokens_field` sends that spelling instead.
+    ///
+    /// Azure OpenAI is configured on `open_ai_compatible` — it is not OpenAI's
+    /// own `/v1` surface — and its *reasoning* deployments accept only
+    /// `max_completion_tokens`. Without a per-provider override that operator
+    /// had no way to reach one: the protocol's spelling is the one thing the
+    /// admin form did not let them change, and every chat turn came back 400.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_compatible_provider_declaring_max_completion_tokens_sends_that() {
+        use crate::{
+            blocks::llm::providers::fake_provider::FakeProvider, llm_wire::openai::MaxTokensField,
+        };
+
+        let fake = FakeProvider::openai_compatible(FIXTURE_REPLY)
+            .await
+            .requiring_max_tokens_field(MaxTokensField::MaxCompletionTokens);
+        let (ctx, thread_id) = fixture_for(&fake).await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], FIXTURE_REPLY);
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(
+            requests[0]["max_completion_tokens"], FIXTURE_MAX_TOKENS,
+            "the declared field must carry the budget, got: {}",
+            requests[0]
+        );
+        assert!(
+            requests[0].get("max_tokens").is_none(),
+            "never both spellings — the override replaces, it does not add: {}",
+            requests[0]
+        );
+    }
+
+    /// And the override runs the other way too, so it is a property of the
+    /// provider rather than a second name for "reasoning model": a provider on
+    /// OpenAI's *own* protocol that declares `max_tokens` sends `max_tokens`.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn an_openai_provider_declaring_max_tokens_sends_that() {
+        use crate::{
+            blocks::llm::providers::fake_provider::FakeProvider, llm_wire::openai::MaxTokensField,
+        };
+
+        let fake = FakeProvider::openai(FIXTURE_REPLY)
+            .await
+            .requiring_max_tokens_field(MaxTokensField::MaxTokens);
+        let (ctx, thread_id) = fixture_for(&fake).await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], FIXTURE_REPLY);
+        let requests = fake.requests();
+        assert_eq!(requests[0]["max_tokens"], FIXTURE_MAX_TOKENS);
+        assert!(
+            requests[0].get("max_completion_tokens").is_none(),
+            "the override replaces the protocol's spelling, got: {}",
             requests[0]
         );
     }

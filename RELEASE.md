@@ -541,6 +541,32 @@ That second step is new in this release — before it, nothing anywhere in the
 product could remove a provider link. The page refuses to remove an account's
 last way in, so set a password (step 1) before unlinking the only link.
 
+### LLM: a provider can name its token-budget field (migration 002)
+
+**What changes.** Which field carries the output-token budget in a chat request
+used to follow the provider's protocol and nothing else: `open_ai` sent
+`max_completion_tokens`, `open_ai_compatible` sent `max_tokens`. That is right
+for every endpoint but one. Azure OpenAI is configured as
+`open_ai_compatible`, and its *reasoning* deployments accept only
+`max_completion_tokens` — so that operator had no reachable configuration and
+every chat turn came back `400`. Providers now carry an optional
+**Token budget field**, on the form and on
+`POST`/`PATCH /b/llm/api/providers`, which overrides the protocol's spelling.
+
+**Nothing changes for existing providers.** The column is nullable and empty
+means "follow the protocol", which is what every configured provider was
+already doing. There is no backfill.
+
+**Upgrade with `--run-migrations`** to add the column. Cloudflare deploys run
+the block's migrations through `/_deploy/init` on every deploy, so a Cloudflare
+deployment gets it without doing anything. A native deployment that skips the
+flag logs the generic `schema drift; redeploy with --run-migrations to apply`
+warning for the llm block on each boot; providers keep working, because a
+native deployment leaves `WAFER_RUN__DATABASE__STRICT_SCHEMA` off and the
+column is then added on the first provider write. If you have turned strict
+schema **on**, the migration is not optional — a provider create or edit will
+fail on the missing column until it runs.
+
 ## The release workflow has never produced a release
 
 Read this before you tag anything. No `v*` tag has ever existed in this

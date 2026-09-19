@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use wafer_core::clients::database::Record;
 
 use super::providers::config::{ProviderConfig, ProviderProtocol};
+use crate::llm_wire::openai::MaxTokensField;
 
 pub const TABLE: &str = "impresspress__llm__providers";
 
@@ -41,6 +42,7 @@ pub fn config_into_row(cfg: ProviderConfig) -> HashMap<String, serde_json::Value
         endpoint,
         api_key: _,
         key_var,
+        max_tokens_field,
         models,
         enabled,
     } = cfg;
@@ -52,9 +54,22 @@ pub fn config_into_row(cfg: ProviderConfig) -> HashMap<String, serde_json::Value
         serde_json::Value::String(protocol.as_str().to_string()),
     );
     row.insert("endpoint".to_string(), serde_json::Value::String(endpoint));
-    if let Some(var) = key_var {
-        row.insert("key_var".to_string(), serde_json::Value::String(var));
-    }
+    // Both nullable columns are written on every encode, `None` as SQL NULL.
+    // `db::update` builds its SET list from the keys present in this map, so a
+    // key omitted here leaves the stored value untouched — which is how an
+    // admin who cleared `key_var` through `PATCH /b/llm/api/providers/{id}`
+    // got a 200 and a response body saying `null` over a row that still held
+    // the variable name.
+    row.insert(
+        "key_var".to_string(),
+        key_var.map_or(serde_json::Value::Null, serde_json::Value::String),
+    );
+    row.insert(
+        "max_tokens_field".to_string(),
+        max_tokens_field.map_or(serde_json::Value::Null, |f| {
+            serde_json::Value::String(f.as_str().to_string())
+        }),
+    );
     row.insert(
         "models".to_string(),
         serde_json::Value::Array(models.into_iter().map(serde_json::Value::String).collect()),
@@ -101,6 +116,23 @@ pub fn row_to_config(record: &Record) -> Result<ProviderConfig, String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
+    // An unreadable token is rejected rather than degraded to "follow the
+    // protocol": the whole point of the column is that the operator chose a
+    // spelling their server requires, and quietly sending the other one is the
+    // 400-on-every-chat this setting exists to prevent.
+    let max_tokens_field = match record
+        .data
+        .get("max_tokens_field")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(raw) => Some(
+            MaxTokensField::parse(raw)
+                .ok_or_else(|| format!("invalid `max_tokens_field`: {raw}"))?,
+        ),
+    };
+
     let models = parse_models_field(record.data.get("models"));
     let enabled = parse_enabled_field(record.data.get("enabled"));
 
@@ -110,6 +142,7 @@ pub fn row_to_config(record: &Record) -> Result<ProviderConfig, String> {
         endpoint,
         api_key: None,
         key_var,
+        max_tokens_field,
         models,
         enabled,
     })
@@ -180,7 +213,13 @@ mod tests {
             Some("https://api.openai.com/v1")
         );
         assert!(!row.contains_key("api_key_encrypted"));
-        assert!(!row.contains_key("key_var"));
+        assert_eq!(
+            row.get("key_var"),
+            Some(&serde_json::Value::Null),
+            "written as NULL, not omitted — `db::update` only sets the columns \
+             this map names"
+        );
+        assert_eq!(row.get("max_tokens_field"), Some(&serde_json::Value::Null));
         assert_eq!(row.get("models"), Some(&serde_json::json!([])));
         assert_eq!(row.get("enabled").and_then(|v| v.as_i64()), Some(1));
     }
@@ -244,6 +283,69 @@ mod tests {
             decoded.api_key.is_none(),
             "api_key must be None after roundtrip — resolve via key_var at call time"
         );
+    }
+
+    #[test]
+    fn max_tokens_field_survives_the_row_roundtrip() {
+        let cfg = ProviderConfig::new(
+            "azure-reasoning",
+            ProviderProtocol::OpenAiCompatible,
+            "https://example.openai.azure.com/openai/v1",
+        )
+        .with_max_tokens_field(crate::llm_wire::openai::MaxTokensField::MaxCompletionTokens);
+        let row = config_to_row(&cfg);
+        assert_eq!(
+            row.get("max_tokens_field").and_then(|v| v.as_str()),
+            Some("max_completion_tokens"),
+            "the column holds the wire field name itself"
+        );
+        let decoded = row_to_config(&Record {
+            id: "r1".into(),
+            data: row,
+        })
+        .expect("decode");
+        assert_eq!(decoded.max_tokens_field, cfg.max_tokens_field);
+    }
+
+    /// A row written before the column existed reads as "follow the
+    /// protocol", which is what those providers were already doing.
+    #[test]
+    fn a_row_without_the_column_has_no_override() {
+        let record = Record {
+            id: "r1".into(),
+            data: {
+                let mut d = HashMap::new();
+                d.insert("name".into(), serde_json::json!("x"));
+                d.insert("protocol".into(), serde_json::json!("open_ai_compatible"));
+                d.insert("endpoint".into(), serde_json::json!("https://x"));
+                d
+            },
+        };
+        assert!(row_to_config(&record)
+            .expect("decode")
+            .max_tokens_field
+            .is_none());
+    }
+
+    /// An unreadable token is an error, not a silent fall back to the
+    /// protocol's spelling: the stored value exists because a server refuses
+    /// that spelling, so guessing it back is the 400-per-chat the column
+    /// exists to prevent.
+    #[test]
+    fn row_to_config_rejects_an_unknown_max_tokens_field() {
+        let record = Record {
+            id: "r1".into(),
+            data: {
+                let mut d = HashMap::new();
+                d.insert("name".into(), serde_json::json!("x"));
+                d.insert("protocol".into(), serde_json::json!("open_ai"));
+                d.insert("endpoint".into(), serde_json::json!("https://x"));
+                d.insert("max_tokens_field".into(), serde_json::json!("maxTokens"));
+                d
+            },
+        };
+        let err = row_to_config(&record).expect_err("must reject an unknown token");
+        assert!(err.contains("invalid `max_tokens_field`"), "got: {err}");
     }
 
     #[test]

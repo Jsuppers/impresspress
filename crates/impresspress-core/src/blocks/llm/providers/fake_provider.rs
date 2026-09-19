@@ -26,7 +26,7 @@ use super::{
     config::{ProviderConfig, ProviderProtocol},
     ProviderLlmService,
 };
-use crate::blocks::llm::provider_admin::ProviderAdmin;
+use crate::{blocks::llm::provider_admin::ProviderAdmin, llm_wire::openai::MaxTokensField};
 
 /// A one-provider deployment: an HTTP server on loopback that answers every
 /// chat request with a scripted reply in its protocol's streaming format, and
@@ -34,6 +34,7 @@ use crate::blocks::llm::provider_admin::ProviderAdmin;
 pub(crate) struct FakeProvider {
     endpoint: String,
     protocol: ProviderProtocol,
+    max_tokens_field: Option<MaxTokensField>,
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
@@ -53,6 +54,16 @@ impl FakeProvider {
     /// streaming format, but `max_tokens` is the budget field it knows.
     pub(crate) async fn openai_compatible(text: &'static str) -> Self {
         Self::start(ProviderProtocol::OpenAiCompatible, text).await
+    }
+
+    /// Configure this provider with an explicit `max_tokens_field`, the way an
+    /// operator declares one on the admin form for a server whose budget
+    /// spelling departs from its protocol's — an Azure OpenAI reasoning
+    /// deployment, which is configured as `open_ai_compatible` but accepts
+    /// only `max_completion_tokens`.
+    pub(crate) fn requiring_max_tokens_field(mut self, field: MaxTokensField) -> Self {
+        self.max_tokens_field = Some(field);
+        self
     }
 
     /// Bind a loopback port and serve `text` until the test ends.
@@ -110,6 +121,7 @@ impl FakeProvider {
         Self {
             endpoint: format!("http://localhost:{port}"),
             protocol,
+            max_tokens_field: None,
             requests,
         }
     }
@@ -151,13 +163,11 @@ impl FakeProvider {
     /// enabled provider pointed at this fake.
     pub(crate) fn llm_service_block(&self) -> Arc<dyn Block> {
         let svc = ProviderLlmService::try_new().expect("build the provider service");
-        svc.configure(vec![ProviderConfig::new(
-            self.backend_id(),
-            self.protocol,
-            &self.endpoint,
-        )
-        .with_api_key("sk-test")
-        .with_models(vec![self.model().to_string()])])
+        let mut cfg = ProviderConfig::new(self.backend_id(), self.protocol, &self.endpoint)
+            .with_api_key("sk-test")
+            .with_models(vec![self.model().to_string()]);
+        cfg.max_tokens_field = self.max_tokens_field;
+        svc.configure(vec![cfg])
             .expect("the provider router accepts configuration");
         Arc::new(wafer_core::service_blocks::llm::LlmBlock::new(Arc::new(
             svc,

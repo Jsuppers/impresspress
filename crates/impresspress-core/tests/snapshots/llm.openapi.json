@@ -694,6 +694,29 @@
                             "null"
                           ]
                         },
+                        "max_tokens_field": {
+                          "anyOf": [
+                            {
+                              "description": "Which field carries the output-token budget in a `/chat/completions` body.",
+                              "oneOf": [
+                                {
+                                  "const": "max_tokens",
+                                  "description": "`max_tokens` — the spelling the OpenAI-compatible servers accept.",
+                                  "type": "string"
+                                },
+                                {
+                                  "const": "max_completion_tokens",
+                                  "description": "`max_completion_tokens` — OpenAI's current spelling; its reasoning\nmodels refuse the other one.",
+                                  "type": "string"
+                                }
+                              ]
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "description": "Which field carries the output-token budget in this provider's chat\nbodies, or `null` to send the one its `protocol` implies."
+                        },
                         "models": {
                           "description": "Explicit model list. Empty means the models are discovered from the\nprovider's `/v1/models`.",
                           "items": {
@@ -721,6 +744,7 @@
                         "protocol",
                         "endpoint",
                         "key_var",
+                        "max_tokens_field",
                         "models",
                         "enabled"
                       ],
@@ -772,6 +796,29 @@
                     "string",
                     "null"
                   ]
+                },
+                "max_tokens_field": {
+                  "anyOf": [
+                    {
+                      "description": "Which field carries the output-token budget in a `/chat/completions` body.",
+                      "oneOf": [
+                        {
+                          "const": "max_tokens",
+                          "description": "`max_tokens` — the spelling the OpenAI-compatible servers accept.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "max_completion_tokens",
+                          "description": "`max_completion_tokens` — OpenAI's current spelling; its reasoning\nmodels refuse the other one.",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Which field carries the output-token budget in this provider's chat\nbodies. Omit to send the one `protocol` implies, which is what all but\na handful of endpoints want. Refused on the `anthropic` protocol,\nwhose wire format has only one such field."
                 },
                 "models": {
                   "description": "Explicit model list. Omitted or empty means the models are discovered\nfrom the provider's `/v1/models`.",
@@ -835,6 +882,29 @@
                       "null"
                     ]
                   },
+                  "max_tokens_field": {
+                    "anyOf": [
+                      {
+                        "description": "Which field carries the output-token budget in a `/chat/completions` body.",
+                        "oneOf": [
+                          {
+                            "const": "max_tokens",
+                            "description": "`max_tokens` — the spelling the OpenAI-compatible servers accept.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "max_completion_tokens",
+                            "description": "`max_completion_tokens` — OpenAI's current spelling; its reasoning\nmodels refuse the other one.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Which field carries the output-token budget in this provider's chat\nbodies, or `null` to send the one its `protocol` implies."
+                  },
                   "models": {
                     "description": "Explicit model list. Empty means the models are discovered from the\nprovider's `/v1/models`.",
                     "items": {
@@ -862,6 +932,7 @@
                   "protocol",
                   "endpoint",
                   "key_var",
+                  "max_tokens_field",
                   "models",
                   "enabled"
                 ],
@@ -962,6 +1033,29 @@
                     "null"
                   ]
                 },
+                "max_tokens_field": {
+                  "anyOf": [
+                    {
+                      "description": "Which field carries the output-token budget in a `/chat/completions` body.",
+                      "oneOf": [
+                        {
+                          "const": "max_tokens",
+                          "description": "`max_tokens` — the spelling the OpenAI-compatible servers accept.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "max_completion_tokens",
+                          "description": "`max_completion_tokens` — OpenAI's current spelling; its reasoning\nmodels refuse the other one.",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Which field carries the output-token budget, or `null` to go back to\nthe one `protocol` implies."
+                },
                 "models": {
                   "items": {
                     "type": "string"
@@ -1024,6 +1118,29 @@
                       "null"
                     ]
                   },
+                  "max_tokens_field": {
+                    "anyOf": [
+                      {
+                        "description": "Which field carries the output-token budget in a `/chat/completions` body.",
+                        "oneOf": [
+                          {
+                            "const": "max_tokens",
+                            "description": "`max_tokens` — the spelling the OpenAI-compatible servers accept.",
+                            "type": "string"
+                          },
+                          {
+                            "const": "max_completion_tokens",
+                            "description": "`max_completion_tokens` — OpenAI's current spelling; its reasoning\nmodels refuse the other one.",
+                            "type": "string"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Which field carries the output-token budget in this provider's chat\nbodies, or `null` to send the one its `protocol` implies."
+                  },
                   "models": {
                     "description": "Explicit model list. Empty means the models are discovered from the\nprovider's `/v1/models`.",
                     "items": {
@@ -1051,6 +1168,7 @@
                   "protocol",
                   "endpoint",
                   "key_var",
+                  "max_tokens_field",
                   "models",
                   "enabled"
                 ],

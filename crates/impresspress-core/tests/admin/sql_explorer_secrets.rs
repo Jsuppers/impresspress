@@ -483,6 +483,14 @@ const CLEARED_COLUMNS: &[(&str, &str, &str)] = &[
         "digest of an inbound message, for idempotency",
     ),
     (
+        "impresspress__llm__providers",
+        "max_tokens_field",
+        "the name of the JSON field a provider's chat body spells its \
+         output-token budget in — `max_tokens` or `max_completion_tokens`. It \
+         matches the `token` needle by the arithmetic of the word; the value \
+         is one of two literals the admin picks from a select",
+    ),
+    (
         "impresspress__tickets__events",
         "body",
         "one ticket message's prose. A submitter does compose it, but it is \

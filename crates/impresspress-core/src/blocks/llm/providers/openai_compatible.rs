@@ -22,7 +22,9 @@ use crate::llm_wire::openai::MaxTokensField;
 /// The output-token budget goes out as `max_tokens`, the original spelling:
 /// it is what Ollama, llama.cpp, vLLM, LM Studio, Groq, Together and
 /// OpenRouter accept, and most of them do not know OpenAI's newer
-/// `max_completion_tokens` at all.
+/// `max_completion_tokens` at all. A provider that declares a
+/// `max_tokens_field` overrides that — Azure OpenAI is configured on this
+/// protocol and its reasoning deployments accept only the newer spelling.
 pub fn encode_chat_request(
     req: &ChatRequest,
     provider: &ProviderConfig,
@@ -156,6 +158,30 @@ mod tests {
             assert!(
                 json.get("max_completion_tokens").is_none(),
                 "api_key={key:?}: a compatible server gets the spelling it knows, got: {json}"
+            );
+        }
+    }
+
+    /// A provider that declares `max_completion_tokens` gets it, on the
+    /// protocol whose default is the other spelling.
+    ///
+    /// Azure OpenAI is configured here, not on `open_ai` — it is a different
+    /// URL shape with its own deployment path — and its reasoning deployments
+    /// reject `max_tokens`. The protocol default alone left that operator with
+    /// no reachable configuration at all.
+    #[test]
+    fn a_declared_max_tokens_field_overrides_the_protocols_spelling() {
+        let provider = local_provider().with_max_tokens_field(MaxTokensField::MaxCompletionTokens);
+        let mut req = ChatRequest::new("local-ollama", "o3-mini", vec![ChatMessage::user("hi")]);
+        req.params.max_tokens = Some(4096);
+
+        for key in [None, Some("azure-key")] {
+            let (_, _, body) = encode_chat_request(&req, &provider, key).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["max_completion_tokens"], 4096, "api_key={key:?}");
+            assert!(
+                json.get("max_tokens").is_none(),
+                "api_key={key:?}: one spelling only, got: {json}"
             );
         }
     }

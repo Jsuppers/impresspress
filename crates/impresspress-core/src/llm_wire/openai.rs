@@ -25,30 +25,61 @@ use wafer_core::interfaces::llm::service::{
 
 use super::sse::{DecodeBatch, FeedLoss, SseFrameStream};
 
+// The two spellings are mutually exclusive, and which one a server accepts is
+// a property of the wire format it implements, not of the model string — so it
+// is named, never inferred:
+//
+// * `MaxCompletionTokens` — OpenAI's own API. `max_tokens` is deprecated there
+//   and is rejected outright (`unsupported_parameter`) by the reasoning
+//   models, which are selectable from `/v1/models` discovery like any other.
+// * `MaxTokens` — the OpenAI-*compatible* servers (Ollama, llama.cpp, vLLM,
+//   LM Studio, Groq, Together, OpenRouter, …), which accept the original
+//   spelling and mostly do not know the new one.
+//
+// A provider's protocol names it by default, and
+// `ProviderConfig::max_tokens_field` overrides that for a server whose wire
+// format departs from its protocol's usual spelling — an Azure OpenAI
+// reasoning deployment, declared `open_ai_compatible`, requires
+// `max_completion_tokens`.
+//
+// Never both: a body carrying the two fields is an implicit mapping between
+// them, and upstreams do not reliably accept it.
+//
+// Derives `JsonSchema` because it is published on the provider contracts
+// (`ProviderView` and the create/update requests), so the `///` below is the
+// schema `description` — detail belongs in this plain comment.
 /// Which field carries the output-token budget in a `/chat/completions` body.
-///
-/// The two spellings are mutually exclusive, and which one a server accepts is
-/// a property of the wire format it implements, not of the model string. So
-/// the caller names it — the protocol a provider is declared under is the
-/// operator's explicit statement of that format, and it is the only signal in
-/// the system that does not have to be inferred from a model id.
-///
-/// * [`MaxCompletionTokens`](Self::MaxCompletionTokens) — OpenAI's own API.
-///   `max_tokens` is deprecated there and is **rejected outright**
-///   (`unsupported_parameter`) by the reasoning models, which are selectable
-///   from `/v1/models` discovery like any other.
-/// * [`MaxTokens`](Self::MaxTokens) — the OpenAI-*compatible* servers
-///   (Ollama, llama.cpp, vLLM, LM Studio, Groq, Together, OpenRouter, …),
-///   which accept the original spelling and mostly do not know the new one.
-///
-/// Never both: a body carrying the two fields is an implicit mapping between
-/// them, and upstreams do not reliably accept it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum MaxTokensField {
-    /// `max_tokens` — the original spelling.
+    /// `max_tokens` — the spelling the OpenAI-compatible servers accept.
     MaxTokens,
-    /// `max_completion_tokens` — OpenAI's current spelling.
+    /// `max_completion_tokens` — OpenAI's current spelling; its reasoning
+    /// models refuse the other one.
     MaxCompletionTokens,
+}
+
+impl MaxTokensField {
+    /// Parse from the string column stored in `impresspress__llm__providers`.
+    /// The tokens are the wire field names themselves, so what is stored, what
+    /// serde accepts and what goes out in the body are one spelling and not
+    /// three.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "max_tokens" => Some(Self::MaxTokens),
+            "max_completion_tokens" => Some(Self::MaxCompletionTokens),
+            _ => None,
+        }
+    }
+
+    /// The JSON field name this variant writes, and the token
+    /// [`parse`](Self::parse) reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
 }
 
 /// Serialize `req` into an OpenAI `/chat/completions` request body, spelling
@@ -1303,6 +1334,37 @@ mod encode_body {
             compatible.get("max_completion_tokens").is_none(),
             "a compatible server is sent the only spelling it knows, got: {compatible}"
         );
+    }
+
+    /// The stored token, the serde token and the JSON field name are one
+    /// string. Storing `max_completion_tokens` and writing something else on
+    /// the wire is the sort of mapping layer this repo does not have.
+    #[test]
+    fn the_variant_tokens_are_the_wire_field_names() {
+        for field in [
+            MaxTokensField::MaxTokens,
+            MaxTokensField::MaxCompletionTokens,
+        ] {
+            assert_eq!(MaxTokensField::parse(field.as_str()), Some(field));
+            assert_eq!(
+                serde_json::to_value(field).unwrap(),
+                serde_json::Value::String(field.as_str().to_string())
+            );
+            let mut req = ChatRequest::new("p", "m", vec![ChatMessage::user("hi")]);
+            req.params.max_tokens = Some(7);
+            assert_eq!(
+                body_as(&req, field)[field.as_str()],
+                7,
+                "the variant must write the field it is named after"
+            );
+        }
+    }
+
+    #[test]
+    fn max_tokens_field_parse_rejects_anything_else() {
+        assert_eq!(MaxTokensField::parse("maxTokens"), None);
+        assert_eq!(MaxTokensField::parse("MaxTokens"), None);
+        assert_eq!(MaxTokensField::parse(""), None);
     }
 
     /// No budget, no field — under either spelling. The request the browser

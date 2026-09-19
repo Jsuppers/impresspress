@@ -218,8 +218,12 @@ pub(in crate::blocks::llm) async fn list_providers(
 /// `application/x-www-form-urlencoded` and every field arrives as a string.
 ///
 /// The form values that are not strings in the contract are coerced here, and
-/// only here: `models` is one comma-separated text input, and `enabled` is a
-/// checkbox, which posts nothing at all when the admin unticks it. `models` is
+/// only here: `models` is one comma-separated text input, `enabled` is a
+/// checkbox, which posts nothing at all when the admin unticks it, and
+/// `max_tokens_field` is a select whose "follow the protocol" option has no
+/// token to post — a `<select>` always sends *something*, and `""` is not one
+/// of the two wire spellings, so an empty one is dropped and the contract
+/// sees the field omitted. `models` is
 /// read through [`crate::util::form_values`] rather than the last-wins map, so
 /// a client that spells the list as a repeated key (`models=a&models=b`, which
 /// is how urlencoded serialisation writes an array) is understood to mean both
@@ -235,6 +239,9 @@ fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, Strin
     let mut fields = serde_json::Map::new();
     for (key, value) in &form {
         if key == "models" || key == "enabled" {
+            continue;
+        }
+        if key == "max_tokens_field" && value.is_empty() {
             continue;
         }
         fields.insert(key.clone(), serde_json::Value::String(value.clone()));
@@ -256,6 +263,25 @@ fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, Strin
     );
     serde_json::from_value(serde_json::Value::Object(fields))
         .map_err(|e| format!("Invalid body: {e}"))
+}
+
+/// Refuse a `max_tokens_field` on a protocol that has no use for one.
+///
+/// The Anthropic Messages API carries the budget in a single `max_tokens`
+/// field, so `providers::anthropic`'s encoder never reads the override.
+/// Storing one there would be a setting an admin can see in the row and on
+/// `GET /b/llm/api/providers` and that changes nothing on the wire, which is
+/// worth a 400 rather than a shrug.
+fn check_max_tokens_field(cfg: &ProviderConfig) -> Result<(), String> {
+    match cfg.max_tokens_field {
+        Some(field) if !cfg.protocol.accepts_max_tokens_field() => Err(format!(
+            "`max_tokens_field` ({}) does not apply to the `{}` protocol: its \
+             request body has a single budget field",
+            field.as_str(),
+            cfg.protocol.as_str()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `POST /b/llm/api/providers` — create. The typed body requires `name`,
@@ -301,11 +327,15 @@ pub(in crate::blocks::llm) async fn create_provider(
     if let Some(k) = body.key_var.filter(|s| !s.is_empty()) {
         cfg.key_var = Some(k);
     }
+    cfg.max_tokens_field = body.max_tokens_field;
     if let Some(m) = body.models {
         cfg.models = m;
     }
     if let Some(e) = body.enabled {
         cfg.enabled = e;
+    }
+    if let Err(e) = check_max_tokens_field(&cfg) {
+        return err_bad_request(&e);
     }
 
     let mut data = config_to_row(&cfg);
@@ -372,11 +402,22 @@ pub(in crate::blocks::llm) async fn update_provider(
     if let Some(k) = body.key_var {
         cfg.key_var = if k.is_empty() { None } else { Some(k) };
     }
+    // Present at all — `null` included — replaces the stored override; a body
+    // that omits the key leaves it alone. See `UpdateProviderRequest`.
+    if let Some(f) = body.max_tokens_field {
+        cfg.max_tokens_field = f;
+    }
     if let Some(m) = body.models {
         cfg.models = m;
     }
     if let Some(e) = body.enabled {
         cfg.enabled = e;
+    }
+    // Checked on the patched config, not on the body: switching a provider to
+    // `anthropic` while an override is stored produces the same unusable
+    // pairing as sending both in one body.
+    if let Err(e) = check_max_tokens_field(&cfg) {
+        return err_bad_request(&e);
     }
 
     let mut data = config_to_row(&cfg);
@@ -764,7 +805,16 @@ mod tests {
         got.sort_unstable();
         assert_eq!(
             got,
-            ["enabled", "endpoint", "id", "key_var", "models", "name", "protocol"],
+            [
+                "enabled",
+                "endpoint",
+                "id",
+                "key_var",
+                "max_tokens_field",
+                "models",
+                "name",
+                "protocol"
+            ],
             "{label}: the wire field set must equal ProviderView's, or the published \
              schema describes something the handler does not emit"
         );
@@ -844,6 +894,262 @@ mod tests {
                 "{label} published an api_key field: {raw}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The per-provider output-token budget field
+    // -----------------------------------------------------------------
+
+    /// Refusals from these handlers, as `(code, message)`.
+    async fn provider_refusal(out: OutputStream) -> (ErrorCode, String) {
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => (e.code, e.message),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The stored rows, re-read through `GET /b/llm/api/providers` — the only
+    /// way to tell a write that persisted from one the handler merely echoed
+    /// back out of the config it had in hand.
+    async fn stored_rows(ctx: &TestContext, block: &LlmBlock) -> Vec<serde_json::Value> {
+        let listed = output_json(
+            list_providers(block, ctx, &admin_msg("retrieve", "/b/llm/api/providers")).await,
+        )
+        .await;
+        listed["providers"]
+            .as_array()
+            .expect("providers array")
+            .clone()
+    }
+
+    async fn create_azure_style(
+        ctx: &TestContext,
+        block: &LlmBlock,
+    ) -> (String, serde_json::Value) {
+        let created = output_json(
+            create_provider(
+                block,
+                ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                json_input(serde_json::json!({
+                    "name": "azure-reasoning",
+                    "protocol": "open_ai_compatible",
+                    "endpoint": "https://example.openai.azure.com/openai/v1",
+                    "max_tokens_field": "max_completion_tokens",
+                })),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        (id, created)
+    }
+
+    /// The configuration this whole field exists for: an Azure OpenAI
+    /// reasoning deployment, which speaks `open_ai_compatible` but accepts
+    /// only `max_completion_tokens`. It survives to the stored row, not just
+    /// the create response.
+    #[tokio::test]
+    async fn a_declared_max_tokens_field_is_stored_and_published() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (_id, created) = create_azure_style(&ctx, &block).await;
+
+        assert_eq!(created["max_tokens_field"], "max_completion_tokens");
+        let rows = stored_rows(&ctx, &block).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["max_tokens_field"], "max_completion_tokens",
+            "the row must carry it, not only the create echo"
+        );
+    }
+
+    /// Omitted means "follow the protocol", and that is what the row says —
+    /// `null`, never a spelling chosen on the admin's behalf.
+    #[tokio::test]
+    async fn an_omitted_max_tokens_field_stays_null() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(created["max_tokens_field"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["max_tokens_field"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A present `null` on the patch clears the override; an absent key
+    /// leaves it alone. Both re-read from the store, because `update_provider`
+    /// answers out of the config it just built either way.
+    #[tokio::test]
+    async fn a_null_max_tokens_field_clears_it_and_an_absent_one_does_not() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (id, _) = create_azure_style(&ctx, &block).await;
+
+        let untouched = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "enabled": false })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            untouched["max_tokens_field"], "max_completion_tokens",
+            "a patch that does not mention the field must not change it"
+        );
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["max_tokens_field"],
+            "max_completion_tokens"
+        );
+
+        let cleared = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "max_tokens_field": null })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(cleared["max_tokens_field"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["max_tokens_field"],
+            serde_json::Value::Null,
+            "the cleared override must be gone from the row, not only the reply"
+        );
+    }
+
+    /// `UpdateProviderRequest` documents an empty `key_var` as clearing the
+    /// variable. The row is what has to say so: `config_to_row` feeds
+    /// `db::update`, which sets only the columns it is handed, so a `key_var`
+    /// the encoder omitted left the old variable name in place under a reply
+    /// that said `null`.
+    #[tokio::test]
+    async fn an_emptied_key_var_is_cleared_in_the_stored_row() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        assert_eq!(created["key_var"], KEY_VAR);
+
+        let updated = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({ "key_var": "" })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(updated["key_var"], serde_json::Value::Null);
+        assert_eq!(
+            stored_rows(&ctx, &block).await[0]["key_var"],
+            serde_json::Value::Null,
+            "the reply said the variable was cleared; the row has to agree"
+        );
+    }
+
+    /// Anthropic's Messages API has one budget field, so an override there is
+    /// a setting that cannot do anything. It is refused by name rather than
+    /// stored and ignored.
+    #[tokio::test]
+    async fn an_anthropic_provider_may_not_declare_a_max_tokens_field() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let out = create_provider(
+            &block,
+            &ctx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            json_input(serde_json::json!({
+                "name": "anthropic-main",
+                "protocol": "anthropic",
+                "endpoint": "https://api.anthropic.com/v1",
+                "max_tokens_field": "max_completion_tokens",
+            })),
+        )
+        .await;
+
+        let (code, message) = provider_refusal(out).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("max_tokens_field") && message.contains("anthropic"),
+            "the refusal must name the field and the protocol, got: {message}"
+        );
+        assert!(
+            stored_rows(&ctx, &block).await.is_empty(),
+            "a refused create must leave no row behind"
+        );
+    }
+
+    /// The same pairing reached the other way round — switching an existing
+    /// provider to `anthropic` while its override is still stored — is refused
+    /// on the patched configuration, and the stored row is untouched.
+    #[tokio::test]
+    async fn switching_a_provider_with_an_override_to_anthropic_is_refused() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (id, _) = create_azure_style(&ctx, &block).await;
+
+        let out = update_provider(
+            &block,
+            &ctx,
+            &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+            json_input(serde_json::json!({ "protocol": "anthropic" })),
+        )
+        .await;
+
+        let (code, message) = provider_refusal(out).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("max_tokens_field"), "got: {message}");
+        let rows = stored_rows(&ctx, &block).await;
+        assert_eq!(rows[0]["protocol"], "open_ai_compatible");
+        assert_eq!(rows[0]["max_tokens_field"], "max_completion_tokens");
+    }
+
+    /// Clearing the override and switching protocol in one body is accepted —
+    /// the check reads the patched configuration, so the two changes are
+    /// judged together rather than as the body's field order happens to fall.
+    #[tokio::test]
+    async fn clearing_the_override_in_the_same_patch_that_switches_to_anthropic_is_accepted() {
+        let (ctx, _admin, block) = keyed_fixture().await;
+        let (id, _) = create_azure_style(&ctx, &block).await;
+
+        let updated = output_json(
+            update_provider(
+                &block,
+                &ctx,
+                &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+                json_input(serde_json::json!({
+                    "protocol": "anthropic",
+                    "max_tokens_field": null,
+                    "endpoint": "https://api.anthropic.com/v1",
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(updated["protocol"], "anthropic");
+        assert_eq!(updated["max_tokens_field"], serde_json::Value::Null);
     }
 
     /// Every provider endpoint publishes the one row projection, and the
@@ -1405,12 +1711,15 @@ mod form_body_tests {
     }
 
     /// The exact body htmx builds from the rendered form when the admin fills
-    /// in every field and leaves the "Enabled" box ticked. `enabled=true` is
-    /// the checkbox's own `value` attribute; the endpoint is percent-encoded
-    /// as a browser encodes it.
+    /// in every field, leaves the "Enabled" box ticked and leaves the budget
+    /// field on "Follow the protocol". `enabled=true` is the checkbox's own
+    /// `value` attribute; `max_tokens_field=` is what a select whose chosen
+    /// option has an empty value posts — a select always sends something; the
+    /// endpoint is percent-encoded as a browser encodes it.
     const TICKED_FORM: &str = "name=openai-main&protocol=open_ai\
 &endpoint=https%3A%2F%2Fapi.openai.com%2Fv1\
 &key_var=IMPRESSPRESS__LLM__OPENAI_KEY\
+&max_tokens_field=\
 &models=gpt-4o%2C+gpt-4o-mini\
 &enabled=true";
 
@@ -1488,6 +1797,47 @@ mod form_body_tests {
         assert_eq!(
             created["models"],
             serde_json::json!(["gpt-4o", "gpt-4o-mini"])
+        );
+    }
+
+    /// The budget-field select's "Follow the protocol" option has no token to
+    /// post, so it posts the empty string — which is not one of the two wire
+    /// spellings. Handing it to serde as-is would 400 every ordinary submit,
+    /// so the parser drops it and the contract sees the field omitted.
+    #[tokio::test]
+    async fn an_empty_budget_field_select_leaves_the_provider_on_its_protocol() {
+        let created = output_json(create_from_form(TICKED_FORM).await).await;
+        assert_eq!(created["max_tokens_field"], serde_json::Value::Null);
+    }
+
+    /// And a chosen option arrives as the override — the Azure reasoning
+    /// deployment, configured the way the form configures it.
+    #[tokio::test]
+    async fn a_chosen_budget_field_reaches_the_stored_provider() {
+        let body = TICKED_FORM
+            .replace("protocol=open_ai&", "protocol=open_ai_compatible&")
+            .replace(
+                "max_tokens_field=",
+                "max_tokens_field=max_completion_tokens",
+            );
+        let created = output_json(create_from_form(&body).await).await;
+        assert_eq!(created["protocol"], "open_ai_compatible");
+        assert_eq!(created["max_tokens_field"], "max_completion_tokens");
+    }
+
+    /// A token the enum does not have is refused rather than stored, the same
+    /// way a wrong `protocol` is — the select's options are the only two.
+    #[tokio::test]
+    async fn a_form_body_with_an_unknown_budget_field_is_refused() {
+        let body = TICKED_FORM.replace("max_tokens_field=", "max_tokens_field=maxTokens");
+        let (code, message) = refusal(create_from_form(&body).await).await;
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("maxTokens")
+                && message.contains("max_completion_tokens")
+                && message.contains("max_tokens"),
+            "the refusal must name the rejected token and both accepted ones, \
+             got: {message}"
         );
     }
 
