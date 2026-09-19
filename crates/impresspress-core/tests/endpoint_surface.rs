@@ -18,6 +18,8 @@ use std::path::PathBuf;
 
 use wafer_run::BlockInfo;
 
+mod baselines;
+
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
 }
@@ -63,39 +65,17 @@ fn surface_block_infos() -> Vec<BlockInfo> {
     infos
 }
 
-/// Baselines whose block is compiled in only under a non-default feature.
-/// They are legitimately absent from `surface_block_infos()` in a default
-/// run; every other committed baseline must be compared, or the gate is
-/// passing for free and the test fails to say so.
-#[cfg(feature = "block-dev")]
-const ABSENT_BY_FEATURE: &[&str] = &[];
-#[cfg(not(feature = "block-dev"))]
-const ABSENT_BY_FEATURE: &[&str] = &["dev"];
-
-/// Stems of `*.endpoints.json` files in `dir` that this run did not compare
-/// (`checked`) and that are not excused by `absent_by_feature`, sorted.
-fn unchecked_baselines(
-    dir: &std::path::Path,
-    checked: &[String],
-    absent_by_feature: &[&str],
-) -> Vec<String> {
-    let mut left: Vec<String> = std::fs::read_dir(dir)
-        .expect("read snapshot dir")
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_suffix(".endpoints.json"))
-                .map(str::to_string)
-        })
-        .filter(|stem| {
-            !checked.iter().any(|c| c == stem) && !absent_by_feature.contains(&stem.as_str())
-        })
-        .collect();
-    left.sort();
-    left
-}
+/// Baselines whose block is compiled in only under a non-default feature,
+/// each with the gate that decides it. They are legitimately absent from
+/// `surface_block_infos()` in a run without that feature; every other
+/// committed baseline must be compared, or the gate is passing for free and
+/// the test fails to say so.
+///
+/// The gate is per row, and the row's own `cfg!` is the whole of it. A
+/// cfg-gated pair of slices spells the same decision twice and the copies can
+/// drift; one bool for the whole list would excuse a row gated on some other
+/// feature in every run that has that feature off.
+const FEATURE_GATED_BASELINES: &[(&str, bool)] = &[("dev", cfg!(feature = "block-dev"))];
 
 #[test]
 fn endpoint_surface_matches_committed_snapshots() {
@@ -142,33 +122,26 @@ fn endpoint_surface_matches_committed_snapshots() {
         }
     }
 
-    for stem in unchecked_baselines(&snapshot_dir(), &checked, ABSENT_BY_FEATURE) {
+    let absent_by_feature: Vec<&str> = FEATURE_GATED_BASELINES
+        .iter()
+        .filter(|(_, compiled)| !*compiled)
+        .map(|(stem, _)| *stem)
+        .collect();
+    for stem in baselines::unchecked(
+        &snapshot_dir(),
+        ".endpoints.json",
+        &checked,
+        &absent_by_feature,
+    ) {
         failures.push(format!(
-            "\n=== {stem} ===\n{stem}.endpoints.json was not compared by this run because its \
-             block is not compiled in, so the gate is vacuous for it. Enable the block's \
-             feature, or list the stem in ABSENT_BY_FEATURE under the feature that gates it."
+            "\n=== {stem} ===\n{stem}.endpoints.json was not compared by this run, so the gate \
+             is vacuous for it. Either the block no longer declares a surface and the baseline \
+             should be `git rm`-ed, or it is compiled in only under a feature and belongs in \
+             FEATURE_GATED_BASELINES with the `cfg!` that gates it."
         ));
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-/// A committed baseline this run never compared is a gate that passes for
-/// free. Under a reduced feature set most blocks are not compiled in, so
-/// without this check `products.endpoints.json` could sit unchecked forever.
-#[test]
-fn unchecked_baselines_lists_committed_files_this_run_did_not_compare() {
-    let dir = std::env::temp_dir().join(format!("endpoint-surface-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    for stem in ["alpha", "beta", "dev"] {
-        std::fs::write(dir.join(format!("{stem}.endpoints.json")), "[]\n").expect("write");
-    }
-    std::fs::write(dir.join("alpha.openapi.json"), "{}\n").expect("write");
-
-    let left = unchecked_baselines(&dir, &["alpha".to_string()], &["dev"]);
-    std::fs::remove_dir_all(&dir).expect("remove temp dir");
-
-    assert_eq!(left, vec!["beta".to_string()]);
 }
 
 #[test]
