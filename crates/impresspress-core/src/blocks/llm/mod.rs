@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use wafer_core::clients::config;
 use wafer_run::{
-    context::Context, Block, BlockInfo, ConfigVar, HttpMethod, InputStream, InstanceMode,
-    LifecycleEvent, LifecycleType, Message, OutputStream, WaferError,
+    context::Context, Block, BlockInfo, ConfigVar, HttpMethod, InputStream, InputType,
+    InstanceMode, LifecycleEvent, LifecycleType, Message, OutputStream, WaferError,
 };
 
 use self::provider_admin::ProviderAdmin;
@@ -25,6 +25,7 @@ use crate::{
     },
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_internal, err_not_found, ok_json},
+    llm_target::DefaultTarget,
 };
 
 /// In-block dispatch targets, one per declared HTTP endpoint.
@@ -227,7 +228,43 @@ impl LlmBlock {
 
 pub(super) const DEFAULT_PROVIDER_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_PROVIDER";
 pub(super) const DEFAULT_MODEL_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MODEL";
+pub(super) const DEFAULT_MAX_TOKENS_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS";
 pub(super) const DEFAULT_PROVIDER: &str = "impresspress/provider-llm";
+
+/// Output-token budget used when a chat request names none.
+///
+/// Anthropic's Messages API requires `max_tokens` on every request, so a
+/// request that carries none is refused by the encoder before it reaches the
+/// provider (`providers::anthropic::EncodeError::MissingMaxTokens`). Every
+/// protocol therefore gets a budget from here, which also bounds
+/// OpenAI-protocol replies — those are unbounded when the field is absent.
+pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// The output-token budget for a request that names none: the configured
+/// [`DEFAULT_MAX_TOKENS_VAR`], or [`DEFAULT_MAX_TOKENS`] when it is unset,
+/// unparseable, or zero.
+///
+/// Zero is rejected rather than forwarded: Anthropic answers `400` for
+/// `max_tokens: 0`, so honouring it would turn a mis-typed variable into a
+/// provider error on every chat instead of a logged fallback.
+pub(super) async fn default_max_tokens(ctx: &dyn Context) -> u32 {
+    let raw = config::get_default(ctx, DEFAULT_MAX_TOKENS_VAR, "").await;
+    if raw.is_empty() {
+        return DEFAULT_MAX_TOKENS;
+    }
+    match raw.parse::<u32>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            tracing::warn!(
+                var = DEFAULT_MAX_TOKENS_VAR,
+                value = %raw,
+                fallback = DEFAULT_MAX_TOKENS,
+                "llm max-token budget is not a positive integer — using the built-in default"
+            );
+            DEFAULT_MAX_TOKENS
+        }
+    }
+}
 
 // The previous in-process `default_target()` helper has moved to a
 // `GET /b/llm/api/internal/default-target` route — see
@@ -511,27 +548,31 @@ impl LlmBlock {
 
     // --- Config ---
 
-    /// Inter-block discovery: returns the default `(provider, model)` target
-    /// other blocks should use when they have no caller-supplied preference.
+    /// Inter-block discovery: returns the default target other blocks should
+    /// use when they have no caller-supplied preference, as a
+    /// [`DefaultTarget`] — the one type both sides of this route serde, so
+    /// the body cannot be described differently at each end.
     ///
-    /// Wire format:
-    /// * `200 {"provider": "...", "model": "..."}` when configured
-    /// * `200 {"provider": null, "model": null}` when no model is configured
-    ///   (callers should take a degraded path — same contract as the previous
-    ///   in-process `default_target()` returning `None`).
+    /// Answers `200` either way: [`DefaultTarget::unconfigured`] when no
+    /// provider or model is set, which callers take a degraded path on (the
+    /// same contract as the previous in-process `default_target()` returning
+    /// `None`).
+    ///
+    /// `max_tokens` travels with the target rather than being read by the
+    /// caller: [`DEFAULT_MAX_TOKENS_VAR`] is this block's own variable, and a
+    /// caller that has to reach a completion needs a budget for it —
+    /// Anthropic-protocol providers refuse a request that carries none.
     async fn handle_default_target(&self, ctx: &dyn Context) -> OutputStream {
         let provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
         let model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
         if model.is_empty() || provider.is_empty() {
-            return ok_json(&serde_json::json!({
-                "provider": serde_json::Value::Null,
-                "model": serde_json::Value::Null,
-            }));
+            return ok_json(&DefaultTarget::unconfigured());
         }
-        ok_json(&serde_json::json!({
-            "provider": provider,
-            "model": model,
-        }))
+        ok_json(&DefaultTarget::configured(
+            &provider,
+            &model,
+            default_max_tokens(ctx).await,
+        ))
     }
 
     async fn handle_get_config(&self, ctx: &dyn Context) -> OutputStream {
@@ -720,6 +761,20 @@ impl Block for LlmBlock {
             )
             .name("Default Model")
             .optional(),
+            ConfigVar::new(
+                DEFAULT_MAX_TOKENS_VAR,
+                "Largest reply, in output tokens, a chat request that names no \
+                 budget of its own may generate. Anthropic-protocol providers \
+                 refuse a request without one; OpenAI-protocol providers are \
+                 capped by it too, where the field's absence would otherwise \
+                 leave the reply unbounded. The usable ceiling belongs to the \
+                 model, not to this setting: a value above what the configured \
+                 model accepts is refused by the provider (Anthropic answers \
+                 400), so raise it against the model you actually run.",
+                &DEFAULT_MAX_TOKENS.to_string(),
+            )
+            .name("Default Max Tokens")
+            .input_type(InputType::Number),
         ])
         .can_disable(true)
         .default_enabled(true)
@@ -738,7 +793,7 @@ impl Block for LlmBlock {
         // declared HTTP endpoint (declaring it would publish it), so it stays
         // a handler-owned guard ahead of the matcher; this is the one path
         // read in this block outside `endpoint_match::dispatch`.
-        if msg.action() == "retrieve" && msg.path() == "/b/llm/api/internal/default-target" {
+        if msg.action() == "retrieve" && msg.path() == DefaultTarget::RESOURCE {
             if ctx.caller_id().is_none() {
                 return crate::http::err_not_found("not found");
             }
@@ -856,6 +911,52 @@ mod config_tests {
 
     fn block() -> LlmBlock {
         LlmBlock::new(Arc::new(provider_admin::NoopProviderAdmin))
+    }
+
+    /// The output-token budget comes from the declared variable, and a value
+    /// that is not a positive integer falls back instead of reaching a
+    /// provider as garbage (or as `max_tokens: 0`, which Anthropic answers
+    /// `400` to).
+    #[tokio::test]
+    async fn the_max_token_budget_is_read_from_its_variable() {
+        let mut ctx = TestContext::with_llm().await;
+        assert_eq!(
+            default_max_tokens(&ctx).await,
+            DEFAULT_MAX_TOKENS,
+            "an unset variable is the built-in default"
+        );
+
+        ctx.set_config(DEFAULT_MAX_TOKENS_VAR, "1500");
+        assert_eq!(default_max_tokens(&ctx).await, 1500);
+
+        for bad in ["0", "-1", "lots", "4096.5", " 4096"] {
+            ctx.set_config(DEFAULT_MAX_TOKENS_VAR, bad);
+            assert_eq!(
+                default_max_tokens(&ctx).await,
+                DEFAULT_MAX_TOKENS,
+                "{bad:?} is not a usable budget and must fall back"
+            );
+        }
+    }
+
+    /// An operator changes the budget on the admin Variables screen, which
+    /// renders `info().config_keys`. A variable the block reads but does not
+    /// declare is unreachable there — and its default would be a number
+    /// hardcoded in one handler, which is what the project's config rules
+    /// exist to prevent.
+    #[test]
+    fn the_block_declares_the_max_token_variable() {
+        let declared = block().info().config_keys;
+        let var = declared
+            .iter()
+            .find(|v| v.key == DEFAULT_MAX_TOKENS_VAR)
+            .expect("the llm block must declare the variable it reads");
+        assert_eq!(var.input_type, InputType::Number);
+        assert_eq!(
+            var.default,
+            DEFAULT_MAX_TOKENS.to_string(),
+            "the declared default and the fallback are one number"
+        );
     }
 
     /// The settings page renders `hx-delete="/b/llm/api/config/{id}"` for

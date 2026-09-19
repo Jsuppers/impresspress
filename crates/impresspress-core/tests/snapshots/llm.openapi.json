@@ -7,6 +7,15 @@
             "schema": {
               "description": "Request body shared by `POST /b/llm/api/chat` and\n`POST /b/llm/api/chat/stream`.",
               "properties": {
+                "max_tokens": {
+                  "description": "Largest reply, in output tokens, this turn may generate. Omitted, the\ndeployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every\nrequest reaches the provider with a budget, because\nAnthropic-protocol providers refuse one that carries none.\n\nMust be at least 1: zero asks for no answer at all and is answered\n`400` here rather than by the provider. There is no upper bound on\nthis side, deliberately — the real ceiling is the model's, it differs\nper model and per provider, and the provider is the only party that\nknows it. A value the model will not accept comes back as that\nprovider's own error rather than one invented here. (The configured\ndefault is treated differently: a value that is not a positive integer\nfalls back with a warning, because an operator's typo must not break\nevery chat on the deployment at once.)",
+                  "format": "uint32",
+                  "minimum": 1,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "message": {
                   "description": "The user's message.",
                   "type": "string"
@@ -61,7 +70,7 @@
                     "type": "string"
                   },
                   "truncated": {
-                    "description": "`true` when the reply exceeded the 1 MiB buffering cap. `content` is\nthen a prefix of the reply — it ends at the last delta that fitted and\nnothing after it is appended, so the text is never spliced across a\ngap.",
+                    "description": "`true` when `content` is a prefix of the answer rather than the whole\nof it. Two ceilings can do that, and the flag does not distinguish\nthem because a caller's response to either is the same — ask again,\nor ask for less:\n\n* the model stopped at its output-token budget (the request's own\n  `max_tokens`, or `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS`), which it\n  reports as a `length` finish reason;\n* the reply exceeded the 1 MiB buffering cap of this endpoint, in\n  which case the text ends at the last delta that fitted and nothing\n  after it is appended, so it is never spliced across a gap.",
                     "type": "boolean"
                   }
                 },
@@ -95,6 +104,15 @@
             "schema": {
               "description": "Request body shared by `POST /b/llm/api/chat` and\n`POST /b/llm/api/chat/stream`.",
               "properties": {
+                "max_tokens": {
+                  "description": "Largest reply, in output tokens, this turn may generate. Omitted, the\ndeployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every\nrequest reaches the provider with a budget, because\nAnthropic-protocol providers refuse one that carries none.\n\nMust be at least 1: zero asks for no answer at all and is answered\n`400` here rather than by the provider. There is no upper bound on\nthis side, deliberately — the real ceiling is the model's, it differs\nper model and per provider, and the provider is the only party that\nknows it. A value the model will not accept comes back as that\nprovider's own error rather than one invented here. (The configured\ndefault is treated differently: a value that is not a positive integer\nfalls back with a warning, because an operator's typo must not break\nevery chat on the deployment at once.)",
+                  "format": "uint32",
+                  "minimum": 1,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "message": {
                   "description": "The user's message.",
                   "type": "string"

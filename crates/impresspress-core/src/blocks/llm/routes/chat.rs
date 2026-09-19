@@ -12,7 +12,7 @@ use futures::StreamExt;
 use wafer_core::clients::{
     llm::{
         self as llm_client, ChatChunk, ChatContent, ChatMessage, ChatParams, ChatRequest, ChatRole,
-        ChunkDelta,
+        ChunkDelta, FinishReason,
     },
     NativeTypedFrameStream,
 };
@@ -22,7 +22,8 @@ use super::streaming::sse_chat_response;
 use crate::{
     blocks::{
         llm::{
-            contracts, messages_create, messages_list, record_field, LlmBlock, DEFAULT_PROVIDER,
+            contracts, default_max_tokens, messages_create, messages_list, record_field, LlmBlock,
+            DEFAULT_PROVIDER,
         },
         messages::contracts::EntryRole,
     },
@@ -134,10 +135,17 @@ async fn dispatch_chat(
         message,
         provider,
         model,
+        max_tokens,
     } = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return Err(err_bad_request(&format!("Invalid body: {e}"))),
     };
+    // A caller asking for zero output tokens is asking for no answer at all,
+    // and Anthropic answers `400` to it. Refused here, before the turn is
+    // stored, rather than after a round-trip to be told the same thing.
+    if max_tokens == Some(0) {
+        return Err(err_bad_request("max_tokens must be greater than zero"));
+    }
 
     // 1. Persist the user message before calling the model — and refuse if it
     //    did not land. A turn that was not stored must not be followed by a
@@ -184,11 +192,25 @@ async fn dispatch_chat(
     };
 
     // 5. Build the service request and dispatch via the typed client.
+    //
+    //    Every request carries an output-token budget: the caller's, or the
+    //    deployment default. Anthropic's Messages API requires `max_tokens`,
+    //    so a request without one never reaches the provider — the encoder
+    //    refuses it (`providers::anthropic::EncodeError::MissingMaxTokens`)
+    //    and the caller sees a 500. The same budget bounds OpenAI-protocol
+    //    replies, which are unbounded when the field is absent.
+    let max_tokens = match max_tokens {
+        Some(requested) => requested,
+        None => default_max_tokens(ctx).await,
+    };
     let chat_req = ChatRequest {
         backend_id,
         model: resolved_model.clone(),
         messages,
-        params: ChatParams::default(),
+        params: ChatParams {
+            max_tokens: Some(max_tokens),
+            ..ChatParams::default()
+        },
         tools: Vec::new(),
         extra: serde_json::Value::Null,
     };
@@ -244,11 +266,17 @@ pub(in crate::blocks::llm) async fn handle_chat(
     // bytes into the assistant reply. Propagate any error terminal as a 500.
     let mut content = String::new();
     let mut truncated = false;
+    // The model stopped because it hit the output-token budget, not because
+    // it had finished. Both decoders report it (`FinishReason::Length`), and
+    // it is the other way a published reply can be a fragment — invisible
+    // from the text alone, which ends mid-sentence but looks like an answer.
+    let mut budget_exhausted = false;
     while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(c) => c,
             Err(e) => return err_internal("llm service error", e.message),
         };
+        budget_exhausted |= chunk.finish_reason == Some(FinishReason::Length);
         match chunk.delta {
             ChunkDelta::Text(s) => {
                 if truncated || content.len() + s.len() > MAX_BUFFERED_RESPONSE_BYTES {
@@ -277,6 +305,16 @@ pub(in crate::blocks::llm) async fn handle_chat(
             "llm buffered response exceeded cap — truncated"
         );
     }
+    if budget_exhausted {
+        tracing::warn!(
+            "llm reply stopped at the output-token budget \
+             (IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS or the request's own max_tokens)"
+        );
+    }
+    // One flag for "what you are reading is not the whole answer", whichever
+    // ceiling ended it: the 1 MiB buffering cap here, or the model's own
+    // token budget upstream.
+    let truncated = truncated || budget_exhausted;
 
     // Persist the assistant reply. The model has already answered and has
     // already been paid for, but no status line has been written yet, so this
@@ -464,6 +502,303 @@ mod tests {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // The provider actually encodes the request
+    // -----------------------------------------------------------------------
+    //
+    // Every test above stubs `wafer-run/llm`, so nothing in them ever encodes
+    // a provider request — and an Anthropic request without `max_tokens` is
+    // refused at encode time. That is why a block whose every chat through an
+    // Anthropic-protocol provider failed shipped with a green suite. The
+    // tests below run the real `ProviderLlmService` and the real Anthropic
+    // encoder against a loopback provider, so the budget is observable as the
+    // value on the wire rather than as the absence of an error.
+
+    /// The output-token budget the fixture configures. Deliberately not
+    /// [`crate::blocks::llm::DEFAULT_MAX_TOKENS`]: a test asserting the
+    /// built-in default cannot tell a handler that reads the variable from
+    /// one that hardcodes the same number.
+    #[cfg(feature = "llm")]
+    const FIXTURE_MAX_TOKENS: u32 = 321;
+
+    /// What the fake provider answers, so a test can assert the reply came
+    /// back through the decoder rather than merely that nothing failed.
+    #[cfg(feature = "llm")]
+    const FIXTURE_REPLY: &str = "Hi there";
+
+    /// A chat fixture whose `wafer-run/llm` is the production service block
+    /// wrapping a real [`ProviderLlmService`], routed to `fake` — a loopback
+    /// provider speaking one of the three wire protocols. Returns the thread
+    /// id; the fake's recorded request bodies are what the assertions read.
+    #[cfg(feature = "llm")]
+    async fn fixture_for(
+        fake: &crate::blocks::llm::providers::fake_provider::FakeProvider,
+    ) -> (crate::test_support::TestContext, String) {
+        use crate::blocks::llm::{DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR};
+
+        let mut ctx = crate::test_support::TestContext::with_llm().await;
+        register_messages_block(&mut ctx).await;
+        ctx.set_config(DEFAULT_PROVIDER_VAR, fake.backend_id());
+        ctx.set_config(DEFAULT_MODEL_VAR, fake.model());
+        ctx.set_config(DEFAULT_MAX_TOKENS_VAR, &FIXTURE_MAX_TOKENS.to_string());
+        ctx.register_block("wafer-run/llm", fake.llm_service_block());
+        let thread = crate::blocks::messages::service::create_context(
+            &ctx,
+            "user-a",
+            "conversation",
+            "T",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .expect("seed a thread");
+        (ctx, thread.id)
+    }
+
+    /// [`fixture_for`] an Anthropic-protocol provider, the one that refuses a
+    /// request with no budget at all.
+    #[cfg(feature = "llm")]
+    async fn anthropic_fixture() -> (
+        crate::test_support::TestContext,
+        String,
+        crate::blocks::llm::providers::fake_provider::FakeProvider,
+    ) {
+        use crate::blocks::llm::providers::fake_provider::FakeProvider;
+
+        let fake = FakeProvider::anthropic(FIXTURE_REPLY).await;
+        let (ctx, thread_id) = fixture_for(&fake).await;
+        (ctx, thread_id, fake)
+    }
+
+    /// A chat through an Anthropic-protocol provider answers, and the request
+    /// carries the configured output-token budget.
+    ///
+    /// The buffered handler sent `ChatParams::default()`, whose `max_tokens`
+    /// is `None`, and Anthropic's Messages API requires the field — so the
+    /// encoder refused every request before it left the process and the
+    /// caller got a 500. Nothing reached the provider, which is why the
+    /// recorded request list is asserted as well as the reply.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_chat_reaches_an_anthropic_provider_with_the_configured_max_tokens() {
+        let (ctx, thread_id, fake) = anthropic_fixture().await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            body["content"], FIXTURE_REPLY,
+            "the provider's answer must come back to the caller"
+        );
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(
+            requests[0]["max_tokens"], FIXTURE_MAX_TOKENS,
+            "the request must carry the configured budget, not a hardcoded one"
+        );
+    }
+
+    /// The SSE path shares the prelude, so it must carry the budget too — and
+    /// it fails differently: the client receives `event: error` after the
+    /// status line is already committed, never a 500.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_streamed_chat_reaches_an_anthropic_provider_with_the_configured_max_tokens() {
+        let (ctx, thread_id, fake) = anthropic_fixture().await;
+
+        let out = handle_chat_stream(
+            &stub_block(),
+            &ctx,
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat/stream", "user-a"),
+            chat_body(&thread_id),
+        )
+        .await;
+        let buf = out
+            .collect_buffered()
+            .await
+            .expect("the SSE stream completes");
+        let sse = String::from_utf8(buf.body).expect("SSE body is utf8");
+
+        assert!(
+            sse.contains(FIXTURE_REPLY),
+            "the provider's answer must be forwarded as a frame, got: {sse}"
+        );
+        assert!(
+            sse.ends_with("data: [DONE]\n\n"),
+            "a refused request ends in `event: error`, got: {sse}"
+        );
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(requests[0]["max_tokens"], FIXTURE_MAX_TOKENS);
+    }
+
+    /// A caller may ask for a budget of its own, and that is what is sent.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_caller_supplied_max_tokens_overrides_the_configured_default() {
+        let (ctx, thread_id, fake) = anthropic_fixture().await;
+        let body = InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "thread_id": thread_id,
+                "message": "hi",
+                "max_tokens": 77,
+            }))
+            .expect("body"),
+        );
+
+        let out = handle_chat(
+            &stub_block(),
+            &ctx,
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+            body,
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 200);
+        assert_eq!(fake.requests()[0]["max_tokens"], 77);
+    }
+
+    /// Zero tokens is a request for no answer at all — Anthropic answers 400
+    /// to it — so it is refused here, before the user turn is stored and
+    /// before the provider is paid for a round-trip.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_zero_max_tokens_is_refused_without_reaching_the_provider() {
+        let (ctx, thread_id, fake) = anthropic_fixture().await;
+        let body = InputStream::from_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "thread_id": thread_id,
+                "message": "hi",
+                "max_tokens": 0,
+            }))
+            .expect("body"),
+        );
+
+        let out = handle_chat(
+            &stub_block(),
+            &ctx,
+            &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+            body,
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 400);
+        assert!(
+            fake.requests().is_empty(),
+            "nothing may reach the provider for a request that cannot be answered"
+        );
+        assert!(
+            messages_list(
+                &ctx,
+                &crate::test_support::auth_msg("retrieve", "/b/llm/api/chat", "user-a"),
+                &thread_id,
+            )
+            .await
+            .expect("the history read succeeds")
+            .is_empty(),
+            "the refused turn must not be stored"
+        );
+    }
+
+    /// The budget reaches an OpenAI-protocol provider as
+    /// `max_completion_tokens`, and `max_tokens` is nowhere on the wire.
+    ///
+    /// This is the field the same fix would otherwise have broken: making the
+    /// budget always present means an OpenAI *reasoning* model — selectable
+    /// from `/v1/models` discovery like any other — starts refusing every
+    /// chat with `unsupported_parameter` if the deprecated spelling goes out.
+    /// The encoder tests pin the body; this pins that a real chat request
+    /// travelling through the real provider service arrives that way.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_chat_to_an_openai_provider_sends_max_completion_tokens() {
+        use crate::blocks::llm::providers::fake_provider::FakeProvider;
+
+        let fake = FakeProvider::openai(FIXTURE_REPLY).await;
+        let (ctx, thread_id) = fixture_for(&fake).await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], FIXTURE_REPLY);
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(requests[0]["max_completion_tokens"], FIXTURE_MAX_TOKENS);
+        assert!(
+            requests[0].get("max_tokens").is_none(),
+            "OpenAI's reasoning models refuse `max_tokens`, got: {}",
+            requests[0]
+        );
+    }
+
+    /// The inverse for an OpenAI-*compatible* server: `max_tokens` is the
+    /// spelling Ollama, vLLM and the hosted gateways know, and a budget that
+    /// landed in a field they ignore would be an uncapped reply with no sign
+    /// anything was wrong.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_chat_to_an_openai_compatible_provider_sends_max_tokens() {
+        use crate::blocks::llm::providers::fake_provider::FakeProvider;
+
+        let fake = FakeProvider::openai_compatible(FIXTURE_REPLY).await;
+        let (ctx, thread_id) = fixture_for(&fake).await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], FIXTURE_REPLY);
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(requests[0]["max_tokens"], FIXTURE_MAX_TOKENS);
+        assert!(
+            requests[0].get("max_completion_tokens").is_none(),
+            "a compatible server gets the only spelling it knows, got: {}",
+            requests[0]
+        );
+    }
+
     /// Once the reply passes the buffering cap, nothing after it is kept.
     ///
     /// The check was per delta, so a delta that overflowed was skipped and the
@@ -504,6 +839,63 @@ mod tests {
             "a delta after the cap must not be spliced onto the prefix"
         );
         assert_eq!(body["truncated"], true, "and the reply says it is partial");
+    }
+
+    /// A reply the model cut at the budget says so.
+    ///
+    /// The budget this PR introduces is a ceiling every chat now carries, so
+    /// hitting it is an ordinary outcome — and `handle_chat` read only
+    /// `chunk.delta`, dropping the `finish_reason` beside it. The answer came
+    /// back `truncated: false`: a fragment ending mid-sentence, published as
+    /// a complete reply, with nothing anywhere to say otherwise. Both
+    /// decoders already produce `FinishReason::Length` from the provider's
+    /// own terminal field.
+    #[tokio::test]
+    async fn a_reply_stopped_by_the_token_budget_is_reported_as_truncated() {
+        use wafer_core::clients::llm::FinishReason;
+
+        let (ctx, thread_id, _chat_calls) = chat_fixture_answering(vec![
+            ChatChunk::text("The three causes are, first"),
+            ChatChunk::finish(FinishReason::Length, None),
+        ])
+        .await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["content"], "The three causes are, first");
+        assert_eq!(
+            body["truncated"], true,
+            "a reply cut at the budget is not a complete answer"
+        );
+    }
+
+    /// The flag stays off for a reply the model finished on its own, so
+    /// `truncated` keeps meaning something.
+    #[tokio::test]
+    async fn a_reply_the_model_finished_is_not_reported_as_truncated() {
+        let (ctx, thread_id, _chat_calls) = chat_fixture().await;
+
+        let body = crate::test_support::output_json(
+            handle_chat(
+                &stub_block(),
+                &ctx,
+                &crate::test_support::auth_msg("create", "/b/llm/api/chat", "user-a"),
+                chat_body(&thread_id),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(body["truncated"], false);
     }
 
     /// A user turn the store refused must not be followed by a model call.

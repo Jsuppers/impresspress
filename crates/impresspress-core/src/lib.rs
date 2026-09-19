@@ -59,6 +59,7 @@ pub mod flows;
 pub mod http;
 pub mod isolate_cell;
 pub mod kv;
+pub mod llm_target;
 pub mod llm_wire;
 pub mod log_level;
 pub mod metrics;
