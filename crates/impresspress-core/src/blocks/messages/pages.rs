@@ -131,7 +131,12 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
                     hx-post="/b/messages/api/contexts"
                     hx-target="#context-list"
                     hx-swap="afterbegin"
-                    hx-on--after-request="if(event.detail.successful){this.reset()}"
+                    // The swap has just put a row in the list, so the empty
+                    // state is now false. It is removed here rather than
+                    // re-rendered server-side: the response is one row, and
+                    // re-sending the whole list to delete one sentence would
+                    // cost every reader the scroll position.
+                    hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('context-list-empty')?.remove();}"
                 {
                     div .form-group {
                         label .form-label for="new-context-type" { "Type" }
@@ -152,7 +157,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
 
         div #context-list .messages-list {
             @if contexts.is_empty() {
-                div .messages-list__empty {
+                div #context-list-empty .messages-list__empty {
                     p { "No contexts yet — create one above." }
                 }
             } @else {
@@ -380,7 +385,7 @@ fn render_default_view(
 
         div #entries-list .entries-list--scroll .mb-6 {
             @if entries.is_empty() {
-                div .text-center .text-muted .p-8 {
+                div #entries-empty .text-center .text-muted .p-8 {
                     "No entries yet. Add one below."
                 }
             } @else {
@@ -398,7 +403,9 @@ fn render_default_view(
                 hx-post=(post_url)
                 hx-target="#entries-list"
                 hx-swap="beforeend"
-                hx-on--after-request="if(event.detail.successful){this.reset();var list=document.getElementById('entries-list');list.scrollTop=list.scrollHeight;}"
+                // `#entries-empty` is the "No entries yet" line, now
+                // contradicted by the entry this swap appended.
+                hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('entries-empty')?.remove();var list=document.getElementById('entries-list');list.scrollTop=list.scrollHeight;}"
             {
                 div .flex .gap-2 .mb-2 {
                     select .form-input .w-auto name="kind" {
@@ -490,7 +497,7 @@ fn render_conversation_messages(entries: &[db::Record]) -> Result<Markup, WaferE
     Ok(html! {
         div #entries-list {
             @if cards.is_empty() {
-                div .text-center .text-muted .p-8 {
+                div #entries-empty .text-center .text-muted .p-8 {
                     "No messages yet. Send the first one below."
                 }
             } @else {
@@ -511,7 +518,9 @@ fn render_conversation_composer(post_url: &str) -> Markup {
             // Scroll the parent `.chat-messages` (the chat_page template's
             // pane wrapper) — `#entries-list` itself is no longer a scroll
             // container in the conversation view (see render_conversation_messages).
-            hx-on--after-request="if(event.detail.successful){this.reset();var list=document.getElementById('entries-list').parentElement;list.scrollTop=list.scrollHeight;}"
+            // `#entries-empty` is the "No messages yet" line, now
+            // contradicted by the message this swap appended.
+            hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('entries-empty')?.remove();var list=document.getElementById('entries-list').parentElement;list.scrollTop=list.scrollHeight;}"
         {
             // Hidden defaults: kind=message, role=user. Conversation lens is
             // an opinionated view — composers below the fold (settings page,
@@ -767,15 +776,33 @@ mod form_contract_tests {
         test_support::{admin_msg, output_html},
     };
 
-    fn task_context() -> db::Record {
+    fn context_of_type(context_type: &str) -> db::Record {
         let mut record = db::Record {
             id: "ctx-1".to_string(),
             data: std::collections::HashMap::new(),
         };
         record
             .data
-            .insert("type".to_string(), serde_json::json!("task"));
+            .insert("type".to_string(), serde_json::json!(context_type));
         record
+    }
+
+    /// The empty state an empty list renders, and the handler that removes it,
+    /// name the same element.
+    ///
+    /// A successful swap has just put a row into the list, so the sentence
+    /// saying there is none is false from that moment until the next page
+    /// load. Asserted on both ends because an id that only one side spells is
+    /// exactly how this stops working.
+    fn assert_drops_empty_state(html: &str, id: &str) {
+        assert!(
+            html.contains(&format!(r#"id="{id}""#)),
+            "an empty list must render #{id}; got: {html}"
+        );
+        assert!(
+            html.contains(&format!("getElementById('{id}')?.remove()")),
+            "the form that fills the list must drop #{id}; got: {html}"
+        );
     }
 
     fn assert_posts_form_fields(html: &str, post_url: &str, fields: &[&str]) {
@@ -804,22 +831,12 @@ mod form_contract_tests {
         )
         .await;
         assert_posts_form_fields(&html, "/b/messages/api/contexts", &["type", "title"]);
+        assert_drops_empty_state(&html, "context-list-empty");
     }
 
     #[test]
     fn the_conversation_composer_posts_the_fields_add_entry_reads() {
-        let html =
-            render_conversation_composer("/b/messages/api/contexts/ctx-1/entries").into_string();
-        assert_posts_form_fields(
-            &html,
-            "/b/messages/api/contexts/ctx-1/entries",
-            &["kind", "role", "content"],
-        );
-    }
-
-    #[test]
-    fn the_default_view_composer_posts_the_fields_add_entry_reads() {
-        let html = render_context_detail_body(&task_context(), &[], &[], "ctx-1")
+        let html = render_context_detail_body(&context_of_type("conversation"), &[], &[], "ctx-1")
             .expect("the fixture row decodes")
             .into_string();
         assert_posts_form_fields(
@@ -827,5 +844,19 @@ mod form_contract_tests {
             "/b/messages/api/contexts/ctx-1/entries",
             &["kind", "role", "content"],
         );
+        assert_drops_empty_state(&html, "entries-empty");
+    }
+
+    #[test]
+    fn the_default_view_composer_posts_the_fields_add_entry_reads() {
+        let html = render_context_detail_body(&context_of_type("task"), &[], &[], "ctx-1")
+            .expect("the fixture row decodes")
+            .into_string();
+        assert_posts_form_fields(
+            &html,
+            "/b/messages/api/contexts/ctx-1/entries",
+            &["kind", "role", "content"],
+        );
+        assert_drops_empty_state(&html, "entries-empty");
     }
 }

@@ -746,31 +746,52 @@ pub fn urlencode(s: &str) -> String {
 
 /// Parse a URL-encoded form body (htmx default) into a HashMap. Thin wrapper
 /// over [`url::form_urlencoded::parse`], which handles `+`→space and `%XX`
-/// decoding. Repeated keys collapse to the last value (the existing behaviour).
+/// decoding. Repeated keys collapse to the last value (the existing behaviour);
+/// a field that can legitimately be posted more than once needs
+/// [`form_values`] instead.
 pub fn parse_form_body(data: &[u8]) -> HashMap<String, String> {
     url::form_urlencoded::parse(data).into_owned().collect()
 }
 
+/// Every value posted under `key`, in wire order.
+///
+/// The half of a form body [`parse_form_body`]'s last-wins map cannot express.
+/// A control that can post its own name more than once — a multi-select, a
+/// checkbox group, or a client serialising an array — sends `k=a&k=b`, and
+/// reading that through the map silently keeps only `b`.
+pub fn form_values(data: &[u8], key: &str) -> Vec<String> {
+    url::form_urlencoded::parse(data)
+        .filter(|(k, _)| k == key)
+        .map(|(_, value)| value.into_owned())
+        .collect()
+}
+
 /// Parse a request body as either JSON or URL-encoded form into a JSON Value.
 ///
-/// Inspects the first non-whitespace byte: `{` → JSON, anything else →
-/// URL-encoded form (then promoted to a flat object). Lets one handler
-/// accept both htmx form posts and programmatic JSON clients without
+/// Inspects the first non-whitespace byte: `{` or `[` → JSON, anything else →
+/// URL-encoded form (then promoted to a flat object of strings). Lets one
+/// handler accept both htmx form posts and programmatic JSON clients without
 /// duplicating parse logic.
-pub fn parse_body_value(data: &[u8]) -> serde_json::Value {
+///
+/// A body that announces itself as JSON and then fails to parse is returned as
+/// the `serde_json` error, position and reason intact. Swallowing it into
+/// `Value::Null` cost the caller that sentence: every malformed JSON body came
+/// back to the client as "invalid type: null, expected struct …", which names
+/// neither the offending byte nor the fact that the body was not JSON at all.
+/// The form branch cannot fail — `form_urlencoded::parse` accepts any bytes.
+pub fn parse_body_value(data: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
     let trimmed_start = data
         .iter()
         .position(|b| !b.is_ascii_whitespace())
         .unwrap_or(0);
     if data.get(trimmed_start) == Some(&b'{') || data.get(trimmed_start) == Some(&b'[') {
-        serde_json::from_slice(data).unwrap_or(serde_json::Value::Null)
-    } else {
-        let mut obj = serde_json::Map::new();
-        for (k, v) in parse_form_body(data) {
-            obj.insert(k, serde_json::Value::String(v));
-        }
-        serde_json::Value::Object(obj)
+        return serde_json::from_slice(data);
     }
+    let mut obj = serde_json::Map::new();
+    for (k, v) in parse_form_body(data) {
+        obj.insert(k, serde_json::Value::String(v));
+    }
+    Ok(serde_json::Value::Object(obj))
 }
 
 /// Encode client-side [`Filter`](wafer_block::db::Filter)s as all-leaf wire
@@ -1026,6 +1047,58 @@ mod tests {
     fn parse_form_body_decodes_percent_escapes() {
         let parsed = parse_form_body(b"k=a%2Fb");
         assert_eq!(parsed.get("k"), Some(&"a/b".to_string()));
+    }
+
+    #[test]
+    fn form_values_keeps_every_value_a_repeated_key_carries() {
+        assert_eq!(form_values(b"k=a&k=b&other=c", "k"), vec!["a", "b"]);
+        assert_eq!(form_values(b"k=a+b&k=c%2Fd", "k"), vec!["a b", "c/d"]);
+        assert_eq!(form_values(b"k=", "k"), vec![""]);
+        assert!(form_values(b"k=a", "absent").is_empty());
+        // The last-wins map is what it cannot express.
+        assert_eq!(
+            parse_form_body(b"k=a&k=b").get("k").map(String::as_str),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn parse_body_value_reads_json_and_form_bodies() {
+        assert_eq!(
+            parse_body_value(br#"{"a":1}"#).expect("JSON object"),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_body_value(b"  [1,2]").expect("JSON array after whitespace"),
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(
+            parse_body_value(b"a=1&b=two+words").expect("a form body cannot fail"),
+            serde_json::json!({"a": "1", "b": "two words"}),
+            "form fields are strings — a form cannot say `1` the number"
+        );
+        assert_eq!(
+            parse_body_value(b"").expect("an empty body is an empty form"),
+            serde_json::json!({})
+        );
+    }
+
+    /// A body that opens with `{` claims to be JSON, so a failure to parse it
+    /// is a JSON error and must be reported as one. Returning `Value::Null`
+    /// instead handed the caller's `from_value` a type mismatch to describe,
+    /// and the byte position and reason were gone by then.
+    #[test]
+    fn a_malformed_json_body_reports_where_it_broke() {
+        let err = parse_body_value(b"{oops").expect_err("`{oops` is not JSON");
+        let message = err.to_string();
+        assert!(
+            message.contains("line 1 column 2"),
+            "the error must keep its position, got: {message}"
+        );
+        assert!(
+            message.contains("key must be a string"),
+            "the error must keep its reason, got: {message}"
+        );
     }
 
     #[test]

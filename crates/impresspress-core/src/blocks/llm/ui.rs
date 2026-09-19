@@ -145,8 +145,11 @@ fn cannot_manage_providers_notice() -> Markup {
 /// A plain htmx form: it posts `application/x-www-form-urlencoded`, which is
 /// what the handler parses. Nothing here reshapes the body in the browser —
 /// the `models` text input and the `enabled` checkbox are coerced by
-/// `routes::providers::parse_create_provider_body`, so a submit with
-/// JavaScript disabled carries the same meaning as one without.
+/// `routes::providers::parse_create_provider_body`, which is one description
+/// of the field shapes instead of two.
+///
+/// Like every control on this page it needs htmx: there is no `action` or
+/// `method`, so the submit is htmx's or it is nothing.
 ///
 /// `hx-swap="none"` because the response is the created provider as JSON for
 /// SDK callers; the page picks up the new row by reloading.
@@ -154,7 +157,6 @@ fn add_provider_form() -> Markup {
     html! {
         form
             hx-post="/b/llm/api/providers"
-            hx-target="body"
             hx-swap="none"
             hx-on--after-request="if(event.detail.successful){location.reload()}"
         {
@@ -557,20 +559,42 @@ mod tests {
         }
     }
 
-    /// What makes the assertion above true rather than merely asserted: the
-    /// only htmx the chrome serves is the core library, which carries no
-    /// extension of any kind. Ship one and this test is the place that says
-    /// `hx-ext` may be used again.
+    /// What makes the assertion above true rather than merely asserted: no
+    /// script this deployment serves mentions json-enc, so nothing can be
+    /// registering it. Scanning htmx alone would have missed a
+    /// `htmx.defineExtension('json-enc', …)` in the shared chrome or in a
+    /// block's own bundle, which is exactly where a hand-rolled one would go.
+    ///
+    /// Ship an extension and this test is the place that says `hx-ext` may be
+    /// used again.
     #[cfg(feature = "embed-assets")]
     #[test]
-    fn the_chrome_ships_no_htmx_extension() {
-        let htmx = crate::ui::assets::bytes("htmx.min.js").expect("htmx.min.js is embedded");
-        let htmx = String::from_utf8_lossy(htmx);
-        assert!(
-            !htmx.contains("json-enc"),
-            "htmx.min.js now mentions json-enc — check whether an extension is \
-             registered before trusting `hx-ext`"
-        );
+    fn no_shipped_script_registers_a_json_enc_extension() {
+        let mut scanned: Vec<&str> = Vec::new();
+        for asset in crate::ui::assets::ASSETS {
+            if !asset.logical.ends_with(".js") {
+                continue;
+            }
+            // A block's bundle is in the manifest even when that block is not
+            // compiled into this build; only the embedded ones can be read.
+            let Some(bytes) = crate::ui::assets::bytes(asset.logical) else {
+                continue;
+            };
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("json-enc"),
+                "{} mentions json-enc — check whether an extension is now \
+                 registered before trusting `hx-ext`",
+                asset.logical
+            );
+            scanned.push(asset.logical);
+        }
+        // Without this the scan passes whether it read anything or not.
+        for required in ["htmx.min.js", "chrome.js"] {
+            assert!(
+                scanned.contains(&required),
+                "the scan must reach {required}; it read {scanned:?}"
+            );
+        }
     }
 
     #[test]

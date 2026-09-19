@@ -85,7 +85,11 @@ pub async fn list_contexts(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// and render as its own source text.
 pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let raw = input.collect_to_bytes().await;
-    let body: CreateContextRequest = match serde_json::from_value(parse_body_value(&raw)) {
+    let parsed = match parse_body_value(&raw) {
+        Ok(value) => value,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
+    let body: CreateContextRequest = match serde_json::from_value(parsed) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
@@ -182,7 +186,11 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
         Err(resp) => return resp,
     };
     let raw = input.collect_to_bytes().await;
-    let body: AddEntryRequest = match serde_json::from_value(parse_body_value(&raw)) {
+    let parsed = match parse_body_value(&raw) {
+        Ok(value) => value,
+        Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
+    };
+    let body: AddEntryRequest = match serde_json::from_value(parsed) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };

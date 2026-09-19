@@ -219,7 +219,11 @@ pub(in crate::blocks::llm) async fn list_providers(
 ///
 /// The form values that are not strings in the contract are coerced here, and
 /// only here: `models` is one comma-separated text input, and `enabled` is a
-/// checkbox, which posts nothing at all when the admin unticks it. The rest
+/// checkbox, which posts nothing at all when the admin unticks it. `models` is
+/// read through [`crate::util::form_values`] rather than the last-wins map, so
+/// a client that spells the list as a repeated key (`models=a&models=b`, which
+/// is how urlencoded serialisation writes an array) is understood to mean both
+/// rather than silently reduced to the last one. The rest
 /// of the map is handed to serde untouched, so `deny_unknown_fields` still
 /// refuses an `api_key` by name on the form path too — which is the whole
 /// point of that attribute (see [`CreateProviderRequest`]).
@@ -235,9 +239,11 @@ fn parse_create_provider_body(raw: &[u8]) -> Result<CreateProviderRequest, Strin
         }
         fields.insert(key.clone(), serde_json::Value::String(value.clone()));
     }
-    if let Some(models) = form.get("models") {
-        let models: Vec<serde_json::Value> = models
-            .split(',')
+    let posted_models = crate::util::form_values(raw, "models");
+    if !posted_models.is_empty() {
+        let models: Vec<serde_json::Value> = posted_models
+            .iter()
+            .flat_map(|value| value.split(','))
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(|m| serde_json::Value::String(m.to_string()))
@@ -1459,6 +1465,24 @@ mod form_body_tests {
         let body = TICKED_FORM.replace("models=gpt-4o%2C+gpt-4o-mini", "models=");
         let created = output_json(create_from_form(&body).await).await;
         assert_eq!(created["models"], serde_json::json!([]));
+    }
+
+    /// A list spelled as a repeated key is the other way a form can carry one,
+    /// and it is what urlencoded serialisation writes for an array. The
+    /// last-wins map behind `parse_form_body` would have kept `gpt-4o-mini`
+    /// alone — the same silent single-model failure that ruled out keeping the
+    /// browser-side hook.
+    #[tokio::test]
+    async fn a_repeated_models_key_keeps_every_model() {
+        let body = TICKED_FORM.replace(
+            "models=gpt-4o%2C+gpt-4o-mini",
+            "models=gpt-4o&models=gpt-4o-mini",
+        );
+        let created = output_json(create_from_form(&body).await).await;
+        assert_eq!(
+            created["models"],
+            serde_json::json!(["gpt-4o", "gpt-4o-mini"])
+        );
     }
 
     /// `deny_unknown_fields` is on `CreateProviderRequest` so an inline
