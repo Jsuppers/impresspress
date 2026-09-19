@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::auth::repo::provider_links::{upsert, NewLink},
-        test_support::{anon_msg, auth_msg, output_html, output_status, TestContext},
+        test_support::{anon_msg, auth_msg, output_html, output_json, output_status, TestContext},
     };
 
     async fn seed_user(ctx: &TestContext, user_id: &str) {
@@ -325,6 +325,90 @@ mod tests {
         assert!(html.contains("/b/auth/api/change-password"));
         assert!(html.contains("name=\"current_password\""));
         assert!(html.contains("name=\"new_password\""));
+    }
+
+    /// The form and the endpoint it posts to are one surface, and asserting
+    /// on the rendered strings alone does not check that they still meet:
+    /// this form is htmx, so it sends `application/x-www-form-urlencoded`
+    /// under those names, and the handler read the body as JSON only — every
+    /// post this page made was answered `400 Invalid body` and no password
+    /// ever changed.
+    ///
+    /// So the bytes go through: the field names above, form-encoded, into the
+    /// real handler, proved by signing in afterwards with the new password.
+    #[tokio::test]
+    async fn the_change_password_form_is_answered_by_the_endpoint_it_posts_to() {
+        use wafer_run::InputStream;
+
+        use crate::blocks::auth_ui::api::{change_password, login, signup};
+
+        const OLD: &str = "original-horse-battery1";
+        const NEW: &str = "new-horse-battery-2026";
+        const EMAIL: &str = "portal-user@example.com";
+
+        // A password change needs a credential row, so the account is made
+        // the way a real one is.
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let (limiter, mail_msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let signed_up = output_json(
+            signup::handle(
+                &limiter,
+                &ctx,
+                &mail_msg,
+                InputStream::from_bytes(
+                    serde_json::json!({ "email": EMAIL, "password": OLD })
+                        .to_string()
+                        .into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        let user_id = signed_up["user"]["id"]
+            .as_str()
+            .expect("signup response carries user.id")
+            .to_string();
+
+        let page = security_page(
+            &ctx,
+            &auth_msg("retrieve", "/b/userportal/security", &user_id),
+        )
+        .await;
+        let html = output_html(page).await;
+        assert!(html.contains(r#"hx-post="/b/auth/api/change-password""#));
+
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("current_password", OLD)
+            .append_pair("new_password", NEW)
+            .finish();
+        let mut post = auth_msg("update", "/b/auth/api/change-password", &user_id);
+        post.set_meta("http.header.hx-request", "true");
+        let answer =
+            change_password::handle(&ctx, &post, InputStream::from_bytes(form.into_bytes())).await;
+        assert_eq!(
+            output_status(answer).await,
+            200,
+            "the page's own form post must be accepted"
+        );
+
+        let signed_in = output_json(
+            login::handle(
+                &ctx,
+                InputStream::from_bytes(
+                    serde_json::json!({ "email": EMAIL, "password": NEW })
+                        .to_string()
+                        .into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            signed_in["access_token"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty()),
+            "the new password must authenticate"
+        );
     }
 
     #[tokio::test]
