@@ -7,9 +7,11 @@
 //! 2. If the row is `revoked = 1`, that token was already rotated away — a
 //!    legitimate client would only have the *current* token. Revoke the
 //!    entire family.
-//! 3. If the row is live, mark it revoked and insert a new row under the
-//!    same family ID with `generation + 1`. Return the new access + refresh
-//!    pair.
+//! 3. If the row is live, claim it with a compare-and-set revoke. The claim
+//!    is what keeps two concurrent refreshes of one token from both minting a
+//!    successor: exactly one wins, and the loser is answered as step 2.
+//! 4. The winner inserts a new row under the same family ID with
+//!    `generation + 1` and returns the new access + refresh pair.
 
 use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, OutputStream};
@@ -76,37 +78,15 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             // family to revoke; just refuse.
             return error_response(ErrorCode::InvalidToken, "Refresh token has been revoked");
         }
-        Err(e) => {
-            tracing::warn!("refresh: token lookup failed: {e}");
-            return error_response(ErrorCode::InvalidToken, "Invalid refresh token");
-        }
+        // A read that could not run says nothing about the token. "Revoked"
+        // is a statement about the credential, and making it for this
+        // deployment's own outage ends a session a working database would
+        // have kept — the same rule the account-state read below follows.
+        Err(e) => return err_internal("Refresh could not look the token up", e),
     };
 
     if row.revoked {
-        // SEC-039: a revoked token surfaced. If the family still has a live
-        // row, an attacker is replaying a stolen token after legitimate
-        // rotation. Burn the whole family.
-        //
-        // Both steps fail closed. An outage on the live-row check or on the
-        // revoke would leave the attacker's rotated family usable, so it is
-        // reported as an error rather than as the ordinary "revoked"
-        // rejection a replayed token gets — the same rule logout applies to
-        // its revocation writes.
-        let family_live = match tokens::family_has_live_row(ctx, &row.family).await {
-            Ok(live) => live,
-            Err(e) => return err_internal("Refresh could not check the token family", e),
-        };
-        if family_live {
-            tracing::warn!(
-                user_id = %row.user_id,
-                family = %row.family,
-                "refresh: token reuse detected; revoking entire family"
-            );
-            if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
-                return err_internal("Refresh could not revoke the token family", e);
-            }
-        }
-        return error_response(ErrorCode::InvalidToken, "Refresh token has been revoked");
+        return refuse_rotated_away(ctx, &row).await;
     }
 
     // Get user and verify account is still active. Use the typed repo so
@@ -117,10 +97,12 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         // The row is genuinely gone: the account was deleted while a refresh
         // token was still live. That is a revoked session.
         Ok(None) => return error_response(ErrorCode::NotAuthenticated, "User not found"),
-        // A read that could not run is not a revoked session. Answering 401
-        // signs the client out — the SDK discards its refresh token on that
-        // status — so a database blip logged every session out and the only
-        // trace of the outage was in this deployment's own logs.
+        // A read that could not run is not a revoked session. Reporting it as
+        // one tells the caller its credential is finished when nothing about
+        // the credential changed — `AuthService.refreshSession` in
+        // `packages/impresspress-js` raises the 401 as an `ImpresspressError`
+        // the app has to handle — while the real cause is visible only in
+        // this deployment's own logs.
         Err(e) => return err_internal("Refresh could not load the account", e),
     };
 
@@ -153,12 +135,21 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         .unwrap_or("password")
         .to_string();
 
-    // Atomic-ish rotation: mark the old row revoked *before* minting the
-    // replacement, so we never leave two live rows in a family. If issuance
-    // then fails the user simply gets logged out — a recoverable UX outcome.
-    if let Err(e) = tokens::revoke_by_id(ctx, &row.id).await {
-        tracing::warn!("refresh: failed to revoke prior token row: {e}");
-        return error_response(ErrorCode::InvalidToken, "Could not rotate refresh token");
+    // Claim the row before minting the replacement, so a family never holds
+    // two live generations. The claim is a compare-and-set
+    // ([`tokens::revoke_if_live`]): losing it means another request rotated
+    // this very token first, which is the same situation a replayed token is
+    // in and gets the same answer. If issuance then fails the user is logged
+    // out — recoverable, and the alternative is a live token nobody can
+    // account for.
+    match tokens::revoke_if_live(ctx, &row.id).await {
+        Ok(true) => {}
+        Ok(false) => return refuse_rotated_away(ctx, &row).await,
+        // The claim is the gate on minting a successor. A write that could
+        // not run leaves the presented token live, so issuing anyway would
+        // put a second live generation in the family — refuse, and say it was
+        // this deployment that failed.
+        Err(e) => return err_internal("Refresh could not rotate the token", e),
     }
 
     // Re-issue within the *preserved* family (SEC-039): passing
@@ -192,13 +183,54 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         })
 }
 
+/// Refuse a refresh token that is no longer its family's live generation, and
+/// burn the family if one still is (SEC-039).
+///
+/// Two ways in: the row was already `revoked` when it was read — a replay of a
+/// rotated-away token — or the compare-and-set claim on a live row lost to a
+/// concurrent rotation of the same token. Both mean someone is refreshing with
+/// a token that is not the current one, and neither can tell a stolen token
+/// from a client that sent two requests at once, so both get the same answer.
+///
+/// A live sibling in the family is what makes it an attack rather than a stale
+/// tab: the legitimate client holds the successor, so anyone presenting the
+/// predecessor has a copy. Both steps fail closed — an outage on the live-row
+/// check or on the family revoke would leave the replayed family usable, so it
+/// surfaces as an error rather than as the ordinary "revoked" rejection.
+async fn refuse_rotated_away(ctx: &dyn Context, row: &tokens::TokenRow) -> OutputStream {
+    let family_live = match tokens::family_has_live_row(ctx, &row.family).await {
+        Ok(live) => live,
+        Err(e) => return err_internal("Refresh could not check the token family", e),
+    };
+    if family_live {
+        tracing::warn!(
+            user_id = %row.user_id,
+            family = %row.family,
+            "refresh: token reuse detected; revoking entire family"
+        );
+        if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
+            return err_internal("Refresh could not revoke the token family", e);
+        }
+    }
+    error_response(ErrorCode::InvalidToken, "Refresh token has been revoked")
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use wafer_run::{BlockInfo, Message, ResourceType, WaferError};
+
     use super::*;
     use crate::{
         blocks::auth_ui::api::{login, signup},
+        db_read,
         test_support::{
-            collect_or_panic, output_is_error, output_json, FailingDbOpContext, TestContext,
+            collect_or_panic, output_http_json, output_is_error, output_json, FailingDbOpContext,
+            TestContext,
         },
     };
 
@@ -299,12 +331,14 @@ mod tests {
         );
     }
 
-    /// The account-state read answered `Unauthenticated: User not found` for
-    /// both `Ok(None)` and `Err`, so a database outage signed every client
-    /// out: the SDK discards its refresh token on a 401 and the user is back
-    /// at the login form, with the deployment's own logs the only place the
-    /// outage appears. A live token whose user row could not be read is an
-    /// error, not a revocation.
+    /// A live token whose user row could not be read is an error, not a
+    /// revocation: `Ok(None)` and `Err` are different answers, and collapsing
+    /// them told every client its session was over whenever the database
+    /// blinked. The SDK does not silently recover — `AuthService.refreshSession`
+    /// raises the 401 as an `ImpresspressError` and keeps the token pair it
+    /// cached (only `signOut` clears it) — so the app sees a hard refresh
+    /// failure and the deployment's own logs are the only place the real cause
+    /// appears.
     #[tokio::test]
     async fn an_unreadable_user_row_does_not_sign_a_live_token_out() {
         let ctx = TestContext::with_auth_and_crypto().await;
@@ -318,6 +352,236 @@ mod tests {
         assert!(
             output_is_error(out, "Internal").await,
             "a failed account-state read must not be answered as a revoked session"
+        );
+    }
+
+    /// A lookup that could not run says nothing about the token, so it cannot
+    /// be answered as "this token is finished".
+    #[tokio::test]
+    async fn a_token_lookup_outage_is_not_reported_as_a_revoked_session() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        // The first `database.list` on the tokens table a refresh makes is
+        // `find_by_token`, so no `after_passing` is needed here.
+        let failing = FailingDbOpContext::new(ctx, vec![("database.list", tokens::TABLE)]);
+
+        let out = handle(&failing, refresh_with(&token)).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a token lookup that could not run must not be answered as a revoked session"
+        );
+    }
+
+    /// The rotation claim is the gate on minting a successor: if it could not
+    /// run, the presented token is still live and issuing anyway would leave
+    /// two live generations in the family.
+    #[tokio::test]
+    async fn a_rotation_claim_that_could_not_run_is_not_reported_as_a_plain_rejection() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        let failing =
+            FailingDbOpContext::new(ctx, vec![("database.update_where_count", tokens::TABLE)]);
+
+        let out = handle(&failing, refresh_with(&token)).await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a rotation claim that could not run must surface as an error, not as an ordinary 401"
+        );
+    }
+
+    /// The refresh row IS the token: `handle` refuses any refresh JWT whose
+    /// hash has no row. A rotation whose new row cannot be written must
+    /// therefore hand out nothing — the alternative is a 200 carrying a pair
+    /// the very next refresh rejects, on a family whose previous generation
+    /// this request already revoked.
+    #[tokio::test]
+    async fn a_rotation_that_cannot_store_its_row_hands_out_no_tokens() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        // Signup and login are already done, so the only `database.create`
+        // left on the tokens table is the rotation's own insert.
+        let failing = FailingDbOpContext::new(ctx, vec![("database.create", tokens::TABLE)]);
+
+        let body = output_http_json(handle(&failing, refresh_with(&token)).await).await;
+
+        assert_eq!(
+            body["error"], "Internal",
+            "a refresh row that could not be written is this deployment failing: {body}"
+        );
+        assert!(
+            body.get("access_token").is_none() && body.get("refresh_token").is_none(),
+            "no row, no token — the response must not carry a credential: {body}"
+        );
+    }
+
+    /// Wraps a [`TestContext`] and holds the first `n` refresh-token LOOKUPS
+    /// open until all `n` have arrived.
+    ///
+    /// Rotation is a read of the row followed by a write claiming it, and the
+    /// bug this pins lives in the window between them. Two plain concurrent
+    /// requests do not reliably open that window — the first can finish its
+    /// whole rotation before the second reads — so the rendezvous puts both
+    /// requests past the read, holding the same live row, before either is
+    /// allowed to claim it.
+    ///
+    /// Only the first `n` matching calls are held; every later one (the
+    /// loser's family check, for instance) passes straight through, so the
+    /// barrier is never waited on by a third arrival that has no partner.
+    #[derive(Clone)]
+    struct RendezvousOnTokenLookup {
+        inner: TestContext,
+        /// Matching calls still to be held. Shared across clones — the
+        /// handler's `clone_arc` must see the same countdown.
+        holds_left: Arc<AtomicUsize>,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    /// Every `wafer-run/database` request carries a `collection`; the rest of
+    /// the fields are irrelevant here and serde drops them.
+    #[derive(serde::Deserialize)]
+    struct CollectionPeek {
+        collection: String,
+    }
+
+    impl RendezvousOnTokenLookup {
+        fn new(inner: TestContext, n: usize) -> Self {
+            Self {
+                inner,
+                holds_left: Arc::new(AtomicUsize::new(n)),
+                barrier: Arc::new(tokio::sync::Barrier::new(n)),
+            }
+        }
+
+        /// Claim one of the holds. `true` while any are left.
+        fn take_hold(&self) -> bool {
+            self.holds_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Context for RendezvousOnTokenLookup {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: ResourceType,
+            is_write: bool,
+        ) -> Result<(), WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+            if !(name == "wafer-run/database" && msg.action() == "database.list") {
+                return self.inner.call_block(name, msg, input).await;
+            }
+            let bytes = input.collect_to_bytes().await;
+            let on_tokens = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+                .map(|p| p.collection == tokens::TABLE)
+                .unwrap_or(false);
+            let out = self
+                .inner
+                .call_block(name, msg, InputStream::from_bytes(bytes))
+                .await;
+            // Park AFTER the read has been answered: the row is in hand and no
+            // database lock is held while we wait for the other request.
+            if on_tokens && self.take_hold() {
+                self.barrier.wait().await;
+            }
+            out
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> Arc<dyn Context> {
+            Arc::new(self.clone())
+        }
+    }
+
+    /// Two requests presenting the SAME live refresh token, each on its own
+    /// worker thread, both past the row read before either claims it.
+    ///
+    /// Only one may rotate. The claim is a compare-and-set, so the loser is
+    /// told its token is gone instead of being handed a second live
+    /// generation in the family — which is what an unconditional revoke gave
+    /// it, leaving a stolen token that refreshes forever and never trips
+    /// reuse detection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_refreshes_of_one_token_mint_one_pair() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        let family = tokens::find_by_token(&ctx, &token)
+            .await
+            .expect("token lookup")
+            .expect("the login's row")
+            .family;
+        let gated = RendezvousOnTokenLookup::new(ctx.clone(), 2);
+
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let gated = gated.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    output_http_json(handle(&gated, refresh_with(&token)).await).await
+                })
+            })
+            .collect();
+
+        let mut bodies = Vec::new();
+        for racer in racers {
+            bodies.push(
+                tokio::time::timeout(std::time::Duration::from_secs(30), racer)
+                    .await
+                    .expect("both requests must reach the rendezvous and finish")
+                    .expect("refresh task panicked"),
+            );
+        }
+
+        let minted = bodies
+            .iter()
+            .filter(|b| b["refresh_token"].is_string())
+            .count();
+        assert_eq!(
+            minted, 1,
+            "exactly one of two concurrent refreshes of one token may mint a pair: {bodies:?}"
+        );
+        let loser = bodies
+            .iter()
+            .find(|b| !b["refresh_token"].is_string())
+            .expect("one request must lose the claim");
+        assert_eq!(
+            loser["message"], "Refresh token has been revoked",
+            "the request that lost the claim gets the reuse answer: {loser}"
+        );
+
+        let rows = db_read::list_every(
+            &ctx,
+            tokens::TABLE,
+            vec![wafer_block::db::Filter {
+                field: "family".into(),
+                operator: wafer_block::db::FilterOp::Equal,
+                value: serde_json::json!(family),
+            }],
+        )
+        .await
+        .expect("read the family back");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the family holds the rotated-away row and ONE successor, not two: {rows:?}"
         );
     }
 }

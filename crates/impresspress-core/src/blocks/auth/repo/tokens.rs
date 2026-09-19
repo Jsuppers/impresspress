@@ -132,14 +132,40 @@ pub async fn family_has_live_row(ctx: &dyn Context, family: &str) -> Result<bool
     Ok(!records.is_empty())
 }
 
-/// Mark a single row as revoked.
-pub async fn revoke_by_id(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
+/// Claim a single row for rotation: mark it revoked, but only while it is
+/// still live.
+///
+/// Compare-and-set. `revoked = false` is part of the UPDATE's own `WHERE`, so
+/// the read the caller did beforehand cannot go stale between the two: the
+/// backend evaluates the condition and the write in one statement. Returns
+/// `true` when this caller is the one that revoked the row, `false` when the
+/// row was already revoked by the time the statement ran (or has gone).
+///
+/// `false` is the SEC-039 reuse signal. Rotation is a read-then-write, and
+/// nothing in the schema stops two live generations in a family — the UNIQUE
+/// index covers `token_hash` alone. Without the condition, two requests
+/// carrying the same refresh token both read a live row, both revoke it, and
+/// both mint a successor, so the family ends up with two live tokens and the
+/// stolen one refreshes forever without ever surfacing as reuse.
+pub async fn revoke_if_live(ctx: &dyn Context, id: &str) -> Result<bool, WaferError> {
+    let filters = vec![
+        Filter {
+            field: "id".into(),
+            operator: FilterOp::Equal,
+            value: json!(id),
+        },
+        Filter {
+            field: "revoked".into(),
+            operator: FilterOp::Equal,
+            value: json!(false),
+        },
+    ];
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("revoked".into(), json!(true));
-    db::update(ctx, TABLE, id, data)
+    let n = db::update_by_filters_count(ctx, TABLE, filters, data)
         .await
-        .map_err(|e| db_failed("tokens revoke_by_id", e))?;
-    Ok(())
+        .map_err(|e| db_failed("tokens revoke_if_live", e))?;
+    Ok(n > 0)
 }
 
 /// Mark every row in `family` as revoked. Used both for normal logout-style
@@ -281,7 +307,7 @@ mod tests {
             .await
             .unwrap();
         let old = find_by_token(&ctx, "tok-v0").await.unwrap().unwrap();
-        revoke_by_id(&ctx, &old.id).await.unwrap();
+        assert!(revoke_if_live(&ctx, &old.id).await.unwrap());
         insert(&ctx, "user-1", "tok-v1", "fam-1", 1, &future_iso(3600))
             .await
             .unwrap();
@@ -309,7 +335,7 @@ mod tests {
             .await
             .unwrap();
         let old = find_by_token(&ctx, "tok-v0").await.unwrap().unwrap();
-        revoke_by_id(&ctx, &old.id).await.unwrap();
+        assert!(revoke_if_live(&ctx, &old.id).await.unwrap());
         insert(&ctx, "user-1", "tok-v1", "fam-1", 1, &future_iso(3600))
             .await
             .unwrap();
@@ -324,6 +350,29 @@ mod tests {
         let new = find_by_token(&ctx, "tok-v1").await.unwrap().unwrap();
         assert!(new.revoked, "rotation target should now be revoked too");
         assert!(!family_has_live_row(&ctx, "fam-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn only_the_first_claim_of_a_row_revokes_it() {
+        // The rotation claim is a compare-and-set, so the second caller to
+        // reach an already-revoked row is told it lost — the signal the
+        // refresh handler turns into reuse detection.
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-1", "u1@example.com").await;
+        insert(&ctx, "user-1", "tok-v0", "fam-1", 0, &future_iso(3600))
+            .await
+            .unwrap();
+        let row = find_by_token(&ctx, "tok-v0").await.unwrap().unwrap();
+
+        assert!(
+            revoke_if_live(&ctx, &row.id).await.unwrap(),
+            "the first claim revokes the live row"
+        );
+        assert!(
+            !revoke_if_live(&ctx, &row.id).await.unwrap(),
+            "a second claim of the same row must report that it lost"
+        );
+        assert!(!revoke_if_live(&ctx, "no-such-row").await.unwrap());
     }
 
     #[tokio::test]
