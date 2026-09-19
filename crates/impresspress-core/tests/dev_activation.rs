@@ -17,7 +17,7 @@ use impresspress_core::{
             generations::{self, GenerationCause, GenerationStatus, NewGeneration},
             runtime_state::{self, ActivationPhase, RuntimeState},
         },
-        test_support::FakeControl,
+        test_support::{dev_get, dev_post, dev_status, FakeControl},
         workspace::FileEntry,
         WAFER_GUEST_VERSION,
     },
@@ -27,21 +27,10 @@ use impresspress_core::{
     },
 };
 use serde_json::json;
-use wafer_run::OutputStream;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// `POST` a JSON body to a `/b/dev` route as an admin, through the router.
-async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
-}
-
-/// `GET` a `/b/dev` route as an admin, through the router.
-async fn dev_get(ctx: &TestContext, path: &str) -> OutputStream {
-    ctx.dispatch(admin_msg("retrieve", path)).await
-}
 
 /// Write `content` at `path`, expecting the file to hold `expected`.
 async fn write_file(
@@ -72,10 +61,6 @@ fn sha_of(content: &str) -> String {
     blobs::sha256_hex(content.as_bytes())
 }
 
-async fn status_of(ctx: &TestContext) -> serde_json::Value {
-    output_json(dev_get(ctx, "/b/dev/api/status").await).await
-}
-
 // ---------------------------------------------------------------------------
 // A site write publishes
 // ---------------------------------------------------------------------------
@@ -102,7 +87,7 @@ async fn a_site_write_creates_and_activates_a_generation_without_rebuilding_the_
         Some(b"<h1>v1</h1>".as_slice())
     );
 
-    let status = status_of(&ctx).await;
+    let status = dev_status(&ctx).await;
     assert_eq!(status["active_generation"]["id"], w["generation"]["id"]);
     // Nothing is in flight once the request has answered.
     assert_eq!(status["activation"], serde_json::Value::Null);
@@ -149,7 +134,7 @@ async fn block_source_writes_do_not_create_generations() {
         "only a compile publishes a block: {l}"
     );
     assert_eq!(
-        status_of(&ctx).await["active_generation"],
+        dev_status(&ctx).await["active_generation"],
         serde_json::Value::Null
     );
 
@@ -217,7 +202,7 @@ async fn compile_of(ctx: &TestContext, names: &[&str]) -> ActivationIntent {
 
 /// The block names the active generation declares, sorted.
 async fn active_block_names(ctx: &TestContext) -> Vec<String> {
-    let status = status_of(ctx).await;
+    let status = dev_status(ctx).await;
     let mut names: Vec<String> = status["blocks"]
         .as_array()
         .expect("blocks")
@@ -361,7 +346,7 @@ async fn a_failed_runtime_rebuild_leaves_the_previous_generation_active() {
     let control = FakeControl::new();
     let ctx = TestContext::with_dev(control.clone()).await;
     write_file(&ctx, "site/index.html", "v1", None).await;
-    let before = status_of(&ctx).await;
+    let before = dev_status(&ctx).await;
 
     control.fail_next_rebuild("wasmi: boom");
     // Task 8 stages a block; here drive the queue directly with a manifest
@@ -379,7 +364,7 @@ async fn a_failed_runtime_rebuild_leaves_the_previous_generation_active() {
         "{err:?}"
     );
 
-    let after = status_of(&ctx).await;
+    let after = dev_status(&ctx).await;
     assert_eq!(
         after["active_generation"]["id"],
         before["active_generation"]["id"]
@@ -424,7 +409,7 @@ async fn a_manifest_naming_content_that_is_not_stored_is_refused() {
     let l = output_json(dev_get(&ctx, "/b/dev/api/generations").await).await;
     assert_eq!(l["generations"][0]["status"], "failed");
     assert_eq!(
-        status_of(&ctx).await["active_generation"],
+        dev_status(&ctx).await["active_generation"],
         serde_json::Value::Null
     );
 }
@@ -1188,7 +1173,7 @@ async fn a_publish_that_fails_after_the_swap_restores_the_previous_runtime_and_s
     );
 
     // The previous generation is still live, still serving its own content.
-    let status = status_of(&ctx).await;
+    let status = dev_status(&ctx).await;
     assert_eq!(status["active_generation"]["id"], json!(active));
     assert_eq!(status["activation"], serde_json::Value::Null);
     assert_eq!(

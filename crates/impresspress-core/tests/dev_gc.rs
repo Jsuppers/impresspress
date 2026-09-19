@@ -27,7 +27,7 @@ use impresspress_core::{
             runtime_state::{self, ActivationPhase, RuntimeState},
         },
         retention,
-        test_support::FakeControl,
+        test_support::{dev_post, FakeControl},
         workspace::{self, FileEntry},
         WAFER_GUEST_VERSION,
     },
@@ -35,16 +35,10 @@ use impresspress_core::{
 };
 use serde_json::json;
 use wafer_core::clients::storage;
-use wafer_run::OutputStream;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// `POST` a JSON body to a `/b/dev` route as an admin, through the router.
-async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
-}
 
 /// Write `content` at `path`, expecting the file to hold `expected`, and
 /// return the sha the write reports.

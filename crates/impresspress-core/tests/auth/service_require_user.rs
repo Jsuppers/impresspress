@@ -10,10 +10,13 @@
 
 use std::{sync::Arc, time::Duration};
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{jwt_blocklist, pats, users},
-    service::{hash_token, AuthServiceImpl, BlockState},
+use impresspress_core::{
+    blocks::auth::{
+        migrations,
+        repo::{jwt_blocklist, pats, users},
+        service::{hash_token, AuthServiceImpl, BlockState},
+    },
+    test_support::seed_user,
 };
 use sha2::{Digest, Sha256};
 use wafer_core::interfaces::auth::service::{AuthError, AuthService};
@@ -27,21 +30,10 @@ fn msg_with_bearer(token: &str) -> Message {
     m
 }
 
-async fn seed_user(ctx: &dyn Context, email: &str) -> String {
-    users::insert(
-        ctx,
-        users::NewUser {
-            email: email.into(),
-            display_name: "R".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user")
-    .id
+/// A seeded account's id — every case here identifies its user by id, never
+/// by profile.
+async fn seed_user_id(ctx: &dyn Context, email: &str) -> String {
+    seed_user(email).display_name("R").insert(ctx).await.id
 }
 
 async fn fixture() -> (Arc<MigrationTestCtx>, Arc<dyn Context>) {
@@ -54,7 +46,7 @@ async fn fixture() -> (Arc<MigrationTestCtx>, Arc<dyn Context>) {
 #[tokio::test]
 async fn require_user_accepts_an_access_jwt_and_a_pat_and_rejects_missing_creds() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "r@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "r@example.com").await;
 
     let access = raw
         .mint_access_token(&uid, &[], Duration::from_secs(3600))
@@ -125,7 +117,7 @@ async fn require_user_accepts_an_access_jwt_and_a_pat_and_rejects_missing_creds(
 #[tokio::test]
 async fn require_user_accepts_the_auth_token_cookie() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "cookie-jwt@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "cookie-jwt@example.com").await;
     let access = raw
         .mint_access_token(&uid, &[], Duration::from_secs(3600))
         .await;
@@ -146,7 +138,7 @@ async fn require_user_accepts_the_auth_token_cookie() {
 #[tokio::test]
 async fn the_auth_token_cookie_is_still_verified() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "cookie-refresh@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "cookie-refresh@example.com").await;
     let refresh = raw
         .mint_access_token(
             &uid,
@@ -172,7 +164,7 @@ async fn the_auth_token_cookie_is_still_verified() {
 #[tokio::test]
 async fn require_user_ignores_a_wafer_session_cookie() {
     let (_raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "cookie@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "cookie@example.com").await;
     let svc = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
 
     let mut msg = Message::new("auth.require_user");
@@ -191,7 +183,7 @@ async fn require_user_ignores_a_wafer_session_cookie() {
 #[tokio::test]
 async fn require_user_rejects_a_refresh_jwt() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "refresh@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "refresh@example.com").await;
 
     let refresh = raw
         .mint_access_token(
@@ -212,7 +204,7 @@ async fn require_user_rejects_a_refresh_jwt() {
 #[tokio::test]
 async fn require_user_rejects_an_expired_access_jwt() {
     let (_raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "expired@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "expired@example.com").await;
 
     let expired = sign_access_token_expired(&uid, chrono::Utc::now().timestamp() - 60);
 
@@ -230,7 +222,7 @@ async fn require_user_rejects_an_expired_access_jwt() {
 #[tokio::test]
 async fn require_user_rejects_a_blocklisted_jti() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "blocked@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "blocked@example.com").await;
 
     let token = raw
         .mint_access_token(
@@ -263,7 +255,7 @@ async fn require_user_rejects_a_blocklisted_jti() {
 #[tokio::test]
 async fn require_user_rejects_a_stale_auth_version() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "stale@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "stale@example.com").await;
 
     let token = raw
         .mint_access_token(
@@ -289,7 +281,7 @@ async fn require_user_rejects_a_stale_auth_version() {
 #[tokio::test]
 async fn require_user_rejects_a_foreign_issuer() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "iss@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "iss@example.com").await;
     assert_eq!(
         TEST_ISSUER, "http://localhost:5173",
         "the fixture issuer must be `expected_issuer`'s declared default"
@@ -316,7 +308,7 @@ async fn require_user_rejects_a_foreign_issuer() {
 #[tokio::test]
 async fn require_user_rejects_a_disabled_account_on_the_jwt_path() {
     let (raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "disabled@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "disabled@example.com").await;
 
     let token = raw
         .mint_access_token(&uid, &[], Duration::from_secs(3600))
@@ -336,7 +328,7 @@ async fn require_user_rejects_a_disabled_account_on_the_jwt_path() {
 #[tokio::test]
 async fn require_user_rejects_an_expired_pat() {
     let (_raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "e@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "e@example.com").await;
 
     let expired_pat_raw = "expired-pat";
     pats::insert(
@@ -368,7 +360,7 @@ async fn require_user_rejects_a_token_signed_with_a_foreign_secret() {
     use wafer_block_crypto::primitives;
 
     let (_raw, ctx) = fixture().await;
-    let uid = seed_user(ctx.as_ref(), "foreign@example.com").await;
+    let uid = seed_user_id(ctx.as_ref(), "foreign@example.com").await;
     assert_ne!(TEST_MASTER_SECRET, "some-other-deployments-master-secret");
 
     let derived = primitives::derive_block_key(

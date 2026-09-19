@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::users,
-    service::{AuthServiceImpl, BlockState},
+use impresspress_core::{
+    blocks::auth::{
+        migrations,
+        service::{AuthServiceImpl, BlockState},
+    },
+    test_support::seed_user,
 };
 use wafer_core::interfaces::auth::service::{AuthError, AuthService, Role, UserId};
 use wafer_run::context::Context;
@@ -18,19 +20,12 @@ async fn user_profile_returns_row_with_empty_orgs() {
     let ctx: Arc<dyn Context> = Arc::new(MigrationTestCtx::new().await);
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
-    let u = users::insert(
-        ctx.as_ref(),
-        users::NewUser {
-            email: "p@e.com".into(),
-            display_name: "P".into(),
-            avatar_url: Some("https://a/x.png".into()),
-            role: "admin".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("p@e.com")
+        .display_name("P")
+        .avatar_url("https://a/x.png")
+        .role("admin")
+        .insert(ctx.as_ref())
+        .await;
 
     let svc = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
     let p = svc
@@ -66,19 +61,10 @@ async fn user_profile_maps_non_admin_role_to_user() {
     let ctx: Arc<dyn Context> = Arc::new(MigrationTestCtx::new().await);
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
-    let u = users::insert(
-        ctx.as_ref(),
-        users::NewUser {
-            email: "ordinary@e.com".into(),
-            display_name: "O".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("ordinary@e.com")
+        .display_name("O")
+        .insert(ctx.as_ref())
+        .await;
 
     let svc = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
     let p = svc.user_profile(UserId(u.id)).await.expect("profile");

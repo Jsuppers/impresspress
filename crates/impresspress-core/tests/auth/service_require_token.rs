@@ -3,10 +3,13 @@
 
 use std::{sync::Arc, time::Duration};
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{pats, users},
-    service::{hash_token, AuthServiceImpl, BlockState},
+use impresspress_core::{
+    blocks::auth::{
+        migrations,
+        repo::pats,
+        service::{hash_token, AuthServiceImpl, BlockState},
+    },
+    test_support::seed_user,
 };
 use wafer_core::interfaces::auth::service::{AuthError, AuthService, TokenScope};
 use wafer_run::{context::Context, Message};
@@ -25,19 +28,10 @@ async fn require_token_enforces_scope_and_rejects_an_access_jwt() {
     let ctx: Arc<dyn Context> = raw_ctx.clone();
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
-    let u = users::insert(
-        ctx.as_ref(),
-        users::NewUser {
-            email: "t@example.com".into(),
-            display_name: "T".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("t@example.com")
+        .display_name("T")
+        .insert(ctx.as_ref())
+        .await;
 
     // PAT with publish scope → Ok.
     let ok_raw = "wafer_pat_ok";

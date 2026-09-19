@@ -3,10 +3,13 @@
 
 use std::{sync::Arc, time::Duration};
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{bootstrap_tokens, users},
-    service::{hash_token, AuthServiceImpl, BlockState},
+use impresspress_core::{
+    blocks::auth::{
+        migrations,
+        repo::bootstrap_tokens,
+        service::{hash_token, AuthServiceImpl, BlockState},
+    },
+    test_support::seed_user,
 };
 use wafer_core::interfaces::auth::service::{AuthError, AuthService, Role};
 use wafer_run::{context::Context, Message};
@@ -25,32 +28,15 @@ async fn require_role_user_admin_and_bootstrap_token() {
     let ctx: Arc<dyn Context> = raw_ctx.clone();
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
-    let admin = users::insert(
-        ctx.as_ref(),
-        users::NewUser {
-            email: "admin@e.com".into(),
-            display_name: "A".into(),
-            avatar_url: None,
-            role: "admin".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed admin");
-    let plain = users::insert(
-        ctx.as_ref(),
-        users::NewUser {
-            email: "user@e.com".into(),
-            display_name: "U".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let admin = seed_user("admin@e.com")
+        .display_name("A")
+        .role("admin")
+        .insert(ctx.as_ref())
+        .await;
+    let plain = seed_user("user@e.com")
+        .display_name("U")
+        .insert(ctx.as_ref())
+        .await;
 
     // The credential production issues: an access JWT per user.
     let admin_jwt = raw_ctx
@@ -129,19 +115,10 @@ async fn require_role_admin_comes_from_the_roles_table_not_the_token_claim() {
         .await
         .expect("admin migrations (user_roles lives in the platform tables)");
 
-    let u = users::insert(
-        ctx.as_ref(),
-        users::NewUser {
-            email: "claims@e.com".into(),
-            display_name: "C".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user");
+    let u = seed_user("claims@e.com")
+        .display_name("C")
+        .insert(ctx.as_ref())
+        .await;
 
     // The token claims admin; the database does not agree.
     let lying = raw_ctx

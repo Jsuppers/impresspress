@@ -51,9 +51,9 @@ async fn collect_or_panic(out: OutputStream) -> BufferedResponse {
 ///
 /// Plan A2 note: passwords live in `local_credentials`, not on the users row.
 async fn seed_password_user(ctx: &MigrationTestCtx, email: &str, password: &str) -> String {
-    use impresspress_core::blocks::auth::{
-        migrations,
-        repo::{local_credentials, users},
+    use impresspress_core::{
+        blocks::auth::{migrations, repo::local_credentials},
+        test_support::seed_user,
     };
     use wafer_core::clients::database as db;
 
@@ -63,19 +63,7 @@ async fn seed_password_user(ctx: &MigrationTestCtx, email: &str, password: &str)
 
     let password_hash = crypto::hash(ctx, password).await.expect("hash password");
 
-    let user = users::insert(
-        ctx,
-        users::NewUser {
-            email: email.to_string(),
-            display_name: String::new(),
-            avatar_url: None,
-            role: "user".to_string(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("insert user");
+    let user = seed_user(email).display_name("").insert(ctx).await;
 
     // Set email_verified via exec_raw (test-fixture setup — CLAUDE.md exception).
     db::exec_raw(

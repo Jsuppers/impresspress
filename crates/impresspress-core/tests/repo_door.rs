@@ -30,6 +30,8 @@
 //! allowlists below — each listed individually with its reason, so a NEW
 //! file naming a table fails the gate and has to justify itself here.
 
+use impresspress_core::test_support::source_scan::{strip_line_comments, SourceWalk};
+
 /// `(door, table, const, qualifier)` for every door this gate covers.
 ///
 /// `door` names the door in the failure message and keys the two allowlists.
@@ -289,40 +291,19 @@ const TABLES: &[(&str, &str, &[&str], &str)] = &[
     ),
 ];
 
-fn crate_sources() -> Vec<(String, String)> {
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read source dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("under root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read_to_string(&path).expect("read source")));
-            }
-        }
-    }
-    assert!(
-        out.len() > 100,
-        "the scan walks the whole crate; {} files means it lost its way",
-        out.len()
-    );
-    out
+/// The walk this gate runs over: every `.rs` file in the crate, with a floor
+/// so an empty scan cannot pass as a clean one.
+fn scan() -> SourceWalk {
+    SourceWalk::crate_src().least(100)
 }
 
-/// `src` without its full-line comments (`//`, `///`, `//!` lines). A
-/// trailing comment on a code line stays, so it is still scanned.
-fn code_only(src: &str) -> String {
-    src.lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Every file the walk reaches, as `(path, code)` — the source with its
+/// full-line comments dropped, which is what every scan below matches on.
+fn sources(walk: &SourceWalk) -> Vec<(String, String)> {
+    walk.collect()
+        .into_iter()
+        .map(|file| (file.rel, strip_line_comments(&file.text)))
+        .collect()
 }
 
 /// Whether `path` (relative to `src`) is one of `allowlist`'s entries.
@@ -330,6 +311,22 @@ fn code_only(src: &str) -> String {
 /// exempt a file that does not exist yet.
 fn matches_allowlist(path: &str, allowlist: &[&str]) -> bool {
     allowlist.contains(&path)
+}
+
+/// The files, outside `allowed`, whose code satisfies `names` — every scan
+/// below is this shape, and stating it once is what lets the walk's own
+/// self-test drive the same filter over a planted tree.
+fn offenders<'a>(
+    sources: &'a [(String, String)],
+    allowed: &[&str],
+    names: impl Fn(&str) -> bool,
+) -> Vec<&'a String> {
+    sources
+        .iter()
+        .filter(|(path, _)| !matches_allowlist(path, allowed))
+        .filter(|(_, src)| names(src))
+        .map(|(path, _)| path)
+        .collect()
 }
 
 /// Files allowed to spell a table's literal name, per table. Each entry is
@@ -652,22 +649,14 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
 
 #[test]
 fn only_the_door_names_a_platform_table() {
-    let sources: Vec<(String, String)> = crate_sources()
-        .into_iter()
-        .map(|(path, src)| (path, code_only(&src)))
-        .collect();
+    let sources = sources(&scan());
     for (door, literal, _consts, _qualifier) in TABLES {
         let allowed = LITERAL_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
             .map(|(_, files)| *files)
             .unwrap_or(&[]);
-        let offenders: Vec<&String> = sources
-            .iter()
-            .filter(|(path, _)| !matches_allowlist(path, allowed))
-            .filter(|(_, src)| src.contains(literal))
-            .map(|(path, _)| path)
-            .collect();
+        let offenders = offenders(&sources, allowed, |src| src.contains(literal));
         assert!(
             offenders.is_empty(),
             "these files name `{literal}` directly and so bypass \
@@ -1158,24 +1147,16 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
 
 #[test]
 fn only_the_allowlist_names_a_platform_table_via_the_const() {
-    let sources: Vec<(String, String)> = crate_sources()
-        .into_iter()
-        .map(|(path, src)| (path, code_only(&src)))
-        .collect();
+    let sources = sources(&scan());
     for (door, _, consts, qualifier) in TABLES {
         let allowed = IDENT_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
             .map(|(_, files)| *files)
             .unwrap_or(&[]);
-        let offenders: Vec<&String> = sources
-            .iter()
-            .filter(|(path, _)| !matches_allowlist(path, allowed))
-            .filter(|(_, src)| {
-                src.contains(qualifier) && consts.iter().any(|ident| src.contains(ident))
-            })
-            .map(|(path, _)| path)
-            .collect();
+        let offenders = offenders(&sources, allowed, |src| {
+            src.contains(qualifier) && consts.iter().any(|ident| src.contains(ident))
+        });
         assert!(
             offenders.is_empty(),
             "these files name the table via one of `{consts:?}` instead of calling a \
@@ -1188,10 +1169,7 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
 /// dead exemption: it silently pre-approves whatever that file does next.
 #[test]
 fn no_allowlist_entry_is_dead() {
-    let sources: Vec<(String, String)> = crate_sources()
-        .into_iter()
-        .map(|(path, src)| (path, code_only(&src)))
-        .collect();
+    let sources = sources(&scan());
     for (door, literal, consts, _qualifier) in TABLES {
         for (m, files) in LITERAL_ALLOWED {
             if m != door {
@@ -1235,10 +1213,7 @@ fn no_allowlist_entry_is_dead() {
 /// it.)
 #[test]
 fn the_old_table_name_shims_are_gone() {
-    let sources: Vec<(String, String)> = crate_sources()
-        .into_iter()
-        .map(|(path, src)| (path, code_only(&src)))
-        .collect();
+    let sources = sources(&scan());
     for old in [
         "admin_schema::",
         "mod admin_schema",
@@ -1251,11 +1226,7 @@ fn the_old_table_name_shims_are_gone() {
         "mod messages_schema",
         "PRODUCTS_TABLE",
     ] {
-        let offenders: Vec<&String> = sources
-            .iter()
-            .filter(|(_, src)| src.contains(old))
-            .map(|(path, _)| path)
-            .collect();
+        let offenders = offenders(&sources, &[], |src| src.contains(old));
         assert!(
             offenders.is_empty(),
             "`{old}` still referenced in {offenders:?}"
@@ -1278,10 +1249,7 @@ fn the_old_table_name_shims_are_gone() {
 /// tables it does not own.
 #[test]
 fn the_messages_tables_are_named_only_inside_the_messages_block() {
-    let sources: Vec<(String, String)> = crate_sources()
-        .into_iter()
-        .map(|(path, src)| (path, code_only(&src)))
-        .collect();
+    let sources = sources(&scan());
     for name in [
         "impresspress__messages__contexts",
         "impresspress__messages__entries",
@@ -1303,11 +1271,45 @@ fn the_messages_tables_are_named_only_inside_the_messages_block() {
     }
 }
 
+/// The *walk* reaches a planted offender, honours an allowlist entry, and
+/// reads only Rust — over the same `sources` pipeline every scan above runs.
+///
+/// Each scan above proves what it matches; none of them proves the walk ever
+/// opened a file. A root that moved or an extension filter that broke would
+/// leave every assertion here passing on an empty list of sources, which is
+/// the failure mode that makes most source gates worthless. The floor on
+/// [`scan`] is the other half: it fails when the real tree comes back short.
 #[test]
-fn code_only_drops_full_line_comments_and_keeps_trailing_ones() {
-    let src = "//! doc\nlet a = 1; // trailing impresspress__admin__variables\n/// more\n  // indented\nlet b = 2;\n";
+fn the_walk_reaches_the_files_it_claims_to_scan() {
+    const LITERAL: &str = "impresspress__admin__variables";
+
+    let root = std::env::temp_dir().join(format!("repo-door-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("nested")).expect("temp tree");
+    std::fs::write(
+        root.join("nested/offender.rs"),
+        format!("let t = \"{LITERAL}\";\n"),
+    )
+    .expect("offender");
+    std::fs::write(
+        root.join("door.rs"),
+        format!("pub const T: &str = \"{LITERAL}\";\n"),
+    )
+    .expect("the allowlisted door");
+    std::fs::write(
+        root.join("prose.rs"),
+        format!("// {LITERAL} named in a comment, not queried\n"),
+    )
+    .expect("prose only");
+    std::fs::write(root.join("notes.txt"), LITERAL).expect("non-rust");
+
+    let sources = sources(&SourceWalk::new(&root));
+    std::fs::remove_dir_all(&root).expect("clean up");
+
+    let found = offenders(&sources, &["door.rs"], |src| src.contains(LITERAL));
     assert_eq!(
-        code_only(src),
-        "let a = 1; // trailing impresspress__admin__variables\nlet b = 2;"
+        found,
+        vec![&"nested/offender.rs".to_string()],
+        "expected exactly the planted offender"
     );
 }

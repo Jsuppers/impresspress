@@ -1,35 +1,22 @@
 //! Sessions repo against in-memory SQLite after applying the auth
 //! migrations — the family-keyed shape migration 012 installs (B12).
 
-use impresspress_core::blocks::auth::{
-    migrations,
-    repo::{sessions, users},
+use impresspress_core::{
+    blocks::auth::{migrations, repo::sessions},
+    test_support::seed_user,
 };
 
 use crate::common::MigrationTestCtx;
-
-async fn seed_user(ctx: &MigrationTestCtx, email: &str) -> String {
-    users::insert(
-        ctx,
-        users::NewUser {
-            email: email.into(),
-            display_name: "S".into(),
-            avatar_url: None,
-            role: "user".into(),
-            email_verified: false,
-            verification_token_hash: None,
-        },
-    )
-    .await
-    .expect("seed user")
-    .id
-}
 
 #[tokio::test]
 async fn insert_find_touch_delete_expired() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let uid = seed_user(&ctx, "s@example.com").await;
+    let uid = seed_user("s@example.com")
+        .display_name("S")
+        .insert(&ctx)
+        .await
+        .id;
 
     sessions::insert(
         &ctx,
@@ -100,7 +87,11 @@ async fn insert_find_touch_delete_expired() {
 async fn find_for_user_missing_family_returns_none() {
     let ctx = MigrationTestCtx::new().await;
     migrations::apply(&ctx).await.expect("migration apply");
-    let uid = seed_user(&ctx, "missing@example.com").await;
+    let uid = seed_user("missing@example.com")
+        .display_name("S")
+        .insert(&ctx)
+        .await
+        .id;
 
     let hit = sessions::find_for_user(&ctx, &uid, "fam-nope")
         .await
