@@ -505,3 +505,71 @@ fn the_paid_subset_of_order_status_is_the_three_that_took_money() {
         ]
     );
 }
+
+/// `set_addon_totals` excludes a terminal subscription by naming the spellings
+/// its `status` column can hold, because SQL cannot ask the type. The constant
+/// and [`SubscriptionStatus::is_terminal`] therefore have to say the same
+/// thing: a variant that becomes terminal without being listed would have
+/// add-on quota written onto a row that can never go live again, and one
+/// listed without being terminal would stop having its quota recorded at all.
+///
+/// Both spellings of the cancelled state are covered. The platform-billing
+/// projection has stored `cancelled` since it was written and every
+/// Stripe-sourced write spells it `canceled`; the type reads both through its
+/// serde alias, so only this test can see the constant miss one.
+#[test]
+fn subscription_terminal_spellings_match_the_type() {
+    use crate::blocks::products::repo::subscriptions::TERMINAL_STATUS_SPELLINGS;
+
+    // The alias is not a serialized spelling, so `wire` cannot produce it.
+    // It is a stored literal all the same — see `cancel_and_reset_addons`.
+    let stored_aliases = [("cancelled", SubscriptionStatus::Canceled)];
+
+    let mut terminal_variants = 0;
+    for status in [
+        SubscriptionStatus::Unset,
+        SubscriptionStatus::Incomplete,
+        SubscriptionStatus::IncompleteExpired,
+        SubscriptionStatus::Trialing,
+        SubscriptionStatus::Active,
+        SubscriptionStatus::PastDue,
+        SubscriptionStatus::Unpaid,
+        SubscriptionStatus::Paused,
+        SubscriptionStatus::Canceled,
+    ] {
+        let spelling = wire(status);
+        assert_eq!(
+            TERMINAL_STATUS_SPELLINGS.contains(&spelling.as_str()),
+            status.is_terminal(),
+            "{spelling:?} is listed as terminal but `is_terminal` disagrees (or vice versa)"
+        );
+        terminal_variants += usize::from(status.is_terminal());
+    }
+
+    for (spelling, status) in stored_aliases {
+        assert!(
+            status.is_terminal(),
+            "{spelling:?} aliases a status that is no longer terminal — \
+             it must leave TERMINAL_STATUS_SPELLINGS with it"
+        );
+        assert!(
+            TERMINAL_STATUS_SPELLINGS.contains(&spelling),
+            "{spelling:?} is a stored spelling of a terminal status and must be excluded"
+        );
+    }
+
+    // Nothing else is in the constant: every entry above accounted for one.
+    assert_eq!(
+        TERMINAL_STATUS_SPELLINGS.len(),
+        terminal_variants + stored_aliases.len(),
+        "TERMINAL_STATUS_SPELLINGS holds a spelling no SubscriptionStatus produces"
+    );
+
+    // A round trip through the type, so the constant's literals are the ones
+    // the column stores rather than lookalikes.
+    for spelling in TERMINAL_STATUS_SPELLINGS {
+        let status: SubscriptionStatus =
+            serde_json::from_value(json!(spelling)).expect("a stored spelling must decode");
+        assert!(status.is_terminal(), "{spelling:?} decodes as non-terminal");
+    }
+}

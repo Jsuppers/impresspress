@@ -6419,82 +6419,187 @@ async fn an_addon_total_write_that_fails_does_not_report_success() {
     );
 }
 
-/// The add-on columns are a projection of what Stripe reports, and Stripe
-/// reports add-on items on a trialing subscription exactly as it does on an
-/// active one. Writing only `active` rows dropped an add-on bought during a
-/// trial; which lifecycle states earn the quota is the reading platform's
-/// decision, made from the `status` it is served beside them.
+/// Which subscription states have their add-on totals recorded.
+///
+/// The columns are a projection of what Stripe reports, and Stripe reports
+/// add-on items on a trialing or past-due subscription exactly as it does on
+/// an active one. Writing only `active` rows lost an add-on bought during a
+/// trial until the next `updated` delivery, and one bought while past due
+/// until the item set next changed; which lifecycle states earn the quota is
+/// the reading platform's decision, made from the `status` it is served
+/// beside them.
+///
+/// The states that stay excluded are the terminal ones — a row that can never
+/// go live again, because Stripe issues a new subscription id for a
+/// resubscription. `customer.subscription.updated` can be delivered after
+/// `customer.subscription.deleted`, and writing quota onto a cancelled row
+/// would undo the zeroing `cancel_and_reset_addons` just did. Both stored
+/// spellings of the cancelled state are covered: the platform-billing
+/// projection writes `cancelled`, every Stripe-sourced write `canceled`.
 #[tokio::test]
-async fn addon_totals_are_recorded_for_a_subscription_that_is_not_yet_active() {
+async fn addon_totals_reach_every_live_subscription_state_and_no_terminal_one() {
     let ctx = ctx_with(&[(
         "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
         WEBHOOK_SECRET,
     )])
     .await;
-    seed_platform_subscription(&ctx, "sub_addon_trial", "owner_trial", "trialing").await;
 
-    let event = subscription_updated_with_addon(
-        "evt_addon_trial",
-        "sub_addon_trial",
-        "trialing",
-        "1024",
-        3,
-    );
-    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
-    assert_eq!(
-        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
-        true
-    );
+    // (stored status, the status the delivery reports, the expected total).
+    // A terminal row is probed with an `active` delivery, which is the
+    // redelivery that would resurrect it; 5 is what `seed_platform_subscription`
+    // leaves in the column, so "unchanged" is distinguishable from "zeroed".
+    let cases: [(&str, &str, i64); 9] = [
+        ("incomplete", "incomplete", 3072),
+        ("trialing", "trialing", 3072),
+        ("active", "active", 3072),
+        ("past_due", "past_due", 3072),
+        ("unpaid", "unpaid", 3072),
+        ("paused", "paused", 3072),
+        ("canceled", "active", 5),
+        ("cancelled", "active", 5),
+        ("incomplete_expired", "active", 5),
+    ];
 
-    let subscription = db::get(
-        &ctx,
-        repo::subscriptions::SUBSCRIPTIONS_TABLE,
-        "sub_addon_trial",
-    )
-    .await
-    .unwrap();
-    assert_eq!(subscription.data["status"], "trialing");
-    assert_eq!(
-        subscription.data["addon_r2_bytes"], 3072,
-        "a trialing subscriber's add-on purchase has to reach the row"
-    );
-}
-
-/// The one row the totals must never reach is a cancelled one:
-/// `cancel_and_reset_addons` zeroes the columns on cancellation, and a
-/// `customer.subscription.updated` redelivered afterwards would otherwise hand
-/// the cancelled account its quota back. The seeded totals are non-zero so
-/// that "nothing was written" is distinguishable from "zero was written".
-#[tokio::test]
-async fn addon_totals_are_not_written_back_onto_a_cancelled_subscription() {
-    let ctx = ctx_with(&[(
-        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
-        WEBHOOK_SECRET,
-    )])
-    .await;
-    // The platform-billing projection stores the British spelling; every
-    // Stripe-sourced column stores `canceled`. Both have to be excluded.
-    for (index, spelling) in ["cancelled", "canceled"].into_iter().enumerate() {
-        let subscription_id = format!("sub_addon_cancelled_{index}");
+    for (index, (stored, reported, expected)) in cases.into_iter().enumerate() {
+        let subscription_id = format!("sub_addon_state_{index}");
         seed_platform_subscription(
             &ctx,
             &subscription_id,
-            &format!("owner_cancelled_{index}"),
-            spelling,
+            &format!("owner_state_{index}"),
+            stored,
         )
         .await;
 
         let event = subscription_updated_with_addon(
-            &format!("evt_addon_cancelled_{index}"),
+            &format!("evt_addon_state_{index}"),
             &subscription_id,
-            "active",
+            reported,
             "1024",
             3,
         );
         let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
         assert_eq!(
             output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
-            true
+            true,
+            "the {stored} delivery has to be acknowledged"
+        );
+
+        let subscription = db::get(
+            &ctx,
+            repo::subscriptions::SUBSCRIPTIONS_TABLE,
+            &subscription_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            subscription.data["addon_r2_bytes"], expected,
+            "a {stored} subscription's add-on total"
+        );
+    }
+}
+
+/// The totals write carries the same ordering predicate every other write to
+/// this table carries. A delivery that failed and is retried after a newer one
+/// has landed must not put the older payload's totals back: `update_status_plan`
+/// refuses the stale status and answers `Ok(0)`, and the arm runs on to the
+/// add-on sync regardless, so without the predicate the stale totals were
+/// written over the current ones.
+#[tokio::test]
+async fn a_stale_redelivery_does_not_overwrite_newer_addon_totals() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    // `seed_platform_subscription` stamps `stripe_event_created` at 100 and
+    // `subscription_updated_with_addon` builds events created at 200, so this
+    // row is a subscription whose newest applied event is later than both.
+    seed_platform_subscription(&ctx, "sub_addon_stale", "owner_stale", "active").await;
+    db::update(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_addon_stale",
+        HashMap::from([
+            ("stripe_event_created".to_string(), serde_json::json!(500)),
+            ("addon_r2_bytes".to_string(), serde_json::json!(9000)),
+        ]),
+    )
+    .await
+    .expect("advance the row past the stale event");
+
+    let event =
+        subscription_updated_with_addon("evt_addon_stale", "sub_addon_stale", "active", "1024", 3);
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true,
+        "a stale delivery is still acknowledged — it is applied to nothing, not failed"
+    );
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_addon_stale",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subscription.data["addon_r2_bytes"], 9000,
+        "an event older than the row must not write its totals"
+    );
+    assert_eq!(
+        subscription.data["stripe_event_created"], 500,
+        "the totals write must not move the column `update_status_plan` compare-and-swaps on"
+    );
+}
+
+/// The totals are quotas, so a negative one is not a smaller number — it is
+/// less capacity than none. Neither a negative per-unit amount nor a negative
+/// quantity may reach the column.
+#[tokio::test]
+async fn a_negative_addon_amount_or_quantity_fails_the_delivery() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+
+    for (index, (amount, quantity)) in [("-1024", 3), ("1024", -3)].into_iter().enumerate() {
+        let subscription_id = format!("sub_addon_negative_{index}");
+        seed_platform_subscription(
+            &ctx,
+            &subscription_id,
+            &format!("owner_negative_{index}"),
+            "active",
+        )
+        .await;
+
+        let event_id = format!("evt_addon_negative_{index}");
+        let event = subscription_updated_with_addon(
+            &event_id,
+            &subscription_id,
+            "active",
+            amount,
+            quantity,
+        );
+        let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+        assert!(
+            output_is_error(
+                stripe::handle_webhook(&ctx, &msg, input).await,
+                ErrorCode::Internal,
+            )
+            .await,
+            "a negative add-on total must not be answered with a success \
+             (amount {amount}, quantity {quantity})"
+        );
+
+        let event_row = db::get(&ctx, "impresspress__products__stripe_events", &event_id)
+            .await
+            .unwrap();
+        assert_eq!(event_row.data["status"], "failed");
+        assert_eq!(
+            event_row.data["last_error"],
+            "add-on total synchronization failed"
         );
 
         let subscription = db::get(
@@ -6506,7 +6611,7 @@ async fn addon_totals_are_not_written_back_onto_a_cancelled_subscription() {
         .unwrap();
         assert_eq!(
             subscription.data["addon_r2_bytes"], 5,
-            "a {spelling} subscription must keep the totals it was cancelled with"
+            "the stored total must be left alone"
         );
     }
 }
