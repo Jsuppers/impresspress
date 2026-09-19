@@ -15,8 +15,9 @@
 
 /// Vanilla-JS bundle for the file-browser surfaces — drag-drop upload, bulk
 /// select, kebab menus, share modal, upload modal, confirm-delete. Consumed
-/// by [`super::pages_user::object_list_page`], `cloudstorage_page` and the
-/// admin storage pages.
+/// by [`super::pages_user::objects::object_list_page`],
+/// [`super::pages_user::cloudstorage::cloudstorage_page`] and the admin
+/// storage pages.
 #[cfg(feature = "embed-assets")]
 const FILES_BROWSER_JS: &str = include_str!("assets/files-browser.js");
 

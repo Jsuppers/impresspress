@@ -14,7 +14,7 @@ use crate::blocks::files::repo;
 /// decide the admin policy on top of it:
 /// - JSON API handlers go through [`is_bucket_access_denied`], which grants
 ///   admins access to every bucket.
-/// - The SSR user portal (`pages_user::object_list_page`) deliberately does
+/// - The SSR user portal (`pages_user::objects::object_list_page`) deliberately does
 ///   NOT bypass for admins — the portal is strictly owner-scoped so an
 ///   admin browsing `/b/storage/` sees only their own buckets; cross-user
 ///   inspection happens via the admin pages instead.

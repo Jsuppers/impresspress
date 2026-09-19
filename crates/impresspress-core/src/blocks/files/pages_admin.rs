@@ -291,7 +291,7 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Some(admin_tabs("Buckets")),
         html! {
             (render_admin_buckets_table(&rows))
-            (super::pages_user::render_new_bucket_modal())
+            (super::pages_user::buckets::render_new_bucket_modal())
             script type="application/json" id="files-browser-bootstrap" {
                 "{}"
             }
@@ -923,7 +923,7 @@ mod b13_visibility_tests {
             (json!("false"), false),
         ] {
             let row = row_with_public(shape.clone());
-            let user = super::super::pages_user::BucketRow::from((&row, 3));
+            let user = super::super::pages_user::buckets::BucketRow::from((&row, 3));
             let admin = AdminBucketRow::from(&row);
             assert_eq!(
                 (user.public, admin.public),
@@ -941,7 +941,7 @@ mod b13_visibility_tests {
     #[test]
     fn the_bucket_projections_shape_only_what_the_table_renders() {
         let row = row_with_public(json!(1));
-        let user = super::super::pages_user::BucketRow::from((&row, 7));
+        let user = super::super::pages_user::buckets::BucketRow::from((&row, 7));
         assert_eq!(user.name, "photos");
         assert_eq!(user.created_at, "2026-05-06T10:00:00Z");
         assert_eq!(user.object_count, 7);
@@ -953,7 +953,7 @@ mod b13_visibility_tests {
     }
 
     /// Does the user-facing bucket table say this bucket is public?
-    /// `pages_user::render_buckets_table` renders `badge-success`/"Public"
+    /// `pages_user::buckets::render_buckets_table` renders `badge-success`/"Public"
     /// for a public bucket and a bare `badge`/"Private" otherwise.
     fn user_page_says_public(html: &str) -> bool {
         assert!(
@@ -998,8 +998,11 @@ mod b13_visibility_tests {
             .expect("seed public bucket");
 
         let user_html = output_html(
-            super::super::pages_user::bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/"))
-                .await,
+            super::super::pages_user::buckets::bucket_list_page(
+                &ctx,
+                &admin_msg("retrieve", "/b/storage/"),
+            )
+            .await,
         )
         .await;
         let admin_html =
@@ -1026,8 +1029,11 @@ mod b13_visibility_tests {
             .expect("seed private bucket");
 
         let user_html = output_html(
-            super::super::pages_user::bucket_list_page(&ctx, &admin_msg("retrieve", "/b/storage/"))
-                .await,
+            super::super::pages_user::buckets::bucket_list_page(
+                &ctx,
+                &admin_msg("retrieve", "/b/storage/"),
+            )
+            .await,
         )
         .await;
         let admin_html =
