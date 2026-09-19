@@ -67,6 +67,11 @@ pub struct ChatRequest {
     pub provider: Option<String>,
     /// Model id within the provider. Same precedence as `provider`.
     pub model: Option<String>,
+    /// Largest reply, in output tokens, this turn may generate. Omitted, the
+    /// deployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every
+    /// request reaches the provider with a budget, because
+    /// Anthropic-protocol providers refuse one that carries none.
+    pub max_tokens: Option<u32>,
 }
 
 /// `POST /b/llm/api/chat` response body.

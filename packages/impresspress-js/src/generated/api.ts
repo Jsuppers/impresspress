@@ -2866,6 +2866,14 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
+                        /**
+                         * Format: uint32
+                         * @description Largest reply, in output tokens, this turn may generate. Omitted, the
+                         *     deployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every
+                         *     request reaches the provider with a budget, because
+                         *     Anthropic-protocol providers refuse one that carries none.
+                         */
+                        max_tokens?: number | null;
                         /** @description The user's message. */
                         message: string;
                         /** @description Model id within the provider. Same precedence as `provider`. */
@@ -2946,6 +2954,14 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
+                        /**
+                         * Format: uint32
+                         * @description Largest reply, in output tokens, this turn may generate. Omitted, the
+                         *     deployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every
+                         *     request reaches the provider with a budget, because
+                         *     Anthropic-protocol providers refuse one that carries none.
+                         */
+                        max_tokens?: number | null;
                         /** @description The user's message. */
                         message: string;
                         /** @description Model id within the provider. Same precedence as `provider`. */

@@ -7,6 +7,15 @@
             "schema": {
               "description": "Request body shared by `POST /b/llm/api/chat` and\n`POST /b/llm/api/chat/stream`.",
               "properties": {
+                "max_tokens": {
+                  "description": "Largest reply, in output tokens, this turn may generate. Omitted, the\ndeployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every\nrequest reaches the provider with a budget, because\nAnthropic-protocol providers refuse one that carries none.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "message": {
                   "description": "The user's message.",
                   "type": "string"
@@ -95,6 +104,15 @@
             "schema": {
               "description": "Request body shared by `POST /b/llm/api/chat` and\n`POST /b/llm/api/chat/stream`.",
               "properties": {
+                "max_tokens": {
+                  "description": "Largest reply, in output tokens, this turn may generate. Omitted, the\ndeployment's `IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS` applies — every\nrequest reaches the provider with a budget, because\nAnthropic-protocol providers refuse one that carries none.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "message": {
                   "description": "The user's message.",
                   "type": "string"

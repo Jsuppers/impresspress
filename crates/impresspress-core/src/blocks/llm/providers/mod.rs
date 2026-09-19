@@ -23,5 +23,10 @@ pub mod openai_compatible;
 #[cfg(feature = "llm")]
 mod service;
 
+/// A loopback Anthropic provider the chat and contextual-retrieval tests
+/// drive the real encoder against — see the module doc.
+#[cfg(all(test, feature = "llm"))]
+pub(crate) mod fake_anthropic;
+
 #[cfg(feature = "llm")]
 pub use service::ProviderLlmService;
