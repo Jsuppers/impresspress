@@ -6176,3 +6176,85 @@ async fn a_subscription_update_whose_owner_lookup_fails_does_not_report_success(
         "the failure has to name the lookup, not a downstream symptom"
     );
 }
+
+// ============================================================
+// Webhook signature rotation and add-on totals
+// ============================================================
+
+/// A `Stripe-Signature` header signed by several secrets at once, which is
+/// what Stripe sends for the whole window a rolled secret stays live.
+fn webhook_msg_signed_by(payload: &serde_json::Value, secrets: &[&str]) -> (Message, InputStream) {
+    let payload_bytes = serde_json::to_vec(payload).unwrap();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut signed = format!("{timestamp}.");
+    signed.push_str(&String::from_utf8_lossy(&payload_bytes));
+
+    let mut sig_header = format!("t={timestamp}");
+    for secret in secrets {
+        let sig = primitives::hmac_sha256(secret.as_bytes(), signed.as_bytes());
+        sig_header.push_str(&format!(",v1={}", hex_encode(&sig)));
+    }
+
+    let mut msg = Message::new("http.request");
+    msg.set_meta("req.action", "create");
+    msg.set_meta("req.resource", "/b/products/webhooks");
+    msg.set_meta("http.header.stripe-signature", &sig_header);
+    (msg, InputStream::from_bytes(payload_bytes))
+}
+
+/// Rolling the endpoint's signing secret leaves the retired one live for up
+/// to 24 hours, and Stripe signs every delivery in that window with both. The
+/// order of the `v1` values is Stripe's, not the endpoint's, so reading one
+/// of them rejected every delivery of the roll window whenever the configured
+/// secret's signature was not the last.
+#[tokio::test]
+async fn a_delivery_signed_during_a_secret_roll_is_accepted_whichever_v1_comes_last() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let retired = "whsec_the_secret_being_rolled_out";
+
+    let event = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "type": "charge.refunded",
+            "livemode": false,
+            "data": {"object": {"payment_intent": "pi_does_not_exist"}}
+        })
+    };
+
+    // The configured secret signs second…
+    let body = event("evt_roll_configured_last");
+    let (msg, input) = webhook_msg_signed_by(&body, &[retired, WEBHOOK_SECRET]);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+
+    // …and first.
+    let body = event("evt_roll_configured_first");
+    let (msg, input) = webhook_msg_signed_by(&body, &[WEBHOOK_SECRET, retired]);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+
+    // A delivery carrying no signature from the configured secret is still
+    // refused, so the two above cannot be passing because verification stopped
+    // happening.
+    let body = event("evt_roll_neither");
+    let (msg, input) = webhook_msg_signed_by(&body, &[retired, "whsec_a_third_secret"]);
+    assert!(
+        output_is_error(
+            stripe::handle_webhook(&ctx, &msg, input).await,
+            ErrorCode::Unauthenticated,
+        )
+        .await,
+        "a header with no signature from the configured secret must be rejected"
+    );
+}

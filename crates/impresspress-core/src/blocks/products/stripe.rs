@@ -4070,22 +4070,29 @@ async fn fire_products_webhook(ctx: &dyn Context, event: &str, data: &serde_json
     }
 }
 
-/// Verify Stripe webhook signature using HMAC-SHA256.
-/// Stripe sends `t=timestamp,v1=signature` in the Stripe-Signature header.
+/// Verify a Stripe webhook signature: HMAC-SHA256 over `timestamp.payload`.
+///
+/// `Stripe-Signature` carries a `t=` timestamp and one `v1=` signature *per
+/// signing secret currently active on the endpoint*. Rolling a secret leaves
+/// the retired one live for up to 24 hours, and every delivery in that window
+/// is signed with both, so the header holds two `v1` values of which only one
+/// matches the secret this deployment holds. The delivery is accepted when any
+/// `v1` matches; reading a single value rejected every delivery for the whole
+/// roll window whenever the retired secret's signature came second.
 fn verify_stripe_signature(payload: &[u8], sig_header: &str, secret: &str) -> bool {
+    let candidates = || {
+        sig_header
+            .split(',')
+            .filter_map(|part| part.trim().strip_prefix("v1="))
+    };
     let mut timestamp = "";
-    let mut expected_sig = "";
-
     for part in sig_header.split(',') {
-        let part = part.trim();
-        if let Some(t) = part.strip_prefix("t=") {
+        if let Some(t) = part.trim().strip_prefix("t=") {
             timestamp = t;
-        } else if let Some(v) = part.strip_prefix("v1=") {
-            expected_sig = v;
         }
     }
 
-    if timestamp.is_empty() || expected_sig.is_empty() {
+    if timestamp.is_empty() || candidates().all(str::is_empty) {
         return false;
     }
 
@@ -4112,8 +4119,12 @@ fn verify_stripe_signature(payload: &[u8], sig_header: &str, secret: &str) -> bo
     let computed = primitives::hmac_sha256(secret.as_bytes(), &signed_payload);
     let computed_hex = hex_encode(&computed);
 
-    // Constant-time comparison
-    primitives::constant_time_eq(computed_hex.as_bytes(), expected_sig.as_bytes())
+    // Constant-time comparison against each offered signature. Which of them
+    // matches is not a secret — the header is attacker-supplied — so stopping
+    // at the first match leaks nothing about `secret`.
+    candidates().any(|candidate| {
+        primitives::constant_time_eq(computed_hex.as_bytes(), candidate.as_bytes())
+    })
 }
 
 /// Strict origin match: scheme + host + port must agree between `url` and
@@ -4300,6 +4311,52 @@ mod tests {
 
         let sig_header = format!("t={timestamp},v1={computed_hex}");
         assert!(verify_stripe_signature(payload, &sig_header, secret));
+    }
+
+    /// Rolling a webhook secret leaves the retired one live for up to 24
+    /// hours, and Stripe signs every delivery in that window with both: the
+    /// header carries one `v1` per active secret, in an order the endpoint
+    /// does not choose. Reading a single value accepted the delivery only
+    /// when the held secret's signature happened to come last.
+    #[test]
+    fn test_verify_stripe_signature_accepts_either_secret_during_a_roll() {
+        let held = "whsec_current";
+        let retired = "whsec_retired";
+        let payload = b"{\"type\":\"customer.subscription.updated\"}";
+        let timestamp = chrono::Utc::now().timestamp() as u64;
+        let sign = |secret: &str| {
+            hex_encode(&primitives::hmac_sha256(
+                secret.as_bytes(),
+                &build_signed_payload(timestamp, payload),
+            ))
+        };
+        let held_sig = sign(held);
+        let retired_sig = sign(retired);
+
+        assert!(
+            verify_stripe_signature(
+                payload,
+                &format!("t={timestamp},v1={retired_sig},v1={held_sig}"),
+                held
+            ),
+            "the held secret's signature last must verify"
+        );
+        assert!(
+            verify_stripe_signature(
+                payload,
+                &format!("t={timestamp},v1={held_sig},v1={retired_sig}"),
+                held
+            ),
+            "the held secret's signature first must verify just the same"
+        );
+        assert!(
+            !verify_stripe_signature(
+                payload,
+                &format!("t={timestamp},v1={retired_sig},v1={retired_sig}"),
+                held
+            ),
+            "a header carrying no signature from the held secret must not verify"
+        );
     }
 
     #[test]
