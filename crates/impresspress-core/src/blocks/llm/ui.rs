@@ -520,6 +520,59 @@ mod tests {
     // `tests/extra_routes_test.rs` (llm_admin_ui_*), not here, so these page
     // renderers no longer carry their own `is_admin` re-check.
 
+    /// The add-provider form is submitted with the browser's own encoding,
+    /// and `routes::providers::create_provider` parses that.
+    ///
+    /// The form used to declare `hx-ext="json-enc"` and carry a script that
+    /// reshaped the parameters for it. Neither did anything: no json-enc
+    /// extension is shipped with the chrome — asserted below against the
+    /// bytes actually served — and htmx silently ignores an extension it was
+    /// never given, so the body went out form-encoded either way and the
+    /// handler answered 400 to every submit.
+    #[test]
+    fn the_add_provider_form_declares_no_encoding_extension() {
+        let m = add_provider_form().into_string();
+
+        assert!(
+            !m.contains("hx-ext"),
+            "no htmx extension is shipped, so declaring one only misdescribes \
+             the request; got: {m}"
+        );
+        assert!(
+            !m.contains("<script"),
+            "the field coercions are the handler's, not the browser's; got: {m}"
+        );
+        assert!(
+            m.contains(r#"hx-post="/b/llm/api/providers""#),
+            "the form must post to the create endpoint; got: {m}"
+        );
+        for field in [
+            "name", "protocol", "endpoint", "key_var", "models", "enabled",
+        ] {
+            assert!(
+                m.contains(&format!(r#"name="{field}""#)),
+                "the form must send `{field}` — `routes::providers`'s form tests \
+                 post exactly these; got: {m}"
+            );
+        }
+    }
+
+    /// What makes the assertion above true rather than merely asserted: the
+    /// only htmx the chrome serves is the core library, which carries no
+    /// extension of any kind. Ship one and this test is the place that says
+    /// `hx-ext` may be used again.
+    #[cfg(feature = "embed-assets")]
+    #[test]
+    fn the_chrome_ships_no_htmx_extension() {
+        let htmx = crate::ui::assets::bytes("htmx.min.js").expect("htmx.min.js is embedded");
+        let htmx = String::from_utf8_lossy(htmx);
+        assert!(
+            !htmx.contains("json-enc"),
+            "htmx.min.js now mentions json-enc — check whether an extension is \
+             registered before trusting `hx-ext`"
+        );
+    }
+
     #[test]
     fn render_providers_table_empty_shows_hint() {
         let m = render_providers_table(&[], true).into_string();
