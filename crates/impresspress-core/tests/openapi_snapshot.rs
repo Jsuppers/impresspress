@@ -12,8 +12,15 @@
 //! So: snapshot a block before migrating it, migrate, then read the diff.
 //! Every changed line is a decision. Regenerate with
 //! `UPDATE_OPENAPI_SNAPSHOTS=1 cargo test -p impresspress-core --test openapi_snapshot`.
+//!
+//! Creating a baseline is that explicit run and nothing else. A missing
+//! baseline fails the test rather than being written in passing, so deleting
+//! a committed contract cannot be a green run and a new block's contract
+//! cannot enter the tree unreviewed.
 
 use std::path::PathBuf;
+
+mod baselines;
 
 /// Blocks under migration, mapped to the URL prefixes they actually serve.
 ///
@@ -37,16 +44,21 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
     ("legalpages", &["/b/legalpages"]),
 ];
 
-/// Blocks whose snapshot exists only under a non-default feature.
+/// Blocks whose snapshot exists only under a non-default feature: the block,
+/// its prefixes, and whether this run compiles it.
 ///
 /// `dev` cannot live in [`SNAPSHOTTED_BLOCKS`]: a default-feature run does not
 /// compile the block, `real_block_infos()` does not list it, and the empty-
-/// snapshot guard below would (correctly) fail. A separate cfg-gated list is
-/// how a per-element `#[cfg]` is expressed on a `const` slice.
-#[cfg(feature = "block-dev")]
-const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[("dev", &["/b/dev"])];
-#[cfg(not(feature = "block-dev"))]
-const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[];
+/// snapshot guard below would (correctly) fail.
+///
+/// Each row carries its OWN gate, and one list serves both uses: a row whose
+/// gate is true is compared, a row whose gate is false is the excuse the
+/// unchecked-baseline check needs for its committed file. A cfg-gated *pair*
+/// of slices would name a block twice and the copies could drift; a single
+/// bool for the whole list would be worse still, excusing a row gated on some
+/// other feature in every run that has that feature off.
+const FEATURE_GATED_BLOCKS: &[(&str, &[&str], bool)] =
+    &[("dev", &["/b/dev"], cfg!(feature = "block-dev"))];
 
 /// Blocks that legitimately have no schema-carrying endpoints yet, so an
 /// empty snapshot for them is correct rather than a sign the prefix map or
@@ -90,16 +102,25 @@ async fn openapi_matches_committed_snapshots() {
     std::fs::create_dir_all(snapshot_dir()).expect("create snapshot dir");
 
     let mut failures = Vec::new();
+    let mut compared = Vec::new();
 
-    for (block, prefixes) in SNAPSHOTTED_BLOCKS.iter().chain(FEATURE_GATED_BLOCKS) {
+    let always = SNAPSHOTTED_BLOCKS
+        .iter()
+        .map(|(block, prefixes)| (*block, *prefixes));
+    let gated = FEATURE_GATED_BLOCKS
+        .iter()
+        .filter(|(_, _, compiled)| *compiled)
+        .map(|(block, prefixes, _)| (*block, *prefixes));
+    for (block, prefixes) in always.chain(gated) {
         let actual = block_openapi(&doc, prefixes);
         let path = snapshot_dir().join(format!("{block}.openapi.json"));
+        compared.push(block.to_string());
 
         // An empty snapshot for a block that has schema-carrying endpoints
         // means the prefix map is wrong and this block is being "guarded" by
         // a diff that can never change. Only the blocks in
         // `LEGITIMATELY_EMPTY` are exempt.
-        if !LEGITIMATELY_EMPTY.contains(block) && actual.trim() == "{}" {
+        if !LEGITIMATELY_EMPTY.contains(&block) && actual.trim() == "{}" {
             failures.push(format!(
                 "\n=== {block} ===\nEMPTY snapshot. This block's prefixes {prefixes:?} matched no \
                  OpenAPI paths, so its gate is vacuous. Either the prefix map is wrong or the \
@@ -108,8 +129,24 @@ async fn openapi_matches_committed_snapshots() {
             continue;
         }
 
-        if updating || !path.exists() {
+        if updating {
             std::fs::write(&path, &actual).expect("write snapshot");
+            continue;
+        }
+
+        // A missing baseline is a failure, never a silent write. Writing it
+        // here would mean `git rm`-ing a committed contract is a green run,
+        // and a new block's published contract would get a baseline nobody
+        // ever read.
+        if !path.exists() {
+            failures.push(format!(
+                "\n=== {block} ===\nNo baseline at {}. A block's published OpenAPI contract is \
+                 a decision: review the document below, then create the file with \
+                 UPDATE_OPENAPI_SNAPSHOTS=1 cargo test -p impresspress-core --test \
+                 openapi_snapshot. If the block is gone, drop its row above and `git rm` \
+                 the baseline instead.\n{actual}",
+                path.display()
+            ));
             continue;
         }
 
@@ -124,6 +161,25 @@ async fn openapi_matches_committed_snapshots() {
                 path.display()
             ));
         }
+    }
+
+    let absent_by_feature: Vec<&str> = FEATURE_GATED_BLOCKS
+        .iter()
+        .filter(|(_, _, compiled)| !*compiled)
+        .map(|(block, _, _)| *block)
+        .collect();
+    for stem in baselines::unchecked(
+        &snapshot_dir(),
+        ".openapi.json",
+        &compared,
+        &absent_by_feature,
+    ) {
+        failures.push(format!(
+            "\n=== {stem} ===\n{stem}.openapi.json was not compared by this run, so the gate is \
+             vacuous for it. Add the block to SNAPSHOTTED_BLOCKS with the prefixes it serves; or, \
+             if it is compiled in only under a feature, to FEATURE_GATED_BLOCKS with the `cfg!` \
+             that gates it; or `git rm` the baseline if the block is gone."
+        ));
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
