@@ -3352,10 +3352,9 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 );
             }
 
-            // Sync addon totals from Stripe subscription items metadata.
-            // Each addon subscription item has metadata fields: extra_projects,
-            // extra_requests, extra_r2_bytes, extra_d1_bytes (set when creating
-            // the subscription item via Stripe API).
+            // Sync add-on totals from the metadata of the subscription's
+            // items. `repo::subscriptions::ADDON_TOTALS` names the metadata
+            // keys the platform stamps on its add-on objects.
             let user_id =
                 match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await {
                     Ok(user_id) => user_id,
@@ -3370,7 +3369,18 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 };
             if let Some(ref uid) = user_id {
                 if let Some(items) = data_object.get("items") {
-                    sync_addon_totals_from_items(ctx, uid, items).await;
+                    // A failed sync used to be logged and nothing else, so the
+                    // delivery still sealed the event as processed and Stripe
+                    // had nothing to retry: the subscriber kept paying for
+                    // add-ons their row never recorded.
+                    if let Err(error) =
+                        sync_addon_totals_from_items(ctx, uid, items, event_created).await
+                    {
+                        fail_webhook!(
+                            err_internal("Failed to synchronize add-on totals", error),
+                            "add-on total synchronization failed"
+                        );
+                    }
                 }
             }
 
@@ -4070,22 +4080,29 @@ async fn fire_products_webhook(ctx: &dyn Context, event: &str, data: &serde_json
     }
 }
 
-/// Verify Stripe webhook signature using HMAC-SHA256.
-/// Stripe sends `t=timestamp,v1=signature` in the Stripe-Signature header.
+/// Verify a Stripe webhook signature: HMAC-SHA256 over `timestamp.payload`.
+///
+/// `Stripe-Signature` carries a `t=` timestamp and one `v1=` signature *per
+/// signing secret currently active on the endpoint*. Rolling a secret leaves
+/// the retired one live for up to 24 hours, and every delivery in that window
+/// is signed with both, so the header holds two `v1` values of which only one
+/// matches the secret this deployment holds. The delivery is accepted when any
+/// `v1` matches; reading a single value rejected every delivery for the whole
+/// roll window whenever the retired secret's signature came second.
 fn verify_stripe_signature(payload: &[u8], sig_header: &str, secret: &str) -> bool {
+    let candidates = || {
+        sig_header
+            .split(',')
+            .filter_map(|part| part.trim().strip_prefix("v1="))
+    };
     let mut timestamp = "";
-    let mut expected_sig = "";
-
     for part in sig_header.split(',') {
-        let part = part.trim();
-        if let Some(t) = part.strip_prefix("t=") {
+        if let Some(t) = part.trim().strip_prefix("t=") {
             timestamp = t;
-        } else if let Some(v) = part.strip_prefix("v1=") {
-            expected_sig = v;
         }
     }
 
-    if timestamp.is_empty() || expected_sig.is_empty() {
+    if timestamp.is_empty() || candidates().all(str::is_empty) {
         return false;
     }
 
@@ -4112,8 +4129,12 @@ fn verify_stripe_signature(payload: &[u8], sig_header: &str, secret: &str) -> bo
     let computed = primitives::hmac_sha256(secret.as_bytes(), &signed_payload);
     let computed_hex = hex_encode(&computed);
 
-    // Constant-time comparison
-    primitives::constant_time_eq(computed_hex.as_bytes(), expected_sig.as_bytes())
+    // Constant-time comparison against each offered signature. Which of them
+    // matches is not a secret — the header is attacker-supplied — so stopping
+    // at the first match leaks nothing about `secret`.
+    candidates().any(|candidate| {
+        primitives::constant_time_eq(computed_hex.as_bytes(), candidate.as_bytes())
+    })
 }
 
 /// Strict origin match: scheme + host + port must agree between `url` and
@@ -4198,32 +4219,60 @@ async fn user_owns_product(
     repo::purchases::line_item_exists_for_product(ctx, purchase_ids, product_id).await
 }
 
-/// Sync addon column totals from Stripe subscription items.
+/// Sum the add-on totals a Stripe subscription's items report and write them
+/// to the subscriber's row.
 ///
-/// Reads addon values from item metadata (set by the platform when creating
-/// subscription items). This keeps the products block plan-agnostic — it
-/// doesn't need to know what addon packs exist, just what Stripe reports.
-async fn sync_addon_totals_from_items(ctx: &dyn Context, user_id: &str, items: &serde_json::Value) {
-    let mut total_projects: i64 = 0;
-    let mut total_requests: i64 = 0;
-    let mut total_r2: i64 = 0;
-    let mut total_d1: i64 = 0;
+/// The per-unit amounts are read from the metadata the platform stamps on its
+/// add-on objects. [`repo::subscriptions::ADDON_ITEM_MARKER`] is what makes an
+/// item an add-on at all, and [`repo::subscriptions::ADDON_TOTALS`] owns the
+/// metadata key for each total and the column it feeds. The block never needs a
+/// list of the add-on packs that exist — only the totals Stripe reports.
+///
+/// The marker decides which object to read, not just whether to read one:
+/// Stripe always serialises a subscription item's own `metadata`, as `{}` when
+/// it is unset, so testing the item object for presence rather than for the
+/// marker meant the price was never consulted and a price-stamped add-on
+/// counted as zero. Whichever object carries the marker supplies the amounts
+/// too — the objects are not merged.
+///
+/// The totals are quotas, so a quantity or an amount that is negative, or a
+/// product or sum too large to represent, is refused rather than written: each
+/// would otherwise hand the subscriber less capacity than none. That and a
+/// failed write are both errors, and the caller answers Stripe with one so the
+/// delivery is retried.
+async fn sync_addon_totals_from_items(
+    ctx: &dyn Context,
+    user_id: &str,
+    items: &serde_json::Value,
+    event_created: i64,
+) -> Result<(), WaferError> {
+    let mut totals = [0i64; repo::subscriptions::ADDON_TOTALS.len()];
+    let refuse = |detail: String| {
+        WaferError::new(
+            wafer_run::ErrorCode::InvalidArgument,
+            format!("Stripe subscription item metadata {detail}"),
+        )
+    };
 
     if let Some(data) = items.get("data").and_then(|v| v.as_array()) {
         for item in data {
+            let marked = |meta: &serde_json::Value| {
+                meta.get(repo::subscriptions::ADDON_ITEM_MARKER).is_some()
+            };
             let meta = item
                 .get("metadata")
-                .or_else(|| item.pointer("/price/metadata"));
+                .filter(|meta| marked(meta))
+                .or_else(|| item.pointer("/price/metadata").filter(|meta| marked(meta)));
+            // The base plan item carries the marker on neither object and
+            // contributes nothing to the totals.
             let Some(meta) = meta else {
                 continue;
             };
 
-            // Skip non-addon items (the base plan item won't have addon_id)
-            if meta.get("addon_id").is_none() {
-                continue;
-            }
-
             let qty = item.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
+            if qty < 0 {
+                return Err(refuse(format!("reports a negative quantity ({qty})")));
+            }
             let parse = |key: &str| -> i64 {
                 meta.get(key)
                     .and_then(|v| {
@@ -4233,25 +4282,25 @@ async fn sync_addon_totals_from_items(ctx: &dyn Context, user_id: &str, items: &
                     })
                     .unwrap_or(0)
             };
-            total_projects += parse("extra_projects") * qty;
-            total_requests += parse("extra_requests") * qty;
-            total_r2 += parse("extra_r2_bytes") * qty;
-            total_d1 += parse("extra_d1_bytes") * qty;
+            for (total, (metadata_key, _)) in
+                totals.iter_mut().zip(repo::subscriptions::ADDON_TOTALS)
+            {
+                let per_unit = parse(metadata_key);
+                if per_unit < 0 {
+                    return Err(refuse(format!(
+                        "reports a negative {metadata_key} ({per_unit})"
+                    )));
+                }
+                *total = per_unit
+                    .checked_mul(qty)
+                    .and_then(|line| total.checked_add(line))
+                    .ok_or_else(|| refuse(format!("overflows the {metadata_key} add-on total")))?;
+            }
         }
     }
 
-    if let Err(e) = repo::subscriptions::set_addon_totals(
-        ctx,
-        user_id,
-        total_projects,
-        total_requests,
-        total_r2,
-        total_d1,
-    )
-    .await
-    {
-        tracing::error!(error = %e, user_id = %user_id, "syncing addon totals failed");
-    }
+    repo::subscriptions::set_addon_totals(ctx, user_id, totals, event_created).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4300,6 +4349,52 @@ mod tests {
 
         let sig_header = format!("t={timestamp},v1={computed_hex}");
         assert!(verify_stripe_signature(payload, &sig_header, secret));
+    }
+
+    /// Rolling a webhook secret leaves the retired one live for up to 24
+    /// hours, and Stripe signs every delivery in that window with both: the
+    /// header carries one `v1` per active secret, in an order the endpoint
+    /// does not choose. Reading a single value accepted the delivery only
+    /// when the held secret's signature happened to come last.
+    #[test]
+    fn test_verify_stripe_signature_accepts_either_secret_during_a_roll() {
+        let held = "whsec_current";
+        let retired = "whsec_retired";
+        let payload = b"{\"type\":\"customer.subscription.updated\"}";
+        let timestamp = chrono::Utc::now().timestamp() as u64;
+        let sign = |secret: &str| {
+            hex_encode(&primitives::hmac_sha256(
+                secret.as_bytes(),
+                &build_signed_payload(timestamp, payload),
+            ))
+        };
+        let held_sig = sign(held);
+        let retired_sig = sign(retired);
+
+        assert!(
+            verify_stripe_signature(
+                payload,
+                &format!("t={timestamp},v1={retired_sig},v1={held_sig}"),
+                held
+            ),
+            "the held secret's signature last must verify"
+        );
+        assert!(
+            verify_stripe_signature(
+                payload,
+                &format!("t={timestamp},v1={held_sig},v1={retired_sig}"),
+                held
+            ),
+            "the held secret's signature first must verify just the same"
+        );
+        assert!(
+            !verify_stripe_signature(
+                payload,
+                &format!("t={timestamp},v1={retired_sig},v1={retired_sig}"),
+                held
+            ),
+            "a header carrying no signature from the held secret must not verify"
+        );
     }
 
     #[test]
