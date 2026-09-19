@@ -829,19 +829,22 @@ pub(crate) mod helpers {
     /// never lands in the database. New families start at `generation = 0`;
     /// rotation from `auth_ui::api::refresh::handle` calls this with the same
     /// `family` and `generation = prev + 1` (SEC-039).
+    ///
+    /// The row is the token: `refresh::handle` looks the presented JWT up by
+    /// hash and refuses it when no row matches. A failure here therefore has
+    /// to abort issuance rather than be logged — handing the caller a JWT with
+    /// no row gives them a credential that is already dead, and on rotation it
+    /// is worse, because the predecessor row was revoked first and the family
+    /// has no live generation left to refresh from.
     pub(crate) async fn store_refresh_token(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
         token: &str,
         family: &str,
         generation: i64,
-    ) {
+    ) -> Result<(), WaferError> {
         let expires_at = refresh_expires_at(ctx).await;
-        if let Err(e) =
-            super::repo::tokens::insert(ctx, user_id, token, family, generation, &expires_at).await
-        {
-            tracing::warn!("Failed to store refresh token: {e}");
-        }
+        super::repo::tokens::insert(ctx, user_id, token, family, generation, &expires_at).await
     }
 
     /// The `; Secure` attribute, or nothing on a development deployment that
@@ -1008,9 +1011,11 @@ pub(crate) mod helpers {
     /// row's, so the list cannot claim a device is signed in after its refresh
     /// token has expired.
     ///
-    /// The session-row write failing does not abort issuance — it is a UX
-    /// signal, not a security gate (auth is entirely JWT-based) — but it is
-    /// logged.
+    /// The SESSION row is the only write here that may fail without aborting
+    /// issuance: it is a device-list entry, not a credential, so losing it
+    /// costs a row on a UX surface and is logged rather than raised. The
+    /// REFRESH-token row is a credential — [`store_refresh_token`] explains
+    /// why its failure returns an error and no tokens are handed out.
     pub(crate) async fn issue_tokens_and_cookie(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
@@ -1023,7 +1028,9 @@ pub(crate) mod helpers {
         let (access_token, refresh_token, issued_family) =
             generate_tokens(ctx, user_id, email, roles, auth_method, family).await?;
 
-        store_refresh_token(ctx, user_id, &refresh_token, &issued_family, generation).await;
+        store_refresh_token(ctx, user_id, &refresh_token, &issued_family, generation)
+            .await
+            .map_err(|e| crate::http::err_internal("Could not persist the refresh token", e))?;
         record_login_family(
             ctx,
             user_id,
