@@ -30,7 +30,9 @@
 //! runs this path on a Worker today; if that changes, the subscriber is what
 //! has to be installed first, or these logs are decoration.
 
-use wafer_block::wire::llm::{ChatContent, ChatMessage, ChatRequest, ChatRole, ChunkDelta};
+use wafer_block::wire::llm::{
+    ChatContent, ChatMessage, ChatParams, ChatRequest, ChatRole, ChunkDelta,
+};
 use wafer_core::clients::llm;
 use wafer_run::{context::Context, InputStream, Message, WaferError};
 
@@ -118,14 +120,14 @@ pub async fn add_context(
     if chunks.is_empty() {
         return Ok(chunks);
     }
-    let Some((provider, model)) = default_llm_target(ctx).await else {
+    let Some(target) = default_llm_target(ctx).await else {
         tracing::debug!("contextual retrieval skipped: no default LLM model configured");
         return Ok(chunks);
     };
 
     let request = ChatRequest {
-        backend_id: provider,
-        model,
+        backend_id: target.provider,
+        model: target.model,
         messages: vec![
             ChatMessage {
                 role: ChatRole::System,
@@ -140,7 +142,13 @@ pub async fn add_context(
                 tool_calls: Vec::new(),
             },
         ],
-        params: Default::default(),
+        // The summary call needs an output-token budget like any other:
+        // Anthropic-protocol providers refuse a request without one, and the
+        // llm block publishes the deployment's alongside the target.
+        params: ChatParams {
+            max_tokens: Some(target.max_tokens),
+            ..Default::default()
+        },
         tools: Vec::new(),
         extra: serde_json::Value::Null,
     };
@@ -176,18 +184,26 @@ pub async fn add_context(
         .collect())
 }
 
-/// Fetch the default `(provider, model)` LLM target via the llm block's
-/// internal discovery route. Returns `None` when no model is configured or
-/// when the llm block isn't registered — both cases trigger the same
-/// degradation in `add_context`, which logs before returning the chunks
-/// unchanged.
+/// The default LLM target the llm block publishes: which backend and model to
+/// call, and the output-token budget to call them with.
+struct LlmTarget {
+    provider: String,
+    model: String,
+    max_tokens: u32,
+}
+
+/// Fetch the default LLM target via the llm block's internal discovery route.
+/// Returns `None` when no model is configured or when the llm block isn't
+/// registered — both cases trigger the same degradation in `add_context`,
+/// which logs before returning the chunks unchanged.
 ///
 /// Going through `ctx.call_block(...)` rather than a direct in-process
 /// function call is what keeps the vector block independent of the llm block
 /// at the type/dep level — and it is why this whole path needs no cargo
 /// feature: the edge is a runtime dispatch, resolved against what is
-/// registered.
-async fn default_llm_target(ctx: &dyn Context) -> Option<(String, String)> {
+/// registered. The budget travels with the target for the same reason: it is
+/// the llm block's configuration variable, so it is read by the llm block.
+async fn default_llm_target(ctx: &dyn Context) -> Option<LlmTarget> {
     let resource = "/b/llm/api/internal/default-target";
     let mut msg = Message::new(format!("retrieve:{resource}"));
     msg.set_meta("req.action", "retrieve");
@@ -202,10 +218,15 @@ async fn default_llm_target(ctx: &dyn Context) -> Option<(String, String)> {
     let body: serde_json::Value = serde_json::from_slice(&buf.body).ok()?;
     let provider = body.get("provider")?.as_str()?.to_string();
     let model = body.get("model")?.as_str()?.to_string();
-    if provider.is_empty() || model.is_empty() {
+    let max_tokens = u32::try_from(body.get("max_tokens")?.as_u64()?).ok()?;
+    if provider.is_empty() || model.is_empty() || max_tokens == 0 {
         return None;
     }
-    Some((provider, model))
+    Some(LlmTarget {
+        provider,
+        model,
+        max_tokens,
+    })
 }
 
 const CONTEXTUAL_SYSTEM_PROMPT: &str = "\
@@ -302,6 +323,13 @@ mod contextual_retrieval_tests {
         )
     }
 
+    /// Output-token budget the stub target publishes, mirroring the real
+    /// block's `max_tokens` field. A stub that omitted it would make every
+    /// test here take the no-target degradation, so the field is not optional
+    /// on this side either — `a_contextual_ingest_reaches_an_anthropic_provider`
+    /// is what checks the stub still describes the real block.
+    const STUB_MAX_TOKENS: u32 = 4096;
+
     /// Stub `impresspress/llm` feature block. `default_llm_target` reads one
     /// internal route off it and nothing else; anything else errors loudly so
     /// a test cannot silently exercise an unscripted path.
@@ -334,6 +362,7 @@ mod contextual_retrieval_tests {
                 serde_json::to_vec(&serde_json::json!({
                     "provider": provider,
                     "model": model,
+                    "max_tokens": STUB_MAX_TOKENS,
                 }))
                 .expect("serialize default-target body"),
             )
@@ -486,6 +515,77 @@ mod contextual_retrieval_tests {
             .expect("add_context never fails the ingest");
 
         assert_eq!(out, vec!["one".to_string()]);
+    }
+
+    /// The summary call reaches a real Anthropic-protocol provider.
+    ///
+    /// Every test above stubs both hops, so none of them encodes a provider
+    /// request — and `add_context` sent `ChatParams::default()`, whose
+    /// `max_tokens` is `None`, which Anthropic's Messages API requires. The
+    /// encoder refused it, `llm::chat` returned an error, and the ingest took
+    /// its "LLM call failed" degradation: raw chunks, a `warn!` nobody reads,
+    /// and a green suite. So this drives the real `impresspress/llm` block
+    /// (which is what publishes the budget alongside the target) and the real
+    /// `ProviderLlmService` behind `wafer-run/llm`.
+    ///
+    /// The one test here that does NOT use [`vector_ctx`]: the real llm block
+    /// reads its own `IMPRESSPRESS__LLM__*` variables, which WRAP scopes to
+    /// their owning block, and this harness keeps `caller_id` fixed at the
+    /// outermost caller instead of re-pointing it per hop the way
+    /// `RuntimeContext::dispatch_call` does (the gap `TestContext::call_block`
+    /// documents). Under `vector_ctx` the llm block would therefore read its
+    /// own configuration as `impresspress/vector` and be refused — a harness
+    /// artefact, not a deployment one. One identity has to stand in for the
+    /// whole call tree, so it is the admin block's, which WRAP admits
+    /// everywhere; the allowlist question `vector_ctx` exists for is pinned
+    /// directly by
+    /// `the_block_declares_every_target_contextual_retrieval_reaches`.
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn a_contextual_ingest_reaches_an_anthropic_provider() {
+        use crate::blocks::llm::{
+            provider_admin::NoopProviderAdmin,
+            providers::fake_anthropic::{FakeAnthropic, BACKEND_ID, MODEL},
+            DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
+        };
+
+        let mut ctx = TestContext::with_vector().await.with_wrap(
+            "impresspress/admin",
+            Vec::new(),
+            Vec::new(),
+            "impresspress/admin",
+        );
+        ctx.set_config(DEFAULT_PROVIDER_VAR, BACKEND_ID);
+        ctx.set_config(DEFAULT_MODEL_VAR, MODEL);
+        ctx.set_config(DEFAULT_MAX_TOKENS_VAR, "321");
+        ctx.register_block(
+            "impresspress/llm",
+            Arc::new(crate::blocks::llm::LlmBlock::new(Arc::new(
+                NoopProviderAdmin,
+            ))),
+        );
+        let fake = FakeAnthropic::answering("A report about widget sales.").await;
+        ctx.register_block("wafer-run/llm", fake.llm_service_block());
+
+        let out = add_context(&ctx, "the document", vec!["one".into()])
+            .await
+            .expect("add_context never fails the ingest");
+
+        assert_eq!(
+            out,
+            vec!["A report about widget sales.\n\none".to_string()],
+            "the provider's summary must reach the chunks"
+        );
+        let requests = fake.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request reached the provider"
+        );
+        assert_eq!(
+            requests[0]["max_tokens"], 321,
+            "the budget the llm block published must be what is sent"
+        );
     }
 
     /// The three degradation tests above cannot see this on their own: a
