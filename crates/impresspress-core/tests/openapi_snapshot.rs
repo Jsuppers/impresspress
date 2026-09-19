@@ -12,6 +12,11 @@
 //! So: snapshot a block before migrating it, migrate, then read the diff.
 //! Every changed line is a decision. Regenerate with
 //! `UPDATE_OPENAPI_SNAPSHOTS=1 cargo test -p impresspress-core --test openapi_snapshot`.
+//!
+//! Creating a baseline is that explicit run and nothing else. A missing
+//! baseline fails the test rather than being written in passing, so deleting
+//! a committed contract cannot be a green run and a new block's contract
+//! cannot enter the tree unreviewed.
 
 use std::path::PathBuf;
 
@@ -41,12 +46,18 @@ const SNAPSHOTTED_BLOCKS: &[(&str, &[&str])] = &[
 ///
 /// `dev` cannot live in [`SNAPSHOTTED_BLOCKS`]: a default-feature run does not
 /// compile the block, `real_block_infos()` does not list it, and the empty-
-/// snapshot guard below would (correctly) fail. A separate cfg-gated list is
-/// how a per-element `#[cfg]` is expressed on a `const` slice.
-#[cfg(feature = "block-dev")]
+/// snapshot guard below would (correctly) fail.
+///
+/// The list is spelled once and compared only when [`FEATURE_GATED_COMPILED`]
+/// is true. A cfg-gated *pair* of slices would name `dev` twice — once as a
+/// block to compare, once as a baseline to excuse — and the two copies can
+/// drift.
 const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[("dev", &["/b/dev"])];
-#[cfg(not(feature = "block-dev"))]
-const FEATURE_GATED_BLOCKS: &[(&str, &[&str])] = &[];
+
+/// Whether the blocks in [`FEATURE_GATED_BLOCKS`] are compiled into this run.
+/// When false their committed baselines are the only ones the unchecked-
+/// baseline guard excuses.
+const FEATURE_GATED_COMPILED: bool = cfg!(feature = "block-dev");
 
 /// Blocks that legitimately have no schema-carrying endpoints yet, so an
 /// empty snapshot for them is correct rather than a sign the prefix map or
@@ -64,6 +75,40 @@ const LEGITIMATELY_EMPTY: &[&str] = &[];
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
+}
+
+/// Stems of `*.openapi.json` files in `dir` that this run did not compare
+/// (`compared`) and that are not excused by `absent_by_feature`, sorted.
+///
+/// A committed baseline this run never compared is a gate that passes for
+/// free: the file sits there looking like a reviewed contract while nothing
+/// reads it. Under a reduced feature set most blocks are not compiled in, so
+/// without this check `dev.openapi.json` could sit unchecked forever.
+///
+/// The walk is deliberately local to this file rather than shared with the
+/// endpoint-surface test: the two differ in the suffix they own, and a shared
+/// helper would have to be told which, which is the whole body of the function.
+fn unchecked_baselines(
+    dir: &std::path::Path,
+    compared: &[String],
+    absent_by_feature: &[&str],
+) -> Vec<String> {
+    let mut left: Vec<String> = std::fs::read_dir(dir)
+        .expect("read snapshot dir")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".openapi.json"))
+                .map(str::to_string)
+        })
+        .filter(|stem| {
+            !compared.iter().any(|c| c == stem) && !absent_by_feature.contains(&stem.as_str())
+        })
+        .collect();
+    left.sort();
+    left
 }
 
 /// Every path in the generated OpenAPI document belonging to `block`,
@@ -90,10 +135,15 @@ async fn openapi_matches_committed_snapshots() {
     std::fs::create_dir_all(snapshot_dir()).expect("create snapshot dir");
 
     let mut failures = Vec::new();
+    let mut compared = Vec::new();
 
-    for (block, prefixes) in SNAPSHOTTED_BLOCKS.iter().chain(FEATURE_GATED_BLOCKS) {
+    let gated = FEATURE_GATED_BLOCKS
+        .iter()
+        .filter(|_| FEATURE_GATED_COMPILED);
+    for (block, prefixes) in SNAPSHOTTED_BLOCKS.iter().chain(gated) {
         let actual = block_openapi(&doc, prefixes);
         let path = snapshot_dir().join(format!("{block}.openapi.json"));
+        compared.push(block.to_string());
 
         // An empty snapshot for a block that has schema-carrying endpoints
         // means the prefix map is wrong and this block is being "guarded" by
@@ -108,8 +158,23 @@ async fn openapi_matches_committed_snapshots() {
             continue;
         }
 
-        if updating || !path.exists() {
+        if updating {
             std::fs::write(&path, &actual).expect("write snapshot");
+            continue;
+        }
+
+        // A missing baseline is a failure, never a silent write. Writing it
+        // here would mean `git rm`-ing a committed contract is a green run,
+        // and a new block's published contract would get a baseline nobody
+        // ever read.
+        if !path.exists() {
+            failures.push(format!(
+                "\n=== {block} ===\nNo baseline at {}. A block's published OpenAPI contract is \
+                 a decision: review the document below, then create the file with \
+                 UPDATE_OPENAPI_SNAPSHOTS=1 cargo test -p impresspress-core --test \
+                 openapi_snapshot\n{actual}",
+                path.display()
+            ));
             continue;
         }
 
@@ -126,7 +191,39 @@ async fn openapi_matches_committed_snapshots() {
         }
     }
 
+    let absent_by_feature: Vec<&str> = if FEATURE_GATED_COMPILED {
+        Vec::new()
+    } else {
+        FEATURE_GATED_BLOCKS.iter().map(|(name, _)| *name).collect()
+    };
+    for stem in unchecked_baselines(&snapshot_dir(), &compared, &absent_by_feature) {
+        failures.push(format!(
+            "\n=== {stem} ===\n{stem}.openapi.json was not compared by this run, so the gate is \
+             vacuous for it. Add the block to SNAPSHOTTED_BLOCKS with the prefixes it serves, or \
+             — if it is compiled in only under a feature — to FEATURE_GATED_BLOCKS."
+        ));
+    }
+
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The unchecked-baseline walk itself, on a directory this test owns: a
+/// baseline the run compared is quiet, one it did not is reported, one excused
+/// by a feature is quiet, and a file with a different suffix is not this
+/// gate's business.
+#[test]
+fn unchecked_baselines_lists_committed_files_this_run_did_not_compare() {
+    let dir = std::env::temp_dir().join(format!("openapi-snapshot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    for stem in ["alpha", "beta", "dev"] {
+        std::fs::write(dir.join(format!("{stem}.openapi.json")), "{}\n").expect("write");
+    }
+    std::fs::write(dir.join("alpha.endpoints.json"), "[]\n").expect("write");
+
+    let left = unchecked_baselines(&dir, &["alpha".to_string()], &["dev"]);
+    std::fs::remove_dir_all(&dir).expect("remove temp dir");
+
+    assert_eq!(left, vec!["beta".to_string()]);
 }
 
 /// `admin` shipped 17 endpoints and zero schemas: its handlers returned the
