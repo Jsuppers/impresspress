@@ -37,7 +37,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Err(e) => return err_internal("User lookup failed", e),
     };
 
-    // The real stored credential, if this login has one at all.
+    // The real stored credential, if this login has one at all. A user with
+    // no `local_credentials` row (an OAuth-only account) is `None` and takes
+    // the equalization arm below; a failed read is an outage, refused the
+    // same way the users read above refuses one, not a wrong password.
     let stored_hash_owned: String;
     let stored_hash: Option<&str> = match &user_row {
         Some(u) => match local_credentials::find_by_user_id(ctx, &u.id).await {
@@ -45,7 +48,8 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
                 stored_hash_owned = cred.password_hash;
                 Some(&stored_hash_owned)
             }
-            _ => None,
+            Ok(None) => None,
+            Err(e) => return err_internal("Credential lookup failed", e),
         },
         None => None,
     };
@@ -169,7 +173,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::{auth::TIMING_EQUALIZATION_PASSWORD, auth_ui::api::signup},
-        test_support::{collect_or_panic, output_json, TestContext},
+        test_support::{collect_or_panic, output_http_status, output_json, TestContext},
     };
 
     /// A context with a real crypto block — login verifies passwords via
@@ -301,5 +305,33 @@ mod tests {
                 "the timing-equalization password signed a credential-less user in: {other:?}"
             ),
         }
+    }
+
+    /// A credential read that fails is an outage, and the caller is told so
+    /// with a 500. Answering it as "Invalid email or password" would tell a
+    /// user with the right password that it is wrong, and hide the outage
+    /// behind what looks like ordinary failed logins.
+    #[tokio::test]
+    async fn a_failed_credential_read_is_a_500_not_invalid_credentials() {
+        use crate::{blocks::auth::repo::local_credentials, test_support::FailingDbOpContext};
+
+        let ctx = ctx_with_crypto().await;
+        signup_user(&ctx, "outage@example.com", "correct-horse-battery").await;
+        let failing =
+            FailingDbOpContext::new(ctx, vec![("database.list", local_credentials::TABLE)]);
+
+        let body = serde_json::json!({
+            "email": "outage@example.com",
+            "password": "correct-horse-battery",
+        })
+        .to_string();
+        let status =
+            output_http_status(handle(&failing, InputStream::from_bytes(body.into_bytes())).await)
+                .await;
+
+        assert_eq!(
+            status, 500,
+            "a failed credential read must surface as a server error, not a wrong password"
+        );
     }
 }
