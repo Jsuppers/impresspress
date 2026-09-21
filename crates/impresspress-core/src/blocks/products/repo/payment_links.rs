@@ -81,31 +81,16 @@ fn offer_filter(offer_id: &str) -> Filter {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "`ctx` plus one argument for each value the pending payment-link \
-              row records"
-)]
-pub(crate) async fn create_pending(
-    ctx: &dyn Context,
-    offer_id: &str,
-    preset_id: &str,
+/// The values one synchronization attempt sends to Stripe on behalf of a row.
+/// A retry of the same configuration rewrites them, so the row always
+/// describes the attempt that is in flight.
+fn attempt_fields(
     seller_account_id: &str,
     stripe_account_id: &str,
-    livemode: bool,
-    configuration_hash: &str,
     pricing_snapshot: &PricingPreview,
     fee_basis_points: u16,
-) -> Result<StoredPaymentLink, WaferError> {
-    let id = uuid::Uuid::now_v7().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let data = HashMap::from([
-        ("id".to_string(), Value::String(id)),
-        ("offer_id".to_string(), Value::String(offer_id.to_string())),
-        (
-            "preset_id".to_string(),
-            Value::String(preset_id.to_string()),
-        ),
+) -> Result<HashMap<String, Value>, WaferError> {
+    Ok(HashMap::from([
         (
             "seller_account_id".to_string(),
             Value::String(seller_account_id.to_string()),
@@ -113,21 +98,6 @@ pub(crate) async fn create_pending(
         (
             "stripe_account_id".to_string(),
             Value::String(stripe_account_id.to_string()),
-        ),
-        ("livemode".to_string(), Value::Bool(livemode)),
-        (
-            "stripe_payment_link_id".to_string(),
-            Value::String(String::new()),
-        ),
-        (
-            "stripe_buy_button_id".to_string(),
-            Value::String(String::new()),
-        ),
-        ("url".to_string(), Value::String(String::new())),
-        ("active".to_string(), Value::Bool(true)),
-        (
-            "configuration_hash".to_string(),
-            Value::String(configuration_hash.to_string()),
         ),
         (
             "pricing_snapshot".to_string(),
@@ -147,10 +117,90 @@ pub(crate) async fn create_pending(
             Value::String("syncing".to_string()),
         ),
         ("sync_error".to_string(), Value::String(String::new())),
-        ("created_at".to_string(), Value::String(now.clone())),
-        ("updated_at".to_string(), Value::String(now)),
+        (
+            "updated_at".to_string(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        ),
+    ]))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`ctx` plus one argument for each value the pending payment-link \
+              row records"
+)]
+pub(crate) async fn create_pending(
+    ctx: &dyn Context,
+    offer_id: &str,
+    preset_id: &str,
+    seller_account_id: &str,
+    stripe_account_id: &str,
+    livemode: bool,
+    configuration_hash: &str,
+    pricing_snapshot: &PricingPreview,
+    fee_basis_points: u16,
+) -> Result<StoredPaymentLink, WaferError> {
+    let mut data = attempt_fields(
+        seller_account_id,
+        stripe_account_id,
+        pricing_snapshot,
+        fee_basis_points,
+    )?;
+    let created_at = data["updated_at"].clone();
+    data.extend([
+        (
+            "id".to_string(),
+            Value::String(uuid::Uuid::now_v7().to_string()),
+        ),
+        ("offer_id".to_string(), Value::String(offer_id.to_string())),
+        (
+            "preset_id".to_string(),
+            Value::String(preset_id.to_string()),
+        ),
+        ("livemode".to_string(), Value::Bool(livemode)),
+        (
+            "stripe_payment_link_id".to_string(),
+            Value::String(String::new()),
+        ),
+        (
+            "stripe_buy_button_id".to_string(),
+            Value::String(String::new()),
+        ),
+        ("url".to_string(), Value::String(String::new())),
+        ("active".to_string(), Value::Bool(true)),
+        (
+            "configuration_hash".to_string(),
+            Value::String(configuration_hash.to_string()),
+        ),
+        ("created_at".to_string(), created_at),
     ]);
     hydrate(db::create(ctx, TABLE, data).await?)
+}
+
+/// Put an unfinished row (`syncing` or `error`) back into `syncing` for a new
+/// attempt at its configuration, recording what this attempt sends.
+pub(crate) async fn restart_pending(
+    ctx: &dyn Context,
+    id: &str,
+    seller_account_id: &str,
+    stripe_account_id: &str,
+    pricing_snapshot: &PricingPreview,
+    fee_basis_points: u16,
+) -> Result<StoredPaymentLink, WaferError> {
+    hydrate(
+        db::update(
+            ctx,
+            TABLE,
+            id,
+            attempt_fields(
+                seller_account_id,
+                stripe_account_id,
+                pricing_snapshot,
+                fee_basis_points,
+            )?,
+        )
+        .await?,
+    )
 }
 
 pub(crate) async fn mark_synced(
@@ -249,13 +299,26 @@ pub(crate) async fn list_for_offer(
         .collect()
 }
 
-pub(crate) async fn find_reusable(
+/// The active local row for one Payment Link configuration.
+pub(crate) enum ConfiguredLink {
+    /// Stripe holds the link and the row records it: reuse it as it is.
+    Synced(ManagedPaymentLink),
+    /// A row whose last attempt did not finish (`syncing` or `error`). Stripe
+    /// may or may not hold a link for it; a retry re-drives this row rather
+    /// than inserting another. Carries the row id.
+    Unfinished(String),
+}
+
+/// Find the active row for `(offer, preset, configuration)`, preferring a
+/// synced one. Of several unfinished rows the oldest is returned, so every
+/// retry re-drives the same one.
+pub(crate) async fn find_for_configuration(
     ctx: &dyn Context,
     offer_id: &str,
     preset_id: &str,
     configuration_hash: &str,
-) -> Result<Option<ManagedPaymentLink>, WaferError> {
-    let rows = db_read::list_bounded(
+) -> Result<Option<ConfiguredLink>, WaferError> {
+    let mut rows = db_read::list_bounded(
         ctx,
         TABLE,
         vec![
@@ -275,20 +338,25 @@ pub(crate) async fn find_reusable(
                 operator: FilterOp::Equal,
                 value: Value::Bool(true),
             },
-            Filter {
-                field: "sync_status".to_string(),
-                operator: FilterOp::Equal,
-                value: Value::String("synced".to_string()),
-            },
         ],
         Bound::OnePer("payment link on one offer preset"),
     )
-    .await?;
-    rows.into_iter()
-        .next()
-        .map(hydrate)
-        .transpose()
-        .map(|stored| stored.map(|stored| stored.managed))
+    .await?
+    .into_iter()
+    .map(|record| {
+        let created_at = record.str_field("created_at").to_string();
+        hydrate(record).map(|stored| (created_at, stored))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut unfinished = None;
+    for (_, stored) in rows {
+        if stored.managed.sync_status == "synced" {
+            return Ok(Some(ConfiguredLink::Synced(stored.managed)));
+        }
+        unfinished.get_or_insert(stored.managed.id);
+    }
+    Ok(unfinished.map(ConfiguredLink::Unfinished))
 }
 
 pub(crate) async fn deactivate_local(

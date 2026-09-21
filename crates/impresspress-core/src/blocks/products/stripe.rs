@@ -1955,7 +1955,6 @@ fn payment_link_form(
     offer: &Offer,
     preview: &crate::blocks::products::contracts::PricingPreview,
     product_name: &str,
-    local_link_id: &str,
     preset_id: &str,
     after_completion_url: Option<&str>,
     automatic_tax: bool,
@@ -1972,11 +1971,6 @@ fn payment_link_form(
         return Err("Payment Links require between 1 and 20 included line items".to_string());
     }
     let mut pairs = Vec::new();
-    push_form(
-        &mut pairs,
-        "metadata[impresspress_payment_link_id]",
-        local_link_id,
-    );
     push_form(&mut pairs, "metadata[offer_id]", &offer.id);
     push_form(&mut pairs, "metadata[offer_version]", offer.version);
     if !preset_id.is_empty() {
@@ -2180,34 +2174,28 @@ pub(crate) async fn create_payment_link(
         )
     })?;
     let configuration_hash = wafer_block::hash::sha256_hex(canonical.as_bytes());
-    if let Some(existing) =
-        repo::payment_links::find_reusable(ctx, offer_id, &preset_id, &configuration_hash).await?
-    {
-        return Ok(existing);
-    }
+    let configured =
+        repo::payment_links::find_for_configuration(ctx, offer_id, &preset_id, &configuration_hash)
+            .await?;
+    let unfinished = match configured {
+        Some(repo::payment_links::ConfiguredLink::Synced(existing)) => return Ok(existing),
+        Some(repo::payment_links::ConfiguredLink::Unfinished(id)) => Some(id),
+        None => None,
+    };
 
     let (seller_account_id, stripe_account_id, fee_basis_points) =
         payment_link_seller_context(ctx, product).await?;
     let fee_minor = application_fee(preview.amounts.total_minor, fee_basis_points)
         .map_err(|error| WaferError::new(wafer_run::ErrorCode::InvalidArgument, error))?;
-    let pending = repo::payment_links::create_pending(
-        ctx,
-        offer_id,
-        &preset_id,
-        &seller_account_id,
-        &stripe_account_id,
-        livemode,
-        &configuration_hash,
-        &preview,
-        fee_basis_points,
-    )
-    .await?;
+    // The whole Stripe request is settled before any row is written, so a
+    // configuration that can never produce a valid request (a malformed
+    // platform country, an out-of-range line-item count) leaves nothing
+    // behind to retry.
     let country = platform_country(ctx).await?;
-    let body = payment_link_form(
+    let mut body = payment_link_form(
         &offer,
         &preview,
         product.str_field("name"),
-        &pending.managed.id,
         &preset_id,
         after_completion_url,
         offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await,
@@ -2216,13 +2204,47 @@ pub(crate) async fn create_payment_link(
         fee_basis_points,
     )
     .map_err(|error| WaferError::new(wafer_run::ErrorCode::InvalidArgument, error))?;
+    let idempotency_key =
+        payment_link_idempotency_key(&configuration_hash, &stripe_account_id, &body);
+    let pending = match unfinished {
+        Some(id) => {
+            repo::payment_links::restart_pending(
+                ctx,
+                &id,
+                &seller_account_id,
+                &stripe_account_id,
+                &preview,
+                fee_basis_points,
+            )
+            .await?
+        }
+        None => {
+            repo::payment_links::create_pending(
+                ctx,
+                offer_id,
+                &preset_id,
+                &seller_account_id,
+                &stripe_account_id,
+                livemode,
+                &configuration_hash,
+                &preview,
+                fee_basis_points,
+            )
+            .await?
+        }
+    };
+    push_form(
+        &mut body,
+        "metadata[impresspress_payment_link_id]",
+        &pending.managed.id,
+    );
     let response = match client
         .request_json(
             ctx,
             "POST",
             "/v1/payment_links",
             Some(&stripe_account_id),
-            Some(&format!("impresspress_payment_link_{}", pending.managed.id)),
+            Some(&idempotency_key),
             Some(body),
         )
         .await
@@ -2253,10 +2275,48 @@ pub(crate) async fn create_payment_link(
             "Stripe Payment Link response was incomplete",
         ));
     }
-    Ok(
-        repo::payment_links::mark_synced(ctx, &pending.managed.id, stripe_id, url)
-            .await?
-            .managed,
+    // Stripe now holds a live link. If this write fails the row stays
+    // `syncing`; a retry re-drives the same row with the same idempotency
+    // key, and while Stripe retains that key it answers with this same link
+    // for the retry to record. The log line names the link for reconciling a
+    // row that is not retried in time.
+    match repo::payment_links::mark_synced(ctx, &pending.managed.id, stripe_id, url).await {
+        Ok(stored) => Ok(stored.managed),
+        Err(error) => {
+            tracing::error!(
+                link_id = %pending.managed.id,
+                stripe_payment_link_id = %stripe_id,
+                error = %error,
+                "Stripe created a Payment Link that could not be recorded locally"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// The Stripe idempotency key for one Payment Link request.
+///
+/// It is derived from the local configuration, the Stripe account and every
+/// parameter sent except the local row id (sent as metadata), so every attempt
+/// at an unchanged request reuses one key and, while Stripe retains the key
+/// (at least 24 hours), reaches one Stripe object. That covers a retry after
+/// the local write of a created link failed, and a concurrent duplicate
+/// request, which Stripe refuses (in-flight conflict or parameter mismatch)
+/// instead of creating a second link. Any change to what is sent (fee, tax
+/// setting, product name, account) is a new key, because Stripe rejects a
+/// reused key whose parameters differ.
+fn payment_link_idempotency_key(
+    configuration_hash: &str,
+    stripe_account_id: &str,
+    form: &[(String, String)],
+) -> String {
+    let request = format!(
+        "{configuration_hash}\n{stripe_account_id}\n{}",
+        encode_form(form.to_vec())
+    );
+    format!(
+        "impresspress_payment_link_{}",
+        sha256_hex(request.as_bytes())
     )
 }
 
@@ -4671,7 +4731,6 @@ mod tests {
             &offer,
             &preview,
             "Shipped product",
-            "link_shipping",
             "",
             None,
             false,
@@ -4688,7 +4747,6 @@ mod tests {
                 &offer,
                 &preview,
                 "Shipped product",
-                "link_shipping",
                 "",
                 None,
                 false,
