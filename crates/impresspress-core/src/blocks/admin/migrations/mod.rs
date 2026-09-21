@@ -58,6 +58,37 @@ const SQL_002_POSTGRES: &str = include_str!("002_variables_block_column.postgres
 const SQL_003_SQLITE: &str = include_str!("003_block_settings_seed_hash.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgres.sql");
+// 004 makes `user_roles` hold at most one grant per `(user_id, role)`.
+//
+// `platform_state::user_roles::assign` is a read-then-insert, and the login
+// path runs it concurrently: `auth::helpers::ensure_admin_role` grants `admin`
+// on every login of the bootstrap-admin address that does not already hold
+// it, so two logins racing on a fresh account could both find no grant and
+// both insert one. A duplicate is not harmless. `get_user_roles` folds the
+// twins into one role, while `iam::handle_remove_role` deletes ONE row by id —
+// so a revoke answered `{"deleted": true}`, bumped the auth version and wrote
+// its audit row, and the surviving twin kept granting the role on the very
+// next token. The index makes the insert itself the claim: the losing racer
+// is refused, and `assign` reads that refusal back as "already assigned".
+//
+// Rows that already repeat a grant are collapsed onto the earliest
+// (`created_at`, then `id`, so the result does not depend on row order).
+// Every deleted row names a `(user_id, role)` pair its survivor still grants,
+// so no user's effective roles change — what goes is the second row a revoke
+// could miss. `RELEASE.md` carries the operator-facing version.
+//
+// Re-runnable, which admin's migrations must be twice over: the gate re-runs
+// the whole concatenated set from 001 whenever its hash changes, and the
+// native CLI runs `ddl_files` ungated on every boot, before the wafer exists
+// (`migration_helper::apply_ddl_via_service`). Once the index exists the
+// `DELETE` finds nothing and the `CREATE UNIQUE INDEX IF NOT EXISTS` is a
+// no-op.
+//
+// This reasoning lives here rather than in the .sql files for the reason 002's
+// note above gives.
+const SQL_004_SQLITE: &str = include_str!("004_user_roles_unique.sqlite.sql");
+#[cfg(feature = "postgres")]
+const SQL_004_POSTGRES: &str = include_str!("004_user_roles_unique.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle_init` apply path.
@@ -66,7 +97,12 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("001_admin_schema", SQL_001_SQLITE),
     ("002_variables_block_column", SQL_002_SQLITE),
     ("003_block_settings_seed_hash", SQL_003_SQLITE),
+    (USER_ROLES_UNIQUE, SQL_004_SQLITE),
 ];
+
+/// Basename of the grant-uniqueness repair, named once so the migration list
+/// and the test that slices it cannot drift apart.
+pub(crate) const USER_ROLES_UNIQUE: &str = "004_user_roles_unique";
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`] one
 /// for one. Selected at runtime by `apply_migrations` and reused by
@@ -74,8 +110,12 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
 /// feature is off — see `files::migrations`'s doc for the rationale
 /// (Cloudflare/D1 never selects postgres; don't embed dead SQL).
 #[cfg(feature = "postgres")]
-pub(crate) const POSTGRES_MIGRATIONS: &[&str] =
-    &[SQL_001_POSTGRES, SQL_002_POSTGRES, SQL_003_POSTGRES];
+pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
+    SQL_001_POSTGRES,
+    SQL_002_POSTGRES,
+    SQL_003_POSTGRES,
+    SQL_004_POSTGRES,
+];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
 
@@ -113,15 +153,15 @@ pub fn ddl_files(db_type: &str) -> &'static [&'static str] {
     if db_type.eq_ignore_ascii_case("postgres") {
         POSTGRES_MIGRATIONS
     } else {
-        &[SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE]
+        &[SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE, SQL_004_SQLITE]
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "postgres")]
-    use super::{SQL_001_POSTGRES, SQL_002_POSTGRES, SQL_003_POSTGRES};
-    use super::{SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE};
+    use super::{SQL_001_POSTGRES, SQL_002_POSTGRES, SQL_003_POSTGRES, SQL_004_POSTGRES};
+    use super::{SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE, SQL_004_SQLITE};
 
     #[test]
     fn sqlite_migrations_contain_expected_ddl() {
@@ -132,6 +172,8 @@ mod tests {
         assert!(SQL_002_SQLITE.contains("impresspress__admin__variables_block_idx"));
         // 003 follow-up (ADD COLUMN seed_defaults_hash)
         assert!(SQL_003_SQLITE.contains("ADD COLUMN seed_defaults_hash"));
+        // 004 grant uniqueness
+        assert!(SQL_004_SQLITE.contains("impresspress__admin__user_roles_user_role_uniq"));
     }
 
     #[test]
@@ -140,5 +182,103 @@ mod tests {
         assert!(SQL_001_POSTGRES.contains("impresspress__admin__variables_key_uniq"));
         assert!(SQL_002_POSTGRES.contains("ADD COLUMN"));
         assert!(SQL_003_POSTGRES.contains("seed_defaults_hash"));
+        assert!(SQL_004_POSTGRES.contains("impresspress__admin__user_roles_user_role_uniq"));
+    }
+}
+
+#[cfg(test)]
+mod user_roles_unique_tests {
+    //! What `004_user_roles_unique` does to a deployment that already holds a
+    //! repeated grant — the only database its `DELETE` has anything to do on.
+    //! Every other fixture applies 001-004 together against an empty table,
+    //! so an error in the repair would go unnoticed until a real deployment
+    //! tried to upgrade, where it fails the whole batch and re-fails on every
+    //! later boot.
+
+    use super::{SQLITE_MIGRATIONS, USER_ROLES_UNIQUE};
+    use crate::{
+        migration_helper,
+        platform_state::user_roles::{self, UserRoleRow, TABLE},
+        test_support::TestContext,
+    };
+    use wafer_core::clients::database as db;
+
+    const ADMIN: &str = "impresspress/admin";
+
+    /// The migrations before 004, sliced out of the shipped list by name so
+    /// an unwired 004 cannot pass as applied.
+    fn before_004() -> Vec<&'static str> {
+        let at = SQLITE_MIGRATIONS
+            .iter()
+            .position(|(name, _)| *name == USER_ROLES_UNIQUE)
+            .expect("004 is wired into SQLITE_MIGRATIONS");
+        SQLITE_MIGRATIONS[..at].iter().map(|(_, sql)| *sql).collect()
+    }
+
+    fn grant(id: &str, user_id: &str, role: &str, created_at: &str) -> UserRoleRow {
+        UserRoleRow {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            role: role.to_string(),
+            assigned_at: Some(created_at.to_string()),
+            assigned_by: String::new(),
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_004_collapses_repeated_grants_and_the_index_then_refuses_one() {
+        let mut ctx = TestContext::new().await;
+        migration_helper::apply_migrations(&ctx, ADMIN, &before_004(), &[])
+            .await
+            .expect("001-003 apply");
+
+        // What two racing bootstrap-admin logins left behind, plus a pair
+        // tied on `created_at` so the `id` tie-break is what decides, plus a
+        // grant that repeats nothing and must be left alone.
+        for row in [
+            grant("ur_b_first", "alice", "admin", "2026-01-01T00:00:00Z"),
+            grant("ur_a_second", "alice", "admin", "2026-02-01T00:00:00Z"),
+            grant("ur_tie_b", "bob", "editor", "2026-03-01T00:00:00Z"),
+            grant("ur_tie_a", "bob", "editor", "2026-03-01T00:00:00Z"),
+            grant("ur_other", "bob", "admin", "2026-04-01T00:00:00Z"),
+        ] {
+            db::create(&ctx, TABLE, row.to_data())
+                .await
+                .expect("seed the repeated grant");
+        }
+
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+        let all: Vec<&str> = SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect();
+        migration_helper::apply_migrations(&ctx, ADMIN, &all, &[])
+            .await
+            .expect("004 applies to a database holding repeated grants");
+
+        let mut ids: Vec<String> = user_roles::list_all(&ctx)
+            .await
+            .expect("list grants")
+            .rows
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["ur_b_first", "ur_other", "ur_tie_a"],
+            "each repeated grant collapses onto its earliest row, and nothing \
+             else is touched"
+        );
+
+        assert!(
+            db::create(
+                &ctx,
+                TABLE,
+                grant("ur_again", "alice", "admin", "2026-05-01T00:00:00Z").to_data(),
+            )
+            .await
+            .is_err(),
+            "the index is in place, so the grant cannot be repeated again"
+        );
     }
 }

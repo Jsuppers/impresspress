@@ -570,6 +570,31 @@ mod tests {
     }
 
     #[test]
+    fn admin_004_splits_into_its_repair_and_its_index() {
+        // Both statements have to reach `db::ddl`: without the `DELETE` the
+        // index cannot be created on a database that already repeats a grant.
+        for (dialect, sql) in [
+            (
+                "sqlite",
+                include_str!("blocks/admin/migrations/004_user_roles_unique.sqlite.sql"),
+            ),
+            (
+                "postgres",
+                include_str!("blocks/admin/migrations/004_user_roles_unique.postgres.sql"),
+            ),
+        ] {
+            let count = split_statements(sql)
+                .into_iter()
+                .filter(|s| has_executable_content(s))
+                .count();
+            assert_eq!(
+                count, 2,
+                "admin {dialect} migration 004: expected 2 statements, got {count}"
+            );
+        }
+    }
+
+    #[test]
     fn products_sql_splits_into_expected_chunks() {
         // Counts the executable statements in the products block SQL files.
         // 9 CREATE TABLE + 9 CREATE INDEX = 18 statements per backend (the

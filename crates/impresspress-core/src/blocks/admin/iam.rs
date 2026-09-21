@@ -182,7 +182,7 @@ async fn cascade_role_rename(
     };
 
     for grant in &grants {
-        if let Err(e) = user_roles::rename_role(ctx, &grant.id, new_name).await {
+        if let Err(e) = user_roles::rename_role(ctx, grant, new_name).await {
             return Err(err_internal(
                 "Role renamed but its grants did not follow",
                 e,
@@ -1123,5 +1123,127 @@ mod tests {
             before_remove + 1,
             "removing a role must bump the target user's auth_version"
         );
+    }
+
+    /// Two grants of one role to one user, racing, leave ONE row — and so a
+    /// revoke of that row really revokes.
+    ///
+    /// `assign` reads before it inserts, and two callers that both pass the
+    /// read see no grant. The rendezvous holds both on that read until each
+    /// has made it, which is the interleaving two concurrent bootstrap-admin
+    /// logins can produce (`ensure_admin_role` reaches `assign` on every such
+    /// login). Without the unique index both inserts land, and the
+    /// duplicate's cost shows at the revoke: `handle_remove_role` deletes one
+    /// row, answers `{"deleted": true}`, and the twin keeps the role live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_grants_of_one_role_leave_one_row_that_a_revoke_removes() {
+        use crate::test_support::RendezvousDbOpContext;
+
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("racer").await;
+        let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", user_roles::TABLE, 2);
+
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let gated = gated.clone();
+                tokio::spawn(
+                    async move { user_roles::assign(&gated, "racer", "auditor", "").await },
+                )
+            })
+            .collect();
+        let outcomes = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both grants must reach the rendezvous and finish")
+        .expect("grant task panicked");
+
+        let outcomes: Vec<Assigned> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("neither racer may fail: the loser is already-assigned"))
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, Assigned::Created(_)))
+                .count(),
+            1,
+            "exactly one racer writes the grant: {outcomes:?}"
+        );
+        assert!(
+            outcomes.contains(&Assigned::AlreadyAssigned),
+            "the other is told it is already held: {outcomes:?}"
+        );
+
+        let rows = user_roles::list_for_user(&ctx, "racer")
+            .await
+            .expect("list grants");
+        assert_eq!(rows.len(), 1, "one grant, not one per racer: {rows:?}");
+
+        let out = handle_remove_role(
+            &ctx,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/user-roles/{}", rows[0].id),
+            )),
+        )
+        .await;
+        assert_eq!(
+            output_json(out).await,
+            serde_json::json!({"deleted": true})
+        );
+        let roles = crate::blocks::auth::helpers::get_user_roles(&ctx, "racer")
+            .await
+            .expect("resolve roles");
+        assert!(
+            !roles.iter().any(|r| r == "auditor"),
+            "a revoke that reports success must leave the role gone: {roles:?}"
+        );
+    }
+
+    /// A rename onto a role name a user already holds a grant of leaves that
+    /// user with one grant, not a rewrite the unique index refuses.
+    ///
+    /// Grants name roles by string and `assign` does not check the name
+    /// against the role definitions, so a user can hold `editor-v2` before
+    /// any role is called that. Renaming `editor` to `editor-v2` then has two
+    /// grants to merge for them.
+    #[tokio::test]
+    async fn a_rename_onto_a_name_already_held_merges_the_grants() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("holder").await;
+        let created = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        let role_id = created["id"].as_str().expect("created role id").to_string();
+        for role in ["editor", "editor-v2"] {
+            assert!(matches!(
+                user_roles::assign(&ctx, "holder", role, "").await,
+                Ok(Assigned::Created(_))
+            ));
+        }
+
+        let out = handle_update_role(
+            &ctx,
+            &update_role_msg(&role_id),
+            body_input(serde_json::json!({"name": "editor-v2"})),
+        )
+        .await;
+        assert_eq!(output_json(out).await["name"], "editor-v2");
+
+        let names: Vec<String> = user_roles::list_for_user(&ctx, "holder")
+            .await
+            .expect("list grants")
+            .into_iter()
+            .map(|row| row.role)
+            .collect();
+        assert_eq!(names, vec!["editor-v2"]);
     }
 }

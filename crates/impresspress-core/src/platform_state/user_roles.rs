@@ -1,5 +1,6 @@
 //! `impresspress__admin__user_roles`: role grants beyond a user's initial
-//! role — one row per `(user_id, role)`, read by the framework auth block on
+//! role — one row per `(user_id, role)`, which a unique index over the pair
+//! (admin migration 004) enforces — read by the framework auth block on
 //! every login (`get_user_roles` merges them with the inline `users.role`)
 //! and managed by admin's IAM surface.
 //!
@@ -193,12 +194,14 @@ pub async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
     db::count(ctx, TABLE, &[]).await
 }
 
-/// EVERY grant of `role`, for a rename to carry along.
+/// EVERY grant of `role`, for a rename to carry along or a delete to revoke.
 ///
-/// Exhaustive on purpose. A role rename rewrites each grant and bumps each
-/// grantee's auth version; a grant this read missed would keep naming a role
-/// that no longer exists, and its holder would keep a token minted under the
-/// old name. There is no size at which it is acceptable to stop early.
+/// Exhaustive on purpose. A role rename rewrites each grant, a role delete
+/// removes each one, and both bump each grantee's auth version; a grant this
+/// read missed would keep naming a role that no longer exists — its holder
+/// would keep being minted tokens carrying that name, and would silently get
+/// it back if a role of the same name were created again. There is no size at
+/// which it is acceptable to stop early.
 pub async fn list_by_role(ctx: &dyn Context, role: &str) -> Result<Vec<UserRoleRow>, WaferError> {
     Ok(decode_rows(
         db_read::list_every(ctx, TABLE, vec![eq("role", role)]).await?,
@@ -216,22 +219,63 @@ pub async fn get(ctx: &dyn Context, id: &str) -> Result<Option<UserRoleRow>, Waf
     }
 }
 
+/// Whether `user_id` holds a grant of `role` — the pair the table's unique
+/// index is over.
+async fn holds(ctx: &dyn Context, user_id: &str, role: &str) -> Result<bool, WaferError> {
+    let rows = list_for_principals(
+        ctx,
+        vec![eq("user_id", user_id), eq("role", role)],
+        Bound::OnePer("grant of one role to one user"),
+    )
+    .await?;
+    Ok(!rows.is_empty())
+}
+
+/// Whether a write refused with `error` was refused because `user_id`
+/// already holds `role` — the unique index over `(user_id, role)`.
+///
+/// Classified the way [`crate::blocks::crud::taken_key_or_db_error`]
+/// classifies a unique-index collision, and for the same reasons: a backend
+/// that says `AlreadyExists` has answered; one that reports `Internal` or
+/// `Aborted` may be a constraint violation it did not classify, so the pair is
+/// re-read AFTER the refusal, when the row that refused it is there to be
+/// found; any other code (a WRAP refusal, a quota) is not a collision. A
+/// re-read that itself fails is "could not tell", which keeps the write's own
+/// error rather than guessing.
+async fn refused_as_held(ctx: &dyn Context, user_id: &str, role: &str, error: &WaferError) -> bool {
+    match error.code {
+        ErrorCode::AlreadyExists => true,
+        ErrorCode::Internal | ErrorCode::Aborted => match holds(ctx, user_id, role).await {
+            Ok(held) => held,
+            Err(probe_error) => {
+                tracing::warn!(
+                    error = %probe_error,
+                    "could not re-read the grant a refused user_roles write may have collided with",
+                );
+                false
+            }
+        },
+        _ => false,
+    }
+}
+
 /// Grant `role` to `user_id` unless they already hold it. `assigned_by` is
 /// the granting admin's id, or empty for a grant the system makes. The
 /// single writer for this table.
+///
+/// The unique index over `(user_id, role)` (admin migration 004) is what
+/// makes this safe to run concurrently — two logins of the bootstrap admin
+/// both reach it through `ensure_admin_role`. The read first is only the
+/// cheap answer for the common repeat; two callers can both pass it, and the
+/// insert of whichever comes second is then refused by the index and
+/// reported as [`Assigned::AlreadyAssigned`] rather than as a failure.
 pub async fn assign(
     ctx: &dyn Context,
     user_id: &str,
     role: &str,
     assigned_by: &str,
 ) -> Result<Assigned, WaferError> {
-    let existing = list_for_principals(
-        ctx,
-        vec![eq("user_id", user_id), eq("role", role)],
-        Bound::OnePer("grant of one role to one user"),
-    )
-    .await?;
-    if !existing.is_empty() {
+    if holds(ctx, user_id, role).await? {
         return Ok(Assigned::AlreadyAssigned);
     }
     let now = crate::util::now_rfc3339();
@@ -244,18 +288,39 @@ pub async fn assign(
         created_at: now.clone(),
         updated_at: now,
     };
-    let rec = db::create(ctx, TABLE, row.to_data()).await?;
+    let rec = match db::create(ctx, TABLE, row.to_data()).await {
+        Ok(rec) => rec,
+        Err(e) if refused_as_held(ctx, user_id, role, &e).await => {
+            return Ok(Assigned::AlreadyAssigned)
+        }
+        Err(e) => return Err(e),
+    };
     UserRoleRow::from_record(&rec.id, &rec.data)
         .map(Assigned::Created)
         .map_err(decode_error)
 }
 
-/// Point the grant with `id` at `new_role` (a role definition was renamed).
-pub async fn rename_role(ctx: &dyn Context, id: &str, new_role: &str) -> Result<(), WaferError> {
+/// Point `grant` at `new_role` (a role definition was renamed).
+///
+/// When its holder already has a grant naming `new_role` the unique index
+/// refuses the rewrite, and `grant` is revoked instead: the holder keeps the
+/// role through the grant they already had, and ends up with exactly the one
+/// grant a rename leaves everyone else with.
+pub async fn rename_role(
+    ctx: &dyn Context,
+    grant: &UserRoleRow,
+    new_role: &str,
+) -> Result<(), WaferError> {
     let mut data = HashMap::new();
     data.insert("role".to_string(), json!(new_role));
     data.insert("updated_at".to_string(), json!(crate::util::now_rfc3339()));
-    db::update(ctx, TABLE, id, data).await.map(|_| ())
+    match db::update(ctx, TABLE, &grant.id, data).await {
+        Ok(_) => Ok(()),
+        Err(e) if refused_as_held(ctx, &grant.user_id, new_role, &e).await => {
+            remove(ctx, &grant.id).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Revoke the grant with `id`. `NotFound` when there is none.
@@ -356,7 +421,7 @@ mod tests {
 
         let editors = list_by_role(&ctx, "editor").await.expect("list");
         assert_eq!(editors.len(), 1);
-        rename_role(&ctx, &row.id, "editor-v2")
+        rename_role(&ctx, &row, "editor-v2")
             .await
             .expect("rename");
         assert!(list_by_role(&ctx, "editor").await.expect("list").is_empty());
