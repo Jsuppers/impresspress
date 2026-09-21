@@ -156,7 +156,9 @@ pub async fn handle(
     };
 
     // Phase 2: fetch the user's profile, and what the provider promises
-    // about the address on it.
+    // about the address on it. This is the provider token's only use: it is
+    // dropped when this request ends and never stored (see
+    // `auth::repo::provider_links`).
     let info = match fetch_user_info(ctx, spec, &oauth_token).await {
         Ok(i) => i,
         Err(r) => return r,
@@ -165,17 +167,7 @@ pub async fn handle(
     // Phase 3: resolve the local user (link / email-merge / create), enforcing
     // the signup, disabled-account and email-verification gates, and upsert
     // the provider link.
-    let account = match resolve_user(
-        limiter,
-        ctx,
-        msg,
-        &provider,
-        &oauth_token,
-        &info,
-        &clear_binding,
-    )
-    .await
-    {
+    let account = match resolve_user(limiter, ctx, msg, &provider, &info, &clear_binding).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -513,7 +505,6 @@ async fn resolve_user(
     ctx: &dyn Context,
     msg: &Message,
     provider: &str,
-    oauth_token: &str,
     info: &OAuthUserInfo,
     clear_binding: &str,
 ) -> Result<ResolvedAccount, OutputStream> {
@@ -691,7 +682,6 @@ async fn resolve_user(
             provider_ref: &info.provider_ref,
             user_id: &user_id,
             provider_login: &info.provider_login,
-            access_token: oauth_token,
         },
     )
     .await
@@ -1784,7 +1774,6 @@ mod security_regression_tests {
                 provider_ref: GOOGLE_ID,
                 user_id: &bob.id,
                 provider_login: "bob",
-                access_token: "old-token",
             },
         )
         .await
@@ -2061,7 +2050,6 @@ mod security_regression_tests {
                 provider_ref: GOOGLE_ID,
                 user_id: &user.id,
                 provider_login: "legacy",
-                access_token: "old-token",
             },
         )
         .await
@@ -2149,6 +2137,38 @@ mod security_regression_tests {
             session_rows.len(),
             1,
             "OAuth login must persist exactly one session row"
+        );
+    }
+
+    /// The provider's access token is a bearer credential for the user's
+    /// account at that provider. The sign-in is done with it once the profile
+    /// is fetched, so the link row the callback writes must not carry it: the
+    /// mock provider hands out `mock-access-token`, and the stored column,
+    /// read raw, must not hold it.
+    #[tokio::test]
+    async fn the_provider_access_token_is_not_stored() {
+        use wafer_core::clients::database as db;
+
+        let ctx = OauthFlow::google("tokenless@example.com").ctx().await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
+        assert_eq!(status, 302, "the sign-in itself succeeds");
+
+        let rec = db::get_by_field(
+            &ctx,
+            provider_links::TABLE,
+            "provider_ref",
+            serde_json::json!(GOOGLE_ID),
+        )
+        .await
+        .expect("the callback wrote the link row");
+        assert_eq!(
+            rec.data.get("access_token"),
+            Some(&serde_json::json!("")),
+            "the link row must not store the provider's access token: {:?}",
+            rec.data
         );
     }
 
@@ -2336,7 +2356,6 @@ mod security_regression_tests {
                 provider_ref: GOOGLE_ID,
                 user_id: &user.id,
                 provider_login: "linked",
-                access_token: "old-token",
             },
         )
         .await

@@ -274,6 +274,9 @@ pub const SECRET_TABLES: &[SecretTable] = &[
     },
     // A third-party OAuth access token in the clear — replayable against the
     // provider by anyone who reads it, with no involvement of this site.
+    // Sign-ins write the column empty (see `auth::repo::provider_links`), but
+    // a row nobody has signed in through since can still hold a live token,
+    // so the table stays refused until a migration drops the column.
     SecretTable {
         table: provider_links::TABLE,
         columns: &["access_token"],
