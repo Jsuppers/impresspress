@@ -962,7 +962,13 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ),
     (
         "payment_links",
-        &["blocks/products/mod.rs", "blocks/dev/data_snapshot.rs"],
+        &[
+            "blocks/products/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            // a fault injector: `FailingDbOpContext` fails the update that
+            // records a link Stripe already created, and nothing else
+            "blocks/products/tests/stripe_tests.rs",
+        ],
     ),
     (
         "checkout_presets",
