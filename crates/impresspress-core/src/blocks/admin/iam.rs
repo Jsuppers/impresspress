@@ -1125,83 +1125,6 @@ mod tests {
         );
     }
 
-    /// Two grants of one role to one user, racing, leave ONE row — and so a
-    /// revoke of that row really revokes.
-    ///
-    /// `assign` reads before it inserts, and two callers that both pass the
-    /// read see no grant. The rendezvous holds both on that read until each
-    /// has made it, which is the interleaving two concurrent bootstrap-admin
-    /// logins can produce (`ensure_admin_role` reaches `assign` on every such
-    /// login). Without the unique index both inserts land, and the
-    /// duplicate's cost shows at the revoke: `handle_remove_role` deletes one
-    /// row, answers `{"deleted": true}`, and the twin keeps the role live.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn racing_grants_of_one_role_leave_one_row_that_a_revoke_removes() {
-        use crate::test_support::RendezvousDbOpContext;
-
-        let ctx = TestContext::with_auth().await;
-        ctx.seed_auth_user("racer").await;
-        let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", user_roles::TABLE, 2);
-
-        let racers: Vec<_> = (0..2)
-            .map(|_| {
-                let gated = gated.clone();
-                tokio::spawn(
-                    async move { user_roles::assign(&gated, "racer", "auditor", "").await },
-                )
-            })
-            .collect();
-        let outcomes = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            futures::future::try_join_all(racers),
-        )
-        .await
-        .expect("both grants must reach the rendezvous and finish")
-        .expect("grant task panicked");
-
-        let outcomes: Vec<Assigned> = outcomes
-            .into_iter()
-            .map(|outcome| outcome.expect("neither racer may fail: the loser is already-assigned"))
-            .collect();
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|o| matches!(o, Assigned::Created(_)))
-                .count(),
-            1,
-            "exactly one racer writes the grant: {outcomes:?}"
-        );
-        assert!(
-            outcomes.contains(&Assigned::AlreadyAssigned),
-            "the other is told it is already held: {outcomes:?}"
-        );
-
-        let rows = user_roles::list_for_user(&ctx, "racer")
-            .await
-            .expect("list grants");
-        assert_eq!(rows.len(), 1, "one grant, not one per racer: {rows:?}");
-
-        let out = handle_remove_role(
-            &ctx,
-            &routed(admin_msg(
-                "delete",
-                &format!("/b/admin/api/iam/user-roles/{}", rows[0].id),
-            )),
-        )
-        .await;
-        assert_eq!(
-            output_json(out).await,
-            serde_json::json!({"deleted": true})
-        );
-        let roles = crate::blocks::auth::helpers::get_user_roles(&ctx, "racer")
-            .await
-            .expect("resolve roles");
-        assert!(
-            !roles.iter().any(|r| r == "auditor"),
-            "a revoke that reports success must leave the role gone: {roles:?}"
-        );
-    }
-
     /// A rename onto a role name a user already holds a grant of leaves that
     /// user with one grant, not a rewrite the unique index refuses.
     ///
@@ -1338,10 +1261,7 @@ mod tests {
             )),
         )
         .await;
-        assert_eq!(
-            output_json(out).await,
-            serde_json::json!({"deleted": true})
-        );
+        assert_eq!(output_json(out).await, serde_json::json!({"deleted": true}));
 
         let after_delete = roles_in_a_fresh_token(ctx.clone()).await;
         assert!(

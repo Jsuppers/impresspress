@@ -375,6 +375,69 @@ mod tests {
         );
     }
 
+    /// Two grants of one role to one user, racing, leave ONE row — and so a
+    /// revoke of that row really revokes.
+    ///
+    /// `assign` reads before it inserts, and two callers that both pass the
+    /// read see no grant. The rendezvous holds both on that read until each
+    /// has made it, which is the interleaving two concurrent bootstrap-admin
+    /// logins can produce (`ensure_admin_role` reaches `assign` on every such
+    /// login). Without the unique index both inserts land, and the
+    /// duplicate's cost shows at the revoke: admin's `handle_remove_role`
+    /// removes one row by id through [`remove`], reports success, and the
+    /// twin keeps the role live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_grants_of_one_role_leave_one_row_that_a_revoke_removes() {
+        use crate::test_support::RendezvousDbOpContext;
+
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("racer").await;
+        let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", TABLE, 2);
+
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let gated = gated.clone();
+                tokio::spawn(async move { assign(&gated, "racer", "auditor", "").await })
+            })
+            .collect();
+        let outcomes = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both grants must reach the rendezvous and finish")
+        .expect("grant task panicked");
+
+        let outcomes: Vec<Assigned> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("neither racer may fail: the loser is already-assigned"))
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, Assigned::Created(_)))
+                .count(),
+            1,
+            "exactly one racer writes the grant: {outcomes:?}"
+        );
+        assert!(
+            outcomes.contains(&Assigned::AlreadyAssigned),
+            "the other is told it is already held: {outcomes:?}"
+        );
+
+        let rows = list_for_user(&ctx, "racer").await.expect("list grants");
+        assert_eq!(rows.len(), 1, "one grant, not one per racer: {rows:?}");
+
+        remove(&ctx, &rows[0].id).await.expect("revoke");
+        let roles = crate::blocks::auth::helpers::get_user_roles(&ctx, "racer")
+            .await
+            .expect("resolve roles");
+        assert!(
+            !roles.iter().any(|r| r == "auditor"),
+            "a revoke that reports success must leave the role gone: {roles:?}"
+        );
+    }
+
     /// `ensure_admin_role` grants with no admin behind it; the column keeps
     /// its empty default.
     #[tokio::test]
@@ -421,9 +484,7 @@ mod tests {
 
         let editors = list_by_role(&ctx, "editor").await.expect("list");
         assert_eq!(editors.len(), 1);
-        rename_role(&ctx, &row, "editor-v2")
-            .await
-            .expect("rename");
+        rename_role(&ctx, &row, "editor-v2").await.expect("rename");
         assert!(list_by_role(&ctx, "editor").await.expect("list").is_empty());
         let renamed = list_by_role(&ctx, "editor-v2").await.expect("list");
         assert_eq!(renamed.len(), 1);

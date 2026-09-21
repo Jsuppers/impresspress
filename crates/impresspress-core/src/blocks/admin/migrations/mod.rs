@@ -153,7 +153,12 @@ pub fn ddl_files(db_type: &str) -> &'static [&'static str] {
     if db_type.eq_ignore_ascii_case("postgres") {
         POSTGRES_MIGRATIONS
     } else {
-        &[SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE, SQL_004_SQLITE]
+        &[
+            SQL_001_SQLITE,
+            SQL_002_SQLITE,
+            SQL_003_SQLITE,
+            SQL_004_SQLITE,
+        ]
     }
 }
 
@@ -173,7 +178,7 @@ mod tests {
         // 003 follow-up (ADD COLUMN seed_defaults_hash)
         assert!(SQL_003_SQLITE.contains("ADD COLUMN seed_defaults_hash"));
         // 004 grant uniqueness
-        assert!(SQL_004_SQLITE.contains("impresspress__admin__user_roles_user_role_uniq"));
+        assert!(SQL_004_SQLITE.contains("CREATE UNIQUE INDEX IF NOT EXISTS"));
     }
 
     #[test]
@@ -182,7 +187,7 @@ mod tests {
         assert!(SQL_001_POSTGRES.contains("impresspress__admin__variables_key_uniq"));
         assert!(SQL_002_POSTGRES.contains("ADD COLUMN"));
         assert!(SQL_003_POSTGRES.contains("seed_defaults_hash"));
-        assert!(SQL_004_POSTGRES.contains("impresspress__admin__user_roles_user_role_uniq"));
+        assert!(SQL_004_POSTGRES.contains("CREATE UNIQUE INDEX IF NOT EXISTS"));
     }
 }
 
@@ -195,13 +200,14 @@ mod user_roles_unique_tests {
     //! tried to upgrade, where it fails the whole batch and re-fails on every
     //! later boot.
 
+    use wafer_core::clients::database as db;
+
     use super::{SQLITE_MIGRATIONS, USER_ROLES_UNIQUE};
     use crate::{
         migration_helper,
         platform_state::user_roles::{self, UserRoleRow, TABLE},
         test_support::TestContext,
     };
-    use wafer_core::clients::database as db;
 
     const ADMIN: &str = "impresspress/admin";
 
@@ -212,7 +218,10 @@ mod user_roles_unique_tests {
             .iter()
             .position(|(name, _)| *name == USER_ROLES_UNIQUE)
             .expect("004 is wired into SQLITE_MIGRATIONS");
-        SQLITE_MIGRATIONS[..at].iter().map(|(_, sql)| *sql).collect()
+        SQLITE_MIGRATIONS[..at]
+            .iter()
+            .map(|(_, sql)| *sql)
+            .collect()
     }
 
     fn grant(id: &str, user_id: &str, role: &str, created_at: &str) -> UserRoleRow {

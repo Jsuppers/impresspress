@@ -372,7 +372,7 @@ pub(super) async fn delete_role(
 async fn revoke_every_grant_of(ctx: &dyn Context, role: &str) -> Result<(), OutputStream> {
     let grants = match user_roles::list_by_role(ctx, role).await {
         Ok(rows) => rows,
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error_internal(e, "Database error")),
     };
 
     for grant in &grants {
@@ -380,9 +380,9 @@ async fn revoke_every_grant_of(ctx: &dyn Context, role: &str) -> Result<(), Outp
             Ok(()) => {}
             Err(e) if e.code == ErrorCode::NotFound => {}
             Err(e) => {
-                return Err(err_internal(
-                    "Role not deleted: its grants could not be revoked",
+                return Err(db_error_internal(
                     e,
+                    "Role not deleted: its grants could not be revoked",
                 ))
             }
         }
