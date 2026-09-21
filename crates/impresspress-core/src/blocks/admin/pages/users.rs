@@ -328,8 +328,8 @@ pub async fn handle_create_role(
 /// as the route table bound it.
 pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let role_id = msg.var("id");
-    // System-role guard, delete, and audit-log write live in the shared ops
-    // layer.
+    // System-role guard, grant revocation, delete, and audit-log write live
+    // in the shared ops layer.
     if let Err(out) = ops::delete_role(ctx, msg, role_id).await {
         return out;
     }
@@ -376,7 +376,7 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
                                 button .btn .btn--sm .btn--danger
                                     hx-delete={"/b/admin/iam/roles/" (record.id)}
                                     hx-target="#iam-content"
-                                    hx-confirm={"Delete role \"" (name) "\"?"}
+                                    hx-confirm={"Delete role \"" (name) "\"? Everyone it is assigned to loses it."}
                                 { (icons::trash()) }
                             }
                         },

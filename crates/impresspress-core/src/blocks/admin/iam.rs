@@ -209,8 +209,8 @@ async fn cascade_role_rename(
 /// table bound it.
 pub(super) async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
-    // System-role guard, delete, and audit-log write live in the shared ops
-    // layer (the JSON path previously logged nothing).
+    // System-role guard, grant revocation, delete, and audit-log write live
+    // in the shared ops layer.
     match super::ops::delete_role(ctx, msg, id).await {
         Ok(()) => ok_json(&AdminRoleDeleteResponse { deleted: true }),
         Err(out) => out,
@@ -1245,5 +1245,140 @@ mod tests {
             .map(|row| row.role)
             .collect();
         assert_eq!(names, vec!["editor-v2"]);
+    }
+
+    /// Deleting a role revokes it: the next token its former holder is minted
+    /// no longer names it, and a role created again under the same name does
+    /// not quietly hand it back.
+    ///
+    /// The token is minted by the real login handler, AFTER the delete — the
+    /// `roles` claim is built from the grant rows alone, without consulting
+    /// the role definitions, so a grant the delete left behind shows up
+    /// exactly there.
+    #[tokio::test]
+    async fn deleting_a_role_revokes_it_from_every_token_minted_afterwards() {
+        use crate::blocks::{
+            auth::repo::users,
+            auth_ui::api::{login, signup, test_mail_request},
+        };
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let creds = serde_json::json!({
+            "email": "grantee@example.com",
+            "password": "correct-horse-battery",
+        });
+        let (limiter, msg) = test_mail_request();
+        output_json(signup::handle(&limiter, &ctx, &msg, body_input(creds.clone())).await).await;
+        let uid = users::find_by_email(&ctx, "grantee@example.com")
+            .await
+            .expect("user lookup")
+            .expect("signup created the user")
+            .id;
+
+        let role_id = output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await["id"]
+            .as_str()
+            .expect("created role id")
+            .to_string();
+        output_json(
+            handle_assign_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                body_input(serde_json::json!({"user_id": uid, "role": "editor"})),
+            )
+            .await,
+        )
+        .await;
+
+        let roles_in_a_fresh_token = |ctx: TestContext| {
+            let creds = creds.clone();
+            async move {
+                let token = output_json(login::handle(&ctx, body_input(creds)).await).await
+                    ["access_token"]
+                    .as_str()
+                    .expect("login mints an access token")
+                    .to_string();
+                // The claims as minted: the payload segment, decoded. What
+                // is asserted is what the token says, not whether this
+                // fixture's signing key is the one verification derives.
+                use base64ct::Encoding;
+                let payload = token.split('.').nth(1).expect("a JWT has a payload");
+                let claims: serde_json::Value = serde_json::from_slice(
+                    &base64ct::Base64UrlUnpadded::decode_vec(payload).expect("base64url payload"),
+                )
+                .expect("JSON claims");
+                claims["roles"]
+                    .as_array()
+                    .expect("the token carries a roles claim")
+                    .iter()
+                    .filter_map(|r| r.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert!(
+            roles_in_a_fresh_token(ctx.clone())
+                .await
+                .contains(&"editor".to_string()),
+            "precondition: the grant reaches the token"
+        );
+
+        let before = users::auth_version(&ctx, &uid).await.expect("auth version");
+        let out = handle_delete_role(
+            &ctx,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/roles/{role_id}"),
+            )),
+        )
+        .await;
+        assert_eq!(
+            output_json(out).await,
+            serde_json::json!({"deleted": true})
+        );
+
+        let after_delete = roles_in_a_fresh_token(ctx.clone()).await;
+        assert!(
+            !after_delete.contains(&"editor".to_string()),
+            "a token minted after the delete must not carry the role: {after_delete:?}"
+        );
+        assert!(
+            users::auth_version(&ctx, &uid).await.expect("auth version") > before,
+            "tokens minted while the role existed must stop authenticating"
+        );
+
+        output_json(
+            handle_create_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/roles"),
+                body_input(serde_json::json!({"name": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        let after_recreate = roles_in_a_fresh_token(ctx.clone()).await;
+        assert!(
+            !after_recreate.contains(&"editor".to_string()),
+            "a new role under the old name must not re-attach the old grant: {after_recreate:?}"
+        );
+    }
+
+    /// A delete of a role that is not there is a 404 from the guard read,
+    /// before anything is revoked.
+    #[tokio::test]
+    async fn deleting_a_missing_role_is_not_found() {
+        let ctx = TestContext::with_admin().await;
+        let out = handle_delete_role(
+            &ctx,
+            &routed(admin_msg("delete", "/b/admin/api/iam/roles/no-such-role")),
+        )
+        .await;
+        assert!(output_is_error(out, "NotFound").await);
     }
 }
