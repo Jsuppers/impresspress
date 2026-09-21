@@ -342,8 +342,10 @@ const ROUTES: &[EndpointRoute<Route>] = &[
 /// new row is a rate-limit decision, not an omission.
 const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLimit)> {
     match route {
-        // Login / signup / bootstrap redemption, and the token-issuing and
-        // token-consuming password-reset and verification endpoints, share
+        // Login / signup / bootstrap redemption, the token-issuing and
+        // token-consuming password-reset and verification endpoints, and the
+        // OAuth start (each hit writes a PKCE state row that stays until a
+        // callback redeems it or a maintenance sweep finds it expired) share
         // the `auth` bucket.
         Route::Login
         | Route::Signup
@@ -351,7 +353,8 @@ const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLim
         | Route::ForgotPassword
         | Route::ResetPassword
         | Route::ResendVerification
-        | Route::Verify => Some((LimitKey::Ip, "auth", RateLimit::AUTH)),
+        | Route::Verify
+        | Route::OauthStart => Some((LimitKey::Ip, "auth", RateLimit::AUTH)),
         // Token refresh has its own (looser) category.
         Route::Refresh => Some((LimitKey::Ip, "refresh", RateLimit::REFRESH)),
         Route::Me | Route::ListApiKeys => Some((LimitKey::User, "auth_read", RateLimit::API_READ)),
@@ -368,7 +371,6 @@ const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLim
         | Route::OrgsPage
         | Route::ResetPasswordPage
         | Route::BootstrapPage
-        | Route::OauthStart
         | Route::OauthCallback
         | Route::Logout
         | Route::OauthProviders => None,
@@ -679,15 +681,14 @@ mod rate_limit_tests {
         assert!(rate_limit_for(Route::BootstrapPage).is_none());
     }
 
-    /// The assignments the old five-rule `RATE_LIMIT_ROUTES` table made, by
-    /// method and wire path (it matched the `/b`-stripped form; the paths
-    /// here are the wire spelling of the same rules). Every row's bucket must
-    /// be what that table gave it, and every row the table did not match must
-    /// spend nothing, so keying on the variant changed no assignment.
+    /// Every limited route's bucket, by method and wire path. Every row's
+    /// bucket must be the one listed here, and every row not listed must
+    /// spend nothing, so a change to `rate_limit_for` is a change to this
+    /// list too.
     #[test]
-    fn rate_limits_are_the_old_route_table_assignments() {
+    fn rate_limits_are_the_listed_assignments() {
         use HttpMethod::{Delete, Get, Patch, Post};
-        let old_assignments: &[(HttpMethod, &str, LimitKey, &str)] = &[
+        let assignments: &[(HttpMethod, &str, LimitKey, &str)] = &[
             (Post, "/b/auth/api/login", LimitKey::Ip, "auth"),
             (Post, "/b/auth/api/signup", LimitKey::Ip, "auth"),
             (Post, "/b/auth/api/bootstrap", LimitKey::Ip, "auth"),
@@ -702,6 +703,7 @@ mod rate_limit_tests {
             ),
             (Get, "/b/auth/api/verify", LimitKey::Ip, "auth"),
             (Post, "/b/auth/api/verify", LimitKey::Ip, "auth"),
+            (Get, "/b/auth/oauth/login", LimitKey::Ip, "auth"),
             (Get, "/b/auth/api/me", LimitKey::User, "auth_read"),
             (Get, "/b/auth/api/api-keys", LimitKey::User, "auth_read"),
             (Patch, "/b/auth/api/me", LimitKey::User, "auth_write"),
@@ -725,7 +727,7 @@ mod rate_limit_tests {
             ),
             (Post, "/b/auth/api/api-keys", LimitKey::User, "auth_write"),
         ];
-        for (method, path, _, _) in old_assignments {
+        for (method, path, _, _) in assignments {
             assert!(
                 ROUTES
                     .iter()
@@ -734,7 +736,7 @@ mod rate_limit_tests {
             );
         }
         for row in ROUTES {
-            let expected = old_assignments
+            let expected = assignments
                 .iter()
                 .find(|(method, path, _, _)| *method == row.method && *path == row.template)
                 .map(|(_, _, key, category)| (*key, *category));
@@ -912,6 +914,68 @@ mod outbound_mail_wiring_tests {
             bodies.windows(2).all(|w| w[0] == w[1]),
             "the refused request must answer the same constant body as the others: a response \
              that changed once the budget ran out would be an enumeration oracle"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oauth_start_limit_tests {
+    use std::sync::Arc;
+
+    use wafer_core::clients::database as db;
+    use wafer_run::{InputStream, Message};
+
+    use super::*;
+    use crate::{
+        blocks::auth::repo::oauth_pkce,
+        test_support::{anon_msg, output_http_status, TestContext},
+    };
+
+    /// The start request a browser navigates to, from one client address.
+    fn start_msg() -> Message {
+        let mut msg = anon_msg("retrieve", "/b/auth/oauth/login");
+        msg.set_meta("req.query.provider", "google");
+        msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.21");
+        msg
+    }
+
+    /// Every OAuth start writes a PKCE state row, and nothing but a callback
+    /// or a later maintenance sweep removes it. Driven through the real route
+    /// with OAuth enabled and a provider configured, so each request below the
+    /// limit genuinely starts a flow: the one past it must be refused before it
+    /// writes a row.
+    #[tokio::test]
+    async fn oauth_start_is_ip_rate_limited_before_it_writes_state() {
+        let mut ctx = TestContext::with_auth().await;
+        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
+        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID", "client-id");
+        ctx.register_block("impresspress/auth-ui", Arc::new(AuthUiBlock::new()));
+
+        let budget = RateLimit::AUTH.max_requests as usize;
+        for n in 0..budget {
+            let status = output_http_status(
+                ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                    .await,
+            )
+            .await;
+            assert_eq!(
+                status, 302,
+                "request {n} is inside the budget and starts a flow"
+            );
+        }
+        let status = output_http_status(
+            ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                .await,
+        )
+        .await;
+        assert_eq!(status, 429, "the request past the budget must be refused");
+
+        let rows = db::count(&ctx, oauth_pkce::TABLE, &[])
+            .await
+            .expect("count PKCE rows");
+        assert_eq!(
+            rows, budget as i64,
+            "the refused request must not have written a PKCE state row"
         );
     }
 }
