@@ -979,12 +979,12 @@ export interface paths {
                              */
                             token_type?: "Bearer";
                             /**
-                             * @description The new account. `roles` and `name` are present only on the auto-login
-                             *     path; the verification-required reply carries `id` and `email` alone.
+                             * @description The new account. `id`, `roles` and `name` are present only on the
+                             *     auto-login path; the verification-required reply carries `email` alone.
                              */
                             user: {
                                 email: string;
-                                id: string;
+                                id?: string;
                                 name?: string;
                                 roles?: string[];
                             };

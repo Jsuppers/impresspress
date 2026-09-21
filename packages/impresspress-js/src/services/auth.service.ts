@@ -39,7 +39,12 @@ export interface SignInResult {
 }
 
 export interface SignUpResult {
-  user: { id: string; email: string; name?: string; roles?: string[] };
+  /**
+   * `id`, `name` and `roles` arrive only when the signup signed the user in.
+   * A signup awaiting email verification carries `email` alone: it answers
+   * the same bytes whether or not the address was already registered.
+   */
+  user: { id?: string; email: string; name?: string; roles?: string[] };
   emailVerified: boolean;
   message?: string;
   tokens?: AuthTokens;
@@ -87,7 +92,7 @@ export class AuthService extends BaseService {
       token_type?: string;
       expires_in?: number;
       default_redirect?: string;
-      user: { id: string; email: string; name?: string; roles?: string[] };
+      user: { id?: string; email: string; name?: string; roles?: string[] };
     }>({
       method: "POST",
       url: "/b/auth/api/signup",

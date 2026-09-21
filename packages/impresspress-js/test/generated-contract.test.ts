@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { paths } from "../src/generated/api";
-import type { AuthSessionUser, AuthTokens } from "../src/services/auth.service";
+import type { AuthSessionUser, AuthTokens, SignUpResult } from "../src/services/auth.service";
 import type { Extension, ShareRecord } from "../src/services/extensions.service";
 import type { CloudStorageExtension } from "../src/services/extensions.service";
 import type { IAMRole, IAMRoleListResponse } from "../src/services/iam.service";
@@ -50,8 +50,8 @@ type Flattened<T> = { id: string } & T;
 type _MeUserFits = ServerFits<AuthSessionUser, Json200<"/b/auth/api/me", "get">["user"]>;
 type _LoginUserFits = ServerFits<AuthSessionUser, Json200<"/b/auth/api/login", "post">["user"]>;
 type _SignupUserFits = ServerFits<
-  Pick<AuthSessionUser, "id" | "email">,
-  Pick<Json200<"/b/auth/api/signup", "post">["user"], "id" | "email">
+  SignUpResult["user"],
+  Json200<"/b/auth/api/signup", "post">["user"]
 >;
 type _RefreshFits = ServerFits<AuthTokens, Json200<"/b/auth/api/refresh", "post">>;
 
