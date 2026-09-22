@@ -7952,3 +7952,116 @@ async fn checkout_order_insert_denial_is_403_and_quota_is_429() {
         assert!(requests.lock().unwrap().is_empty());
     }
 }
+
+/// A Payment Link completion from a connected account other than the link's
+/// is an integrity mismatch, answered with the same 500 every other webhook
+/// identity mismatch gets — not the 403 the database door gives a WRAP
+/// denial, which is what it would be reported as if the mismatch carried
+/// `PermissionDenied`.
+#[tokio::test]
+async fn payment_link_account_mismatch_is_500_not_a_wrap_denial() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let product_id = "product_payment_link_foreign";
+    seed(
+        &ctx,
+        repo::products::TABLE,
+        product_id,
+        HashMap::from([
+            ("name".to_string(), serde_json::json!("Care plan")),
+            ("slug".to_string(), serde_json::json!(product_id)),
+            ("status".to_string(), serde_json::json!("active")),
+            ("approval_status".to_string(), serde_json::json!("approved")),
+            ("owner_kind".to_string(), serde_json::json!("platform")),
+        ]),
+    )
+    .await;
+    let definition: OfferDefinitionRequest = serde_json::from_value(serde_json::json!({
+        "name": "Monthly subscription",
+        "mode": "subscription",
+        "currency": "nzd",
+        "pricing_model": "fixed",
+        "recurring_interval": "month",
+        "interval_count": 1,
+        "usage_type": "licensed",
+        "billing_scheme": "per_unit",
+        "tax_behavior": "exclusive",
+        "components": [{
+            "key": "plan",
+            "label": "Care plan",
+            "required": true,
+            "amount": {"type": "fixed", "unit_amount_minor": 4900}
+        }]
+    }))
+    .unwrap();
+    let offer_id = repo::offers::create(&ctx, product_id, "admin_1", &definition)
+        .await
+        .unwrap()
+        .offer
+        .id;
+    repo::offers::publish(&ctx, product_id, &offer_id)
+        .await
+        .unwrap();
+    let managed = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &managed.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: Default::default(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let link_id = repo::payment_links::create_pending(
+        &ctx,
+        &offer_id,
+        "",
+        "",
+        "",
+        false,
+        "foreign-link-config",
+        &preview,
+        0,
+    )
+    .await
+    .unwrap()
+    .managed
+    .id;
+
+    let event = serde_json::json!({
+        "id": "evt_payment_link_foreign",
+        "type": "checkout.session.completed",
+        "account": "acct_attacker",
+        "livemode": false,
+        "data": {"object": {
+            "id": "cs_payment_link_foreign",
+            "mode": "subscription",
+            "payment_status": "paid",
+            "metadata": {
+                "impresspress_payment_link_id": link_id,
+                "offer_id": offer_id,
+                "offer_version": "1"
+            },
+            "currency": "nzd",
+            "amount_total": 4900,
+            "livemode": false
+        }}
+    });
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    assert_eq!(
+        crate::test_support::output_http_status(stripe::handle_webhook(&ctx, &msg, input).await)
+            .await,
+        500
+    );
+    assert!(
+        repo::purchases::find_by_session(&ctx, "cs_payment_link_foreign")
+            .await
+            .unwrap()
+            .is_none(),
+        "a mismatched delivery must not create an order"
+    );
+}
