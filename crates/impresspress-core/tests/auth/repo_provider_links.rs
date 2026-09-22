@@ -24,7 +24,6 @@ async fn upsert_insert_then_update_same_provider_ref() {
             provider_ref: "42",
             user_id: &uid1,
             provider_login: "alice",
-            access_token: "tok1",
         },
     )
     .await
@@ -34,11 +33,10 @@ async fn upsert_insert_then_update_same_provider_ref() {
         .expect("find")
         .expect("row present");
     assert_eq!(got.user_id, uid1);
-    assert_eq!(got.access_token, "tok1");
     assert_eq!(got.provider_login, "alice");
 
-    // Second call, same (provider, provider_ref), different user + login +
-    // token → updates in place.
+    // Second call, same (provider, provider_ref), different user + login →
+    // updates in place.
     provider_links::upsert(
         &ctx,
         provider_links::NewLink {
@@ -46,7 +44,6 @@ async fn upsert_insert_then_update_same_provider_ref() {
             provider_ref: "42",
             user_id: &uid2,
             provider_login: "alice-renamed",
-            access_token: "tok2",
         },
     )
     .await
@@ -56,7 +53,6 @@ async fn upsert_insert_then_update_same_provider_ref() {
         .expect("find")
         .expect("row present");
     assert_eq!(got.user_id, uid2);
-    assert_eq!(got.access_token, "tok2");
     assert_eq!(got.provider_login, "alice-renamed");
 
     // Rows with distinct provider_ref are independent.
@@ -67,7 +63,6 @@ async fn upsert_insert_then_update_same_provider_ref() {
             provider_ref: "99",
             user_id: &uid3,
             provider_login: "carol",
-            access_token: "tokC",
         },
     )
     .await
@@ -115,7 +110,6 @@ async fn provider_axis_is_independent() {
             provider_ref: "1",
             user_id: &uid_gh,
             provider_login: "alice",
-            access_token: "tg",
         },
     )
     .await
@@ -127,7 +121,6 @@ async fn provider_axis_is_independent() {
             provider_ref: "1",
             user_id: &uid_goog,
             provider_login: "alice@g",
-            access_token: "to",
         },
     )
     .await

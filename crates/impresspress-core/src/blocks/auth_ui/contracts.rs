@@ -94,14 +94,17 @@ pub struct SignupRequest {
 }
 
 // Distinct from `AuthenticatedUser` because the verification-required and
-// already-registered paths answer before any role lookup happens. On the
-// already-registered path `id` is deliberately the empty string — [SEC-035]
-// forbids confirming that the address exists.
-/// The new account. `roles` and `name` are present only on the auto-login
-/// path; the verification-required reply carries `id` and `email` alone.
+// already-registered paths answer before any role lookup happens. Those two
+// paths must answer identical bytes ([SEC-035]; `api::signup`'s
+// `pending_verification`), and only one of them has an account id to send,
+// so neither sends one.
+/// The new account. `id`, `roles` and `name` are present only on the
+/// auto-login path; the verification-required reply carries `email` alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SignupUser {
-    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
+    pub id: Option<String>,
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(required)]
@@ -114,7 +117,9 @@ pub struct SignupUser {
 /// `POST /b/auth/api/signup` response body.
 ///
 /// Auto-logs in (issues tokens) unless email verification is required, in
-/// which case only email_verified/message/user are returned.
+/// which case only email_verified/message/user are returned. An address that
+/// is already registered gets that verification-required reply either way,
+/// so with verification off the reply reveals whether an address is registered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SignupResponse {
     pub email_verified: bool,

@@ -447,7 +447,6 @@ mod tests {
                 provider_ref: "gh-1",
                 user_id: "user-a",
                 provider_login: "alice",
-                access_token: "tok",
             },
         )
         .await
@@ -476,7 +475,6 @@ mod tests {
                 provider_ref: "gh-1",
                 user_id: "user-a",
                 provider_login: "alice",
-                access_token: "tok",
             },
         )
         .await
@@ -512,7 +510,6 @@ mod tests {
                 provider_ref: "gh-1",
                 user_id: "user-a",
                 provider_login: "alice",
-                access_token: "tok",
             },
         )
         .await
@@ -544,7 +541,6 @@ mod tests {
                 provider_ref: reference,
                 user_id,
                 provider_login: "someone",
-                access_token: "tok",
             },
         )
         .await

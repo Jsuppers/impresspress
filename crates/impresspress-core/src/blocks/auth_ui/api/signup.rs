@@ -33,12 +33,19 @@ async fn user_exists(ctx: &dyn Context, email_lower: &str) -> Result<bool, Strin
     }
 }
 
-/// The no-auto-login signup response, shared by the two paths that must be
-/// byte-identical: verification-required, and [SEC-035]'s already-registered
-/// reply. Building both from one constructor is what keeps them
-/// indistinguishable — the whole point of SEC-035 is that a caller cannot tell
-/// which one they got, and two hand-built literals could drift apart.
-fn pending_verification(id: String, email: String) -> SignupResponse {
+/// The no-auto-login signup response. Under `REQUIRE_VERIFICATION` a fresh
+/// signup and an already-registered address both answer exactly this, byte
+/// for byte, so the reply cannot tell a caller whether the address has an
+/// account ([SEC-035]). That is why it takes nothing but the address the
+/// caller sent: no account id, which exists on only one of the two paths,
+/// and nothing read back from a row.
+///
+/// Without `REQUIRE_VERIFICATION` a fresh signup is signed in on the spot and
+/// answers tokens instead, so an address that answers this is one that is
+/// already registered. That channel is the price of auto-login, not an
+/// oversight; a deployment that needs signup not to reveal registered
+/// addresses turns verification on.
+fn pending_verification(email: String) -> SignupResponse {
     SignupResponse {
         email_verified: false,
         message: Some("Account created. Please verify your email before signing in.".to_string()),
@@ -48,7 +55,7 @@ fn pending_verification(id: String, email: String) -> SignupResponse {
         expires_in: None,
         default_redirect: None,
         user: SignupUser {
-            id,
+            id: None,
             email,
             roles: None,
             name: None,
@@ -108,9 +115,13 @@ pub async fn handle(
     }
 
     // [SEC-035] If the email is already registered, do NOT confirm that to
-    // the caller — return the same generic "check your email" response a
-    // fresh signup would produce. The signup endpoint is otherwise a free
+    // the caller — answer the reply a fresh signup under REQUIRE_VERIFICATION
+    // produces (see `pending_verification` for when that hides the address's
+    // state and when it cannot). The signup endpoint is otherwise a free
     // email-enumeration oracle for password-reset / phishing campaigns.
+    // What matches is the response, not the time it takes: a fresh signup
+    // also hashes the password, inserts two rows and sends mail, and this
+    // branch does none of that.
     //
     // Follow-up: send a "someone tried to sign up with your email" notice
     // to the existing account. Not included in this PR — needs the email
@@ -126,7 +137,7 @@ pub async fn handle(
     if email_already_taken {
         return ResponseBuilder::new()
             .status(201)
-            .json(&pending_verification(String::new(), email_lower));
+            .json(&pending_verification(email_lower));
     }
 
     // Hash password
@@ -200,17 +211,11 @@ pub async fn handle(
         )
         .await
         {
-            // The response below cannot carry this. It answers the same
-            // message string as the "[SEC-035] email already registered"
-            // branch above, and a message that varied with whether mail
-            // actually went out would hand an anonymous caller the
-            // enumeration oracle that branch exists to close.
-            //
-            // The two bodies are NOT yet identical — this one carries
-            // `user.id` where that branch carries an empty string, which is
-            // a separate, known leak on the same response — but that is a
-            // reason to close the id divergence, not to open a second
-            // channel beside it.
+            // The response below cannot carry this. It is the same body the
+            // "[SEC-035] email already registered" branch above answers, and
+            // a body that varied with whether mail actually went out would
+            // hand an anonymous caller the enumeration oracle that branch
+            // exists to close.
             //
             // The account exists and the resend endpoint can mint a fresh
             // token, so the recoverable half is already in the user's hands;
@@ -220,7 +225,7 @@ pub async fn handle(
         // Do NOT issue tokens before email is verified
         return ResponseBuilder::new()
             .status(201)
-            .json(&pending_verification(user.id, email_lower));
+            .json(&pending_verification(email_lower));
     }
 
     // Mint tokens, persist the refresh + session rows, build the cookie
@@ -261,7 +266,7 @@ pub async fn handle(
             expires_in: Some(issued.access_lifetime),
             default_redirect: Some(default_redirect),
             user: SignupUser {
-                id: user.id,
+                id: Some(user.id),
                 email: email_lower,
                 roles: Some(roles),
                 name: Some(user.display_name),
@@ -359,13 +364,63 @@ mod tests {
             "no redirect target is minted when the user isn't logged in yet: {resp}"
         );
 
-        // The account was still created — a duplicate signup must return the
-        // generic "already registered" response, not a fresh 201.
+        // The account was still created, unverified.
         let user = users::find_by_email(&ctx, "pending@example.com")
             .await
             .unwrap()
             .expect("user row created even though verification is pending");
         assert!(!user.email_verified);
+    }
+
+    /// Everything the HTTP boundary would send for one signup attempt:
+    /// status, headers (cookies included) and body bytes.
+    async fn signup_on_the_wire(
+        ctx: &TestContext,
+        email: &str,
+        password: &str,
+    ) -> wafer_block::http_codec::HttpResponseParts {
+        let body = serde_json::json!({"email": email, "password": password}).to_string();
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let out = handle(
+            &limiter,
+            ctx,
+            &msg,
+            InputStream::from_bytes(body.into_bytes()),
+        )
+        .await;
+        wafer_block::http_codec::collect_http_response(out).await
+    }
+
+    /// [SEC-035] Under REQUIRE_VERIFICATION, signing up with an address
+    /// that is already registered answers exactly what signing it up fresh
+    /// answered. Both attempts use the same address, so nothing but the
+    /// account's existence differs between them, and the comparison is the
+    /// whole response a caller receives: a difference anywhere — an account
+    /// id on one side, a header, a status — is an oracle for which addresses
+    /// have accounts.
+    #[tokio::test]
+    async fn verification_required_signup_is_byte_identical_for_new_and_registered_addresses() {
+        let mut ctx = ctx_with_crypto().await;
+        ctx.set_config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true");
+
+        let fresh = signup_on_the_wire(&ctx, "someone@example.com", "correct-horse-battery").await;
+        assert!(
+            users::find_by_email(&ctx, "someone@example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "the first attempt must create the account, or the second is not the registered case"
+        );
+        let registered =
+            signup_on_the_wire(&ctx, "someone@example.com", "another-password-entirely").await;
+
+        assert_eq!(fresh.status, registered.status, "status");
+        assert_eq!(fresh.headers, registered.headers, "headers");
+        assert_eq!(
+            String::from_utf8_lossy(&fresh.body),
+            String::from_utf8_lossy(&registered.body),
+            "body"
+        );
     }
 
     #[tokio::test]

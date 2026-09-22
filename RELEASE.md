@@ -541,6 +541,36 @@ That second step is new in this release — before it, nothing anywhere in the
 product could remove a provider link. The page refuses to remove an account's
 last way in, so set a password (step 1) before unlinking the only link.
 
+### Auth: stored OAuth provider tokens are cleared (migration 014), and the device list empties once
+
+**What changes.** An OAuth sign-in used to store the provider's access token in
+`wafer_run__auth__provider_links.access_token`, in the clear. That token is a
+live bearer credential for the user's account at Google, GitHub or Microsoft,
+usable there by anyone who reads it, and nothing in Impresspress ever read it
+back. Sign-ins now write the column empty, and auth migration 014 empties every
+existing row, including links nobody signs in through any more. The column
+itself stays, empty, and the admin SQL explorer keeps refusing the table.
+
+**Upgrade with `--run-migrations`** to clear the tokens already stored. A
+Cloudflare deploy runs migrations through `/_deploy/init` and gets it without
+doing anything. A native deployment that skips the flag keeps the old tokens in
+the table, and logs the `schema drift` warning for `wafer-run/auth` on each
+boot, until it runs.
+
+**What the migration run also does: every device leaves the session list.**
+Auth migrations are re-run as a set whenever any auth migration changes, and
+migration 012 in that set drops and recreates `wafer_run__auth__sessions`. So
+the run that applies 014 also empties that table. **Nobody is signed out.**
+Nothing authenticates against that table: access tokens are verified on their
+own and refresh tokens live in a separate table. What the table feeds is the
+device list at **Account → Sessions**. After the upgrade that list is empty,
+and each device reappears when it next refreshes its tokens, which an active
+browser does within the access-token lifetime
+(`WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS`, 30 minutes by default). Until a
+device reappears, its user cannot revoke that one device from the list;
+**changing the password** still signs every device out, because it revokes the
+refresh tokens rather than reading the list.
+
 ### LLM: a provider can name its token-budget field (migration 002)
 
 **What changes.** Which field carries the output-token budget in a chat request

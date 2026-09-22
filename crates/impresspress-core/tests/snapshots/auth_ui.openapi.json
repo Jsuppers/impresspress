@@ -534,7 +534,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "`POST /b/auth/api/signup` response body.\n\nAuto-logs in (issues tokens) unless email verification is required, in\nwhich case only email_verified/message/user are returned.",
+                "description": "`POST /b/auth/api/signup` response body.\n\nAuto-logs in (issues tokens) unless email verification is required, in\nwhich case only email_verified/message/user are returned. An address that\nis already registered gets that verification-required reply either way,\nso with verification off the reply reveals whether an address is registered.",
                 "properties": {
                   "access_token": {
                     "type": "string"
@@ -565,7 +565,7 @@
                     "type": "string"
                   },
                   "user": {
-                    "description": "The new account. `roles` and `name` are present only on the auto-login\npath; the verification-required reply carries `id` and `email` alone.",
+                    "description": "The new account. `id`, `roles` and `name` are present only on the\nauto-login path; the verification-required reply carries `email` alone.",
                     "properties": {
                       "email": {
                         "type": "string"
@@ -584,7 +584,6 @@
                       }
                     },
                     "required": [
-                      "id",
                       "email"
                     ],
                     "type": "object"

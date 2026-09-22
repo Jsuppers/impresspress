@@ -39,12 +39,39 @@ export interface SignInResult {
 }
 
 export interface SignUpResult {
-  user: { id: string; email: string; name?: string; roles?: string[] };
+  /**
+   * `id`, `name` and `roles` arrive only when the signup signed the user in.
+   * A signup awaiting email verification carries `email` alone: it answers
+   * the same bytes whether or not the address was already registered.
+   */
+  user: { id?: string; email: string; name?: string; roles?: string[] };
   emailVerified: boolean;
   message?: string;
   tokens?: AuthTokens;
   default_redirect?: string;
 }
+
+/**
+ * The two shapes `POST /b/auth/api/signup` answers, told apart by
+ * `email_verified`. Only the reply that signed the user in names the account;
+ * the one awaiting verification carries the address alone, because it must
+ * read the same whether or not that address was already registered.
+ */
+type SignUpReply =
+  | {
+      email_verified: true;
+      access_token: string;
+      refresh_token: string;
+      token_type: string;
+      expires_in: number;
+      default_redirect: string;
+      user: AuthSessionUser;
+    }
+  | {
+      email_verified: false;
+      message?: string;
+      user: { email: string };
+    };
 
 export interface SignUpOptions {
   email: string;
@@ -79,40 +106,35 @@ export class AuthService extends BaseService {
 
   /** Create an account. Auto-signs in unless email verification is required. */
   async signUp(options: SignUpOptions): Promise<SignUpResult> {
-    const res = await this.request<{
-      email_verified: boolean;
-      message?: string;
-      access_token?: string;
-      refresh_token?: string;
-      token_type?: string;
-      expires_in?: number;
-      default_redirect?: string;
-      user: { id: string; email: string; name?: string; roles?: string[] };
-    }>({
+    const res = await this.request<SignUpReply>({
       method: "POST",
       url: "/b/auth/api/signup",
       data: options,
     });
 
-    const tokens =
-      res.access_token && res.refresh_token
-        ? {
-            access_token: res.access_token,
-            refresh_token: res.refresh_token,
-            token_type: res.token_type ?? "Bearer",
-            expires_in: res.expires_in ?? 0,
-          }
-        : undefined;
-
-    if (tokens) {
-      this.tokens = tokens;
-      this.currentUser = res.user as AuthSessionUser;
+    if (!res.email_verified) {
+      return {
+        user: res.user,
+        emailVerified: false,
+        message: res.message,
+        tokens: undefined,
+        default_redirect: undefined,
+      };
     }
+
+    const tokens: AuthTokens = {
+      access_token: res.access_token,
+      refresh_token: res.refresh_token,
+      token_type: res.token_type,
+      expires_in: res.expires_in,
+    };
+    this.tokens = tokens;
+    this.currentUser = res.user;
 
     return {
       user: res.user,
-      emailVerified: res.email_verified,
-      message: res.message,
+      emailVerified: true,
+      message: undefined,
       tokens,
       default_redirect: res.default_redirect,
     };

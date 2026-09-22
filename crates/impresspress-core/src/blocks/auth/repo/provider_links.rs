@@ -1,9 +1,19 @@
 //! Row-level access over `wafer_run__auth__provider_links`.
 //!
-//! One row per `(provider, provider_ref)` pair. The primary key matches the
-//! spec §3 definition; `upsert` relies on `ON CONFLICT` against that PK so
-//! an OAuth login by the same user from the same provider deterministically
-//! refreshes `access_token`, `provider_login`, `user_id`, and `linked_at`.
+//! One row per `(provider, provider_ref)` pair, which the table holds
+//! `UNIQUE`. [`upsert`] updates the row for that pair in place when it
+//! exists, so an OAuth login by the same user from the same provider
+//! refreshes `provider_login`, `user_id`, and `linked_at`.
+//!
+//! The table's `access_token` column is never given a token. A provider
+//! access token is a live bearer credential for the user's account at that
+//! provider, the sign-in flow is done with it once the profile is fetched,
+//! and nothing reads it back — so storing it would only leave a credential
+//! wherever this table can be read. [`upsert`] writes the column empty, and
+//! auth migration `014_clear_provider_access_tokens` empties the rows written
+//! before it did. The column itself stays, `NOT NULL` as migration 001
+//! declares it: SQLite cannot guard a `DROP COLUMN` with `IF EXISTS`, and auth
+//! migrations re-run in full whenever the block's SQL changes.
 
 use std::collections::HashMap;
 
@@ -25,7 +35,6 @@ pub struct ProviderLink {
     pub provider_ref: String,
     pub user_id: String,
     pub provider_login: String,
-    pub access_token: String,
     pub linked_at: String,
 }
 
@@ -37,7 +46,6 @@ pub struct NewLink<'a> {
     pub provider_ref: &'a str,
     pub user_id: &'a str,
     pub provider_login: &'a str,
-    pub access_token: &'a str,
 }
 
 fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, WaferError> {
@@ -47,14 +55,13 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, WaferError> 
             .ok_or_else(|| internal_error("missing provider_ref"))?,
         user_id: map_opt_str(m, "user_id").ok_or_else(|| internal_error("missing user_id"))?,
         provider_login: map_str(m, "provider_login"),
-        access_token: map_str(m, "access_token"),
         linked_at: map_str(m, "linked_at"),
     })
 }
 
-/// Insert a link row, or update `user_id`, `provider_login`, `access_token`,
-/// `linked_at` in place when a row with the same `(provider, provider_ref)`
-/// already exists. Manual two-step (list → update_by_filters or create) since
+/// Insert a link row, or update `user_id`, `provider_login`, `linked_at` in
+/// place (and empty `access_token`, see the module doc) when a row with the
+/// same `(provider, provider_ref)` already exists. Manual two-step (list → update_by_filters or create) since
 /// `db::*` has no two-key upsert primitive.
 pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferError> {
     let now = now_iso();
@@ -82,7 +89,7 @@ pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferErro
     let mut data: HashMap<String, Value> = HashMap::new();
     data.insert("user_id".into(), json!(new.user_id));
     data.insert("provider_login".into(), json!(new.provider_login));
-    data.insert("access_token".into(), json!(new.access_token));
+    data.insert("access_token".into(), json!(""));
     data.insert("linked_at".into(), json!(now));
 
     if existing.is_empty() {
@@ -139,13 +146,9 @@ pub async fn find_by_provider_ref(
 /// Return all OAuth provider links owned by `user_id`, ordered by
 /// `linked_at` ASC for stable rendering on the security page.
 ///
-/// Uses the typed `db::list` client (not raw SQL) because this is the
-/// only entry point in this module called cross-block — userportal's
-/// `/b/userportal/security` page reads it. Raw SQL is admin-only under
-/// WRAP, so the cross-block call must go through the namespaced path.
-/// The auth-internal lookup (`find_by_provider_ref`) remains on raw SQL
-/// because it's called only by auth itself (the resource owner —
-/// own-resource access is always permitted, regardless of typed-vs-raw).
+/// Reads through the typed database client (via `db_read`), not raw SQL:
+/// userportal's `/b/userportal/security` page calls it cross-block, and raw
+/// SQL is admin-only under WRAP.
 pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,
@@ -228,13 +231,12 @@ mod typed_client_tests {
                 provider_ref: "gh-1",
                 user_id: "user-a",
                 provider_login: "alice",
-                access_token: "tok-old",
             },
         )
         .await
         .unwrap();
-        // Re-upsert with new access_token / login — should update in place,
-        // not insert a duplicate.
+        // Re-upsert with a new login — should update in place, not insert a
+        // duplicate.
         upsert(
             &ctx,
             NewLink {
@@ -242,7 +244,6 @@ mod typed_client_tests {
                 provider_ref: "gh-1",
                 user_id: "user-a",
                 provider_login: "alice2",
-                access_token: "tok-new",
             },
         )
         .await
@@ -251,8 +252,58 @@ mod typed_client_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.access_token, "tok-new");
         assert_eq!(got.provider_login, "alice2");
+    }
+
+    /// The stored `access_token` column, read raw — `ProviderLink` has no
+    /// field for it, which is the point.
+    async fn stored_access_token(ctx: &TestContext, provider_ref: &str) -> String {
+        let rec = db::get_by_field(ctx, TABLE, "provider_ref", json!(provider_ref))
+            .await
+            .expect("link row exists");
+        map_str(&rec.data, "access_token")
+    }
+
+    /// A link row written before tokens stopped being stored still holds one.
+    /// The next sign-in through that link must clear it, not leave the
+    /// credential sitting in the table.
+    #[tokio::test]
+    async fn upsert_clears_a_token_an_existing_row_still_holds() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        let mut legacy = HashMap::new();
+        for (k, v) in [
+            ("id", "link-1"),
+            ("provider", "github"),
+            ("provider_ref", "gh-1"),
+            ("user_id", "user-a"),
+            ("provider_login", "alice"),
+            ("access_token", "gho_live_bearer_token"),
+            ("linked_at", "2026-01-01T00:00:00Z"),
+        ] {
+            legacy.insert(k.to_string(), json!(v));
+        }
+        db::create(&ctx, TABLE, legacy)
+            .await
+            .expect("seed legacy row");
+        assert_eq!(
+            stored_access_token(&ctx, "gh-1").await,
+            "gho_live_bearer_token"
+        );
+
+        upsert(
+            &ctx,
+            NewLink {
+                provider: "github",
+                provider_ref: "gh-1",
+                user_id: "user-a",
+                provider_login: "alice",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stored_access_token(&ctx, "gh-1").await, "");
     }
 }
 
@@ -278,7 +329,6 @@ mod tests_phase_4 {
                 provider_ref: "gh-1",
                 user_id: "user-a",
                 provider_login: "alice",
-                access_token: "tok-a",
             },
         )
         .await
@@ -290,7 +340,6 @@ mod tests_phase_4 {
                 provider_ref: "gg-1",
                 user_id: "user-a",
                 provider_login: "alice@example.com",
-                access_token: "tok-b",
             },
         )
         .await
@@ -302,7 +351,6 @@ mod tests_phase_4 {
                 provider_ref: "gh-2",
                 user_id: "user-b",
                 provider_login: "bob",
-                access_token: "tok-c",
             },
         )
         .await
