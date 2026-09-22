@@ -525,6 +525,62 @@ async fn admin_stats_never_combine_currencies() {
     assert_eq!(analytics[1]["lost_disputed_volume_minor"], 900);
 }
 
+/// One order refunded past its own total fails the stats read, even when the
+/// currency's summed refunds stay under its summed gross.
+///
+/// A check on the sums alone cannot see this: the healthy order's 5000 hides
+/// the bad order's 500 overshoot. The first dispatch is the control — the
+/// same rows with a refund inside the total read fine — so the failure is
+/// the per-row check and nothing else about the seed.
+#[tokio::test]
+async fn admin_stats_refuse_an_order_refunded_past_its_total() {
+    let ctx = ctx().await;
+    for (id, total, refunded) in [("order_bad", 1000, 1000), ("order_big", 5000, 0)] {
+        seed(
+            &ctx,
+            "impresspress__products__purchases",
+            id,
+            HashMap::from([
+                ("user_id".to_string(), serde_json::json!("buyer_stats")),
+                ("status".to_string(), serde_json::json!("completed")),
+                ("currency".to_string(), serde_json::json!("USD")),
+                ("total_cents".to_string(), serde_json::json!(total)),
+                (
+                    "refunded_total_cents".to_string(),
+                    serde_json::json!(refunded),
+                ),
+            ]),
+        )
+        .await;
+    }
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(body["currency_analytics"][0]["refunded_volume_minor"], 1000);
+
+    wafer_core::clients::database::update(
+        &ctx,
+        "impresspress__products__purchases",
+        "order_bad",
+        HashMap::from([("refunded_total_cents".to_string(), serde_json::json!(1500))]),
+    )
+    .await
+    .expect("overshoot the refund");
+
+    let (msg, input) = admin_get_msg("/b/products/api/admin/stats");
+    assert!(
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::Internal).await,
+        "a refund larger than its order's total must fail the read"
+    );
+    let error = super::super::repo::purchases::commerce_analytics(&ctx, None)
+        .await
+        .expect_err("the analytics the handler reads fail the same way");
+    assert!(
+        error.message.contains("refund larger than their total"),
+        "the message has to name the cause: {}",
+        error.message
+    );
+}
+
 #[tokio::test]
 async fn seller_stats_orders_and_refunds_are_tenant_isolated() {
     let ctx = ctx_with(&[("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true")]).await;

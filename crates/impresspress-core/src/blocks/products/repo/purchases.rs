@@ -1656,6 +1656,21 @@ fn negative_rows(field: &str) -> Vec<wafer_block::wire::database::FilterNode> {
     }])
 }
 
+/// A conditional count of the rows in a group whose `refunded_total_cents`
+/// exceeds their own `total_cents` — the grouped form of the per-row "an
+/// order cannot refund more than it took" check. A column-to-column compare,
+/// so the leaf names a `column` rather than a `value`.
+fn refunds_exceeding_total() -> Vec<wafer_block::wire::database::FilterNode> {
+    vec![wafer_block::wire::database::FilterNode::Leaf(
+        wafer_block::wire::database::FilterDef {
+            field: "refunded_total_cents".to_string(),
+            operator: "gt".to_string(),
+            value: serde_json::Value::Null,
+            column: Some("total_cents".to_string()),
+        },
+    )]
+}
+
 /// Read an aggregate column as a signed minor-unit amount.
 ///
 /// Every aggregate output here goes through [`crate::util::aggregate_i64`],
@@ -1683,8 +1698,9 @@ fn analytics_count(record: &Record, alias: &str) -> Result<u128, WaferError> {
 }
 
 /// Order totals per `(currency, status)` — `COUNT(*)`, the three money sums,
-/// the number of orders carrying a refund, and one conditional count per
-/// money column for rows holding a negative amount.
+/// the number of orders carrying a refund, one conditional count per money
+/// column for rows holding a negative amount, and a conditional count of rows
+/// that refunded more than their total.
 async fn order_totals(
     ctx: &dyn Context,
     seller_account_id: Option<&str>,
@@ -1730,6 +1746,10 @@ async fn order_totals(
             wire::AggregateColumnDef::CaseWhenSum {
                 when: negative_rows("platform_fee_cents"),
                 alias: "negative_fees".into(),
+            },
+            wire::AggregateColumnDef::CaseWhenSum {
+                when: refunds_exceeding_total(),
+                alias: "over_refunded".into(),
             },
         ],
         filters: crate::util::to_wire_filters(&analytics_scope(seller_account_id)),
@@ -1890,7 +1910,8 @@ async fn line_item_totals(
 /// ceiling, which would have made the dashboard understate revenue on a busy
 /// platform with no symptom at all. The per-row integrity checks the scan
 /// used to make survive as conditional counts: a group reporting even one
-/// negative amount still fails the whole read.
+/// negative amount, or one order refunded past its total, still fails the
+/// whole read.
 ///
 /// The totals are three statements whatever the table size. The top-products
 /// half is not: it walks the paid orders a keyset page at a time and issues
@@ -1942,6 +1963,12 @@ pub(crate) async fn commerce_analytics(
                     format!("{status:?} orders hold a negative analytics amount"),
                 ));
             }
+            if analytics_count(&group, "over_refunded")? > 0 {
+                return Err(WaferError::new(
+                    wafer_run::ErrorCode::Internal,
+                    format!("{status:?} orders hold a refund larger than their total"),
+                ));
+            }
             aggregate.paid_order_count += orders;
             aggregate.gross_volume_minor += analytics_amount(&group, "gross")?;
             aggregate.refunded_volume_minor += analytics_amount(&group, "refunded")?;
@@ -1949,19 +1976,6 @@ pub(crate) async fn commerce_analytics(
             aggregate.refunded_order_count += analytics_count(&group, "refunded_orders")?;
         } else if status == OrderStatus::Failed {
             aggregate.failed_order_count += orders;
-        }
-    }
-
-    // The row scan also refused an order whose refunded amount exceeded its
-    // total. The aggregate wire compares a column against a literal, never
-    // against another column, so the same rule is enforced on the sums: no
-    // currency may report more refunded than it took.
-    for (currency, aggregate) in &by_currency {
-        if aggregate.refunded_volume_minor > aggregate.gross_volume_minor {
-            return Err(WaferError::new(
-                wafer_run::ErrorCode::Internal,
-                format!("{currency} orders report more refunded than gross volume"),
-            ));
         }
     }
 
