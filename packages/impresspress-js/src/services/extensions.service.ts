@@ -730,6 +730,8 @@ export interface ProviderReconcileResult {
   succeeded: number;
   retry_scheduled: number;
   dead_letter: number;
+  /** Operations whose state could not be written; a later run retries them. */
+  unrecorded: number;
 }
 
 /**

@@ -310,6 +310,17 @@ async fn claim_one(
     }
     let owner = uuid::Uuid::now_v7().to_string();
     let now = now_value.to_rfc3339();
+    let claimed_fields = HashMap::from([
+        (
+            "status".to_string(),
+            serde_json::json!(OperationStatus::Processing),
+        ),
+        ("attempts".to_string(), serde_json::json!(attempts)),
+        ("processing_owner".to_string(), serde_json::json!(&owner)),
+        ("processing_started_at".to_string(), serde_json::json!(&now)),
+        ("next_attempt_at".to_string(), serde_json::Value::Null),
+        ("updated_at".to_string(), serde_json::json!(&now)),
+    ]);
     let rows = db::update_by_filters_count(
         ctx,
         TABLE,
@@ -330,24 +341,20 @@ async fn claim_one(
                 value: serde_json::json!(record.str_field("processing_owner")),
             },
         ],
-        HashMap::from([
-            (
-                "status".to_string(),
-                serde_json::json!(OperationStatus::Processing),
-            ),
-            ("attempts".to_string(), serde_json::json!(attempts)),
-            ("processing_owner".to_string(), serde_json::json!(&owner)),
-            ("processing_started_at".to_string(), serde_json::json!(&now)),
-            ("next_attempt_at".to_string(), serde_json::Value::Null),
-            ("updated_at".to_string(), serde_json::json!(&now)),
-        ]),
+        claimed_fields.clone(),
     )
     .await?;
     if rows != 1 {
         return Ok(Candidate::Skipped);
     }
+    // The CAS matched the row exactly as read, so the row now IS the read
+    // plus the fields just written. Building it here rather than reading it
+    // back means nothing can fail between taking the lease and handing it to
+    // the caller, which would strand the row leased with an attempt spent.
+    let mut record = record;
+    record.data.extend(claimed_fields);
     Ok(Candidate::Claimed(OperationClaim {
-        record: db::get(ctx, TABLE, &record.id).await?,
+        record,
         owner,
         attempts,
     }))

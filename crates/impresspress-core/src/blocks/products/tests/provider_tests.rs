@@ -1791,3 +1791,40 @@ async fn an_operation_out_of_attempts_dead_letters_with_its_reason_and_is_counte
     assert_eq!(last_try.data["attempts"], repo::MAX_ATTEMPTS);
     assert!(!last_try.str_field("last_error").is_empty());
 }
+
+/// Taking a lease is the last database step of a claim: the claimed row is
+/// handed to the worker without being read back, so no failure can land
+/// between the lease and the work and strand the row leased with an attempt
+/// spent. Every read of the table is made to fail after the claim pass's
+/// candidate list.
+#[tokio::test]
+async fn a_claimed_operation_is_run_without_reading_it_back() {
+    let ctx = ctx().await;
+    seed_due_operation(
+        &ctx,
+        "op_no_readback",
+        "unsupported.kind",
+        "2026-01-01T00:00:00Z",
+        &[],
+    )
+    .await;
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.get", repo::provider_operations::TABLE)],
+    );
+
+    let result = output_to_json(reconcile_due(&failing).await).await;
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "claimed": 1,
+            "succeeded": 0,
+            "retry_scheduled": 0,
+            "dead_letter": 1,
+            "unrecorded": 0,
+        })
+    );
+    let row = operation_row(&ctx, "op_no_readback").await;
+    assert_eq!(row.data["status"], "dead_letter");
+    assert_eq!(row.data["attempts"], 1);
+}
