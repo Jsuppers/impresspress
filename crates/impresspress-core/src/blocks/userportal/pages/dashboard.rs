@@ -12,7 +12,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     http::redirect,
-    ui::{icons, sidebar::nav_icon, SiteConfig, UserInfo},
+    ui::{self, icons, sidebar::nav_icon, SiteConfig, UserInfo},
     util::RecordExt,
 };
 
@@ -29,7 +29,15 @@ pub async fn dashboard_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    let buttons = load_buttons(ctx).await;
+    // The app tiles are this page's one read. Rendering without them would
+    // look like "no apps configured", so a failed read is the 500 page.
+    let buttons = match load_buttons(ctx).await {
+        Ok(buttons) => buttons,
+        Err(e) => {
+            tracing::error!(error = %e, user_id = %user_id, "userportal dashboard: buttons read failed");
+            return ui::server_error_response(msg);
+        }
+    };
     let config = SiteConfig::load(ctx).await;
     let is_admin = UserInfo::from_message(msg).is_some_and(|u| u.is_admin());
 
@@ -69,16 +77,16 @@ fn nav_link(href: &str, icon: Markup, label: &str) -> Markup {
     }
 }
 
-async fn load_buttons(ctx: &dyn Context) -> Vec<DashboardButton> {
-    super::super::load_buttons(ctx)
-        .await
+async fn load_buttons(ctx: &dyn Context) -> Result<Vec<DashboardButton>, wafer_run::WaferError> {
+    Ok(super::super::load_buttons(ctx)
+        .await?
         .into_iter()
         .map(|r: Record| DashboardButton {
             label: r.str_field("label").to_string(),
             icon: r.str_field("icon").to_string(),
             path: r.str_field("path").to_string(),
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -196,6 +204,32 @@ mod tests {
         let resp = dashboard_page(&ctx, &msg).await;
         let html = output_html(resp).await;
         assert!(html.contains("Files") && html.contains("/b/storage/"));
+    }
+
+    /// An unreadable buttons table is the 500 page, not an account card
+    /// with the app tiles silently missing.
+    #[tokio::test]
+    async fn a_failed_buttons_read_is_a_500_not_a_card_without_tiles() {
+        let ctx = ctx_with_userportal().await;
+        seed_user(&ctx, "user-a").await;
+        db::create(
+            &ctx,
+            "impresspress__userportal__buttons",
+            button_data("Files", "folder", "/b/storage/", 0),
+        )
+        .await
+        .unwrap();
+        let ctx = ctx.break_list_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            auth_msg("retrieve", "/b/userportal/", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("account-nav"), "{html}");
     }
 
     #[tokio::test]

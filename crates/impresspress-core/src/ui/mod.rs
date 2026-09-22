@@ -508,6 +508,12 @@ pub fn not_found_response(msg: &wafer_run::Message) -> wafer_run::OutputStream {
 }
 
 /// Return styled 500 for browser requests, JSON for API requests.
+///
+/// This is what a full page answers when a read it renders from fails: the
+/// page is never drawn from defaults, because an empty list or a blank form
+/// field reads as "you have none" / "your name is empty", and a form built
+/// that way writes the blank back on submit. An htmx swap uses
+/// [`swap_error_response`] instead, since htmx drops a 5xx body.
 pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStream {
     let accept = msg.get_meta("http.header.accept");
     if accept.contains("text/html") && !accept.contains("application/json") {
@@ -522,6 +528,29 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
     } else {
         crate::http::err_internal_no_cause("internal server error")
     }
+}
+
+/// The htmx-swap half of [`server_error_response`]: the read behind a
+/// fragment failed, so the swap target is replaced by an error notice and an
+/// error toast fires.
+///
+/// The notice is a `div` carrying `target_id` as its own `id`, so the caller's
+/// control must swap a block-level target with `hx-swap="outerHTML"`: the
+/// target is then still there for the next request to swap into. An
+/// `innerHTML` swap would nest a second element with the same id, and a
+/// table-part target (`<tr>`, `<tbody>`) would get a `div` where the parser
+/// only allows rows. The status is 200 because htmx 2's default
+/// `responseHandling` swaps only 2xx: a 5xx body would be dropped and the
+/// stale fragment left on screen, which is the stale state this exists to
+/// replace. `message` is shown in both places
+/// and should say what the operator can do (usually: reload the page).
+pub fn swap_error_response(target_id: &str, message: &str) -> wafer_run::OutputStream {
+    let markup = maud::html! {
+        div id=(target_id) {
+            div class="alert alert--error" role="alert" { (message) }
+        }
+    };
+    html_response_with_toast(markup, message, "error")
 }
 
 /// Respond with HTML + an HX-Trigger header for toast notifications.

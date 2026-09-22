@@ -44,7 +44,15 @@ pub(crate) const ICON_OPTIONS: &[(&str, &str)] = &[
 ];
 
 pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let buttons = load_buttons(ctx).await;
+    // "No buttons configured" is what an empty table renders; an unreadable
+    // one is the 500 page, or the admin would add back buttons that exist.
+    let buttons = match load_buttons(ctx).await {
+        Ok(buttons) => buttons,
+        Err(e) => {
+            tracing::error!(error = %e, "userportal admin buttons page: buttons read failed");
+            return ui::server_error_response(msg);
+        }
+    };
 
     let content = html! {
         (components::page_header(
@@ -173,9 +181,24 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
 
 /// Re-load the buttons and render the `#buttons-table` fragment — the htmx
 /// swap target every mutating handler responds with.
-async fn buttons_table_response(ctx: &dyn Context) -> OutputStream {
-    let buttons = load_buttons(ctx).await;
-    ui::html_response(render_buttons_table(&buttons))
+///
+/// Called only after the mutation has been written, so a failed re-read must
+/// not render the empty table (which reads as "the change wiped every
+/// button"): the target becomes an error notice saying the change was
+/// `applied` and the list needs a reload.
+async fn buttons_table_response(ctx: &dyn Context, applied: &str) -> OutputStream {
+    match load_buttons(ctx).await {
+        Ok(buttons) => ui::html_response(render_buttons_table(&buttons)),
+        Err(e) => {
+            tracing::error!(error = %e, "userportal admin buttons: table re-read failed");
+            ui::swap_error_response(
+                "buttons-table",
+                &format!(
+                    "{applied}, but the button list could not be loaded. Reload the page to see it."
+                ),
+            )
+        }
+    }
 }
 
 /// Parse + validate the create/update button form (shared by both handlers):
@@ -221,7 +244,7 @@ pub async fn handle_create_button(ctx: &dyn Context, input: InputStream) -> Outp
         return err_internal("Failed to create button", e.message);
     }
 
-    buttons_table_response(ctx).await
+    buttons_table_response(ctx, "Button added").await
 }
 
 /// Validate that `id` is safe to interpolate into inline HTML/JS strings
@@ -328,7 +351,7 @@ pub async fn handle_update_button(ctx: &dyn Context, input: InputStream, id: &st
         return err_internal("Failed to update button", e.message);
     }
 
-    buttons_table_response(ctx).await
+    buttons_table_response(ctx, "Button saved").await
 }
 
 pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
@@ -339,7 +362,7 @@ pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
         return crud::db_error(e, "Button not found", "Failed to delete button");
     }
 
-    buttons_table_response(ctx).await
+    buttons_table_response(ctx, "Button deleted").await
 }
 
 #[cfg(test)]
@@ -352,7 +375,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::userportal::UserPortalBlock,
-        test_support::{output_header, output_html, output_is_error, TestContext},
+        test_support::{admin_msg, output_header, output_html, output_is_error, TestContext},
     };
 
     async fn ctx_with_userportal() -> TestContext {
@@ -458,6 +481,82 @@ mod tests {
         assert!(
             output_is_error(out, "Internal").await,
             "a failed row read must not answer 404"
+        );
+    }
+
+    /// An unreadable buttons table is the 500 page, not "No buttons
+    /// configured" — which invites the admin to add back buttons that exist.
+    #[tokio::test]
+    async fn a_failed_buttons_read_is_a_500_not_the_empty_state() {
+        let ctx = ctx_with_userportal().await;
+        db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let ctx = ctx.break_list_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            admin_msg("retrieve", "/b/userportal/admin/buttons"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("No buttons configured"), "{html}");
+    }
+
+    /// A mutation that was written but whose table re-read failed swaps in an
+    /// error notice with an error toast, not the empty table. The empty table
+    /// reads as "adding this button deleted all the others". The notice keeps
+    /// the `buttons-table` id so the next `outerHTML` swap still has a target.
+    #[tokio::test]
+    async fn a_failed_reread_after_create_swaps_an_error_not_an_empty_table() {
+        let ctx = ctx_with_userportal().await;
+        db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let failing = ctx.clone().break_list_reads();
+
+        let out = crate::blocks::userportal::test_support::browser_request(
+            &failing,
+            admin_msg("create", "/b/userportal/admin/buttons"),
+            "label=Shop&path=%2Fb%2Fproducts%2F&icon=shopping-cart&sort_order=1",
+        )
+        .await;
+        let (status, html) = out;
+
+        assert_eq!(status, 200, "htmx swaps only a 2xx");
+        assert!(!html.contains("No buttons configured"), "{html}");
+        assert!(html.contains(r#"id="buttons-table""#), "{html}");
+        assert!(html.contains("alert--error"), "{html}");
+        assert!(html.contains("Button added"), "{html}");
+
+        // The write did land — the notice is right to say so.
+        let rows = db::list(&ctx, TABLE, &Default::default()).await.unwrap();
+        assert_eq!(rows.records.len(), 2);
+    }
+
+    /// The toast half of the swap above rides the `HX-Trigger` header.
+    #[tokio::test]
+    async fn a_failed_reread_after_delete_fires_an_error_toast() {
+        let ctx = ctx_with_userportal().await;
+        let record = db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let failing = ctx.break_list_reads();
+
+        let out = handle_delete_button(&failing, &record.id).await;
+        let trigger = output_header(out, "HX-Trigger")
+            .await
+            .expect("an error toast must be triggered");
+        let trigger: serde_json::Value = serde_json::from_str(&trigger).unwrap();
+        assert_eq!(trigger["showToast"]["type"], "error", "{trigger}");
+        assert!(
+            trigger["showToast"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Button deleted"),
+            "{trigger}"
         );
     }
 

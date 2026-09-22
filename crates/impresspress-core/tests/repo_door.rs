@@ -810,6 +810,11 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // that increment to prove a failed invalidation revokes nothing.
             // `break_reads` cannot reach it — the delete's reads succeed.
             "blocks/admin/iam.rs",
+            // A fault injector: the security page reads the provider links
+            // and THEN the user's `email_verified` flag, and the branch under
+            // test is the flag read. `break_reads` fails the link list first;
+            // only `FailingDbOpContext` aimed at this table reaches it.
+            "blocks/userportal/pages/security.rs",
         ],
     ),
     // The auth doors B12 adds. Two categories, both already established
