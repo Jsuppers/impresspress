@@ -91,6 +91,19 @@ mod tests {
     use super::*;
     use crate::test_support::{admin_msg, output_body, TestContext};
 
+    /// The badge boundaries: the error floor turns a row amber, a 5xx red.
+    #[test]
+    fn status_code_badge_variant_splits_at_400_and_500() {
+        for (code, variant) in [
+            (399, BadgeVariant::Success),
+            (400, BadgeVariant::Warning),
+            (499, BadgeVariant::Warning),
+            (500, BadgeVariant::Danger),
+        ] {
+            assert_eq!(status_code_badge_variant(code), variant, "{code}");
+        }
+    }
+
     /// The admin shell must hide nav entries whose block isn't registered on
     /// this target, exactly as every other shelled page does — otherwise the
     /// Cloudflare and browser builds link to blocks that answer 404.

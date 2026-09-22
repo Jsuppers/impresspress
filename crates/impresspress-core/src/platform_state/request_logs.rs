@@ -29,6 +29,8 @@ pub const TABLE: &str = "impresspress__admin__request_logs";
 /// `status` column's label is derived from it, so a row's label, the
 /// dashboard's error tiles, the network page's error column and the "Recent
 /// Errors" card cannot disagree about one row.
+/// [`RequestLogPolicy::Errors`](crate::pipeline::RequestLogPolicy::Errors)
+/// (5xx only) is a separate rule, about which rows are stored at all.
 pub const ERROR_STATUS_FLOOR: i64 = 400;
 
 /// Whether a response with this status code is an error row.
@@ -398,9 +400,9 @@ pub async fn today_counts(ctx: &dyn Context, since_iso: &str) -> Result<TodayCou
     })
 }
 
-/// Requests and errors ([`is_error_status`]) per day since `since` (one entry per day that has
-/// rows), from one grouped statement. The dashboard's request and error
-/// series come from the same rows.
+/// Requests and errors ([`is_error_status`]) per day since `since` (one
+/// entry per day that has rows), from one grouped statement. The dashboard's
+/// request and error series come from the same rows.
 pub async fn daily_counts(
     ctx: &dyn Context,
     since_iso: &str,
