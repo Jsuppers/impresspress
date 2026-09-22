@@ -1017,36 +1017,23 @@ mod integration_tests {
         assert_eq!(status, ObjectStatus::Complete);
     }
 
-    /// Two first uploads of the same NEW key, racing: one claims the key and
-    /// stores its object, the other is told the key is taken (409) — neither
-    /// is a 500 — and the one row describes the bytes that are stored.
+    /// Two uploads of `assets/same.txt` that the database interleaves: both
+    /// are held at the reservation's read until both have made it, so both
+    /// reserve on the same view of the key's row.
     ///
-    /// Each upload reads the key's row twice — once for the quota (a
-    /// replacement is charged the difference) and once to reserve it. The
-    /// rendezvous lets each racer's first read through and holds both at the
-    /// reservation's read until both have made it, so both reserve believing
-    /// the key is free: the interleaving in which a plain insert has the
-    /// unique index refuse the loser, and in which a loser that joined the
-    /// winner's row would leave it describing one upload's bytes with the
-    /// other's size and type.
-    ///
-    /// Names `repo::objects::TABLE` only to aim the rendezvous.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn racing_first_uploads_of_a_new_key_store_one_object_and_refuse_the_other() {
+    /// Each upload reads the row twice — once for the quota (a replacement is
+    /// charged the difference) and once to reserve it — so each racer lets
+    /// its own first read through ([`RendezvousDbOpContext::passing_first`])
+    /// and is held on the second. Names `repo::objects::TABLE` only to aim
+    /// the rendezvous. Answers each racer's HTTP status, in `uploads` order.
+    async fn race_two_uploads(
+        ctx: &TestContext,
+        uploads: [(&'static [u8], &'static str); 2],
+    ) -> Vec<u16> {
         use crate::test_support::{output_http_status, RendezvousDbOpContext};
 
-        let ctx = ctx_with_storage().await;
-        seed_bucket(&ctx, "assets", "alice").await;
         let gated =
             RendezvousDbOpContext::new(ctx.clone(), "database.list", repo::objects::TABLE, 2);
-
-        let uploads: [(&'static [u8], &'static str); 2] = [
-            (b"the first racer's bytes", "text/plain"),
-            (
-                b"# the second racer, a longer markdown file",
-                "text/markdown",
-            ),
-        ];
         let racers: Vec<_> = uploads
             .into_iter()
             .map(|(bytes, content_type)| {
@@ -1064,24 +1051,33 @@ mod integration_tests {
                 })
             })
             .collect();
-        let statuses = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(30),
             futures::future::try_join_all(racers),
         )
         .await
         .expect("both uploads must reach the rendezvous and finish")
-        .expect("upload task panicked");
+        .expect("upload task panicked")
+    }
 
-        let mut sorted = statuses.clone();
+    /// After a race: exactly one racer got a 200 and the other a 409 — the
+    /// key was taken, not a fault — and the key's one row describes the bytes
+    /// that are stored, which are the winner's.
+    async fn assert_one_upload_won(
+        ctx: &TestContext,
+        uploads: [(&'static [u8], &'static str); 2],
+        statuses: &[u16],
+    ) {
+        let mut sorted = statuses.to_vec();
         sorted.sort_unstable();
         assert_eq!(
             sorted,
             vec![200, 409],
-            "one upload claims the new key; the other is told it is taken, not 500"
+            "one upload claims the key; the other is told it is taken, not 500"
         );
         let (winner_bytes, winner_type) = uploads[statuses.iter().position(|s| *s == 200).unwrap()];
 
-        let (stored, info) = store::get(&ctx, "assets", "same.txt")
+        let (stored, info) = store::get(ctx, "assets", "same.txt")
             .await
             .expect("the winner's object is stored");
         assert_eq!(
@@ -1090,7 +1086,7 @@ mod integration_tests {
         );
         assert_eq!(info.content_type, winner_type);
 
-        let rows = repo::objects::list_all(&ctx).await.expect("object rows");
+        let rows = repo::objects::list_all(ctx).await.expect("object rows");
         assert_eq!(rows.len(), 1, "one key, one row: {rows:?}");
         let row = &rows[0];
         assert_eq!(row.status, ObjectStatus::Complete);
@@ -1100,6 +1096,52 @@ mod integration_tests {
             "the row must describe the bytes that are stored"
         );
         assert_eq!(row.uploaded_by, "alice");
+    }
+
+    const RACING_UPLOADS: [(&[u8], &str); 2] = [
+        (b"the first racer's bytes", "text/plain"),
+        (
+            b"# the second racer, a longer markdown file",
+            "text/markdown",
+        ),
+    ];
+
+    /// Two first uploads of the same NEW key. Both read no row; a plain
+    /// insert has the unique index refuse the loser (a 500), and a loser that
+    /// joined the winner's row leaves it describing one upload's bytes with
+    /// the other's size and type.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_first_uploads_of_a_new_key_store_one_object_and_refuse_the_other() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let statuses = race_two_uploads(&ctx, RACING_UPLOADS).await;
+
+        assert_one_upload_won(&ctx, RACING_UPLOADS, &statuses).await;
+    }
+
+    /// Two re-uploads of an EXISTING key. Both read the same `Complete` row;
+    /// if both took it over, the row would describe whichever wrote last, and
+    /// a failure of the other would put the old object's values back over an
+    /// upload in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_re_uploads_of_a_key_store_one_object_and_refuse_the_other() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let first = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "same.txt", "text/csv"),
+            InputStream::from_bytes(b"the original".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(first).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        let statuses = race_two_uploads(&ctx, RACING_UPLOADS).await;
+
+        assert_one_upload_won(&ctx, RACING_UPLOADS, &statuses).await;
     }
 
     /// An upload of a key whose previous upload is still in flight — its row
@@ -1442,7 +1484,7 @@ mod integration_tests {
         assert_eq!(
             status,
             ObjectStatus::Pending,
-            "the row is still the reservation, which is what the uploader retries against",
+            "the row is still the reservation, held until the sweep clears it",
         );
     }
 

@@ -235,9 +235,11 @@ pub struct Reservation {
 /// - **`Pending`, older**: an orphan. Taken over as a fresh claim, with
 ///   nothing to put back.
 ///
-/// Also [`ErrorCode::Aborted`] when the insert lost to another upload whose
-/// row is gone again by the read-back — that upload failed and released the
-/// key, which is free to retry.
+/// Also [`ErrorCode::Aborted`] when another upload claimed the row between
+/// this one's read and its write (every take-over is conditional on the row
+/// being unchanged), or when the insert lost to another upload whose row is
+/// gone again by the read-back — that upload failed and released the key,
+/// which is free to retry.
 pub async fn reserve_upload(
     ctx: &dyn Context,
     bucket: &str,
@@ -287,7 +289,8 @@ struct PendingClaim<'a> {
 }
 
 /// Claim the key's existing row per [`reserve_upload`]'s rules: take over a
-/// stored object or an orphaned reservation, refuse an upload in flight.
+/// stored object or an orphaned reservation, refuse an upload in flight — and
+/// refuse, the same way, a row another upload claimed since it was read.
 async fn claim_existing(
     ctx: &dyn Context,
     existing: ObjectRow,
@@ -309,8 +312,29 @@ async fn claim_existing(
         "status": ObjectStatus::Pending,
         "uploaded_by": claim.uploaded_by,
         "uploaded_at": claim.uploaded_at,
+        "updated_at": claim.uploaded_at,
     }));
-    db::update(ctx, TABLE, &existing.id, data).await?;
+    // Conditional on the row being unwritten since it was read: two uploads
+    // that both read the same `Complete` row (or the same orphan) must not
+    // both take it over, or the row ends up describing whichever wrote last
+    // while the other's failure puts values back over an upload in flight.
+    // `updated_at` is `NOT NULL` and every write to the row sets it — this
+    // one explicitly, to this claim's own timestamp.
+    let unchanged = vec![
+        Filter {
+            field: "id".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(existing.id.clone()),
+        },
+        Filter {
+            field: "updated_at".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(existing.updated_at.clone()),
+        },
+    ];
+    if db::update_by_filters_count(ctx, TABLE, unchanged, data).await? == 0 {
+        return Err(upload_in_progress());
+    }
     Ok(Reservation {
         id: existing.id,
         replaced,
