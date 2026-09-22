@@ -7040,9 +7040,9 @@ async fn a_base_plan_item_contributes_no_addon_total() {
 
 /// A `customer.subscription.updated` delivery with no `status` reports
 /// nothing about the lifecycle, so the platform row keeps the status it has
-/// while the plan the payload does carry is applied. The empty status used to
-/// be written as-is, and it ranks with the live statuses, so a newer
-/// statusless event blanked an active subscription's status to `""`.
+/// while the plan the payload does carry is applied. Written as-is, the empty
+/// status ranks with the live statuses, so a newer statusless event would
+/// blank an active subscription's status to `""`.
 #[tokio::test]
 async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
     let ctx = ctx_with(&[(
@@ -7129,10 +7129,9 @@ async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
     assert_eq!(subscription.data["stripe_event_created"], 200);
 
     // A statusless event on a terminal row restates the terminal status, so
-    // it applies; the row keeps its stored spelling, which re-serialising
-    // the parsed status would change. (On main this delivery is refused
-    // outright, so this part passes there; it pins the compare-and-swap
-    // below, which a statusless event can now reach on a `cancelled` row.)
+    // it applies and reaches the compare-and-swap on a `cancelled` row; the
+    // row keeps its stored spelling, which re-serialising the parsed status
+    // would change.
     deliver(statusless(
         "evt_statusless_cancelled",
         "sub_statusless_cancelled",
@@ -7150,8 +7149,8 @@ async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
 /// which parses as [`SubscriptionStatus::Canceled`]. A later
 /// `customer.subscription.updated` that restates `canceled` is allowed by the
 /// transition rules, and its compare-and-swap has to match the text the row
-/// holds: comparing the re-serialised `canceled` never matched, every attempt
-/// read as a concurrent change, and the delivery failed until it
+/// holds. The re-serialised `canceled` never matches it, so every attempt
+/// would read as a concurrent change and the delivery would fail until it
 /// dead-lettered.
 #[tokio::test]
 async fn a_canceled_update_after_the_deletion_is_applied_not_retried() {
