@@ -235,7 +235,8 @@ pub async fn latest_valid_for_artifact(
 
 /// The `limit` newest builds, newest first.
 ///
-/// `id` breaks a `created_at` tie, for the reason
+/// `id` breaks a `created_at` tie (the table's primary key, which the
+/// database appends to every sorted list), for the reason
 /// [`super::generations::list_recent`] states: the timestamp is
 /// millisecond-resolution on wasm32, and two rows sharing one would otherwise
 /// come back in whatever order the backend chose.
@@ -517,19 +518,15 @@ pub async fn delete_for_artifact(
     .await
 }
 
-/// Newest first, with `id` breaking a `created_at` tie — the ordering every
-/// listing here uses, for the reason [`list_recent`] states.
+/// Newest first — the ordering every listing here uses. The database breaks
+/// a `created_at` tie on the primary key, `id`, descending (a sorted `list`
+/// always ends its `ORDER BY` with the key), for the reason [`list_recent`]
+/// states.
 fn newest_first() -> Vec<SortField> {
-    vec![
-        SortField {
-            field: "created_at".into(),
-            desc: true,
-        },
-        SortField {
-            field: "id".into(),
-            desc: true,
-        },
-    ]
+    vec![SortField {
+        field: "created_at".into(),
+        desc: true,
+    }]
 }
 
 /// Decode a stored row. An unrecognized `status` is an error, never a default.

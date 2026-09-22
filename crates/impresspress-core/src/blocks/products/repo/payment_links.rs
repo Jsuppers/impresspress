@@ -472,16 +472,12 @@ pub(crate) async fn find_for_configuration(
         ctx,
         TABLE,
         configuration_filters(offer_id, preset_id, configuration_hash, true),
-        vec![
-            SortField {
-                field: "created_at".to_string(),
-                desc: false,
-            },
-            SortField {
-                field: "id".to_string(),
-                desc: false,
-            },
-        ],
+        // The database breaks a `created_at` tie on the primary key, `id`,
+        // ascending (a sorted `list` always ends its `ORDER BY` with the key).
+        vec![SortField {
+            field: "created_at".to_string(),
+            desc: false,
+        }],
         Bound::OnePer("payment link on one offer preset"),
     )
     .await?;
