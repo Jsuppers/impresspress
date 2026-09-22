@@ -18,8 +18,9 @@
 //!
 //! The tables are still created by the admin block's migrations —
 //! `blocks/admin/migrations/001_admin_schema.{sqlite,postgres}.sql` (all
-//! five), `002_variables_block_column` (`variables.block`) and
-//! `003_block_settings_seed_hash` (`block_settings.seed_defaults_hash`) —
+//! five), `002_variables_block_column` (`variables.block`),
+//! `003_block_settings_seed_hash` (`block_settings.seed_defaults_hash`) and
+//! `004_user_roles_unique` (one `user_roles` row per `(user_id, role)`) —
 //! applied as one hash-gated unit by admin's `Init`. Moving the DDL would
 //! change the concatenated migration bytes every deployment has blessed, so
 //! the schema keeps living there (spec decision 5.4); `blocks/admin` also

@@ -241,10 +241,14 @@ pub(super) async fn update_user_fields(
 // ---------------------------------------------------------------------------
 
 /// Whether a role called `name` exists. The probe [`create_role`] hands to
-/// [`taken_key_or_db_error`]; `roles.name` is UNIQUE, so one row is all there
-/// can be and a `NotFound` from the lookup is the "free" answer rather than a
+/// [`taken_key_or_db_error`], and the check `iam::handle_assign_role` makes
+/// before granting one; `roles.name` is UNIQUE, so one row is all there can
+/// be and a `NotFound` from the lookup is the "free" answer rather than a
 /// failure.
-async fn role_name_taken(ctx: &dyn Context, name: &str) -> Result<bool, wafer_run::WaferError> {
+pub(super) async fn role_name_taken(
+    ctx: &dyn Context,
+    name: &str,
+) -> Result<bool, wafer_run::WaferError> {
     match db::get_by_field(
         ctx,
         ROLES_TABLE,
@@ -309,8 +313,25 @@ pub(super) async fn create_role(
     Ok(record)
 }
 
-/// Delete a role, writing an audit-log row. Rejects deletion of system roles
-/// (the `is_system` flag), which would break auth.
+/// Delete a role, revoking every grant of it, writing an audit-log row.
+/// Rejects deletion of system roles (the `is_system` flag), which would break
+/// auth.
+///
+/// The grants have to go, and before the role does. `user_roles.role` stores
+/// the role NAME, and the auth block builds a token's `roles` claim from those
+/// rows without consulting the role definitions — so a grant left behind
+/// keeps putting the deleted role's name into every token its holder is
+/// minted, and a role later created under the same name silently re-attaches
+/// to it. [`revoke_every_grant_of`] says in what order, and what a failure at
+/// each step leaves behind.
+///
+/// A second revocation pass runs after the role row is gone. An assign that
+/// passed `iam::handle_assign_role`'s "is this a defined role" check just
+/// before the role was deleted can land its grant after the first pass; once
+/// the role row is gone no assign can pass that check, so the second pass
+/// takes whatever slipped in. (An assign whose check ran before the role was
+/// deleted and whose insert lands after this second pass is still possible
+/// in principle — the check and the insert are two statements.)
 pub(super) async fn delete_role(
     ctx: &dyn Context,
     msg: &Message,
@@ -321,34 +342,111 @@ pub(super) async fn delete_role(
     }
     let admin_id = msg.user_id().to_string();
 
-    // Protect system roles. The guard read must fail closed, for the same
-    // reason `handle_update_role`'s does: the old `if let Ok(role)` swallowed
-    // every non-success result — including a transient infra error — as "not
-    // a system role" and fell through to the unprotected delete below, which
-    // would drop the `admin` role and break auth. Not-found still falls
-    // through, so `db::delete` reports it.
-    match db::get(ctx, ROLES_TABLE, role_id).await {
-        Ok(role) if role.bool_field("is_system") => {
-            return Err(err_forbidden("Cannot delete system role"))
-        }
-        Ok(_) => {}
-        Err(e) if e.code == ErrorCode::NotFound => {}
-        Err(e) => return Err(db_error_internal(e, "Database error")),
+    // The guard read must fail closed, for the same reason
+    // `handle_update_role`'s does: an infra error treated as "not a system
+    // role" would fall through to the delete and drop the `admin` role. It is
+    // also where the role's name comes from, which the revocation needs, so a
+    // missing role is answered here as the 404 it is.
+    let role = match db::get(ctx, ROLES_TABLE, role_id).await {
+        Ok(role) => role,
+        Err(e) => return Err(db_error(e, "Role not found", "Database error")),
+    };
+    if role.bool_field("is_system") {
+        return Err(err_forbidden("Cannot delete system role"));
     }
+    let name = role.str_field("name").to_string();
+
+    let mut revoked = revoke_every_grant_of(ctx, &name).await?;
 
     match db::delete(ctx, ROLES_TABLE, role_id).await {
         Ok(()) => {}
         Err(e) => return Err(db_error(e, "Role not found", "Database error")),
     }
 
+    revoked += revoke_every_grant_of(ctx, &name).await?;
+
     audit_log(
         ctx,
         &admin_id,
         "role.delete",
-        &format!("roles/{role_id}"),
+        &format!("roles/{role_id} (name: {name}; grants revoked: {revoked})"),
         msg.remote_addr(),
     )
     .await;
+    Ok(())
+}
+
+/// Remove every `user_roles` row naming `role` and invalidate each holder's
+/// access tokens, returning how many rows went.
+///
+/// Bump, delete, bump — so a failure at each step leaves something a retry
+/// can finish:
+///
+/// 1. Every holder's auth version is bumped while their grant still exists.
+///    If a bump fails here nothing has been removed, the role is still
+///    there, and deleting it again finds every holder again.
+/// 2. Every grant goes in one statement ([`user_roles::revoke_role`]), which
+///    also takes a grant written after the read in step 1.
+/// 3. Every holder is bumped again. A refresh that landed between their
+///    first bump and the delete minted a token that still names the role;
+///    this is what invalidates it. A failure here is reported, but the
+///    grants are gone, so a retry cannot find these holders — what remains
+///    is only a token minted inside that window, until it expires.
+///
+/// A holder whose grant was written after step 1's read is not bumped. Their
+/// grant is still removed, and the assign that wrote it bumped them, so the
+/// only token that can still carry the role is one minted between that
+/// assign and step 2.
+async fn revoke_every_grant_of(ctx: &dyn Context, role: &str) -> Result<i64, OutputStream> {
+    let grants = match user_roles::list_by_role(ctx, role).await {
+        Ok(rows) => rows,
+        Err(e) => return Err(db_error_internal(e, "Database error")),
+    };
+    let mut holders: Vec<&str> = grants.iter().map(|g| g.user_id.as_str()).collect();
+    holders.sort_unstable();
+    holders.dedup();
+
+    bump_each(
+        ctx,
+        &holders,
+        "Role not deleted: session invalidation failed",
+    )
+    .await?;
+    let revoked = match user_roles::revoke_role(ctx, role).await {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(db_error_internal(
+                e,
+                "Role not deleted: its grants could not be revoked",
+            ))
+        }
+    };
+    bump_each(
+        ctx,
+        &holders,
+        "Role grants revoked but session invalidation failed",
+    )
+    .await?;
+    Ok(revoked)
+}
+
+/// Bump each of `user_ids`' auth version, stopping at the first failure and
+/// answering it with `failure` as the client message.
+async fn bump_each(
+    ctx: &dyn Context,
+    user_ids: &[&str],
+    failure: &str,
+) -> Result<(), OutputStream> {
+    for &user_id in user_ids {
+        if let Err(e) = bump_auth_version(ctx, user_id).await {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "role delete: auth_version bump failed"
+            );
+            return Err(err_internal(failure, e));
+        }
+    }
     Ok(())
 }
 

@@ -609,6 +609,70 @@ column is then added on the first provider write. If you have turned strict
 schema **on**, the migration is not optional — a provider create or edit will
 fail on the missing column until it runs.
 
+### Admin: a user holds each role once (migration 004), and deleting a role revokes it
+
+**What changes.** Role grants (`impresspress__admin__user_roles`) are now unique
+per user and role, on every deployment the migration reaches (see the last
+paragraph). Before, two logins of the bootstrap-admin address at the same
+moment could each grant `admin`, leaving two identical rows — and revoking the
+role then deleted one of them, reported success, and left the user an admin
+through the other. Deleting a role also left every grant of it in place: its
+name kept appearing in the tokens its former holders were issued, and creating
+a role of the same name later handed it straight back to them. Deleting a role
+now revokes it from everyone who held it and invalidates the access tokens
+issued to them while they had it, and the audit row names the role and how many
+grants went with it.
+
+**One admin-API change.** `POST /b/admin/api/iam/user-roles` now grants only a
+role that exists: a role name with no definition answers `400` ("No role named
+… exists. Create the role first.") instead of writing a grant. Create the role
+on the Roles tab first if you script against this endpoint.
+
+**The repair deletes rows.** Migration `004_user_roles_unique` deletes
+duplicate grant rows before creating the index, keeping **one** row for each
+user and role — the least by `created_at`, then `id`, in the database's text
+ordering (the earliest, on SQLite; on Postgres under a non-`C` collation the
+order is the locale's, which need not be chronological). Which twin survives
+does not matter: every row it deletes repeats a grant the kept row still
+makes, so nobody gains or loses a role — what goes is the extra row a revoke
+could miss.
+
+**Data snapshots.** A `/b/dev` data snapshot exported before this release can
+repeat a grant too. Importing it keeps one row per user and role, by the same
+rule, rather than failing on the new index.
+
+**Roles you deleted before upgrading are still granted.** The migration does
+not touch grants that name a role which no longer exists. To find them, run this
+from the admin SQL explorer:
+
+```sql
+SELECT ur.user_id, ur.role, ur.id
+FROM impresspress__admin__user_roles AS ur
+WHERE NOT EXISTS (
+    SELECT 1 FROM impresspress__admin__roles AS r WHERE r.name = ur.role
+)
+ORDER BY ur.role, ur.user_id;
+```
+
+and revoke each one with `DELETE /b/admin/api/iam/user-roles/{id}` — or
+re-create the role on the Roles tab and delete it again, which now revokes all
+of them at once.
+
+**No flag is needed to apply it.** A native deployment runs the admin block's
+schema files before every boot, and a Cloudflare deploy runs every block's
+migrations through `/_deploy/init`, so the repair and the index are in place on
+the first boot or deploy of this release. A native deployment that does not
+pass `--run-migrations` still logs the generic `schema drift` warning for the
+admin block until it does once; that warning is about the recorded hash, not
+the schema.
+
+**Browser installs made before this release do not get it.** A browser install
+applies migrations only when it creates its database; nothing passes
+`--run-migrations` there, so an install whose admin schema already exists logs
+the drift warning and keeps the old table, without the index. Twin grants
+remain possible there, as before. The role-delete revocation and the
+assign-endpoint check do not depend on the index and apply everywhere.
+
 ## The release workflow has never produced a release
 
 Read this before you tag anything. No `v*` tag has ever existed in this

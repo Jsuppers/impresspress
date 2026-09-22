@@ -544,6 +544,48 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
     );
 }
 
+/// A bundle exported before admin migration 004 can repeat a grant; the
+/// destination's unique index over `(user_id, role)` would refuse the twin
+/// partway through an import that has already cleared the table. The twin is
+/// dropped instead, keeping the same survivor 004 keeps.
+#[tokio::test]
+async fn import_collapses_twin_grants_from_a_pre_004_bundle() {
+    let ctx = TestContext::with_products().await.with_auth_added().await;
+    let grant = |id: &str, user: &str, role: &str, at: &str| {
+        json_map(json!({
+            "id": id, "user_id": user, "role": role, "assigned_by": "",
+            "created_at": at, "updated_at": at,
+        }))
+        .into_iter()
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+    };
+    let mut snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables: std::collections::BTreeMap::new(),
+    };
+    snap.tables.insert(
+        user_roles::TABLE.to_string(),
+        vec![
+            grant("ur_later", "alice", "admin", "2026-02-01T00:00:00Z"),
+            grant("ur_first", "alice", "admin", "2026-01-01T00:00:00Z"),
+            grant("ur_other", "alice", "editor", "2026-03-01T00:00:00Z"),
+        ],
+    );
+
+    let report = data_snapshot::import(&ctx, &snap)
+        .await
+        .expect("a bundle repeating a grant still imports");
+    assert_eq!(report.tables[user_roles::TABLE], 2);
+    let mut ids: Vec<String> = db::list_all(&ctx, user_roles::TABLE, Vec::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["ur_first", "ur_other"]);
+}
+
 #[tokio::test]
 async fn import_refuses_a_table_outside_this_builds_allowlist() {
     let ctx = TestContext::with_products().await;

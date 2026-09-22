@@ -182,7 +182,7 @@ async fn cascade_role_rename(
     };
 
     for grant in &grants {
-        if let Err(e) = user_roles::rename_role(ctx, &grant.id, new_name).await {
+        if let Err(e) = user_roles::rename_role(ctx, grant, new_name).await {
             return Err(err_internal(
                 "Role renamed but its grants did not follow",
                 e,
@@ -209,8 +209,8 @@ async fn cascade_role_rename(
 /// table bound it.
 pub(super) async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
-    // System-role guard, delete, and audit-log write live in the shared ops
-    // layer (the JSON path previously logged nothing).
+    // System-role guard, grant revocation, delete, and audit-log write live
+    // in the shared ops layer.
     match super::ops::delete_role(ctx, msg, id).await {
         Ok(()) => ok_json(&AdminRoleDeleteResponse { deleted: true }),
         Err(out) => out,
@@ -395,6 +395,23 @@ pub(super) async fn handle_assign_role(
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
+    // Only a defined role can be granted. A grant names its role by string,
+    // and a grant naming no role is not inert: the auth block puts it in the
+    // holder's token `roles` claim regardless, and a role later created under
+    // that name re-attaches to it. It is also what lets a grant outlive
+    // `ops::delete_role`, whose second revocation pass relies on no assign
+    // getting past this check once the role row is gone.
+    match super::ops::role_name_taken(ctx, &body.role).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return err_bad_request(&format!(
+                "No role named \"{}\" exists. Create the role first.",
+                body.role
+            ))
+        }
+        Err(e) => return crud::db_error_internal(e, "Database error"),
+    }
+
     let assigned = format!("users/{}/roles/{}", body.user_id, body.role);
     match user_roles::assign(ctx, &body.user_id, &body.role, msg.user_id()).await {
         Ok(Assigned::AlreadyAssigned) => err_conflict("Role already assigned to user"),
@@ -459,12 +476,26 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
         }
     };
 
+    // P2c: role removal (demotion) is exactly the change this mechanism
+    // exists for — bump so a JWT minted with the removed role stops
+    // authenticating as that role immediately rather than at its natural
+    // expiry. Bumped BEFORE the removal as well as after, for the reason
+    // `ops::revoke_every_grant_of` gives: if a bump after the removal were the
+    // only one and it failed, the grant would be gone and a retry would answer
+    // 404, leaving the holder's live token carrying the role until it
+    // expires. A failure of this first bump leaves the grant in place to
+    // retry; the second closes a refresh landing between the two.
+    if let Err(e) = bump_auth_version(ctx, &role_user).await {
+        tracing::error!(
+            user_id = %role_user,
+            error = %e,
+            "role not removed: auth_version bump failed"
+        );
+        return err_internal("Role not removed: session invalidation failed", e);
+    }
+
     match user_roles::remove(ctx, id).await {
         Ok(()) => {
-            // P2c: role removal (demotion) is exactly the change this
-            // mechanism exists for — bump so a JWT minted with the removed
-            // role stops authenticating as that role immediately rather
-            // than at its natural expiry.
             if let Err(e) = bump_auth_version(ctx, &role_user).await {
                 tracing::error!(
                     user_id = %role_user,
@@ -668,6 +699,23 @@ mod tests {
 
     fn body_input(json: serde_json::Value) -> InputStream {
         InputStream::from_bytes(serde_json::to_vec(&json).unwrap())
+    }
+
+    /// Define a role through the create handler and return its row id — a
+    /// grant can only name a defined role.
+    async fn define_role(ctx: &TestContext, name: &str) -> String {
+        output_json(
+            handle_create_role(
+                ctx,
+                &admin_msg("create", "/b/admin/api/iam/roles"),
+                body_input(serde_json::json!({ "name": name })),
+            )
+            .await,
+        )
+        .await["id"]
+            .as_str()
+            .expect("created role id")
+            .to_string()
     }
 
     /// The system-role guard on the delete path must fail closed, exactly as
@@ -1047,6 +1095,7 @@ mod tests {
         .unwrap()
         .id;
         assert_eq!(users::auth_version(&ctx, &uid).await.unwrap(), 0);
+        define_role(&ctx, "editor").await;
 
         let msg = admin_msg("create", "/b/admin/api/iam/user-roles");
         let out = handle_assign_role(
@@ -1089,6 +1138,7 @@ mod tests {
         .await
         .unwrap()
         .id;
+        define_role(&ctx, "editor").await;
 
         let msg = admin_msg("create", "/b/admin/api/iam/user-roles");
         let assigned = output_json(
@@ -1105,7 +1155,7 @@ mod tests {
             .expect("assign response carries the user_roles row id")
             .to_string();
         // The assign above already bumped once; capture that baseline so the
-        // removal's OWN bump is what this test proves.
+        // removal's OWN bumps are what this test proves.
         let before_remove = users::auth_version(&ctx, &uid).await.unwrap();
 
         let remove_msg = routed(admin_msg(
@@ -1120,8 +1170,372 @@ mod tests {
 
         assert_eq!(
             users::auth_version(&ctx, &uid).await.unwrap(),
-            before_remove + 1,
-            "removing a role must bump the target user's auth_version"
+            before_remove + 2,
+            "removing a role bumps the target user's auth_version before the \
+             removal and again after it"
         );
+    }
+
+    /// A rename onto a role name a user already holds a grant of leaves that
+    /// user with one grant, not a rewrite the unique index refuses.
+    ///
+    /// The assign endpoint now grants only defined roles and a role delete
+    /// revokes its grants, so neither makes such a grant any more. A database
+    /// can still hold one: a grant of a role deleted before this release
+    /// outlived it, and `RELEASE.md` tells operators how to find them. That
+    /// grant is planted here the way it was left — through the table's
+    /// writer, with no role behind it — and the `editor` grant is made the
+    /// way an admin makes one today.
+    #[tokio::test]
+    async fn a_rename_onto_a_name_already_held_merges_the_grants() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("holder").await;
+        let role_id = define_role(&ctx, "editor").await;
+        output_json(
+            handle_assign_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                body_input(serde_json::json!({"user_id": "holder", "role": "editor"})),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(
+            user_roles::assign(&ctx, "holder", "editor-v2", "").await,
+            Ok(Assigned::Created(_))
+        ));
+
+        let out = handle_update_role(
+            &ctx,
+            &update_role_msg(&role_id),
+            body_input(serde_json::json!({"name": "editor-v2"})),
+        )
+        .await;
+        assert_eq!(output_json(out).await["name"], "editor-v2");
+
+        let names: Vec<String> = user_roles::list_for_user(&ctx, "holder")
+            .await
+            .expect("list grants")
+            .into_iter()
+            .map(|row| row.role)
+            .collect();
+        assert_eq!(names, vec!["editor-v2"]);
+    }
+
+    /// Deleting a role revokes it: the next token its former holder is minted
+    /// no longer names it, and a role created again under the same name does
+    /// not quietly hand it back.
+    ///
+    /// The token is minted by the real login handler, AFTER the delete — the
+    /// `roles` claim is built from the grant rows alone, without consulting
+    /// the role definitions, so a grant the delete left behind shows up
+    /// exactly there.
+    #[tokio::test]
+    async fn deleting_a_role_revokes_it_from_every_token_minted_afterwards() {
+        use crate::blocks::{
+            auth::repo::users,
+            auth_ui::api::{login, signup, test_mail_request},
+        };
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let creds = serde_json::json!({
+            "email": "grantee@example.com",
+            "password": "correct-horse-battery",
+        });
+        let (limiter, msg) = test_mail_request();
+        output_json(signup::handle(&limiter, &ctx, &msg, body_input(creds.clone())).await).await;
+        let uid = users::find_by_email(&ctx, "grantee@example.com")
+            .await
+            .expect("user lookup")
+            .expect("signup created the user")
+            .id;
+
+        let role_id = define_role(&ctx, "editor").await;
+        output_json(
+            handle_assign_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                body_input(serde_json::json!({"user_id": uid, "role": "editor"})),
+            )
+            .await,
+        )
+        .await;
+
+        let roles_in_a_fresh_token = |ctx: TestContext| {
+            let creds = creds.clone();
+            async move {
+                let token = output_json(login::handle(&ctx, body_input(creds)).await).await
+                    ["access_token"]
+                    .as_str()
+                    .expect("login mints an access token")
+                    .to_string();
+                // The claims as minted: the payload segment, decoded. What
+                // is asserted is what the token says, not whether this
+                // fixture's signing key is the one verification derives.
+                use base64ct::Encoding;
+                let payload = token.split('.').nth(1).expect("a JWT has a payload");
+                let claims: serde_json::Value = serde_json::from_slice(
+                    &base64ct::Base64UrlUnpadded::decode_vec(payload).expect("base64url payload"),
+                )
+                .expect("JSON claims");
+                claims["roles"]
+                    .as_array()
+                    .expect("the token carries a roles claim")
+                    .iter()
+                    .filter_map(|r| r.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert!(
+            roles_in_a_fresh_token(ctx.clone())
+                .await
+                .contains(&"editor".to_string()),
+            "precondition: the grant reaches the token"
+        );
+
+        let before = users::auth_version(&ctx, &uid).await.expect("auth version");
+        let out = handle_delete_role(
+            &ctx,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/roles/{role_id}"),
+            )),
+        )
+        .await;
+        assert_eq!(output_json(out).await, serde_json::json!({"deleted": true}));
+
+        let after_delete = roles_in_a_fresh_token(ctx.clone()).await;
+        assert!(
+            !after_delete.contains(&"editor".to_string()),
+            "a token minted after the delete must not carry the role: {after_delete:?}"
+        );
+        assert!(
+            users::auth_version(&ctx, &uid).await.expect("auth version") > before,
+            "tokens minted while the role existed must stop authenticating"
+        );
+
+        let audit = db_read::list_every(
+            &ctx,
+            super::super::logs::AUDIT_LOGS_TABLE,
+            vec![Filter {
+                field: "action".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("role.delete"),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        assert_eq!(
+            audit[0].str_field("resource"),
+            format!("roles/{role_id} (name: editor; grants revoked: 1)"),
+            "the audit row says which role went and how many grants went with it"
+        );
+
+        define_role(&ctx, "editor").await;
+        let after_recreate = roles_in_a_fresh_token(ctx.clone()).await;
+        assert!(
+            !after_recreate.contains(&"editor".to_string()),
+            "a new role under the old name must not re-attach the old grant: {after_recreate:?}"
+        );
+    }
+
+    /// A delete of a role that is not there is a 404 from the guard read,
+    /// and touches no grant — not even one naming the id it was given.
+    ///
+    /// Passes on the code before the revocation existed, by design: that
+    /// code revoked nothing at all. It pins that the revocation added since
+    /// runs only for a role that was found, and never keys on the path id.
+    #[tokio::test]
+    async fn deleting_a_missing_role_is_not_found_and_revokes_nothing() {
+        let ctx = TestContext::with_admin().await;
+        // A grant of a name no role has, as a role deleted before this
+        // release left behind.
+        user_roles::assign(&ctx, "u-1", "ghost", "")
+            .await
+            .expect("plant the grant");
+
+        let out = handle_delete_role(
+            &ctx,
+            &routed(admin_msg("delete", "/b/admin/api/iam/roles/ghost")),
+        )
+        .await;
+        assert!(output_is_error(out, "NotFound").await);
+        assert_eq!(
+            user_roles::list_by_role(&ctx, "ghost")
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "a refused delete revokes nothing"
+        );
+    }
+
+    /// The assign endpoint grants only a role that is defined.
+    ///
+    /// A grant of an undefined name reaches the holder's token regardless —
+    /// the `roles` claim is built from the grant rows alone — and a role
+    /// later created under that name re-attaches to it.
+    #[tokio::test]
+    async fn assigning_an_undefined_role_is_refused() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("u-1").await;
+        let out = handle_assign_role(
+            &ctx,
+            &admin_msg("create", "/b/admin/api/iam/user-roles"),
+            body_input(serde_json::json!({"user_id": "u-1", "role": "editor"})),
+        )
+        .await;
+        assert!(output_is_error(out, "InvalidArgument").await);
+        assert!(user_roles::list_for_user(&ctx, "u-1")
+            .await
+            .expect("list")
+            .is_empty());
+    }
+
+    /// Two concurrent assigns of one role to one user leave ONE grant — and
+    /// so the revoke endpoint, which removes one row, really revokes.
+    ///
+    /// `assign` reads before it inserts, and two callers that both pass the
+    /// read see no grant. The rendezvous holds both on that read (a
+    /// `database.list` of the grants table; the handler's role-definition
+    /// lookup is on another table and passes through) until each has made
+    /// it — the interleaving two concurrent bootstrap-admin logins produce
+    /// through `ensure_admin_role`, and two admins clicking "assign" at once
+    /// through this handler. Without the unique index both inserts land, and
+    /// `handle_remove_role` then deletes one of them, answers
+    /// `{"deleted": true}`, and the twin keeps the role live.
+    ///
+    /// Names `user_roles::TABLE` only to aim the rendezvous; `tests/repo_door.rs`
+    /// allowlists it as a fault injector.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_assigns_leave_one_grant_that_the_revoke_endpoint_removes() {
+        use crate::test_support::RendezvousDbOpContext;
+
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("racer").await;
+        define_role(&ctx, "auditor").await;
+        let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", user_roles::TABLE, 2);
+
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let gated = gated.clone();
+                tokio::spawn(async move {
+                    crate::test_support::output_http_status(
+                        handle_assign_role(
+                            &gated,
+                            &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                            body_input(serde_json::json!({"user_id": "racer", "role": "auditor"})),
+                        )
+                        .await,
+                    )
+                    .await
+                })
+            })
+            .collect();
+        let mut statuses = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both assigns must reach the rendezvous and finish")
+        .expect("assign task panicked");
+        statuses.sort_unstable();
+        assert_eq!(
+            statuses,
+            vec![200, 409],
+            "one assign writes the grant, the other is told it is already held"
+        );
+
+        let rows = user_roles::list_for_user(&ctx, "racer")
+            .await
+            .expect("list grants");
+        assert_eq!(rows.len(), 1, "one grant, not one per racer: {rows:?}");
+
+        let out = handle_remove_role(
+            &ctx,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/user-roles/{}", rows[0].id),
+            )),
+        )
+        .await;
+        assert_eq!(output_json(out).await, serde_json::json!({"deleted": true}));
+        let roles = crate::blocks::auth::helpers::get_user_roles(&ctx, "racer")
+            .await
+            .expect("resolve roles");
+        assert!(
+            !roles.iter().any(|r| r == "auditor"),
+            "a revoke that reports success must leave the role gone: {roles:?}"
+        );
+    }
+
+    /// A role delete whose session invalidation fails leaves every grant in
+    /// place, so deleting again finishes the job — and bumps every holder.
+    ///
+    /// The shape this replaces removed a grant and THEN bumped its holder; a
+    /// failed bump left that grant gone, so a retry's read never found the
+    /// holder again, and their live token kept the deleted role until it
+    /// expired. The injector fails every auth-version bump, which is the
+    /// first write the delete makes.
+    ///
+    /// Names `users::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn a_role_delete_whose_invalidation_fails_can_be_retried() {
+        use crate::{blocks::auth::repo::users, test_support::FailingDbOpContext};
+
+        let ctx = TestContext::with_auth().await;
+        let role_id = define_role(&ctx, "editor").await;
+        for user in ["u-1", "u-2"] {
+            ctx.seed_auth_user(user).await;
+            output_json(
+                handle_assign_role(
+                    &ctx,
+                    &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                    body_input(serde_json::json!({"user_id": user, "role": "editor"})),
+                )
+                .await,
+            )
+            .await;
+        }
+        let delete = || {
+            routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/roles/{role_id}"),
+            ))
+        };
+
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.increment_field_where", users::TABLE)],
+        );
+        assert!(output_is_error(handle_delete_role(&failing, &delete()).await, "Internal").await);
+        assert_eq!(
+            user_roles::list_by_role(&ctx, "editor")
+                .await
+                .expect("list")
+                .len(),
+            2,
+            "a delete that could not invalidate sessions must not have revoked a grant"
+        );
+
+        let before: Vec<i64> =
+            futures::future::try_join_all(["u-1", "u-2"].map(|u| users::auth_version(&ctx, u)))
+                .await
+                .expect("auth versions");
+        assert_eq!(
+            output_json(handle_delete_role(&ctx, &delete()).await).await,
+            serde_json::json!({"deleted": true})
+        );
+        assert!(user_roles::list_by_role(&ctx, "editor")
+            .await
+            .expect("list")
+            .is_empty());
+        for (user, was) in ["u-1", "u-2"].into_iter().zip(before) {
+            assert!(
+                users::auth_version(&ctx, user).await.expect("auth version") > was,
+                "the retry bumps {user}"
+            );
+        }
     }
 }

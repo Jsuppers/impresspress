@@ -1437,7 +1437,7 @@ jobs:
       # never stamps the hash, and every later boot re-runs and re-fails.
       - name: Apply all PostgreSQL migrations in order
         run: |
-          for block in products files; do
+          for block in products files admin; do
             for migration in crates/impresspress-core/src/blocks/${block}/migrations/*.postgres.sql; do
               echo "applying ${migration}"
               psql --set ON_ERROR_STOP=1 --file "${migration}"
@@ -1490,6 +1490,24 @@ jobs:
           psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/products/migrations/020_normalize_blank_deleted_at.postgres.sql
           test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at IS NULL")" = "blank_noslug,blank_scarf,live_jacket,live_noslug"
           test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at = ''")" = "blank_hat_a,blank_hat_b,blank_jacket"
+
+      # Admin 004 collapses repeated `(user_id, role)` grants onto the earliest
+      # row and then makes the pair unique. It already ran above against an
+      # empty table, so the index exists; it is dropped here to plant what an
+      # upgrading deployment holds — two grants of `admin` to one user, one
+      # pair tied on `created_at` so the `id` tie-break decides — and the file
+      # is run again. `blocks/admin/migrations` pins the same on SQLite.
+      - name: Migration admin/004 collapses duplicate role grants
+        run: |
+          psql --set ON_ERROR_STOP=1 --command "DROP INDEX impresspress__admin__user_roles_user_role_uniq"
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__admin__user_roles (id, user_id, role, assigned_by, created_at, updated_at) VALUES ('ur_b_first', 'alice', 'admin', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('ur_a_second', 'alice', 'admin', '', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'), ('ur_tie_b', 'bob', 'editor', '', '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z'), ('ur_tie_a', 'bob', 'editor', '', '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z'), ('ur_other', 'bob', 'admin', '', '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')"
+          psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/admin/migrations/004_user_roles_unique.postgres.sql
+          test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__admin__user_roles")" = "ur_b_first,ur_other,ur_tie_a"
+          # `if`, not `!`: bash's `-e` ignores a negated command's status.
+          if psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__admin__user_roles (id, user_id, role, assigned_by, created_at, updated_at) VALUES ('ur_again', 'alice', 'admin', '', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z')"; then
+            echo "the unique index did not refuse a repeated grant"
+            exit 1
+          fi
 
       # Files 003 gives every legacy (JWT-shaped, unexpiring) share row the
       # lifetime its token used to impose: 365 days for one minted before

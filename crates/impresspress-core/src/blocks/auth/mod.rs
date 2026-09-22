@@ -368,7 +368,8 @@ fn invalidate_auth_version_cache(user_id: &str) {
 /// The single call site for every security-relevant mutation: password
 /// change (`auth_ui::api::change_password`), disable/soft-delete
 /// (`admin::ops::{set_user_disabled,delete_user,update_user_fields}`), and
-/// role change (`admin::iam::{handle_assign_role,handle_remove_role}`).
+/// role change (`admin::iam::{handle_assign_role,handle_remove_role,
+/// cascade_role_rename}` and `admin::ops::delete_role`).
 pub(crate) async fn bump_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
@@ -503,8 +504,8 @@ pub(crate) mod helpers {
     /// Both reads propagate `Err` instead of swallowing it (SB-3): a WRAP
     /// denial or transient DB error on `user_roles::TABLE` must not look
     /// identical to "user has no roles" — that would silently 403 every
-    /// admin (`AuthServiceImpl::require_role`), re-insert a duplicate admin
-    /// row on every login (`ensure_admin_role`), and stamp empty roles on
+    /// admin (`AuthServiceImpl::require_role`), re-attempt the admin grant
+    /// on every login (`ensure_admin_role`), and stamp empty roles on
     /// API keys (`authenticate_api_key`). `NotFound` on the inline-role read
     /// is the one case that is genuinely "no role from this source", not a
     /// failure, and stays non-fatal.
@@ -547,7 +548,7 @@ pub(crate) mod helpers {
     ///
     /// Propagates the read's own [`wafer_run::WaferError`] (SB-3) when the
     /// underlying roles read fails — a WRAP denial or DB error must not be
-    /// mistaken for "user has no admin row yet" and drive a duplicate insert
+    /// mistaken for "user has no admin row yet" and drive a grant attempt
     /// into `user_roles::TABLE`.
     pub(crate) async fn ensure_admin_role(
         ctx: &dyn wafer_run::context::Context,
@@ -572,9 +573,12 @@ pub(crate) mod helpers {
         }
 
         // Email matches and admin role is missing — grant it, through the
-        // table's single writer, with no admin behind the grant.
+        // table's single writer, with no admin behind the grant. A concurrent
+        // login of the same account can win the insert between the read above
+        // and this write; `assign` then answers `AlreadyAssigned`, and the
+        // user holds admin all the same.
         match user_roles::assign(ctx, user_id, "admin", "").await {
-            Ok(_) => {
+            Ok(user_roles::Assigned::Created(_)) => {
                 tracing::info!(
                     user_id = %user_id,
                     email = %email,
@@ -582,6 +586,7 @@ pub(crate) mod helpers {
                 );
                 roles.push("admin".to_string());
             }
+            Ok(user_roles::Assigned::AlreadyAssigned) => roles.push("admin".to_string()),
             Err(e) => {
                 tracing::warn!(
                     user_id = %user_id,

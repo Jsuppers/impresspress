@@ -670,8 +670,10 @@ fn only_the_door_names_a_platform_table() {
 /// `platform_state::variables::TABLE` to `db::list_all` — which compiles
 /// cleanly because the constant is `pub` for `blocks/admin`'s
 /// `collections(..)` registration. This scan closes that gap: a file that
-/// imports `platform_state` and names `<module>::TABLE` must be on the list
-/// below, each entry justified on why it is not a query around the door.
+/// imports `platform_state` and names `<module>::TABLE` — by its path, or by
+/// a grouped `<module>::{…, TABLE}` import that leaves only a bare `TABLE` at
+/// the call site ([`names_const`]) — must be on the list below, each entry
+/// justified on why it is not a query around the door.
 ///
 /// The `platform_state` condition is what keeps a block's own
 /// `repo::variables::TABLE` (products has one) out of the match. The doors
@@ -734,7 +736,20 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ),
     (
         "user_roles",
-        &["blocks/admin/mod.rs", "blocks/dev/data_snapshot.rs"],
+        &[
+            "blocks/admin/mod.rs",
+            "blocks/dev/data_snapshot.rs",
+            // A fault injector, the same category as `blocks/admin/pages/blocks.rs`:
+            // the race test aims `RendezvousDbOpContext` at the grants read
+            // `assign` makes, so the two concurrent assigns both pass it
+            // before either inserts. It then drives the revoke through
+            // `handle_remove_role`, where the reported bug lived.
+            "blocks/admin/iam.rs",
+            // A test fixture that must write past the door: migration 004's
+            // test plants twin grants for the repair to collapse, and the
+            // door's only writer (`assign`) refuses to make a twin.
+            "blocks/admin/migrations/mod.rs",
+        ],
     ),
     (
         "users",
@@ -756,6 +771,11 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // branch on their first read and use `break_reads`, which names
             // no table at all.
             "blocks/auth_ui/api/refresh.rs",
+            // A fault injector: a role delete's first write is the
+            // auth-version bump of each holder, and the test fails exactly
+            // that increment to prove a failed invalidation revokes nothing.
+            // `break_reads` cannot reach it — the delete's reads succeed.
+            "blocks/admin/iam.rs",
         ],
     ),
     // The auth doors B12 adds. Two categories, both already established
@@ -1145,6 +1165,105 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ("llm_settings", &["blocks/llm/mod.rs"]),
 ];
 
+/// Whether `src` names `ident` — by its path (`user_roles::TABLE`), or by a
+/// grouped import that brings the constant in under its bare name
+/// (`user_roles::{self, TABLE}`, `user_roles::{TABLE as T}`) and so never
+/// spells the path at a call site. A bare `TABLE` alone is not evidence of
+/// anything, every door names its own; the group is what attributes it.
+fn names_const(src: &str, ident: &str) -> bool {
+    if src.contains(ident) {
+        return true;
+    }
+    let Some((module, name)) = ident.rsplit_once("::") else {
+        return false;
+    };
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let opener = format!("{module}::{{");
+    let mut from = 0;
+    while let Some(at) = src[from..].find(&opener) {
+        let start = from + at;
+        from = start + opener.len();
+        if src[..start].chars().next_back().is_some_and(is_word) {
+            continue; // `other_user_roles::{`, not this module
+        }
+        let mut depth = 1;
+        let mut end = from;
+        for (offset, c) in src[from..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                end = from + offset;
+                break;
+            }
+        }
+        // Only the group's own top level imports from `module`: a `TABLE`
+        // inside a nested group, or after another `::`, is some other
+        // module's (`products::{repo::{groups::TABLE}}` is the groups door).
+        let group = &src[from..end];
+        let mut depth = 0;
+        for (lo, c) in group.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth != 0 || !group[lo..].starts_with(name) {
+                continue;
+            }
+            let hi = lo + name.len();
+            let before = group[..lo].chars().next_back();
+            let after = group[hi..].chars().next();
+            let pathed = group[..lo].trim_end().ends_with("::");
+            if !before.is_some_and(is_word) && !after.is_some_and(is_word) && !pathed {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn a_grouped_import_of_the_const_is_naming_it() {
+    for (src, named) in [
+        ("use crate::platform_state::user_roles::TABLE;", true),
+        (
+            "use crate::platform_state::user_roles::{self, UserRoleRow, TABLE};",
+            true,
+        ),
+        (
+            "use crate::platform_state::{user_roles::{TABLE as T}, variables};",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles::{\n    self,\n    TABLE,\n};",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles::{self, UserRoleRow};",
+            false,
+        ),
+        (
+            "use crate::platform_state::user_roles::{self, OTHER_TABLE};",
+            false,
+        ),
+        ("use crate::blocks::x::not_user_roles::{TABLE};", false),
+        // another module's constant inside the group
+        (
+            "use crate::platform_state::user_roles::{self, other::TABLE};",
+            false,
+        ),
+        (
+            "use crate::platform_state::user_roles::{self, other::{TABLE}};",
+            false,
+        ),
+    ] {
+        assert_eq!(names_const(src, "user_roles::TABLE"), named, "{src}");
+    }
+}
+
 #[test]
 fn only_the_allowlist_names_a_platform_table_via_the_const() {
     let sources = sources(&scan());
@@ -1155,7 +1274,7 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
             .map(|(_, files)| *files)
             .unwrap_or(&[]);
         let offenders = offenders(&sources, allowed, |src| {
-            src.contains(qualifier) && consts.iter().any(|ident| src.contains(ident))
+            src.contains(qualifier) && consts.iter().any(|ident| names_const(src, ident))
         });
         assert!(
             offenders.is_empty(),
@@ -1192,7 +1311,7 @@ fn no_allowlist_entry_is_dead() {
             for entry in *files {
                 assert!(
                     sources.iter().any(|(path, src)| path == entry
-                        && consts.iter().any(|ident| src.contains(ident))),
+                        && consts.iter().any(|ident| names_const(src, ident))),
                     "`{entry}` is allowlisted for `{consts:?}` but no longer names any \
                      of them; drop the entry rather than leaving a standing exemption"
                 );
