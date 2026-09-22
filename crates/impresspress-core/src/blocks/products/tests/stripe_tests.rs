@@ -16,7 +16,7 @@ use crate::{
     blocks::products::{
         contracts::{
             OfferDefinitionRequest, OfferSyncStatus, PaymentLinkCreateRequest,
-            PricingPreviewRequest,
+            PricingPreviewRequest, SubscriptionStatus,
         },
         offer_pricing, repo, stripe,
     },
@@ -7035,6 +7035,260 @@ async fn a_base_plan_item_contributes_no_addon_total() {
     assert_eq!(
         subscription.data["addon_r2_bytes"], 0,
         "an unmarked item must contribute nothing, so the totals write zeroes"
+    );
+}
+
+/// A `customer.subscription.updated` delivery with no `status` reports
+/// nothing about the lifecycle, so the platform row keeps the status it has
+/// while the plan the payload does carry is applied. Written as-is, the empty
+/// status ranks with the live statuses, so a newer statusless event would
+/// blank an active subscription's status to `""`.
+#[tokio::test]
+async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_statusless", "owner_statusless", "active").await;
+    seed_platform_subscription(
+        &ctx,
+        "sub_statusless_cancelled",
+        "owner_statusless_cancelled",
+        "cancelled",
+    )
+    .await;
+
+    let statusless = |event_id: &str, subscription_id: &str, created: i64, plan: &str| {
+        serde_json::json!({
+            "id": event_id,
+            "type": "customer.subscription.updated",
+            "created": created,
+            "livemode": false,
+            "data": {"object": {
+                "id": subscription_id,
+                "items": {"data": [{
+                    "quantity": 1,
+                    "metadata": {},
+                    "price": {"id": "price_plan", "lookup_key": plan, "metadata": {}}
+                }]}
+            }}
+        })
+    };
+    let deliver = |event: serde_json::Value| {
+        let ctx = &ctx;
+        async move {
+            let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+            let answer = output_to_json(stripe::handle_webhook(ctx, &msg, input).await).await;
+            assert_eq!(
+                answer["received"], true,
+                "{} was answered {answer}",
+                event["id"]
+            );
+        }
+    };
+    let row = |subscription_id: &'static str| {
+        let ctx = &ctx;
+        async move {
+            db::get(
+                ctx,
+                repo::subscriptions::SUBSCRIPTIONS_TABLE,
+                subscription_id,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    deliver(statusless(
+        "evt_statusless_newer",
+        "sub_statusless",
+        200,
+        "business",
+    ))
+    .await;
+    let subscription = row("sub_statusless").await;
+    assert_eq!(
+        subscription.data["status"], "active",
+        "an event without a status must not overwrite the stored one"
+    );
+    assert_eq!(subscription.data["plan"], "business");
+    assert_eq!(subscription.data["stripe_event_created"], 200);
+
+    // Guard (passes without the fix too): the ordering rule still refuses a
+    // strictly older statusless event, so it cannot put an old plan back.
+    deliver(statusless(
+        "evt_statusless_older",
+        "sub_statusless",
+        150,
+        "starter",
+    ))
+    .await;
+    let subscription = row("sub_statusless").await;
+    assert_eq!(subscription.data["plan"], "business");
+    assert_eq!(subscription.data["stripe_event_created"], 200);
+
+    // A statusless event on a terminal row restates the terminal status, so
+    // it applies and reaches the compare-and-swap on a `cancelled` row; the
+    // row keeps its stored spelling, which re-serialising the parsed status
+    // would change.
+    deliver(statusless(
+        "evt_statusless_cancelled",
+        "sub_statusless_cancelled",
+        200,
+        "business",
+    ))
+    .await;
+    assert_eq!(
+        row("sub_statusless_cancelled").await.data["status"],
+        "cancelled"
+    );
+}
+
+/// `customer.subscription.deleted` stores the platform row as `cancelled`,
+/// which parses as [`SubscriptionStatus::Canceled`]. A later
+/// `customer.subscription.updated` that restates `canceled` is allowed by the
+/// transition rules, and its compare-and-swap has to match the text the row
+/// holds. The re-serialised `canceled` never matches it, so every attempt
+/// would read as a concurrent change and the delivery would fail until it
+/// dead-lettered.
+#[tokio::test]
+async fn a_canceled_update_after_the_deletion_is_applied_not_retried() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_deleted_then_updated", "owner_deleted", "active").await;
+
+    let deleted = serde_json::json!({
+        "id": "evt_deleted_first",
+        "type": "customer.subscription.deleted",
+        "created": 200,
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_deleted_then_updated",
+            "status": "canceled",
+            "canceled_at": 200
+        }}
+    });
+    let (msg, input) = webhook_msg(&deleted, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+
+    // Immediate cancellation stamps both events with the same second.
+    let updated = serde_json::json!({
+        "id": "evt_updated_second",
+        "type": "customer.subscription.updated",
+        "created": 200,
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_deleted_then_updated",
+            "status": "canceled",
+            "items": {"data": [{
+                "quantity": 1,
+                "metadata": {},
+                "price": {"id": "price_plan", "lookup_key": "pro", "metadata": {}}
+            }]}
+        }}
+    });
+    let (msg, input) = webhook_msg(&updated, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true,
+        "a canceled restatement of a canceled row must not fail the delivery"
+    );
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_updated_second",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["status"], "processed");
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_deleted_then_updated",
+    )
+    .await
+    .unwrap();
+    // Either spelling is the terminal state; which one the explicit write
+    // leaves is not what this test is about.
+    assert_eq!(
+        serde_json::from_value::<SubscriptionStatus>(subscription.data["status"].clone()).unwrap(),
+        SubscriptionStatus::Canceled
+    );
+    assert_eq!(subscription.data["addon_r2_bytes"], 0);
+}
+
+/// `mark_past_due` compare-and-swaps on the parsed status re-serialised,
+/// which a row holding `cancelled` would never match — and it may, because
+/// `subscription_transition_allowed` refuses terminal -> `past_due` before
+/// the write, so such a row never reaches it. This guard (it passes whatever
+/// the CAS filter compares) pins that precondition: the delivery is answered
+/// and sealed, not retried into the dead-letter queue, and no grace window
+/// appears. Relaxing the terminal rule without moving the filter to the
+/// stored text would break it.
+#[tokio::test]
+async fn a_failed_invoice_on_a_cancelled_row_is_refused_not_dead_lettered() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(
+        &ctx,
+        "sub_failed_invoice",
+        "owner_failed_invoice",
+        "cancelled",
+    )
+    .await;
+
+    let payment_failed = serde_json::json!({
+        "id": "evt_failed_invoice_cancelled",
+        "type": "invoice.payment_failed",
+        "created": 400,
+        "livemode": false,
+        "data": {"object": {
+            "parent": {"subscription_details": {"subscription": "sub_failed_invoice"}}
+        }}
+    });
+    let (msg, input) = webhook_msg(&payment_failed, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_failed_invoice_cancelled",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_row.data["status"], "processed",
+        "a refused past-due write is not a failure to retry"
+    );
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_failed_invoice",
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription.data["status"], "cancelled");
+    assert_eq!(subscription.data["stripe_event_created"], 100);
+    assert!(
+        subscription.data["grace_period_end"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "a refused past-due write must not grant a fresh grace window"
     );
 }
 
