@@ -234,7 +234,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .summary("Update role API")
     .path_params(role_id_path_schema)
     .input(request_schema_of::<contracts::UpdateRoleRequest>)
-    .output(response_schema_of::<contracts::AdminRoleView>),
+    .output(response_schema_of::<contracts::AdminRoleUpdateResponse>),
     EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/admin/api/iam/roles/{id}",

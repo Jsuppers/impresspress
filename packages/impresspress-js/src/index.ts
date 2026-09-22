@@ -57,6 +57,7 @@ export type {
 export type {
   IAMRole,
   IAMRoleListResponse,
+  IAMRoleUpdateResponse,
   CreateRoleRequest,
   UpdateRoleRequest,
 } from './services/iam.service';

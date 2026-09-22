@@ -216,23 +216,37 @@ async fn admin_json_api_appears_in_openapi() {
         );
     }
 
-    // The three role writes publish the list's row projection, so a consumer
-    // reading one role from any of them can rely on one shape.
+    // The two role writes that answer with a role publish the list's row
+    // projection, so a consumer reading one role from any of them can rely on
+    // one shape. The update adds one optional field beside it: `warning`,
+    // present only when a rename's grants did not all follow it.
     let list_row = &doc["paths"]["/b/admin/api/iam/roles"]["get"]["responses"]["200"]["content"]
         ["application/json"]["schema"]["properties"]["records"]["items"];
-    for (path, method) in [
-        ("/b/admin/api/iam/roles", "post"),
-        ("/b/admin/api/iam/roles/{id}", "patch"),
+    for (path, method, extra) in [
+        ("/b/admin/api/iam/roles", "post", None),
+        ("/b/admin/api/iam/roles/{id}", "patch", Some("warning")),
     ] {
         let written = &doc["paths"][path][method]["responses"]["200"]["content"]
             ["application/json"]["schema"];
+        let mut properties = written["properties"].clone();
+        if let Some(extra) = extra {
+            assert!(
+                properties
+                    .as_object_mut()
+                    .expect("properties is an object")
+                    .remove(extra)
+                    .is_some(),
+                "{method} {path} must publish `{extra}`"
+            );
+        }
         assert_eq!(
-            written["properties"], list_row["properties"],
+            properties, list_row["properties"],
             "{method} {path} must publish the same row projection as the list"
         );
         assert_eq!(
             written["required"], list_row["required"],
-            "{method} {path} must publish the same row projection as the list"
+            "{method} {path} must publish the same row projection as the list, and \
+             nothing beside it that is required"
         );
     }
 }

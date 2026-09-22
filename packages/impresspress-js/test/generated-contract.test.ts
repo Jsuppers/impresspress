@@ -3,7 +3,11 @@ import type { paths } from "../src/generated/api";
 import type { AuthSessionUser, AuthTokens, SignUpResult } from "../src/services/auth.service";
 import type { Extension, ShareRecord } from "../src/services/extensions.service";
 import type { CloudStorageExtension } from "../src/services/extensions.service";
-import type { IAMRole, IAMRoleListResponse } from "../src/services/iam.service";
+import type {
+  IAMRole,
+  IAMRoleListResponse,
+  IAMRoleUpdateResponse,
+} from "../src/services/iam.service";
 import type {
   FileMetadataRecord,
   FileViewRecord,
@@ -59,6 +63,10 @@ type _RefreshFits = ServerFits<AuthTokens, Json200<"/b/auth/api/refresh", "post"
 type _ExtensionFits = ServerFits<Extension, Json200<"/b/admin/api/extensions", "get">[number]>;
 type _RoleListFits = ServerFits<IAMRoleListResponse, Json200<"/b/admin/api/iam/roles", "get">>;
 type _RoleFits = ServerFits<IAMRole, Json200<"/b/admin/api/iam/roles", "post">>;
+type _RoleUpdateFits = ServerFits<
+  IAMRoleUpdateResponse,
+  Json200<"/b/admin/api/iam/roles/{id}", "patch">
+>;
 
 // ── storage ───────────────────────────────────────────────────────────────
 type ObjectList = Json200<"/b/storage/api/buckets/{name}/objects", "get">;
@@ -106,6 +114,7 @@ describe("the SDK's exported types accept what the server publishes", () => {
       | _ExtensionFits
       | _RoleListFits
       | _RoleFits
+      | _RoleUpdateFits
       | _ObjectListFits
       | _ObjectInfoFits
       | _SearchRowFits
