@@ -780,6 +780,16 @@ mod test_support {
     /// `share::handle_direct_access` — run on this one fixture, so neither
     /// side can be tested against wiring the other never sees.
     pub(super) async fn share_ctx(bucket: &str, owner: &str) -> TestContext {
+        share_ctx_over(bucket, owner, Arc::new(InMemoryStorageService::new())).await
+    }
+
+    /// [`share_ctx`] over a caller-supplied object store, so a test can watch
+    /// which storage calls a handler makes.
+    pub(super) async fn share_ctx_over(
+        bucket: &str,
+        owner: &str,
+        storage: Arc<dyn wafer_core::interfaces::storage::service::StorageService>,
+    ) -> TestContext {
         let mut ctx = TestContext::with_files().await;
 
         let crypto_svc = Arc::new(
@@ -797,7 +807,7 @@ mod test_support {
         );
         ctx.register_block(
             "wafer-run/storage",
-            super::test_wrap::storage_block(Arc::new(InMemoryStorageService::new())),
+            super::test_wrap::storage_block(storage),
         );
 
         let data = crate::util::json_map(serde_json::json!({
@@ -811,6 +821,50 @@ mod test_support {
             .expect("seed bucket");
 
         ctx
+    }
+
+    /// The message the router hands the upload handler for
+    /// `POST /b/storage/api/buckets/{bucket}/objects?key={key}` with a raw
+    /// `content_type` body, sent by `uploader`.
+    pub(super) fn upload_msg(
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        uploader: &str,
+    ) -> Message {
+        let mut msg = routed(crate::test_support::auth_msg(
+            "create",
+            &format!("/b/storage/api/buckets/{bucket}/objects"),
+            uploader,
+        ));
+        msg.set_meta("req.query.key", key);
+        msg.set_meta("req.content_type", content_type);
+        msg
+    }
+
+    /// Store `bytes` at `bucket/key` the way a user does: through the real
+    /// upload handler, so the object has both its blob and the `complete`
+    /// row every other files handler reads.
+    pub(super) async fn upload(
+        ctx: &TestContext,
+        bucket: &str,
+        key: &str,
+        bytes: &[u8],
+        content_type: &str,
+        uploader: &str,
+    ) {
+        let out = super::storage::handle_upload_object(
+            ctx,
+            &upload_msg(bucket, key, content_type, uploader),
+            wafer_run::InputStream::from_bytes(bytes.to_vec()),
+        )
+        .await;
+        let resp = crate::test_support::output_json(out).await;
+        assert_eq!(
+            resp["uploaded"],
+            serde_json::json!(true),
+            "seeding {bucket}/{key} through the upload handler failed: {resp}"
+        );
     }
 
     // -----------------------------------------------------------------
