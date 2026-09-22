@@ -140,9 +140,33 @@ pub(super) async fn handle_update_role(
         data.insert("permissions".to_string(), serde_json::json!(permissions));
     }
     crate::util::stamp_updated(&mut data);
+    // The role row is written first, and on its own: `roles.name` is UNIQUE,
+    // so a rename onto a name another role holds is refused right here,
+    // before a single grant has moved or a single token been invalidated.
+    // The refusal is classified AFTER it happened, as `ops::create_role`
+    // classifies the same collision — see `crud::taken_key_or_db_error` for
+    // why a probe after the refused write closes the race a read beforehand
+    // would leave open.
     let record = match db::update(ctx, ROLES_TABLE, id, data).await {
         Ok(record) => record,
-        Err(e) => return crud::db_error(e, "Role not found", "Database error"),
+        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
+            return crud::db_error(e, "Role not found", "Database error")
+        }
+        Err(e) => match &rename_to {
+            Some(new_name) => {
+                return crud::taken_key_or_db_error(
+                    e,
+                    super::ops::role_name_taken(ctx, new_name),
+                    &format!(
+                        "A role named \"{new_name}\" already exists. Rename this role to \
+                         another name."
+                    ),
+                    "Database error",
+                )
+                .await
+            }
+            None => return crud::db_error(e, "Role not found", "Database error"),
+        },
     };
 
     if let Some(new_name) = rename_to {
@@ -171,6 +195,19 @@ pub(super) async fn handle_update_role(
 /// role they were granted. The auth-version bump is the same reasoning as
 /// `handle_assign_role`'s: the set of roles a live JWT was minted with has
 /// changed, so it must stop authenticating.
+///
+/// It runs only once the role row carries the new name, so a rename the
+/// unique index refuses never reaches it. A grant whose holder already has
+/// one naming the new value is merged by [`user_roles::rename_role`], not
+/// refused, so that is not a collision this has to foresee.
+///
+/// Not atomic. The role update and each grant's rewrite and bump are
+/// separate writes, and there is no transaction primitive to put them in: a
+/// failure part-way leaves the role under its new name, the grants before
+/// the failing one moved, and the rest still naming the old one. Repeating
+/// the same PATCH does not finish the job — the name no longer differs, so
+/// no cascade runs. Renaming the role back and then forward again does,
+/// since each rename carries every grant naming the name it leaves.
 async fn cascade_role_rename(
     ctx: &dyn Context,
     old_name: &str,
@@ -1537,5 +1574,73 @@ mod tests {
                 "the retry bumps {user}"
             );
         }
+    }
+
+    /// A rename onto a name another role holds is a **409**, and moves
+    /// nothing: no grant is rewritten and no holder's sessions are
+    /// invalidated.
+    ///
+    /// `roles.name` is UNIQUE, so the role update refuses it — as the create
+    /// path's insert refuses the same name, which `ops::create_role` already
+    /// answers 409. The update answered 500. The grant and auth-version
+    /// assertions are what a status check alone would not pin: they hold only
+    /// because the role row is written before the cascade, and fail on any
+    /// order that moves a grant first.
+    #[tokio::test]
+    async fn a_rename_onto_another_roles_name_is_a_conflict_that_moves_nothing() {
+        use crate::blocks::auth::repo::users;
+
+        let ctx = TestContext::with_auth().await;
+        let editor_id = define_role(&ctx, "editor").await;
+        define_role(&ctx, "author").await;
+        for (user, role) in [("u-1", "editor"), ("u-2", "author")] {
+            ctx.seed_auth_user(user).await;
+            output_json(
+                handle_assign_role(
+                    &ctx,
+                    &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                    body_input(serde_json::json!({"user_id": user, "role": role})),
+                )
+                .await,
+            )
+            .await;
+        }
+        let versions =
+            || futures::future::try_join_all(["u-1", "u-2"].map(|u| users::auth_version(&ctx, u)));
+        let before = versions().await.expect("auth versions");
+
+        let out = handle_update_role(
+            &ctx,
+            &update_role_msg(&editor_id),
+            body_input(serde_json::json!({"name": "author"})),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            409,
+            "a rename onto a taken role name is a conflict, not an internal error"
+        );
+
+        assert_eq!(
+            db::get(&ctx, ROLES_TABLE, &editor_id)
+                .await
+                .expect("role row")
+                .str_field("name"),
+            "editor"
+        );
+        for (role, holder) in [("editor", "u-1"), ("author", "u-2")] {
+            let holders: Vec<String> = user_roles::list_by_role(&ctx, role)
+                .await
+                .expect("list grants")
+                .into_iter()
+                .map(|g| g.user_id)
+                .collect();
+            assert_eq!(holders, vec![holder], "the {role} grants must be untouched");
+        }
+        assert_eq!(
+            versions().await.expect("auth versions"),
+            before,
+            "a refused rename must not invalidate anyone's sessions"
+        );
     }
 }
