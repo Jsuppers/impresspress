@@ -1019,9 +1019,81 @@ mod integration_tests {
         assert_eq!(status, ObjectStatus::Complete);
     }
 
+    /// One racer of [`race_two_uploads`]: its blob write is held until BOTH
+    /// racers are through their reservation — each has either reached its own
+    /// write or answered without one.
+    ///
+    /// Without the hold, the upload that claimed the key can store its bytes
+    /// and mark its row `Complete` before the other has finished reserving,
+    /// and the other then finds a stored object where it lost a race. Taking
+    /// that object over is a replacement, correctly answered 200 — the two
+    /// uploads ran one after the other, not against each other — so the race
+    /// under test would not have been run at all.
+    #[derive(Clone)]
+    struct WriteHeldUntilBothReserved {
+        inner: crate::test_support::RendezvousDbOpContext,
+        /// How many racers are through their reservation. Shared by both.
+        reserved: std::sync::Arc<tokio::sync::watch::Sender<usize>>,
+        /// Whether THIS racer has been counted in `reserved`. Shared by this
+        /// racer's clones only.
+        counted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl WriteHeldUntilBothReserved {
+        /// Count this racer as through its reservation, once.
+        fn through_reservation(&self) {
+            if !self.counted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.reserved.send_modify(|n| *n += 1);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::context::Context for WriteHeldUntilBothReserved {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+            if name == "wafer-run/storage" && msg.action() == wafer_block::ServiceOp::STORAGE_PUT {
+                self.through_reservation();
+                self.reserved
+                    .subscribe()
+                    .wait_for(|reserved| *reserved == 2)
+                    .await
+                    .expect("the racers hold the sender");
+            }
+            self.inner.call_block(name, msg, input).await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
+
     /// Two uploads of `assets/same.txt` that the database interleaves: both
     /// are held at the reservation's read until both have made it, so both
-    /// reserve on the same view of the key's row.
+    /// reserve on the same view of the key's row, and neither stores its
+    /// bytes until both are through the reservation
+    /// ([`WriteHeldUntilBothReserved`]).
     ///
     /// Each upload reads the row twice — once for the quota (a replacement is
     /// charged the difference) and once to reserve it — so each racer lets
@@ -1036,20 +1108,26 @@ mod integration_tests {
 
         let gated =
             RendezvousDbOpContext::new(ctx.clone(), "database.list", repo::objects::TABLE, 2);
+        let reserved = std::sync::Arc::new(tokio::sync::watch::Sender::new(0));
         let racers: Vec<_> = uploads
             .into_iter()
             .map(|(bytes, content_type)| {
-                let racer = gated.passing_first(1);
+                let racer = WriteHeldUntilBothReserved {
+                    inner: gated.passing_first(1),
+                    reserved: reserved.clone(),
+                    counted: std::sync::Arc::default(),
+                };
                 tokio::spawn(async move {
-                    output_http_status(
-                        handle_upload_object(
-                            &racer,
-                            &upload_msg("assets", "same.txt", content_type),
-                            InputStream::from_bytes(bytes.to_vec()),
-                        )
-                        .await,
+                    let out = handle_upload_object(
+                        &racer,
+                        &upload_msg("assets", "same.txt", content_type),
+                        InputStream::from_bytes(bytes.to_vec()),
                     )
-                    .await
+                    .await;
+                    // Answered without storing anything: through its
+                    // reservation all the same, so the rival may write.
+                    racer.through_reservation();
+                    output_http_status(out).await
                 })
             })
             .collect();

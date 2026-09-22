@@ -1017,12 +1017,23 @@ impl seed::SeedFetch for ArchiveFetch {
 /// The ordinary site-config variable the size tests grow.
 const NOTES_KEY: &str = "WAFER_RUN_SHARED__SHOP_NOTES";
 
-/// Replace the notes variable with one holding `len` bytes.
+/// Every timestamp the notes row is written with.
+const NOTES_WRITTEN_AT: &str = "2026-01-01T00:00:00.123456789+00:00";
+
+/// Replace the notes variable with one holding `len` bytes, and nothing else
+/// about the row different from the last one.
+///
+/// The row's `created_at` and `updated_at` are pinned because their width is
+/// not fixed: `now_rfc3339` (chrono's `to_rfc3339`) writes the fraction of a
+/// second with 9, 6, 3 or 0 digits as the instant does or does not fall on a
+/// whole microsecond, millisecond or second. Left to the clock, a notes row
+/// written one byte longer can serialize shorter than the last one, and the
+/// size these tests step to the byte is off by up to 20.
 async fn set_notes(ctx: &TestContext, len: usize) {
     variables::delete_by_key(ctx, NOTES_KEY)
         .await
         .expect("clear the notes");
-    variables::insert(
+    let row = variables::insert(
         ctx,
         variables::NewVariable {
             key: NOTES_KEY.to_string(),
@@ -1037,6 +1048,17 @@ async fn set_notes(ctx: &TestContext, len: usize) {
     )
     .await
     .expect("store the notes");
+    db::update(
+        ctx,
+        variables::TABLE,
+        &row.id,
+        HashMap::from([
+            ("created_at".to_string(), json!(NOTES_WRITTEN_AT)),
+            ("updated_at".to_string(), json!(NOTES_WRITTEN_AT)),
+        ]),
+    )
+    .await
+    .expect("pin the notes' timestamps");
 }
 
 /// The size `seed/data.json` has in an export of `ctx` right now.
