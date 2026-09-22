@@ -754,9 +754,9 @@ async fn a_workspace_full_of_unreachable_blobs_refuses_the_next_write() {
     .await;
     assert_eq!(output_http_status(out).await, 413);
 
-    // Collecting one blob's worth makes room again — the accounting the GC
-    // will drive is the same one the quota reads.
-    ws.record_blob_freed(paths::MAX_FILE_BYTES as u64);
+    // Collecting one blob's worth makes room again — the counters the
+    // collector resets are the ones the quota reads.
+    ws.reset_blob_totals(paths::MAX_WORKSPACE_BYTES - paths::MAX_FILE_BYTES as u64, 0);
     workspace::save(&ctx, &ws).await.expect("stage room");
     let out = dev_post(
         &ctx,
@@ -781,6 +781,17 @@ async fn a_write_of_already_stored_content_needs_no_headroom() {
         .await
         .expect("stage a full workspace");
 
+    // Anything new is refused. Asked first: the allowed write below publishes,
+    // and the collection that follows every activation resets the counters to
+    // what the store really holds — a few bytes, not the staged 64 MiB.
+    let out = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "site/c.html", "content": "<p>different</p>", "expected_sha256": null}),
+    )
+    .await;
+    assert_eq!(output_http_status(out).await, 413);
+
     // The same bytes at a second path: already stored, so allowed.
     let out = dev_post(
         &ctx,
@@ -801,15 +812,6 @@ async fn a_write_of_already_stored_content_needs_no_headroom() {
         .await["sha256"],
         serde_json::json!(sha)
     );
-
-    // Anything new is still refused.
-    let out = dev_post(
-        &ctx,
-        "/b/dev/api/files/write",
-        json!({"path": "site/c.html", "content": "<p>different</p>", "expected_sha256": null}),
-    )
-    .await;
-    assert_eq!(output_http_status(out).await, 413);
 }
 
 /// A hostile body must be refused from its encoded length, before it is

@@ -78,7 +78,8 @@
 //!
 //! A read paces behind a mutation instead of failing. The status poll pays the
 //! most for that: it runs on a fixed interval, so during a collector pass —
-//! which holds the lock across a loop of sequential deletes — a waiter accrues
+//! which holds the lock from its blob listing through a loop of sequential
+//! deletes — a waiter accrues
 //! per interval and `futures::lock::Mutex` is first-in-first-out, which would
 //! queue the user's next save behind all of them. That is why the page's poll
 //! now carries an in-flight guard (`assets/dev.js`): at most one status
@@ -283,9 +284,11 @@ pub async fn handle_write(
 
         // Store, then save. The other order would let a manifest name a blob
         // that was never written, and every later read of that path would be a
-        // 500. In this order a save that fails leaves an uncharged blob behind
-        // — the workspace under-counts its own store until the collector
-        // reconciles it, which costs headroom rather than correctness.
+        // 500. In this order a save that fails leaves a blob in the store that
+        // no counter includes — and a retry of the same write finds it stored
+        // and charges nothing either — so the quota under-counts the store
+        // until the next collection, which sets both counters from the store's
+        // own listing (`super::gc`) rather than from what was charged.
         match blobs::put_hashed(ctx, &sha, &bytes).await {
             // Charge the workspace only when the store actually grew.
             Ok(blobs::Stored::New) => ws.record_blob_stored(bytes.len() as u64),
@@ -818,8 +821,10 @@ mod tests {
                 would_be: paths::MAX_WORKSPACE_BYTES + 1
             })
         );
-        // Collecting one blob makes room again.
-        ws.record_blob_freed(paths::MAX_FILE_BYTES as u64);
+        // Collecting one blob makes room again: the collector resets the
+        // counters to what is left in the store.
+        let (bytes, count) = (ws.blob_bytes, ws.blob_count);
+        ws.reset_blob_totals(bytes - paths::MAX_FILE_BYTES as u64, count - 1);
         assert_eq!(
             check_quotas(&ws, "site/a.css", &WorkspaceArea::Site, 1),
             Ok(())

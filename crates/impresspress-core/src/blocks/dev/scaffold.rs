@@ -238,8 +238,10 @@ pub async fn handle_create(
     // the first one's blob in the store while the `record_blob_stored` that
     // charges for it is discarded with `ws`. `check_quotas` bounds on
     // `blob_bytes` precisely because a blob no entry names still occupies the
-    // author's storage, so each such refusal would open a permanent hole in
-    // the accounting, and a caller sitting on the limit could widen it past
+    // author's storage, so each such refusal would open a hole in the
+    // accounting that stays open until the next collection resets the
+    // counters from the store (`super::gc`) — and a `blocks/` write triggers
+    // no collection, so a caller sitting on the limit could widen it past
     // `MAX_WORKSPACE_BYTES` by retrying. `files::handle_write` cannot reach
     // this shape — it writes one file — and nothing forces the interleave
     // here: every size and hash is known before the first store.
@@ -288,15 +290,16 @@ pub async fn handle_create(
             Err(e) => {
                 // The blobs already written are charged for even though this
                 // request is over and no entry will ever name them. They are
-                // in the store, `blob_bytes` is defined as what has been
-                // written and not yet reclaimed, and the collector credits
-                // them back when it reaches them — a workspace saved without
-                // them would under-report storage for good.
+                // in the store, `blob_bytes` is what the store holds, and the
+                // next collection frees them and resets the counters from
+                // what is left — a workspace saved without them would
+                // under-report storage until then.
                 if let Err(save) = workspace::save(ctx, &ws).await {
                     tracing::error!(
                         error = %save,
                         "dev workspace: a blob write failed and the bytes already stored \
-                         could not be recorded — blob_bytes now under-reports the store"
+                         could not be recorded — blob_bytes under-reports the store until the \
+                         next collection"
                     );
                 }
                 return err_internal("dev workspace blob write", e);
