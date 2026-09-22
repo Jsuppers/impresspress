@@ -331,6 +331,53 @@ A deployment whose fee is currently unreadable has been taking **no** platform
 fee on connected-account sales; after this release those sales refuse until the
 value is corrected.
 
+### Products: every seller pays the current platform fee — check your sellers before upgrading
+
+**What changes.** A seller used to keep the platform application fee
+(`IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS`) that was in force the
+day they started Stripe onboarding. It was stored on their seller account and
+nothing ever changed it. A seller onboarded while the fee was `0` was the one
+exception: they were charged whatever the platform fee was at the time of each
+sale, while their seller pages showed `0.00%`. From this release there is one
+fee. Every seller's **new** Checkout Sessions and **newly created** Payment
+Links carry the current platform fee, and every seller page, the seller API and
+the admin seller pages show that same number. Per-seller rates are not
+supported.
+
+**Who is affected.** Sellers onboarded at a non-zero fee that differs from
+today's platform fee. They were charged their onboarding rate. After the
+upgrade they are charged the current rate. Sellers onboarded at `0`, or at
+exactly today's fee, are charged what they were charged before; only the fee
+their pages show changes.
+
+**What does not change.** Anything Stripe already holds keeps the fee it was
+created with. An existing Payment Link is reused as it is, because its fee is
+not part of what identifies it. An existing subscription renews with the
+`application_fee_percent` it was created with. Orders already placed are not
+touched.
+
+**Find the affected sellers before upgrading.** The stored per-seller fee is
+still in the table (it is no longer read), so this read-only query works from
+the admin SQL explorer on SQLite, Cloudflare D1 and PostgreSQL alike. Replace
+`500` with your current `SELLER_APPLICATION_FEE_BPS`:
+
+```sql
+SELECT id, user_id, status, fee_basis_points
+FROM impresspress__products__seller_accounts
+WHERE fee_basis_points <> 0
+  AND fee_basis_points <> 500
+ORDER BY fee_basis_points, user_id;
+```
+
+Every row returned is a seller whose new checkouts and new Payment Links will
+charge a different fee after the upgrade. `fee_basis_points` is the rate they
+pay today.
+
+**If you need to keep an old rate.** Set
+`IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS` to that rate before
+upgrading. It then applies to every seller, since there is no per-seller
+override. No migration is involved and no flag is needed.
+
 ### Products: `deleted_at` normalization (migration 020) — upgrade with `--run-migrations`
 
 Product deletion is a soft delete, and `deleted_at` now carries a strict

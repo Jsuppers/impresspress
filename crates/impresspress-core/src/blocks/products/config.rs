@@ -21,8 +21,8 @@
 use wafer_core::clients::config;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-/// Config key: the platform application fee, in basis points, applied to
-/// connected-account sales when the seller carries no fee of its own.
+/// Config key: the platform application fee, in basis points, that each new
+/// connected-account Checkout Session and Payment Link carries.
 /// Declared as a `ConfigVar` in [`super::config_vars`].
 pub(crate) const SELLER_APPLICATION_FEE_BPS: &str =
     "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS";
@@ -59,6 +59,14 @@ impl CountryCode {
 }
 
 /// The platform application fee in basis points.
+///
+/// The only fee there is: every seller's new Checkout Sessions and newly
+/// created Payment Links carry it, and every seller surface shows it
+/// (`SellerAccount::fee_basis_points` included). No seller carries a fee of
+/// its own. What Stripe already holds keeps the fee it was created with: a
+/// reused Payment Link (the fee is not part of its configuration hash) and
+/// the renewals of an existing subscription, whose `application_fee_percent`
+/// was set when it was created.
 ///
 /// An unset key is the `ConfigVar`'s `"0"` — a real, deliberate value. Any
 /// other value that is not 0..=10000 basis points is a `FailedPrecondition`,

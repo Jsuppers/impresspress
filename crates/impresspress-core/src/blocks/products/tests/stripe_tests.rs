@@ -7354,3 +7354,414 @@ async fn a_negative_addon_amount_or_quantity_fails_the_delivery() {
         );
     }
 }
+
+// ============================================================
+// The platform application fee: one fee, charged and shown alike
+// ============================================================
+
+/// A Stripe stand-in for a seller's whole selling life: Connect onboarding,
+/// the account refresh the seller API makes, a Checkout Session and a
+/// Payment Link. Each answer is picked by method and path, so the order the
+/// handlers call in is theirs to choose.
+#[derive(Clone, Default)]
+struct SellerLifecycleStripe {
+    requests: Arc<Mutex<Vec<Request>>>,
+    links_created: Arc<Mutex<usize>>,
+}
+
+const LIFECYCLE_ACCOUNT: &str = "acct_fee_lifecycle";
+
+fn lifecycle_account(active: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": LIFECYCLE_ACCOUNT,
+        "object": "account",
+        "country": "NZ",
+        "default_currency": "nzd",
+        "details_submitted": active,
+        "charges_enabled": active,
+        "payouts_enabled": active,
+        "controller": {"stripe_dashboard": {"type": "express"}},
+        "requirements": {"currently_due": []}
+    })
+}
+
+#[async_trait]
+impl NetworkService for SellerLifecycleStripe {
+    async fn do_request(&self, request: &Request) -> Result<Response, NetworkError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let path = request
+            .url
+            .strip_prefix("https://api.stripe.com")
+            .unwrap_or(&request.url);
+        let body = match (request.method.as_str(), path) {
+            ("POST", "/v1/accounts") => lifecycle_account(false),
+            ("GET", p) if p == format!("/v1/accounts/{LIFECYCLE_ACCOUNT}") => {
+                lifecycle_account(true)
+            }
+            ("POST", "/v1/account_links") => serde_json::json!({
+                "object": "account_link",
+                "url": "https://connect.stripe.com/setup/fee-lifecycle",
+                "expires_at": 1_900_000_000_i64
+            }),
+            ("POST", "/v1/checkout/sessions") => serde_json::json!({
+                "id": "cs_fee_lifecycle",
+                "url": "https://checkout.stripe.com/c/pay/cs_fee_lifecycle"
+            }),
+            ("POST", "/v1/payment_links") => {
+                let mut created = self.links_created.lock().unwrap();
+                *created += 1;
+                serde_json::json!({
+                    "id": format!("plink_fee_lifecycle_{created}"),
+                    "url": format!("https://buy.stripe.com/fee_lifecycle_{created}")
+                })
+            }
+            (method, path) => panic!("unexpected Stripe request {method} {path}"),
+        };
+        Ok(Response {
+            status_code: 200,
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&body).unwrap(),
+        })
+    }
+}
+
+/// The form bodies this lifecycle sent to `path`, in order.
+fn lifecycle_forms(stripe: &SellerLifecycleStripe, path: &str) -> Vec<String> {
+    stripe
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.url == format!("https://api.stripe.com{path}"))
+        .map(|request| String::from_utf8(request.body.clone().unwrap()).unwrap())
+        .collect()
+}
+
+/// Whether a Stripe form carries `application_fee_amount={fee_minor}`, or
+/// no fee at all when `fee_minor` is 0 (a zero fee is omitted, not sent).
+fn carries_fee(form: &str, fee_minor: i64) -> bool {
+    if fee_minor == 0 {
+        !form.contains("application_fee_amount")
+    } else {
+        form.contains(&format!("application_fee_amount={fee_minor}"))
+    }
+}
+
+/// Create a seller preset for `pages` and a Payment Link for it, through the
+/// seller routes. Returns the link and the preset id.
+async fn create_preset_link(
+    ctx: &crate::test_support::TestContext,
+    base: &str,
+    slug: &str,
+    pages: u32,
+) -> (serde_json::Value, serde_json::Value) {
+    let (msg, input) = create_msg(
+        &format!("{base}/presets"),
+        "seller_fee",
+        serde_json::json!({"name": slug, "slug": slug, "inputs": {"pages": pages}}),
+    );
+    let preset = output_to_json(dispatch(ctx, msg, input).await).await;
+    let (msg, input) = create_msg(
+        &format!("{base}/payment-links"),
+        "seller_fee",
+        serde_json::json!({"preset_id": preset["id"]}),
+    );
+    (
+        output_to_json(dispatch(ctx, msg, input).await).await,
+        preset["id"].clone(),
+    )
+}
+
+/// What a seller is charged and shown follows the platform fee, whatever it
+/// was when they onboarded — for everything created after the change.
+///
+/// Onboarding stamped the platform fee of that moment into the seller row and
+/// nothing ever changed it. Checkout and Payment Links read a stored 0 as
+/// "use the platform fee" and any other value as the seller's own, while
+/// every seller page printed the stored value. So a seller onboarded at 0 bps
+/// was SHOWN 0.00% and CHARGED the raised fee, and a seller onboarded at a
+/// higher fee was charged that fee forever. Both directions are driven here,
+/// through the real onboarding, checkout, Payment Link, seller API and page
+/// routes: a new Checkout Session, a newly created Payment Link, the API and
+/// every page must agree on the fee the platform sets now.
+///
+/// A Payment Link created BEFORE the change is reused as it is, with the fee
+/// it was created with: the fee is not part of its configuration hash. That
+/// is the boundary `config::seller_fee_bps` documents.
+#[tokio::test]
+async fn a_changed_platform_fee_is_what_every_seller_is_charged_and_shown() {
+    // (fee at onboarding, fee after the change, the old link's fee on 1100
+    // minor units, the new checkout's fee on 1100, the new link's fee on
+    // 1200, the percentage every page prints)
+    for (onboarded_at, now, old_link_fee, checkout_fee, new_link_fee, shown) in [
+        ("0", "500", 0, 55, 60, "5.00%"),
+        ("500", "200", 55, 22, 24, "2.00%"),
+    ] {
+        let mut ctx = ctx_with(&[
+            ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+            ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+            ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+            ("IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY", "NZ"),
+            (
+                "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS",
+                onboarded_at,
+            ),
+        ])
+        .await;
+        let stripe = SellerLifecycleStripe::default();
+        let block: Arc<dyn Block> = Arc::new(
+            wafer_core::service_blocks::network::NetworkBlock::new(Arc::new(stripe.clone())),
+        );
+        ctx.register_block("wafer-run/network", block);
+
+        let (msg, input) = create_msg(
+            "/b/products/api/seller/onboarding",
+            "seller_fee",
+            serde_json::json!({
+                "return_url": "https://shop.example/seller/stripe/return",
+                "refresh_url": "https://shop.example/seller/stripe/refresh"
+            }),
+        );
+        let onboarded = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(onboarded["account"]["stripe_account_id"], LIFECYCLE_ACCOUNT);
+
+        // The seller API refreshes the account from Stripe, which is what
+        // turns it active.
+        let (msg, input) = get_msg("/b/products/api/seller/account", "seller_fee");
+        let account = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(account["status"], "active", "onboarded at {onboarded_at}");
+
+        // A Payment Link created at the onboarding fee.
+        let offer_id = seed_active_offer(&ctx, "product_fee_lifecycle", "seller_fee").await;
+        let base = format!("/b/products/api/products/product_fee_lifecycle/offers/{offer_id}");
+        let (old_link, old_preset) = create_preset_link(&ctx, &base, "four-pages", 4).await;
+        assert_eq!(old_link["url"], "https://buy.stripe.com/fee_lifecycle_1");
+
+        // The platform changes its fee.
+        ctx.set_config("IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS", now);
+        let now_bps: u64 = now.parse().unwrap();
+
+        let (msg, input) = get_msg("/b/products/api/seller/account", "seller_fee");
+        let account = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(
+            account["fee_basis_points"], now_bps,
+            "the seller API publishes today's fee (onboarded at {onboarded_at})"
+        );
+
+        let (msg, input) = create_msg(
+            "/b/products/checkout",
+            "",
+            serde_json::json!({"offer_id": offer_id, "inputs": {"pages": 4}}),
+        );
+        let checkout = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(checkout["amounts"]["total_minor"], 1100);
+        assert_eq!(
+            checkout["amounts"]["platform_fee_minor"], checkout_fee,
+            "a new checkout charges today's fee (onboarded at {onboarded_at})"
+        );
+        let sessions = lifecycle_forms(&stripe, "/v1/checkout/sessions");
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0].contains(&format!(
+                "payment_intent_data[application_fee_amount]={checkout_fee}"
+            )),
+            "the Checkout Session carries today's fee (onboarded at {onboarded_at})"
+        );
+
+        // The link made before the change is reused, untouched.
+        let (msg, input) = create_msg(
+            &format!("{base}/payment-links"),
+            "seller_fee",
+            serde_json::json!({"preset_id": old_preset}),
+        );
+        let reused = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(
+            reused["url"], old_link["url"],
+            "the existing link is reused"
+        );
+
+        // A link created after the change carries the new fee.
+        let (new_link, _) = create_preset_link(&ctx, &base, "eight-pages", 8).await;
+        assert_eq!(new_link["url"], "https://buy.stripe.com/fee_lifecycle_2");
+
+        let links = lifecycle_forms(&stripe, "/v1/payment_links");
+        assert_eq!(links.len(), 2, "the reuse sends nothing to Stripe");
+        assert!(
+            carries_fee(&links[0], old_link_fee),
+            "the pre-change link keeps its fee {old_link_fee} (onboarded at {onboarded_at})"
+        );
+        assert!(
+            carries_fee(&links[1], new_link_fee),
+            "a new Payment Link carries today's fee (onboarded at {onboarded_at})"
+        );
+
+        let local = repo::seller_accounts::get_for_user(&ctx, "seller_fee")
+            .await
+            .unwrap()
+            .expect("seller row");
+        for (path, admin) in [
+            ("/b/products/".to_string(), false),
+            ("/b/products/selling".to_string(), false),
+            (format!("/b/products/admin/sellers/{}", local.id), true),
+        ] {
+            let (msg, input) = if admin {
+                admin_get_msg(&path)
+            } else {
+                get_msg(&path, "seller_fee")
+            };
+            let html = output_to_html(dispatch(&ctx, msg, input).await).await;
+            assert!(
+                html.contains(shown),
+                "{path} shows today's fee {shown} (onboarded at {onboarded_at})"
+            );
+        }
+    }
+}
+
+/// A typo in the fee setting leaves the admin seller pages — and the suspend
+/// control on the detail page — working, and shows the fee as misconfigured
+/// rather than as a number nobody set.
+///
+/// The fee is a platform setting, so reading it could fail both pages with a
+/// 500, and the detail page is where an operator suspends a seller: a config
+/// typo would have switched the fraud control off in the UI.
+#[tokio::test]
+async fn an_unreadable_fee_setting_leaves_the_admin_seller_pages_and_suspension_working() {
+    let ctx = ctx_with(&[
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+        ("IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS", "2.5%"),
+    ])
+    .await;
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_typo",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_typo")),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_typo"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+        ]),
+    )
+    .await;
+
+    let (msg, input) = admin_get_msg("/b/products/admin/sellers");
+    let list = output_to_html(dispatch(&ctx, msg, input).await).await;
+    assert!(list.contains("user_typo"), "the seller list renders");
+
+    let (msg, input) = admin_get_msg("/b/products/admin/sellers/seller_typo");
+    let detail = output_to_html(dispatch(&ctx, msg, input).await).await;
+    assert!(
+        detail.contains("data-seller-action=\"suspend\""),
+        "the suspend control renders"
+    );
+    assert!(
+        detail.contains("Misconfigured"),
+        "the fee is shown as misconfigured"
+    );
+
+    // The suspension itself lands; the answer that cannot carry a fee is a
+    // server fault (its logged label says the change is saved), not a 409.
+    let (msg, input) = admin_create_msg(
+        "/b/products/api/admin/sellers/seller_typo/suspend",
+        serde_json::json!({}),
+    );
+    assert_eq!(
+        crate::test_support::output_http_status(dispatch(&ctx, msg, input).await).await,
+        500,
+        "an unreadable fee setting is a server fault, not a 409 inviting a retry"
+    );
+    let row = db::get(&ctx, repo::seller_accounts::TABLE, "seller_typo")
+        .await
+        .unwrap();
+    assert_eq!(row.data["status"], "suspended", "the suspension is saved");
+}
+
+/// Checkout's seller lookup answers 400 only when the seller genuinely is not
+/// ready; a fault reading the seller is a 500.
+///
+/// Every `ready_for_user` error became 400 "this seller's Stripe account is
+/// not ready", so a database outage — or a seller row the block cannot
+/// decode — told the buyer the seller had not finished onboarding, and
+/// nothing reached the logs.
+#[tokio::test]
+async fn checkout_separates_a_seller_that_is_not_ready_from_a_failed_read() {
+    use crate::test_support::{output_http_status, FailingDbOpContext};
+
+    let ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+    ])
+    .await;
+    let seller = |status: &str| {
+        HashMap::from([
+            (
+                "user_id".to_string(),
+                serde_json::json!(format!("seller_{status}")),
+            ),
+            ("status".to_string(), serde_json::json!(status)),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!(format!("acct_{status}")),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(false)),
+        ])
+    };
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_restricted",
+        seller("restricted"),
+    )
+    .await;
+    // Not a `SellerStatus` spelling: the row exists and cannot be decoded.
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_dormant",
+        seller("dormant"),
+    )
+    .await;
+    let restricted = seed_active_offer(&ctx, "product_restricted", "seller_restricted").await;
+    let dormant = seed_active_offer(&ctx, "product_dormant", "seller_dormant").await;
+    let checkout = |offer_id: &str| {
+        create_msg(
+            "/b/products/checkout",
+            "",
+            serde_json::json!({"offer_id": offer_id, "inputs": {"pages": 4}}),
+        )
+    };
+
+    // Guard: a seller that cannot take charges yet is still the buyer's 400
+    // (passes before and after the fix).
+    let (msg, input) = checkout(&restricted);
+    assert_eq!(
+        output_http_status(dispatch(&ctx, msg, input).await).await,
+        400
+    );
+
+    let (msg, input) = checkout(&dormant);
+    assert_eq!(
+        output_http_status(dispatch(&ctx, msg, input).await).await,
+        500,
+        "an undecodable seller row is a server fault, not an unready seller"
+    );
+
+    let outage = FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.list", repo::seller_accounts::TABLE)],
+    );
+    let (msg, input) = checkout(&restricted);
+    assert_eq!(
+        output_http_status(dispatch(&outage, msg, input).await).await,
+        500,
+        "a seller read that failed is a server fault, not an unready seller"
+    );
+}

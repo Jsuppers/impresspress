@@ -203,7 +203,7 @@ async fn the_seller_listing_reports_that_it_is_a_prefix() {
     .await
     .expect("seed sellers");
 
-    let listed = repo::seller_accounts::list_contracts(&ctx)
+    let listed = repo::seller_accounts::list_rows(&ctx)
         .await
         .expect("sellers");
 
