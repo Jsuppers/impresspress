@@ -267,6 +267,10 @@ pub(crate) async fn update_status_plan(
     for _ in 0..3 {
         let current_created = current.i64_field("stripe_event_created");
         let current_status: SubscriptionStatus = enum_column(&current, "status")?;
+        // The CAS compares the stored text, not the parsed variant
+        // re-serialised: a row holding `cancelled` parses as `Canceled`,
+        // whose spelling would never match it.
+        let stored_status = current.data.get("status").cloned().unwrap_or_default();
         if !super::subscription_transition_allowed(
             current_status,
             current_created,
@@ -303,7 +307,7 @@ pub(crate) async fn update_status_plan(
                 Filter {
                     field: "status".into(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!(current_status),
+                    value: stored_status,
                 },
             ],
             data,

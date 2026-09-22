@@ -16,7 +16,7 @@ use crate::{
     blocks::products::{
         contracts::{
             OfferDefinitionRequest, OfferSyncStatus, PaymentLinkCreateRequest,
-            PricingPreviewRequest,
+            PricingPreviewRequest, SubscriptionStatus,
         },
         offer_pricing, repo, stripe,
     },
@@ -7036,6 +7036,86 @@ async fn a_base_plan_item_contributes_no_addon_total() {
         subscription.data["addon_r2_bytes"], 0,
         "an unmarked item must contribute nothing, so the totals write zeroes"
     );
+}
+
+/// `customer.subscription.deleted` stores the platform row as `cancelled`,
+/// which parses as [`SubscriptionStatus::Canceled`]. A later
+/// `customer.subscription.updated` that restates `canceled` is allowed by the
+/// transition rules, and its compare-and-swap has to match the text the row
+/// holds: comparing the re-serialised `canceled` never matched, every attempt
+/// read as a concurrent change, and the delivery failed until it
+/// dead-lettered.
+#[tokio::test]
+async fn a_canceled_update_after_the_deletion_is_applied_not_retried() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_deleted_then_updated", "owner_deleted", "active").await;
+
+    let deleted = serde_json::json!({
+        "id": "evt_deleted_first",
+        "type": "customer.subscription.deleted",
+        "created": 200,
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_deleted_then_updated",
+            "status": "canceled",
+            "canceled_at": 200
+        }}
+    });
+    let (msg, input) = webhook_msg(&deleted, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+
+    // Immediate cancellation stamps both events with the same second.
+    let updated = serde_json::json!({
+        "id": "evt_updated_second",
+        "type": "customer.subscription.updated",
+        "created": 200,
+        "livemode": false,
+        "data": {"object": {
+            "id": "sub_deleted_then_updated",
+            "status": "canceled",
+            "items": {"data": [{
+                "quantity": 1,
+                "metadata": {},
+                "price": {"id": "price_plan", "lookup_key": "pro", "metadata": {}}
+            }]}
+        }}
+    });
+    let (msg, input) = webhook_msg(&updated, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true,
+        "a canceled restatement of a canceled row must not fail the delivery"
+    );
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_updated_second",
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_row.data["status"], "processed");
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_deleted_then_updated",
+    )
+    .await
+    .unwrap();
+    // Either spelling is the terminal state; which one the explicit write
+    // leaves is not what this test is about.
+    assert_eq!(
+        serde_json::from_value::<SubscriptionStatus>(subscription.data["status"].clone()).unwrap(),
+        SubscriptionStatus::Canceled
+    );
+    assert_eq!(subscription.data["addon_r2_bytes"], 0);
 }
 
 /// The add-on totals are summed from payload numbers, so an amount or a
