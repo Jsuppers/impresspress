@@ -514,6 +514,14 @@ fn cached() -> Option<Rc<ReadyRuntime>> {
 }
 
 fn store(rt: Rc<ReadyRuntime>) {
+    // A rebuild is this isolate's one signal that the world may have moved:
+    // it follows a deploy, a migration run or any config-version bump
+    // (`force_bump_config_version` marks every other isolate dirty). Schema
+    // facts memoized from before it may describe a schema another isolate has
+    // since migrated, so they go with the old runtime. Within an isolate the
+    // shared `DbExec` paths invalidate per table as they mutate — see
+    // `database::D1DatabaseService::schema_cache`.
+    crate::database::forget_isolate_schema();
     // `IsolateCell::set` installs the new runtime BEFORE dropping the old
     // one. That matters here: the displaced `Rc<ReadyRuntime>` may be the
     // last handle to an entire Wafer, so its destructor is long enough to be

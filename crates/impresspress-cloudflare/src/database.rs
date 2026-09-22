@@ -24,8 +24,8 @@
 //! On D1 each is a *network* round-trip that dwarfs the data query. This
 //! adapter therefore opts into the two `DbExec` accessors #313 added:
 //!
-//! - [`schema_cache`](DbExec::schema_cache) returns a per-isolate
-//!   [`SchemaCache`], so a warm backend memoizes those introspection facts and
+//! - [`schema_cache`](DbExec::schema_cache) returns the isolate's
+//!   [`SchemaCache`], so a warm isolate memoizes those introspection facts and
 //!   issues zero introspection round-trips in steady state. The shared defaults
 //!   own invalidation (lazy `ALTER TABLE`, `exec_raw`/DDL) — D1's own
 //!   schema-*mutation* methods never run on the live path (schema is
@@ -45,19 +45,31 @@
 //!   `ORDER BY` with the table's primary key, which the executor reads with a
 //!   `pragma_table_info` the first time it lists that table
 //!   ([`DbExec::get_primary_key`]) and memoizes in the schema cache (plus one
-//!   table-exists probe for a table with no key). A warm isolate pays nothing;
-//!   a request-scoped handle (below) pays it once per table it lists sorted.
+//!   table-exists probe for a table with no key).
 //!
 //!   Seeding at construction is what covers the D1 services that never reach
 //!   an `Init`: the request-log drain's batch handle, built per request inside
 //!   `run_with_config` and used from `ctx.wait_until`, and the handle
 //!   `build_runtime` reads `block_settings` through before a runtime exists.
-//!   Each is discarded with the request, so its `SchemaCache` is always cold —
-//!   a drain-only site with strict off pays one `pragma_table_info` per insert
-//!   batch forever, which is the cost this seeding removes.
+//!   Neither is ever handed to `set_strict_schema`, so without the seeding a
+//!   drain-only site would run the lazy column-add path on every insert batch,
+//!   whatever the deploy configured.
+//!
+//! The cache is the **isolate's**, not the service's ([`isolate_schema_cache`]),
+//! and that is what makes the memoization worth anything: every D1 service is
+//! built per request (`warm_request_services`, the request-log drain handle,
+//! `build_runtime`'s pre-`Init` `block_settings` read), and every request runs
+//! `D1ConfigSource::snapshot`, a paged `list` over the variables table. A
+//! per-service cache would be cold for each of them, so each request would pay
+//! the key round trip. What may invalidate the cache is enumerated on
+//! [`D1DatabaseService::schema_cache`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
+use impresspress_core::IsolateCell;
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
@@ -73,15 +85,63 @@ use wafer_sql_utils::{introspect, Backend};
 use wasm_bindgen::JsValue;
 use worker::*;
 
+thread_local! {
+    /// The isolate's one [`SchemaCache`], shared by every
+    /// [`D1DatabaseService`] built in it (see [`isolate_schema_cache`]).
+    ///
+    /// An [`IsolateCell`], never a `RefCell`: this is isolate-lifetime state
+    /// on the request path, and a request hard-stopped inside a borrow would
+    /// strand the flag for the life of the isolate. The worst a hard stop can
+    /// do here is drop the cache, which is a cold isolate — a state every
+    /// caller already handles.
+    static ISOLATE_SCHEMA_CACHE: IsolateCell<Rc<SchemaCache>> = const { IsolateCell::new() };
+}
+
+/// The isolate's schema cache, created on first use.
+///
+/// Scoped to the isolate rather than to one service because the services are
+/// per *request*: `warm_request_services` builds a fresh `D1DatabaseService`
+/// (and so a fresh `KvCachedD1DatabaseService` and `D1ConfigSource`) for every
+/// request it serves. A per-service cache is therefore always cold, and
+/// `D1ConfigSource::snapshot` — which every request runs — issues a paged
+/// `list` over the variables table, so each request would pay a
+/// `pragma_table_info` round trip for the primary key before its select. One
+/// cache per isolate is what makes the introspection amortize, and it is the
+/// same argument the browser backend's cache is a static for: the facts
+/// describe the database, not the handle.
+///
+/// What may invalidate it is enumerated on [`D1DatabaseService::schema_cache`].
+pub(crate) fn isolate_schema_cache() -> Rc<SchemaCache> {
+    ISOLATE_SCHEMA_CACHE.with(|cell| {
+        if let Some(cache) = cell.get() {
+            return cache;
+        }
+        let cache = Rc::new(SchemaCache::new());
+        cell.set(Rc::clone(&cache));
+        cache
+    })
+}
+
+/// Drop the isolate's schema cache.
+///
+/// Called when this isolate installs a (re)built runtime — the event that
+/// follows a deploy, a migration run or any config-version bump, and so the
+/// one point at which a schema change made by *another* isolate can be
+/// assumed to have reached this one. Within an isolate the shared `DbExec`
+/// paths invalidate per table as they mutate; see
+/// [`D1DatabaseService::schema_cache`].
+pub(crate) fn forget_isolate_schema() {
+    ISOLATE_SCHEMA_CACHE.with(IsolateCell::clear);
+}
+
 /// Async database service wrapping Cloudflare D1.
 pub struct D1DatabaseService {
     db: D1Database,
-    /// Memoized table-exists / column-list / primary-key facts (see
-    /// [`SchemaCache`]). Consulted by the shared executor before introspection
-    /// and invalidated by it on every schema mutation. While `strict_schema`
-    /// is set only the primary key a sorted or paged `list` orders by is
-    /// looked up, so that is all the cache holds then.
-    schema_cache: SchemaCache,
+    /// The isolate's memoized table-exists / column-list / primary-key facts
+    /// (see [`isolate_schema_cache`]). An `Rc`, not an owned cache: every
+    /// service in the isolate addresses the same D1 database, and each of
+    /// them is built per request.
+    schema_cache: Rc<SchemaCache>,
     /// STRICT_SCHEMA flag. Seeded at construction from the deploy's
     /// `WAFER_RUN__DATABASE__STRICT_SCHEMA` var, and re-applied at lifecycle
     /// `Init` via [`DatabaseService::set_strict_schema`] for the one service a
@@ -111,7 +171,7 @@ impl D1DatabaseService {
     pub fn new(db: D1Database, strict_schema: bool) -> Self {
         Self {
             db,
-            schema_cache: SchemaCache::new(),
+            schema_cache: isolate_schema_cache(),
             strict_schema: AtomicBool::new(strict_schema),
         }
     }
@@ -247,10 +307,12 @@ fn prepare_batch_rows(
 // SAFETY: `D1DatabaseService` holds a `D1Database` handle scoped to a single
 // Worker isolate. wasm32-unknown-unknown has no threads, so the
 // `Send`/`Sync` bounds required by `Arc<dyn DatabaseService>` are satisfied
-// trivially — no cross-thread aliasing or data races can occur. The added
-// `schema_cache` (`parking_lot::RwLock`) and `strict_schema` (`AtomicBool`)
-// fields are themselves `Send + Sync`; the `unsafe impl` remains required
-// only because of the `!Send` `D1Database` handle.
+// trivially — no cross-thread aliasing or data races can occur. `strict_schema`
+// (`AtomicBool`) is `Send + Sync` on its own; `schema_cache` is an
+// `Rc<SchemaCache>`, which is not, and is sound here for the same reason the
+// `D1Database` handle is: the `Rc` and every clone of it live in the one
+// isolate that owns this thread-local cache. The `unsafe impl` is required by
+// both.
 unsafe impl Send for D1DatabaseService {}
 unsafe impl Sync for D1DatabaseService {}
 
@@ -263,6 +325,28 @@ unsafe impl Sync for D1DatabaseService {}
 impl DbExec for D1DatabaseService {
     const BACKEND: Backend = Backend::Sqlite;
 
+    /// The isolate's cache (see [`isolate_schema_cache`]).
+    ///
+    /// Every D1 schema change invalidates what it touches, which is what
+    /// makes an isolate-lifetime cache sound here:
+    ///
+    /// - **Migrations** (`migration_helper` → the `database.ddl` host op) and
+    ///   the admin SQL explorer's writes reach `DatabaseService::exec_raw`,
+    ///   and the shared [`DbExec::exec_raw`] clears the whole cache after a
+    ///   statement it cannot attribute to a table.
+    /// - **The lazy column-add** (`DbExec::add_column_checked`, non-strict
+    ///   mode only) invalidates the table it alters.
+    /// - **`ensure_schema_table`, `schema_add_column`, `schema_drop_table`**
+    ///   are refused on D1 (see their impls below): the schema is
+    ///   migration-owned, so a block cannot mutate it around the two paths
+    ///   above. Every DDL this repo issues goes through one of them — the
+    ///   `database.ddl` host op and `migration_helper::apply_ddl_via_service`
+    ///   both end at `exec_raw`, and the dev block issues no DDL at all.
+    /// - **Another isolate's migration** is outside this cache's reach. The
+    ///   deploy that runs it bumps the KV config-version stamp
+    ///   (`force_bump_config_version`), so every other isolate rebuilds its
+    ///   runtime on its next probe, and that rebuild calls
+    ///   [`forget_isolate_schema`].
     fn schema_cache(&self) -> Option<&SchemaCache> {
         Some(&self.schema_cache)
     }
@@ -854,6 +938,58 @@ mod tests {
     /// `conformance.rs`.
     fn never_queried_handle() -> D1Database {
         wasm_bindgen::JsCast::unchecked_into::<D1Database>(JsValue::undefined())
+    }
+
+    /// **Fails with a per-service cache**: every D1 service in an isolate has
+    /// to answer with the same cache, because each of them is built per
+    /// request (`warm_request_services`) over the same database, and
+    /// `D1ConfigSource::snapshot`'s paged `list` would otherwise pay a
+    /// primary-key round trip on every request.
+    #[wasm_bindgen_test]
+    fn every_d1_service_in_an_isolate_shares_one_schema_cache() {
+        forget_isolate_schema();
+        let request_one = D1DatabaseService::new(never_queried_handle(), true);
+        let request_two = D1DatabaseService::new(never_queried_handle(), true);
+        let cache = DbExec::schema_cache(&request_one).expect("the D1 backend keeps a cache");
+        let other = DbExec::schema_cache(&request_two).expect("so does every other handle");
+        assert!(std::ptr::eq(cache, other), "one isolate, one cache");
+
+        cache.set_primary_key_if_gen("shared_t", vec!["id".into()], cache.generation());
+        assert_eq!(
+            other.primary_key("shared_t"),
+            Some(vec!["id".to_string()]),
+            "a key one request learned is served to the next"
+        );
+    }
+
+    /// The cache outlives a request but not a runtime rebuild: that rebuild is
+    /// what follows a deploy or a migration run in another isolate, and
+    /// `runtime_cache::store` calls this.
+    #[wasm_bindgen_test]
+    fn a_rebuild_forgets_what_the_isolate_had_memoized() {
+        forget_isolate_schema();
+        let before = D1DatabaseService::new(never_queried_handle(), true);
+        let cache = DbExec::schema_cache(&before).expect("a cache");
+        cache.set_primary_key_if_gen("rebuilt_t", vec!["id".into()], cache.generation());
+        let next_request = D1DatabaseService::new(never_queried_handle(), true);
+        assert_eq!(
+            DbExec::schema_cache(&next_request)
+                .expect("a cache")
+                .primary_key("rebuilt_t"),
+            Some(vec!["id".to_string()]),
+            "the memoized key outlives the request that learned it"
+        );
+
+        forget_isolate_schema();
+
+        let after = D1DatabaseService::new(never_queried_handle(), true);
+        assert_eq!(
+            DbExec::schema_cache(&after)
+                .expect("a cache")
+                .primary_key("rebuilt_t"),
+            None,
+            "a rebuilt isolate re-introspects rather than trusting the old schema"
+        );
     }
 
     /// The verdict a D1 service is *born* with is the one the executor reads.
