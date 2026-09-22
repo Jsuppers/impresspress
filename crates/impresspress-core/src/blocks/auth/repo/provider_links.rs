@@ -9,13 +9,11 @@
 //! access token is a live bearer credential for the user's account at that
 //! provider, the sign-in flow is done with it once the profile is fetched,
 //! and nothing reads it back — so storing it would only leave a credential
-//! wherever this table can be read. [`upsert`] writes the column empty,
-//! which also clears a token an older row still holds. The column itself
-//! stays, `NOT NULL` as migration 001 declares it: dropping it takes an auth
-//! migration, auth migrations re-run in full whenever the block's SQL
-//! changes, and migration 012 drops the sessions table on every such run
-//! (see its header), so that is a change to make deliberately, not alongside
-//! this one.
+//! wherever this table can be read. [`upsert`] writes the column empty, and
+//! auth migration `014_clear_provider_access_tokens` empties the rows written
+//! before it did. The column itself stays, `NOT NULL` as migration 001
+//! declares it: SQLite cannot guard a `DROP COLUMN` with `IF EXISTS`, and auth
+//! migrations re-run in full whenever the block's SQL changes.
 
 use std::collections::HashMap;
 
@@ -62,7 +60,7 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, WaferError> 
 }
 
 /// Insert a link row, or update `user_id`, `provider_login`, `linked_at` in
-/// place (and empty `access_token` — see the module doc) when a row with the
+/// place (and empty `access_token`, see the module doc) when a row with the
 /// same `(provider, provider_ref)` already exists. Manual two-step (list → update_by_filters or create) since
 /// `db::*` has no two-key upsert primitive.
 pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferError> {
@@ -148,13 +146,9 @@ pub async fn find_by_provider_ref(
 /// Return all OAuth provider links owned by `user_id`, ordered by
 /// `linked_at` ASC for stable rendering on the security page.
 ///
-/// Uses the typed `db::list` client (not raw SQL) because this is the
-/// only entry point in this module called cross-block — userportal's
-/// `/b/userportal/security` page reads it. Raw SQL is admin-only under
-/// WRAP, so the cross-block call must go through the namespaced path.
-/// The auth-internal lookup (`find_by_provider_ref`) remains on raw SQL
-/// because it's called only by auth itself (the resource owner —
-/// own-resource access is always permitted, regardless of typed-vs-raw).
+/// Reads through the typed database client (via `db_read`), not raw SQL:
+/// userportal's `/b/userportal/security` page calls it cross-block, and raw
+/// SQL is admin-only under WRAP.
 pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,

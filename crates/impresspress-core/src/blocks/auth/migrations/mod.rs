@@ -46,6 +46,9 @@ const SQL_012_POSTGRES: &str = include_str!("012_sessions_family.postgres.sql");
 const SQL_013_SQLITE: &str = include_str!("013_email_proof.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_013_POSTGRES: &str = include_str!("013_email_proof.postgres.sql");
+const SQL_014_SQLITE: &str = include_str!("014_clear_provider_access_tokens.sqlite.sql");
+#[cfg(feature = "postgres")]
+const SQL_014_POSTGRES: &str = include_str!("014_clear_provider_access_tokens.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle(Init)` apply path (auth's `init`).
@@ -64,6 +67,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("011_rate_limit_retention", SQL_011_SQLITE),
     ("012_sessions_family", SQL_012_SQLITE),
     ("013_email_proof", SQL_013_SQLITE),
+    ("014_clear_provider_access_tokens", SQL_014_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`] one
@@ -85,6 +89,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_011_POSTGRES,
     SQL_012_POSTGRES,
     SQL_013_POSTGRES,
+    SQL_014_POSTGRES,
 ];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
@@ -266,5 +271,106 @@ mod strict_upgrade_tests {
         db.create("wafer_run__auth__sessions", sess)
             .await
             .expect("strict-mode create on sessions must succeed after 010");
+    }
+}
+
+#[cfg(test)]
+mod provider_token_clearing_tests {
+    //! `014_clear_provider_access_tokens` on the path a live database takes:
+    //! link rows already holding provider tokens, then the upgrade re-runs
+    //! every auth migration because the SQL hash changed.
+
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use wafer_block_sqlite::service::SQLiteDatabaseService;
+    use wafer_core::interfaces::database::service::DatabaseService;
+
+    use super::SQLITE_MIGRATIONS;
+    use crate::migration_helper::apply_ddl_via_service;
+
+    fn migrations_before_014() -> Vec<&'static str> {
+        SQLITE_MIGRATIONS
+            .iter()
+            .take_while(|(name, _)| *name != "014_clear_provider_access_tokens")
+            .map(|(_, sql)| *sql)
+            .collect()
+    }
+
+    fn all_migrations() -> Vec<&'static str> {
+        SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect()
+    }
+
+    async fn stored_tokens(db: &Arc<dyn DatabaseService>) -> Vec<String> {
+        db.query_raw(
+            "SELECT access_token FROM wafer_run__auth__provider_links ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("read link rows")
+        .iter()
+        .map(|r| {
+            r.data
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .expect("access_token is a string")
+                .to_string()
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_clears_stored_provider_tokens_and_re_runs_cleanly() {
+        let db: Arc<dyn DatabaseService> =
+            Arc::new(SQLiteDatabaseService::open_in_memory().unwrap());
+        let before = migrations_before_014();
+        assert_eq!(
+            before.len() + 1,
+            SQLITE_MIGRATIONS.len(),
+            "precondition: 014 is in the list, and last"
+        );
+        apply_ddl_via_service(&db, &before)
+            .await
+            .expect("apply the pre-014 schema");
+
+        db.exec_raw(
+            "INSERT INTO wafer_run__auth__users \
+             (id, email, display_name, role, created_at, updated_at) \
+             VALUES ('u1', 'u1@example.com', 'U1', 'user', \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            &[],
+        )
+        .await
+        .expect("seed user");
+        for (id, provider, token) in [
+            ("l1", "google", "ya29.live-google-token"),
+            ("l2", "github", "gho_live_github_token"),
+        ] {
+            db.exec_raw(
+                "INSERT INTO wafer_run__auth__provider_links \
+                 (id, provider, provider_ref, user_id, provider_login, access_token, linked_at) \
+                 VALUES (?, ?, ?, 'u1', 'u1', ?, '2026-01-01T00:00:00Z')",
+                &[json!(id), json!(provider), json!(id), json!(token)],
+            )
+            .await
+            .expect("seed a link row holding a token");
+        }
+        assert_eq!(
+            stored_tokens(&db).await,
+            vec!["ya29.live-google-token", "gho_live_github_token"],
+            "precondition: the rows hold tokens"
+        );
+
+        // The upgrade: the hash changed, so every auth migration runs again.
+        apply_ddl_via_service(&db, &all_migrations())
+            .await
+            .expect("the upgrade re-run succeeds");
+        assert_eq!(stored_tokens(&db).await, vec!["", ""]);
+
+        // And the next hash change re-runs it again without failing.
+        apply_ddl_via_service(&db, &all_migrations())
+            .await
+            .expect("a second re-run succeeds");
+        assert_eq!(stored_tokens(&db).await, vec!["", ""]);
     }
 }
