@@ -1390,7 +1390,7 @@ mod test_support {
 
     /// Wraps `inner` and, just before the `nth` read of the grants table
     /// (`database.list` on `user_roles::TABLE`) goes through, assigns `role`
-    /// to `user` on the unwrapped fixture: an assign landing while a role
+    /// to each of `users` on the unwrapped fixture: an assign landing while a role
     /// delete is in flight. With `nth = 2` it lands after the delete's first
     /// revocation pass has read and revoked, so only the pass after the role
     /// row is gone can see it — the grant [`super::ops::RoleDeleted`]'s
@@ -1403,7 +1403,7 @@ mod test_support {
         inner: crate::test_support::FailingDbOpContext,
         fixture: crate::test_support::TestContext,
         nth: usize,
-        user: &'static str,
+        users: &'static [&'static str],
         role: &'static str,
         reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1413,14 +1413,14 @@ mod test_support {
             fixture: crate::test_support::TestContext,
             inner: crate::test_support::FailingDbOpContext,
             nth: usize,
-            user: &'static str,
+            users: &'static [&'static str],
             role: &'static str,
         ) -> Self {
             Self {
                 inner,
                 fixture,
                 nth,
-                user,
+                users,
                 role,
                 reads: std::sync::Arc::default(),
             }
@@ -1458,9 +1458,11 @@ mod test_support {
             if collection == user_roles::TABLE
                 && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth
             {
-                user_roles::assign(&self.fixture, self.user, self.role, "")
-                    .await
-                    .expect("the in-flight assign lands");
+                for user in self.users {
+                    user_roles::assign(&self.fixture, user, self.role, "")
+                        .await
+                        .expect("the in-flight assign lands");
+                }
             }
             self.inner
                 .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
@@ -1945,10 +1947,10 @@ mod table_tests {
 /// the network rows' `data-detail-url`) against the table of the block that
 /// owns it, with the method the attribute implies.
 #[cfg(test)]
-mod htmx_contract_tests;
+pub(crate) mod htmx_contract_tests;
 
 #[cfg(test)]
-mod page_link_tests {
+pub(crate) mod page_link_tests {
     use std::collections::BTreeSet;
 
     use wafer_core::clients::database as db;
@@ -2001,11 +2003,11 @@ mod page_link_tests {
         out
     }
 
-    pub(super) struct Seeds {
-        pub(super) user_id: String,
-        pub(super) role_id: String,
-        pub(super) key_id: String,
-        pub(super) grant_id: String,
+    pub(crate) struct Seeds {
+        pub(crate) user_id: String,
+        pub(crate) role_id: String,
+        pub(crate) key_id: String,
+        pub(crate) grant_id: String,
     }
 
     const PROBE_BLOCK: &str = "impresspress/probe";
@@ -2039,11 +2041,11 @@ mod page_link_tests {
     const ADMIN_PREFIX: &str = "/b/admin/";
     const AUTH_UI_PREFIX: &str = "/b/auth/";
 
-    /// One row behind every per-record control the pages render: a user
-    /// (enable/disable/delete), a custom role (delete), an active API key
+    /// One row behind every per-record control the pages render: an enabled
+    /// user (disable/delete) and a disabled one (enable), a custom role (delete), an active API key
     /// (revoke), a variable (edit, delete), a WRAP grant (delete), a request-log
     /// row (network detail) and a Feature block (detail, toggle).
-    pub(super) async fn seeded_ctx() -> (TestContext, Seeds) {
+    pub(crate) async fn seeded_ctx() -> (TestContext, Seeds) {
         // Crypto as well: the API-keys tab's Create form mints a key, and
         // `htmx_contract_tests` submits it.
         let mut ctx = TestContext::with_auth_and_crypto().await;
@@ -2064,6 +2066,24 @@ mod page_link_tests {
         )
         .await
         .expect("seed user");
+        // A second, DISABLED user, so the users tab renders the Enable
+        // control as well as Disable.
+        let disabled = users::insert(
+            &ctx,
+            users::NewUser {
+                email: "disabled@example.com".into(),
+                display_name: "Disabled".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed disabled user");
+        users::set_disabled(&ctx, &disabled.id, true)
+            .await
+            .expect("disable the second user");
         let key = api_keys::insert(
             &ctx,
             api_keys::NewApiKey {
@@ -2232,7 +2252,7 @@ mod page_link_tests {
     }
 
     /// `(action, path, query parameters)` of one page render.
-    pub(super) type Page = (
+    pub(crate) type Page = (
         &'static str,
         &'static str,
         &'static [(&'static str, &'static str)],
@@ -2240,7 +2260,7 @@ mod page_link_tests {
 
     /// Every page and fragment the block serves as HTML, with the query
     /// parameters that select each tab.
-    pub(super) const PAGES: &[Page] = &[
+    pub(crate) const PAGES: &[Page] = &[
         ("retrieve", "/b/admin/", &[]),
         ("retrieve", "/b/admin/users", &[]),
         ("retrieve", "/b/admin/users", &[("tab", "roles")]),

@@ -368,9 +368,8 @@ fn late_pass_warning(deleted: &ops::RoleDeleted) -> Option<String> {
             holders.join(", ")
         ),
         ops::RoleDeleted::LateSessionsNotInvalidated { holders } => format!(
-            "Role deleted and every grant of it revoked, but the sessions of user(s) {} could \
-             not be invalidated: a token they already hold may carry the role until it \
-             expires.",
+            "Role deleted and every grant of it revoked, but the sessions of user(s) {} were \
+             not invalidated: a token they already hold may carry the role until it expires.",
             holders.join(", ")
         ),
     };
@@ -702,7 +701,7 @@ mod tests {
             )
             .after_passing(1),
             2,
-            "u-late",
+            &["u-late"],
             "editor",
         );
         let msg = crate::blocks::admin::test_support::routed(admin_msg(

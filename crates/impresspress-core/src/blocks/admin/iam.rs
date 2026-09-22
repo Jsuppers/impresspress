@@ -1922,17 +1922,18 @@ mod tests {
         );
     }
 
-    /// Two holders, `u-1` granted before the delete and `u-late` granted
-    /// while it is in flight, and a role delete driven over `wrap` — the
-    /// context that lands `u-late`'s grant between the two revocation passes.
+    /// `u-1` granted before the delete and `late` granted while it is in
+    /// flight, and a role delete driven over `wrap` — the context that lands
+    /// the `late` grants between the two revocation passes.
     async fn delete_with_an_in_flight_assign(
+        late: &'static [&'static str],
         wrap: impl FnOnce(TestContext) -> crate::test_support::FailingDbOpContext,
     ) -> (TestContext, String, super::super::ops::RoleDeleted) {
         use super::super::test_support::AssignBeforeGrantRead;
 
         let ctx = TestContext::with_auth().await;
         let role_id = define_role(&ctx, "editor").await;
-        for user in ["u-1", "u-late"] {
+        for user in std::iter::once(&"u-1").chain(late) {
             ctx.seed_auth_user(user).await;
         }
         output_json(
@@ -1945,8 +1946,7 @@ mod tests {
         )
         .await;
 
-        let racing =
-            AssignBeforeGrantRead::new(ctx.clone(), wrap(ctx.clone()), 2, "u-late", "editor");
+        let racing = AssignBeforeGrantRead::new(ctx.clone(), wrap(ctx.clone()), 2, late, "editor");
         let deleted = super::super::ops::delete_role(
             &racing,
             &routed(admin_msg(
@@ -1976,7 +1976,7 @@ mod tests {
     async fn a_late_grant_the_delete_could_not_revoke_is_reported_with_its_holder() {
         use crate::test_support::FailingDbOpContext;
 
-        let (ctx, role_id, deleted) = delete_with_an_in_flight_assign(|ctx| {
+        let (ctx, role_id, deleted) = delete_with_an_in_flight_assign(&["u-late"], |ctx| {
             FailingDbOpContext::new(
                 ctx,
                 vec![("database.delete_where_count", user_roles::TABLE)],
@@ -2025,14 +2025,17 @@ mod tests {
         );
     }
 
-    /// When the late pass revokes the in-flight grant and then fails to
-    /// invalidate its holder's sessions, no grant is left: the outcome says
-    /// so, rather than warning about a grant that is gone, and names whose
-    /// sessions were not invalidated.
+    /// When the late pass revokes the in-flight grants and then fails to
+    /// invalidate a holder's sessions, no grant is left: the outcome says so,
+    /// rather than warning about a grant that is gone, and names only the
+    /// holders whose sessions were not invalidated. The pass stops at the
+    /// first failure, so the holder before it WAS invalidated and is not
+    /// named.
     ///
-    /// Bumps run before and after each pass's revoke: `u-1`'s two in the
-    /// first pass, then `u-late`'s before the late revoke, pass. The fourth,
-    /// `u-late`'s after it, fails.
+    /// Bumps run before and after each pass's revoke. The first pass bumps
+    /// `u-1` twice; the late pass bumps `u-late-a` and `u-late-b` before its
+    /// revoke, then `u-late-a` after it — five that pass. The sixth,
+    /// `u-late-b`'s after the revoke, fails.
     ///
     /// Names `users::TABLE` only to aim the fault injector;
     /// `tests/repo_door.rs` allowlists it as one.
@@ -2040,16 +2043,16 @@ mod tests {
     async fn a_late_pass_that_revoked_but_could_not_invalidate_names_the_sessions_left() {
         use crate::{blocks::auth::repo::users, test_support::FailingDbOpContext};
 
-        let (ctx, _, deleted) = delete_with_an_in_flight_assign(|ctx| {
+        let (ctx, _, deleted) = delete_with_an_in_flight_assign(&["u-late-a", "u-late-b"], |ctx| {
             FailingDbOpContext::new(ctx, vec![("database.increment_field_where", users::TABLE)])
-                .after_passing(3)
+                .after_passing(5)
         })
         .await;
 
         assert_eq!(
             deleted,
             super::super::ops::RoleDeleted::LateSessionsNotInvalidated {
-                holders: vec!["u-late".to_string()],
+                holders: vec!["u-late-b".to_string()],
             }
         );
         assert!(
