@@ -347,12 +347,13 @@ pub async fn summarise_by_path(
             method: r.data.str_field("method").to_string(),
             path: r.data.str_field("path").to_string(),
             count: r.data.i64_field("cnt"),
-            // `db::aggregate`'s Avg has no result-cast, so AVG(duration_ms)
-            // comes back as a JSON float; `as_i64()` is always `None` for the
-            // `Number::Float` variant, so read it as f64 and truncate. The
-            // old `CAST(AVG(duration_ms) AS INTEGER)` truncated toward zero;
-            // `duration_ms` is always >= 0, so `as i64` (which also truncates
-            // toward zero) is exact parity — no `.round()`.
+            // The Avg is requested uncast, so AVG(duration_ms) comes back as
+            // a JSON float; `as_i64()` is always `None` for the
+            // `Number::Float` variant, so read it as f64 and truncate. A
+            // `BIGINT` cast would round on PostgreSQL and truncate on SQLite;
+            // truncating here gives one answer on every backend, and
+            // `duration_ms` is always >= 0, so `as i64` (which truncates
+            // toward zero) needs no `.round()`.
             avg_ms: r
                 .data
                 .get("avg_ms")

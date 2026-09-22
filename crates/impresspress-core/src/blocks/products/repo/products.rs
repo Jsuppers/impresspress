@@ -215,8 +215,8 @@ pub(crate) async fn live_counts_by_owner(
             Ok((
                 row.str_field("owner_id").to_string(),
                 // Through `aggregate_i64`, like every other aggregate read in
-                // this block: a backend is entitled to hand an aggregate back
-                // as a JSON float, and `i64_field` reads one as 0.
+                // this block: a count that is not a JSON integer is a decode
+                // fault, not the 0 `i64_field` would read it as.
                 crate::util::aggregate_i64(row, "products")?,
             ))
         })

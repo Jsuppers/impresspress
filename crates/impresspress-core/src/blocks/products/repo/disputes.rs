@@ -299,7 +299,7 @@ pub(crate) async fn analytics_totals(
             wire::AggregateColumnDef::Sum {
                 field: "amount_minor".into(),
                 alias: "amount".into(),
-                cast_as: None,
+                cast_as: crate::util::bigint_cast(),
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: crate::util::to_wire_filters(&[Filter {

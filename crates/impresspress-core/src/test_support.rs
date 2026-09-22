@@ -2060,21 +2060,26 @@ impl Context for RendezvousDbOpContext {
 }
 
 /// Wraps a [`Context`] and re-decodes every `database.aggregate` result the
-/// way `wafer-block-postgres` does: whole numbers come back as JSON floats.
+/// way PostgreSQL and `wafer-block-postgres` would type it: an uncast `Sum`,
+/// `SumWhere` or `Avg` comes back as a JSON float, everything else as the
+/// in-memory SQLite database answered it.
 ///
-/// This is not a hypothetical shape. PostgreSQL's `sum(bigint)` is `NUMERIC`,
-/// and `wafer-block-postgres` decodes `NUMERIC` through `BigDecimal` into
-/// `f64`, so a money column declared `BIGINT` — which every one of them is in
-/// the products block's `.postgres.sql` schema — arrives as `1000.0` rather
-/// than `1000`. `serde_json::Value::as_i64` refuses that outright, so a
-/// caller reading a sum with `i64_field` reports `0` on PostgreSQL and the
-/// right figure on SQLite.
+/// This is not a hypothetical shape. PostgreSQL's `sum(bigint)` and `avg` are
+/// `NUMERIC`, and `wafer-block-postgres` decodes `NUMERIC` through
+/// `BigDecimal` into `f64`, so a money column declared `BIGINT` — which every
+/// one of them is in the products block's `.postgres.sql` schema — sums to
+/// `1000.0` rather than `1000` unless the request casts it. A `BIGINT` cast
+/// makes it an integer again, and `COUNT(*)` / `CaseWhenSum` are `bigint`
+/// already, so those pass through. (`SUM` of an `INTEGER` column is `bigint`
+/// on PostgreSQL, so for one of those this wrapper is stricter than the real
+/// server: it floats every uncast sum.)
 ///
 /// The `Tests (postgres feature)` CI job cannot see this: the `postgres`
 /// feature is a pure cfg flag and that job runs no server. The real-server
 /// job (`PostgreSQL migrations`) pins the premise — that `sum` of a money
-/// column really is `NUMERIC` there — in SQL; this wrapper is what lets a
-/// Rust test drive the real analytics code against the shape that produces.
+/// column really is `NUMERIC` there, and `bigint` once cast — in SQL; this
+/// wrapper is what lets a Rust test drive the real analytics code against
+/// the shape that produces.
 #[derive(Clone)]
 pub struct FloatAggregateContext {
     inner: Arc<dyn Context>,
@@ -2087,6 +2092,29 @@ impl FloatAggregateContext {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// The aliases of `req`'s aggregates that PostgreSQL types as `NUMERIC`:
+    /// every `Sum`, `SumWhere` and `Avg` not cast to `BIGINT`.
+    fn numeric_aliases(req: &wafer_block::wire::database::AggregateRequest) -> Vec<String> {
+        use wafer_block::wire::database::AggregateColumnDef;
+        use wafer_sql_utils::aggregate::CastType;
+        let uncast = |cast_as: &Option<String>| {
+            cast_as.as_deref().and_then(CastType::parse) != Some(CastType::BigInt)
+        };
+        req.aggregates
+            .iter()
+            .filter_map(|column| match column {
+                AggregateColumnDef::Sum { alias, cast_as, .. }
+                | AggregateColumnDef::SumWhere { alias, cast_as, .. }
+                | AggregateColumnDef::Avg { alias, cast_as, .. } => {
+                    uncast(cast_as).then(|| alias.clone())
+                }
+                AggregateColumnDef::Count { .. }
+                | AggregateColumnDef::Max { .. }
+                | AggregateColumnDef::CaseWhenSum { .. } => None,
+            })
+            .collect()
     }
 }
 
@@ -2107,7 +2135,17 @@ impl Context for FloatAggregateContext {
         if !rewrites {
             return self.inner.call_block(name, msg, input).await;
         }
-        let out = self.inner.call_block(name, msg, input).await;
+        let request_bytes = input.collect_to_bytes().await;
+        let request: wafer_block::wire::database::AggregateRequest =
+            match wafer_block::codec::decode(&request_bytes) {
+                Ok(request) => request,
+                Err(e) => return OutputStream::error(e),
+            };
+        let numeric = Self::numeric_aliases(&request);
+        let out = self
+            .inner
+            .call_block(name, msg, InputStream::from_bytes(request_bytes))
+            .await;
         let buf = match out.collect_buffered().await {
             Ok(buf) => buf,
             Err(TerminalNotResponse::Error(e)) => return OutputStream::error(e),
@@ -2124,9 +2162,11 @@ impl Context for FloatAggregateContext {
                 Err(e) => return OutputStream::error(e),
             };
         for record in &mut records {
-            for value in record.data.values_mut() {
-                if let Some(whole) = value.as_i64() {
-                    *value = serde_json::json!(whole as f64);
+            for alias in &numeric {
+                if let Some(value) = record.data.get_mut(alias) {
+                    if let Some(whole) = value.as_i64() {
+                        *value = serde_json::json!(whole as f64);
+                    }
                 }
             }
         }

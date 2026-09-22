@@ -1658,11 +1658,11 @@ fn negative_rows(field: &str) -> Vec<wafer_block::wire::database::FilterNode> {
 
 /// Read an aggregate column as a signed minor-unit amount.
 ///
-/// Every aggregate output here goes through [`crate::util::aggregate_i64`]
-/// rather than `i64_field`: PostgreSQL's `sum(bigint)` is `NUMERIC` and
-/// reaches this crate as a JSON float, which `i64_field` reads as `0`. Every
-/// money column in this block's PostgreSQL schema is `BIGINT`, so every money
-/// figure on the dashboard is one of those.
+/// Every aggregate output here goes through [`crate::util::aggregate_i64`],
+/// which refuses anything but a JSON integer, and every `Sum` it reads is cast
+/// with [`crate::util::bigint_cast`]: PostgreSQL's `sum(bigint)` is `NUMERIC`
+/// and would otherwise reach this crate as a JSON float. Every money column in
+/// this block's PostgreSQL schema is `BIGINT`.
 fn analytics_amount(record: &Record, alias: &str) -> Result<i128, WaferError> {
     Ok(i128::from(crate::util::aggregate_i64(record, alias)?))
 }
@@ -1699,17 +1699,17 @@ async fn order_totals(
             wire::AggregateColumnDef::Sum {
                 field: "total_cents".into(),
                 alias: "gross".into(),
-                cast_as: None,
+                cast_as: crate::util::bigint_cast(),
             },
             wire::AggregateColumnDef::Sum {
                 field: "refunded_total_cents".into(),
                 alias: "refunded".into(),
-                cast_as: None,
+                cast_as: crate::util::bigint_cast(),
             },
             wire::AggregateColumnDef::Sum {
                 field: "platform_fee_cents".into(),
                 alias: "fees".into(),
-                cast_as: None,
+                cast_as: crate::util::bigint_cast(),
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: crate::util::to_wire_filters(&[Filter {
@@ -1843,12 +1843,12 @@ async fn line_item_totals(
             wire::AggregateColumnDef::Sum {
                 field: "quantity".into(),
                 alias: "quantity".into(),
-                cast_as: None,
+                cast_as: crate::util::bigint_cast(),
             },
             wire::AggregateColumnDef::Sum {
                 field: "total_minor".into(),
                 alias: "revenue".into(),
-                cast_as: None,
+                cast_as: crate::util::bigint_cast(),
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: negative_rows("quantity"),

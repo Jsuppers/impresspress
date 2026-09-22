@@ -827,30 +827,24 @@ pub(crate) fn to_wire_filters(
         .collect()
 }
 
-/// Read one aggregate output column as an exact integer, whatever JSON shape
-/// the backend's decoder produced.
+/// Read one aggregate output column as an exact integer.
 ///
-/// `db::aggregate` does not hand back the same JSON type on every backend.
-/// SQLite sums an INTEGER column to a JSON integer. PostgreSQL's
-/// `sum(bigint)` is `NUMERIC`, and `wafer-block-postgres` decodes `NUMERIC`
-/// through `BigDecimal` into `f64`, so the same column arrives as a JSON
-/// float — which [`serde_json::Value::as_i64`] refuses outright. A money sum
-/// read with [`RecordExt::i64_field`] therefore answers the right figure on
-/// SQLite and `0` on PostgreSQL. `wafer-core`'s own conformance suite reads
-/// `Sum` results as `f64` for exactly this reason, and
-/// `platform_state::request_logs` already documents the float shape at its
-/// own `Avg` call site.
+/// Only a JSON integer is accepted. A float, a numeric string or an absent
+/// column is a decode fault, reported with the alias and the value rather
+/// than coerced into a plausible figure.
 ///
-/// The float branch is exact for the figures this reads. Money is stored in
-/// minor units and quantities are whole, so the sum is an integer; an `f64`
-/// carries every integer up to 2^53 losslessly, and a value beyond that — or
-/// one with a fractional part, which a sum of integers cannot have — is a
-/// decode fault and is reported rather than rounded into a plausible number.
+/// The caller is responsible for asking the database for an integer. A
+/// `COUNT(*)` or a `CaseWhenSum` is one on every backend. A `Sum` is not:
+/// PostgreSQL's `sum(bigint)` is `NUMERIC`, which `wafer-block-postgres`
+/// decodes through `BigDecimal` into `f64`, and SQLite sums to `REAL` as soon
+/// as one summed value is not an integer. So every `Sum` this reads carries
+/// [`bigint_cast`], which settles the type in the statement itself.
+/// A cast rounds a non-integral value on PostgreSQL and truncates it on
+/// SQLite, so it belongs only on columns that hold whole numbers — minor-unit
+/// money and quantities, which is all this reads.
 ///
 /// Not folded into [`json_as_i64`]: that one is the coercion for *stored
-/// columns*, where accepting a float would silently truncate a real
-/// fractional value. This one is for aggregate output, where a float is the
-/// backend's chosen representation of an integer.
+/// columns*, which accepts the numeric string a TEXT column hands back.
 ///
 /// Gated on `block-products` because that block is its only caller: the
 /// commerce analytics is the one place in the crate that reads a `SUM` over a
@@ -862,22 +856,25 @@ pub(crate) fn aggregate_i64(record: &Record, alias: &str) -> Result<i64, wafer_r
     let fault = |detail: &str| {
         wafer_run::WaferError::new(
             wafer_run::ErrorCode::Internal,
-            format!("aggregate column {alias} is not a whole number: {detail}"),
+            format!("aggregate column {alias} is not an integer: {detail}"),
         )
     };
     let Some(value) = record.data.get(alias) else {
         return Err(fault("the column is absent from the result row"));
     };
-    if let Some(exact) = json_as_i64(value) {
-        return Ok(exact);
-    }
-    let Some(float) = value.as_f64() else {
-        return Err(fault(&value.to_string()));
-    };
-    if float.fract() != 0.0 || float.abs() > 9_007_199_254_740_992.0 {
-        return Err(fault(&float.to_string()));
-    }
-    Ok(float as i64)
+    value.as_i64().ok_or_else(|| fault(&value.to_string()))
+}
+
+/// The `cast_as` for a `Sum` read through [`aggregate_i64`]: `BIGINT`, so the
+/// sum is an integer on every backend. Spelled from the allowlist
+/// `wafer-sql-utils` parses the wire value against, not typed out here.
+#[cfg(feature = "block-products")]
+pub(crate) fn bigint_cast() -> Option<String> {
+    Some(
+        wafer_sql_utils::aggregate::CastType::BigInt
+            .as_sql()
+            .to_string(),
+    )
 }
 
 /// Run ONE grouped-by-day aggregate over `table` for rows whose `created_at`
@@ -1657,5 +1654,37 @@ mod tests {
         ));
         // None of the three → not sensitive.
         assert!(!is_sensitive_key("SITE_NAME", 0));
+    }
+
+    /// An aggregate that comes back as a float is a fault even when the
+    /// float is whole. `2500.0` is how an uncast `SUM(bigint)` reads on
+    /// PostgreSQL; accepting it would let a sum that is missing its
+    /// `BIGINT` cast pass on one backend and keep passing unnoticed.
+    #[cfg(feature = "block-products")]
+    #[test]
+    fn aggregate_i64_refuses_a_whole_float() {
+        let err = aggregate_i64(&record(serde_json::json!({"gross": 2500.0})), "gross")
+            .expect_err("a float is not an integer");
+        assert_eq!(err.code, wafer_run::ErrorCode::Internal);
+        assert!(err.message.contains("gross"), "{}", err.message);
+        assert!(err.message.contains("2500.0"), "{}", err.message);
+    }
+
+    #[cfg(feature = "block-products")]
+    #[test]
+    fn aggregate_i64_reads_an_integer_and_refuses_everything_else() {
+        let row = record(serde_json::json!({
+            "gross": 2500,
+            "negative": -7,
+            "fraction": 2500.5,
+            "text": "2500",
+            "null": null,
+        }));
+        assert_eq!(aggregate_i64(&row, "gross").unwrap(), 2500);
+        assert_eq!(aggregate_i64(&row, "negative").unwrap(), -7);
+        for alias in ["fraction", "text", "null", "absent"] {
+            let err = aggregate_i64(&row, alias).expect_err(alias);
+            assert!(err.message.contains(alias), "{}", err.message);
+        }
     }
 }
