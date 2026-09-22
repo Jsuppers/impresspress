@@ -600,6 +600,24 @@ pub async fn count_for_uploader(ctx: &dyn Context, user_id: &str) -> Result<i64,
     db::count(ctx, TABLE, &owned_objects_filter(user_id)).await
 }
 
+/// Number of object rows `user_id` uploaded into `bucket` — what the
+/// per-bucket file-count cap (`QuotaConfig::max_files_per_bucket`) is
+/// checked against. Includes `pending` reservations, on the same basis as
+/// [`count_for_uploader`] and [`sum_size_for_uploader`].
+pub async fn count_for_uploader_in_bucket(
+    ctx: &dyn Context,
+    user_id: &str,
+    bucket: &str,
+) -> Result<i64, WaferError> {
+    let mut filters = owned_objects_filter(user_id);
+    filters.push(Filter {
+        field: "bucket".to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(bucket.to_string()),
+    });
+    db::count(ctx, TABLE, &filters).await
+}
+
 /// `SUM(size)` over the rows uploaded by `user_id` (quota accounting —
 /// includes `pending` reservations; no row materialization).
 pub async fn sum_size_for_uploader(ctx: &dyn Context, user_id: &str) -> Result<f64, WaferError> {

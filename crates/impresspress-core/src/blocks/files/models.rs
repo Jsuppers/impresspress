@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct QuotaConfig {
     pub max_storage_bytes: i64,
     pub max_file_size_bytes: i64,
+    /// Most objects one user may hold in any one bucket, in-flight uploads included.
     pub max_files_per_bucket: i64,
     pub reset_period_days: i64,
 }
@@ -27,7 +28,11 @@ impl QuotaConfig {
     /// ([`super::quota::clamp_to_transport`]). Raise the ceiling and this
     /// default becomes reachable without changing here or the migration.
     pub const DEFAULT_MAX_FILE_SIZE_BYTES: i64 = 104_857_600;
-    /// Default per-bucket file-count cap.
+    /// Default cap on the objects one user holds in one bucket: 10,000.
+    ///
+    /// Enforced per `(uploader, bucket)` by
+    /// [`super::quota::check_quota`], counting `pending` rows as well as
+    /// completed ones; the user's total across buckets is not capped.
     pub const DEFAULT_MAX_FILES_PER_BUCKET: i64 = 10_000;
     /// Default reset period (0 = never).
     pub const DEFAULT_RESET_PERIOD_DAYS: i64 = 0;

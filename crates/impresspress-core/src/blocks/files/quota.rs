@@ -54,7 +54,9 @@ pub async fn get_used_bytes(ctx: &dyn Context, user_id: &str) -> Result<i64, Waf
     Ok(repo::objects::sum_size_for_uploader(ctx, user_id).await? as i64)
 }
 
-/// Number of object rows owned by `user_id`.
+/// Number of object rows owned by `user_id`, across every bucket — the
+/// usage figure the quota endpoint reports. The file-count cap is per bucket
+/// and is checked against [`repo::objects::count_for_uploader_in_bucket`].
 pub async fn get_file_count(ctx: &dyn Context, user_id: &str) -> Result<i64, WaferError> {
     repo::objects::count_for_uploader(ctx, user_id).await
 }
@@ -70,7 +72,8 @@ pub async fn get_user_usage(
     })
 }
 
-/// Admit or refuse an upload of `file_size` bytes for `user_id`.
+/// Admit or refuse an upload of `file_size` bytes into `bucket` for
+/// `user_id`.
 ///
 /// `replaces_own_bytes` is `Some(size)` when the upload overwrites an object
 /// this same user already stores under the key — the size of that object, as
@@ -81,12 +84,24 @@ pub async fn get_user_usage(
 /// user's usage and not in this one's — charges the full size and one more
 /// file.
 ///
+/// The storage cap is over everything `user_id` stores; the file-count cap
+/// is per bucket, over the rows `user_id` holds in `bucket`
+/// ([`repo::objects::count_for_uploader_in_bucket`]), so being at the limit
+/// in one bucket does not stop an upload into another. Both count `pending`
+/// rows: a pending row is an upload in flight that will add a file once it
+/// settles, and it is counted for the same reason its bytes are — so that
+/// concurrent uploads each see the others' reservations instead of all
+/// passing the check against the same pre-upload count. A pending row left
+/// behind by a failed upload stops counting once [`sweep_stale_pending`],
+/// which the upload handler runs before this check, removes it.
+///
 /// Fails closed: if the quota or the current usage cannot be read, the
 /// upload is refused with an internal error rather than admitted against
 /// the defaults or against zero usage.
 pub async fn check_quota(
     ctx: &dyn Context,
     user_id: &str,
+    bucket: &str,
     file_size: i64,
     replaces_own_bytes: Option<i64>,
 ) -> Result<(), OutputStream> {
@@ -113,12 +128,12 @@ pub async fn check_quota(
     // An overwrite adds no row, so a user already at the file-count limit can
     // still replace what they have.
     if quota.max_files_per_bucket > 0 && replaces_own_bytes.is_none() {
-        let file_count = get_file_count(ctx, user_id)
+        let file_count = repo::objects::count_for_uploader_in_bucket(ctx, user_id, bucket)
             .await
             .map_err(|e| err_internal("Quota usage lookup failed", e))?;
         if file_count >= quota.max_files_per_bucket {
             return Err(err_bad_request(&format!(
-                "File count limit reached (max {})",
+                "File count limit reached for this bucket (max {})",
                 quota.max_files_per_bucket
             )));
         }
@@ -263,9 +278,9 @@ mod tests {
         row.insert("max_storage_bytes".into(), json!(2048));
         repo::quota::seed(&ctx, row).await.expect("seed quota");
 
-        assert!(check_quota(&ctx, "u1", 1024, None).await.is_ok());
+        assert!(check_quota(&ctx, "u1", "photos", 1024, None).await.is_ok());
         assert!(
-            check_quota(&ctx, "u1", 4096, None).await.is_err(),
+            check_quota(&ctx, "u1", "photos", 4096, None).await.is_err(),
             "file above the override cap must be rejected"
         );
     }
@@ -277,7 +292,7 @@ mod tests {
         let ctx = TestContext::with_files().await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.list", repo::quota::TABLE)]);
 
-        let out = check_quota(&failing, "u1", 1, None)
+        let out = check_quota(&failing, "u1", "photos", 1, None)
             .await
             .expect_err("an override lookup outage must not admit the upload");
 
@@ -294,7 +309,7 @@ mod tests {
         let ctx = TestContext::with_files().await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.sum", repo::objects::TABLE)]);
 
-        let out = check_quota(&failing, "u1", 1, None)
+        let out = check_quota(&failing, "u1", "photos", 1, None)
             .await
             .expect_err("a usage lookup outage must not admit the upload");
 

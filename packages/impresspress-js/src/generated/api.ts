@@ -1131,7 +1131,10 @@ export interface paths {
                                     id: string;
                                     /** Format: int64 */
                                     max_file_size_bytes: number;
-                                    /** Format: int64 */
+                                    /**
+                                     * Format: int64
+                                     * @description Most objects one user may hold in any one bucket, in-flight uploads included.
+                                     */
                                     max_files_per_bucket: number;
                                     /** Format: int64 */
                                     max_storage_bytes: number;
@@ -1196,7 +1199,10 @@ export interface paths {
                                 id: string;
                                 /** Format: int64 */
                                 max_file_size_bytes: number;
-                                /** Format: int64 */
+                                /**
+                                 * Format: int64
+                                 * @description Most objects one user may hold in any one bucket, in-flight uploads included.
+                                 */
                                 max_files_per_bucket: number;
                                 /** Format: int64 */
                                 max_storage_bytes: number;
@@ -1335,7 +1341,10 @@ export interface paths {
                             quota: {
                                 /** Format: int64 */
                                 max_file_size_bytes: number;
-                                /** Format: int64 */
+                                /**
+                                 * Format: int64
+                                 * @description Most objects one user may hold in any one bucket, in-flight uploads included.
+                                 */
                                 max_files_per_bucket: number;
                                 /** Format: int64 */
                                 max_storage_bytes: number;
