@@ -1533,6 +1533,10 @@ fn a_grouped_import_of_the_const_is_naming_it() {
             false,
         ),
         (
+            "fn f() { db::list(ctx, TABLE); } // use crate::platform_state::user_roles::*;",
+            false,
+        ),
+        (
             "fn f() { let _ = \"user_roles::TABLE\"; }",
             false,
         ),
