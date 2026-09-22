@@ -7765,3 +7765,190 @@ async fn checkout_separates_a_seller_that_is_not_ready_from_a_failed_read() {
         "a seller read that failed is a server fault, not an unready seller"
     );
 }
+
+// ============================================================
+// Error mapping — the webhook dispatcher and the offer checkout
+// ============================================================
+
+/// A `refund.updated` delivery whose first read inside the dispatcher — the
+/// refund-ledger lookup — answers `code`, and the status the delivery gets.
+///
+/// The lookup is a `database.list` on the refunds table, which nothing before
+/// it in `handle_webhook` touches: the lease claim is on the events table. So
+/// the injected refusal lands on a dispatcher site, and the lease is already
+/// held when it does.
+async fn refund_webhook_status_when_the_ledger_read_answers(
+    code: ErrorCode,
+    event_id: &str,
+) -> (crate::test_support::TestContext, serde_json::Value, u16) {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let event = serde_json::json!({
+        "id": event_id,
+        "type": "refund.updated",
+        "livemode": false,
+        "data": {"object": {
+            "id": format!("re_{event_id}"),
+            "status": "succeeded",
+            "livemode": false
+        }}
+    });
+    let failing = crate::test_support::FailingDbOpContext::failing_with(
+        ctx.clone(),
+        vec![("database.list", repo::refunds::TABLE)],
+        wafer_run::WaferError::new(code, "refused by the database client"),
+    );
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let status = crate::test_support::output_http_status(
+        stripe::handle_webhook(&failing, &msg, input).await,
+    )
+    .await;
+    (ctx, event, status)
+}
+
+/// The lease the refused delivery held was released as a scheduled retry, and
+/// the next delivery after the backoff processes the event. A 4xx does not
+/// stop Stripe redelivering — every non-2xx is a failed delivery — and this
+/// is the local half: the refusal did not seal or strand the event.
+async fn assert_refused_delivery_is_retried(
+    ctx: &crate::test_support::TestContext,
+    event: &serde_json::Value,
+    event_id: &str,
+) {
+    let row = db::get(ctx, "impresspress__products__stripe_events", event_id)
+        .await
+        .unwrap();
+    assert_eq!(row.data["status"], "failed");
+    assert!(!row.str_field("next_retry_at").is_empty());
+
+    db::update(
+        ctx,
+        "impresspress__products__stripe_events",
+        event_id,
+        HashMap::from([(
+            "next_retry_at".to_string(),
+            serde_json::json!("2000-01-01T00:00:00Z"),
+        )]),
+    )
+    .await
+    .unwrap();
+    let (msg, input) = webhook_msg(event, WEBHOOK_SECRET);
+    let body = output_to_json(stripe::handle_webhook(ctx, &msg, input).await).await;
+    assert_eq!(body["received"], true);
+    let row = db::get(ctx, "impresspress__products__stripe_events", event_id)
+        .await
+        .unwrap();
+    assert_eq!(row.data["status"], "processed");
+}
+
+#[tokio::test]
+async fn webhook_database_denial_is_403_and_the_delivery_is_retried() {
+    let (ctx, event, status) = refund_webhook_status_when_the_ledger_read_answers(
+        ErrorCode::PermissionDenied,
+        "evt_ledger_denied",
+    )
+    .await;
+    assert_eq!(status, 403, "a WRAP denial inside the dispatcher is a 403");
+    assert_refused_delivery_is_retried(&ctx, &event, "evt_ledger_denied").await;
+}
+
+#[tokio::test]
+async fn webhook_database_quota_is_429_and_the_delivery_is_retried() {
+    let (ctx, event, status) = refund_webhook_status_when_the_ledger_read_answers(
+        ErrorCode::ResourceExhausted,
+        "evt_ledger_quota",
+    )
+    .await;
+    assert_eq!(
+        status, 429,
+        "a database quota inside the dispatcher is a 429"
+    );
+    assert_refused_delivery_is_retried(&ctx, &event, "evt_ledger_quota").await;
+}
+
+/// Guard (passes before and after the database tails were classified): a
+/// Stripe rate limit is Stripe's, not the database's, so the checkout it
+/// interrupts is the sanitized 500 — never the 429 a database quota earns.
+#[tokio::test]
+async fn checkout_stripe_rate_limit_stays_500() {
+    let mut ctx = ctx_with(&[
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+        ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+        ("IMPRESSPRESS__PRODUCTS__STRIPE_ACCOUNT_COUNTRY", "NZ"),
+    ])
+    .await;
+    let requests = register_stripe_sequence(
+        &mut ctx,
+        vec![(429, serde_json::json!({"error": {"code": "rate_limit"}}))],
+    );
+    let offer_id = seed_active_offer(&ctx, "product_checkout_rate_limit", "").await;
+    let (msg, input) = create_msg(
+        "/b/products/checkout",
+        "",
+        serde_json::json!({
+            "offer_id": offer_id,
+            "quantity": 1,
+            "inputs": {"pages": 3},
+            "presentation": "hosted"
+        }),
+    );
+    assert_eq!(
+        crate::test_support::output_http_status(stripe::handle_checkout(&ctx, &msg, input).await)
+            .await,
+        500
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the Stripe call is the failure under test"
+    );
+    assert!(requests[0].url.ends_with("/v1/checkout/sessions"));
+}
+
+/// A checkout whose order insert is refused by the database is that refusal's
+/// status, not a 500. The insert is the first write to the purchases table, so
+/// nothing has reached Stripe yet.
+#[tokio::test]
+async fn checkout_order_insert_denial_is_403_and_quota_is_429() {
+    for (code, status) in [
+        (ErrorCode::PermissionDenied, 403),
+        (ErrorCode::ResourceExhausted, 429),
+    ] {
+        let mut ctx = ctx_with(&[
+            ("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x"),
+            ("WAFER_RUN_SHARED__FRONTEND_URL", "https://shop.example"),
+            ("IMPRESSPRESS__PRODUCTS__STRIPE_ACCOUNT_COUNTRY", "NZ"),
+        ])
+        .await;
+        let requests = register_stripe_sequence(&mut ctx, Vec::new());
+        let offer_id = seed_active_offer(&ctx, "product_checkout_denied", "").await;
+        let failing = crate::test_support::FailingDbOpContext::failing_with(
+            ctx.clone(),
+            vec![("database.create", repo::purchases::PURCHASES_TABLE)],
+            wafer_run::WaferError::new(code, "refused by the database client"),
+        );
+        let (msg, input) = create_msg(
+            "/b/products/checkout",
+            "",
+            serde_json::json!({
+                "offer_id": offer_id,
+                "quantity": 1,
+                "inputs": {"pages": 3},
+                "presentation": "hosted"
+            }),
+        );
+        assert_eq!(
+            crate::test_support::output_http_status(
+                stripe::handle_checkout(&failing, &msg, input).await
+            )
+            .await,
+            status,
+            "{code:?}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+}

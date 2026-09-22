@@ -1461,3 +1461,99 @@ async fn refund_reconciliation_keeps_the_provider_response_summary() {
     // Stripe was asked exactly twice: the create and the one reconcile GET.
     assert_eq!(requests.lock().unwrap().len(), 2);
 }
+
+// ============================================================
+// Error mapping — the refund orchestration in `purchase.rs`
+// ============================================================
+
+/// An admin refund of a Stripe order whose refund-ledger lookup answers
+/// `code`, and the status the request gets.
+///
+/// The lookup (`get_by_idempotency_key`, a `database.list` on the refunds
+/// table) runs after the purchase read, which is a `database.get` on the
+/// purchases table, so the refusal lands on the orchestration's own site.
+async fn refund_status_when_the_ledger_read_answers(code: ErrorCode) -> u16 {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_refunds",
+    )])
+    .await;
+    seed_stripe_refund_order(
+        &ctx,
+        "purchase_ledger_refused",
+        "completed",
+        5000,
+        0,
+        "",
+        false,
+    )
+    .await;
+    let requests = register_sequence_with_status(&mut ctx, Vec::new());
+    let failing = crate::test_support::FailingDbOpContext::failing_with(
+        ctx.clone(),
+        vec![("database.list", repo::refunds::TABLE)],
+        wafer_run::WaferError::new(code, "refused by the database client"),
+    );
+    let (msg, input) = admin_refund_msg(
+        "purchase_ledger_refused",
+        serde_json::json!({"amount_minor": 1000, "idempotency_key": "refused"}),
+    );
+    let status =
+        crate::test_support::output_http_status(dispatch(&failing, msg, input).await).await;
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a refused ledger read must stop the refund before Stripe is asked"
+    );
+    status
+}
+
+#[tokio::test]
+async fn refund_ledger_denial_is_403() {
+    assert_eq!(
+        refund_status_when_the_ledger_read_answers(ErrorCode::PermissionDenied).await,
+        403
+    );
+}
+
+#[tokio::test]
+async fn refund_ledger_quota_is_429() {
+    assert_eq!(
+        refund_status_when_the_ledger_read_answers(ErrorCode::ResourceExhausted).await,
+        429
+    );
+}
+
+/// Guard (passes before and after the database tails were classified): a
+/// Stripe rate limit on the refund call is Stripe's, so it stays the
+/// sanitized 500 rather than borrowing the 429 a database quota earns.
+#[tokio::test]
+async fn refund_stripe_rate_limit_stays_500() {
+    let mut ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+        "sk_test_refunds",
+    )])
+    .await;
+    seed_stripe_refund_order(
+        &ctx,
+        "purchase_stripe_rate_limited",
+        "completed",
+        5000,
+        0,
+        "",
+        false,
+    )
+    .await;
+    let requests = register_sequence_with_status(
+        &mut ctx,
+        vec![(429, serde_json::json!({"error": {"code": "rate_limit"}}))],
+    );
+    let (msg, input) = admin_refund_msg(
+        "purchase_stripe_rate_limited",
+        serde_json::json!({"amount_minor": 1000, "idempotency_key": "rate_limited"}),
+    );
+    assert_eq!(
+        crate::test_support::output_http_status(dispatch(&ctx, msg, input).await).await,
+        500
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
