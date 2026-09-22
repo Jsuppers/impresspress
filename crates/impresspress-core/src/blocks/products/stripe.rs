@@ -46,7 +46,6 @@ use crate::{
 const STRIPE_EVENTS_TABLE: &str = repo::stripe_events::TABLE;
 
 const EVENT_LEASE_SECONDS: i64 = 300;
-const EVENT_MAX_ATTEMPTS: u64 = 8;
 
 /// Stable GA version used when an administrator has not selected another.
 const DEFAULT_STRIPE_API_VERSION: &str = "2026-02-25.clover";
@@ -66,6 +65,7 @@ enum EventRecordState {
     /// already completed. A true duplicate; the caller must skip.
     AlreadyProcessed,
     /// The bounded retry budget was exhausted and requires operator review.
+    /// The row is `dead_letter` (with its `last_error`) when this is returned.
     DeadLetter,
 }
 
@@ -73,11 +73,6 @@ fn event_timestamp(record: &Record, field: &str) -> Option<chrono::DateTime<chro
     chrono::DateTime::parse_from_rfc3339(record.str_field(field))
         .ok()
         .map(|value| value.with_timezone(&chrono::Utc))
-}
-
-fn event_retry_delay_seconds(attempts: u64) -> i64 {
-    let exponent = attempts.saturating_sub(1).min(7) as u32;
-    (30_i64.saturating_mul(2_i64.pow(exponent))).min(3600)
 }
 
 /// Insert and claim a fresh event atomically, or atomically acquire a failed,
@@ -162,9 +157,57 @@ async fn record_event(
         EventStatus::Pending => {}
     }
 
+    // The CAS both writes below take: the row must still be in the state
+    // this delivery just read, under the owner it just read.
+    let unchanged = vec![
+        Filter {
+            field: "id".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(event_id),
+        },
+        Filter {
+            field: "status".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(status),
+        },
+        Filter {
+            field: "processing_owner".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(existing.str_field("processing_owner")),
+        },
+    ];
     let attempts = existing.u64_field("attempts").saturating_add(1);
-    if attempts > EVENT_MAX_ATTEMPTS {
-        return Ok(EventRecordState::DeadLetter);
+    if attempts > repo::MAX_ATTEMPTS {
+        // Out of budget without a recorded outcome — the last attempt's
+        // lease expired. The row is moved to `dead_letter` here, before the
+        // caller acknowledges: Stripe stops redelivering an acknowledged
+        // event, and only a `failed`/`dead_letter` row can be replayed, so a
+        // row left `processing` would be unrecoverable.
+        let reason = exhausted_event_reason(status, &existing);
+        let dead_lettered = db::update_by_filters_count(
+            ctx,
+            STRIPE_EVENTS_TABLE,
+            unchanged,
+            HashMap::from([
+                (
+                    "status".to_string(),
+                    serde_json::json!(EventStatus::DeadLetter),
+                ),
+                ("processing_owner".to_string(), serde_json::json!("")),
+                ("processing_started_at".to_string(), serde_json::Value::Null),
+                ("next_retry_at".to_string(), serde_json::Value::Null),
+                ("last_error".to_string(), serde_json::json!(reason)),
+                ("terminal_at".to_string(), serde_json::json!(&now)),
+            ]),
+        )
+        .await?;
+        return Ok(if dead_lettered == 1 {
+            EventRecordState::DeadLetter
+        } else {
+            // Another delivery moved the row first; its state stands and
+            // this delivery is retried against it.
+            EventRecordState::InFlight
+        });
     }
     let mut data = HashMap::new();
     data.insert(
@@ -188,34 +231,36 @@ async fn record_event(
         serde_json::json!(stripe_account_id),
     );
     data.insert("livemode".to_string(), serde_json::json!(livemode));
-    let claimed = db::update_by_filters_count(
-        ctx,
-        STRIPE_EVENTS_TABLE,
-        vec![
-            Filter {
-                field: "id".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(event_id),
-            },
-            Filter {
-                field: "status".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(status),
-            },
-            Filter {
-                field: "processing_owner".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(existing.str_field("processing_owner")),
-            },
-        ],
-        data,
-    )
-    .await?;
+    let claimed = db::update_by_filters_count(ctx, STRIPE_EVENTS_TABLE, unchanged, data).await?;
     if claimed == 1 {
         Ok(EventRecordState::Claimed { owner, attempts })
     } else {
         Ok(EventRecordState::InFlight)
     }
+}
+
+/// `last_error` for an event that ran out of attempts without its last
+/// attempt recording an outcome. The previous recorded error, if any, is kept
+/// after it so the operator still sees why the earlier attempts failed.
+fn exhausted_event_reason(status: EventStatus, existing: &Record) -> String {
+    let attempts = existing.u64_field("attempts");
+    let mut reason = match status {
+        EventStatus::Processing => format!(
+            "retry budget of {} attempts exhausted: the processing lease of attempt {attempts} \
+             expired without recording an outcome",
+            repo::MAX_ATTEMPTS
+        ),
+        _ => format!(
+            "retry budget of {} attempts exhausted after {attempts} attempts",
+            repo::MAX_ATTEMPTS
+        ),
+    };
+    let previous = existing.str_field("last_error");
+    if !previous.is_empty() {
+        reason.push_str("; last recorded error: ");
+        reason.push_str(previous);
+    }
+    reason.chars().take(1000).collect()
 }
 
 async fn mark_event_processed(
@@ -276,7 +321,7 @@ async fn mark_event_failed(
     error: &str,
 ) -> Result<(), WaferError> {
     let now = chrono::Utc::now();
-    let dead_letter = attempts >= EVENT_MAX_ATTEMPTS;
+    let dead_letter = attempts >= repo::MAX_ATTEMPTS;
     let mut data = HashMap::new();
     data.insert(
         "status".to_string(),
@@ -302,7 +347,7 @@ async fn mark_event_failed(
         data.insert(
             "next_retry_at".to_string(),
             serde_json::json!((now
-                + chrono::Duration::seconds(event_retry_delay_seconds(attempts)))
+                + chrono::Duration::seconds(repo::retry_delay_seconds(attempts)))
             .to_rfc3339()),
         );
     }
@@ -5216,7 +5261,7 @@ mod tests {
             &ctx,
             "evt_failure",
             &retry_owner,
-            EVENT_MAX_ATTEMPTS,
+            repo::MAX_ATTEMPTS,
             "permanent failure",
         )
         .await
