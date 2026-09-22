@@ -701,6 +701,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // allowlist and its import through `seed::import`, and the dev
             // block grants itself those tables (see the audit pragma there)
             "blocks/dev/data_snapshot.rs",
+            // A fault injector: the seed's tests fail its one metadata
+            // refresh (`database.update`) and its bulk read (`database.list`)
+            // on this table, to prove neither stamps the seed hash gate.
+            "blocks/admin/settings.rs",
         ],
     ),
     (
