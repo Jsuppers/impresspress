@@ -69,7 +69,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use impresspress_core::IsolateCell;
+use impresspress_core::IdentityCache;
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
@@ -86,18 +86,20 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 thread_local! {
-    /// The isolate's one [`SchemaCache`], shared by every
-    /// [`D1DatabaseService`] built in it (see [`isolate_schema_cache`]).
+    /// The isolate's [`SchemaCache`], keyed by D1 binding name and shared by
+    /// every [`D1DatabaseService`] over that binding (see
+    /// [`isolate_schema_cache`]).
     ///
-    /// An [`IsolateCell`], never a `RefCell`: this is isolate-lifetime state
-    /// on the request path, and a request hard-stopped inside a borrow would
-    /// strand the flag for the life of the isolate. The worst a hard stop can
-    /// do here is drop the cache, which is a cold isolate — a state every
-    /// caller already handles.
-    static ISOLATE_SCHEMA_CACHE: IsolateCell<Rc<SchemaCache>> = const { IsolateCell::new() };
+    /// An [`IdentityCache`], built on `IsolateCell` rather than a `RefCell`:
+    /// this is isolate-lifetime state on the request path, and a request
+    /// hard-stopped inside a borrow would strand the flag for the life of the
+    /// isolate. The worst a hard stop can do here is drop the entry, which is
+    /// a cold isolate — a state every caller already handles.
+    static ISOLATE_SCHEMA_CACHE: IdentityCache<SchemaCache> = const { IdentityCache::new() };
 }
 
-/// The isolate's schema cache, created on first use.
+/// The isolate's schema cache for the D1 binding named `binding`, created on
+/// first use.
 ///
 /// Scoped to the isolate rather than to one service because the services are
 /// per *request*: `warm_request_services` builds a fresh `D1DatabaseService`
@@ -110,15 +112,24 @@ thread_local! {
 /// same argument the browser backend's cache is a static for: the facts
 /// describe the database, not the handle.
 ///
+/// Keyed by binding name because the two constructors that reach this
+/// (`services::make_d1_database_service`,
+/// `services::make_kv_cached_database_service`) are public and take one:
+/// two bindings are two databases, and one table name can mean a different
+/// schema in each. `IdentityCache` holds one entry, so a second binding
+/// *replaces* the first's rather than being answered from it — a worker that
+/// alternates bindings re-introspects instead of being told the wrong schema.
+/// Impresspress ships one D1 binding (`runner::D1_BINDING`).
+///
 /// What may invalidate it is enumerated on [`D1DatabaseService::schema_cache`].
-pub(crate) fn isolate_schema_cache() -> Rc<SchemaCache> {
-    ISOLATE_SCHEMA_CACHE.with(|cell| {
-        if let Some(cache) = cell.get() {
-            return cache;
+pub(crate) fn isolate_schema_cache(binding: &str) -> Rc<SchemaCache> {
+    ISOLATE_SCHEMA_CACHE.with(|cache| {
+        if let Some(entry) = cache.get(binding) {
+            return entry;
         }
-        let cache = Rc::new(SchemaCache::new());
-        cell.set(Rc::clone(&cache));
-        cache
+        let entry = Rc::new(SchemaCache::new());
+        cache.store(binding.to_string(), Rc::clone(&entry));
+        entry
     })
 }
 
@@ -131,7 +142,7 @@ pub(crate) fn isolate_schema_cache() -> Rc<SchemaCache> {
 /// paths invalidate per table as they mutate; see
 /// [`D1DatabaseService::schema_cache`].
 pub(crate) fn forget_isolate_schema() {
-    ISOLATE_SCHEMA_CACHE.with(IsolateCell::clear);
+    ISOLATE_SCHEMA_CACHE.with(IdentityCache::clear);
 }
 
 /// Async database service wrapping Cloudflare D1.
@@ -168,10 +179,14 @@ impl D1DatabaseService {
     /// `Init` still calls [`DatabaseService::set_strict_schema`] on the
     /// runtime's own service; it reads the same var through `ctx.config_get`,
     /// so it re-affirms this value rather than contradicting it.
-    pub fn new(db: D1Database, strict_schema: bool) -> Self {
+    ///
+    /// `binding` is the D1 binding `db` came from. It is the key of the
+    /// isolate's schema cache ([`isolate_schema_cache`]): two bindings are two
+    /// databases, and one table name can name a different schema in each.
+    pub fn new(db: D1Database, strict_schema: bool, binding: &str) -> Self {
         Self {
             db,
-            schema_cache: isolate_schema_cache(),
+            schema_cache: isolate_schema_cache(binding),
             strict_schema: AtomicBool::new(strict_schema),
         }
     }
@@ -330,29 +345,76 @@ impl DbExec for D1DatabaseService {
     /// Every D1 schema change invalidates what it touches, which is what
     /// makes an isolate-lifetime cache sound here:
     ///
-    /// - **Migrations** (`migration_helper` → the `database.ddl` host op) and
-    ///   the admin SQL explorer's writes reach `DatabaseService::exec_raw`,
-    ///   and the shared [`DbExec::exec_raw`] clears the whole cache after a
-    ///   statement it cannot attribute to a table.
+    /// - **Migrations** reach `DatabaseService::exec_raw` — both the
+    ///   `database.ddl` host op and `migration_helper::apply_ddl_via_service`
+    ///   end there, and the KV decorator forwards it — and the shared
+    ///   [`DbExec::exec_raw`] clears the whole cache after a statement it
+    ///   cannot attribute to a table. (The admin SQL explorer is not a writer:
+    ///   `validate_readonly_query` refuses anything but a read.)
     /// - **The lazy column-add** (`DbExec::add_column_checked`, non-strict
     ///   mode only) invalidates the table it alters.
     /// - **`ensure_schema_table`, `schema_add_column`, `schema_drop_table`**
     ///   are refused on D1 (see their impls below): the schema is
-    ///   migration-owned, so a block cannot mutate it around the two paths
-    ///   above. Every DDL this repo issues goes through one of them — the
-    ///   `database.ddl` host op and `migration_helper::apply_ddl_via_service`
-    ///   both end at `exec_raw`, and the dev block issues no DDL at all.
-    /// - **Another isolate's migration** is outside this cache's reach. The
-    ///   deploy that runs it bumps the KV config-version stamp
-    ///   (`force_bump_config_version`), so every other isolate rebuilds its
-    ///   runtime on its next probe, and that rebuild calls
-    ///   [`forget_isolate_schema`].
+    ///   migration-owned, so a block cannot mutate it around the path above.
+    ///   That covers the dev sandbox too — its tables come from
+    ///   `dev/migrations/*.sql` through the migration runner, and it issues no
+    ///   runtime DDL outside it.
+    /// - **Another isolate's migration** is outside this cache's reach, and
+    ///   not promptly. The deploy that runs it bumps the KV config-version
+    ///   stamp (`force_bump_config_version`), which marks the *writing*
+    ///   isolate dirty; every other isolate notices at its next version probe,
+    ///   which `runtime_cache`'s jittered floor puts up to
+    ///   `PROBE_INTERVAL_FLOOR_MS + PROBE_INTERVAL_JITTER_MS` away (5-10
+    ///   minutes). The rebuild that follows calls [`forget_isolate_schema`].
+    ///
+    ///   What can be stale in that window is bounded by what is cached:
+    ///   a negative table-exists is never stored (see
+    ///   [`table_present_for_op`](Self::table_present_for_op)), so a table the
+    ///   migration creates is not read as missing; a column list that predates
+    ///   an `ADD COLUMN` only makes the lazy add re-run, which
+    ///   `add_column_checked` treats as benign; and a primary key is stale
+    ///   only if a migration rebuilds the table under a different key, which
+    ///   would make a sorted `list` in an unrebuilt isolate sort by a column
+    ///   that no longer exists until the probe lands.
     fn schema_cache(&self) -> Option<&SchemaCache> {
         Some(&self.schema_cache)
     }
 
     fn strict_schema(&self) -> bool {
         self.strict_schema.load(Ordering::Relaxed)
+    }
+
+    /// The shared table-exists guard, except that a **negative** answer is
+    /// never memoized.
+    ///
+    /// The shared default caches both answers, which is right for a
+    /// request-scoped cache and wrong for an isolate-scoped one: a table a
+    /// migration creates a moment later would read as missing for the life of
+    /// the isolate, and a `list` against a missing table answers an empty
+    /// `RecordList` rather than an error — a silent wrong answer, for minutes.
+    /// A positive is safe to keep: nothing drops a table at runtime on D1
+    /// (the schema-mutation methods are refused, and a migration's `DROP`
+    /// goes through `exec_raw`, which clears this cache).
+    ///
+    /// The cost of not caching it is one `sqlite_master` probe per operation
+    /// against a table that does not exist — the pre-cache behaviour, on a
+    /// path production does not take at all (live deploys set STRICT_SCHEMA,
+    /// which skips the guard outright).
+    async fn table_present_for_op(&self, table: &str) -> Result<bool, DatabaseError> {
+        if self.strict_schema() {
+            return Ok(true);
+        }
+        if self.schema_cache.table_exists(table) == Some(true) {
+            return Ok(true);
+        }
+        // Generation snapshot before the probe yields, as the shared default
+        // takes one: a write-back that raced a schema mutation is dropped.
+        let gen0 = self.schema_cache.generation();
+        let exists = self.dbx_table_exists(table).await?;
+        if exists {
+            self.schema_cache.set_table_exists_if_gen(table, true, gen0);
+        }
+        Ok(exists)
     }
 
     async fn run_fetch(
@@ -948,8 +1010,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn every_d1_service_in_an_isolate_shares_one_schema_cache() {
         forget_isolate_schema();
-        let request_one = D1DatabaseService::new(never_queried_handle(), true);
-        let request_two = D1DatabaseService::new(never_queried_handle(), true);
+        let request_one = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let request_two = D1DatabaseService::new(never_queried_handle(), true, "DB");
         let cache = DbExec::schema_cache(&request_one).expect("the D1 backend keeps a cache");
         let other = DbExec::schema_cache(&request_two).expect("so does every other handle");
         assert!(std::ptr::eq(cache, other), "one isolate, one cache");
@@ -962,16 +1024,156 @@ mod tests {
         );
     }
 
+    /// A `D1Database` double for the table-exists probe: `prepare(sql)` →
+    /// `bind(args)` → `first()` answers one row, `{"present": 0|1}`, which is
+    /// what [`introspect::build_table_exists`] asks for and `scalar_i64` reads
+    /// positionally. `present` is read when `first()` is called, so a test can
+    /// flip it to model a migration landing between two probes; `probes`
+    /// counts the round trips, which is what tells a cached answer from a
+    /// re-read.
+    ///
+    /// The other tests here use an `undefined` handle, which is enough while
+    /// nothing calls it. This one has to call it: the behaviour under test is
+    /// what the guard does with the probe's answer.
+    fn scripted_d1(
+        present: Rc<std::cell::Cell<bool>>,
+        probes: Rc<std::cell::Cell<u32>>,
+    ) -> D1Database {
+        use wasm_bindgen::{closure::Closure, JsCast};
+
+        let statement = js_sys::Object::new();
+        let first = Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |_col: JsValue| {
+            probes.set(probes.get() + 1);
+            let row = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &row,
+                &JsValue::from_str("present"),
+                &JsValue::from(u32::from(present.get())),
+            )
+            .expect("set present");
+            js_sys::Promise::resolve(&JsValue::from(row))
+        });
+        js_sys::Reflect::set(
+            &statement,
+            &JsValue::from_str("first"),
+            first.as_ref().unchecked_ref(),
+        )
+        .expect("set first");
+        first.forget();
+
+        let bound = statement.clone();
+        let bind = Closure::<dyn Fn(JsValue) -> JsValue>::new(move |_args: JsValue| {
+            JsValue::from(bound.clone())
+        });
+        js_sys::Reflect::set(
+            &statement,
+            &JsValue::from_str("bind"),
+            bind.as_ref().unchecked_ref(),
+        )
+        .expect("set bind");
+        bind.forget();
+
+        let db = js_sys::Object::new();
+        let prepared = statement;
+        let prepare = Closure::<dyn Fn(JsValue) -> JsValue>::new(move |_sql: JsValue| {
+            JsValue::from(prepared.clone())
+        });
+        js_sys::Reflect::set(
+            &db,
+            &JsValue::from_str("prepare"),
+            prepare.as_ref().unchecked_ref(),
+        )
+        .expect("set prepare");
+        prepare.forget();
+
+        JsValue::from(db).unchecked_into::<D1Database>()
+    }
+
+    /// A table that does not exist is **not** memoized as missing, so the
+    /// migration that creates it is seen by the next operation rather than by
+    /// the next runtime rebuild.
+    ///
+    /// **Fails on the shared default**, which caches both answers: cheap and
+    /// right for a per-request cache, wrong for an isolate-scoped one. The
+    /// second probe below would be answered `false` from the cache, and a
+    /// `list` against a table the executor believes is missing returns an
+    /// empty `RecordList` — a silent wrong answer, for as long as the isolate
+    /// lives. A positive is still memoized: nothing drops a table at runtime
+    /// on D1.
+    #[wasm_bindgen_test]
+    async fn a_missing_table_is_re_probed_until_it_appears() {
+        forget_isolate_schema();
+        let present = Rc::new(std::cell::Cell::new(false));
+        let probes = Rc::new(std::cell::Cell::new(0u32));
+        let svc = D1DatabaseService::new(
+            scripted_d1(Rc::clone(&present), Rc::clone(&probes)),
+            false,
+            "DB",
+        );
+
+        assert_eq!(
+            DbExec::table_present_for_op(&svc, "later_t").await.ok(),
+            Some(false)
+        );
+        assert_eq!(
+            DbExec::schema_cache(&svc)
+                .expect("a cache")
+                .table_exists("later_t"),
+            None,
+            "a missing table must leave no memoized fact behind"
+        );
+
+        // The migration lands out of band.
+        present.set(true);
+        assert_eq!(
+            DbExec::table_present_for_op(&svc, "later_t").await.ok(),
+            Some(true),
+            "the next operation must see the table, not the isolate's rebuild"
+        );
+        assert_eq!(probes.get(), 2, "both calls probed");
+
+        // …and the positive IS memoized, so the probes stop there.
+        assert_eq!(
+            DbExec::table_present_for_op(&svc, "later_t").await.ok(),
+            Some(true)
+        );
+        assert_eq!(
+            probes.get(),
+            2,
+            "a memoized `present` is served without a probe"
+        );
+    }
+
+    /// A second D1 binding is a second database: it must not be answered from
+    /// the first's memoized schema, where one table name can mean a different
+    /// shape.
+    #[wasm_bindgen_test]
+    fn a_second_binding_is_not_answered_from_the_firsts_schema() {
+        forget_isolate_schema();
+        let primary = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let cache = DbExec::schema_cache(&primary).expect("a cache");
+        cache.set_primary_key_if_gen("shared_name", vec!["id".into()], cache.generation());
+
+        let secondary = D1DatabaseService::new(never_queried_handle(), true, "ARCHIVE_DB");
+        assert_eq!(
+            DbExec::schema_cache(&secondary)
+                .expect("a cache")
+                .primary_key("shared_name"),
+            None,
+            "one binding's schema must never answer for another's"
+        );
+    }
+
     /// The cache outlives a request but not a runtime rebuild: that rebuild is
     /// what follows a deploy or a migration run in another isolate, and
     /// `runtime_cache::store` calls this.
     #[wasm_bindgen_test]
     fn a_rebuild_forgets_what_the_isolate_had_memoized() {
         forget_isolate_schema();
-        let before = D1DatabaseService::new(never_queried_handle(), true);
+        let before = D1DatabaseService::new(never_queried_handle(), true, "DB");
         let cache = DbExec::schema_cache(&before).expect("a cache");
         cache.set_primary_key_if_gen("rebuilt_t", vec!["id".into()], cache.generation());
-        let next_request = D1DatabaseService::new(never_queried_handle(), true);
+        let next_request = D1DatabaseService::new(never_queried_handle(), true, "DB");
         assert_eq!(
             DbExec::schema_cache(&next_request)
                 .expect("a cache")
@@ -982,7 +1184,7 @@ mod tests {
 
         forget_isolate_schema();
 
-        let after = D1DatabaseService::new(never_queried_handle(), true);
+        let after = D1DatabaseService::new(never_queried_handle(), true, "DB");
         assert_eq!(
             DbExec::schema_cache(&after)
                 .expect("a cache")
@@ -1003,7 +1205,7 @@ mod tests {
     /// single drain.
     #[wasm_bindgen_test]
     fn a_d1_service_is_born_with_the_deploys_strict_schema_verdict() {
-        let strict = D1DatabaseService::new(never_queried_handle(), true);
+        let strict = D1DatabaseService::new(never_queried_handle(), true, "DB");
         assert!(
             DbExec::strict_schema(&strict),
             "a service constructed with STRICT_SCHEMA on must already skip the \
@@ -1011,7 +1213,7 @@ mod tests {
              `set_strict_schema` on the drain or pre-Init handles",
         );
 
-        let lax = D1DatabaseService::new(never_queried_handle(), false);
+        let lax = D1DatabaseService::new(never_queried_handle(), false, "DB");
         assert!(
             !DbExec::strict_schema(&lax),
             "and a service constructed with it off must still introspect",
@@ -1025,7 +1227,7 @@ mod tests {
     /// the constructor.
     #[wasm_bindgen_test]
     fn lifecycle_init_still_overrides_the_constructed_verdict() {
-        let svc = D1DatabaseService::new(never_queried_handle(), false);
+        let svc = D1DatabaseService::new(never_queried_handle(), false, "DB");
         DatabaseService::set_strict_schema(&svc, true);
         assert!(DbExec::strict_schema(&svc));
 

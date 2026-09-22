@@ -406,7 +406,34 @@ pub fn build_upsert_sql_stmts(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    /// [`index_tables`] claims to name every table the create/delete builders
+    /// touch. Enforced rather than asserted in prose: each statement has to
+    /// name the table at its position, in both keyword-search shapes.
+    #[test]
+    fn index_tables_names_the_table_each_built_statement_touches() {
+        for keyword_search in [false, true] {
+            let tables = index_tables("idx", keyword_search);
+            for (builder, statements) in [
+                ("create", build_create_index_sql("idx", keyword_search)),
+                ("delete", build_delete_index_sql("idx", keyword_search)),
+            ] {
+                assert_eq!(
+                    statements.len(),
+                    tables.len(),
+                    "{builder} builds one statement per table (keyword_search = {keyword_search})"
+                );
+                for (statement, table) in statements.iter().zip(&tables) {
+                    assert!(
+                        statement.contains(table.as_str()),
+                        "{builder} statement {statement:?} does not name {table}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn create_index_with_keyword_emits_three_tables() {

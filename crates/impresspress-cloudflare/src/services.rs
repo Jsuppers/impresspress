@@ -54,7 +54,7 @@ pub(crate) fn make_d1_database_service_concrete(
     environment: &crate::environment::CfEnvironment,
     binding: &str,
 ) -> Result<Arc<database::D1DatabaseService>, worker::Error> {
-    Ok(Arc::new(d1_service(env.d1(binding)?, environment)))
+    Ok(Arc::new(d1_service(env.d1(binding)?, environment, binding)))
 }
 
 /// The environment → adapter joint, split out from the binding lookup above so
@@ -69,8 +69,9 @@ pub(crate) fn make_d1_database_service_concrete(
 pub(crate) fn d1_service(
     db: worker::D1Database,
     environment: &crate::environment::CfEnvironment,
+    binding: &str,
 ) -> database::D1DatabaseService {
-    database::D1DatabaseService::new(db, environment.strict_schema_enabled())
+    database::D1DatabaseService::new(db, environment.strict_schema_enabled(), binding)
 }
 
 /// Construct a [`DatabaseService`] backed by D1 with a Cloudflare KV cache
@@ -298,13 +299,13 @@ mod tests {
         let mut on = empty_environment();
         on.set_strict_schema_for_test("true");
         assert!(
-            DbExec::strict_schema(&d1_service(never_queried_handle(), &on)),
+            DbExec::strict_schema(&d1_service(never_queried_handle(), &on, "DB")),
             "a deploy that sets the var must get a strict service",
         );
 
         let off = empty_environment();
         assert!(
-            !DbExec::strict_schema(&d1_service(never_queried_handle(), &off)),
+            !DbExec::strict_schema(&d1_service(never_queried_handle(), &off, "DB")),
             "and one that does not must not — a hardcoded `true` is as wrong \
              as a hardcoded `false`",
         );

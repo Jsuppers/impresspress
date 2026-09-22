@@ -2094,10 +2094,11 @@ impl FloatAggregateContext {
         }
     }
 
-    /// The aliases of `req`'s aggregates that PostgreSQL types as `NUMERIC`:
-    /// every `Sum` and `SumWhere` not cast to `BIGINT`, and every `Avg` (the
-    /// database handler rejects `BIGINT` on an `Avg`, so its cast can only be
-    /// `DOUBLE PRECISION`, which is `NUMERIC` there too).
+    /// The aliases of `req`'s aggregates that come back from PostgreSQL as a
+    /// JSON float: every `Sum` and `SumWhere` not cast to `BIGINT` (`NUMERIC`
+    /// there), and every `Avg` — the database handler rejects `BIGINT` on an
+    /// `Avg`, so it is either uncast `NUMERIC` or cast to
+    /// `DOUBLE PRECISION`, and both decode as a float.
     fn numeric_aliases(req: &wafer_block::wire::database::AggregateRequest) -> Vec<String> {
         use wafer_block::wire::database::AggregateColumnDef;
         use wafer_sql_utils::aggregate::CastType;
