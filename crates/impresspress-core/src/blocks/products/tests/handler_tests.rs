@@ -575,7 +575,9 @@ async fn admin_stats_refuse_an_order_refunded_past_its_total() {
         .await
         .expect_err("the analytics the handler reads fail the same way");
     assert!(
-        error.message.contains("refund larger than their total"),
+        error
+            .message
+            .contains("USD Completed orders hold a refund larger than their total"),
         "the message has to name the cause: {}",
         error.message
     );

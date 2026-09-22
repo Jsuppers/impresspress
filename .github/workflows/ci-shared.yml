@@ -1451,27 +1451,28 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE table_name = 'impresspress__products__purchases' AND column_name IN ('shipping_cents','subscription_event_created','provider_payment_status','payment_intent_event_created')")" -eq 4
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE (table_name, column_name) IN (('impresspress__products__refunds','stripe_event_created'),('impresspress__products__seller_accounts','stripe_event_created'),('impresspress__products__provider_operations','processing_owner'))")" -eq 3
 
-      # The commerce analytics reads five money columns as `SUM(...)` through
-      # `db::aggregate`, and every one of them is BIGINT here. PostgreSQL's
-      # `sum(bigint)` is NUMERIC, which `wafer-block-postgres` decodes through
-      # BigDecimal into f64 — so an uncast sum reaches block code as a JSON
-      # float, and `crate::util::aggregate_i64` refuses a float. Every sum the
-      # analytics reads therefore asks for `CAST(... AS BIGINT)`.
+      # The commerce analytics reads six sums through `db::aggregate`: five
+      # money columns, every one of them BIGINT here, plus line-item quantity.
+      # PostgreSQL's `sum(bigint)` is NUMERIC, which `wafer-block-postgres`
+      # decodes through BigDecimal into f64 — so an uncast sum reaches block
+      # code as a JSON float, and `crate::util::aggregate_i64` refuses a float.
+      # Every sum the analytics reads therefore asks for `CAST(... AS BIGINT)`.
       #
       # `money_figures_read_as_integers_where_an_uncast_sum_is_a_float` drives
       # the real analytics against a context that floats every uncast sum and
       # leaves a BIGINT-cast one an integer. This step pins the PREMISE that
-      # test encodes, on a real server: these are the columns, they are
-      # BIGINT, their sum is NUMERIC, and the cast makes it bigint. If
-      # PostgreSQL or the schema ever stopped making it so, the test would
-      # still pass while describing something that no longer happens.
+      # test encodes, on a real server: these are the money columns, they are
+      # BIGINT, and their uncast sum is NUMERIC. If PostgreSQL or the schema
+      # ever stopped making it so, the test would still pass while describing
+      # something that no longer happens. That a BIGINT-cast sum decodes as an
+      # integer end to end is proven upstream, by wafer-run's PostgreSQL
+      # Conformance job (`check_aggregate_money`, wafer-run#336).
       - name: Money sums really are NUMERIC on PostgreSQL
         run: |
           test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE (table_name, column_name) IN (('impresspress__products__purchases','total_cents'),('impresspress__products__purchases','refunded_total_cents'),('impresspress__products__purchases','platform_fee_cents'),('impresspress__products__line_items','total_minor'),('impresspress__products__disputes','amount_minor')) AND data_type = 'bigint'")" -eq 5
           test "$(psql --tuples-only --no-align --command "SELECT pg_typeof(sum(total_cents))::text FROM impresspress__products__purchases")" = "numeric"
           test "$(psql --tuples-only --no-align --command "SELECT pg_typeof(sum(amount_minor))::text FROM impresspress__products__disputes")" = "numeric"
           test "$(psql --tuples-only --no-align --command "SELECT pg_typeof(count(*))::text FROM impresspress__products__purchases")" = "bigint"
-          test "$(psql --tuples-only --no-align --command "SELECT pg_typeof(CAST(sum(total_cents) AS BIGINT))::text FROM impresspress__products__purchases")" = "bigint"
 
       # 020 repairs historical `deleted_at = ''` rows. Those rows sit OUTSIDE
       # 005's partial unique slug index (`slug <> '' AND deleted_at IS NULL`),

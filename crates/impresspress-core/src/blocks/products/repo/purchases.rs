@@ -1934,7 +1934,7 @@ pub(crate) async fn commerce_analytics(
                 )
             })?;
         let orders = analytics_count(&group, "orders")?;
-        let aggregate = by_currency.entry(currency).or_default();
+        let aggregate = by_currency.entry(currency.clone()).or_default();
         aggregate.order_count += orders;
         // Same reasoning as `PurchaseListResponse::from_record_list`: rows
         // whose state column is outside the contract must not take down the
@@ -1960,13 +1960,13 @@ pub(crate) async fn commerce_analytics(
             {
                 return Err(WaferError::new(
                     wafer_run::ErrorCode::Internal,
-                    format!("{status:?} orders hold a negative analytics amount"),
+                    format!("{currency} {status:?} orders hold a negative analytics amount"),
                 ));
             }
             if analytics_count(&group, "over_refunded")? > 0 {
                 return Err(WaferError::new(
                     wafer_run::ErrorCode::Internal,
-                    format!("{status:?} orders hold a refund larger than their total"),
+                    format!("{currency} {status:?} orders hold a refund larger than their total"),
                 ));
             }
             aggregate.paid_order_count += orders;
