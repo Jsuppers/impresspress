@@ -103,6 +103,60 @@ const CONFIG_BLOCK: &str = "wafer-run/config";
 /// callers go through [`get_many`].
 pub const CONFIG_GET_MANY: &str = "impresspress.config.get_many";
 
+/// The interface this block declares: `config@v1`'s two actions plus
+/// [`CONFIG_GET_MANY`].
+///
+/// It has to be its own interface rather than `config@v1`, and that is a
+/// runtime rule rather than bookkeeping: `RuntimeContext::dispatch_call`
+/// refuses a `call_block` whose action is not in the TARGET's declared
+/// interface (`wafer_run::runtime::validation::check_action_interface`), so
+/// under `config@v1` — whose action map is exactly `config.get` and
+/// `config.set` — [`CONFIG_GET_MANY`] is refused before this block sees it,
+/// and every settings page answers 500. Overwriting the platform's
+/// `config@v1` spec instead would claim every `config@v1` block serves an
+/// action only this one does.
+pub const CONFIG_INTERFACE: &str = "impresspress-config@v1";
+
+/// [`CONFIG_INTERFACE`]'s spec: wafer-run's `config@v1` actions under the new
+/// name, plus [`CONFIG_GET_MANY`]. Built from `interfaces::config_v1()` so the
+/// two `config.*` actions cannot drift from the platform's.
+pub fn interface_spec() -> wafer_block::InterfaceSpec {
+    let mut spec = wafer_block::interfaces::config_v1();
+    spec.name = CONFIG_INTERFACE.to_string();
+    spec.description = format!(
+        "{} Adds {CONFIG_GET_MANY}, which fails rather than falling back when the variables \
+         table cannot be read.",
+        spec.description
+    );
+    spec.actions.insert(
+        CONFIG_GET_MANY.to_string(),
+        wafer_block::ActionSpec {
+            description: "Read several config values by key, failing when the stored values \
+                          cannot be read."
+                .to_string(),
+            message_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "keys": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["keys"]
+            })),
+            response_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "values": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "One entry per requested key that has a value; a key \
+                                        with none is absent"
+                    }
+                }
+            })),
+        },
+    );
+    spec
+}
+
 /// Request for [`CONFIG_GET_MANY`].
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct GetManyRequest {
@@ -530,7 +584,11 @@ impl VariablesConfigBlock {
 #[wafer_block::wafer_async_trait]
 impl Block for VariablesConfigBlock {
     fn info(&self) -> BlockInfo {
-        self.inner.info()
+        // wafer-core's info, under this block's own interface: it serves one
+        // action more than `config@v1` declares. See [`CONFIG_INTERFACE`].
+        let mut info = self.inner.info();
+        info.interface = CONFIG_INTERFACE.to_string();
+        info
     }
 
     async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
@@ -622,6 +680,10 @@ pub fn register_with(
     db: Arc<dyn DatabaseService>,
 ) -> Result<(), wafer_run::RuntimeError> {
     let block: Arc<dyn Block> = Arc::new(VariablesConfigBlock::new(boot, db));
+    // Before the block: `dispatch_call` validates a call's action against the
+    // spec registered for the target's declared interface, and an interface
+    // name with no spec only warns and lets every action through.
+    wafer.register_interface(interface_spec());
     wafer.register_block(CONFIG_BLOCK, block)?;
     Ok(())
 }

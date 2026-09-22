@@ -1045,6 +1045,20 @@ impl TestContext {
         self.config_store = true;
     }
 
+    /// The interface the block registered under `name` declares, or `None`
+    /// when this fixture has no such block. See the action gate in
+    /// [`Context::call_block`].
+    fn callee_interface(&self, name: &str) -> Option<String> {
+        if name == "wafer-run/database" {
+            return Some(self.database_block.info().interface);
+        }
+        let block = {
+            let guard = self.blocks.lock().expect("blocks mutex poisoned");
+            guard.get(name).cloned()
+        };
+        block.map(|block| block.info().interface)
+    }
+
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
     /// will route to this block's `handle()`.
     ///
@@ -1718,7 +1732,36 @@ impl Context for TestContext {
             ));
         }
 
-        // Gate 2: WRAP (only when the test opted in via `with_wrap`).
+        // Gate 2: interface action validation, which production runs on EVERY
+        // `call_block` — `RuntimeContext::dispatch_call` checks the message's
+        // action (the `req.action` meta, else the message kind) against the
+        // spec registered for the TARGET block's declared interface. A block
+        // whose interface has no registered spec is skipped, as upstream skips
+        // it (`ActionCheck::UnknownInterface` warns once and proceeds), and so
+        // is a target this fixture cannot resolve to a block.
+        //
+        // The gap this closes is not hypothetical: `blocks::config`'s
+        // `CONFIG_GET_MANY` passed every unit test and was refused by the real
+        // runtime under `config@v1`, which took every settings page with it.
+        if let Some(interface) = self.callee_interface(name) {
+            let action = if msg.action().is_empty() {
+                msg.kind.as_str()
+            } else {
+                msg.action()
+            };
+            if let wafer_run::runtime::validation::ActionCheck::Invalid { message } =
+                wafer_run::runtime::validation::check_action_interface(
+                    name,
+                    &interface,
+                    action,
+                    &interface_specs(),
+                )
+            {
+                return OutputStream::error(WaferError::new(ErrorCode::InvalidArgument, message));
+            }
+        }
+
+        // Gate 3: WRAP (only when the test opted in via `with_wrap`).
         // Mirrors `RuntimeContext::check_resource_access`, which production
         // reaches from the service handler's `decode_and_authorize` — same
         // `check_access` callsite shape, one frame earlier.
@@ -2453,6 +2496,17 @@ impl<'a> SeedUser<'a> {
         .await
         .unwrap_or_else(|e| panic!("seed user {}: {e:?}", self.email))
     }
+}
+
+/// Every interface spec a block in this workspace can declare: wafer-run's
+/// well-known ones plus impresspress's own, which is the config block's
+/// ([`crate::blocks::config::CONFIG_INTERFACE`]). `Wafer` holds the same two
+/// sets — `wafer_block::interfaces::all()` at construction, plus whatever
+/// `register_interface` adds, which in this repo is that one spec.
+fn interface_specs() -> Vec<wafer_block::InterfaceSpec> {
+    let mut specs = wafer_block::interfaces::all();
+    specs.push(crate::blocks::config::interface_spec());
+    specs
 }
 
 /// Build an anonymous request `Message`. No `auth.user_id` meta set.
