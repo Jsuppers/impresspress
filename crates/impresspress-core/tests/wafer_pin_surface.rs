@@ -140,3 +140,48 @@ fn take_where_write_path_surface_is_pinned() {
     let _: fn(&wafer_block_sqlite::service::SQLiteDatabaseService) -> usize =
         wafer_block_sqlite::service::SQLiteDatabaseService::reader_count;
 }
+
+/// The stable-list-ordering and error-body surface (#337, #338), pinned for
+/// the reason [`take_where_write_path_surface_is_pinned`] states: both
+/// `DbExec` impls in this repo are `wasm32`-only, so a host build would not
+/// notice one of these disappearing at the `impl`.
+#[test]
+fn list_tiebreak_and_error_body_surface_is_pinned() {
+    // #337: the record-id policy, public so a backend that inserts rows
+    // through its own path (the D1 batch insert) mints ids the same way the
+    // shared `create` does — a UUIDv7, so a `created_at` tie lists in
+    // creation order.
+    let id: String = wafer_core::interfaces::database::mint_record_id();
+    assert_eq!(
+        uuid::Uuid::parse_str(&id)
+            .expect("a UUID")
+            .get_version_num(),
+        7
+    );
+
+    // #337: the accessor a backend overrides to memoize introspection — now
+    // also the primary key a sorted or paged `list` orders by, which is why
+    // both wasm backends implement it.
+    fn _db_exec_schema_cache<T: wafer_core::interfaces::database::exec::DbExec>() {
+        let _ = T::schema_cache;
+        let _ = T::get_primary_key;
+    }
+
+    // #337: the builders' `unique_key` argument, and the predicate an executor
+    // uses to decide whether it needs the key at all.
+    let _: fn(&wafer_block::db::ListOptions) -> bool = wafer_sql_utils::query::orders_rows;
+    let _: fn(&str, wafer_sql_utils::Backend) -> (String, Vec<serde_json::Value>) =
+        wafer_sql_utils::introspect::build_list_primary_key;
+
+    // #338: the single Error → HTTP rendering, for an adapter that holds a
+    // `WaferError` rather than an `OutputStream` (the browser's buffered
+    // path). It carries the detail code as the body's `code`.
+    let parts: wafer_block::http_codec::HttpResponseParts =
+        wafer_block::http_codec::error_to_http_response(
+            &wafer_block::WaferError::new(wafer_block::ErrorCode::NotFound, "gone")
+                .with_detail_code("not_found"),
+        );
+    assert_eq!(parts.status, 404);
+    let body: serde_json::Value = serde_json::from_slice(&parts.body).expect("a JSON body");
+    assert_eq!(body["code"], "not_found");
+}

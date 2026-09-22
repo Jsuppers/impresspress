@@ -18,6 +18,20 @@
 //! add only missing *columns* (always `TEXT` on SQLite) on demand — unless
 //! STRICT_SCHEMA is on, which this backend now honours (see [`STRICT_SCHEMA`]).
 //!
+//! ## Schema cache
+//!
+//! The shared executor fronts its operations with introspection: a
+//! table-exists probe and a column list (off in STRICT_SCHEMA mode), and a
+//! primary-key lookup before every sorted or paged `list`, whose `ORDER BY`
+//! ends with the key. Each of those is a `bridge::db_query_raw` round trip
+//! into sql.js, so this backend memoizes them in [`SCHEMA_CACHE`], one cache
+//! for the one database. The shared defaults invalidate it on every schema
+//! change they make (`exec_raw`, `ensure_schema_table`, lazy column-add); the
+//! schema changes made anywhere else invalidate it themselves: this file's own
+//! `schema_drop_table` / `schema_add_column`, `vector::service`'s DDL (through
+//! [`forget_table_schema`]), and `db_init` reopening the database (through
+//! [`forget_schema`]).
+//!
 //! ## The `DatabaseService` impl is a ledger, not a list of forwards
 //!
 //! It is written with [`wafer_core::forward_database_service!`], whose
@@ -46,7 +60,10 @@
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        LazyLock,
+    },
 };
 
 // The `forward_database_service!` ledger below spells every generated
@@ -56,6 +73,7 @@ use wafer_block::db::Filter;
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
     exec::DbExec,
+    schema_cache::SchemaCache,
     service::{Column, DatabaseError, DatabaseService, Record, Table, UpsertSpec},
 };
 use wafer_sql_utils::{introspect, Backend};
@@ -73,6 +91,29 @@ use crate::{bridge, db_codec};
 /// property of that database, so a per-instance field would let two handles
 /// disagree about the same schema.
 static STRICT_SCHEMA: AtomicBool = AtomicBool::new(false);
+
+/// Memoized table-exists / column-list / primary-key facts for the one
+/// sql.js database, returned by [`DbExec::schema_cache`].
+///
+/// A static for the reason [`STRICT_SCHEMA`] is one: every
+/// [`BrowserDatabaseService`] handle addresses the same database, so they
+/// share what is known about its schema. A per-handle cache would let the
+/// handle `impresspress-web`'s boot hook builds keep facts that a migration
+/// run through the runtime's handle had already invalidated.
+static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(SchemaCache::new);
+
+/// Drop every memoized schema fact. Called when the whole database changes
+/// under the cache — `db_init` reopening it — rather than one table's shape.
+pub(crate) fn forget_schema() {
+    SCHEMA_CACHE.clear();
+}
+
+/// Drop the memoized schema facts for one table, for a schema change the
+/// shared executor did not make and so did not invalidate for: the DDL
+/// `vector::service` runs straight through the bridge.
+pub(crate) fn forget_table_schema(table: &str) {
+    SCHEMA_CACHE.invalidate(table);
+}
 
 /// Browser-side DatabaseService backed by sql.js via the JS bridge.
 pub struct BrowserDatabaseService;
@@ -149,7 +190,8 @@ pub(crate) fn resolve_flush_outcome<T, E>(op: Result<T, E>, flush: Result<(), E>
     }
 }
 
-// SAFETY: `BrowserDatabaseService` is a unit struct with no shared state.
+// SAFETY: `BrowserDatabaseService` is a unit struct; the state its handles
+// share (`STRICT_SCHEMA`, `SCHEMA_CACHE`) is in statics that are `Sync`.
 // wasm32-unknown-unknown has no threads, so the `Send`/`Sync` bounds
 // required by `Arc<dyn DatabaseService>` are satisfied trivially — no
 // cross-thread aliasing or data races are possible.
@@ -204,6 +246,12 @@ impl BrowserDatabaseService {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl DbExec for BrowserDatabaseService {
     const BACKEND: Backend = Backend::Sqlite;
+
+    /// The database-wide [`SCHEMA_CACHE`]. Without it every sorted or paged
+    /// `list` would read the table's primary key through the bridge first.
+    fn schema_cache(&self) -> Option<&SchemaCache> {
+        Some(&SCHEMA_CACHE)
+    }
 
     /// The flag `DatabaseService::set_strict_schema` recorded. When it is on,
     /// the shared orchestration skips the per-operation table-exists probe and
@@ -460,8 +508,8 @@ wafer_core::forward_database_service! {
         /// same CREATE / add-missing-columns / indexes / FK-indexes sequence,
         /// but it hard-coded `Backend::Sqlite` instead of reading
         /// `Self::BACKEND`, and it did not invalidate the schema cache on the
-        /// error path (harmless here only because this backend has no cache —
-        /// a fact the copy did not state and could not enforce).
+        /// error path. The shared default invalidates [`SCHEMA_CACHE`] on
+        /// both paths.
         ///
         /// What stays browser-specific is the one flush: the whole sequence is
         /// several `run_execute` calls and they share a single write to OPFS.
@@ -470,11 +518,15 @@ wafer_core::forward_database_service! {
                 .await
         }
 
+        /// DDL through `run_execute` rather than a shared default, so the
+        /// cached facts for `name` are dropped here, whatever the statement
+        /// returned.
         async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
             self.with_flush(async {
                 let stmt = wafer_sql_utils::ddl::build_drop_table(name, Self::BACKEND);
-                self.run_execute(&stmt.sql, &[]).await?;
-                Ok(())
+                let dropped = self.run_execute(&stmt.sql, &[]).await;
+                SCHEMA_CACHE.invalidate(name);
+                dropped.map(|_| ())
             })
             .await
         }
@@ -486,8 +538,9 @@ wafer_core::forward_database_service! {
         ) -> Result<(), DatabaseError> {
             self.with_flush(async {
                 let stmt = wafer_sql_utils::ddl::build_add_column(table, column, Self::BACKEND);
-                self.run_execute(&stmt.sql, &[]).await?;
-                Ok(())
+                let added = self.run_execute(&stmt.sql, &[]).await;
+                SCHEMA_CACHE.invalidate(table);
+                added.map(|_| ())
             })
             .await
         }
@@ -705,6 +758,100 @@ mod strict_schema_policy {
 
         DatabaseService::set_strict_schema(&svc, false);
         assert!(!DbExec::strict_schema(&svc));
+    }
+}
+
+/// The schema cache the shared executor memoizes introspection in. No bridge:
+/// the facts are written straight into the cache the executor reads.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod schema_cache_policy {
+    use wafer_core::interfaces::database::exec::DbExec;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{forget_schema, BrowserDatabaseService};
+
+    /// **Fails without the cache**, where `DbExec::schema_cache` was the
+    /// trait's `None` default: every sorted or paged `list` then read the
+    /// table's primary key through the bridge before its select. Two handles
+    /// share one cache, because they address one database, and
+    /// `forget_schema` empties it for the schema changes the shared executor
+    /// does not see.
+    #[wasm_bindgen_test]
+    fn every_handle_shares_one_cache_and_forget_schema_empties_it() {
+        let runtime = BrowserDatabaseService;
+        let boot_hook = BrowserDatabaseService;
+        let cache = DbExec::schema_cache(&runtime).expect("the browser backend keeps a cache");
+        let other = DbExec::schema_cache(&boot_hook).expect("so does every other handle");
+        assert!(std::ptr::eq(cache, other), "one database, one cache");
+
+        cache.set_primary_key_if_gen("cache_policy_t", vec!["id".into()], cache.generation());
+        assert_eq!(
+            other.primary_key("cache_policy_t"),
+            Some(vec!["id".to_string()]),
+            "a key one handle learned is served to the other"
+        );
+
+        forget_schema();
+        assert_eq!(other.primary_key("cache_policy_t"), None);
+    }
+}
+
+/// The invalidation half of the cache: every schema change the shared executor
+/// does not make has to drop what the cache knows about the table it changed.
+///
+/// Each of these calls a bridge function, which rejects under
+/// `wasm-pack test --node` (there is no sql.js there) — which is the point:
+/// the invalidation has to happen whatever the statement returned, because a
+/// failed DDL may still have applied. The test seeds a fact, calls the real
+/// method, and asserts the fact is gone however the call ended.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod schema_invalidation {
+    use wafer_core::interfaces::database::{
+        exec::DbExec,
+        service::{Column, DatabaseService},
+    };
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::BrowserDatabaseService;
+
+    /// Seed a primary key for `table` and hand back the cache it went into.
+    fn seed(table: &str) -> &'static wafer_core::interfaces::database::schema_cache::SchemaCache {
+        let cache = DbExec::schema_cache(&BrowserDatabaseService).expect("a cache");
+        cache.set_primary_key_if_gen(table, vec!["id".into()], cache.generation());
+        assert_eq!(cache.primary_key(table), Some(vec!["id".to_string()]));
+        cache
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropping_a_table_forgets_it() {
+        let cache = seed("invalidate_drop_t");
+        let _ =
+            DatabaseService::schema_drop_table(&BrowserDatabaseService, "invalidate_drop_t").await;
+        assert_eq!(cache.primary_key("invalidate_drop_t"), None);
+    }
+
+    #[wasm_bindgen_test]
+    async fn adding_a_column_forgets_its_table() {
+        let cache = seed("invalidate_add_t");
+        let _ = DatabaseService::schema_add_column(
+            &BrowserDatabaseService,
+            "invalidate_add_t",
+            &Column::new(
+                "extra",
+                wafer_core::interfaces::database::service::DataType::Text,
+            ),
+        )
+        .await;
+        assert_eq!(cache.primary_key("invalidate_add_t"), None);
+    }
+
+    /// Reopening the database replaces everything the cache described, so it
+    /// drops the lot rather than one table.
+    #[wasm_bindgen_test]
+    async fn reopening_the_database_forgets_everything() {
+        let cache = seed("invalidate_init_t");
+        let _ = crate::db_init().await;
+        assert_eq!(cache.primary_key("invalidate_init_t"), None);
     }
 }
 

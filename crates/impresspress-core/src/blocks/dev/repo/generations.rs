@@ -459,6 +459,12 @@ fn status_in(keep: impl Fn(GenerationStatus) -> bool) -> Filter {
 
 /// Newest first, with `id` breaking a `created_at` tie — the one ordering
 /// every listing here uses, and the one the retention boundary is defined in.
+///
+/// The database appends a table's primary key (`id` here) to a sorted list
+/// anyway, in the last sort term's direction. It is named here regardless because
+/// [`list_prunable`]'s boundary filter compares `id` in exactly this
+/// direction, and the order that filter depends on belongs beside it rather
+/// than in the runtime's defaults.
 fn newest_first() -> Vec<SortField> {
     vec![
         SortField {

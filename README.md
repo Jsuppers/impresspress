@@ -28,6 +28,23 @@ If you commit from this checkout, point git at the repository's hooks once so fo
 git config core.hooksPath .githooks
 ```
 
+### Running the tests
+
+```sh
+cargo test --workspace --exclude impresspress-web --exclude impresspress-cloudflare
+cargo test -p impresspress-cloudflare --target wasm32-unknown-unknown --lib   # needs wasm-bindgen-test-runner
+NODE_OPTIONS=--import\ ./js/test/node-hooks.mjs wasm-pack test --node crates/impresspress-browser
+```
+
+The browser suite needs that `NODE_OPTIONS` import, which CI sets as a job
+env. `crates/impresspress-browser/js/bridge.js` carries a top-level
+`import initSqlJs from '/vendor/sql-wasm-esm.js'` — an absolute site-root path
+a Service Worker resolves and plain Node cannot — and the hook stubs that one
+specifier. Without it the whole suite fails to load with `ERR_MODULE_NOT_FOUND`
+before a single test runs. The path is relative to `crates/impresspress-browser`,
+which is where `wasm-pack` runs `cargo test` from, so do not export it for the
+other suites.
+
 ## Try it without installing anything
 
 `dev.impresspress.org` is a browser-local sandbox where a WebMCP-capable AI agent builds a site, writes backend blocks and stocks a shop entirely in your browser tab — nothing is installed, and nothing is deployed behind it. See [`docs/dev-sandbox.md`](docs/dev-sandbox.md).

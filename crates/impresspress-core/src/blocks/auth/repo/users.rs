@@ -163,26 +163,20 @@ fn like_filter(field: &str, pattern: &str) -> Filter {
     }
 }
 
-/// Newest account first, as a TOTAL order. `created_at` has one-second
-/// precision, so accounts created in the same second tie on it, and SQL
-/// leaves the order of tied rows to the backend's plan — a page boundary
-/// through a tie can then repeat or skip an account between two pages, and
-/// "the most recent" can name the oldest of the second. `id` breaks the tie:
-/// it is unique, so the order is total, which is what paging needs. [`insert`]
-/// mints it as a UUIDv7, which within one process orders by creation, so
-/// there the tie also resolves newest first; ids minted in the same
-/// millisecond by different processes (two Workers isolates) order at random.
+/// Newest account first. `created_at` has one-second precision, so accounts
+/// created in the same second tie on it; the database breaks the tie on the
+/// primary key, `id`, in the direction of this sort (a sorted `list` ends its
+/// `ORDER BY` with the table's key, and this table has one — `id TEXT PRIMARY
+/// KEY`, `001_auth_schema.sqlite.sql`), which makes the order total — what
+/// paging needs. [`insert`] mints `id` as a UUIDv7, which within one process
+/// orders by creation, so there the tie also resolves newest first; ids
+/// minted in the same millisecond by different processes (two Workers
+/// isolates) order at random.
 fn newest_first() -> Vec<SortField> {
-    vec![
-        SortField {
-            field: "created_at".to_string(),
-            desc: true,
-        },
-        SortField {
-            field: "id".to_string(),
-            desc: true,
-        },
-    ]
+    vec![SortField {
+        field: "created_at".to_string(),
+        desc: true,
+    }]
 }
 
 pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, WaferError> {

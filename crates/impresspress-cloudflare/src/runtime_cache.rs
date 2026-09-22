@@ -514,6 +514,14 @@ fn cached() -> Option<Rc<ReadyRuntime>> {
 }
 
 fn store(rt: Rc<ReadyRuntime>) {
+    // A rebuild is this isolate's one signal that the world may have moved:
+    // it follows a deploy, a migration run or any config-version bump
+    // (`force_bump_config_version` marks every other isolate dirty). Schema
+    // facts memoized from before it may describe a schema another isolate has
+    // since migrated, so they go with the old runtime. Within an isolate the
+    // shared `DbExec` paths invalidate per table as they mutate — see
+    // `database::D1DatabaseService::schema_cache`.
+    crate::database::forget_isolate_schema();
     // `IsolateCell::set` installs the new runtime BEFORE dropping the old
     // one. That matters here: the displaced `Rc<ReadyRuntime>` may be the
     // last handle to an entire Wafer, so its destructor is long enough to be
@@ -1545,6 +1553,46 @@ mod tests {
         NEXT_BUILD_OWNER.with(|value| value.set(0));
         BUILD_LIVENESS.with(IsolateCell::clear);
         DIRTY.with(|value| value.set(false));
+    }
+
+    /// A bare runtime, enough to publish: `store` only moves the `Rc`.
+    fn ready_runtime() -> Rc<ReadyRuntime> {
+        Rc::new(ReadyRuntime {
+            wafer: wafer_run::Wafer::new(std::sync::Arc::new(
+                wafer_run::StaticConfigSource::default(),
+            ))
+            .expect("a bare runtime"),
+            version: "v-test".to_string(),
+            config_version: None,
+            environment_identity: "env-test".to_string(),
+            probe_deadline_ms: Cell::new(0),
+            probe_failures: Cell::new(0),
+        })
+    }
+
+    /// Publishing a runtime drops the isolate's memoized schema. That is the
+    /// only point at which a schema change made by another isolate — a deploy,
+    /// a migration run — can be assumed to have reached this one, and the
+    /// wiring is what makes the isolate-scoped cache sound; the cache's own
+    /// tests cannot see it.
+    #[wasm_bindgen_test]
+    fn publishing_a_runtime_drops_the_isolates_schema_cache() {
+        let cache = crate::database::isolate_schema_cache("DB");
+        cache.set_primary_key_if_gen("published_t", vec!["id".into()], cache.generation());
+        assert_eq!(
+            crate::database::isolate_schema_cache("DB").primary_key("published_t"),
+            Some(vec!["id".to_string()]),
+            "the fact is in the isolate's cache before the rebuild"
+        );
+
+        store(ready_runtime());
+
+        assert_eq!(
+            crate::database::isolate_schema_cache("DB").primary_key("published_t"),
+            None,
+            "a rebuilt isolate must re-introspect rather than trust a schema \
+             another isolate may have migrated"
+        );
     }
 
     /// The NEGATIVE side of the build slot, which nothing else asserted.
