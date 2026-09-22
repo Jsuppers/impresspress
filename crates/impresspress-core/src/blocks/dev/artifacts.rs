@@ -110,9 +110,10 @@ pub async fn get_direct(
 /// `O(folder)` on OPFS, and a buffered `get` would transfer up to
 /// [`super::validation::MAX_ARTIFACT_BYTES`] to answer a yes or no.
 ///
-/// Activation does not ask this: it answers the same question from the builds
-/// ledger ([`repo::builds::artifact_index`](super::repo::builds::artifact_index)),
-/// which costs no storage call at all — see `activation::missing_content`.
+/// Nothing in the block asks this — tests use it to observe the store.
+/// Activation answers the same question from the builds ledger
+/// ([`artifact_index`](super::repo::builds::artifact_index)), which costs no
+/// storage call at all — see `activation::missing_content`.
 pub async fn exists(ctx: &dyn Context, sha: &str) -> Result<bool, WaferError> {
     match storage::get_stream(ctx, FOLDER, &key_for(sha)).await {
         Ok(_unread) => Ok(true),

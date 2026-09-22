@@ -226,6 +226,29 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
         workspace::load(ctx).await.map_err(Refusal::Internal)?
     };
 
+    // --- the data snapshot -----------------------------------------------
+    //
+    // First, before the shell and before any stored content: it is the one
+    // part of the bundle with a size limit, and an export that is going to be
+    // refused should cost one snapshot, not the runtime's wasm and the whole
+    // site as well.
+    //
+    // Compact, not pretty-printed: the file's reader is the importer, and
+    // indentation repeated on every row would spend a sizeable share of
+    // [`seed::MAX_DATA_BYTES`] on whitespace.
+    let snapshot = data_snapshot::export(ctx)
+        .await
+        .map_err(Refusal::Internal)?;
+    let data_bytes = serde_json::to_vec(&snapshot)
+        .map_err(|e| Refusal::Internal(encoding_error("the data snapshot", e)))?;
+    // The importer's bound, applied here so an export is never a bundle its
+    // own importer refuses.
+    if data_bytes.len() > seed::MAX_DATA_BYTES {
+        return Err(Refusal::DataTooLarge {
+            bytes: data_bytes.len(),
+        });
+    }
+
     // --- the shell -------------------------------------------------------
     let listed = shared.shell.list().await.map_err(Refusal::Shell)?;
     let mut shell: Vec<Entry> = Vec::new();
@@ -255,19 +278,6 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     }
 
     // --- the seed --------------------------------------------------------
-    let snapshot = data_snapshot::export(ctx)
-        .await
-        .map_err(Refusal::Internal)?;
-    let data_bytes = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|e| Refusal::Internal(encoding_error("the data snapshot", e)))?;
-    // The importer's bound, applied here so an export is never a bundle its
-    // own importer refuses — and before a single blob is read, so the refusal
-    // costs one snapshot rather than the whole archive.
-    if data_bytes.len() > seed::MAX_DATA_BYTES {
-        return Err(Refusal::DataTooLarge {
-            bytes: data_bytes.len(),
-        });
-    }
     let tables: BTreeMap<String, usize> = snapshot
         .tables
         .iter()

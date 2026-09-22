@@ -111,6 +111,9 @@ pub struct GcReport {
     /// that ([`workspace::Workspace::blob_bytes`]), which is what design §6.6
     /// bounds. This is the storage figure.
     pub bytes_freed: u64,
+    /// How many build rows were dropped because the artifact they name is no
+    /// longer stored.
+    pub build_rows_dropped: u32,
 }
 
 /// A seam the collector yields at, once, between its listing and its roots.
@@ -127,6 +130,12 @@ pub struct GcReport {
 pub trait GcInterleave: wafer_run::MaybeSend + wafer_run::MaybeSync {
     /// Called once, after both folders have been listed and before any root
     /// has been read.
+    ///
+    /// **Called with `DevShared::workspace` held** — the collector takes it
+    /// before the blob listing (see "The counters are read off the listing").
+    /// An implementation that writes a workspace file, or does anything else
+    /// that takes that lock, deadlocks: it waits on the collector that is
+    /// waiting on it.
     async fn after_listing(&self);
 }
 
@@ -151,6 +160,20 @@ pub async fn collect_interleaved(
     shared: &DevShared,
     interleave: &dyn GcInterleave,
 ) -> Result<GcReport, WaferError> {
+    // 0. The settled build rows, read before the artifact listing — see
+    //    `stale_build_rows` for why that order makes the rows it drops safe
+    //    to drop.
+    let settled = repo::builds::list_settled(ctx).await?;
+
+    // 1. The listings, first and before any root is read. They fix the
+    //    candidate set: an object stored after this point is not in it.
+    //
+    //    The artifact folder is listed before the workspace lock is taken:
+    //    nothing in `workspace.json` describes an artifact, and a listing is
+    //    `O(folder)` on OPFS, so holding the lock across it would only make
+    //    saves and the status poll wait longer.
+    let artifact_objects = list_all(ctx, artifacts::FOLDER).await?;
+
     // The workspace lock, before the blob listing and held until the blob
     // half is done (see "The counters are read off the listing" above).
     //
@@ -159,11 +182,7 @@ pub async fn collect_interleaved(
     // nothing holding it is ever waiting on the queue this runs under, and
     // nothing below takes another lock while holding it.
     let serialized = shared.workspace.lock().await;
-
-    // 1. The listings, first and before anything else is read. They fix the
-    //    candidate set: an object stored after this point is not in it.
     let blob_objects = list_all(ctx, blobs::FOLDER).await?;
-    let artifact_objects = list_all(ctx, artifacts::FOLDER).await?;
 
     interleave.after_listing().await;
 
@@ -198,7 +217,12 @@ pub async fn collect_interleaved(
     let mut report = GcReport::default();
     collect_blobs(ctx, blob_objects, live_blobs, &mut report).await?;
     drop(serialized);
+    let stale = stale_build_rows(settled, &artifact_objects);
     collect_artifacts(ctx, artifact_objects, &live_artifacts, &mut report).await?;
+    for id in stale {
+        repo::builds::delete(ctx, &id).await?;
+        report.build_rows_dropped += 1;
+    }
     Ok(report)
 }
 
@@ -296,6 +320,38 @@ async fn collect_blobs(
         workspace::save(ctx, &ws).await?;
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// The settled build rows whose artifact the store no longer holds.
+///
+/// The collector deletes an artifact and then the rows naming it; if the row
+/// delete fails, the rows outlive their bytes. The artifact half of
+/// [`collect_artifacts`] walks the folder listing and so never meets them
+/// again, yet `dev_status` counts them in the artifact total and activation
+/// answers "is this artifact stored?" from them
+/// ([`repo::builds::artifact_index`]). They are found here instead, by the
+/// other direction: a row whose artifact is not in the listing.
+///
+/// Only rows that were already settled — `valid` or `invalid`, never
+/// `staged` — **when they were read, before the listing**. Every path that
+/// settles a row does so after its artifact is stored (staging stores the
+/// bytes before it validates them; the seed importer stores them before it
+/// records the row), so a row settled before the listing had its bytes down
+/// before the listing too, and missing from it means gone. A staged row makes
+/// no such promise: its bytes may be stored a moment after the listing, which
+/// is why staging's rows are roots rather than candidates here. And the rows
+/// are dropped by id, so a compile that stages the same bytes again after the
+/// read keeps its own row.
+fn stale_build_rows(settled: Vec<repo::builds::SettledRow>, listed: &[ObjectInfo]) -> Vec<String> {
+    let stored: BTreeSet<&str> = listed
+        .iter()
+        .filter_map(|object| artifacts::sha_of_key(&object.key))
+        .collect();
+    settled
+        .into_iter()
+        .filter(|row| !stored.contains(row.artifact_sha256.as_str()))
+        .map(|row| row.id)
+        .collect()
 }
 
 /// Delete the unreachable artifacts and the build rows that named them.

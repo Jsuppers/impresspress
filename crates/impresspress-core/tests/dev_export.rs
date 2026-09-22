@@ -199,6 +199,14 @@ fn sorted(entries: &HashMap<String, Vec<u8>>) -> Vec<String> {
 /// A sandbox with the products block, a shop page, one compiled block and one
 /// product — the state the scenario in design §16 leaves behind.
 async fn shop_instance(control: &std::sync::Arc<FakeControl>) -> TestContext {
+    shop_instance_with_shell(control, std::sync::Arc::new(FakeShell::new())).await
+}
+
+/// [`shop_instance`] over a shell the caller keeps a handle to.
+async fn shop_instance_with_shell(
+    control: &std::sync::Arc<FakeControl>,
+    shell: std::sync::Arc<FakeShell>,
+) -> TestContext {
     control.set_validated_info(hello_info("site/hello"));
     // `with_auth_added`: the data snapshot's allowlist spans products, admin
     // AND auth (`users`, `local_credentials`, `user_roles` — the visitor's own
@@ -210,7 +218,7 @@ async fn shop_instance(control: &std::sync::Arc<FakeControl>) -> TestContext {
         .await
         .with_auth_added()
         .await
-        .with_dev_added_and_shell(control.clone(), std::sync::Arc::new(FakeShell::new()))
+        .with_dev_added_and_shell(control.clone(), shell)
         .await;
     dev_post(
         &ctx,
@@ -1050,7 +1058,8 @@ async fn data_json_len(ctx: &TestContext) -> usize {
 #[tokio::test]
 async fn a_data_snapshot_over_the_import_limit_is_refused_at_export_and_one_at_it_round_trips() {
     let a_control = FakeControl::new();
-    let a = shop_instance(&a_control).await;
+    let a_shell = std::sync::Arc::new(FakeShell::new());
+    let a = shop_instance_with_shell(&a_control, a_shell.clone()).await;
 
     // Grow the notes until `data.json` is exactly the limit. The value is
     // plain ASCII, so a byte of value is a byte of JSON; the loop only has to
@@ -1095,10 +1104,23 @@ async fn a_data_snapshot_over_the_import_limit_is_refused_at_export_and_one_at_i
     // One byte over: refused, on both routes and to the non-HTTP caller.
     set_notes(&a, len + 1).await;
     for path in ["/b/dev/api/export", "/b/dev/api/export/manifest"] {
+        let before = a.storage_reads().len();
+        let shell_before = a_shell.fetches();
         let refused = wafer_block::http_codec::collect_http_response(
             a.dispatch(admin_msg("retrieve", path)).await,
         )
         .await;
+        // Refused before the runtime or any stored content was read: the
+        // snapshot is built and measured first.
+        assert_eq!(a_shell.fetches(), shell_before, "{path} fetched the shell");
+        let reads = a.storage_reads()[before..].to_vec();
+        assert!(
+            !reads
+                .iter()
+                .any(|read| read.contains("impresspress/dev/blobs/")
+                    || read.contains("impresspress/dev/artifacts/")),
+            "{path} read content it was about to refuse: {reads:#?}"
+        );
         assert_eq!(refused.status, 413, "{path}");
         let body: serde_json::Value = serde_json::from_slice(&refused.body).expect("json");
         let message = body["message"].as_str().expect("message");

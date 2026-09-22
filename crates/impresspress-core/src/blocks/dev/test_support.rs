@@ -396,6 +396,8 @@ pub struct FakeShell {
     files: BTreeMap<String, Vec<u8>>,
     /// Set by [`Self::failing_to_list`]: what `list` refuses with.
     list_failure: Option<String>,
+    /// How many files `fetch` has been asked for — read by [`Self::fetches`].
+    fetched: std::sync::atomic::AtomicUsize,
 }
 
 /// The `sw.js` [`FakeShell::new`] serves — a dev bundle's, trimmed to the
@@ -442,7 +444,14 @@ impl FakeShell {
         Self {
             files,
             list_failure: None,
+            fetched: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many shell files have been fetched so far: what an export that
+    /// was refused before it read the runtime has to leave at zero.
+    pub fn fetches(&self) -> usize {
+        self.fetched.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Add or replace one file, chainable.
@@ -478,6 +487,8 @@ impl ShellSource for FakeShell {
     }
 
     async fn fetch(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.fetched
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.files
             .get(path)
             .cloned()

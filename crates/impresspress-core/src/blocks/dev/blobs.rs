@@ -95,12 +95,12 @@ pub async fn get(ctx: &dyn Context, sha: &str) -> Result<Vec<u8>, WaferError> {
 ///   blob.
 ///
 /// And a *streaming* read, dropped unread: the object's metadata arrives
-/// ahead of its body, so the answer costs an open, not a transfer. The
-/// buffered `storage::get` would pull the whole blob across to answer a yes or
-/// no — up to [`super::paths::MAX_FILE_BYTES`] per call, on the write path.
-/// Dropping the stream is how the body is declined: the backends that stream
-/// (OPFS, R2, the local filesystem) release their reader when the consumer
-/// goes away.
+/// ahead of its body, so the answer costs an open and at most the few chunks
+/// the backend's reader pulls before it sees the consumer has gone — not the
+/// whole blob, which the buffered `storage::get` would transfer to answer a yes
+/// or no (up to [`super::paths::MAX_FILE_BYTES`] per call, on the write path).
+/// Dropping the stream is how the body is declined: the OPFS backend the
+/// sandbox runs on releases its reader when the consumer goes away.
 pub async fn exists(ctx: &dyn Context, sha: &str) -> Result<bool, WaferError> {
     match storage::get_stream(ctx, FOLDER, sha).await {
         Ok(_unread) => Ok(true),

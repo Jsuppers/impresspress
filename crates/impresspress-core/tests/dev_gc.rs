@@ -468,6 +468,94 @@ async fn a_blob_whose_charge_was_lost_leaves_the_quota_exact_after_collection() 
     assert_eq!(output_http_status(over).await, 413);
 }
 
+/// The collector takes the workspace lock BEFORE it lists the blob store, and
+/// the counters depend on it. A write that stored its blob and saved its charge
+/// after an unlocked listing would be charged in the workspace and absent from
+/// the listing, and the reset would drop the charge.
+///
+/// Forced, not hoped for: the write is parked inside its own lock hold (on its
+/// `workspace.json` read), the collection is started while it is parked, and
+/// the write is released only once the collection has had every chance to run
+/// as far as it can. Locked first, the collection waits for the write and
+/// lists its blob; listing first, it lists without it, waits, and resets the
+/// counters from a listing that is missing the write's blob.
+#[tokio::test]
+async fn a_write_landing_as_a_collection_starts_keeps_its_charge() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    let hold = ctx.hold_next_storage_get("impresspress/dev", "", "workspace.json");
+    let write = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "blocks/shop/late.txt", "content": "late", "expected_sha256": null}),
+    );
+    let collection = async {
+        while !hold.was_reached() {
+            tokio::task::yield_now().await;
+        }
+        gc::collect(&ctx, &shared).await
+    };
+    let driver = async {
+        while !hold.was_reached() {
+            tokio::task::yield_now().await;
+        }
+        // Far fewer than the park's budget, far more than the collection
+        // needs to reach the lock (or, listing first, to list and then reach
+        // it).
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        hold.release();
+    };
+    let (written, collected, ()) = tokio::join!(write, collection, driver);
+    assert!(hold.was_reached());
+    assert!(
+        !hold.budget_expired(),
+        "the write was released, not timed out"
+    );
+    assert_eq!(output_http_status(written).await, 200);
+    collected.expect("collect");
+
+    let after = workspace::load(&ctx).await.expect("load");
+    assert_eq!(
+        (after.blob_bytes, after.blob_count),
+        stored_blobs(&ctx).await,
+        "the write's charge survived the collection",
+    );
+    assert_eq!(after.blob_count, 1);
+}
+
+/// A build row can outlive its artifact — the collector deletes the bytes and
+/// then the rows, and the second step can fail. The folder walk never meets
+/// such a row again, yet `dev_status` counts it and activation treats its
+/// artifact as stored. The next collection drops it; a staged row, whose
+/// bytes may simply not have arrived yet, it leaves alone.
+#[tokio::test]
+async fn a_settled_build_row_whose_artifact_is_gone_is_dropped() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    let (spec, bytes) = spec_only(&ctx, "gone").await;
+    let orphan = accept_build(&ctx, &spec, bytes.len() as u64).await;
+    artifacts::delete(&ctx, &spec.artifact_sha256)
+        .await
+        .expect("the bytes go, the row stays");
+    let pending = stage_build(&ctx, &blobs::sha256_hex(b"\0asm\x01pending"), 16).await;
+    assert_eq!(storage_of(&ctx).await["artifacts"], 2);
+
+    let report = gc::collect(&ctx, &shared).await.expect("collect");
+    assert_eq!(report.build_rows_dropped, 1);
+    assert!(
+        repo::builds::get(&ctx, &orphan).await.is_err(),
+        "the row naming nothing is gone"
+    );
+    repo::builds::get(&ctx, &pending)
+        .await
+        .expect("a staged row is a compile on its way, not an orphan");
+    assert_eq!(storage_of(&ctx).await["artifacts"], 1);
+}
+
 /// A delete that fails partway through a collection must not throw away the
 /// credit for the blobs the same pass already freed: the counters are saved
 /// before the failure is returned, and say what the store still holds —

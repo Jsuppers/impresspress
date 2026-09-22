@@ -741,7 +741,11 @@ async fn identical_content_is_charged_once_however_many_paths_name_it() {
 async fn a_workspace_full_of_unreachable_blobs_refuses_the_next_write() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let mut ws = workspace::Workspace::default();
-    ws.record_blob_stored(paths::MAX_WORKSPACE_BYTES);
+    // 128 largest-possible files' worth of stored blobs: what 128 overwrites
+    // of one page leave behind.
+    for _ in 0..(paths::MAX_WORKSPACE_BYTES / paths::MAX_FILE_BYTES as u64) {
+        ws.record_blob_stored(paths::MAX_FILE_BYTES as u64);
+    }
     workspace::save(&ctx, &ws)
         .await
         .expect("stage a full workspace");
@@ -756,7 +760,10 @@ async fn a_workspace_full_of_unreachable_blobs_refuses_the_next_write() {
 
     // Collecting one blob's worth makes room again — the counters the
     // collector resets are the ones the quota reads.
-    ws.reset_blob_totals(paths::MAX_WORKSPACE_BYTES - paths::MAX_FILE_BYTES as u64, 0);
+    ws.reset_blob_totals(
+        paths::MAX_WORKSPACE_BYTES - paths::MAX_FILE_BYTES as u64,
+        ws.blob_count - 1,
+    );
     workspace::save(&ctx, &ws).await.expect("stage room");
     let out = dev_post(
         &ctx,

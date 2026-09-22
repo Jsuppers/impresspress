@@ -957,9 +957,11 @@ async fn load_previous(
 ///   own table of contents. One ledger read replaces a probe per block, and a
 ///   block's artifact is up to [`super::validation::MAX_ARTIFACT_BYTES`]. The
 ///   one way the two can disagree is a collection that deleted an artifact
-///   and then failed to drop its rows; a runtime rebuild reads every artifact
-///   it loads, so a manifest naming such an artifact still fails, as a
-///   refused rebuild rather than here.
+///   and then failed to drop its rows. Until the next collection drops them
+///   (`gc`'s stale-row pass), this answers "stored" for that artifact: a
+///   manifest that changes the block set then fails at the rebuild, which
+///   reads every artifact it loads, but one that keeps the block set — a site
+///   write — commits naming it, as the generation before it already did.
 /// * **Blobs** have no ledger, so each is probed with [`blobs::exists`], which
 ///   opens the object and declines its body rather than reading it.
 ///

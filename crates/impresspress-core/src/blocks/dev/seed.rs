@@ -221,10 +221,15 @@ pub const DATA_CONTENT_TYPE: &str = "application/json";
 /// over a bundle whose own importer then rejects it — on a cold boot, where
 /// the refusal leaves the imported instance's site empty.
 ///
-/// The same size as a workspace file ([`paths::MAX_FILE_BYTES`]), for the same
-/// reason: the snapshot is held whole more than once on the way in — the
-/// fetched bytes and the parsed rows — on a runtime that may be a browser tab.
-pub const MAX_DATA_BYTES: usize = 512 * 1024;
+/// Sized for a shop, not for an editable file. The snapshot carries every row
+/// of the exported tables — each account with its credentials and role, each
+/// product with its offers — so a limit on the scale of
+/// [`paths::MAX_FILE_BYTES`] would refuse an ordinary shop of a few hundred
+/// accounts. 8 MiB of compact JSON is over a thousand products or several
+/// thousand accounts, and still small for the service worker that imports it:
+/// the fetched bytes are dropped once they are parsed, so the peak is the
+/// bytes plus the parsed rows, briefly.
+pub const MAX_DATA_BYTES: usize = 8 * 1024 * 1024;
 
 /// The short workspace name of a registered block (`site/hello` → `hello`).
 ///
@@ -515,10 +520,16 @@ async fn import_bundle(
     // a bare `Option<String>` path could only ever be.
     if let Some(declared) = &manifest.data {
         let url = data_url(&declared.path);
-        let bytes =
-            fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE, MAX_DATA_BYTES).await?;
-        let snapshot: data_snapshot::DataSnapshot = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?;
+        // The raw bytes live only as long as the parse: the rows are applied
+        // from the parsed snapshot, so holding up to `MAX_DATA_BYTES` of JSON
+        // beside them through every database write would be a second copy of
+        // the snapshot for nothing.
+        let snapshot: data_snapshot::DataSnapshot = {
+            let bytes =
+                fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE, MAX_DATA_BYTES).await?;
+            serde_json::from_slice(&bytes)
+                .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?
+        };
         data_snapshot::import(ctx, &snapshot)
             .await
             .map_err(|e| format!("{url}: {}", e.message))?;
