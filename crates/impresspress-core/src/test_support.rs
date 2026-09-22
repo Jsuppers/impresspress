@@ -790,6 +790,39 @@ impl TestContext {
         self.storage().fail_next_put(message);
     }
 
+    /// Make the fixture's object store refuse the next `put` of one object,
+    /// letting every other `put` through.
+    ///
+    /// `block`, `folder` and `key` are [`Self::storage_get`]'s three parts.
+    /// For the failures that land after other writes on the same request —
+    /// a file write whose blob stores and whose `workspace.json` save does
+    /// not, or a rollback whose publish succeeds and whose workspace adoption
+    /// does not — where [`Self::fail_next_storage_put`] would hit the first
+    /// write instead.
+    pub fn fail_next_storage_put_to(&self, block: &str, folder: &str, key: &str, message: &str) {
+        self.storage()
+            .fail_next_put_to(&store_folder(block, folder), key, message);
+    }
+
+    /// Make the fixture's object store refuse the next `delete` of one object,
+    /// deleting nothing.
+    pub fn fail_next_storage_delete_of(&self, block: &str, folder: &str, key: &str, message: &str) {
+        self.storage()
+            .fail_next_delete_of(&store_folder(block, folder), key, message);
+    }
+
+    /// Every read the fixture's store has served, oldest first, as
+    /// `"get {folder}/{key}"` for a buffered read and
+    /// `"get_streaming {folder}/{key}"` for a streaming one.
+    ///
+    /// The two are recorded apart because they cost apart on a real backend:
+    /// a buffered `get` transfers the whole body before it answers, a
+    /// streaming one answers with the metadata and transfers only what its
+    /// consumer reads.
+    pub fn storage_reads(&self) -> Vec<String> {
+        self.storage().reads()
+    }
+
     /// Every mutating storage operation the fixture's store has seen, oldest
     /// first, as `"{op} {folder}/{key}"`.
     ///
@@ -2885,6 +2918,16 @@ pub struct InMemoryStorageService {
     /// fixture can produce it: every other failure is refused before anything
     /// has been changed.
     fail_next_put: Mutex<Option<String>>,
+    /// One-shot `put` refusals for one object each, keyed by `(folder, key)`
+    /// and installed by [`Self::fail_next_put_to`].
+    fail_puts: Mutex<std::collections::BTreeMap<(String, String), String>>,
+    /// One-shot `delete` refusals, keyed and installed the same way by
+    /// [`Self::fail_next_delete_of`].
+    fail_deletes: Mutex<std::collections::BTreeMap<(String, String), String>>,
+    /// Every read in the order it arrived, as `"{op} {folder}/{key}"` with
+    /// `op` one of `get` and `get_streaming`. Kept apart from [`Self::ops`],
+    /// whose consumers assert the exact sequence of writes.
+    reads: Mutex<Vec<String>>,
     /// Objects whose next `get` parks, keyed by `(folder, key)` and installed
     /// by [`Self::hold_next_get`]. One-shot: the entry is taken by the `get`
     /// that matches it.
@@ -2934,9 +2977,67 @@ impl InMemoryStorageService {
         *self.fail_next_put.lock().expect("fail_next_put mutex") = Some(message.to_string());
     }
 
+    /// Make the next `put` of `folder`/`key` refuse with `message`, storing
+    /// nothing. Other objects' `put`s are unaffected.
+    pub fn fail_next_put_to(&self, folder: &str, key: &str, message: &str) {
+        self.fail_puts
+            .lock()
+            .expect("fail_puts mutex")
+            .insert((folder.to_string(), key.to_string()), message.to_string());
+    }
+
+    /// Make the next `delete` of `folder`/`key` refuse with `message`,
+    /// deleting nothing.
+    pub fn fail_next_delete_of(&self, folder: &str, key: &str, message: &str) {
+        self.fail_deletes
+            .lock()
+            .expect("fail_deletes mutex")
+            .insert((folder.to_string(), key.to_string()), message.to_string());
+    }
+
     /// Every mutating operation this store has seen, oldest first.
     pub fn ops(&self) -> Vec<String> {
         self.ops.lock().expect("ops mutex poisoned").clone()
+    }
+
+    /// Every read this store has served, oldest first.
+    pub fn reads(&self) -> Vec<String> {
+        self.reads.lock().expect("reads mutex poisoned").clone()
+    }
+
+    /// Record one read.
+    fn record_read(&self, op: &str, folder: &str, key: &str) {
+        self.reads
+            .lock()
+            .expect("reads mutex poisoned")
+            .push(format!("{op} {folder}/{key}"));
+    }
+
+    /// The object at `folder`/`key`, with its metadata.
+    fn lookup(
+        &self,
+        folder: &str,
+        key: &str,
+    ) -> Result<
+        (
+            Vec<u8>,
+            wafer_core::interfaces::storage::service::ObjectInfo,
+        ),
+        wafer_core::interfaces::storage::service::StorageError,
+    > {
+        let guard = self.objects.lock().expect("objects mutex poisoned");
+        let object = guard
+            .get(&(folder.to_string(), key.to_string()))
+            .ok_or(wafer_core::interfaces::storage::service::StorageError::NotFound)?;
+        Ok((
+            object.data.clone(),
+            wafer_core::interfaces::storage::service::ObjectInfo {
+                key: key.to_string(),
+                size: object.data.len() as i64,
+                content_type: object.content_type.clone(),
+                last_modified: object.last_modified,
+            },
+        ))
     }
 
     /// Record one mutating operation.
@@ -2964,6 +3065,14 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
             .lock()
             .expect("fail_next_put mutex")
             .take()
+        {
+            return Err(wafer_core::interfaces::storage::service::StorageError::Internal(message));
+        }
+        if let Some(message) = self
+            .fail_puts
+            .lock()
+            .expect("fail_puts mutex")
+            .remove(&(folder.to_string(), key.to_string()))
         {
             return Err(wafer_core::interfaces::storage::service::StorageError::Internal(message));
         }
@@ -3005,19 +3114,27 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
         if let Some(hold) = hold {
             hold.park().await;
         }
-        let guard = self.objects.lock().expect("objects mutex poisoned");
-        let object = guard
-            .get(&(folder.to_string(), key.to_string()))
-            .ok_or(wafer_core::interfaces::storage::service::StorageError::NotFound)?;
-        Ok((
-            object.data.clone(),
-            wafer_core::interfaces::storage::service::ObjectInfo {
-                key: key.to_string(),
-                size: object.data.len() as i64,
-                content_type: object.content_type.clone(),
-                last_modified: object.last_modified,
-            },
-        ))
+        self.record_read("get", folder, key);
+        self.lookup(folder, key)
+    }
+
+    /// Overridden rather than left to the trait default, which calls
+    /// [`Self::get`] and would record every streaming read as a buffered one —
+    /// the distinction [`Self::reads`] exists to make.
+    async fn get_streaming(
+        &self,
+        folder: &str,
+        key: &str,
+    ) -> Result<
+        (
+            OutputStream,
+            wafer_core::interfaces::storage::service::ObjectInfo,
+        ),
+        wafer_core::interfaces::storage::service::StorageError,
+    > {
+        self.record_read("get_streaming", folder, key);
+        let (data, info) = self.lookup(folder, key)?;
+        Ok((OutputStream::respond(data), info))
     }
 
     async fn delete(
@@ -3026,6 +3143,14 @@ impl wafer_core::interfaces::storage::service::StorageService for InMemoryStorag
         key: &str,
     ) -> Result<(), wafer_core::interfaces::storage::service::StorageError> {
         self.record("delete", folder, key);
+        if let Some(message) = self
+            .fail_deletes
+            .lock()
+            .expect("fail_deletes mutex")
+            .remove(&(folder.to_string(), key.to_string()))
+        {
+            return Err(wafer_core::interfaces::storage::service::StorageError::Internal(message));
+        }
         self.objects
             .lock()
             .expect("objects mutex poisoned")
