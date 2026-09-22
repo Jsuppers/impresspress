@@ -330,11 +330,20 @@ pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStrea
     let role_id = msg.var("id");
     // System-role guard, grant revocation, delete, and audit-log write live
     // in the shared ops layer.
-    if let Err(out) = ops::delete_role(ctx, msg, role_id).await {
-        return out;
-    }
+    let deleted = match ops::delete_role(ctx, msg, role_id).await {
+        Ok(deleted) => deleted,
+        Err(out) => return out,
+    };
     let content = roles_tab(ctx).await;
-    ui::html_response_with_toast(content, "Role deleted", "success")
+    match deleted {
+        ops::RoleDeleted::Clean => ui::html_response_with_toast(content, "Role deleted", "success"),
+        ops::RoleDeleted::LateGrantsNotRevoked => ui::html_response_with_toast(
+            content,
+            "Role deleted, but a grant assigned during the delete may remain. Check its \
+             former holders' roles.",
+            "warning",
+        ),
+    }
 }
 
 async fn roles_tab(ctx: &dyn Context) -> Markup {
@@ -594,5 +603,47 @@ mod tests {
             !html.contains("/revoke"),
             "no admin control may target the unserved `/revoke` path: {html}"
         );
+    }
+
+    /// The roles tab's delete, when the revocation pass after the row delete
+    /// fails: the tab re-renders without the role and the toast warns about
+    /// a possibly surviving grant, rather than an error that leaves the
+    /// deleted role on screen.
+    ///
+    /// Names `user_roles::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn deleting_a_role_whose_late_revocation_pass_fails_warns_and_rerenders() {
+        use crate::{
+            platform_state::user_roles,
+            test_support::{output_header, FailingDbOpContext},
+        };
+
+        let ctx = TestContext::with_auth().await;
+        let data = crate::util::json_map(serde_json::json!({
+            "name": "editor",
+            "description": "",
+            "permissions": [],
+            "is_system": false,
+        }));
+        let role_id = db::create(&ctx, ROLES_TABLE, data).await.expect("role").id;
+        user_roles::assign(&ctx, "u-1", "editor", "")
+            .await
+            .expect("grant");
+
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.list", user_roles::TABLE)])
+                .after_passing(1);
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "delete",
+            &format!("/b/admin/iam/roles/{role_id}"),
+        ));
+        let out = handle_delete_role(&failing, &msg).await;
+
+        let trigger = output_header(out, "HX-Trigger")
+            .await
+            .expect("a re-rendered tab carries its toast");
+        let toast: serde_json::Value = serde_json::from_str(&trigger).expect("trigger JSON");
+        assert_eq!(toast["showToast"]["type"], "warning", "{toast}");
     }
 }

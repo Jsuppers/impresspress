@@ -247,9 +247,11 @@ async fn cascade_role_rename(
 pub(super) async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
     // System-role guard, grant revocation, delete, and audit-log write live
-    // in the shared ops layer.
+    // in the shared ops layer. Every `Ok` is a role that is gone, including
+    // one whose late-grant revocation pass failed — the ops layer has logged
+    // and audited that, and an error here would say the role survived.
     match super::ops::delete_role(ctx, msg, id).await {
-        Ok(()) => ok_json(&AdminRoleDeleteResponse { deleted: true }),
+        Ok(_) => ok_json(&AdminRoleDeleteResponse { deleted: true }),
         Err(out) => out,
     }
 }
@@ -780,7 +782,7 @@ mod tests {
                      'not a system role'"
                 );
             }
-            Ok(()) => panic!("delete succeeded while the system-role guard read was failing"),
+            Ok(_) => panic!("delete succeeded while the system-role guard read was failing"),
         }
 
         // The row must still be there: the mutation must not have run.
@@ -1641,6 +1643,77 @@ mod tests {
             versions().await.expect("auth versions"),
             before,
             "a refused rename must not invalidate anyone's sessions"
+        );
+    }
+
+    /// A role delete whose revocation pass AFTER the row delete fails still
+    /// reports the deletion, and still leaves its audit row.
+    ///
+    /// By then the role is gone. Answering with an error said it was not —
+    /// and skipped the `role.delete` audit row for a deletion that happened.
+    /// The injector lets the first pass's grants read through and fails the
+    /// second's, which is the only read of that table the delete makes after
+    /// the role row is deleted.
+    ///
+    /// Names `user_roles::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn a_role_delete_whose_late_revocation_pass_fails_still_reports_the_deletion() {
+        use crate::test_support::FailingDbOpContext;
+
+        let ctx = TestContext::with_auth().await;
+        let role_id = define_role(&ctx, "editor").await;
+        ctx.seed_auth_user("u-1").await;
+        output_json(
+            handle_assign_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                body_input(serde_json::json!({"user_id": "u-1", "role": "editor"})),
+            )
+            .await,
+        )
+        .await;
+
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.list", user_roles::TABLE)])
+                .after_passing(1);
+        let out = handle_delete_role(
+            &failing,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/roles/{role_id}"),
+            )),
+        )
+        .await;
+        assert_eq!(
+            output_json(out).await,
+            serde_json::json!({"deleted": true}),
+            "the role is gone, so the response must say so"
+        );
+        assert!(
+            matches!(db::get(&ctx, ROLES_TABLE, &role_id).await, Err(e) if e.code == ErrorCode::NotFound),
+            "precondition: the role row really was deleted"
+        );
+
+        let audit = db_read::list_every(
+            &ctx,
+            super::super::logs::AUDIT_LOGS_TABLE,
+            vec![Filter {
+                field: "action".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("role.delete"),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        assert_eq!(audit.len(), 1, "a deletion that happened is audited");
+        assert_eq!(
+            audit[0].str_field("resource"),
+            format!(
+                "roles/{role_id} (name: editor; grants revoked: 1; the revocation pass after \
+                 the delete failed while it was reading the grants)"
+            ),
+            "the audit row records the failed pass"
         );
     }
 }
