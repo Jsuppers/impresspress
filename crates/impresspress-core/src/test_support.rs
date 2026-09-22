@@ -1924,6 +1924,9 @@ pub struct RendezvousDbOpContext {
     /// `clone_arc` sees the same countdown.
     holds_left: Arc<std::sync::atomic::AtomicUsize>,
     barrier: Arc<tokio::sync::Barrier>,
+    /// Matching calls THIS racer lets through before it takes a hold — see
+    /// [`Self::passing_first`]. Shared by this racer's clones only.
+    passes_left: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -1937,7 +1940,31 @@ impl RendezvousDbOpContext {
             collection,
             holds_left: Arc::new(std::sync::atomic::AtomicUsize::new(n)),
             barrier: Arc::new(tokio::sync::Barrier::new(n)),
+            passes_left: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// A racer on the same rendezvous that lets its own first `n` matching
+    /// calls straight through, and is held on the one after.
+    ///
+    /// For a request that makes the same call more than once when the race
+    /// is on a later one: the holds are shared, so without this the first
+    /// matching calls — whichever racer makes them — use them up. Give each
+    /// racer its own `passing_first`, and every racer is held at the same
+    /// point in its own sequence.
+    pub fn passing_first(&self, n: usize) -> Self {
+        Self {
+            passes_left: Arc::new(std::sync::atomic::AtomicUsize::new(n)),
+            ..self.clone()
+        }
+    }
+
+    /// Spend one of this racer's passes. `true` while any are left.
+    fn take_pass(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.passes_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     /// Claim one of the holds. `true` while any are left.
@@ -1974,7 +2001,7 @@ impl Context for RendezvousDbOpContext {
             .inner
             .call_block(name, msg, InputStream::from_bytes(bytes))
             .await;
-        if matches && self.take_hold() {
+        if matches && !self.take_pass() && self.take_hold() {
             self.barrier.wait().await;
         }
         out

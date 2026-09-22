@@ -10,12 +10,15 @@ use std::collections::HashMap;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
-    contracts::{DeletedResponse, QuotaResponse, RecordListView, RecordView, ShareCreatedResponse},
+    contracts::{
+        DeletedResponse, ObjectStatus, QuotaResponse, RecordListView, RecordView,
+        ShareCreatedResponse,
+    },
     repo,
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
 };
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -128,13 +131,21 @@ pub(super) async fn handle_create_share(
         return err_forbidden("Access denied to this bucket");
     }
 
-    // Verify the file actually exists before creating a share
-    // audit-allow: bucket arg is &body.bucket (request-supplied); the storage block @-rewrites cross-block paths and the runtime grant check at impresspress-core/src/blocks/storage.rs:256 enforces the actual access against typed Storage grants
-    if wafer_core::clients::storage::get(ctx, &body.bucket, &body.key)
-        .await
-        .is_err()
-    {
-        return err_not_found("File not found in storage");
+    // Only a stored object is shareable, and the object's row is what says
+    // so: `(bucket, key)` is UNIQUE, so this is one indexed read, where
+    // asking the object store would fetch the whole file to learn that it
+    // exists. A `Pending` row is an upload in flight — a first upload or a
+    // replacement — so which bytes a link would serve is not settled yet: a
+    // 409 to retry once it finishes.
+    match repo::objects::find_by_bucket_key(ctx, &body.bucket, &body.key).await {
+        Ok(Some(object)) => match object.status {
+            ObjectStatus::Complete => {}
+            ObjectStatus::Pending => {
+                return err_conflict("File upload still in progress; retry once it finishes")
+            }
+        },
+        Ok(None) => return err_not_found("File not found"),
+        Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
     }
 
     // Mint the token that addresses the share row. It carries no expiry of
@@ -298,11 +309,11 @@ pub(super) async fn handle_update_quota(
 mod tests {
     use std::sync::Arc;
 
-    use wafer_core::{clients::storage as store, interfaces::storage::service as storage_service};
+    use wafer_core::interfaces::storage::service as storage_service;
     use wafer_run::InputStream;
 
     use super::{
-        super::test_support::{routed, share_modal_expiry, share_modal_expiry_options},
+        super::test_support::{routed, share_modal_expiry, share_modal_expiry_options, upload},
         *,
     };
     use crate::test_support::{
@@ -332,141 +343,125 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({ "bucket": bucket, "key": key })).unwrap()
     }
 
-    /// Minimal `StorageService` fake whose `get` always succeeds, so
-    /// `handle_create_share`'s file-existence check passes without wiring a
-    /// real storage backend (filesystem/S3) into the test. Only `get` needs
-    /// a meaningful implementation for the expiry-validation tests below.
-    struct AlwaysFoundStorageService;
+    /// An object store that counts every call made to it, over a store that
+    /// really holds bytes — so a test can assert which requests reach storage
+    /// at all.
+    #[derive(Default)]
+    struct CountingStorage {
+        inner: crate::test_support::InMemoryStorageService,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingStorage {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn count(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     #[wafer_block::wafer_async_trait]
-    impl storage_service::StorageService for AlwaysFoundStorageService {
+    impl storage_service::StorageService for CountingStorage {
         async fn put(
             &self,
-            _folder: &str,
-            _key: &str,
-            _data: &[u8],
-            _content_type: &str,
+            folder: &str,
+            key: &str,
+            data: &[u8],
+            content_type: &str,
         ) -> Result<(), storage_service::StorageError> {
-            Ok(())
+            self.count();
+            self.inner.put(folder, key, data, content_type).await
+        }
+
+        async fn put_streaming(
+            &self,
+            folder: &str,
+            key: &str,
+            data: InputStream,
+            content_type: &str,
+        ) -> Result<(), storage_service::StorageError> {
+            self.count();
+            self.inner
+                .put_streaming(folder, key, data, content_type)
+                .await
         }
 
         async fn get(
             &self,
-            _folder: &str,
+            folder: &str,
             key: &str,
         ) -> Result<(Vec<u8>, storage_service::ObjectInfo), storage_service::StorageError> {
-            Ok((
-                b"fake body".to_vec(),
-                storage_service::ObjectInfo {
-                    key: key.to_string(),
-                    size: 9,
-                    content_type: "text/plain".to_string(),
-                    last_modified: chrono::Utc::now(),
-                },
-            ))
+            self.count();
+            self.inner.get(folder, key).await
+        }
+
+        async fn get_streaming(
+            &self,
+            folder: &str,
+            key: &str,
+        ) -> Result<(OutputStream, storage_service::ObjectInfo), storage_service::StorageError>
+        {
+            self.count();
+            self.inner.get_streaming(folder, key).await
         }
 
         async fn delete(
             &self,
-            _folder: &str,
-            _key: &str,
+            folder: &str,
+            key: &str,
         ) -> Result<(), storage_service::StorageError> {
-            Ok(())
+            self.count();
+            self.inner.delete(folder, key).await
         }
 
         async fn list(
             &self,
-            _folder: &str,
-            _opts: &storage_service::ListOptions,
+            folder: &str,
+            opts: &storage_service::ListOptions,
         ) -> Result<storage_service::ObjectList, storage_service::StorageError> {
-            Ok(storage_service::ObjectList {
-                objects: vec![],
-                total_count: 0,
-                next_cursor: None,
-            })
+            self.count();
+            self.inner.list(folder, opts).await
         }
 
         async fn create_folder(
             &self,
-            _name: &str,
-            _public: bool,
+            name: &str,
+            public: bool,
         ) -> Result<(), storage_service::StorageError> {
-            Ok(())
+            self.count();
+            self.inner.create_folder(name, public).await
         }
 
-        async fn delete_folder(&self, _name: &str) -> Result<(), storage_service::StorageError> {
-            Ok(())
+        async fn delete_folder(&self, name: &str) -> Result<(), storage_service::StorageError> {
+            self.count();
+            self.inner.delete_folder(name).await
         }
 
         async fn list_folders(
             &self,
         ) -> Result<Vec<storage_service::FolderInfo>, storage_service::StorageError> {
-            Ok(vec![])
+            self.count();
+            self.inner.list_folders().await
         }
     }
 
-    /// Register a real `wafer-run/crypto` block over a fixed test secret, so
-    /// share-token signing and verification run end to end.
-    fn register_crypto(ctx: &mut TestContext) {
-        let crypto_svc = Arc::new(
-            wafer_block_crypto::service::Argon2JwtCryptoService::new(
-                // ≥ 32 bytes for HMAC-SHA256 minimum-length check.
-                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-            )
-            .expect("test secret is long enough"),
-        );
-        ctx.register_block(
-            "wafer-run/crypto",
-            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(
-                crypto_svc,
-            )),
-        );
-    }
-
-    /// Seed one bucket owned by `owner`.
-    async fn seed_bucket(ctx: &TestContext, bucket: &str, owner: &str) {
-        let data = crate::util::json_map(serde_json::json!({
-            "name": bucket,
-            "public": false,
-            "created_by": owner,
-            "created_at": crate::util::now_rfc3339(),
-        }));
-        repo::buckets::seed(ctx, data).await.expect("seed bucket");
-    }
-
-    /// Build a `TestContext` with a real crypto block (a share token is
-    /// CSPRNG output drawn through it) and a fake storage block whose `get`
-    /// always succeeds (the file-existence check needs *some* answer), plus
-    /// one bucket owned by `owner`. This is the minimum needed to drive
-    /// `handle_create_share` past bucket/key validation, the ownership
-    /// check, and the file-existence check, into the `expires_in_hours`
-    /// handling under test — without it, every case below would stop early
-    /// (PermissionDenied / NotFound) and never exercise the fix.
-    ///
-    /// `requires` enforcement is not opted into here: it comes with
-    /// [`TestContext::with_files`], which is what makes every test in this
-    /// module run on the gate that refused the crypto block in production.
-    async fn ctx_with_owned_bucket(bucket: &str, owner: &str) -> TestContext {
-        let mut ctx = TestContext::with_files().await;
-
-        register_crypto(&mut ctx);
-
-        ctx.register_block(
-            "wafer-run/storage",
-            crate::blocks::files::test_wrap::storage_block(Arc::new(AlwaysFoundStorageService)),
-        );
-
-        seed_bucket(&ctx, bucket, owner).await;
-
-        ctx
-    }
-
-    /// A fixture whose object store really holds bytes — the always-found
-    /// fake above can prove a share was *created*, never that the shared file
-    /// comes back. The block's one share fixture, shared with `share.rs`'s
-    /// tests so both ends of the round trip run on the same wiring.
+    /// The block's one share fixture (crypto, the production storage shim
+    /// over a store that really holds bytes, one bucket owned by `owner`),
+    /// shared with `share.rs`'s tests so both ends of the round trip run on
+    /// the same wiring.
     async fn ctx_for_share_round_trip(bucket: &str, owner: &str) -> TestContext {
         super::super::test_support::share_ctx(bucket, owner).await
+    }
+
+    /// [`ctx_for_share_round_trip`] with `key` already uploaded to `photos`
+    /// by `alice` through the real upload handler — the minimum a request
+    /// needs to get past the existence check into the expiry handling.
+    async fn ctx_sharing(key: &str) -> TestContext {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        upload(&ctx, "photos", key, b"bytes", "text/plain", "alice").await;
+        ctx
     }
 
     /// CRUX regression (found by driving the live app): creating a share link
@@ -478,14 +473,12 @@ mod tests {
     /// runtime refused the call with `PermissionDenied: block
     /// 'wafer-run/crypto' not in requires list` above every grant check. No
     /// test in the suite created a share against a fixture that enforced
-    /// `requires` (`ctx_with_owned_bucket` left it empty, which production
-    /// reads as unrestricted), so the whole feature shipped dead.
+    /// `requires` (an empty list, which production reads as unrestricted), so
+    /// the whole feature shipped dead.
     #[tokio::test]
     async fn create_share_mints_a_token_for_an_existing_object() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
 
         let msg = auth_msg("create", "/b/cloudstorage/shares", "alice");
         let out = handle_create_share(
@@ -508,6 +501,106 @@ mod tests {
         );
     }
 
+    /// `POST /b/cloudstorage/shares` for `photos/a.png`, sent by `alice`.
+    async fn share_a_png(ctx: &dyn Context) -> OutputStream {
+        handle_create_share(
+            ctx,
+            &auth_msg("create", "/b/cloudstorage/shares", "alice"),
+            InputStream::from_bytes(share_body("photos", "a.png")),
+        )
+        .await
+    }
+
+    /// A key that holds nothing is not shareable. A guard: the storage read
+    /// this check replaced refused it too.
+    #[tokio::test]
+    async fn create_share_refuses_a_key_that_holds_nothing() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+
+        assert!(output_is_error(share_a_png(&ctx).await, "NotFound").await);
+        assert!(
+            repo::shares::list_for_user(&ctx, "alice", 10)
+                .await
+                .expect("shares")
+                .rows
+                .is_empty(),
+            "a refused share must leave no row"
+        );
+    }
+
+    /// An upload still in flight is not shareable yet: its row is `Pending`,
+    /// so the request is a 409 to retry once it settles. The blob is in place
+    /// (the upload's `put` has landed, its `mark_complete` has not), which is
+    /// exactly the state a storage-existence check reads as shareable.
+    #[tokio::test]
+    async fn create_share_refuses_an_upload_still_in_flight() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        repo::objects::reserve_upload(&ctx, "photos", "a.png", 8, "image/png", "alice")
+            .await
+            .expect("reserve the upload");
+        wafer_core::clients::storage::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("the upload's bytes land before its row settles");
+
+        assert!(output_is_error(share_a_png(&ctx).await, "AlreadyExists").await);
+        assert!(
+            repo::shares::list_for_user(&ctx, "alice", 10)
+                .await
+                .expect("shares")
+                .rows
+                .is_empty(),
+            "a refused share must leave no row"
+        );
+    }
+
+    /// A blob with no object row — placed in the bucket out of band — is not
+    /// shareable. Nothing else in the block sees it either: the object
+    /// browser, search and quota all read the row.
+    #[tokio::test]
+    async fn create_share_refuses_a_blob_the_block_has_no_row_for() {
+        let ctx = ctx_for_share_round_trip("photos", "alice").await;
+        wafer_core::clients::storage::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
+            .await
+            .expect("place a blob without its row");
+
+        assert!(output_is_error(share_a_png(&ctx).await, "NotFound").await);
+    }
+
+    /// Deciding that the object exists reads its row and nothing else: the
+    /// object store is not called at all, where a `storage.get` would fetch
+    /// the whole file into memory to learn that it is there.
+    #[tokio::test]
+    async fn create_share_makes_no_storage_call() {
+        let storage = Arc::new(CountingStorage::default());
+        let ctx =
+            super::super::test_support::share_ctx_over("photos", "alice", storage.clone()).await;
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
+        let before = storage.calls();
+
+        let resp = output_json(share_a_png(&ctx).await).await;
+
+        assert!(
+            resp["token"].as_str().is_some_and(|t| !t.is_empty()),
+            "the share must still be created: {resp}"
+        );
+        assert_eq!(
+            storage.calls() - before,
+            0,
+            "creating a share must not call the object store"
+        );
+    }
+
+    /// The row lookup's own failure is a fault, not "not found": a share
+    /// request that could not tell must not be told the file is gone.
+    #[tokio::test]
+    async fn create_share_reports_a_failed_object_lookup() {
+        let ctx = ctx_sharing("a.png").await;
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.list", repo::objects::TABLE)]);
+
+        assert!(output_is_error(share_a_png(&failing).await, "Internal").await);
+    }
+
     /// The other half of the same outage: the public share link must serve
     /// the shared object's BYTES.
     ///
@@ -519,9 +612,7 @@ mod tests {
     async fn shared_link_serves_the_stored_bytes() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
         let stored: &[u8] = b"PNG\x89bytes-that-must-come-back";
-        store::put(&ctx, "photos", "a.png", stored, "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", stored, "image/png", "alice").await;
 
         let create = handle_create_share(
             &ctx,
@@ -567,15 +658,15 @@ mod tests {
     /// with — both halves through their real handlers.
     async fn share_link_headers(key: &str, content_type: &str) -> Vec<wafer_run::MetaEntry> {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(
+        upload(
             &ctx,
             "photos",
             key,
             b"<h1>uploader-chosen bytes</h1>",
             content_type,
+            "alice",
         )
-        .await
-        .expect("seed the object being shared");
+        .await;
 
         let create = handle_create_share(
             &ctx,
@@ -823,9 +914,7 @@ mod tests {
     #[tokio::test]
     async fn create_share_applies_the_expiry_the_share_modal_offers() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
 
         let expiry = share_modal_expiry();
         let mut body = serde_json::Map::new();
@@ -875,9 +964,7 @@ mod tests {
     #[tokio::test]
     async fn create_share_refuses_a_field_it_does_not_honour() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
 
         let body = serde_json::to_vec(&serde_json::json!({
             "bucket": "photos",
@@ -907,9 +994,7 @@ mod tests {
     #[tokio::test]
     async fn the_share_token_carries_no_lifetime_of_its_own() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
 
         let resp = output_json(
             handle_create_share(
@@ -967,9 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn a_share_created_without_an_expiry_gets_the_configured_maximum() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
 
         let before = chrono::Utc::now();
         let resp = output_json(
@@ -995,9 +1078,7 @@ mod tests {
     #[tokio::test]
     async fn the_configured_ceiling_is_what_bounds_a_share() {
         let mut ctx = ctx_for_share_round_trip("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
-            .await
-            .expect("seed the object being shared");
+        upload(&ctx, "photos", "a.png", b"PNGBYTES", "image/png", "alice").await;
         ctx.set_config(MAX_SHARE_EXPIRY_HOURS_KEY, "48");
 
         let before = chrono::Utc::now();
@@ -1087,10 +1168,10 @@ mod tests {
     /// reachable request path must produce a 400, not a handler panic.
     #[tokio::test]
     async fn create_share_rejects_huge_expiry_without_panicking() {
-        let ctx = ctx_with_owned_bucket("my-bucket", "u1").await;
-        let msg = auth_msg("create", "/b/cloudstorage/shares", "u1");
+        let ctx = ctx_sharing("f").await;
+        let msg = auth_msg("create", "/b/cloudstorage/shares", "alice");
         let body = serde_json::to_vec(&serde_json::json!({
-            "bucket": "my-bucket",
+            "bucket": "photos",
             "key": "f",
             "expires_in_hours": i64::MAX,
         }))
@@ -1108,10 +1189,10 @@ mod tests {
     #[tokio::test]
     async fn create_share_rejects_non_positive_expiry() {
         for hours in [0_i64, -1, i64::MIN] {
-            let ctx = ctx_with_owned_bucket("my-bucket", "u1").await;
-            let msg = auth_msg("create", "/b/cloudstorage/shares", "u1");
+            let ctx = ctx_sharing("f").await;
+            let msg = auth_msg("create", "/b/cloudstorage/shares", "alice");
             let body = serde_json::to_vec(&serde_json::json!({
-                "bucket": "my-bucket",
+                "bucket": "photos",
                 "key": "f",
                 "expires_in_hours": hours,
             }))
@@ -1129,10 +1210,10 @@ mod tests {
     /// is a correct ~24h-out timestamp.
     #[tokio::test]
     async fn create_share_valid_expiry_produces_future_timestamp() {
-        let ctx = ctx_with_owned_bucket("my-bucket", "u1").await;
-        let msg = auth_msg("create", "/b/cloudstorage/shares", "u1");
+        let ctx = ctx_sharing("f").await;
+        let msg = auth_msg("create", "/b/cloudstorage/shares", "alice");
         let body = serde_json::to_vec(&serde_json::json!({
-            "bucket": "my-bucket",
+            "bucket": "photos",
             "key": "f",
             "expires_in_hours": 24,
         }))

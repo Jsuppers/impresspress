@@ -127,27 +127,27 @@ pub async fn check_quota(
     Ok(())
 }
 
-/// Sweep `pending`-status object rows older than `older_than_seconds` for
-/// the given user. A row is claimed `pending` before the actual storage
-/// upload to close the quota TOCTOU window, and two failures can leave one
-/// behind: the upload errored AND `release_reservation` errored too, or the
-/// upload succeeded but `mark_complete` could not record it (which the
-/// uploader is told about, so their retry re-claims the same row). Either way
-/// the row would otherwise inflate that user's quota usage forever. Calling
-/// this best-effort on each new upload keeps the table self-healing without a
-/// separate cron.
+/// Sweep the given user's `pending`-status object rows older than
+/// [`repo::objects::PENDING_RESERVATION_TTL_SECONDS`]. A row is claimed
+/// `pending` before the actual storage upload to close the quota TOCTOU
+/// window, and two failures can leave one behind: the upload errored AND
+/// `release_reservation` errored too, or the upload succeeded but
+/// `mark_complete` could not record it. Either way the row would otherwise
+/// inflate that user's quota usage forever. Calling this best-effort on each
+/// new upload keeps the table self-healing without a separate cron.
 ///
-/// 1 hour is a comfortable cutoff: the largest realistic upload finishes
-/// inside that window, and anything still pending afterward is almost
-/// certainly an orphan.
+/// Until it is swept, such a row also holds the key: `reserve_upload` cannot
+/// tell it from an upload still in flight, so an upload of that key is
+/// refused as in progress until the row passes the TTL. The uploader's next
+/// upload after that sweeps the row first and claims the key afresh.
 ///
 /// It reclaims the ROW, not the blob. A swept row whose upload had in fact
 /// reached storage leaves that object behind, unreferenced and charged to
-/// nobody — see `NICE_TO_HAVE.md`, "The files-block pending sweep does not
-/// reclaim the blob". An uploader who retries never gets there: the retry
-/// re-claims the same row and completes it.
-pub async fn sweep_stale_pending(ctx: &dyn Context, user_id: &str, older_than_seconds: i64) {
-    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(older_than_seconds)).to_rfc3339();
+/// nobody until a new upload of the key overwrites it — see
+/// `NICE_TO_HAVE.md`, "The files-block pending sweep does not reclaim the
+/// blob".
+pub async fn sweep_stale_pending(ctx: &dyn Context, user_id: &str) {
+    let cutoff = repo::objects::pending_reservation_cutoff();
     if let Err(e) = repo::objects::delete_stale_pending(ctx, user_id, &cutoff).await {
         tracing::warn!(error = %e, user_id = %user_id, "failed to sweep stale pending uploads");
     }
