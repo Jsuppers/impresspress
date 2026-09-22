@@ -1001,3 +1001,116 @@ impl seed::SeedFetch for ArchiveFetch {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// The data snapshot's size
+// ---------------------------------------------------------------------------
+
+/// The ordinary site-config variable the size tests grow.
+const NOTES_KEY: &str = "WAFER_RUN_SHARED__SHOP_NOTES";
+
+/// Replace the notes variable with one holding `len` bytes.
+async fn set_notes(ctx: &TestContext, len: usize) {
+    variables::delete_by_key(ctx, NOTES_KEY)
+        .await
+        .expect("clear the notes");
+    variables::insert(
+        ctx,
+        variables::NewVariable {
+            key: NOTES_KEY.to_string(),
+            value: "n".repeat(len),
+            name: String::new(),
+            description: String::new(),
+            warning: String::new(),
+            sensitive: false,
+            updated_by: String::new(),
+            block: variables::block_for_key(NOTES_KEY),
+        },
+    )
+    .await
+    .expect("store the notes");
+}
+
+/// The size `seed/data.json` has in an export of `ctx` right now.
+async fn data_json_len(ctx: &TestContext) -> usize {
+    let archive = entries(
+        impresspress_core::blocks::dev::export::build(ctx, ctx.dev_shared().as_ref())
+            .await
+            .expect("export"),
+    );
+    archive["seed/data.json"].len()
+}
+
+/// A shop whose snapshot would not fit the importer is refused at export,
+/// with the reason and the limit, rather than exported as a bundle whose own
+/// cold boot then refuses it and serves an empty site.
+///
+/// Exactly at the limit, the same shop exports and imports: the bound the
+/// exporter enforces is the importer's, not a stricter or looser copy of it.
+#[tokio::test]
+async fn a_data_snapshot_over_the_import_limit_is_refused_at_export_and_one_at_it_round_trips() {
+    let a_control = FakeControl::new();
+    let a = shop_instance(&a_control).await;
+
+    // Grow the notes until `data.json` is exactly the limit. The value is
+    // plain ASCII, so a byte of value is a byte of JSON; the loop only has to
+    // absorb whatever the row's own columns add.
+    let mut len = 1;
+    set_notes(&a, len).await;
+    for _ in 0..4 {
+        let size = data_json_len(&a).await;
+        if size == seed::MAX_DATA_BYTES {
+            break;
+        }
+        len = (len + seed::MAX_DATA_BYTES)
+            .checked_sub(size)
+            .expect("room");
+        set_notes(&a, len).await;
+    }
+    assert_eq!(data_json_len(&a).await, seed::MAX_DATA_BYTES);
+
+    // At the limit: exported, and imported by a fresh instance.
+    let archive =
+        entries(output_body(a.dispatch(admin_msg("retrieve", "/b/dev/api/export")).await).await);
+    let manifest: SeedManifest =
+        serde_json::from_slice(&archive["seed/manifest.json"]).expect("a seed manifest");
+    let b_control = FakeControl::new();
+    b_control.set_validated_info(hello_info("site/hello"));
+    let b = TestContext::with_products()
+        .await
+        .with_auth_added()
+        .await
+        .with_dev_added_and_shell(b_control.clone(), std::sync::Arc::new(FakeShell::new()))
+        .await;
+    seed::import(&b, b_control.as_ref(), &manifest, &ArchiveFetch { archive })
+        .await
+        .expect("a bundle at the limit imports")
+        .expect("a fresh instance imports");
+    let notes = variables::get_by_key(&b, NOTES_KEY)
+        .await
+        .expect("read")
+        .expect("the notes travelled");
+    assert_eq!(notes.value.len(), len);
+
+    // One byte over: refused, on both routes and to the non-HTTP caller.
+    set_notes(&a, len + 1).await;
+    for path in ["/b/dev/api/export", "/b/dev/api/export/manifest"] {
+        let refused = wafer_block::http_codec::collect_http_response(
+            a.dispatch(admin_msg("retrieve", path)).await,
+        )
+        .await;
+        assert_eq!(refused.status, 413, "{path}");
+        let body: serde_json::Value = serde_json::from_slice(&refused.body).expect("json");
+        let message = body["message"].as_str().expect("message");
+        assert!(
+            message.contains(&format!("{} bytes", seed::MAX_DATA_BYTES + 1))
+                && message.contains(&seed::MAX_DATA_BYTES.to_string())
+                && message.contains("could not be imported"),
+            "{path}: {message}"
+        );
+    }
+    let error = impresspress_core::blocks::dev::export::build(&a, a.dev_shared().as_ref())
+        .await
+        .expect_err("an oversized snapshot refuses the export");
+    assert_eq!(error.code, wafer_run::ErrorCode::ResourceExhausted);
+}

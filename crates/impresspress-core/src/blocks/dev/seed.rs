@@ -213,6 +213,19 @@ pub fn data_url(path: &str) -> String {
 /// spelled at both ends is a string that can be spelled two ways.
 pub const DATA_CONTENT_TYPE: &str = "application/json";
 
+/// Largest data snapshot a bundle may carry, in bytes.
+///
+/// One constant for both ends of the format: the importer refuses a larger
+/// `data.json` before fetching it, and `super::export` refuses to write one.
+/// A bound only the importer knew about would let an export succeed and hand
+/// over a bundle whose own importer then rejects it — on a cold boot, where
+/// the refusal leaves the imported instance's site empty.
+///
+/// The same size as a workspace file ([`paths::MAX_FILE_BYTES`]), for the same
+/// reason: the snapshot is held whole more than once on the way in — the
+/// fetched bytes and the parsed rows — on a runtime that may be a browser tab.
+pub const MAX_DATA_BYTES: usize = 512 * 1024;
+
 /// The short workspace name of a registered block (`site/hello` → `hello`).
 ///
 /// The workspace directory, the artifact URL and the route prefix are all
@@ -502,7 +515,8 @@ async fn import_bundle(
     // a bare `Option<String>` path could only ever be.
     if let Some(declared) = &manifest.data {
         let url = data_url(&declared.path);
-        let bytes = fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE).await?;
+        let bytes =
+            fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE, MAX_DATA_BYTES).await?;
         let snapshot: data_snapshot::DataSnapshot = serde_json::from_slice(&bytes)
             .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?;
         data_snapshot::import(ctx, &snapshot)
@@ -529,17 +543,21 @@ async fn import_bundle(
 /// actually be served as, so a bundle claiming a different one was produced
 /// by an exporter that does not agree with this build about how files are
 /// served.
+///
+/// `max_bytes` is the limit for this kind of file — [`paths::MAX_FILE_BYTES`]
+/// for a workspace file, [`MAX_DATA_BYTES`] for the data snapshot — and the
+/// declared size is checked against it before anything is fetched.
 async fn fetch_and_verify(
     fetch: &dyn SeedFetch,
     url: &str,
     declared: &SeedFile,
     served_as: &str,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    if declared.size > paths::MAX_FILE_BYTES as u64 {
+    if declared.size > max_bytes as u64 {
         return Err(format!(
-            "{url}: declares {} bytes; the per-file limit is {}",
+            "{url}: declares {} bytes; the limit for this file is {max_bytes}",
             declared.size,
-            paths::MAX_FILE_BYTES
         ));
     }
 
@@ -580,7 +598,7 @@ async fn fetch_verified(
     paths::validate_path(workspace_path)
         .map_err(|e| format!("the seed bundle names {workspace_path:?}: {e}"))?;
     let served = paths::content_type_for(workspace_path);
-    fetch_and_verify(fetch, url, declared, served).await
+    fetch_and_verify(fetch, url, declared, served, paths::MAX_FILE_BYTES).await
 }
 
 /// One block's refusal, with every diagnostic's message and code.
