@@ -95,6 +95,7 @@ enum Route {
     UserDelete,
     CreateRole,
     DeleteRole,
+    RevokeApiKey,
     BlockDetail,
     BlockToggle,
     CreateVariable,
@@ -405,6 +406,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     EndpointRoute::admin(HttpMethod::Post, "/b/admin/iam/roles", Route::CreateRole)
         .summary("Create role (form)"),
     EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/admin/api-keys/{id}/revoke",
+        Route::RevokeApiKey,
+    )
+    .summary("Revoke API key"),
+    EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/admin/iam/roles/{id}",
         Route::DeleteRole,
@@ -660,6 +667,7 @@ crate::impresspress_feature_block! {
             Route::UserDelete => pages::handle_user_delete(ctx, &msg).await,
             Route::CreateRole => pages::handle_create_role(ctx, &msg, input).await,
             Route::DeleteRole => pages::handle_delete_role(ctx, &msg).await,
+            Route::RevokeApiKey => pages::handle_revoke_api_key(ctx, &msg).await,
             Route::BlockDetail => pages::handle_block_detail(ctx, &msg).await,
             Route::BlockToggle => {
                 pages::handle_toggle_feature(ctx, &msg, &this.block_settings_handle).await
@@ -1639,6 +1647,12 @@ mod table_tests {
                 &[("id", "r-1")],
             ),
             (
+                "create",
+                "/b/admin/api-keys/k-1/revoke",
+                Route::RevokeApiKey,
+                &[("id", "k-1")],
+            ),
+            (
                 "retrieve",
                 "/b/admin/blocks/wafer-run--auth/detail",
                 Route::BlockDetail,
@@ -1835,6 +1849,9 @@ mod table_tests {
 /// the network rows' `data-detail-url`) against the table of the block that
 /// owns it, with the method the attribute implies.
 #[cfg(test)]
+mod htmx_contract_tests;
+
+#[cfg(test)]
 mod page_link_tests {
     use std::collections::BTreeSet;
 
@@ -1888,11 +1905,11 @@ mod page_link_tests {
         out
     }
 
-    struct Seeds {
-        user_id: String,
-        role_id: String,
-        key_id: String,
-        grant_id: String,
+    pub(super) struct Seeds {
+        pub(super) user_id: String,
+        pub(super) role_id: String,
+        pub(super) key_id: String,
+        pub(super) grant_id: String,
     }
 
     const PROBE_BLOCK: &str = "impresspress/probe";
@@ -1930,8 +1947,14 @@ mod page_link_tests {
     /// (enable/disable/delete), a custom role (delete), an active API key
     /// (revoke), a variable (edit, delete), a WRAP grant (delete), a request-log
     /// row (network detail) and a Feature block (detail, toggle).
-    async fn seeded_ctx() -> (TestContext, Seeds) {
-        let mut ctx = TestContext::with_auth().await;
+    pub(super) async fn seeded_ctx() -> (TestContext, Seeds) {
+        // Crypto as well: the API-keys tab's Create form mints a key, and
+        // `htmx_contract_tests` submits it.
+        let mut ctx = TestContext::with_auth_and_crypto().await;
+        // The admin the requests come from (`admin_msg`'s user), as the real
+        // account a signed-in admin is: a key the Create form mints is theirs,
+        // and `api_keys.user_id` references the users table.
+        ctx.seed_auth_user("admin_1").await;
         let user = users::insert(
             &ctx,
             users::NewUser {
@@ -2113,7 +2136,7 @@ mod page_link_tests {
     }
 
     /// `(action, path, query parameters)` of one page render.
-    type Page = (
+    pub(super) type Page = (
         &'static str,
         &'static str,
         &'static [(&'static str, &'static str)],
@@ -2121,7 +2144,7 @@ mod page_link_tests {
 
     /// Every page and fragment the block serves as HTML, with the query
     /// parameters that select each tab.
-    const PAGES: &[Page] = &[
+    pub(super) const PAGES: &[Page] = &[
         ("retrieve", "/b/admin/", &[]),
         ("retrieve", "/b/admin/users", &[]),
         ("retrieve", "/b/admin/users", &[("tab", "roles")]),
@@ -2199,7 +2222,10 @@ mod page_link_tests {
             ("create", "/b/admin/iam/roles".to_string()),
             ("delete", format!("/b/admin/iam/roles/{}", seeds.role_id)),
             ("create", "/b/auth/api/api-keys".to_string()),
-            ("update", format!("/b/auth/api/api-keys/{}", seeds.key_id)),
+            (
+                "create",
+                format!("/b/admin/api-keys/{}/revoke", seeds.key_id),
+            ),
             ("retrieve", "/b/admin/storage".to_string()),
             (
                 "retrieve",

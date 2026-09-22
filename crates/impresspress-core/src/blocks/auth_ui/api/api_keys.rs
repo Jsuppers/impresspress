@@ -1,7 +1,9 @@
 //! /b/auth/api/api-keys — relocated from auth/api_keys.rs in Task 5.
 //!
-//! Admin user-management still calls these routes via htmx (see
-//! `impresspress-core/src/blocks/admin/pages/users.rs`). PAT migration is a
+//! Admin user-management's Create API Key form still posts [`handle_create`]
+//! via htmx (see `impresspress-core/src/blocks/admin/pages/users.rs`); its
+//! Revoke button is served by the admin block's own route, which answers with
+//! the re-rendered tab. PAT migration is a
 //! follow-up; for PR 5 we relocate rather than delete.
 
 use wafer_core::clients::crypto;
