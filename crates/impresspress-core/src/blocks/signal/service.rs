@@ -186,7 +186,9 @@ async fn fetch_live(ctx: &dyn Context, code: &str) -> Result<RoomRow, RoomError>
 /// as a raw `Db` (500) instead of the documented `Taken` (409).
 async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> RoomError {
     match error.code {
-        // Already classified by the backend — nothing left to find out.
+        // For a backend that classifies the violation itself. No backend at
+        // the current wafer pin does: they answer `Internal`, which the arm
+        // below settles by re-reading the code.
         ErrorCode::AlreadyExists => return RoomError::Taken,
         // The two shapes a constraint violation can arrive as unclassified.
         ErrorCode::Internal | ErrorCode::Aborted => {}

@@ -306,6 +306,42 @@ fn sources(walk: &SourceWalk) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Every file the walk reaches, as `(path, code, names)`: [`sources`]'s pair
+/// plus what the raw text names once its `use` items are resolved
+/// ([`Names`]). Parsed from the raw text, not the comment-stripped code, so
+/// the parse sees the file the compiler sees, and parsed once per test
+/// binary: every test that reads it shares the one walk.
+fn parsed() -> &'static [(String, String, Names)] {
+    static PARSED: std::sync::OnceLock<Vec<(String, String, Names)>> = std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        let files = scan().collect();
+        // `syn` in a debug test build takes seconds over the whole crate on
+        // one thread; the files are independent, so parse them across all.
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let chunk = files.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            // Spawn every worker before joining any, or they run one by one.
+            let mut workers = Vec::new();
+            for batch in files.chunks(chunk) {
+                workers.push(scope.spawn(move || {
+                    batch
+                        .iter()
+                        .map(|file| {
+                            let names = Names::parse(&file.rel, &file.text);
+                            let code = strip_line_comments(&file.text);
+                            (file.rel.clone(), code, names)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("a parse worker panicked"))
+                .collect()
+        })
+    })
+}
+
 /// Whether `path` (relative to `src`) is one of `allowlist`'s entries.
 /// Exact matches only — no directory prefixes, so an allowlist can never
 /// exempt a file that does not exist yet.
@@ -695,10 +731,10 @@ fn only_the_door_names_a_platform_table() {
 /// `platform_state::variables::TABLE` to `db::list_all` — which compiles
 /// cleanly because the constant is `pub` for `blocks/admin`'s
 /// `collections(..)` registration. This scan closes that gap: a file that
-/// imports `platform_state` and names `<module>::TABLE` — by its path, or by
-/// a grouped `<module>::{…, TABLE}` import that leaves only a bare `TABLE` at
-/// the call site ([`names_const`]) — must be on the list below, each entry
-/// justified on why it is not a query around the door.
+/// imports `platform_state` and names `<module>::TABLE` — by its path, or
+/// through an import that leaves some other spelling at the call site (a
+/// grouped `TABLE`, a module alias, a glob; [`names_const`]) — must be on the
+/// list below, each entry justified on why it is not a query around the door.
 ///
 /// The `platform_state` condition is what keeps a block's own
 /// `repo::variables::TABLE` (products has one) out of the match. The doors
@@ -1216,59 +1252,329 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ("llm_settings", &["blocks/llm/mod.rs"]),
 ];
 
-/// Whether `src` names `ident` — by its path (`user_roles::TABLE`), or by a
-/// grouped import that brings the constant in under its bare name
-/// (`user_roles::{self, TABLE}`, `user_roles::{TABLE as T}`) and so never
-/// spells the path at a call site. A bare `TABLE` alone is not evidence of
-/// anything, every door names its own; the group is what attributes it.
-fn names_const(src: &str, ident: &str) -> bool {
-    if src.contains(ident) {
+/// What one source file's code names, resolved through its `use` items.
+///
+/// Parsed, not pattern-matched: `syn` reads the file into its scopes — the
+/// file itself, each inline `mod`, each block — and records in each one the
+/// names its `use` items bind, the globs they open, the `const`/`static`
+/// items it defines, and every path its code spells. Paths inside macro
+/// arguments come from the macro's token stream; comments and string
+/// literals are not tokens, so neither can name anything. An import is
+/// resolved the way the compiler would read it: `user_roles::{self as ur}`
+/// binds `ur`, `use ur::{TABLE}` then binds `TABLE` through `ur`, and
+/// `user_roles::{*}` opens a glob.
+///
+/// A name is looked up in its own scope and every enclosing one, and a name
+/// bound more than once is resolved through every binding. That
+/// over-approximates (an inline `mod` does not really see its parent's
+/// imports), and deliberately: the gate is a ban, so a spelling it cannot
+/// place must count against the file rather than slip past it.
+struct Names {
+    scopes: Vec<Scope>,
+    /// Every path the file spells or imports, in every form it resolves to
+    /// ([`Names::resolve`]) — computed once, since it does not depend on
+    /// which constant is being asked about.
+    resolved: std::collections::HashSet<Vec<String>>,
+}
+
+#[derive(Default)]
+struct Scope {
+    parent: Option<usize>,
+    /// Name bound by a `use` → every path it is bound to in this scope.
+    bindings: std::collections::HashMap<String, Vec<Vec<String>>>,
+    /// The module paths opened by a `use …::*`.
+    globs: Vec<Vec<String>>,
+    /// `const` / `static` items this scope defines: an explicit item beats a
+    /// glob of the same name in the same scope and every scope inside it.
+    own_items: std::collections::HashSet<String>,
+    /// Every path the scope's code spells, and whether it is qualified by
+    /// something that is not a path segment (`::TABLE`, `<T>::TABLE`), which
+    /// makes a one-segment path something other than a bare name in scope.
+    paths: Vec<(Vec<String>, bool)>,
+    /// The names the scope's code spells bare (one segment, unqualified).
+    bare: std::collections::HashSet<String>,
+    /// `globs`, each in every form it resolves to.
+    resolved_globs: Vec<Vec<String>>,
+}
+
+impl Names {
+    fn parse(rel: &str, text: &str) -> Self {
+        use syn::visit::Visit;
+
+        struct Builder {
+            scopes: Vec<Scope>,
+            current: usize,
+        }
+        impl Builder {
+            fn scoped(&mut self, visit: impl FnOnce(&mut Self)) {
+                let outer = self.current;
+                self.scopes.push(Scope {
+                    parent: Some(outer),
+                    ..Scope::default()
+                });
+                self.current = self.scopes.len() - 1;
+                visit(self);
+                self.current = outer;
+            }
+            fn scope(&mut self) -> &mut Scope {
+                &mut self.scopes[self.current]
+            }
+            fn tree(&mut self, prefix: &mut Vec<String>, tree: &syn::UseTree) {
+                match tree {
+                    syn::UseTree::Path(p) => {
+                        prefix.push(p.ident.to_string());
+                        self.tree(prefix, &p.tree);
+                        prefix.pop();
+                    }
+                    syn::UseTree::Name(n) => self.bind(prefix, &n.ident, None),
+                    syn::UseTree::Rename(r) => self.bind(prefix, &r.ident, Some(&r.rename)),
+                    syn::UseTree::Glob(_) => {
+                        let glob = prefix.clone();
+                        self.scope().globs.push(glob);
+                    }
+                    syn::UseTree::Group(g) => {
+                        for item in &g.items {
+                            self.tree(prefix, item);
+                        }
+                    }
+                }
+            }
+            fn bind(&mut self, prefix: &[String], ident: &syn::Ident, rename: Option<&syn::Ident>) {
+                let mut path = prefix.to_vec();
+                if ident != "self" {
+                    path.push(ident.to_string());
+                }
+                let Some(last) = path.last().cloned() else {
+                    return;
+                };
+                let name = rename.map_or(last, ToString::to_string);
+                if name != "_" {
+                    self.scope().bindings.entry(name).or_default().push(path);
+                }
+            }
+            fn record(&mut self, path: &syn::Path, from: usize, pathed: bool) {
+                let segments = path
+                    .segments
+                    .iter()
+                    .skip(from)
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                self.scope().paths.push((segments, pathed));
+            }
+        }
+        impl<'ast> Visit<'ast> for Builder {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                if item.content.is_some() {
+                    self.scoped(|b| syn::visit::visit_item_mod(b, item));
+                } else {
+                    syn::visit::visit_item_mod(self, item);
+                }
+            }
+            fn visit_block(&mut self, block: &'ast syn::Block) {
+                self.scoped(|b| syn::visit::visit_block(b, block));
+            }
+            fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+                self.tree(&mut Vec::new(), &item.tree);
+            }
+            fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+                self.scope().own_items.insert(item.ident.to_string());
+                syn::visit::visit_item_const(self, item);
+            }
+            fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+                self.scope().own_items.insert(item.ident.to_string());
+                syn::visit::visit_item_static(self, item);
+            }
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                self.record(path, 0, path.leading_colon.is_some());
+                syn::visit::visit_path(self, path);
+            }
+            fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+                match &expr.qself {
+                    // `<T as Trait>::NAME`: the segments after the qualified
+                    // self are the trait's, never a bare name in scope.
+                    Some(q) => {
+                        self.visit_type(&q.ty);
+                        self.record(&expr.path, q.position, true);
+                    }
+                    None => syn::visit::visit_expr_path(self, expr),
+                }
+            }
+            fn visit_type_path(&mut self, ty: &'ast syn::TypePath) {
+                match &ty.qself {
+                    Some(q) => {
+                        self.visit_type(&q.ty);
+                        self.record(&ty.path, q.position, true);
+                    }
+                    None => syn::visit::visit_type_path(self, ty),
+                }
+            }
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                let mut paths = Vec::new();
+                collect_paths(mac.tokens.clone(), &mut paths);
+                self.scope().paths.extend(paths);
+                syn::visit::visit_macro(self, mac);
+            }
+        }
+
+        let file = syn::parse_file(text)
+            .unwrap_or_else(|e| panic!("{rel}: the gate cannot read what it cannot parse: {e}"));
+        let mut builder = Builder {
+            scopes: vec![Scope::default()],
+            current: 0,
+        };
+        builder.visit_file(&file);
+        let mut names = Names {
+            scopes: builder.scopes,
+            resolved: std::collections::HashSet::new(),
+        };
+        for at in 0..names.scopes.len() {
+            let scope = &names.scopes[at];
+            let spelled = scope.paths.iter().map(|(path, _)| path);
+            let imported = scope.bindings.values().flatten();
+            let resolved: Vec<Vec<String>> = spelled
+                .chain(imported)
+                .flat_map(|path| names.resolve(at, path))
+                .collect();
+            let bare = scope
+                .paths
+                .iter()
+                .filter(|(path, pathed)| !pathed && path.len() == 1)
+                .map(|(path, _)| path[0].clone())
+                .collect();
+            let resolved_globs = scope
+                .globs
+                .iter()
+                .flat_map(|glob| names.resolve(at, glob))
+                .collect();
+            names.resolved.extend(resolved);
+            names.scopes[at].bare = bare;
+            names.scopes[at].resolved_globs = resolved_globs;
+        }
+        names
+    }
+
+    /// `scope` and every scope enclosing it, innermost first, as indices.
+    fn chain(&self, scope: usize) -> impl Iterator<Item = usize> + '_ {
+        std::iter::successors(Some(scope), |s| self.scopes[*s].parent)
+    }
+
+    /// Every path `path` can stand for in `scope`: itself, and — through each
+    /// binding of its first segment visible there — the bound path with the
+    /// rest appended, recursively, so an alias of an alias lands on the real
+    /// module. A leading `self::` / `super::` is dropped first; the scopes it
+    /// would pick are already on the chain being searched.
+    fn resolve(&self, scope: usize, path: &[String]) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        self.resolve_into(scope, path, 8, &mut out);
+        out
+    }
+
+    fn resolve_into(&self, scope: usize, path: &[String], depth: u8, out: &mut Vec<Vec<String>>) {
+        let start = path
+            .iter()
+            .take_while(|s| *s == "self" || *s == "super")
+            .count();
+        let path = &path[start..];
+        let Some(head) = path.first() else {
+            return;
+        };
+        out.push(path.to_vec());
+        if depth == 0 {
+            return;
+        }
+        for bound in self
+            .chain(scope)
+            .filter_map(|s| self.scopes[s].bindings.get(head))
+            .flatten()
+        {
+            if bound.as_slice() == [head.clone()] {
+                continue; // `use user_roles;` binds the name to itself
+            }
+            let next: Vec<String> = bound.iter().chain(&path[1..]).cloned().collect();
+            self.resolve_into(scope, &next, depth - 1, out);
+        }
+    }
+}
+
+/// Every maximal `ident (:: ident)*` run in `tokens`, descending into groups
+/// (nested macro arguments included), each with whether a `::` preceded it.
+fn collect_paths(tokens: proc_macro2::TokenStream, out: &mut Vec<(Vec<String>, bool)>) {
+    use proc_macro2::{Spacing, TokenTree};
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    let colons = |i: usize| {
+        matches!((trees.get(i), trees.get(i + 1)),
+            (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+                if a.as_char() == ':' && a.spacing() == Spacing::Joint && b.as_char() == ':')
+    };
+    let mut i = 0;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Group(g) => {
+                collect_paths(g.stream(), out);
+                i += 1;
+            }
+            TokenTree::Ident(first) => {
+                let pathed = i >= 2 && colons(i - 2);
+                let mut path = vec![first.to_string()];
+                i += 1;
+                while colons(i) {
+                    match trees.get(i + 2) {
+                        Some(TokenTree::Ident(next)) => {
+                            path.push(next.to_string());
+                            i += 3;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push((path, pathed));
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// Whether the code `names` describes names `ident` — by its path
+/// (`user_roles::TABLE`, `self::ur::TABLE`), by an import that binds the
+/// constant or its module under any name (`user_roles::{self, TABLE}`,
+/// `user_roles::{self as ur}` then `ur::TABLE`, `use ur::{TABLE}` then a bare
+/// `TABLE`), or by a glob (`user_roles::*` or `user_roles::{*}`, then a bare
+/// `TABLE` that no `const`/`static` between the use and the glob's scope
+/// shadows). An import names the constant even before a call site uses it.
+/// An `ident` with no `::` (`PRODUCT_TEMPLATES_TABLE`) is named by any path
+/// ending in it. A bare `TABLE` alone is not evidence of anything, every
+/// door names its own; the import is what attributes it.
+fn names_const(names: &Names, ident: &str) -> bool {
+    let (module, name) = match ident.rsplit_once("::") {
+        Some((module, name)) => (Some(module), name),
+        None => (None, ident),
+    };
+    let ends_with = |path: &[String], tail: &[&str]| {
+        path.len() >= tail.len()
+            && path[path.len() - tail.len()..]
+                .iter()
+                .zip(tail)
+                .all(|(a, b)| a == b)
+    };
+    let tail: Vec<&str> = module.into_iter().chain([name]).collect();
+    if names.resolved.iter().any(|path| ends_with(path, &tail)) {
         return true;
     }
-    let Some((module, name)) = ident.rsplit_once("::") else {
+    let Some(module) = module else {
         return false;
     };
-    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    let opener = format!("{module}::{{");
-    let mut from = 0;
-    while let Some(at) = src[from..].find(&opener) {
-        let start = from + at;
-        from = start + opener.len();
-        if src[..start].chars().next_back().is_some_and(is_word) {
-            continue; // `other_user_roles::{`, not this module
+    // A bare `name` resolves to a glob of `module` when, walking outwards
+    // from the scope that spells it, a scope opening that glob comes before
+    // any scope that defines or imports `name` explicitly.
+    for (at, scope) in names.scopes.iter().enumerate() {
+        if !scope.bare.contains(name) {
+            continue;
         }
-        let mut depth = 1;
-        let mut end = from;
-        for (offset, c) in src[from..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                end = from + offset;
+        for outer_at in names.chain(at) {
+            let outer = &names.scopes[outer_at];
+            if outer.own_items.contains(name) || outer.bindings.contains_key(name) {
                 break;
             }
-        }
-        // Only the group's own top level imports from `module`: a `TABLE`
-        // inside a nested group, or after another `::`, is some other
-        // module's (`products::{repo::{groups::TABLE}}` is the groups door).
-        let group = &src[from..end];
-        let mut depth = 0;
-        for (lo, c) in group.char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth != 0 || !group[lo..].starts_with(name) {
-                continue;
-            }
-            let hi = lo + name.len();
-            let before = group[..lo].chars().next_back();
-            let after = group[hi..].chars().next();
-            let pathed = group[..lo].trim_end().ends_with("::");
-            if !before.is_some_and(is_word) && !after.is_some_and(is_word) && !pathed {
+            if outer.resolved_globs.iter().any(|g| ends_with(g, &[module])) {
                 return true;
             }
         }
@@ -1310,23 +1616,131 @@ fn a_grouped_import_of_the_const_is_naming_it() {
             "use crate::platform_state::user_roles::{self, other::{TABLE}};",
             false,
         ),
+        // a module alias, at the top level and inside a group
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { ur::TABLE; }",
+            true,
+        ),
+        (
+            "use crate::platform_state::{user_roles as ur, variables};\nfn f() { ur::TABLE; }",
+            true,
+        ),
+        // `self as` inside a group: the crate's rustfmt shape
+        (
+            "use crate::platform_state::user_roles::{self as ur, UserRoleRow};\nfn f() { ur::TABLE; }",
+            true,
+        ),
+        // an import through an alias, then the bare name
+        (
+            "use crate::platform_state::user_roles as ur;\nuse ur::{TABLE};\nfn f() { TABLE; }",
+            true,
+        ),
+        // inside a macro's arguments
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { let _ = vec![ur::TABLE]; }",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { ur::UserRoleRow; }",
+            false,
+        ),
+        (
+            "use crate::x::not_user_roles as ur;\nfn f() { ur::TABLE; }",
+            false,
+        ),
+        // a glob import, bare or grouped, then the bare name
+        (
+            "use crate::platform_state::user_roles::*;\nfn f() { db::list(ctx, TABLE); }",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles::{*};\nfn f() { db::list(ctx, TABLE); }",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles::*;\nfn f() { db::list(ctx, OTHER_TABLE); }",
+            false,
+        ),
+        (
+            "use crate::platform_state::user_roles::*;\nfn f() { other::TABLE; }",
+            false,
+        ),
+        (
+            "use crate::x::not_user_roles::*;\nfn f() { db::list(ctx, TABLE); }",
+            false,
+        ),
+        // a glob import next to the file's own `TABLE`: the bare name is the
+        // file's
+        (
+            "use crate::platform_state::user_roles::*;\nconst TABLE: &str = \"t\";\nfn f() { db::list(ctx, TABLE); }",
+            false,
+        ),
+        // a later alias of the same name in another scope does not hide
+        // the first one
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { ur::TABLE; }\nmod tests { use crate::other as ur; }",
+            true,
+        ),
+        // a `const TABLE` in one module does not shadow a glob in another
+        (
+            "mod a { const TABLE: &str = \"t\"; }\nmod b { use crate::platform_state::user_roles::*; fn f() { db::list(ctx, TABLE); } }",
+            true,
+        ),
+        // ... but the module that defines its own `TABLE` uses its own
+        (
+            "mod a { const TABLE: &str = \"t\"; fn f() { db::list(ctx, TABLE); } }\nmod b { use crate::platform_state::user_roles::*; }",
+            false,
+        ),
+        // a glob inside a fn body reaches a bare name in that body
+        (
+            "fn f() { use crate::platform_state::user_roles::*; db::list(ctx, TABLE); }",
+            true,
+        ),
+        // `self::` in front of an alias
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { self::ur::TABLE; }",
+            true,
+        ),
+        // comments and strings name nothing
+        (
+            "/* use crate::platform_state::user_roles::*; */\nfn f() { db::list(ctx, TABLE); }",
+            false,
+        ),
+        (
+            "// use crate::platform_state::user_roles::*;\nfn f() { db::list(ctx, TABLE); }",
+            false,
+        ),
+        (
+            "fn f() { db::list(ctx, TABLE); } // use crate::platform_state::user_roles::*;",
+            false,
+        ),
+        (
+            "fn f() { let _ = \"user_roles::TABLE\"; }",
+            false,
+        ),
     ] {
-        assert_eq!(names_const(src, "user_roles::TABLE"), named, "{src}");
+        let names = Names::parse("case", src);
+        assert_eq!(names_const(&names, "user_roles::TABLE"), named, "{src}");
     }
 }
 
 #[test]
 fn only_the_allowlist_names_a_platform_table_via_the_const() {
-    let sources = sources(&scan());
+    let parsed = parsed();
     for (door, _, consts, qualifier) in TABLES {
         let allowed = IDENT_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
             .map(|(_, files)| *files)
             .unwrap_or(&[]);
-        let offenders = offenders(&sources, allowed, |src| {
-            src.contains(qualifier) && consts.iter().any(|ident| names_const(src, ident))
-        });
+        let offenders: Vec<&String> = parsed
+            .iter()
+            .filter(|(path, _, _)| !matches_allowlist(path, allowed))
+            .filter(|(_, src, names)| {
+                src.contains(qualifier) && consts.iter().any(|ident| names_const(names, ident))
+            })
+            .map(|(path, _, _)| path)
+            .collect();
         assert!(
             offenders.is_empty(),
             "these files name the table via one of `{consts:?}` instead of calling a \
@@ -1339,7 +1753,11 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
 /// dead exemption: it silently pre-approves whatever that file does next.
 #[test]
 fn no_allowlist_entry_is_dead() {
-    let sources = sources(&scan());
+    let parsed = parsed();
+    let sources: Vec<(String, String)> = parsed
+        .iter()
+        .map(|(path, src, _)| (path.clone(), src.clone()))
+        .collect();
     for (door, literal, consts, _qualifier) in TABLES {
         for (m, files) in LITERAL_ALLOWED {
             if m != door {
@@ -1361,8 +1779,8 @@ fn no_allowlist_entry_is_dead() {
             }
             for entry in *files {
                 assert!(
-                    sources.iter().any(|(path, src)| path == entry
-                        && consts.iter().any(|ident| names_const(src, ident))),
+                    parsed.iter().any(|(path, _, names)| path == entry
+                        && consts.iter().any(|ident| names_const(names, ident))),
                     "`{entry}` is allowlisted for `{consts:?}` but no longer names any \
                      of them; drop the entry rather than leaving a standing exemption"
                 );
