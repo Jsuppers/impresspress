@@ -335,15 +335,46 @@ pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStrea
         Err(out) => return out,
     };
     let content = roles_tab(ctx).await;
-    match deleted {
-        ops::RoleDeleted::Clean => ui::html_response_with_toast(content, "Role deleted", "success"),
-        ops::RoleDeleted::LateGrantsNotRevoked => ui::html_response_with_toast(
-            content,
-            "Role deleted, but a grant assigned during the delete may remain. Check its \
-             former holders' roles.",
-            "warning",
-        ),
+    match late_pass_warning(&deleted) {
+        None => ui::html_response_with_toast(content, "Role deleted", "success"),
+        Some(warning) => ui::html_response_with_toast(content, &warning, "warning"),
     }
+}
+
+/// The warning toast for a role delete whose revocation pass after the row
+/// delete failed — what may be left, who holds it, and why it matters — or
+/// `None` for a clean delete.
+fn late_pass_warning(deleted: &ops::RoleDeleted) -> Option<String> {
+    let revives = "Creating a role with this name again would give it back to them.";
+    let warning = match deleted {
+        ops::RoleDeleted::Clean => return None,
+        ops::RoleDeleted::LateGrantsNotRevoked { holders: None } => format!(
+            "Role deleted, but checking for a grant assigned during the delete failed, so one \
+             may remain. Remove the role from anyone the Users tab still lists with it. \
+             {revives}"
+        ),
+        ops::RoleDeleted::LateGrantsNotRevoked {
+            holders: Some(holders),
+        } if holders.is_empty() => format!(
+            "Role deleted, but revoking any grant assigned during the delete failed. None was \
+             found, but one assigned in that moment may remain: remove the role from anyone \
+             the Users tab still lists with it. {revives}"
+        ),
+        ops::RoleDeleted::LateGrantsNotRevoked {
+            holders: Some(holders),
+        } => format!(
+            "Role deleted, but a grant of it assigned during the delete may remain for user(s) \
+             {}. Remove the role from them. {revives}",
+            holders.join(", ")
+        ),
+        ops::RoleDeleted::LateSessionsNotInvalidated { holders } => format!(
+            "Role deleted and every grant of it revoked, but the sessions of user(s) {} could \
+             not be invalidated: a token they already hold may carry the role until it \
+             expires.",
+            holders.join(", ")
+        ),
+    };
+    Some(warning)
 }
 
 /// `POST /b/admin/api-keys/{id}/revoke` (from the API-keys tab). `{id}` is
@@ -625,5 +656,69 @@ mod tests {
             .expect("a re-rendered tab carries its toast");
         let toast: serde_json::Value = serde_json::from_str(&trigger).expect("trigger JSON");
         assert_eq!(toast["showToast"]["type"], "warning", "{toast}");
+        assert_eq!(
+            toast["showToast"]["message"],
+            "Role deleted, but checking for a grant assigned during the delete failed, so one \
+             may remain. Remove the role from anyone the Users tab still lists with it. \
+             Creating a role with this name again would give it back to them.",
+            "the pass could not read the grants, so it cannot name a holder — the toast says \
+             where to look, and why it matters"
+        );
+    }
+
+    /// When the late pass did read the grants, the toast names who holds the
+    /// one that may remain, and says what recreating the role would do.
+    ///
+    /// Names `user_roles::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn the_late_pass_warning_names_the_holder_of_the_grant_that_may_remain() {
+        use crate::{
+            blocks::admin::test_support::AssignBeforeGrantRead,
+            platform_state::user_roles,
+            test_support::{output_header, FailingDbOpContext},
+        };
+
+        let ctx = TestContext::with_auth().await;
+        let data = crate::util::json_map(serde_json::json!({
+            "name": "editor",
+            "description": "",
+            "permissions": [],
+            "is_system": false,
+        }));
+        let role_id = db::create(&ctx, ROLES_TABLE, data).await.expect("role").id;
+        for user in ["u-1", "u-late"] {
+            ctx.seed_auth_user(user).await;
+        }
+        user_roles::assign(&ctx, "u-1", "editor", "")
+            .await
+            .expect("grant");
+
+        let racing = AssignBeforeGrantRead::new(
+            ctx.clone(),
+            FailingDbOpContext::new(
+                ctx.clone(),
+                vec![("database.delete_where_count", user_roles::TABLE)],
+            )
+            .after_passing(1),
+            2,
+            "u-late",
+            "editor",
+        );
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "delete",
+            &format!("/b/admin/iam/roles/{role_id}"),
+        ));
+        let trigger = output_header(handle_delete_role(&racing, &msg).await, "HX-Trigger")
+            .await
+            .expect("a re-rendered tab carries its toast");
+        let toast: serde_json::Value = serde_json::from_str(&trigger).expect("trigger JSON");
+        assert_eq!(toast["showToast"]["type"], "warning", "{toast}");
+        assert_eq!(
+            toast["showToast"]["message"],
+            "Role deleted, but a grant of it assigned during the delete may remain for user(s) \
+             u-late. Remove the role from them. Creating a role with this name again would give \
+             it back to them."
+        );
     }
 }

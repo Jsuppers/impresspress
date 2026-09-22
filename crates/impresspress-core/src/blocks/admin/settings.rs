@@ -519,9 +519,16 @@ pub async fn seed_defaults(ctx: &dyn Context) {
     // migrations create it on the same `Init` pass), which is why this is
     // `upsert_fields` rather than an update. A failed stamp is only logged:
     // it errs toward re-running, costing the next boot the same bulk read
-    // this one paid — which is also why a whole-database outage, where the
-    // writes above and this stamp fail together, heals on the first boot
-    // that has a database again.
+    // this one paid.
+    //
+    // An outage heals because a failed read or write never reaches this
+    // stamp: the read returns early above, a failed write returns at the
+    // `failed` check, and the gate stays open until a boot on which every
+    // read and write lands. The same holds for a write that fails
+    // PERMANENTLY — a row the database refuses on every attempt: the gate
+    // never closes, so every cold start pays the bulk `list_all` again,
+    // retries that write, and logs the "some writes failed" warning above,
+    // until the row is repaired.
     let patch = BlockSettingsPatch {
         seed_defaults_hash: Some(code_hash),
         ..Default::default()

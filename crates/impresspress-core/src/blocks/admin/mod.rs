@@ -1387,6 +1387,102 @@ mod test_support {
         );
         msg
     }
+
+    /// Wraps `inner` and, just before the `nth` read of the grants table
+    /// (`database.list` on `user_roles::TABLE`) goes through, assigns `role`
+    /// to `user` on the unwrapped fixture: an assign landing while a role
+    /// delete is in flight. With `nth = 2` it lands after the delete's first
+    /// revocation pass has read and revoked, so only the pass after the role
+    /// row is gone can see it — the grant [`super::ops::RoleDeleted`]'s
+    /// late-pass outcomes are about. `inner` decides which later step fails.
+    ///
+    /// The assign goes to the fixture directly, so its own reads of the grants
+    /// table are not counted.
+    #[derive(Clone)]
+    pub(super) struct AssignBeforeGrantRead {
+        inner: crate::test_support::FailingDbOpContext,
+        fixture: crate::test_support::TestContext,
+        nth: usize,
+        user: &'static str,
+        role: &'static str,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AssignBeforeGrantRead {
+        pub(super) fn new(
+            fixture: crate::test_support::TestContext,
+            inner: crate::test_support::FailingDbOpContext,
+            nth: usize,
+            user: &'static str,
+            role: &'static str,
+        ) -> Self {
+            Self {
+                inner,
+                fixture,
+                nth,
+                user,
+                role,
+                reads: std::sync::Arc::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::context::Context for AssignBeforeGrantRead {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(
+            &self,
+            name: &str,
+            msg: Message,
+            input: wafer_run::InputStream,
+        ) -> wafer_run::OutputStream {
+            use crate::platform_state::user_roles;
+
+            if name != "wafer-run/database" || msg.action() != "database.list" {
+                return self.inner.call_block(name, msg, input).await;
+            }
+            let bytes = input.collect_to_bytes().await;
+            let collection =
+                wafer_block::codec::decode::<crate::test_support::CollectionPeek>(&bytes)
+                    .map(|peek| peek.collection)
+                    .unwrap_or_default();
+            if collection == user_roles::TABLE
+                && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth
+            {
+                user_roles::assign(&self.fixture, self.user, self.role, "")
+                    .await
+                    .expect("the in-flight assign lands");
+            }
+            self.inner
+                .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+                .await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
 }
 
 #[cfg(test)]
