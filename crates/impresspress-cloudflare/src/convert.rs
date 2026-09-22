@@ -346,3 +346,42 @@ mod request_tests {
         }
     }
 }
+
+/// Response-conversion tests: what a client reads from an error.
+///
+/// They run the real `output_to_response` over the error a block answers with
+/// and read the `worker::Response` back, so they cover the codec call and the
+/// `parts_to_response` glue together.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod response_tests {
+    use impresspress_core::blocks::errors::{error_response, ErrorCode};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::output_to_response;
+
+    /// **Fails before wafer-run 9a080676**, whose codec rendered an error as
+    /// `{"error", "message"}` only: an `errors::error_response` attaches its
+    /// precise code with `with_detail_code`, and the JS SDK reads it from the
+    /// body's `code` (`http-client.ts`), which this transport never sent.
+    #[wasm_bindgen_test]
+    async fn an_error_response_reaches_the_client_with_its_detail_code() {
+        let mut resp = output_to_response(error_response(
+            ErrorCode::NotAuthenticated,
+            "Not authenticated",
+        ))
+        .await
+        .expect("build response");
+
+        assert_eq!(resp.status_code(), 401);
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.text().await.expect("read body")).expect("a JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "Unauthenticated",
+                "message": "Not authenticated",
+                "code": "not_authenticated",
+            })
+        );
+    }
+}

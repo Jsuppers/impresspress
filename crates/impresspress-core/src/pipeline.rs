@@ -553,9 +553,10 @@ pub async fn handle_request(
                 // hardcoded 500, so a `NotFound` was recorded as a server error.
                 //
                 // Only the audit row was wrong, never the response: every adapter
-                // builds its reply through `http_codec::collect_http_response`,
-                // whose `Error` arm already calls `resolve_error_status`, so the
-                // client has always been served the 404/403/401 the error means.
+                // renders an error through `http_codec::error_to_http_response`
+                // (native and Cloudflare via `collect_http_response`), which
+                // resolves the status with `resolve_error_status`, so the client
+                // is served the 404/403/401 the error means.
                 // The row simply disagreed with the response that was sent —
                 // which is what an audit row exists not to do, and what defeats
                 // `RequestLogPolicy::Errors`: it selects on `status_code`, so

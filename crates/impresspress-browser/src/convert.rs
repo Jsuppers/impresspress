@@ -373,6 +373,26 @@ fn apply_response_meta(headers: &Headers, meta: &[MetaEntry]) -> Result<(), JsVa
     Ok(())
 }
 
+/// Apply transport-neutral [`http_codec::HttpResponseParts`] to a
+/// `web_sys::Response`.
+///
+/// `Set-Cookie` is appended, since the parts may carry several; every other
+/// header is set, so a name the parts repeat in a different case (a
+/// `resp.header.content-type` beside the codec's own `Content-Type`) ends as
+/// one header, the later value winning — what [`apply_response_meta`] does
+/// for a buffered success.
+fn parts_to_response(parts: http_codec::HttpResponseParts) -> Result<web_sys::Response, JsValue> {
+    let headers = Headers::new()?;
+    for (name, value) in &parts.headers {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            headers.append(name, value)?;
+        } else {
+            headers.set(name, value)?;
+        }
+    }
+    make_response(parts.body, parts.status, headers)
+}
+
 /// True when `meta` carries an explicit `resp.content_type` entry.
 fn has_content_type(meta: &[MetaEntry]) -> bool {
     MetaGet::contains_key(meta, META_RESP_CONTENT_TYPE)
@@ -462,7 +482,8 @@ fn make_streaming_body(
 ///    mapping mirrors `http_codec::collect_http_response` (whose drift
 ///    decisions — `Continue` → empty `200`, default `Content-Type:
 ///    application/json`, `Ok`/`Halt` identical — are pinned by the codec's
-///    tests).
+///    tests), and an `Error` terminal is rendered by the codec itself
+///    (`http_codec::error_to_http_response`).
 pub async fn output_to_response(mut output: OutputStream) -> Result<web_sys::Response, JsValue> {
     // Peek leading Meta events without consuming Chunks. Buffered blocks send
     // no Meta before their first Chunk, so this returns an empty vec for them
@@ -512,8 +533,10 @@ fn finalise_capped(collected: CappedCollect) -> Result<web_sys::Response, JsValu
 }
 
 /// Map a buffered terminal to a `web_sys::Response`, mirroring
-/// `http_codec::collect_http_response`'s terminal handling (the codec maps to
-/// transport-neutral parts; we apply them to `web_sys` types here).
+/// `http_codec::collect_http_response`'s terminal handling. The `Error` arm is
+/// the codec's own `error_to_http_response`, applied through
+/// [`parts_to_response`]; the others apply the terminal's meta to `web_sys`
+/// types here.
 fn finalise_buffered(
     result: Result<BufferedResponse, TerminalNotResponse>,
 ) -> Result<web_sys::Response, JsValue> {
@@ -529,26 +552,11 @@ fn finalise_buffered(
             make_response(buf.body, status, headers)
         }
 
+        // The codec renders the error — status, headers from the error's
+        // meta, and the `{"error", "message", "code"}` body — so this adapter
+        // answers an error with the bytes native and Cloudflare send.
         Err(TerminalNotResponse::Error(err)) => {
-            let status = http_codec::resolve_error_status(&err);
-            let headers = Headers::new()?;
-            apply_response_meta(&headers, &err.meta)?;
-            // Error bodies ARE JSON; a `resp.content_type` on the error meta is
-            // superseded (exactly one Content-Type, matching the codec).
-            headers.set("Content-Type", http_codec::DEFAULT_RESPONSE_CONTENT_TYPE)?;
-            // Surface the precise application code (set via
-            // `WaferError::with_detail_code`, carried as `error.code` meta) as a
-            // machine-readable `code` field; the coarse wafer code stays in
-            // `error`. Omitted when no detail code was attached.
-            let mut body = serde_json::json!({
-                "error": err.code,
-                "message": err.message,
-            });
-            if let Some(detail) = err.detail_code() {
-                body["code"] = serde_json::Value::String(detail.to_string());
-            }
-            let body = body.to_string().into_bytes();
-            make_response(body, status, headers)
+            parts_to_response(http_codec::error_to_http_response(&err))
         }
 
         Err(TerminalNotResponse::Drop) => make_response(Vec::new(), 204, Headers::new()?),
@@ -1015,6 +1023,45 @@ mod response_tests {
             .await
             .expect("read");
         assert_eq!(text.as_string().as_deref(), Some("one two three"));
+    }
+
+    /// An error answers with the codec's error body, detail code included,
+    /// and keeps the error meta's headers: both cookies (appended, not the
+    /// last one set) and one `Content-Type`, the JSON the body is, even when
+    /// the error meta names another. The body is compared byte for byte with
+    /// `http_codec::error_to_http_response`, the renderer native and
+    /// Cloudflare go through.
+    #[wasm_bindgen_test]
+    async fn an_error_answers_with_the_codecs_error_body_and_headers() {
+        let mut err = WaferError::new(ErrorCode::Unauthenticated, "Not authenticated")
+            .with_detail_code("not_authenticated");
+        err.meta.push(meta("resp.set_cookie.a", "a=1; Path=/"));
+        err.meta.push(meta("resp.set_cookie.b", "b=2; Path=/"));
+        err.meta.push(meta("resp.header.Retry-After", "30"));
+        err.meta.push(meta(META_RESP_CONTENT_TYPE, "text/html"));
+        let expected = wafer_block::http_codec::error_to_http_response(&err);
+
+        let resp = output_to_response(OutputStream::error(err))
+            .await
+            .expect("build response");
+
+        assert_eq!(resp.status(), 401);
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get("content-type").unwrap().as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(headers.get("retry-after").unwrap().as_deref(), Some("30"));
+        let cookies = headers.get("set-cookie").unwrap().unwrap_or_default();
+        assert!(
+            cookies.contains("a=1") && cookies.contains("b=2"),
+            "both cookies must reach the client: {cookies}"
+        );
+        let text = JsFuture::from(resp.text().unwrap()).await.unwrap();
+        let body = text.as_string().expect("a text body");
+        assert_eq!(body.as_bytes(), expected.body.as_slice());
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(json["code"], "not_authenticated");
     }
 
     /// And a body that fits is unaffected — the cap must not change the
