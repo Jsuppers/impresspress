@@ -84,6 +84,9 @@ pub use storage::make_storage_service;
 /// Worker — see `bridge::dbInit`'s `#[wasm_bindgen(catch)]`.
 #[cfg(target_arch = "wasm32")]
 pub async fn db_init() -> Result<(), wasm_bindgen::JsValue> {
-    bridge::dbInit().await?;
+    let opened = bridge::dbInit().await;
+    // Whatever the schema cache knew described the database this replaced.
+    database::forget_schema();
+    opened?;
     Ok(())
 }

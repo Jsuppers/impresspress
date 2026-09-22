@@ -97,8 +97,11 @@ impl BrowserVectorService {
         // Idempotent — guarantees the table exists so the SELECT below
         // can't fail with "no such table" on a DB that has never had any
         // index created in it yet.
-        bridge::db_exec_raw(&sql::build_registry_ddl(), db_codec::empty_params())
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        let created = bridge::db_exec_raw(&sql::build_registry_ddl(), db_codec::empty_params());
+        // DDL through the bridge, which the database service's schema cache
+        // never saw.
+        database::forget_schema();
+        created.map_err(|e| VectorError::Internal(js_err(e)))?;
 
         let Some(state) = self.read_registry_row(name)? else {
             return Ok(None);
@@ -142,8 +145,15 @@ impl VectorService for BrowserVectorService {
         // registry DDL has already run. The hand-written `dbFlush()?` this
         // replaced returned early on that path and left the registry table
         // in memory only.
-        database::with_flush_mapped(self.create_index_statements(&config), VectorError::Internal)
-            .await?;
+        let written = database::with_flush_mapped(
+            self.create_index_statements(&config),
+            VectorError::Internal,
+        )
+        .await;
+        // DDL through the bridge, which the database service's schema cache
+        // never saw.
+        database::forget_schema();
+        written?;
 
         self.indexes
             .lock()
@@ -166,11 +176,15 @@ impl VectorService for BrowserVectorService {
             .lookup(name)?
             .ok_or_else(|| VectorError::IndexNotFound(name.into()))?;
 
-        database::with_flush_mapped(
+        let written = database::with_flush_mapped(
             self.delete_index_statements(name, state.keyword_search),
             VectorError::Internal,
         )
-        .await?;
+        .await;
+        // DDL through the bridge, which the database service's schema cache
+        // never saw.
+        database::forget_schema();
+        written?;
 
         self.indexes
             .lock()
