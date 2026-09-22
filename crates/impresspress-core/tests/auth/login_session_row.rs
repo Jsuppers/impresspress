@@ -21,7 +21,7 @@ use serde_json::json;
 use wafer_core::clients::crypto;
 use wafer_run::{
     streams::output::{BufferedResponse, TerminalNotResponse},
-    Block, InputStream, Message, OutputStream,
+    Block, ErrorCode, InputStream, Message, OutputStream, WaferError,
 };
 
 use crate::common::MigrationTestCtx;
@@ -100,20 +100,29 @@ async fn invoke_login(ctx: &MigrationTestCtx, email: &str, password: &str) -> St
     String::from_utf8(buf.body).expect("body utf8")
 }
 
-/// Run the login handler and consume the output stream regardless of whether
-/// it terminates with `Complete` or `Error` — used by the wrong-password test
-/// which expects an `Unauthenticated` error stream rather than a body.
-async fn invoke_login_drain(ctx: &MigrationTestCtx, email: &str, password: &str) {
+/// Run the login handler and return the error its stream terminates with,
+/// panicking on any other terminal. The wrong-password test needs to know
+/// the login was refused *as a bad credential*: a 500, 404 or 429 would also
+/// write no session row, so "no row" alone proves nothing.
+async fn invoke_login_expecting_error(
+    ctx: &MigrationTestCtx,
+    email: &str,
+    password: &str,
+) -> WaferError {
     let block = AuthUiBlock::default();
     let body = json!({"email": email, "password": password}).to_string();
     let msg = login_msg();
     let out = block
         .handle(ctx, msg, InputStream::from_bytes(body.into_bytes()))
         .await;
-    // Discard the result — we only care about the side-effects (or lack
-    // thereof) on the database. An error stream is the expected outcome on
-    // the wrong-password path.
-    let _ = out.collect_buffered().await;
+    match out.collect_buffered().await {
+        Err(TerminalNotResponse::Error(e)) => e,
+        Ok(buf) => panic!(
+            "login must be refused, got a response: {}",
+            String::from_utf8_lossy(&buf.body)
+        ),
+        Err(other) => panic!("login must terminate with an error, got {other:?}"),
+    }
 }
 
 /// The refresh token both handlers exchange, out of a login or refresh body.
@@ -255,7 +264,20 @@ async fn invalid_credentials_do_not_create_a_session_row() {
     let ctx = MigrationTestCtx::new().await;
     let user_id = seed_password_user(&ctx, "bob@example.com", "correct-horse").await;
 
-    invoke_login_drain(&ctx, "bob@example.com", "WRONG-password").await;
+    let err = invoke_login_expecting_error(&ctx, "bob@example.com", "WRONG-password").await;
+    assert_eq!(
+        err.code,
+        ErrorCode::Unauthenticated,
+        "a wrong password is a 401, not another failure: {} ({:?})",
+        err.message,
+        err.code
+    );
+    assert_eq!(
+        err.detail_code(),
+        Some("invalid_credentials"),
+        "a wrong password is refused as a bad credential: {}",
+        err.message
+    );
 
     let rows = sessions::list_for_user(&ctx, &user_id)
         .await
@@ -263,6 +285,19 @@ async fn invalid_credentials_do_not_create_a_session_row() {
     assert!(
         rows.is_empty(),
         "no session row may be written for a failed login: {rows:?}"
+    );
+
+    // Control: the same user and fixture DO get a row once the password is
+    // right, so the empty list above is the refusal, not a fixture that
+    // could never have written one.
+    let _ = invoke_login(&ctx, "bob@example.com", "correct-horse").await;
+    let rows = sessions::list_for_user(&ctx, &user_id)
+        .await
+        .expect("list sessions");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the correct password must write exactly one row: {rows:?}"
     );
 }
 
