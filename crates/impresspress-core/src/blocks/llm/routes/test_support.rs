@@ -261,7 +261,7 @@ pub(in crate::blocks::llm) fn routed(mut msg: Message) -> Message {
 /// the wire. A leak test whose fixture never had the secret in reach would
 /// pass against a leaking handler.
 #[derive(Default)]
-pub(super) struct RecordingProviderAdmin {
+pub(crate) struct RecordingProviderAdmin {
     configured: Mutex<Vec<ProviderConfig>>,
 }
 
@@ -291,18 +291,18 @@ impl ProviderAdmin for RecordingProviderAdmin {
 
 /// Stub `wafer-run/llm` service block with scripted answers: `llm.list_models`
 /// returns `models`, `llm.status` returns `status`, `llm.chat` streams
-/// `chat_chunks` one frame each, and `llm.unload_model` acknowledges with an
-/// empty body. Anything else errors loudly so a test cannot silently exercise
+/// `chat_chunks` one frame each, `llm.load_model` streams no progress and
+/// ends, and `llm.unload_model` acknowledges with an empty body. Anything else errors loudly so a test cannot silently exercise
 /// an op it did not script.
-pub(super) struct StubLlmServiceBlock {
-    pub(super) models: Vec<ModelInfo>,
-    pub(super) status: ModelStatus,
-    pub(super) chat_chunks: Vec<ChatChunk>,
+pub(crate) struct StubLlmServiceBlock {
+    pub(crate) models: Vec<ModelInfo>,
+    pub(crate) status: ModelStatus,
+    pub(crate) chat_chunks: Vec<ChatChunk>,
     /// How many `llm.chat` requests reached the service. A test that a
     /// request refused *before* the model can only prove it by reading the
     /// provider's own count: asserting the handler's status says nothing
     /// about whether a paid backend was already called.
-    pub(super) chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) chat_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// A classified refusal to answer every op with, instead of the canned
     /// success above.
     ///
@@ -311,7 +311,7 @@ pub(super) struct StubLlmServiceBlock {
     /// `ModelNotFound` → `NotFound`, `InvalidRequest` → `InvalidArgument`,
     /// `NotSupported` → `Unimplemented`). A route test can only show that a
     /// handler preserves that classification if the stub can produce one.
-    pub(super) error: Option<(ErrorCode, String)>,
+    pub(crate) error: Option<(ErrorCode, String)>,
 }
 
 impl Default for StubLlmServiceBlock {
@@ -353,6 +353,8 @@ impl Block for StubLlmServiceBlock {
                 wafer_block::codec::encode(&self.status).expect("encode status"),
             ),
             ServiceOp::LLM_UNLOAD_MODEL => OutputStream::respond(Vec::new()),
+            // A load that finishes at once: no progress frames.
+            ServiceOp::LLM_LOAD_MODEL => OutputStream::from_producer(|_sink, _cancel| async {}),
             ServiceOp::LLM_CHAT => {
                 self.chat_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

@@ -15,6 +15,8 @@
 //! the crate's source gates are built on, so a gate states its root and its
 //! exemptions instead of hand-rolling a fourth `read_dir` recursion.
 
+#[cfg(test)]
+pub mod htmx;
 pub mod source_scan;
 
 use std::{

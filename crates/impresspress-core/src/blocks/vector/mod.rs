@@ -5,7 +5,7 @@ pub mod pages;
 pub mod pages_ui;
 pub mod service;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use wafer_run::{BlockInfo, HttpMethod, InstanceMode};
 
