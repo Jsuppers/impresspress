@@ -821,6 +821,7 @@ pub(crate) fn to_wire_filters(
                 field: f.field.clone(),
                 operator: operator.to_string(),
                 value: f.value.clone(),
+                column: None,
             })
         })
         .collect()

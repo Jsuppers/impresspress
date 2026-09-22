@@ -1699,14 +1699,17 @@ async fn order_totals(
             wire::AggregateColumnDef::Sum {
                 field: "total_cents".into(),
                 alias: "gross".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::Sum {
                 field: "refunded_total_cents".into(),
                 alias: "refunded".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::Sum {
                 field: "platform_fee_cents".into(),
                 alias: "fees".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: crate::util::to_wire_filters(&[Filter {
@@ -1840,10 +1843,12 @@ async fn line_item_totals(
             wire::AggregateColumnDef::Sum {
                 field: "quantity".into(),
                 alias: "quantity".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::Sum {
                 field: "total_minor".into(),
                 alias: "revenue".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: negative_rows("quantity"),

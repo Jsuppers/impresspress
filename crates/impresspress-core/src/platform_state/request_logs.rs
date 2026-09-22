@@ -305,6 +305,7 @@ pub async fn summarise_by_path(
             field: "path".into(),
             operator: "like".into(),
             value: json!(format!("%{path_search}%")),
+            column: None,
         })]
     };
     let req = wire::AggregateRequest {
@@ -317,6 +318,7 @@ pub async fn summarise_by_path(
             wire::AggregateColumnDef::Avg {
                 field: "duration_ms".into(),
                 alias: "avg_ms".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: to_wire_filters(&[is_error()]),
@@ -381,6 +383,7 @@ pub async fn today_counts(ctx: &dyn Context, since_iso: &str) -> Result<TodayCou
             wire::AggregateColumnDef::Avg {
                 field: "duration_ms".into(),
                 alias: "avg_val".into(),
+                cast_as: None,
             },
         ],
         filters: to_wire_filters(&[since(since_iso)]),

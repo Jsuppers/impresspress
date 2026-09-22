@@ -570,6 +570,7 @@ pub async fn count_by_bucket(
             field: "bucket".into(),
             operator: "in".into(),
             value: serde_json::Value::Array(names),
+            column: None,
         })],
         group_by: vec![wire::GroupByDef::Column("bucket".into())],
         sort: vec![],
