@@ -701,6 +701,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // allowlist and its import through `seed::import`, and the dev
             // block grants itself those tables (see the audit pragma there)
             "blocks/dev/data_snapshot.rs",
+            // A fault injector: the seed's tests fail its one metadata
+            // refresh (`database.update`) and its bulk read (`database.list`)
+            // on this table, to prove neither stamps the seed hash gate.
+            "blocks/admin/settings.rs",
         ],
     ),
     (
@@ -743,8 +747,13 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // the race test aims `RendezvousDbOpContext` at the grants read
             // `assign` makes, so the two concurrent assigns both pass it
             // before either inserts. It then drives the revoke through
-            // `handle_remove_role`, where the reported bug lived.
+            // `handle_remove_role`, where the reported bug lived. The role
+            // delete test aims `FailingDbOpContext` at the grants read of
+            // the revocation pass that runs after the role row is deleted.
             "blocks/admin/iam.rs",
+            // A fault injector, the same one: the roles tab's delete with
+            // that late revocation pass failing.
+            "blocks/admin/pages/users.rs",
             // A test fixture that must write past the door: migration 004's
             // test plants twin grants for the repair to collapse, and the
             // door's only writer (`assign`) refuses to make a twin.

@@ -313,6 +313,20 @@ pub(super) async fn create_role(
     Ok(record)
 }
 
+/// What [`delete_role`] did. Either way the role row is gone — a delete that
+/// did not happen is an `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RoleDeleted {
+    /// The role and every grant of it are gone.
+    Clean,
+    /// The role is gone, but the revocation pass that runs after its row was
+    /// deleted failed, so a grant assigned while the delete was in flight may
+    /// have outlived it. The failure is logged and recorded on the audit row;
+    /// such a grant can only be removed individually, since the role it names
+    /// no longer exists to be deleted again.
+    LateGrantsNotRevoked,
+}
+
 /// Delete a role, revoking every grant of it, writing an audit-log row.
 /// Rejects deletion of system roles (the `is_system` flag), which would break
 /// auth.
@@ -332,11 +346,16 @@ pub(super) async fn create_role(
 /// takes whatever slipped in. (An assign whose check ran before the role was
 /// deleted and whose insert lands after this second pass is still possible
 /// in principle — the check and the insert are two statements.)
+///
+/// A failure of that second pass is not reported as a failed delete: the
+/// role IS deleted, and answering with an error would tell the caller it is
+/// still there. It is [`RoleDeleted::LateGrantsNotRevoked`] instead, and the
+/// audit row for the deletion is written either way.
 pub(super) async fn delete_role(
     ctx: &dyn Context,
     msg: &Message,
     role_id: &str,
-) -> Result<(), OutputStream> {
+) -> Result<RoleDeleted, OutputStream> {
     if role_id.is_empty() {
         return Err(err_bad_request("Missing role ID"));
     }
@@ -356,24 +375,103 @@ pub(super) async fn delete_role(
     }
     let name = role.str_field("name").to_string();
 
-    let mut revoked = revoke_every_grant_of(ctx, &name).await?;
+    let revoked = match revoke_every_grant_of(ctx, &name).await {
+        Ok(n) => n,
+        Err(failure) => return Err(failure.before_the_role_is_deleted()),
+    };
 
     match db::delete(ctx, ROLES_TABLE, role_id).await {
         Ok(()) => {}
         Err(e) => return Err(db_error(e, "Role not found", "Database error")),
     }
 
-    revoked += revoke_every_grant_of(ctx, &name).await?;
+    let (outcome, detail) = match revoke_every_grant_of(ctx, &name).await {
+        Ok(late) => (
+            RoleDeleted::Clean,
+            format!("grants revoked: {}", revoked + late),
+        ),
+        Err(failure) => {
+            tracing::error!(
+                role = %name,
+                step = failure.step.describe(),
+                error = %failure.error,
+                "role deleted, but the revocation pass after the delete failed; a grant \
+                 assigned while the delete was in flight may outlive the role"
+            );
+            (
+                RoleDeleted::LateGrantsNotRevoked,
+                format!(
+                    "grants revoked: {revoked}; the revocation pass after the delete failed \
+                     while it {}",
+                    failure.step.describe()
+                ),
+            )
+        }
+    };
 
     audit_log(
         ctx,
         &admin_id,
         "role.delete",
-        &format!("roles/{role_id} (name: {name}; grants revoked: {revoked})"),
+        &format!("roles/{role_id} (name: {name}; {detail})"),
         msg.remote_addr(),
     )
     .await;
-    Ok(())
+    Ok(outcome)
+}
+
+/// The step of [`revoke_every_grant_of`] that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevokeStep {
+    /// Reading the grants. Nothing was written.
+    Read,
+    /// Invalidating a holder's sessions before the revoke. No grant was
+    /// removed.
+    BumpBefore,
+    /// Removing the grants.
+    Revoke,
+    /// Invalidating a holder's sessions after the revoke. The grants are gone.
+    BumpAfter,
+}
+
+impl RevokeStep {
+    /// What the pass was doing, as a phrase for a log line or audit row.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Read => "was reading the grants",
+            Self::BumpBefore => "was invalidating sessions before revoking the grants",
+            Self::Revoke => "was revoking the grants",
+            Self::BumpAfter => "was invalidating sessions after revoking the grants",
+        }
+    }
+}
+
+/// A failed [`revoke_every_grant_of`]: which step, and the error it met.
+struct RevokeFailure {
+    step: RevokeStep,
+    error: wafer_run::WaferError,
+}
+
+impl RevokeFailure {
+    /// The response for a failure of the pass that runs while the role row
+    /// still exists — so the delete did not happen, and deleting again is
+    /// the retry.
+    fn before_the_role_is_deleted(self) -> OutputStream {
+        match self.step {
+            RevokeStep::Read => db_error_internal(self.error, "Database error"),
+            RevokeStep::BumpBefore => {
+                err_internal("Role not deleted: session invalidation failed", self.error)
+            }
+            RevokeStep::Revoke => db_error_internal(
+                self.error,
+                "Role not deleted: its grants could not be revoked",
+            ),
+            RevokeStep::BumpAfter => err_internal(
+                "Role not deleted: its grants were revoked but session invalidation failed",
+                self.error,
+            ),
+        }
+    }
 }
 
 /// Remove every `user_roles` row naming `role` and invalidate each holder's
@@ -397,46 +495,29 @@ pub(super) async fn delete_role(
 /// grant is still removed, and the assign that wrote it bumped them, so the
 /// only token that can still carry the role is one minted between that
 /// assign and step 2.
-async fn revoke_every_grant_of(ctx: &dyn Context, role: &str) -> Result<i64, OutputStream> {
-    let grants = match user_roles::list_by_role(ctx, role).await {
-        Ok(rows) => rows,
-        Err(e) => return Err(db_error_internal(e, "Database error")),
-    };
+async fn revoke_every_grant_of(ctx: &dyn Context, role: &str) -> Result<i64, RevokeFailure> {
+    let failed = |step| move |error| RevokeFailure { step, error };
+    let grants = user_roles::list_by_role(ctx, role)
+        .await
+        .map_err(failed(RevokeStep::Read))?;
     let mut holders: Vec<&str> = grants.iter().map(|g| g.user_id.as_str()).collect();
     holders.sort_unstable();
     holders.dedup();
 
-    bump_each(
-        ctx,
-        &holders,
-        "Role not deleted: session invalidation failed",
-    )
-    .await?;
-    let revoked = match user_roles::revoke_role(ctx, role).await {
-        Ok(n) => n,
-        Err(e) => {
-            return Err(db_error_internal(
-                e,
-                "Role not deleted: its grants could not be revoked",
-            ))
-        }
-    };
-    bump_each(
-        ctx,
-        &holders,
-        "Role grants revoked but session invalidation failed",
-    )
-    .await?;
+    bump_each(ctx, &holders)
+        .await
+        .map_err(failed(RevokeStep::BumpBefore))?;
+    let revoked = user_roles::revoke_role(ctx, role)
+        .await
+        .map_err(failed(RevokeStep::Revoke))?;
+    bump_each(ctx, &holders)
+        .await
+        .map_err(failed(RevokeStep::BumpAfter))?;
     Ok(revoked)
 }
 
-/// Bump each of `user_ids`' auth version, stopping at the first failure and
-/// answering it with `failure` as the client message.
-async fn bump_each(
-    ctx: &dyn Context,
-    user_ids: &[&str],
-    failure: &str,
-) -> Result<(), OutputStream> {
+/// Bump each of `user_ids`' auth version, stopping at the first failure.
+async fn bump_each(ctx: &dyn Context, user_ids: &[&str]) -> Result<(), wafer_run::WaferError> {
     for &user_id in user_ids {
         if let Err(e) = bump_auth_version(ctx, user_id).await {
             tracing::error!(
@@ -444,7 +525,7 @@ async fn bump_each(
                 error = %e,
                 "role delete: auth_version bump failed"
             );
-            return Err(err_internal(failure, e));
+            return Err(e);
         }
     }
     Ok(())
