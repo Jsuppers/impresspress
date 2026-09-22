@@ -3281,6 +3281,16 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
             .description("Send signed billing events to another system you control.")
             .collapsible(),
     ];
+    let form =
+        match settings_form::settings_form(ctx, "/b/products/admin/settings", &sections, html! {})
+            .await
+        {
+            Ok(form) => form,
+            Err(e) => {
+                tracing::error!(error = %e, "products settings: current values read failed");
+                return ui::server_error_response(msg);
+            }
+        };
     let content = html! {
         (admin_tabs("settings"))
         (components::page_header("Settings", Some("Set up payments and choose sensible defaults for new products"), None))
@@ -3303,7 +3313,7 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 }
             }
         }
-        (settings_form::settings_form(ctx, "/b/products/admin/settings", &sections, html! {}).await)
+        (form)
     };
     ui::shell_page(
         ctx,

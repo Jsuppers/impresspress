@@ -1,5 +1,5 @@
 use maud::Markup;
-use wafer_run::{context::Context, ConfigVar, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, ConfigVar, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::email,
@@ -41,8 +41,8 @@ fn mailgun_vars() -> Vec<ConfigVar> {
 /// fetch to `POST /b/admin/email` — the `SaveEmailSettings` route that
 /// [`handle_save_email_settings`] serves. Same pattern as every other
 /// block's admin settings page (products / userportal / legalpages /
-/// auth_ui).
-pub async fn settings_body(ctx: &dyn Context, _msg: &Message) -> Markup {
+/// auth_ui). `Err` when the current values could not be read.
+pub async fn settings_body(ctx: &dyn Context, _msg: &Message) -> Result<Markup, WaferError> {
     let vars = mailgun_vars();
     let section = SettingsSection::new("Mailgun Configuration", icons::globe(), &vars);
     settings_form::settings_form(ctx, "/b/admin/email", &[section], maud::html! {}).await
@@ -135,11 +135,14 @@ mod tests {
         // attribute in plaintext, readable via page source / devtools — see
         // `settings_form.rs`'s own `password_field_is_masked_with_eye_toggle_
         // and_never_echoes_the_raw_value` test for the same contract).
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::with_admin().await;
         ctx.set_config("IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "super-secret-value");
         let msg = anon_msg("retrieve", "/b/admin/settings/email");
 
-        let html = settings_body(&ctx, &msg).await.into_string();
+        let html = settings_body(&ctx, &msg)
+            .await
+            .expect("the current values are readable")
+            .into_string();
 
         assert!(
             !html.contains("super-secret-value"),
@@ -170,10 +173,13 @@ mod tests {
         // The base-URL field keeps its documented default-as-placeholder
         // behavior (was `field.default` in the old hand-rolled render; now
         // sourced from the same `ConfigVar.default` the block declares).
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::with_admin().await;
         let msg = anon_msg("retrieve", "/b/admin/settings/email");
 
-        let html = settings_body(&ctx, &msg).await.into_string();
+        let html = settings_body(&ctx, &msg)
+            .await
+            .expect("the current values are readable")
+            .into_string();
 
         assert!(
             html.contains(email::DEFAULT_MAILGUN_BASE_URL),

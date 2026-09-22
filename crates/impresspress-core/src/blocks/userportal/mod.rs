@@ -473,9 +473,23 @@ async fn admin_settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         icons::settings(),
         &vars,
     )];
+    let form = match settings_form::settings_form(
+        ctx,
+        "/b/userportal/admin/settings",
+        &sections,
+        html! {},
+    )
+    .await
+    {
+        Ok(form) => form,
+        Err(e) => {
+            tracing::error!(error = %e, "userportal branding settings: current values read failed");
+            return ui::server_error_response(msg);
+        }
+    };
     let content = html! {
         (components::page_header("Branding Settings", Some("Customize your application appearance"), None))
-        (settings_form::settings_form(ctx, "/b/userportal/admin/settings", &sections, html! {}).await)
+        (form)
     };
     ui::shell_page(
         ctx,
@@ -540,6 +554,47 @@ mod table_tests {
     use wafer_run::Block as _;
 
     use super::*;
+
+    /// The branding page is a settings form whose Save posts every field.
+    /// When the stored branding cannot be read it is a 500, never the form
+    /// filled from the boot map and the declared defaults.
+    #[tokio::test]
+    async fn a_failed_branding_read_renders_no_form() {
+        let ctx = crate::test_support::TestContext::with_userportal()
+            .await
+            .break_reads();
+
+        let (status, html) = test_support::browser_request(
+            &ctx,
+            crate::test_support::admin_msg("retrieve", "/b/userportal/admin/settings"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("<form"), "{html}");
+    }
+
+    /// Control: a healthy read renders the form with the stored value.
+    #[tokio::test]
+    async fn the_branding_form_shows_the_stored_app_name() {
+        let ctx = crate::test_support::TestContext::with_userportal().await;
+        let app_name = crate::test_support::unique_config_value();
+        wafer_core::clients::config::set(&ctx, "WAFER_RUN_SHARED__APP_NAME", &app_name)
+            .await
+            .expect("store the app name");
+
+        let (status, html) = test_support::browser_request(
+            &ctx,
+            crate::test_support::admin_msg("retrieve", "/b/userportal/admin/settings"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(html.contains("<form"), "{html}");
+        assert!(html.contains(&format!(r#"value="{app_name}""#)), "{html}");
+    }
 
     /// `info().endpoints` is generated from `ROUTES`; nothing else declares
     /// an endpoint for this block.

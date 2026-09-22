@@ -42,6 +42,13 @@
 //! 4. Otherwise `NotFound`, exactly as wafer-core's block reports it, so
 //!    `config::get_default`'s fallback-to-default behaviour is unchanged.
 //!
+//! A `CONFIG_GET` that cannot read the table answers from the boot map, so a
+//! database blip does not blank every page's branding. That is wrong for a
+//! form: a settings page pre-filled from the boot map or the declared
+//! defaults, then saved, writes those over the stored values. Forms read
+//! through [`get_many`] ([`CONFIG_GET_MANY`]) instead, which follows the same
+//! read order but answers an unreadable table with an error.
+//!
 //! An empty row value deliberately falls through to the boot map rather than
 //! masking it. Blank means "unset", not "explicitly blank", everywhere in this
 //! repo — the boot seeder skips an empty env value and
@@ -85,6 +92,55 @@ use crate::{
 /// signing key out from under a running process.
 fn served_only_from_boot_map(key: &str) -> bool {
     crate::config_vars::is_instance_owned_key(key)
+}
+
+/// The block every config read and write is addressed to.
+const CONFIG_BLOCK: &str = "wafer-run/config";
+
+/// Read several keys in the `CONFIG_GET` read order, failing when the
+/// `variables` table cannot be read rather than answering from the boot map.
+/// An impresspress operation on the config block this module registers;
+/// callers go through [`get_many`].
+pub const CONFIG_GET_MANY: &str = "impresspress.config.get_many";
+
+/// Request for [`CONFIG_GET_MANY`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GetManyRequest {
+    keys: Vec<String>,
+}
+
+/// Response for [`CONFIG_GET_MANY`]: the keys that have a value. A key that is
+/// absent is unset everywhere, and the caller applies its own default.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GetManyResponse {
+    values: HashMap<String, String>,
+}
+
+/// The current value of each of `keys` that has one, or an error when the
+/// `variables` table could not be read (or the caller may not read a key).
+///
+/// For a form. [`wafer_core::clients::config::get_default`] never fails: an
+/// unreadable table answers from the boot map and a missing boot value from
+/// the caller's default, which is right for page chrome and wrong for a form
+/// whose Save posts every field back.
+pub async fn get_many(
+    ctx: &dyn Context,
+    keys: &[&str],
+) -> Result<HashMap<String, String>, WaferError> {
+    let req = GetManyRequest {
+        keys: keys.iter().map(|key| (*key).to_string()).collect(),
+    };
+    let body = codec::encode(&req)?;
+    let out = ctx
+        .call_block(
+            CONFIG_BLOCK,
+            Message::new(CONFIG_GET_MANY),
+            InputStream::from_bytes(body),
+        )
+        .await;
+    let buf = out.collect_buffered().await.map_err(WaferError::from)?;
+    let resp: GetManyResponse = codec::decode(&buf.body)?;
+    Ok(resp.values)
 }
 
 /// The `variables` table as a key/value map, shared by every reader holding
@@ -180,7 +236,9 @@ impl VariablesConfigBlock {
     ///
     /// No lock is held across the `await` — the guard is dropped before the
     /// fetch and re-taken after — so a hard-stopped request cannot strand one.
-    async fn snapshot(&self) -> Option<ConfigRows> {
+    ///
+    /// A failed read is not cached: the next reader queries again.
+    async fn snapshot(&self) -> Result<ConfigRows, WaferError> {
         let generation = config_write_generation();
         {
             let cached = self
@@ -190,25 +248,14 @@ impl VariablesConfigBlock {
                 .clone();
             if let Some((cached_generation, rows)) = cached {
                 if cached_generation == generation {
-                    return Some(rows);
+                    return Ok(rows);
                 }
             }
         }
 
-        let rows = match variables::load_all(&self.db).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                // Reported rather than propagated: a config read that cannot
-                // reach the table falls back to the boot map, which is what
-                // the process was already serving. Failing instead would turn
-                // a transient database blip into a blank site.
-                tracing::warn!(
-                    error = %e,
-                    "config read could not reach the variables table; falling back to the boot map"
-                );
-                return None;
-            }
-        };
+        let rows = variables::load_all(&self.db)
+            .await
+            .map_err(|e| WaferError::new(ErrorCode::Unavailable, e))?;
         // `load_all` already returns a key/value map; an empty value falls
         // through to the boot map rather than masking it (see the module docs).
         let map: HashMap<String, String> = rows
@@ -221,13 +268,56 @@ impl VariablesConfigBlock {
             .snapshot
             .write()
             .expect("config snapshot lock poisoned") = Some((generation, map.clone()));
-        Some(map)
+        Ok(map)
     }
 
-    /// The stored value for `key`, or `None` when no row holds a non-empty
-    /// one.
-    async fn stored_value(&self, key: &str) -> Option<String> {
-        self.snapshot().await?.get(key).cloned()
+    /// The value a reader of `key` is served, in the module's read order: the
+    /// boot map for a runtime-owned key, else a non-empty row, else the boot
+    /// map. `Ok(None)` when none holds one; `Err` when the table could not be
+    /// read for a key it might hold.
+    async fn resolve(&self, key: &str) -> Result<Option<String>, WaferError> {
+        if served_only_from_boot_map(key) {
+            return Ok(self.boot.get(key));
+        }
+        let rows = self.snapshot().await?;
+        Ok(rows.get(key).cloned().or_else(|| self.boot.get(key)))
+    }
+
+    /// [`CONFIG_GET_MANY`]: every requested key the caller may read, resolved
+    /// like `CONFIG_GET`, except that an unreadable table is an error.
+    async fn get_many_op(&self, ctx: &dyn Context, input: InputStream) -> OutputStream {
+        let body = input.collect_to_bytes().await;
+        let req = match codec::decode::<GetManyRequest>(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                return OutputStream::error(WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{CONFIG_GET_MANY}: {e}"),
+                ))
+            }
+        };
+        let mut values = HashMap::with_capacity(req.keys.len());
+        for key in req.keys {
+            if let Err(e) = ctx.check_resource_access(&key, ResourceType::Config, false) {
+                return OutputStream::error(e);
+            }
+            match self.resolve(&key).await {
+                Ok(Some(value)) => {
+                    values.insert(key, value);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return OutputStream::error(WaferError::new(
+                        e.code,
+                        format!("{CONFIG_GET_MANY} could not read the variables table: {e}"),
+                    ))
+                }
+            }
+        }
+        match codec::encode(&GetManyResponse { values }) {
+            Ok(bytes) => OutputStream::respond(bytes),
+            Err(e) => OutputStream::error(e),
+        }
     }
 
     /// Persist `key` and let cached readers know the store moved.
@@ -455,12 +545,20 @@ impl Block for VariablesConfigBlock {
                     return OutputStream::error(e);
                 }
 
-                let value = if served_only_from_boot_map(&key) {
-                    self.boot.get(&key)
-                } else {
-                    match self.stored_value(&key).await {
-                        Some(value) => Some(value),
-                        None => self.boot.get(&key),
+                let value = match self.resolve(&key).await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        // Reported rather than propagated: a config read that
+                        // cannot reach the table falls back to the boot map,
+                        // which is what the process was already serving.
+                        // Failing instead would turn a transient database blip
+                        // into a blank site. A form must not be filled from
+                        // this; it reads through `CONFIG_GET_MANY`.
+                        tracing::warn!(
+                            error = %e,
+                            "config read could not reach the variables table; falling back to the boot map"
+                        );
+                        self.boot.get(&key)
                     }
                 };
 
@@ -477,6 +575,7 @@ impl Block for VariablesConfigBlock {
                     },
                 )
             }
+            CONFIG_GET_MANY => self.get_many_op(ctx, input).await,
             ServiceOp::CONFIG_SET => {
                 let body = input.collect_to_bytes().await;
                 let req = match codec::decode::<wire::SetRequest>(&body) {
@@ -523,7 +622,7 @@ pub fn register_with(
     db: Arc<dyn DatabaseService>,
 ) -> Result<(), wafer_run::RuntimeError> {
     let block: Arc<dyn Block> = Arc::new(VariablesConfigBlock::new(boot, db));
-    wafer.register_block("wafer-run/config", block)?;
+    wafer.register_block(CONFIG_BLOCK, block)?;
     Ok(())
 }
 
@@ -534,6 +633,54 @@ mod tests {
         platform_state::variables::VariablePatch,
         test_support::{unique_config_value, TestContext},
     };
+
+    /// `CONFIG_GET_MANY` reads what `CONFIG_GET` reads — a stored row, else
+    /// the boot map — and leaves out a key nothing holds, so the caller's
+    /// default applies.
+    #[tokio::test]
+    async fn get_many_reads_rows_over_the_boot_map_and_omits_unset_keys() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config("X__BOOT_ONLY", "from-boot");
+        let stored = unique_config_value();
+        wafer_core::clients::config::set(&ctx, "WAFER_RUN_SHARED__APP_NAME", &stored)
+            .await
+            .expect("store a row");
+
+        let values = get_many(
+            &ctx,
+            &["WAFER_RUN_SHARED__APP_NAME", "X__BOOT_ONLY", "X__UNSET"],
+        )
+        .await
+        .expect("a healthy read");
+
+        assert_eq!(values.get("WAFER_RUN_SHARED__APP_NAME"), Some(&stored));
+        assert_eq!(
+            values.get("X__BOOT_ONLY").map(String::as_str),
+            Some("from-boot")
+        );
+        assert!(!values.contains_key("X__UNSET"), "{values:?}");
+    }
+
+    /// Where `CONFIG_GET` falls back to the boot map on an unreadable table,
+    /// `CONFIG_GET_MANY` fails: a form must not be filled from the fallback.
+    /// The `CONFIG_GET` half is a guard on the fallback this keeps.
+    #[tokio::test]
+    async fn get_many_fails_where_config_get_falls_back() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "from-boot");
+        wafer_core::clients::config::set(&ctx, "WAFER_RUN_SHARED__APP_NAME", "stored")
+            .await
+            .expect("store a row");
+        let ctx = ctx.break_reads();
+
+        assert_eq!(
+            wafer_core::clients::config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            "from-boot"
+        );
+        assert!(get_many(&ctx, &["WAFER_RUN_SHARED__APP_NAME"])
+            .await
+            .is_err());
+    }
 
     /// An admin write must be visible to a reader whose snapshot is ALREADY
     /// warm.

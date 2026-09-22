@@ -56,18 +56,22 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
         ),
     ];
 
-    // Two of the four tab bodies read the database. Both of them used to
-    // swallow a failure into the same empty table a healthy deployment with
-    // nothing configured renders — "no inbound requests", "no custom grants"
-    // — so those two hand back a `Result` and the whole page fails instead.
-    // `email` and `variables` read only config and are infallible here.
+    // Three of the four tab bodies hand back a `Result`, and a failed read
+    // fails the whole page. `network` and `permissions` used to swallow one
+    // into the empty table a healthy deployment with nothing configured
+    // renders — "no inbound requests", "no custom grants". `email` is a form,
+    // and a form filled from defaults because the stored values could not be
+    // read would write those defaults back on Save. `variables` reports a
+    // failed read inside its own tab body instead (see
+    // `variables::settings_body`), because its create/update handlers
+    // re-render this page as an htmx swap, and htmx drops a 500's body.
     let body_markup = match active {
         "network" => network::settings_body(ctx, msg).await,
         "variables" => Ok(variables::settings_body(ctx, msg).await),
         "permissions" => permissions::settings_body(ctx, msg).await,
         // "email" and any unknown active (defensive — `active` is already
         // normalized above) render the email body.
-        _ => Ok(email::settings_body(ctx, msg).await),
+        _ => email::settings_body(ctx, msg).await,
     };
     let body_markup = match body_markup {
         Ok(markup) => markup,
@@ -127,6 +131,25 @@ fn tab_description(active: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::test_support::{admin_msg, output_html, TestContext};
+
+    /// The email tab is a form whose Save posts every field. When the stored
+    /// values cannot be read the page is a 500, never that form filled from
+    /// the boot map and the declared defaults — saving it would write those
+    /// over the stored settings.
+    #[tokio::test]
+    async fn a_failed_read_renders_no_email_form() {
+        let ctx = TestContext::with_admin().await.break_reads();
+
+        let parts = crate::blocks::admin::test_support::browser_request(
+            &ctx,
+            admin_msg("retrieve", "/b/admin/settings/email"),
+        )
+        .await;
+
+        assert_eq!(parts.status, 500);
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+        assert!(!html.contains("<form"), "{html}");
+    }
 
     /// Maximum `<form>` nesting depth in `html`. HTML forms cannot nest —
     /// a browser drops a nested `<form>` start tag entirely (its

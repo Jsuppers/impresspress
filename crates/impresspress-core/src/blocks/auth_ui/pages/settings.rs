@@ -63,9 +63,19 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         SettingsSection::new("Admin", icons::shield(), &s.admin),
         SettingsSection::new("OAuth Providers", icons::globe(), &s.oauth),
     ];
+    let form =
+        match settings_form::settings_form(ctx, "/b/auth/admin/settings", &form_sections, html! {})
+            .await
+        {
+            Ok(form) => form,
+            Err(e) => {
+                tracing::error!(error = %e, "auth settings: current values read failed");
+                return ui::server_error_response(msg);
+            }
+        };
     let content = html! {
         (components::page_header("Authentication Settings", Some("Configure registration, OAuth providers, and security"), None))
-        (settings_form::settings_form(ctx, "/b/auth/admin/settings", &form_sections, html! {}).await)
+        (form)
     };
     ui::shell_page(
         ctx,

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use maud::{html, Markup, PreEscaped};
 use wafer_core::clients::config;
-use wafer_run::{context::Context, InputStream, OutputStream};
+use wafer_run::{context::Context, InputStream, OutputStream, WaferError};
 pub use wafer_run::{ConfigVar, InputType};
 
 use crate::{
@@ -72,22 +72,35 @@ impl<'a> SettingsSection<'a> {
     }
 }
 
-/// Load the current value for every var in `sections` via the config client.
+/// The value each of `vars` currently reads as — stored, else the boot map,
+/// else the var's declared default — or `Err` when the `variables` table could
+/// not be read.
+///
+/// Through [`crate::blocks::config::get_many`], never `config::get_default`:
+/// that one answers an unreadable table from the boot map and then the
+/// default, and `submit_js` posts every field, so a form rendered from it and
+/// saved writes those over every stored value on the page.
+async fn current_values<'v>(
+    ctx: &dyn Context,
+    vars: impl IntoIterator<Item = &'v ConfigVar>,
+) -> Result<HashMap<String, String>, WaferError> {
+    let vars: Vec<&ConfigVar> = vars.into_iter().collect();
+    let keys: Vec<&str> = vars.iter().map(|var| var.key.as_str()).collect();
+    let mut values = crate::blocks::config::get_many(ctx, &keys).await?;
+    for var in vars {
+        values
+            .entry(var.key.clone())
+            .or_insert_with(|| var.default.clone());
+    }
+    Ok(values)
+}
+
+/// Load the current value for every var in `sections`.
 async fn load_values(
     ctx: &dyn Context,
     sections: &[SettingsSection<'_>],
-) -> HashMap<String, String> {
-    let mut values = HashMap::new();
-    for section in sections {
-        for var in section.vars {
-            // `entry`-guard so a key declared in two sections is only fetched once.
-            if !values.contains_key(&var.key) {
-                let value = config::get_default(ctx, &var.key, &var.default).await;
-                values.insert(var.key.clone(), value);
-            }
-        }
-    }
-    values
+) -> Result<HashMap<String, String>, WaferError> {
+    current_values(ctx, sections.iter().flat_map(|section| section.vars)).await
 }
 
 /// Render one field, deriving the widget from the var's [`InputType`].
@@ -275,10 +288,16 @@ function submitSettings(e) {{
 /// shell used to be such a host; it's form-less now — `ui::templates::
 /// tabbed_page` — precisely so every tab can render a complete
 /// [`settings_form`] instead.)
-pub async fn render_sections(ctx: &dyn Context, sections: &[SettingsSection<'_>]) -> Markup {
-    let values = load_values(ctx, sections).await;
+///
+/// `Err` when the current values could not be read: the caller answers with
+/// an error page, never with fields filled from defaults.
+pub async fn render_sections(
+    ctx: &dyn Context,
+    sections: &[SettingsSection<'_>],
+) -> Result<Markup, WaferError> {
+    let values = load_values(ctx, sections).await?;
     let empty = String::new();
-    html! {
+    Ok(html! {
         @for (i, section) in sections.iter().enumerate() {
             @if section.collapsible {
                 details .card .mt-4 {
@@ -306,13 +325,15 @@ pub async fn render_sections(ctx: &dyn Context, sections: &[SettingsSection<'_>]
                 }
             }
         }
-    }
+    })
 }
 
 /// Render the full ConfigVar-driven settings form: a `#settings-form` posting
 /// JSON to `post_url`, with one titled section per [`SettingsSection`], a
 /// "Save Settings" button, and the shared submit snippet. Current values are
-/// loaded from the config client internally.
+/// loaded from the config block internally; `Err` when they could not be read,
+/// and the caller answers [`crate::ui::server_error_response`] instead of a
+/// form (see [`render_sections`]).
 ///
 /// `extra` is appended after the last section and before the submit button —
 /// used by blocks that want an extra panel inside the form (e.g. legalpages'
@@ -322,16 +343,16 @@ pub async fn settings_form(
     post_url: &str,
     sections: &[SettingsSection<'_>],
     extra: Markup,
-) -> Markup {
-    let fields = render_sections(ctx, sections).await;
-    html! {
+) -> Result<Markup, WaferError> {
+    let fields = render_sections(ctx, sections).await?;
+    Ok(html! {
         form #settings-form {
             (fields)
             (extra)
             button .btn .btn--primary .mt-4 type="submit" { "Save settings" }
         }
         script { (PreEscaped(submit_js(post_url))) }
-    }
+    })
 }
 
 /// Generic settings save handler: parse the JSON body, and for every key in
@@ -393,11 +414,13 @@ pub async fn save_settings(
     // not drop a typed mask), env seeding through `insert_if_absent`, and
     // `dev::data_snapshot::import`.
     //
-    // "Already stored" is read through `config::get_default`, which is the
-    // exact call `load_values` makes for `render_field` — so the question asked
-    // here is the one the browser's answer was formed from. Reading it from
+    // "Already stored" is read through `current_values`, which is the exact
+    // call `load_values` makes for `render_field` — so the question asked here
+    // is the one the browser's answer was formed from. Reading it from
     // anywhere else would reintroduce the drift this guard exists to close. It
-    // costs a read only when a mask is actually submitted.
+    // costs a read only when a mask is actually submitted, and a read that
+    // fails refuses the save before any write, as the page itself would have
+    // refused to render.
     //
     // `ConfigWrite::write` asks it the same way, against a non-empty row else
     // the boot map, and that is load-bearing rather than tidy: it compared
@@ -406,6 +429,21 @@ pub async fn save_settings(
     // refused — mid-loop, page half saved. See
     // `a_boot_map_value_equal_to_the_mask_is_not_a_half_applied_save`. The two
     // sides ask one question; neither is left inferring the other's answer.
+    let masked: Vec<&ConfigVar> = allowed
+        .iter()
+        .filter(|var| {
+            body.get(&var.key)
+                .is_some_and(|value| value == MASKED_VALUE)
+        })
+        .collect();
+    let current = if masked.is_empty() {
+        HashMap::new()
+    } else {
+        match current_values(ctx, masked).await {
+            Ok(current) => current,
+            Err(e) => return err_internal("Could not read the current settings", e),
+        }
+    };
     for var in allowed {
         let Some(value) = body.get(&var.key) else {
             continue;
@@ -415,8 +453,7 @@ pub async fn save_settings(
                 return err_bad_request(&format!("{}: {e}", var.key));
             }
         }
-        if value == MASKED_VALUE && config::get_default(ctx, &var.key, &var.default).await != *value
-        {
+        if value == MASKED_VALUE && current.get(&var.key) != Some(value) {
             // The remedy differs by field, so the message does too — the same
             // sentence cannot be true of both. A sensitive field renders blank
             // and `save_settings` reads blank as "unchanged"; a plain field
@@ -503,13 +540,16 @@ mod tests {
 
     #[tokio::test]
     async fn section_description_renders_under_the_heading() {
-        let ctx = crate::test_support::TestContext::new().await;
+        let ctx = crate::test_support::TestContext::with_admin().await;
         let vars = [var("X__A", "A", InputType::Text)];
         let sections = [
             SettingsSection::new("Checkout", super::super::icons::settings(), &vars)
                 .description("Defaults applied to new offers."),
         ];
-        let s = render_sections(&ctx, &sections).await.into_string();
+        let s = render_sections(&ctx, &sections)
+            .await
+            .expect("the current values are readable")
+            .into_string();
         assert!(s.contains("Defaults applied to new offers."), "{s}");
     }
 
@@ -720,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn render_sections_never_leaks_a_stored_secret_into_the_html() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::with_admin().await;
         ctx.set_config(
             "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY",
             "key-abcdef0123456789",
@@ -735,7 +775,10 @@ mod tests {
             html! {},
             std::slice::from_ref(&v),
         )];
-        let out = render_sections(&ctx, &sections).await.into_string();
+        let out = render_sections(&ctx, &sections)
+            .await
+            .expect("the current values are readable")
+            .into_string();
 
         assert!(
             !out.contains("key-abcdef0123456789"),
@@ -796,7 +839,7 @@ mod tests {
     /// `util::is_masked_submission`.
     #[tokio::test]
     async fn save_settings_refuses_the_mask_rather_than_storing_or_dropping_it() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::with_admin().await;
         ctx.set_config("X__API_SECRET", "original-secret");
         let allowed = [var("X__API_SECRET", "API Secret", InputType::Password)];
 
@@ -828,7 +871,7 @@ mod tests {
     /// saved.
     #[tokio::test]
     async fn a_refused_mask_writes_nothing_at_all() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::with_admin().await;
         ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
         ctx.set_config("X__API_SECRET", "original-secret");
         // App name first, so it would already be written by the time the mask
@@ -1139,7 +1182,10 @@ mod tests {
         // makes the save below the form's own unedited submission, not a
         // hand-built request.
         let sections = [SettingsSection::new("Settings", html! {}, &allowed)];
-        let rendered = render_sections(&ctx, &sections).await.into_string();
+        let rendered = render_sections(&ctx, &sections)
+            .await
+            .expect("the current values are readable")
+            .into_string();
         assert!(
             rendered.contains(MASKED_VALUE),
             "a plain field's stored value is rendered into its input, mask or not: {rendered}"
@@ -1191,7 +1237,7 @@ mod tests {
     /// which is the whole page this would otherwise have made unsavable.
     #[tokio::test]
     async fn save_settings_refuses_the_mask_even_for_a_plain_field() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::with_admin().await;
         ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
         let allowed = [var(
             "WAFER_RUN_SHARED__APP_NAME",
