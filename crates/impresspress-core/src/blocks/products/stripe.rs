@@ -1229,12 +1229,12 @@ async fn handle_offer_checkout(
     .await
     {
         Ok(order) => order,
-        Err(error) => return err_internal("Could not create checkout order", error),
+        Err(error) => return crud::db_error_internal(error, "Could not create checkout order"),
     };
 
     let rows = match repo::purchases::claim_for_checkout(ctx, &order.id).await {
         Ok(rows) => rows,
-        Err(error) => return err_internal("Could not claim checkout order", error),
+        Err(error) => return crud::db_error_internal(error, "Could not claim checkout order"),
     };
     if rows != 1 {
         return err_internal_no_cause("Checkout order could not be claimed");
@@ -1330,7 +1330,7 @@ async fn handle_offer_checkout(
         // The provider session now exists and its metadata points to this
         // retained checkout_started order. Do not revert the claim or create a
         // second charge path; the webhook/reconciliation worker can finish it.
-        return err_internal("Could not save Stripe checkout session", error);
+        return crud::db_error_internal(error, "Could not save Stripe checkout session");
     }
     ok_json(&CheckoutResponse {
         order_id: order.id,
@@ -2405,9 +2405,12 @@ async fn reconcile_payment_link_session(
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let stored = repo::payment_links::get_for_offer(ctx, offer_id, local_link_id).await?;
+    // `FailedPrecondition`, not `PermissionDenied`: the event and the stored
+    // link disagree about their own identity, which is not a WRAP refusal and
+    // must not be answered as one by `crud::db_error_internal`.
     if stored.stripe_account_id != event_account {
         return Err(WaferError::new(
-            wafer_run::ErrorCode::PermissionDenied,
+            wafer_run::ErrorCode::FailedPrecondition,
             "Payment Link webhook account does not match the configured seller",
         ));
     }
@@ -2984,7 +2987,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 );
                 return ok_json(&WebhookAck::dead_letter());
             }
-            Err(e) => return err_internal("Failed to record webhook event", e),
+            Err(e) => return crud::db_error_internal(e, "Failed to record webhook event"),
         }
     } else {
         tracing::warn!(
@@ -3037,7 +3040,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     .await
             {
                 fail_webhook!(
-                    err_internal("Failed to synchronize connected account", error),
+                    crud::db_error_internal(error, "Failed to synchronize connected account"),
                     "connected-account synchronization failed"
                 );
             }
@@ -3079,7 +3082,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 {
                     Ok(rows) => rows,
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to reconcile checkout purchase", error),
+                        crud::db_error_internal(error, "Failed to reconcile checkout purchase"),
                         "checkout session did not match its immutable order"
                     ),
                 };
@@ -3105,9 +3108,9 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                                 ),
                             },
                             Err(error) => fail_webhook!(
-                                err_internal(
-                                    "Failed to load purchase for subscription snapshot",
-                                    error
+                                crud::db_error_internal(
+                                    error,
+                                    "Failed to load purchase for subscription snapshot"
                                 ),
                                 "subscription snapshot purchase lookup failed"
                             ),
@@ -3121,7 +3124,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         .await
                         {
                             fail_webhook!(
-                                err_internal("Failed to snapshot subscription items", error),
+                                crud::db_error_internal(
+                                    error,
+                                    "Failed to snapshot subscription items"
+                                ),
                                 "subscription item snapshot failed"
                             );
                         }
@@ -3141,7 +3147,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 .await
                 {
                     fail_webhook!(
-                        err_internal("Failed to reconcile Payment Link order", error),
+                        crud::db_error_internal(error, "Failed to reconcile Payment Link order"),
                         "Payment Link reconciliation failed"
                     );
                 }
@@ -3177,7 +3183,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 .await
                 {
                     fail_webhook!(
-                        err_internal("Failed to create platform subscription", error),
+                        crud::db_error_internal(error, "Failed to create platform subscription"),
                         "platform subscription upsert failed"
                     );
                 }
@@ -3210,7 +3216,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 {
                     Ok(rows) => rows,
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to reconcile checkout payment failure", error),
+                        crud::db_error_internal(
+                            error,
+                            "Failed to reconcile checkout payment failure"
+                        ),
                         "checkout failure did not match its immutable order"
                     ),
                 };
@@ -3328,7 +3337,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     "PaymentIntent event has no matching typed payment-mode order"
                 ),
                 Err(error) => fail_webhook!(
-                    err_internal("Failed to reconcile PaymentIntent", error),
+                    crud::db_error_internal(error, "Failed to reconcile PaymentIntent"),
                     "PaymentIntent reconciliation failed"
                 ),
             }
@@ -3380,7 +3389,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     Ok(Some(_)) => commerce_matched = true,
                     Ok(None) => {}
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to synchronize commerce subscription", error),
+                        crud::db_error_internal(
+                            error,
+                            "Failed to synchronize commerce subscription"
+                        ),
                         "commerce subscription synchronization failed"
                     ),
                 }
@@ -3393,7 +3405,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         fail_webhook!(err_internal_no_cause(&message), &message);
                     }
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to resolve Stripe subscription ownership", error),
+                        crud::db_error_internal(
+                            error,
+                            "Failed to resolve Stripe subscription ownership"
+                        ),
                         "subscription ownership lookup failed"
                     ),
                 }
@@ -3408,7 +3423,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             .await
             {
                 fail_webhook!(
-                    err_internal("Failed to synchronize platform subscription", error),
+                    crud::db_error_internal(error, "Failed to synchronize platform subscription"),
                     "platform subscription status/plan synchronization failed"
                 );
             }
@@ -3416,18 +3431,19 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             // Sync add-on totals from the metadata of the subscription's
             // items. `repo::subscriptions::ADDON_TOTALS` names the metadata
             // keys the platform stamps on its add-on objects.
-            let user_id =
-                match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await {
-                    Ok(user_id) => user_id,
-                    // The two things this answer gates — the addon-total sync and
-                    // the outbound `products.subscription.updated` — were both
-                    // skipped silently when the read failed, and the delivery
-                    // still told Stripe it had succeeded, so nothing retried them.
-                    Err(error) => fail_webhook!(
-                        err_internal("Failed to resolve Stripe subscription owner", error),
-                        "subscription owner lookup failed"
-                    ),
-                };
+            let user_id = match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id)
+                .await
+            {
+                Ok(user_id) => user_id,
+                // The two things this answer gates — the addon-total sync and
+                // the outbound `products.subscription.updated` — were both
+                // skipped silently when the read failed, and the delivery
+                // still told Stripe it had succeeded, so nothing retried them.
+                Err(error) => fail_webhook!(
+                    crud::db_error_internal(error, "Failed to resolve Stripe subscription owner"),
+                    "subscription owner lookup failed"
+                ),
+            };
             if let Some(ref uid) = user_id {
                 if let Some(items) = data_object.get("items") {
                     // A failed sync used to be logged and nothing else, so the
@@ -3438,7 +3454,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         sync_addon_totals_from_items(ctx, uid, items, event_created).await
                     {
                         fail_webhook!(
-                            err_internal("Failed to synchronize add-on totals", error),
+                            crud::db_error_internal(error, "Failed to synchronize add-on totals"),
                             "add-on total synchronization failed"
                         );
                     }
@@ -3477,7 +3493,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 {
                     Ok(purchase) => purchase.is_some(),
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to recover commerce subscription", error),
+                        crud::db_error_internal(error, "Failed to recover commerce subscription"),
                         "commerce subscription recovery write failed"
                     ),
                 };
@@ -3491,7 +3507,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                             fail_webhook!(err_internal_no_cause(&message), &message);
                         }
                         Err(error) => fail_webhook!(
-                            err_internal("Failed to resolve Stripe subscription ownership", error),
+                            crud::db_error_internal(
+                                error,
+                                "Failed to resolve Stripe subscription ownership"
+                            ),
                             "subscription ownership lookup failed"
                         ),
                     }
@@ -3504,7 +3523,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 .await
                 {
                     fail_webhook!(
-                        err_internal("Failed to recover subscription", error),
+                        crud::db_error_internal(error, "Failed to recover subscription"),
                         "platform subscription recovery write failed"
                     );
                 }
@@ -3533,7 +3552,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 {
                     Ok(purchase) => purchase.is_some(),
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to mark commerce subscription past due", error),
+                        crud::db_error_internal(
+                            error,
+                            "Failed to mark commerce subscription past due"
+                        ),
                         "commerce subscription past-due write failed"
                     ),
                 };
@@ -3547,7 +3569,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                             fail_webhook!(err_internal_no_cause(&message), &message);
                         }
                         Err(error) => fail_webhook!(
-                            err_internal("Failed to resolve Stripe subscription ownership", error),
+                            crud::db_error_internal(
+                                error,
+                                "Failed to resolve Stripe subscription ownership"
+                            ),
                             "subscription ownership lookup failed"
                         ),
                     }
@@ -3562,7 +3587,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         "marking subscription past_due failed"
                     );
                     fail_webhook!(
-                        err_internal("Failed to mark subscription past_due", e),
+                        crud::db_error_internal(e, "Failed to mark subscription past_due"),
                         "platform subscription past-due write failed"
                     );
                 }
@@ -3576,14 +3601,15 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             // the whole delivery's failure: the outbound
             // `products.subscription.deleted` is the only thing that tells
             // the platform a paid user has lapsed.
-            let user_id =
-                match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id).await {
-                    Ok(user_id) => user_id,
-                    Err(error) => fail_webhook!(
-                        err_internal("Failed to resolve Stripe subscription owner", error),
-                        "subscription owner lookup failed"
-                    ),
-                };
+            let user_id = match repo::subscriptions::find_user_by_stripe_sub(ctx, stripe_sub_id)
+                .await
+            {
+                Ok(user_id) => user_id,
+                Err(error) => fail_webhook!(
+                    crud::db_error_internal(error, "Failed to resolve Stripe subscription owner"),
+                    "subscription owner lookup failed"
+                ),
+            };
 
             if !stripe_sub_id.is_empty() {
                 let canceled_at = stripe_timestamp(data_object.get("canceled_at"));
@@ -3603,7 +3629,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 {
                     Ok(purchase) => purchase.is_some(),
                     Err(error) => fail_webhook!(
-                        err_internal("Failed to cancel commerce subscription", error),
+                        crud::db_error_internal(error, "Failed to cancel commerce subscription"),
                         "commerce subscription cancellation failed"
                     ),
                 };
@@ -3617,7 +3643,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                             fail_webhook!(err_internal_no_cause(&message), &message);
                         }
                         Err(error) => fail_webhook!(
-                            err_internal("Failed to resolve Stripe subscription ownership", error),
+                            crud::db_error_internal(
+                                error,
+                                "Failed to resolve Stripe subscription ownership"
+                            ),
                             "subscription ownership lookup failed"
                         ),
                     }
@@ -3637,7 +3666,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     "subscription cancellation failed"
                 );
                 fail_webhook!(
-                    err_internal("Failed to cancel subscription", e),
+                    crud::db_error_internal(e, "Failed to cancel subscription"),
                     "platform subscription cancellation failed"
                 );
             }
@@ -3680,9 +3709,9 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         );
                         if let Some((owner, _)) = event_lease.as_ref() {
                             if let Err(error) = mark_event_processed(ctx, event_id, owner).await {
-                                return err_internal(
-                                    "Failed to complete webhook processing lease",
+                                return crud::db_error_internal(
                                     error,
+                                    "Failed to complete webhook processing lease",
                                 );
                             }
                         }
@@ -3775,7 +3804,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             };
             if let Err(error) = repo::disputes::reconcile(ctx, &snapshot).await {
                 fail_webhook!(
-                    err_internal("Failed to reconcile Stripe dispute", error),
+                    crud::db_error_internal(error, "Failed to reconcile Stripe dispute"),
                     "dispute ledger reconciliation failed"
                 );
             }
@@ -3795,7 +3824,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     match repo::refunds::get_by_provider_refund_id(ctx, provider_refund_id).await {
                         Ok(ledger) => ledger,
                         Err(error) => fail_webhook!(
-                            err_internal("Failed to load refund ledger", error),
+                            crud::db_error_internal(error, "Failed to load refund ledger"),
                             "refund ledger lookup failed"
                         ),
                     };
@@ -3895,7 +3924,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     {
                         Ok(ordered) => ordered,
                         Err(error) => fail_webhook!(
-                            err_internal("Failed to update refund ledger", error),
+                            crud::db_error_internal(error, "Failed to update refund ledger"),
                             "refund provider response write failed"
                         ),
                     };
@@ -3911,13 +3940,16 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         .await
                         {
                             fail_webhook!(
-                                err_internal("Failed to reconcile refund purchase", error),
+                                crud::db_error_internal(
+                                    error,
+                                    "Failed to reconcile refund purchase"
+                                ),
                                 "refund purchase reconciliation failed"
                             );
                         }
                         if let Err(error) = repo::refunds::mark_succeeded(ctx, &ledger.id).await {
                             fail_webhook!(
-                                err_internal("Failed to complete refund ledger", error),
+                                crud::db_error_internal(error, "Failed to complete refund ledger"),
                                 "refund ledger completion failed"
                             );
                         }
@@ -3930,7 +3962,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         .await
                         {
                             fail_webhook!(
-                                err_internal("Failed to complete provider operation", error),
+                                crud::db_error_internal(
+                                    error,
+                                    "Failed to complete provider operation"
+                                ),
                                 "refund provider operation completion failed"
                             );
                         }
@@ -3946,7 +3981,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                         .await
                         {
                             fail_webhook!(
-                                err_internal("Failed to resolve provider operation", error),
+                                crud::db_error_internal(
+                                    error,
+                                    "Failed to resolve provider operation"
+                                ),
                                 "refund provider operation failure write failed"
                             );
                         }
@@ -4050,7 +4088,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                     {
                         tracing::error!("Failed to reconcile refunded charge: {error}");
                         fail_webhook!(
-                            err_internal("Failed to update purchase refund total", error),
+                            crud::db_error_internal(
+                                error,
+                                "Failed to update purchase refund total"
+                            ),
                             "refunded charge purchase update failed"
                         );
                     }
@@ -4077,7 +4118,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
                 error = %error,
                 "failed to mark Stripe webhook event processed"
             );
-            return err_internal("Failed to complete webhook processing lease", error);
+            return crud::db_error_internal(error, "Failed to complete webhook processing lease");
         }
     }
 
