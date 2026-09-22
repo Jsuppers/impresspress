@@ -8,11 +8,11 @@ use crate::{
     blocks::{
         crud,
         products::{
+            config::seller_fee_bps,
             contracts::{
                 AdminSellerDetail, ApprovalStatus, OfferStatus, ProductStatus, SellerAccountList,
                 SellerStatus,
             },
-            config::seller_fee_bps,
             repo, stripe,
         },
     },
@@ -35,7 +35,10 @@ fn admin_error(error: WaferError, not_found: &str) -> OutputStream {
 /// suspension exits build. The platform fee is read here, after any write,
 /// for the reason the raw read in [`set_suspended`] gives: nothing but
 /// storage may stop the fraud control itself.
-async fn seller_json(ctx: &dyn Context, account: &wafer_core::clients::database::Record) -> OutputStream {
+async fn seller_json(
+    ctx: &dyn Context,
+    account: &wafer_core::clients::database::Record,
+) -> OutputStream {
     let fee = match seller_fee_bps(ctx).await {
         Ok(fee) => fee,
         Err(error) => return admin_error(error, "Seller not found"),

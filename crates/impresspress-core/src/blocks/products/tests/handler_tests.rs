@@ -5576,3 +5576,48 @@ async fn a_create_whose_template_lookup_fails_writes_no_row() {
         "the refused product create must leave no row behind"
     );
 }
+
+/// A product create naming a group answers 400 "Group not found" only when
+/// the group is absent; a group read that failed is a 500.
+///
+/// Every group read error was folded into "Group not found", so an outage
+/// told the seller their own group did not exist.
+#[tokio::test]
+async fn a_product_create_whose_group_read_fails_is_a_fault_not_a_missing_group() {
+    use crate::{
+        blocks::products::repo,
+        test_support::{output_http_status, FailingDbOpContext},
+    };
+
+    let ctx = user_products_ctx().await;
+    let (msg, input) = create_msg(
+        "/b/products/groups",
+        "user_1",
+        serde_json::json!({"name": "Mine"}),
+    );
+    let group = output_to_json(dispatch(&ctx, msg, input).await).await;
+
+    // Guard: a group that does not exist is still the caller's 400 (passes
+    // before and after the fix).
+    let (msg, input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({"name": "Orphan", "group_id": "grp_absent"}),
+    );
+    assert_eq!(
+        output_http_status(dispatch(&ctx, msg, input).await).await,
+        400
+    );
+
+    let failing = FailingDbOpContext::new(ctx.clone(), vec![("database.get", repo::groups::TABLE)]);
+    let (msg, input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({"name": "During the outage", "group_id": group["id"]}),
+    );
+    assert_eq!(
+        output_http_status(dispatch(&failing, msg, input).await).await,
+        500,
+        "a group read that failed is a server fault, not a missing group"
+    );
+}

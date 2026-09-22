@@ -1129,6 +1129,7 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // delete_record, verify_owner, *_owned}` take the table from the
             // caller
             "blocks/products/handlers/group.rs",
+            "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/page_link_tests.rs",
             "blocks/products/tests/repo_tests.rs",
         ],

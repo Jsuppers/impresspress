@@ -524,7 +524,10 @@ async fn list_contracts_equals_every_row_through_to_contract() {
         .expect("list_contracts");
     assert_eq!(actual.rows, expected);
     assert!(
-        actual.rows.iter().all(|seller| seller.fee_basis_points == 250),
+        actual
+            .rows
+            .iter()
+            .all(|seller| seller.fee_basis_points == 250),
         "every seller publishes the platform fee it was handed"
     );
     assert_eq!(actual.rows.len(), 2, "both seeded rows are listed");
