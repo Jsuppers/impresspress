@@ -28,7 +28,7 @@ pub struct QuotaRow {
     /// The effective caps: each column that is present overrides the block
     /// default, field by field.
     ///
-    /// Flattened on the wire, because the four caps are four columns of this
+    /// Flattened on the wire, because the caps are columns of this
     /// table — `QuotaConfig` groups them for the enforcement path, it does
     /// not nest them in the row.
     #[serde(flatten)]
@@ -66,9 +66,6 @@ impl QuotaRow {
             max_files_per_bucket: rec
                 .opt_i64_field("max_files_per_bucket")
                 .unwrap_or(defaults.max_files_per_bucket),
-            reset_period_days: rec
-                .opt_i64_field("reset_period_days")
-                .unwrap_or(defaults.reset_period_days),
         });
         Self {
             id: rec.id.clone(),
@@ -195,7 +192,6 @@ mod tests {
             ("max_storage_bytes", json!("2048")),
             ("max_file_size_bytes", json!("1024")),
             ("max_files_per_bucket", json!("5")),
-            ("reset_period_days", json!("7")),
         ]));
         assert_eq!(row.user_id, "u1");
         assert_eq!(
@@ -204,7 +200,6 @@ mod tests {
         );
         assert_eq!(row.config.max_file_size_bytes, 1024);
         assert_eq!(row.config.max_files_per_bucket, 5);
-        assert_eq!(row.config.reset_period_days, 7);
     }
 
     #[test]

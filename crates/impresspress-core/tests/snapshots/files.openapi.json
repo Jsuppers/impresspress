@@ -142,10 +142,6 @@
                               "format": "int64",
                               "type": "integer"
                             },
-                            "reset_period_days": {
-                              "format": "int64",
-                              "type": "integer"
-                            },
                             "updated_at": {
                               "type": "string"
                             },
@@ -160,7 +156,6 @@
                             "max_storage_bytes",
                             "max_file_size_bytes",
                             "max_files_per_bucket",
-                            "reset_period_days",
                             "created_at",
                             "updated_at"
                           ],
@@ -250,10 +245,6 @@
                         "format": "int64",
                         "type": "integer"
                       },
-                      "reset_period_days": {
-                        "format": "int64",
-                        "type": "integer"
-                      },
                       "updated_at": {
                         "type": "string"
                       },
@@ -268,7 +259,6 @@
                       "max_storage_bytes",
                       "max_file_size_bytes",
                       "max_files_per_bucket",
-                      "reset_period_days",
                       "created_at",
                       "updated_at"
                     ],
@@ -449,17 +439,12 @@
                       "max_storage_bytes": {
                         "format": "int64",
                         "type": "integer"
-                      },
-                      "reset_period_days": {
-                        "format": "int64",
-                        "type": "integer"
                       }
                     },
                     "required": [
                       "max_storage_bytes",
                       "max_file_size_bytes",
-                      "max_files_per_bucket",
-                      "reset_period_days"
+                      "max_files_per_bucket"
                     ],
                     "type": "object"
                   },

@@ -6,7 +6,6 @@ pub struct QuotaConfig {
     pub max_file_size_bytes: i64,
     /// Most objects one user may hold in any one bucket, in-flight uploads included.
     pub max_files_per_bucket: i64,
-    pub reset_period_days: i64,
 }
 
 impl QuotaConfig {
@@ -34,8 +33,6 @@ impl QuotaConfig {
     /// [`super::quota::check_quota`], counting `pending` rows as well as
     /// completed ones; the user's total across buckets is not capped.
     pub const DEFAULT_MAX_FILES_PER_BUCKET: i64 = 10_000;
-    /// Default reset period (0 = never).
-    pub const DEFAULT_RESET_PERIOD_DAYS: i64 = 0;
 }
 
 impl QuotaConfig {
@@ -59,7 +56,6 @@ impl Default for QuotaConfig {
             max_storage_bytes: Self::DEFAULT_MAX_STORAGE_BYTES,
             max_file_size_bytes: Self::DEFAULT_MAX_FILE_SIZE_BYTES,
             max_files_per_bucket: Self::DEFAULT_MAX_FILES_PER_BUCKET,
-            reset_period_days: Self::DEFAULT_RESET_PERIOD_DAYS,
         }
     }
 }
@@ -74,7 +70,6 @@ mod tests {
         assert_eq!(quota.max_storage_bytes, 1_073_741_824); // 1GB
         assert_eq!(quota.max_file_size_bytes, 104_857_600); // 100MB
         assert_eq!(quota.max_files_per_bucket, 10_000);
-        assert_eq!(quota.reset_period_days, 0);
     }
 
     #[test]
@@ -83,13 +78,11 @@ mod tests {
             max_storage_bytes: 500_000,
             max_file_size_bytes: 10_000,
             max_files_per_bucket: 100,
-            reset_period_days: 30,
         };
         let json = serde_json::to_string(&quota).unwrap();
         let deserialized: QuotaConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.max_storage_bytes, 500_000);
         assert_eq!(deserialized.max_file_size_bytes, 10_000);
         assert_eq!(deserialized.max_files_per_bucket, 100);
-        assert_eq!(deserialized.reset_period_days, 30);
     }
 }

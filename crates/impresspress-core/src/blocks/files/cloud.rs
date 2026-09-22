@@ -291,7 +291,6 @@ pub(super) async fn handle_update_quota(
         "max_storage_bytes",
         "max_file_size_bytes",
         "max_files_per_bucket",
-        "reset_period_days",
     ];
     for key in body.keys() {
         if !ALLOWED_QUOTA_FIELDS.contains(&key.as_str()) {

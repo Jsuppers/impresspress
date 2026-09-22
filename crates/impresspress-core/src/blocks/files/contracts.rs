@@ -396,8 +396,8 @@ mod tests {
         }
     }
 
-    /// `QuotaRow` groups its four cap columns behind a `QuotaConfig` for the
-    /// enforcement path, but they ARE four columns of one table, so the wire
+    /// `QuotaRow` groups its cap columns behind a `QuotaConfig` for the
+    /// enforcement path, but they ARE columns of one table, so the wire
     /// stays flat — `#[serde(flatten)]`. A `config` key here would be a
     /// reshaped response body for `GET /b/cloudstorage/admin/quotas` and
     /// `PATCH /b/cloudstorage/admin/quotas/{id}`.

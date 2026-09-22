@@ -1138,8 +1138,6 @@ export interface paths {
                                     max_files_per_bucket: number;
                                     /** Format: int64 */
                                     max_storage_bytes: number;
-                                    /** Format: int64 */
-                                    reset_period_days: number;
                                     updated_at: string;
                                     /** @description The user this override applies to. Unique across the table. */
                                     user_id: string;
@@ -1206,8 +1204,6 @@ export interface paths {
                                 max_files_per_bucket: number;
                                 /** Format: int64 */
                                 max_storage_bytes: number;
-                                /** Format: int64 */
-                                reset_period_days: number;
                                 updated_at: string;
                                 /** @description The user this override applies to. Unique across the table. */
                                 user_id: string;
@@ -1348,8 +1344,6 @@ export interface paths {
                                 max_files_per_bucket: number;
                                 /** Format: int64 */
                                 max_storage_bytes: number;
-                                /** Format: int64 */
-                                reset_period_days: number;
                             };
                             /**
                              * @description The `usage` half of [`QuotaResponse`]. Both numbers are computed over the

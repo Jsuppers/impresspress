@@ -680,6 +680,11 @@ mod schema_tests {
     /// source) must match the `QuotaConfig` consts. If you change a const,
     /// change `migrations/001_initial_schema.*.sql` too (and remember
     /// `IMPRESSPRESS_RUN_MIGRATIONS=1`).
+    ///
+    /// The checked columns are exactly `QuotaConfig`'s fields, so a cap added
+    /// to the struct without a matching column default fails here rather
+    /// than going unchecked. `reset_period_days` is in the SQL but not the
+    /// struct: see `migrations/mod.rs` for why the column stays.
     #[test]
     fn quota_sql_defaults_match_quota_config_consts() {
         let sql = SQLITE_MIGRATIONS
@@ -698,8 +703,21 @@ mod schema_tests {
                 "max_files_per_bucket",
                 QuotaConfig::DEFAULT_MAX_FILES_PER_BUCKET,
             ),
-            ("reset_period_days", QuotaConfig::DEFAULT_RESET_PERIOD_DAYS),
         ];
+
+        let fields: std::collections::BTreeSet<String> =
+            match serde_json::to_value(QuotaConfig::default()).expect("serializes") {
+                serde_json::Value::Object(map) => map.keys().cloned().collect(),
+                other => panic!("QuotaConfig serializes as an object, got {other}"),
+            };
+        let checked: std::collections::BTreeSet<String> = asserts
+            .iter()
+            .map(|(column, _)| column.to_string())
+            .collect();
+        assert_eq!(
+            checked, fields,
+            "every QuotaConfig field needs its column default checked here, and nothing else"
+        );
 
         for (column, expected) in asserts {
             // Match the `<column> ... DEFAULT <value>` line in the DDL.
@@ -1365,6 +1383,35 @@ mod handle_tests {
         );
         let quota = quota::get_user_quota(&ctx, "u-9").await.expect("quota row");
         assert_eq!(quota.max_storage_bytes, 5);
+    }
+
+    /// `reset_period_days` is not a quota field: nothing enforces a reset
+    /// period, so an update naming it is refused rather than stored as a
+    /// setting that does nothing. The refusal is the whole request — the
+    /// other field in it is not written either.
+    #[tokio::test]
+    async fn admin_quota_update_naming_reset_period_days_is_refused() {
+        let ctx = TestContext::with_files().await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "max_storage_bytes": 5,
+            "reset_period_days": 30,
+        }))
+        .unwrap();
+        let out = FilesBlock::new()
+            .handle(
+                &ctx,
+                admin_msg("update", "/b/cloudstorage/admin/quotas/u-9"),
+                InputStream::from_bytes(body),
+            )
+            .await;
+        assert!(output_is_error(out, "InvalidArgument").await);
+        assert_eq!(
+            quota::get_user_quota(&ctx, "u-9")
+                .await
+                .expect("quota lookup"),
+            models::QuotaConfig::effective_default(),
+            "a refused update writes no override row",
+        );
     }
 
     /// The share link is the block's one public row, and its handler reads
