@@ -1060,8 +1060,14 @@ async fn handle_offer_checkout(
             return err_not_found("Offer not found");
         }
         let owner_id = product.str_field("owner_id");
-        let Ok(seller) = repo::seller_accounts::ready_for_user(ctx, owner_id).await else {
-            return err_bad_request("This seller's Stripe account is not ready to accept charges");
+        let seller = match repo::seller_accounts::ready_for_user(ctx, owner_id).await {
+            Ok(seller) => seller,
+            Err(error) if error.code == wafer_run::ErrorCode::FailedPrecondition => {
+                return err_bad_request(
+                    "This seller's Stripe account is not ready to accept charges",
+                )
+            }
+            Err(error) => return crud::db_error_internal(error, "Could not load seller account"),
         };
         let fee = match seller_fee_bps(ctx).await {
             Ok(fee) => fee,

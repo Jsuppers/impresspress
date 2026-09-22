@@ -919,7 +919,10 @@ pub(super) async fn handle_user_create_product(
                     return err_bad_request("You don't own this group");
                 }
             }
-            Err(_) => return err_bad_request("Group not found"),
+            Err(error) if error.code == ErrorCode::NotFound => {
+                return err_bad_request("Group not found")
+            }
+            Err(error) => return crud::db_error_internal(error, "Could not load group"),
         }
     }
 
