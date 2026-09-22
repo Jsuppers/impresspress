@@ -872,9 +872,12 @@ async fn boot_accepts_the_staged_build_of_a_live_block_and_closes_the_rest() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let shared = ctx.dev_shared();
 
-    // A block that IS serving, whose build row never got as far as `valid`.
+    // A block that IS serving, whose build row never got as far as `valid`:
+    // staged before its activation, as `blocks_api` stages it, and still
+    // staged after it.
     let (spec, live_bytes) = spec_only(&ctx, "live").await;
     let live_artifact = spec.artifact_sha256.clone();
+    let live_build = stage_build(&ctx, &live_artifact, live_bytes.len() as u64).await;
     activation::request(
         &ctx,
         &shared,
@@ -886,7 +889,6 @@ async fn boot_accepts_the_staged_build_of_a_live_block_and_closes_the_rest() {
     )
     .await
     .expect("the block activates");
-    let live_build = stage_build(&ctx, &live_artifact, live_bytes.len() as u64).await;
 
     // And a compile that got nowhere at all.
     let bytes = b"\0asm\x01abandoned";

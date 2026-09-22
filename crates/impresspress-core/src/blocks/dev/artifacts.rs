@@ -104,13 +104,18 @@ pub async fn get_direct(
 
 /// Whether an artifact is stored under `sha`.
 ///
-/// A keyed `get` rather than a prefix `list`, for the reasons
+/// A keyed streaming read, dropped unread, for the reasons
 /// [`super::blobs::exists`] documents: `list` of a folder nothing has written
-/// yet is not portable across the storage backends this runs on, and it is
-/// `O(folder)` on OPFS.
+/// yet is not portable across the storage backends this runs on, it is
+/// `O(folder)` on OPFS, and a buffered `get` would transfer up to
+/// [`super::validation::MAX_ARTIFACT_BYTES`] to answer a yes or no.
+///
+/// Activation does not ask this: it answers the same question from the builds
+/// ledger ([`repo::builds::artifact_index`](super::repo::builds::artifact_index)),
+/// which costs no storage call at all — see `activation::missing_content`.
 pub async fn exists(ctx: &dyn Context, sha: &str) -> Result<bool, WaferError> {
-    match storage::get(ctx, FOLDER, &key_for(sha)).await {
-        Ok(_) => Ok(true),
+    match storage::get_stream(ctx, FOLDER, &key_for(sha)).await {
+        Ok(_unread) => Ok(true),
         Err(e) if e.code == ErrorCode::NotFound => Ok(false),
         Err(e) => Err(e),
     }

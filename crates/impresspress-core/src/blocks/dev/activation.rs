@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 
 use super::{
-    artifacts, blobs,
+    blobs,
     contracts::{GenerationSummary, SiteManifest},
     control::DynamicBlockSpec,
     gc,
@@ -902,10 +902,28 @@ async fn load_previous(
 /// Content the manifest names that the stores do not hold — empty when
 /// everything is there.
 ///
-/// Presence *is* the hash check: both stores are content-addressed, so the key
-/// a manifest names is the hash of the bytes filed under it. Re-reading and
-/// re-hashing every blob would make each keystroke cost a full pass over the
-/// site to learn something the key already states.
+/// Only presence is checked, never content: both stores are content-addressed,
+/// so the key a manifest names is the hash of the bytes filed under it, and
+/// re-reading and re-hashing every blob would make each keystroke cost a full
+/// pass over the site to learn something the key already states.
+///
+/// Presence is asked as cheaply as each store allows, because this runs on
+/// every activation — every site-file save included — over the WHOLE manifest,
+/// not just what changed:
+///
+/// * **Artifacts** are answered by the builds ledger
+///   ([`repo::builds::artifact_index`]) with no storage call at all. Every
+///   stored artifact has a row — staging inserts the row before it stores the
+///   bytes, the seed importer records one for each artifact it stores, and the
+///   collector deletes the rows with the bytes — so the index is the store's
+///   own table of contents. One ledger read replaces a probe per block, and a
+///   block's artifact is up to [`super::validation::MAX_ARTIFACT_BYTES`]. The
+///   one way the two can disagree is a collection that deleted an artifact
+///   and then failed to drop its rows; a runtime rebuild reads every artifact
+///   it loads, so a manifest naming such an artifact still fails, as a
+///   refused rebuild rather than here.
+/// * **Blobs** have no ledger, so each is probed with [`blobs::exists`], which
+///   opens the object and declines its body rather than reading it.
 ///
 /// The `Err` is a storage failure — the store could not answer — which is a
 /// different thing from the store answering that content is gone.
@@ -919,15 +937,17 @@ async fn missing_content(
             missing.push(format!("no blob is stored for site content {sha}"));
         }
     }
-    for spec in &manifest.blocks {
-        if !artifacts::exists(ctx, &spec.artifact_sha256)
+    if !manifest.blocks.is_empty() {
+        let stored = repo::builds::artifact_index(ctx)
             .await
-            .map_err(storage_error)?
-        {
-            missing.push(format!(
-                "no artifact is stored for block {} ({})",
-                spec.name, spec.artifact_sha256
-            ));
+            .map_err(storage_error)?;
+        for spec in &manifest.blocks {
+            if !stored.contains_key(&spec.artifact_sha256) {
+                missing.push(format!(
+                    "no artifact is stored for block {} ({})",
+                    spec.name, spec.artifact_sha256
+                ));
+            }
         }
     }
     Ok(missing)
