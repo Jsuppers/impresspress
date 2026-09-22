@@ -163,11 +163,24 @@ fn like_filter(field: &str, pattern: &str) -> Filter {
     }
 }
 
+/// Newest account first, as a TOTAL order. `created_at` has one-second
+/// precision, so accounts created in the same second tie on it, and SQL
+/// leaves the order of tied rows to the backend's plan — a page boundary
+/// through a tie can then repeat or skip an account between two pages, and
+/// "the most recent" can name the oldest of the second. `id` breaks the tie:
+/// it is unique, and [`insert`] mints it as a UUIDv7, which orders by
+/// creation, so the tie resolves newest first too.
 fn newest_first() -> Vec<SortField> {
-    vec![SortField {
-        field: "created_at".to_string(),
-        desc: true,
-    }]
+    vec![
+        SortField {
+            field: "created_at".to_string(),
+            desc: true,
+        },
+        SortField {
+            field: "id".to_string(),
+            desc: true,
+        },
+    ]
 }
 
 pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, WaferError> {
@@ -1143,6 +1156,54 @@ mod lifecycle_and_listing_tests {
         // Every row decodes fully — the dashboard's old projected SELECT
         // returned three columns and read them by hand.
         assert!(!rows[0].email.is_empty());
+    }
+
+    /// Accounts created in the same second tie on `created_at`. Both admin
+    /// lists still come back newest first, and paging through the users tab
+    /// visits every account exactly once, in one order however often it is
+    /// asked. On SQLite a tie falls back to scan order — oldest first — so
+    /// "the two most recent" were the two oldest of the second.
+    #[tokio::test]
+    async fn accounts_created_in_the_same_second_list_newest_first() {
+        let ctx = ctx().await;
+        let mut created = Vec::new();
+        for i in 0..5 {
+            created.push(seed(&ctx, &format!("tie{i}@example.com")).await.id);
+        }
+        // Whether real inserts straddle a second boundary is up to the clock;
+        // pin them all into one second so the tie is certain.
+        for id in &created {
+            let mut data = HashMap::new();
+            data.insert("created_at".to_string(), json!("2026-01-01T00:00:00Z"));
+            db::update(&ctx, TABLE, id, data)
+                .await
+                .expect("pin created_at");
+        }
+        let newest_first: Vec<String> = created.iter().rev().cloned().collect();
+
+        let recent: Vec<String> = list_recent_active(&ctx, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(recent, newest_first[..2], "the two created last");
+
+        let mut paged = Vec::new();
+        for page in 1..=3 {
+            let list = list_active_page(
+                &ctx,
+                &ActiveUserQuery {
+                    page,
+                    page_size: 2,
+                    search: None,
+                },
+            )
+            .await
+            .unwrap();
+            paged.extend(list.rows.into_iter().map(|r| r.id));
+        }
+        assert_eq!(paged, newest_first, "every account once, newest first");
     }
 }
 
