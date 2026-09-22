@@ -356,6 +356,85 @@ async fn rollback_republishes_an_earlier_generation_as_a_new_one() {
     assert_eq!(read["sha256"], json!(sha1));
 }
 
+/// A rollback commits and only then adopts its site into the workspace, so an
+/// adoption that fails arrives with the rollback already serving. Reported as
+/// a plain failure, the caller would go after a rollback that happened; the
+/// refusal has to say it is live and what repairs the workspace — and the
+/// repair it names has to work.
+#[tokio::test]
+async fn a_rollback_whose_workspace_update_fails_says_it_is_live_and_a_retry_repairs_it() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let g1 = write_file(&ctx, "site/index.html", "v1", None).await;
+    let id1 = g1["generation"]["id"].as_str().expect("id").to_string();
+    write_file(&ctx, "site/index.html", "v2", Some(&sha_of("v1"))).await;
+
+    // The publish goes through; the save of `workspace.json` that adopts the
+    // rolled-back site does not.
+    ctx.fail_next_storage_put_to("impresspress/dev", "", "workspace.json", "disk is full");
+    let rollback_path = format!("/b/dev/api/generations/{id1}/rollback");
+    let refused = wafer_block::http_codec::collect_http_response(
+        dev_post(&ctx, &rollback_path, json!({})).await,
+    )
+    .await;
+    assert_eq!(refused.status, 500);
+    let body: serde_json::Value = serde_json::from_slice(&refused.body).expect("json refusal");
+    let message = body["message"].as_str().expect("message");
+    assert!(message.contains("the rollback is live"), "{message}");
+    assert!(message.contains("disk is full"), "{message}");
+    assert!(
+        message.contains("Retrying the same rollback repairs the workspace"),
+        "{message}"
+    );
+
+    // Which is true: the rolled-back site is what is served, and a
+    // generation carrying it is the active one.
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
+    let status = dev_status(&ctx).await;
+    let live = status["active_generation"]["id"]
+        .as_str()
+        .expect("an active generation")
+        .to_string();
+    assert!(
+        message.contains(&live),
+        "the message names {live}: {message}"
+    );
+    // And the workspace was left behind, still holding what the rollback
+    // replaced.
+    let read = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "site/index.html"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(read["content"], "v2");
+
+    // The retry the message prescribes.
+    let retried = output_json(dev_post(&ctx, &rollback_path, json!({})).await).await;
+    assert_eq!(retried["generation"]["cause"], "rollback", "{retried}");
+    let read = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "site/index.html"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(read["content"], "v1", "the retry adopted the site");
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
+}
+
 /// A rollback rewrites the workspace as well as publishing, and both have to
 /// happen under one queue lease.
 ///

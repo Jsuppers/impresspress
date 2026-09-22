@@ -82,11 +82,13 @@ pub struct ProgressStep {
     pub detail: String,
 }
 
-/// Why an activation did not happen.
+/// Why an activation did not happen — or, for [`Self::RollbackNotAdopted`],
+/// why one that did happen did not finish.
 ///
-/// Three kinds, because they mean three different things to the caller: the
+/// Four kinds, because they mean four different things to the caller: the
 /// request described a state that cannot be built (fix the request), the host
-/// could not build it (retry or roll back), or persistence failed (retry).
+/// could not build it (retry or roll back), persistence failed (retry), or a
+/// rollback went live and left the workspace behind (retry the rollback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivationError {
     /// The manifest referenced content that is not stored. Reported as `422`:
@@ -97,6 +99,17 @@ pub enum ActivationError {
     Runtime(String),
     /// The ledger, the journal or the object store failed. `500`.
     Storage(String),
+    /// A rollback committed — the generation carrying the target's contents
+    /// is live and journalled — and replacing the workspace's `site/` half
+    /// with the target's then failed. `500`, because the request did not
+    /// finish; but the message says the rollback is live, because telling
+    /// the caller it failed would send them after a rollback that happened.
+    RollbackNotAdopted {
+        /// The generation that went live.
+        generation_id: String,
+        /// Why the workspace could not be updated.
+        message: String,
+    },
 }
 
 impl ActivationError {
@@ -104,7 +117,7 @@ impl ActivationError {
     pub fn status(&self) -> u16 {
         match self {
             Self::Validation(_) => 422,
-            Self::Runtime(_) | Self::Storage(_) => 500,
+            Self::Runtime(_) | Self::Storage(_) | Self::RollbackNotAdopted { .. } => 500,
         }
     }
 
@@ -122,7 +135,9 @@ impl ActivationError {
     pub fn into_response(self) -> OutputStream {
         let code = match self {
             Self::Validation(_) => ErrorCode::InvalidArgument,
-            Self::Runtime(_) | Self::Storage(_) => ErrorCode::Internal,
+            Self::Runtime(_) | Self::Storage(_) | Self::RollbackNotAdopted { .. } => {
+                ErrorCode::Internal
+            }
         };
         no_store_error_status(code, self.status(), &self.to_string())
     }
@@ -140,6 +155,22 @@ impl std::fmt::Display for ActivationError {
             }
             Self::Runtime(message) => write!(f, "the runtime could not be rebuilt: {message}"),
             Self::Storage(message) => write!(f, "the activation could not be stored: {message}"),
+            // Says what IS true before what is not, and what to do about it.
+            // The retry repairs because it is an ordinary rollback: staged
+            // against a live generation with the same manifests,
+            // `activate_staged` rebuilds nothing and publishes nothing, and
+            // `adopt_site` then runs again.
+            Self::RollbackNotAdopted {
+                generation_id,
+                message,
+            } => write!(
+                f,
+                "the rollback is live — generation {generation_id} is serving the rolled-back \
+                 site and blocks — but the workspace's site/ files could not be updated to \
+                 match it: {message}. Until they are, the next site write publishes the \
+                 pre-rollback site again. Retrying the same rollback repairs the workspace: it \
+                 stages the same contents, which are already live, and updates the files."
+            ),
         }
     }
 }
@@ -563,10 +594,17 @@ async fn activate(
     // workspace pointing at content the published site does not have. The
     // reverse order would rewrite the workspace on every refused rollback —
     // including the ordinary case of a target whose blobs have been collected.
+    //
+    // Which means a failure here arrives after the commit, with the rollback
+    // already serving — so it is reported as exactly that, never as a
+    // rollback that did not happen.
     if adopts_site {
-        adopt_site(ctx, shared, &manifest.site)
-            .await
-            .map_err(storage_error)?;
+        adopt_site(ctx, shared, &manifest.site).await.map_err(|e| {
+            ActivationError::RollbackNotAdopted {
+                generation_id: row.id.clone(),
+                message: e.message,
+            }
+        })?;
     }
     Ok(outcome)
 }
