@@ -375,7 +375,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::userportal::UserPortalBlock,
-        test_support::{output_header, output_html, output_is_error, TestContext},
+        test_support::{admin_msg, output_header, output_html, output_is_error, TestContext},
     };
 
     async fn ctx_with_userportal() -> TestContext {
@@ -481,6 +481,82 @@ mod tests {
         assert!(
             output_is_error(out, "Internal").await,
             "a failed row read must not answer 404"
+        );
+    }
+
+    /// An unreadable buttons table is the 500 page, not "No buttons
+    /// configured" — which invites the admin to add back buttons that exist.
+    #[tokio::test]
+    async fn a_failed_buttons_read_is_a_500_not_the_empty_state() {
+        let ctx = ctx_with_userportal().await;
+        db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let ctx = ctx.break_list_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            admin_msg("retrieve", "/b/userportal/admin/buttons"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("No buttons configured"), "{html}");
+    }
+
+    /// A mutation that was written but whose table re-read failed swaps in an
+    /// error notice with an error toast, not the empty table. The empty table
+    /// reads as "adding this button deleted all the others". The notice keeps
+    /// the `buttons-table` id so the next `outerHTML` swap still has a target.
+    #[tokio::test]
+    async fn a_failed_reread_after_create_swaps_an_error_not_an_empty_table() {
+        let ctx = ctx_with_userportal().await;
+        db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let failing = ctx.clone().break_list_reads();
+
+        let out = crate::blocks::userportal::test_support::browser_request(
+            &failing,
+            admin_msg("create", "/b/userportal/admin/buttons"),
+            "label=Shop&path=%2Fb%2Fproducts%2F&icon=shopping-cart&sort_order=1",
+        )
+        .await;
+        let (status, html) = out;
+
+        assert_eq!(status, 200, "htmx swaps only a 2xx");
+        assert!(!html.contains("No buttons configured"), "{html}");
+        assert!(html.contains(r#"id="buttons-table""#), "{html}");
+        assert!(html.contains("alert--error"), "{html}");
+        assert!(html.contains("Button added"), "{html}");
+
+        // The write did land — the notice is right to say so.
+        let rows = db::list(&ctx, TABLE, &Default::default()).await.unwrap();
+        assert_eq!(rows.records.len(), 2);
+    }
+
+    /// The toast half of the swap above rides the `HX-Trigger` header.
+    #[tokio::test]
+    async fn a_failed_reread_after_delete_fires_an_error_toast() {
+        let ctx = ctx_with_userportal().await;
+        let record = db::create(&ctx, TABLE, button_data("Files", "folder", "/b/storage/"))
+            .await
+            .unwrap();
+        let failing = ctx.break_list_reads();
+
+        let out = handle_delete_button(&failing, &record.id).await;
+        let trigger = output_header(out, "HX-Trigger")
+            .await
+            .expect("an error toast must be triggered");
+        let trigger: serde_json::Value = serde_json::from_str(&trigger).unwrap();
+        assert_eq!(trigger["showToast"]["type"], "error", "{trigger}");
+        assert!(
+            trigger["showToast"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Button deleted"),
+            "{trigger}"
         );
     }
 

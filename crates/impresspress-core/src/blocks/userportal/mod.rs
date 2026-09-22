@@ -383,6 +383,48 @@ mod update_profile_csrf_tests {
         assert!(crate::test_support::output_is_error(out, "PermissionDenied").await);
     }
 
+    /// A blank name is refused, not written. The profile page pre-fills
+    /// this field from the user's row; when that read failed the page
+    /// rendered `value=""`, and the user's next Save posted it here, which
+    /// wrote "" over their real name. Driven through the block's route table
+    /// with the exact form bytes the page posts.
+    #[tokio::test]
+    async fn an_empty_name_is_refused_and_the_row_keeps_its_name() {
+        let ctx = TestContext::with_userportal().await;
+        seed_user(&ctx, "user-1").await;
+        let msg = auth_msg("create", "/b/userportal/update-profile", "user-1");
+
+        for blank in ["", "+++"] {
+            let form = format!("csrf_token={}&name={blank}", crate::csrf::token(&ctx, &msg));
+            let (status, _) = super::test_support::browser_request(&ctx, msg.clone(), &form).await;
+            assert_eq!(status, 400, "name={blank:?} must be refused");
+            assert_eq!(profile_name(&ctx, "user-1").await, "Old Name");
+        }
+
+        // A form with no `name` field at all is the same blank.
+        let form = format!("csrf_token={}", crate::csrf::token(&ctx, &msg));
+        let (status, _) = super::test_support::browser_request(&ctx, msg.clone(), &form).await;
+        assert_eq!(status, 400, "a missing name must be refused");
+        assert_eq!(profile_name(&ctx, "user-1").await, "Old Name");
+    }
+
+    /// Control for the test above: the same route, a real name, is written
+    /// (trimmed) and answered with the form's 303.
+    #[tokio::test]
+    async fn a_real_name_is_written_trimmed() {
+        let ctx = TestContext::with_userportal().await;
+        seed_user(&ctx, "user-1").await;
+        let msg = auth_msg("create", "/b/userportal/update-profile", "user-1");
+
+        let form = format!(
+            "csrf_token={}&name=+New+Name+",
+            crate::csrf::token(&ctx, &msg)
+        );
+        let (status, _) = super::test_support::browser_request(&ctx, msg, &form).await;
+        assert_eq!(status, 303);
+        assert_eq!(profile_name(&ctx, "user-1").await, "New Name");
+    }
+
     #[tokio::test]
     async fn another_users_token_is_rejected() {
         // The token is per-identity — user B's valid token must not authorize
@@ -450,7 +492,7 @@ async fn handle_save_settings(ctx: &dyn Context, input: InputStream) -> OutputSt
 
 #[cfg(test)]
 mod test_support {
-    use wafer_run::Message;
+    use wafer_run::{context::Context, InputStream, Message};
 
     /// Run `msg` through the block's own route table so `{family}` / `{id}` is
     /// bound the way it is on the wire, then hand the message to a handler
@@ -466,6 +508,30 @@ mod test_support {
             msg.path()
         );
         msg
+    }
+
+    /// Send a browser request through the block's own `handle` — the route
+    /// table dispatch included — with `body` as the request body, and return
+    /// what the HTTP adapter would send: status and body, error terminals
+    /// rendered by the same `http_codec` the real adapters use.
+    pub(super) async fn browser_request(
+        ctx: &dyn Context,
+        mut msg: Message,
+        body: &str,
+    ) -> (u16, String) {
+        msg.set_meta("http.header.accept", "text/html");
+        let out = wafer_run::Block::handle(
+            &super::UserPortalBlock::new(),
+            ctx,
+            msg,
+            InputStream::from_bytes(body.as_bytes().to_vec()),
+        )
+        .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        (
+            parts.status,
+            String::from_utf8(parts.body).expect("response body is UTF-8"),
+        )
     }
 }
 

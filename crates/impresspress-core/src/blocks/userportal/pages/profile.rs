@@ -125,6 +125,47 @@ mod tests {
         );
     }
 
+    /// A failed user read is the 500 page, never the form. The form is
+    /// pre-filled from the row and posts `name` back, so rendering it from a
+    /// blank default (`value=""`) set the user up to wipe their own name on
+    /// Save.
+    #[tokio::test]
+    async fn a_failed_user_read_is_a_500_without_the_form() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("user-a").await;
+        let ctx = ctx.break_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            auth_msg("retrieve", "/b/userportal/profile", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(
+            !html.contains(r#"name="name""#),
+            "the edit form must not render without the user's row:\n{html}"
+        );
+    }
+
+    /// A signed-in user with no row is an inconsistency, not an empty
+    /// profile: same answer as the failed read, for the same reason.
+    #[tokio::test]
+    async fn a_missing_user_row_is_a_500_without_the_form() {
+        let ctx = TestContext::with_auth().await;
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            auth_msg("retrieve", "/b/userportal/profile", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains(r#"name="name""#), "{html}");
+    }
+
     #[tokio::test]
     async fn shell_chrome_is_absent() {
         let ctx = TestContext::with_auth().await;

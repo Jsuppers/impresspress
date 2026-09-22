@@ -206,6 +206,32 @@ mod tests {
         assert!(html.contains("Files") && html.contains("/b/storage/"));
     }
 
+    /// An unreadable buttons table is the 500 page, not an account card
+    /// with the app tiles silently missing.
+    #[tokio::test]
+    async fn a_failed_buttons_read_is_a_500_not_a_card_without_tiles() {
+        let ctx = ctx_with_userportal().await;
+        seed_user(&ctx, "user-a").await;
+        db::create(
+            &ctx,
+            "impresspress__userportal__buttons",
+            button_data("Files", "folder", "/b/storage/", 0),
+        )
+        .await
+        .unwrap();
+        let ctx = ctx.break_list_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            auth_msg("retrieve", "/b/userportal/", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("account-nav"), "{html}");
+    }
+
     #[tokio::test]
     async fn no_apps_omits_divider() {
         let ctx = ctx_with_userportal().await;

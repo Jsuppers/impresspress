@@ -463,6 +463,54 @@ mod tests {
         assert!(html.contains("alice"));
     }
 
+    /// An unreadable provider-link list is the 500 page. Rendering it as
+    /// "No external accounts linked" hides exactly the sign-in routes this
+    /// page lets a user audit and unlink.
+    #[tokio::test]
+    async fn a_failed_link_read_is_a_500_not_no_linked_accounts() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        link(&ctx, "user-a", "github", "gh-1").await;
+        let ctx = ctx.break_list_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            auth_msg("retrieve", "/b/userportal/security", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("No external accounts linked"), "{html}");
+    }
+
+    /// An unreadable verification flag is the 500 page. Defaulting it to
+    /// `false` told a verified user they were not, and offered to resend.
+    /// Only the users-row `get` fails, so the link list above it still reads
+    /// and the flag is the one thing that decides the response.
+    ///
+    /// Names `users::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn a_failed_verification_read_is_a_500_not_unverified() {
+        use crate::test_support::FailingDbOpContext;
+
+        let ctx = TestContext::with_auth().await;
+        seed_user_with_verified(&ctx, "user-a", true).await;
+        let failing = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &failing,
+            auth_msg("retrieve", "/b/userportal/security", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("Email not verified"), "{html}");
+        assert!(!html.contains("Resend verification email"), "{html}");
+    }
+
     // --- WRAP regression: catches a future removal of the userportal
     // grant on `auth::repo::provider_links::TABLE`. Without it, the
     // /b/userportal/security page silently renders "No external accounts

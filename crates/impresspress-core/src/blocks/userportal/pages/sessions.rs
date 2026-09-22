@@ -368,6 +368,27 @@ mod tests {
         );
     }
 
+    /// An unreadable session list is the 500 page, not "No active
+    /// sessions." — the empty state tells a user looking for a device to
+    /// sign out that there is nothing to revoke.
+    #[tokio::test]
+    async fn a_failed_list_read_is_a_500_not_the_empty_state() {
+        let ctx = TestContext::with_auth().await;
+        seed_user(&ctx, "user-a").await;
+        insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
+        let ctx = ctx.break_reads();
+
+        let (status, html) = crate::blocks::userportal::test_support::browser_request(
+            &ctx,
+            auth_msg("retrieve", "/b/userportal/sessions", "user-a"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        assert!(!html.contains("No active sessions"), "{html}");
+    }
+
     /// The row whose family matches the request's *verified* token gets the
     /// badge. Other rows do not.
     #[tokio::test]
