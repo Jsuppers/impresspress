@@ -236,7 +236,8 @@ pub async fn latest_valid_for_artifact(
 /// The `limit` newest builds, newest first.
 ///
 /// `id` breaks a `created_at` tie (the table's primary key, which the
-/// database appends to every sorted list), for the reason
+/// database appends to a sorted list over a table that has one), for the
+/// reason
 /// [`super::generations::list_recent`] states: the timestamp is
 /// millisecond-resolution on wasm32, and two rows sharing one would otherwise
 /// come back in whatever order the backend chose.
@@ -519,9 +520,10 @@ pub async fn delete_for_artifact(
 }
 
 /// Newest first — the ordering every listing here uses. The database breaks
-/// a `created_at` tie on the primary key, `id`, descending (a sorted `list`
-/// always ends its `ORDER BY` with the key), for the reason [`list_recent`]
-/// states.
+/// a `created_at` tie on the primary key, `id`, descending — a sorted `list`
+/// ends its `ORDER BY` with the table's key, and this table has one
+/// (`id TEXT PRIMARY KEY`, `001_dev_schema.sqlite.sql`) — for the reason
+/// [`list_recent`] states.
 fn newest_first() -> Vec<SortField> {
     vec![SortField {
         field: "created_at".into(),

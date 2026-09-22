@@ -165,8 +165,9 @@ fn like_filter(field: &str, pattern: &str) -> Filter {
 
 /// Newest account first. `created_at` has one-second precision, so accounts
 /// created in the same second tie on it; the database breaks the tie on the
-/// primary key, `id`, in the direction of this sort (a sorted `list` always
-/// ends its `ORDER BY` with the key), which makes the order total — what
+/// primary key, `id`, in the direction of this sort (a sorted `list` ends its
+/// `ORDER BY` with the table's key, and this table has one — `id TEXT PRIMARY
+/// KEY`, `001_auth_schema.sqlite.sql`), which makes the order total — what
 /// paging needs. [`insert`] mints `id` as a UUIDv7, which within one process
 /// orders by creation, so there the tie also resolves newest first; ids
 /// minted in the same millisecond by different processes (two Workers

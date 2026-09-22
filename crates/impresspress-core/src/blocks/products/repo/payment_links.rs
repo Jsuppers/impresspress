@@ -473,7 +473,9 @@ pub(crate) async fn find_for_configuration(
         TABLE,
         configuration_filters(offer_id, preset_id, configuration_hash, true),
         // The database breaks a `created_at` tie on the primary key, `id`,
-        // ascending (a sorted `list` always ends its `ORDER BY` with the key).
+        // ascending: a sorted `list` ends its `ORDER BY` with the table's key,
+        // and this table has one (`id TEXT PRIMARY KEY`,
+        // `005_commerce_v2.sqlite.sql`).
         vec![SortField {
             field: "created_at".to_string(),
             desc: false,
