@@ -713,11 +713,7 @@ pub async fn deleted_product_close(
 // ---------------------------------------------------------------------------
 
 pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let fee = match platform_fee(ctx).await {
-        Ok(fee) => fee,
-        Err(response) => return response,
-    };
-    let sellers = match repo::seller_accounts::list_contracts(ctx, fee).await {
+    let sellers = match repo::seller_accounts::list_rows(ctx).await {
         Ok(sellers) => sellers,
         Err(error) => return crate::http::err_internal("Could not list sellers", error),
     };
@@ -842,11 +838,13 @@ pub async fn admin_seller_detail(
     msg: &Message,
     seller_id: &str,
 ) -> OutputStream {
-    let fee = match platform_fee(ctx).await {
-        Ok(fee) => fee,
-        Err(response) => return response,
-    };
-    let seller = match repo::seller_accounts::get_contract(ctx, seller_id, fee).await {
+    // Not `platform_fee`: this page carries the suspend control, and a typo
+    // in the fee setting must not take the fraud control down with it. An
+    // unreadable fee is shown as exactly that, never as a number.
+    let fee = super::config::seller_fee_bps(ctx).await.map_err(|error| {
+        tracing::warn!(error = %error, "platform application fee setting cannot be read");
+    });
+    let seller = match repo::seller_accounts::get_row(ctx, seller_id).await {
         Ok(Some(seller)) => seller,
         Ok(None) => return crate::http::err_not_found("Seller not found"),
         Err(error) => return crate::http::err_internal("Could not load seller", error),
@@ -895,7 +893,7 @@ pub async fn admin_seller_detail(
                     (components::stat_card("Payments", if seller.capabilities.charges_enabled { "Enabled" } else { "Disabled" }, icons::dollar_sign(), None))
                     (components::stat_card("Payouts", if seller.capabilities.payouts_enabled { "Enabled" } else { "Disabled" }, icons::arrow_up_right(), None))
                     (components::stat_card("Verification", if seller.capabilities.details_submitted { "Complete" } else { "Incomplete" }, icons::info(), None))
-                    (components::stat_card("Platform fee", &fee_percent(seller.fee_basis_points), icons::dollar_sign(), None))
+                    (components::stat_card("Platform fee", &fee.map_or_else(|()| "Misconfigured".to_string(), |fee| fee_percent(fee.into())), icons::dollar_sign(), None))
                 }
                 details .products-plain-details {
                     summary { "Technical account details" }
@@ -2262,12 +2260,14 @@ fn fee_percent(basis_points: u32) -> String {
     format!("{}.{:02}%", basis_points / 100, basis_points % 100)
 }
 
-/// The platform application fee every seller surface shows: the fee
-/// checkout and Payment Links charge, read from the one place they read it.
+/// The platform application fee the seller's own pages show: the fee new
+/// Checkout Sessions and Payment Links carry, read from the one place they
+/// read it.
 ///
 /// Rendered, so it must not be invented: a fee the platform cannot read
 /// would otherwise print as "0.00%" on the page an operator opens to check
-/// exactly that number.
+/// exactly that number. The admin seller detail page reads the setting
+/// itself, because it must render without it.
 async fn platform_fee(ctx: &dyn Context) -> Result<u16, OutputStream> {
     super::config::seller_fee_bps(ctx).await.map_err(|error| {
         crate::http::err_internal("Platform application fee is misconfigured", error)

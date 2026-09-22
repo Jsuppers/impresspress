@@ -123,50 +123,99 @@ fn due_requirements(value: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The stored row as the published [`SellerAccount`], carrying
-/// `fee_basis_points` — the platform application fee
-/// ([`crate::blocks::products::config::seller_fee_bps`]) that checkout and
-/// Payment Links charge this seller's sales now.
+/// Everything a stored seller row says about the account, decoded.
 ///
-/// The fee is a platform setting, not a fact about the row, so the caller
-/// reads it once and hands it in. The table's `fee_basis_points` column is
-/// neither read nor written: no path ever changed it after a row's first
-/// insert, so what it holds is not what anyone is charged.
+/// [`SellerAccount`] minus its `fee_basis_points`: the fee is a platform
+/// setting ([`crate::blocks::products::config::seller_fee_bps`]), not a fact
+/// about the row, so a surface that must render even when that setting cannot
+/// be read — the admin seller pages, where the suspend control lives — works
+/// from this and never has to invent a number. [`SellerRow::into_contract`]
+/// adds the fee for everything that publishes the contract.
+///
+/// The table's `fee_basis_points` column is neither read nor written: no path
+/// ever changed it after a row's first insert, so what it holds is not what
+/// anyone is charged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SellerRow {
+    pub id: String,
+    pub user_id: String,
+    pub status: SellerStatus,
+    pub approval_status: SellerApproval,
+    pub stripe_account_id: String,
+    pub capabilities: SellerCapabilities,
+    pub livemode: bool,
+    pub country: String,
+    pub default_currency: String,
+    pub dashboard_type: String,
+    pub disabled_reason: String,
+    pub sync_error: String,
+    pub last_synced_at: String,
+}
+
+impl SellerRow {
+    /// Decode a stored row. Fails only on a `status` outside the contract.
+    pub(crate) fn from_record(record: &db::Record) -> Result<Self, WaferError> {
+        let requirements = requirements_value(record);
+        let status = status_of(record)?;
+        Ok(Self {
+            id: record.id.clone(),
+            user_id: record.str_field("user_id").to_string(),
+            status,
+            approval_status: approval_from_status(status),
+            stripe_account_id: record.str_field("stripe_account_id").to_string(),
+            capabilities: SellerCapabilities {
+                details_submitted: record.bool_field("details_submitted"),
+                charges_enabled: record.bool_field("charges_enabled"),
+                payouts_enabled: record.bool_field("payouts_enabled"),
+                requirements_due: due_requirements(&requirements),
+            },
+            livemode: record.bool_field("livemode"),
+            country: record.str_field("country").to_string(),
+            default_currency: record.str_field("default_currency").to_string(),
+            dashboard_type: record.str_field("dashboard_type").to_string(),
+            disabled_reason: record.str_field("requirements_disabled_reason").to_string(),
+            sync_error: record.str_field("sync_error").to_string(),
+            last_synced_at: record.str_field("last_synced_at").to_string(),
+        })
+    }
+
+    /// The published [`SellerAccount`], carrying `fee_basis_points` as the
+    /// caller read it from the platform setting.
+    pub(crate) fn into_contract(self, fee_basis_points: u16) -> SellerAccount {
+        SellerAccount {
+            id: self.id,
+            user_id: self.user_id,
+            status: self.status,
+            approval_status: self.approval_status,
+            stripe_account_id: self.stripe_account_id,
+            capabilities: self.capabilities,
+            fee_basis_points: fee_basis_points.into(),
+            livemode: self.livemode,
+            country: self.country,
+            default_currency: self.default_currency,
+            dashboard_type: self.dashboard_type,
+            disabled_reason: self.disabled_reason,
+            sync_error: self.sync_error,
+            last_synced_at: self.last_synced_at,
+        }
+    }
+}
+
+/// The stored row as the published [`SellerAccount`]: [`SellerRow`] plus
+/// the platform fee the caller read.
 pub(crate) fn to_contract(
     record: &db::Record,
     fee_basis_points: u16,
 ) -> Result<SellerAccount, WaferError> {
-    let requirements = requirements_value(record);
-    let status = status_of(record)?;
-    Ok(SellerAccount {
-        id: record.id.clone(),
-        user_id: record.str_field("user_id").to_string(),
-        status,
-        approval_status: approval_from_status(status),
-        stripe_account_id: record.str_field("stripe_account_id").to_string(),
-        capabilities: SellerCapabilities {
-            details_submitted: record.bool_field("details_submitted"),
-            charges_enabled: record.bool_field("charges_enabled"),
-            payouts_enabled: record.bool_field("payouts_enabled"),
-            requirements_due: due_requirements(&requirements),
-        },
-        fee_basis_points: fee_basis_points.into(),
-        livemode: record.bool_field("livemode"),
-        country: record.str_field("country").to_string(),
-        default_currency: record.str_field("default_currency").to_string(),
-        dashboard_type: record.str_field("dashboard_type").to_string(),
-        disabled_reason: record.str_field("requirements_disabled_reason").to_string(),
-        sync_error: record.str_field("sync_error").to_string(),
-        last_synced_at: record.str_field("last_synced_at").to_string(),
-    })
+    Ok(SellerRow::from_record(record)?.into_contract(fee_basis_points))
 }
 
-/// Seller accounts as the published [`SellerAccount`] contract, and whether
-/// there are more than the read returned.
+/// Seller accounts as decoded [`SellerRow`]s, and whether there are more
+/// than the read returned.
 ///
 /// The admin seller list (`GET /b/products/api/admin/sellers`) and the admin
 /// sellers page rendered this from two verbatim copies of the same read plus
-/// `to_contract`; a decode failure on any row is an error for the whole read,
+/// the projection; a decode failure on any row is an error for the whole read,
 /// because a seller list missing the row that could not be decoded is a
 /// governance surface that silently hides an account.
 ///
@@ -174,13 +223,10 @@ pub(crate) fn to_contract(
 /// That is why the read is capped rather than unpaged-and-hopeful: the same
 /// argument that makes an undecodable row fatal makes a silently dropped tail
 /// unacceptable, so the caller is handed the fact that it has a prefix.
-pub(crate) async fn list_contracts(
-    ctx: &dyn Context,
-    fee_basis_points: u16,
-) -> Result<CappedList<SellerAccount>, WaferError> {
+pub(crate) async fn list_rows(ctx: &dyn Context) -> Result<CappedList<SellerRow>, WaferError> {
     db_read::list_capped(ctx, TABLE, vec![])
         .await?
-        .try_map(|record| to_contract(&record, fee_basis_points))
+        .try_map(|record| SellerRow::from_record(&record))
 }
 
 /// How many seller accounts exist, for the listing that shows a prefix.
@@ -191,7 +237,7 @@ pub(crate) async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
 /// One seller account by its local id, as the stored row. `Ok(None)` when
 /// there is no such row.
 ///
-/// Kept alongside [`get_contract`] for the one caller — suspension — that
+/// Kept alongside [`get_row`] for the one caller — suspension — that
 /// must be able to act on a row whose contract projection would fail: an
 /// account whose stored `status` no longer decodes is exactly the one an
 /// operator most needs to be able to suspend.
@@ -203,16 +249,11 @@ pub(crate) async fn get(ctx: &dyn Context, id: &str) -> Result<Option<db::Record
     }
 }
 
-/// One seller account by its local id, as the published [`SellerAccount`]
-/// contract. `Ok(None)` when there is no such row, so a caller can answer 404
-/// without matching on an error code.
-pub(crate) async fn get_contract(
-    ctx: &dyn Context,
-    id: &str,
-    fee_basis_points: u16,
-) -> Result<Option<SellerAccount>, WaferError> {
+/// One seller account by its local id, decoded. `Ok(None)` when there is no
+/// such row, so a caller can answer 404 without matching on an error code.
+pub(crate) async fn get_row(ctx: &dyn Context, id: &str) -> Result<Option<SellerRow>, WaferError> {
     match db::get(ctx, TABLE, id).await {
-        Ok(record) => to_contract(&record, fee_basis_points).map(Some),
+        Ok(record) => SellerRow::from_record(&record).map(Some),
         Err(error) if error.code == ErrorCode::NotFound => Ok(None),
         Err(error) => Err(error),
     }

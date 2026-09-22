@@ -503,10 +503,10 @@ async fn seed_seller_account(
     .await;
 }
 
-/// `list_contracts` is exactly the read both call sites hand-rolled: every
-/// row of the table, each through `to_contract`.
+/// `list_rows` is exactly the read both call sites hand-rolled: every row of
+/// the table, each decoded.
 #[tokio::test]
-async fn list_contracts_equals_every_row_through_to_contract() {
+async fn list_rows_equals_every_row_decoded() {
     let ctx = ctx().await;
     seed_seller_account(&ctx, "seller_a", "user_a", "active").await;
     seed_seller_account(&ctx, "seller_b", "user_b", "restricted").await;
@@ -515,21 +515,14 @@ async fn list_contracts_equals_every_row_through_to_contract() {
         .await
         .expect("rows")
         .iter()
-        .map(|record| repo::seller_accounts::to_contract(record, 250))
+        .map(repo::seller_accounts::SellerRow::from_record)
         .collect::<Result<Vec<_>, _>>()
         .expect("projections");
 
-    let actual = repo::seller_accounts::list_contracts(&ctx, 250)
+    let actual = repo::seller_accounts::list_rows(&ctx)
         .await
-        .expect("list_contracts");
+        .expect("list_rows");
     assert_eq!(actual.rows, expected);
-    assert!(
-        actual
-            .rows
-            .iter()
-            .all(|seller| seller.fee_basis_points == 250),
-        "every seller publishes the platform fee it was handed"
-    );
     assert_eq!(actual.rows.len(), 2, "both seeded rows are listed");
     assert!(!actual.truncated, "two rows is not a prefix");
 }
@@ -538,40 +531,40 @@ async fn list_contracts_equals_every_row_through_to_contract() {
 /// missing the one account that would not decode is a governance surface that
 /// hides an account, which is worse than an error.
 #[tokio::test]
-async fn list_contracts_fails_when_a_row_cannot_be_projected() {
+async fn list_rows_fails_when_a_row_cannot_be_decoded() {
     let ctx = ctx().await;
     seed_seller_account(&ctx, "seller_ok", "user_ok", "active").await;
-    // Not a `SellerStatus` spelling, so `to_contract` cannot decode the row.
+    // Not a `SellerStatus` spelling, so the row cannot be decoded.
     seed_seller_account(&ctx, "seller_bad", "user_bad", "dormant").await;
 
-    let error = repo::seller_accounts::list_contracts(&ctx, 250)
+    let error = repo::seller_accounts::list_rows(&ctx)
         .await
         .expect_err("an unprojectable row fails the read");
     assert_eq!(error.code, wafer_run::ErrorCode::Internal);
 }
 
-/// `get_contract` projects the row and reports a missing id as `Ok(None)`, so
-/// a caller answers 404 without matching on an error code.
+/// `get_row` decodes the row and reports a missing id as `Ok(None)`, so a
+/// caller answers 404 without matching on an error code. The contract it
+/// becomes carries the fee it is handed, not the row's unread column.
 #[tokio::test]
-async fn get_contract_projects_the_row_and_answers_none_for_a_missing_id() {
+async fn get_row_decodes_the_row_and_answers_none_for_a_missing_id() {
     let ctx = ctx().await;
     seed_seller_account(&ctx, "seller_a", "user_a", "active").await;
 
     let record = db::get(&ctx, repo::seller_accounts::TABLE, "seller_a")
         .await
         .expect("row");
-    let expected = repo::seller_accounts::to_contract(&record, 250).expect("projection");
+    let expected = repo::seller_accounts::SellerRow::from_record(&record).expect("projection");
 
+    let row = repo::seller_accounts::get_row(&ctx, "seller_a")
+        .await
+        .expect("get_row");
+    assert_eq!(row, Some(expected));
+    assert_eq!(row.unwrap().into_contract(250).fee_basis_points, 250);
     assert_eq!(
-        repo::seller_accounts::get_contract(&ctx, "seller_a", 250)
+        repo::seller_accounts::get_row(&ctx, "seller_missing")
             .await
-            .expect("get_contract"),
-        Some(expected)
-    );
-    assert_eq!(
-        repo::seller_accounts::get_contract(&ctx, "seller_missing", 250)
-            .await
-            .expect("get_contract"),
+            .expect("get_row"),
         None
     );
 }
