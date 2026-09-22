@@ -266,7 +266,7 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         Ok(row) => row,
         // Fail closed: admitting the upload against "nothing is stored here"
         // would charge the full size to a quota it may not fit, or skip the
-        // per-user file count for a replacement that is not one.
+        // per-bucket file count for a replacement that is not one.
         Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
     };
     let replaces_own_bytes = existing
@@ -277,6 +277,7 @@ pub(in crate::blocks::files) async fn handle_upload_object(
     if let Err(r) = crate::blocks::files::quota::check_quota(
         ctx,
         msg.user_id(),
+        bucket,
         content.len() as i64,
         replaces_own_bytes,
     )
@@ -285,9 +286,10 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         return r;
     }
 
-    // Claim the key BEFORE uploading so concurrent quota checks see the
-    // in-flight size. This closes the TOCTOU race between check_quota and the
-    // actual upload. `(bucket, key)` is UNIQUE: a re-upload takes over the
+    // Claim the key BEFORE uploading so a quota check that runs after this
+    // insert counts the in-flight size. That narrows the race between
+    // check_quota and the upload; it does not close it (see `check_quota`).
+    // `(bucket, key)` is UNIQUE: a re-upload takes over the
     // key's one row, and an upload that finds another upload of the key still
     // in flight is refused (see `reserve_upload`).
     let reservation = match repo::objects::reserve_upload(
@@ -1412,6 +1414,170 @@ mod integration_tests {
         assert!(
             output_is_error(too_big, "InvalidArgument").await,
             "a replacement that does not fit even after the displaced bytes must be refused",
+        );
+    }
+
+    /// Give alice a quota override capping her at `max_files_per_bucket`
+    /// objects per bucket, and own buckets `a` and `b`.
+    async fn alice_capped_at_files_per_bucket(max_files_per_bucket: i64) -> TestContext {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "a", "alice").await;
+        seed_bucket(&ctx, "b", "alice").await;
+        repo::quota::seed(
+            &ctx,
+            crate::util::json_map(serde_json::json!({
+                "user_id": "alice",
+                "max_files_per_bucket": max_files_per_bucket,
+            })),
+        )
+        .await
+        .expect("seed quota");
+        ctx
+    }
+
+    /// Upload a small text file as alice through the real handler.
+    async fn alice_uploads(ctx: &TestContext, bucket: &str, key: &str) -> OutputStream {
+        alice_uploads_as(ctx, bucket, key).await
+    }
+
+    /// [`alice_uploads`] through any context, so a race test can pass a
+    /// decorated one.
+    async fn alice_uploads_as(ctx: &dyn Context, bucket: &str, key: &str) -> OutputStream {
+        handle_upload_object(
+            ctx,
+            &upload_msg(bucket, key, "text/plain"),
+            InputStream::from_bytes(b"hello".to_vec()),
+        )
+        .await
+    }
+
+    /// The file-count cap is per bucket, as its name and the admin table's
+    /// "Max Files/Bucket" column say: filling bucket `a` to the cap does not
+    /// stop an upload into bucket `b`. Counting the user's files across every
+    /// bucket refused it.
+    #[tokio::test]
+    async fn a_full_bucket_does_not_block_uploads_into_another_bucket() {
+        let ctx = alice_capped_at_files_per_bucket(2).await;
+        for key in ["one.txt", "two.txt"] {
+            let out = alice_uploads(&ctx, "a", key).await;
+            assert_eq!(output_json(out).await["uploaded"], serde_json::json!(true));
+        }
+
+        let other_bucket = alice_uploads(&ctx, "b", "three.txt").await;
+        assert_eq!(
+            output_json(other_bucket).await["uploaded"],
+            serde_json::json!(true),
+            "bucket b holds none of alice's files, so the per-bucket cap admits it",
+        );
+    }
+
+    /// And the cap is still a cap within one bucket: the upload that would be
+    /// the N+1th object in it is refused, while replacing an object already
+    /// there adds no row and is admitted. Alice's file in bucket `b` is what
+    /// makes the count the bucket's: counted across buckets, her second
+    /// upload into `a` would already be refused.
+    #[tokio::test]
+    async fn the_per_bucket_cap_refuses_the_upload_past_it_in_that_bucket() {
+        let ctx = alice_capped_at_files_per_bucket(2).await;
+        let elsewhere = alice_uploads(&ctx, "b", "elsewhere.txt").await;
+        assert_eq!(
+            output_json(elsewhere).await["uploaded"],
+            serde_json::json!(true)
+        );
+        for key in ["one.txt", "two.txt"] {
+            let out = alice_uploads(&ctx, "a", key).await;
+            assert_eq!(
+                output_json(out).await["uploaded"],
+                serde_json::json!(true),
+                "{key} is within bucket a's cap of two",
+            );
+        }
+
+        let third = alice_uploads(&ctx, "a", "three.txt").await;
+        assert!(
+            output_is_error(third, "InvalidArgument").await,
+            "a third object in a bucket capped at two must be refused",
+        );
+        assert!(
+            store::get(&ctx, "a", "three.txt").await.is_err(),
+            "nothing may be stored for a refused upload"
+        );
+
+        let replace = alice_uploads(&ctx, "a", "one.txt").await;
+        assert_eq!(
+            output_json(replace).await["uploaded"],
+            serde_json::json!(true),
+            "replacing an object in a full bucket adds no file and is admitted",
+        );
+    }
+
+    /// An upload still in flight counts against the bucket's cap, as its bytes
+    /// count against the storage cap: an upload whose check runs after
+    /// another upload's reservation has landed sees that reservation and is
+    /// refused. A guard on the chosen semantics — the cross-bucket count
+    /// counted pending rows too, so this passes before and after the
+    /// per-bucket fix.
+    #[tokio::test]
+    async fn an_upload_in_flight_counts_against_the_bucket_cap() {
+        let ctx = alice_capped_at_files_per_bucket(1).await;
+        repo::objects::reserve_upload(&ctx, "a", "in-flight.txt", 5, "text/plain", "alice")
+            .await
+            .expect("reserve");
+
+        let out = alice_uploads(&ctx, "a", "next.txt").await;
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "the pending reservation is the bucket's one file",
+        );
+    }
+
+    /// The per-bucket cap is NOT enforced atomically, and this pins that.
+    /// Two uploads of different keys into a bucket one short of its cap are
+    /// held until both have counted the bucket, so both see one file and
+    /// both are admitted: the bucket ends one over its cap. The count and the
+    /// reservation insert are separate calls, and a reservation is exclusive
+    /// per key, not per bucket. Tracked in `NICE_TO_HAVE.md` ("Files quota
+    /// caps are not enforced atomically"); when that lands, this test should
+    /// flip to one 200 and one refusal.
+    #[tokio::test]
+    async fn racing_uploads_of_different_keys_can_overshoot_the_bucket_cap() {
+        use crate::test_support::{output_http_status, RendezvousDbOpContext};
+
+        let ctx = alice_capped_at_files_per_bucket(2).await;
+        let first = alice_uploads(&ctx, "a", "one.txt").await;
+        assert_eq!(
+            output_json(first).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        // Each upload makes exactly one `count` on the objects table: the
+        // per-bucket file count in `check_quota`.
+        let gated =
+            RendezvousDbOpContext::new(ctx.clone(), "database.count", repo::objects::TABLE, 2);
+        let racers: Vec<_> = ["two.txt", "three.txt"]
+            .into_iter()
+            .map(|key| {
+                let racer = gated.clone();
+                tokio::spawn(async move {
+                    output_http_status(alice_uploads_as(&racer, "a", key).await).await
+                })
+            })
+            .collect();
+        let statuses = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both uploads must reach the rendezvous and finish")
+        .expect("upload task panicked");
+
+        assert_eq!(statuses, vec![200, 200], "both racers pass the check");
+        assert_eq!(
+            repo::objects::count_for_uploader_in_bucket(&ctx, "alice", "a")
+                .await
+                .expect("count"),
+            3,
+            "the bucket ends one file over its cap of two",
         );
     }
 

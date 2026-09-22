@@ -1136,12 +1136,13 @@ export interface paths {
                                     id: string;
                                     /** Format: int64 */
                                     max_file_size_bytes: number;
-                                    /** Format: int64 */
+                                    /**
+                                     * Format: int64
+                                     * @description Most objects one user may hold in any one bucket, in-flight uploads included.
+                                     */
                                     max_files_per_bucket: number;
                                     /** Format: int64 */
                                     max_storage_bytes: number;
-                                    /** Format: int64 */
-                                    reset_period_days: number;
                                     updated_at: string;
                                     /** @description The user this override applies to. Unique across the table. */
                                     user_id: string;
@@ -1201,12 +1202,13 @@ export interface paths {
                                 id: string;
                                 /** Format: int64 */
                                 max_file_size_bytes: number;
-                                /** Format: int64 */
+                                /**
+                                 * Format: int64
+                                 * @description Most objects one user may hold in any one bucket, in-flight uploads included.
+                                 */
                                 max_files_per_bucket: number;
                                 /** Format: int64 */
                                 max_storage_bytes: number;
-                                /** Format: int64 */
-                                reset_period_days: number;
                                 updated_at: string;
                                 /** @description The user this override applies to. Unique across the table. */
                                 user_id: string;
@@ -1340,12 +1342,13 @@ export interface paths {
                             quota: {
                                 /** Format: int64 */
                                 max_file_size_bytes: number;
-                                /** Format: int64 */
+                                /**
+                                 * Format: int64
+                                 * @description Most objects one user may hold in any one bucket, in-flight uploads included.
+                                 */
                                 max_files_per_bucket: number;
                                 /** Format: int64 */
                                 max_storage_bytes: number;
-                                /** Format: int64 */
-                                reset_period_days: number;
                             };
                             /**
                              * @description The `usage` half of [`QuotaResponse`]. Both numbers are computed over the
@@ -1354,14 +1357,13 @@ export interface paths {
                             usage: {
                                 /**
                                  * Format: int64
-                                 * @description Number of object rows the caller owns, on the same basis.
+                                 * @description Objects the caller owns across all buckets, `Pending` included; not
+                                 *     what the per-bucket `max_files_per_bucket` cap is checked against.
                                  */
                                 file_count: number;
                                 /**
                                  * Format: int64
-                                 * @description `SUM(size)` over the caller's rows, `Pending` reservations included —
-                                 *     an in-flight upload is charged, which is what closes the quota
-                                 *     TOCTOU window.
+                                 * @description `SUM(size)` over the caller's rows, `Pending` reservations included.
                                  */
                                 total_bytes: number;
                             };

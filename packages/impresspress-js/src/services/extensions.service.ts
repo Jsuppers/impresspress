@@ -165,13 +165,17 @@ export class CloudStorageExtension extends ExtensionsService {
     quota: {
       max_storage_bytes: number;
       max_file_size_bytes: number;
+      /** Most objects the caller may hold in any one bucket, in-flight uploads included. */
       max_files_per_bucket: number;
-      reset_period_days: number;
     };
     usage: {
       /** Bytes stored, in-flight (`pending`) uploads included. */
       total_bytes: number;
-      /** Object rows owned by the caller, on the same basis. */
+      /**
+       * Objects the caller owns across all buckets, in-flight uploads
+       * included. Not what the per-bucket `max_files_per_bucket` cap is
+       * checked against.
+       */
       file_count: number;
     };
   }> {

@@ -3,8 +3,8 @@
 //! Object metadata rows — one row per uploaded file (sibling of the raw
 //! storage blob in `wafer-run/storage`). Tracks size, content type,
 //! status, uploader and timestamps. A row is claimed `pending` *before* the
-//! storage upload ([`reserve_upload`], which closes the quota TOCTOU window)
-//! and flipped to `complete` afterward; quota accounting sums/counts by
+//! storage upload ([`reserve_upload`], so a later quota check counts it —
+//! `quota::check_quota` says what that does and does not bound) and flipped to `complete` afterward; quota accounting sums/counts by
 //! `uploaded_by` (including in-flight `pending` reservations), while
 //! user-facing search and admin stats only see `complete` rows.
 //!
@@ -210,8 +210,10 @@ pub struct Reservation {
 }
 
 /// Claim `(bucket, key)` for an upload of `size` bytes, BEFORE the storage
-/// upload runs, so concurrent quota checks see the in-flight size (this is
-/// what closes the check-quota → upload TOCTOU race). `uploaded_at` is stamped
+/// upload runs, so a quota check that runs after this insert counts the
+/// in-flight size. It narrows the check-quota → upload race without closing
+/// it: the check and this claim are separate calls, and a claim is exclusive
+/// per key, not per bucket (see `quota::check_quota`). `uploaded_at` is stamped
 /// with [`crate::util::now_rfc3339`].
 ///
 /// `(bucket, key)` is UNIQUE, so the key has at most one row, and what that
@@ -598,6 +600,24 @@ pub async fn sum_size_completed(ctx: &dyn Context) -> Result<f64, WaferError> {
 /// includes `pending` reservations).
 pub async fn count_for_uploader(ctx: &dyn Context, user_id: &str) -> Result<i64, WaferError> {
     db::count(ctx, TABLE, &owned_objects_filter(user_id)).await
+}
+
+/// Number of object rows `user_id` uploaded into `bucket` — what the
+/// per-bucket file-count cap (`QuotaConfig::max_files_per_bucket`) is
+/// checked against. Includes `pending` reservations, on the same basis as
+/// [`count_for_uploader`] and [`sum_size_for_uploader`].
+pub async fn count_for_uploader_in_bucket(
+    ctx: &dyn Context,
+    user_id: &str,
+    bucket: &str,
+) -> Result<i64, WaferError> {
+    let mut filters = owned_objects_filter(user_id);
+    filters.push(Filter {
+        field: "bucket".to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(bucket.to_string()),
+    });
+    db::count(ctx, TABLE, &filters).await
 }
 
 /// `SUM(size)` over the rows uploaded by `user_id` (quota accounting —

@@ -134,14 +134,11 @@
                               "type": "integer"
                             },
                             "max_files_per_bucket": {
+                              "description": "Most objects one user may hold in any one bucket, in-flight uploads included.",
                               "format": "int64",
                               "type": "integer"
                             },
                             "max_storage_bytes": {
-                              "format": "int64",
-                              "type": "integer"
-                            },
-                            "reset_period_days": {
                               "format": "int64",
                               "type": "integer"
                             },
@@ -159,7 +156,6 @@
                             "max_storage_bytes",
                             "max_file_size_bytes",
                             "max_files_per_bucket",
-                            "reset_period_days",
                             "created_at",
                             "updated_at"
                           ],
@@ -241,14 +237,11 @@
                         "type": "integer"
                       },
                       "max_files_per_bucket": {
+                        "description": "Most objects one user may hold in any one bucket, in-flight uploads included.",
                         "format": "int64",
                         "type": "integer"
                       },
                       "max_storage_bytes": {
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "reset_period_days": {
                         "format": "int64",
                         "type": "integer"
                       },
@@ -266,7 +259,6 @@
                       "max_storage_bytes",
                       "max_file_size_bytes",
                       "max_files_per_bucket",
-                      "reset_period_days",
                       "created_at",
                       "updated_at"
                     ],
@@ -440,14 +432,11 @@
                         "type": "integer"
                       },
                       "max_files_per_bucket": {
+                        "description": "Most objects one user may hold in any one bucket, in-flight uploads included.",
                         "format": "int64",
                         "type": "integer"
                       },
                       "max_storage_bytes": {
-                        "format": "int64",
-                        "type": "integer"
-                      },
-                      "reset_period_days": {
                         "format": "int64",
                         "type": "integer"
                       }
@@ -455,8 +444,7 @@
                     "required": [
                       "max_storage_bytes",
                       "max_file_size_bytes",
-                      "max_files_per_bucket",
-                      "reset_period_days"
+                      "max_files_per_bucket"
                     ],
                     "type": "object"
                   },
@@ -464,12 +452,12 @@
                     "description": "The `usage` half of [`QuotaResponse`]. Both numbers are computed over the\ncaller's object rows, not read from a counter column.",
                     "properties": {
                       "file_count": {
-                        "description": "Number of object rows the caller owns, on the same basis.",
+                        "description": "Objects the caller owns across all buckets, `Pending` included; not\nwhat the per-bucket `max_files_per_bucket` cap is checked against.",
                         "format": "int64",
                         "type": "integer"
                       },
                       "total_bytes": {
-                        "description": "`SUM(size)` over the caller's rows, `Pending` reservations included —\nan in-flight upload is charged, which is what closes the quota\nTOCTOU window.",
+                        "description": "`SUM(size)` over the caller's rows, `Pending` reservations included.",
                         "format": "int64",
                         "type": "integer"
                       }
