@@ -465,8 +465,8 @@ mod tests {
 
     // --- WRAP regression: catches a future removal of the userportal
     // grant on `auth::repo::sessions::TABLE`. Without it, /b/userportal/
-    // sessions silently returns the empty state for every authenticated
-    // user. PR #77 added the grant; these tests fail closed if it's removed.
+    // sessions answers the 500 page for every authenticated user. PR #77
+    // added the grant; these tests fail closed if it's removed.
 
     #[tokio::test]
     async fn wrap_denies_sessions_list_without_grant() {

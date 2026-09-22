@@ -513,8 +513,8 @@ mod tests {
 
     // --- WRAP regression: catches a future removal of the userportal
     // grant on `auth::repo::provider_links::TABLE`. Without it, the
-    // /b/userportal/security page silently renders "No external accounts
-    // linked" even after a real OAuth link. PR #77 added the grant.
+    // /b/userportal/security page answers the 500 page for every
+    // authenticated user. PR #77 added the grant.
 
     #[tokio::test]
     async fn wrap_denies_provider_links_list_without_grant() {

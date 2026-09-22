@@ -73,9 +73,11 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
                 div .form-group {
                     label .form-label for="display-name" { "Display name" }
-                    // `required`: the update handler refuses an empty name.
+                    // `required` + `pattern`: the update handler refuses an
+                    // empty or whitespace-only name, so the browser does too.
                     input .form-input #display-name type="text" name="name"
-                        value=(display_name) placeholder="Enter your name" required;
+                        value=(display_name) placeholder="Enter your name" required
+                        pattern=".*\\S.*" title="Enter a name that is not just spaces";
                 }
                 button .btn .btn--primary type="submit" .w-full { "Save" }
             }
@@ -109,6 +111,10 @@ mod tests {
         assert!(
             html.contains(r#"name="name""#),
             "missing display-name field"
+        );
+        assert!(
+            html.contains(r#"required pattern=".*\S.*""#),
+            "the name field must refuse blank and whitespace-only input"
         );
     }
 

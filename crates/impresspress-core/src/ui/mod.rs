@@ -534,11 +534,15 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
 /// fragment failed, so the swap target is replaced by an error notice and an
 /// error toast fires.
 ///
-/// The notice keeps `target_id` as its own `id`, so an `hx-swap="outerHTML"`
-/// target is still there for the next request to swap into. The status is
-/// 200 because htmx 2's default `responseHandling` swaps only 2xx: a 5xx body
-/// would be dropped and the stale fragment left on screen, which is the
-/// silent state this exists to replace. `message` is shown in both places
+/// The notice is a `div` carrying `target_id` as its own `id`, so the caller's
+/// control must swap a block-level target with `hx-swap="outerHTML"`: the
+/// target is then still there for the next request to swap into. An
+/// `innerHTML` swap would nest a second element with the same id, and a
+/// table-part target (`<tr>`, `<tbody>`) would get a `div` where the parser
+/// only allows rows. The status is 200 because htmx 2's default
+/// `responseHandling` swaps only 2xx: a 5xx body would be dropped and the
+/// stale fragment left on screen, which is the stale state this exists to
+/// replace. `message` is shown in both places
 /// and should say what the operator can do (usually: reload the page).
 pub fn swap_error_response(target_id: &str, message: &str) -> wafer_run::OutputStream {
     let markup = maud::html! {
