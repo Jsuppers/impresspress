@@ -1271,9 +1271,12 @@ pub(crate) async fn sync_commerce_subscription(
         Err(error) if error.code == wafer_run::ErrorCode::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    // `FailedPrecondition`, like the mode mismatch below: the event and the
+    // order disagree about their own identity. `PermissionDenied` is the code
+    // a WRAP refusal carries, and `crud::db_error_internal` answers it 403.
     if purchase.str_field("stripe_account_id") != stripe_account_id {
         return Err(WaferError::new(
-            wafer_run::ErrorCode::PermissionDenied,
+            wafer_run::ErrorCode::FailedPrecondition,
             "subscription event Stripe account does not match the commerce order",
         ));
     }

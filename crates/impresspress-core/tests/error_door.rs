@@ -38,14 +38,16 @@
 //! `tickets/rest.rs` and two in `vector/pages.rs` only by reading the files
 //! the allowlist sent it to.
 //!
-//! That last blind spot outlived the allowlist. `products/stripe.rs`'s
-//! webhook dispatcher still tails roughly forty database and Stripe-API
-//! failures into `err_internal` with no `NotFound` arm above them, and
-//! `products/purchase.rs`'s refund orchestration does the same; separating
-//! the database calls from the Stripe calls there is a reading job per site,
-//! not a mechanical one, so it is owed as its own PR rather than smuggled
-//! into this gate's scope. An empty list below does NOT mean every products
-//! refusal is classified — it means no file writes the *shape*.
+//! That last blind spot is closed for the two files where it was
+//! concentrated: `products/stripe.rs` (the webhook dispatcher and the offer
+//! checkout) and `products/purchase.rs` (the order reads and the refund
+//! orchestration). Whether an `err_internal(label, cause)` there wraps a
+//! database call is a reading job per site, so the second gate below does not
+//! guess: every `err_internal` tail left in those files is inventoried by its
+//! label, with the reason it is not a database failure, and a tail that is not
+//! on the inventory fails. Everywhere else the blind spot stands — an empty
+//! `STILL_HAND_MAPPED` means no file writes the *shape*, not that every
+//! refusal is classified.
 //!
 //! `auth::repo::RepoError` used to be named here as a site the gate could
 //! not help: it was `NotFound | Db(String)`, so the wafer code was gone
@@ -53,7 +55,7 @@
 //! sites classify like every other one now.
 
 use impresspress_core::test_support::source_scan::{
-    strip_line_comments, strip_test_modules, SourceWalk,
+    code_before_comment, strip_line_comments, strip_test_modules, SourceWalk,
 };
 
 /// Files still carrying the shape. **Empty**, and the history of how it got
@@ -303,4 +305,308 @@ fn the_walk_reaches_the_files_it_claims_to_scan() {
         "expected exactly the planted offender"
     );
     assert!(clean_but_listed.is_empty(), "{clean_but_listed:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Inventoried `err_internal` tails
+// ---------------------------------------------------------------------------
+
+/// Every `err_internal(label, cause)` left in a gated file, by label, with how
+/// many times it appears and why it is not a database failure.
+///
+/// A database failure in these files goes through `crud::db_error_internal`
+/// (or `crud::db_error` where a `NotFound` is the caller's row), so a WRAP
+/// denial is 403 and a quota is 429. What is left here is one of two things:
+///
+/// - **Stripe**: the cause is a Stripe API call. `stripe_client::classify`
+///   gives it `Internal` or `FailedPrecondition`, never a WRAP code, and a
+///   Stripe 429 is Stripe's rate limit, not the database's.
+/// - **Invariant**: the cause is this process, not a service — a row outside
+///   its contract, a setting outside its range (`config::get_default` answers
+///   the default, never a database error), a serialization or the OS RNG.
+///
+/// The gate compares counts both ways. A label that is not listed, or that
+/// appears more often than listed, is a new tail: route it through the door
+/// or add it here with its reason. A label that appears less often than
+/// listed is a stale entry: lower the count or delete the line, so the list
+/// never grants more than the files use.
+///
+/// The behavioural half is fault injection through `FailingDbOpContext`:
+/// `webhook_database_denial_is_403_and_the_delivery_is_retried` and its
+/// siblings in `products/tests/stripe_tests.rs`, and
+/// `refund_ledger_denial_is_403` and its siblings in
+/// `products/tests/provider_tests.rs`.
+const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
+    (
+        "products/stripe.rs",
+        &[
+            Tail {
+                label: "Stripe API error",
+                count: 1,
+                why: "Stripe: the Checkout Session create",
+            },
+            Tail {
+                label: "Platform application fee is misconfigured",
+                count: 1,
+                why: "invariant: the fee setting is outside 0..=10000",
+            },
+            Tail {
+                label: "Platform country is misconfigured",
+                count: 1,
+                why: "invariant: the country setting is not a two-letter code",
+            },
+            Tail {
+                label: "Could not snapshot checkout inputs",
+                count: 1,
+                why: "invariant: serializing the evaluated inputs",
+            },
+            Tail {
+                label: "Could not snapshot checkout condition",
+                count: 1,
+                why: "invariant: serializing a component condition",
+            },
+            Tail {
+                label: "Could not create checkout receipt",
+                count: 1,
+                why: "invariant: the OS random source",
+            },
+            Tail {
+                label: "Purchase row is outside the contract",
+                count: 1,
+                why: "invariant: an undecodable order status",
+            },
+        ],
+    ),
+    (
+        "products/purchase.rs",
+        &[
+            Tail {
+                label: "Stripe refund could not be completed",
+                count: 1,
+                why: "Stripe: the refund create",
+            },
+            Tail {
+                label: "Order row is outside the contract",
+                count: 4,
+                why: "invariant: an undecodable order row",
+            },
+            Tail {
+                label: "Refund row is outside the contract",
+                count: 1,
+                why: "invariant: an undecodable refund status",
+            },
+            Tail {
+                label: "&format!(\"{entity} row is outside the contract\")",
+                count: 1,
+                why: "invariant: an undecodable child row",
+            },
+            Tail {
+                label: "Purchase has invalid refund accounting",
+                count: 1,
+                why: "invariant: the order's own totals disagree",
+            },
+        ],
+    ),
+];
+
+/// One inventoried tail: its label as [`err_internal_labels`] reads it, how
+/// many times the file uses it, and why it is not a database failure —
+/// `"Stripe: …"` or `"invariant: …"`, the only two reasons there are.
+struct Tail {
+    label: &'static str,
+    count: usize,
+    why: &'static str,
+}
+
+/// A label whose use disagrees with its inventory: `(label, used, listed)`.
+type Miscount = (String, usize, usize);
+
+/// The first argument of every `err_internal(` call in `src`'s production
+/// code: a string literal without its quotes, any other expression as
+/// written, with its whitespace collapsed.
+///
+/// A call is `err_internal(` not preceded by an identifier character, so
+/// `err_internal_no_cause(` and `crud::db_error_internal(` are not calls of
+/// it. Comments are cut at `//` first: a call named in prose is not a call.
+fn err_internal_labels(src: &str) -> Vec<String> {
+    const CALL: &str = "err_internal(";
+    let code = strip_test_modules(src)
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut labels = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = code[from..].find(CALL) {
+        let start = from + offset;
+        from = start + CALL.len();
+        let preceded_by_ident = code[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if preceded_by_ident {
+            continue;
+        }
+        labels.push(first_argument(&code[from..]));
+    }
+    labels
+}
+
+/// The text of a call's first argument, up to the first comma outside any
+/// bracket or string.
+fn first_argument(args: &str) -> String {
+    let args = args.trim_start();
+    if let Some(literal) = args.strip_prefix('"') {
+        let mut escaped = false;
+        for (i, c) in literal.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => return literal[..i].to_string(),
+                _ => escaped = false,
+            }
+        }
+        panic!("unterminated string literal in an err_internal call");
+    }
+    let (mut depth, mut in_string, mut escaped) = (0_i32, false, false);
+    for (i, c) in args.char_indices() {
+        if in_string {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => in_string = false,
+                _ => escaped = false,
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ',' | ')' if depth == 0 => {
+                return args[..i].split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated err_internal call");
+}
+
+/// `src` against its inventory: the labels used more often than listed (new
+/// tails), and the labels listed more often than used (stale entries), each
+/// with the two counts.
+fn tails_verdict(src: &str, inventory: &[Tail]) -> (Vec<Miscount>, Vec<Miscount>) {
+    let mut used: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for label in err_internal_labels(src) {
+        *used.entry(label).or_default() += 1;
+    }
+    let listed: std::collections::BTreeMap<String, usize> = inventory
+        .iter()
+        .map(|tail| (tail.label.to_string(), tail.count))
+        .collect();
+    assert_eq!(
+        listed.len(),
+        inventory.len(),
+        "a label is listed twice in its file's inventory"
+    );
+
+    let unlisted = used
+        .iter()
+        .filter_map(|(label, &n)| {
+            let allowed = listed.get(label).copied().unwrap_or(0);
+            (n > allowed).then(|| (label.clone(), n, allowed))
+        })
+        .collect();
+    let stale = listed
+        .iter()
+        .filter_map(|(label, &allowed)| {
+            let n = used.get(label).copied().unwrap_or(0);
+            (n < allowed).then(|| (label.clone(), n, allowed))
+        })
+        .collect();
+    (unlisted, stale)
+}
+
+#[test]
+fn gated_files_tail_only_inventoried_non_database_failures() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/blocks");
+    for (rel, inventory) in INVENTORIED_TAILS {
+        for tail in *inventory {
+            assert!(
+                tail.why.starts_with("Stripe: ") || tail.why.starts_with("invariant: "),
+                "{rel}: `{}` must say whether it is a Stripe call or an invariant",
+                tail.label
+            );
+        }
+        let src = std::fs::read_to_string(format!("{root}/{rel}"))
+            .unwrap_or_else(|error| panic!("{rel} must exist to be gated: {error}"));
+        let (unlisted, stale) = tails_verdict(&src, inventory);
+        assert!(
+            unlisted.is_empty(),
+            "{rel} has `err_internal` tails that are not on its inventory \
+             (label, used, listed): {unlisted:?}\n\
+             If the cause is a database call, use \
+             `crud::db_error_internal(error, \"<label>\")` so a WRAP denial \
+             stays a 403 and a quota a 429. If it genuinely is not — a Stripe \
+             call, or a fault of this process — list it in INVENTORIED_TAILS \
+             with that reason."
+        );
+        assert!(
+            stale.is_empty(),
+            "{rel}'s inventory lists more `err_internal` tails than the file \
+             has (label, used, listed): {stale:?}\n\
+             Lower the count or delete the entry, so the inventory never \
+             grants a tail the file does not use."
+        );
+    }
+}
+
+/// The inventory gate can fail, on the real file: a planted tail that wraps a
+/// database call under a new label, a second copy of a listed label, and a
+/// listed tail that is gone are each reported.
+#[test]
+fn the_inventory_gate_catches_a_planted_tail() {
+    let (rel, inventory) = INVENTORIED_TAILS[0];
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/blocks/products/stripe.rs"
+    ))
+    .expect("stripe.rs");
+    assert_eq!(rel, "products/stripe.rs");
+    assert_eq!(tails_verdict(&src, inventory), (Vec::new(), Vec::new()));
+
+    let planted = format!(
+        "{src}\nasync fn planted(ctx: &dyn Context) -> OutputStream {{\n    \
+         match repo::refunds::get_by_idempotency_key(ctx, \"k\").await {{\n        \
+         Ok(_) => ok_json(&()),\n        \
+         Err(error) => err_internal(\n            \"Could not load the thing\",\n            error,\n        ),\n    \
+         }}\n}}\n"
+    );
+    assert_eq!(
+        tails_verdict(&planted, inventory).0,
+        vec![("Could not load the thing".to_string(), 1, 0)]
+    );
+
+    let reused = format!(
+        "{src}\nfn reused(error: WaferError) -> OutputStream {{ err_internal(\"Stripe API error\", error) }}\n"
+    );
+    assert_eq!(
+        tails_verdict(&reused, inventory).0,
+        vec![("Stripe API error".to_string(), 2, 1)]
+    );
+
+    let removed = src.replacen(
+        "err_internal(\"Stripe API error\", error)",
+        "crud::db_error_internal(error, \"Stripe API error\")",
+        1,
+    );
+    assert_ne!(removed, src, "the listed Stripe tail must be in the file");
+    assert_eq!(
+        tails_verdict(&removed, inventory).1,
+        vec![("Stripe API error".to_string(), 0, 1)]
+    );
+
+    // Neither prose, a test, nor a different function is a tail.
+    let not_tails = "// err_internal(\"prose\", e)\n\
+         fn a() { err_internal_no_cause(\"x\"); crud::db_error_internal(e, \"y\"); }\n\
+         #[cfg(test)]\nmod tests { fn t() { err_internal(\"in a test\", e); } }\n";
+    assert!(err_internal_labels(not_tails).is_empty());
 }

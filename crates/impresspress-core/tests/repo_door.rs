@@ -1043,8 +1043,13 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // stages the `provider_succeeded` state an interrupted reconcile
             // leaves behind. No product path parks a row there across requests,
             // and `record_provider_response` refuses once the reconcile has
-            // stamped `stripe_event_created`.
+            // stamped `stripe_event_created`. Also a fault injector:
+            // `refund_status_when_the_ledger_read_answers` aims
+            // `FailingDbOpContext` at the refund-ledger read.
             "blocks/products/tests/provider_tests.rs",
+            // A fault injector: `refund_webhook_status_when_the_ledger_read_answers`
+            // aims `FailingDbOpContext` at the webhook's refund-ledger read.
+            "blocks/products/tests/stripe_tests.rs",
         ],
     ),
     (

@@ -32,7 +32,7 @@ async fn order_page(
 ) -> Result<wafer_core::clients::database::RecordList, OutputStream> {
     repo::purchases::list_paginated(ctx, filters, i64::from(page), i64::from(page_size))
         .await
-        .map_err(|e| err_internal("Database error", e))
+        .map_err(|e| crud::db_error_internal(e, "Database error"))
 }
 
 pub async fn handle_list_user(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -78,7 +78,7 @@ pub async fn handle_list_seller(ctx: &dyn Context, msg: &Message) -> OutputStrea
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => return err_forbidden("Complete seller setup before viewing seller orders"),
-        Err(error) => return err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
     let query = SellerOrderListQuery::from_message(msg);
     let mut filters = vec![Filter {
@@ -114,13 +114,13 @@ async fn order_relations(
     Ok(OrderRelations {
         line_items: repo::purchases::list_line_items(ctx, purchase_id)
             .await
-            .map_err(|e| err_internal("Could not load purchase line items", e))?,
+            .map_err(|e| crud::db_error_internal(e, "Could not load purchase line items"))?,
         refunds: repo::refunds::list_for_purchase(ctx, purchase_id)
             .await
-            .map_err(|e| err_internal("Could not load purchase refunds", e))?,
+            .map_err(|e| crud::db_error_internal(e, "Could not load purchase refunds"))?,
         disputes: repo::disputes::list_for_purchase(ctx, purchase_id)
             .await
-            .map_err(|e| err_internal("Could not load purchase disputes", e))?,
+            .map_err(|e| crud::db_error_internal(e, "Could not load purchase disputes"))?,
     })
 }
 
@@ -310,7 +310,7 @@ pub async fn handle_get_seller(ctx: &dyn Context, msg: &Message) -> OutputStream
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => return err_forbidden("Complete seller setup before viewing seller orders"),
-        Err(error) => return err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
     let purchase = match repo::purchases::get(ctx, id).await {
         Ok(purchase) => purchase,
@@ -421,7 +421,7 @@ pub async fn handle_seller_refund(
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => return err_forbidden("Complete seller setup before refunding seller orders"),
-        Err(error) => return err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
     let purchase = match repo::purchases::get(ctx, &id).await {
         Ok(purchase) => purchase,
@@ -520,7 +520,7 @@ async fn refund_purchase(
         // recorded outcome instead of deducting a second time.
         let existing = match repo::refunds::get_by_idempotency_key(ctx, &idempotency_key).await {
             Ok(existing) => existing,
-            Err(error) => return err_internal("Could not inspect refund ledger", error),
+            Err(error) => return crud::db_error_internal(error, "Could not inspect refund ledger"),
         };
         let claim = if let Some(existing) = existing {
             if existing.str_field("purchase_id") != id {
@@ -544,7 +544,9 @@ async fn refund_purchase(
             if existing_status == RefundStatus::Succeeded {
                 let current = match repo::purchases::get(ctx, &id).await {
                     Ok(current) => current,
-                    Err(error) => return err_internal("Could not load refunded purchase", error),
+                    Err(error) => {
+                        return crud::db_error_internal(error, "Could not load refunded purchase")
+                    }
                 };
                 return ok_json(&manual_refund_result(
                     &current,
@@ -597,7 +599,9 @@ async fn refund_purchase(
             {
                 return err_bad_request(&error.message)
             }
-            Err(error) => return err_internal("Could not claim refund operation", error),
+            Err(error) => {
+                return crud::db_error_internal(error, "Could not claim refund operation")
+            }
         };
         // Apply against the claimed absolute target so a retry of an
         // interrupted operation converges instead of deducting again.
@@ -612,7 +616,10 @@ async fn refund_purchase(
         {
             Ok(updated) => {
                 if let Err(error) = repo::refunds::mark_succeeded(ctx, &refund.id).await {
-                    return err_internal("Could not record manual refund outcome", error);
+                    return crud::db_error_internal(
+                        error,
+                        "Could not record manual refund outcome",
+                    );
                 }
                 ok_json(&manual_refund_result(
                     &updated,
@@ -622,7 +629,7 @@ async fn refund_purchase(
             Err(error) if error.code == ErrorCode::FailedPrecondition => {
                 err_bad_request(&error.message)
             }
-            Err(error) => err_internal("Could not record manual refund", error),
+            Err(error) => crud::db_error_internal(error, "Could not record manual refund"),
         };
     }
     if payment_intent_id.is_empty() {
@@ -631,7 +638,7 @@ async fn refund_purchase(
 
     let existing = match repo::refunds::get_by_idempotency_key(ctx, &idempotency_key).await {
         Ok(existing) => existing,
-        Err(error) => return err_internal("Could not inspect refund ledger", error),
+        Err(error) => return crud::db_error_internal(error, "Could not inspect refund ledger"),
     };
     let provider_reason = body
         .provider_reason
@@ -700,7 +707,7 @@ async fn refund_purchase(
         {
             return err_bad_request(&error.message)
         }
-        Err(error) => return err_internal("Could not claim refund operation", error),
+        Err(error) => return crud::db_error_internal(error, "Could not claim refund operation"),
     };
     let provider_operation = match repo::provider_operations::ensure(
         ctx,
@@ -714,7 +721,9 @@ async fn refund_purchase(
     .await
     {
         Ok(operation) => operation,
-        Err(error) => return err_internal("Could not enqueue refund reconciliation", error),
+        Err(error) => {
+            return crud::db_error_internal(error, "Could not enqueue refund reconciliation")
+        }
     };
 
     let claimed_status = match refund_status(&refund) {
@@ -731,11 +740,16 @@ async fn refund_purchase(
         )
         .await
         {
-            return err_internal("Could not complete refund reconciliation operation", error);
+            return crud::db_error_internal(
+                error,
+                "Could not complete refund reconciliation operation",
+            );
         }
         let current = match repo::purchases::get(ctx, &id).await {
             Ok(current) => current,
-            Err(error) => return err_internal("Could not load refunded purchase", error),
+            Err(error) => {
+                return crud::db_error_internal(error, "Could not load refunded purchase")
+            }
         };
         return refund_json(&current, &refund);
     }
@@ -750,11 +764,15 @@ async fn refund_purchase(
         .await
         {
             Ok(current) => current,
-            Err(error) => return err_internal("Could not reconcile successful refund", error),
+            Err(error) => {
+                return crud::db_error_internal(error, "Could not reconcile successful refund")
+            }
         };
         refund = match repo::refunds::mark_succeeded(ctx, &refund.id).await {
             Ok(refund) => refund,
-            Err(error) => return err_internal("Could not complete refund ledger", error),
+            Err(error) => {
+                return crud::db_error_internal(error, "Could not complete refund ledger")
+            }
         };
         if let Err(error) = repo::provider_operations::resolve_unleased(
             ctx,
@@ -765,7 +783,10 @@ async fn refund_purchase(
         )
         .await
         {
-            return err_internal("Could not complete refund reconciliation operation", error);
+            return crud::db_error_internal(
+                error,
+                "Could not complete refund reconciliation operation",
+            );
         }
         return refund_json(&current, &refund);
     }
@@ -845,7 +866,9 @@ async fn refund_purchase(
     .await
     {
         Ok(refund) => refund,
-        Err(error) => return err_internal("Could not record Stripe refund response", error),
+        Err(error) => {
+            return crud::db_error_internal(error, "Could not record Stripe refund response")
+        }
     };
     if provider.status != "succeeded" {
         if matches!(provider.status.as_str(), "failed" | "canceled") {
@@ -858,7 +881,7 @@ async fn refund_purchase(
             )
             .await
             {
-                return err_internal("Could not resolve failed refund operation", error);
+                return crud::db_error_internal(error, "Could not resolve failed refund operation");
             }
         }
         return refund_json(&purchase, &refund);
@@ -873,11 +896,13 @@ async fn refund_purchase(
     .await
     {
         Ok(updated) => updated,
-        Err(error) => return err_internal("Could not reconcile successful Stripe refund", error),
+        Err(error) => {
+            return crud::db_error_internal(error, "Could not reconcile successful Stripe refund")
+        }
     };
     refund = match repo::refunds::mark_succeeded(ctx, &refund.id).await {
         Ok(refund) => refund,
-        Err(error) => return err_internal("Could not complete refund ledger", error),
+        Err(error) => return crud::db_error_internal(error, "Could not complete refund ledger"),
     };
     if let Err(error) = repo::provider_operations::resolve_unleased(
         ctx,
@@ -888,7 +913,10 @@ async fn refund_purchase(
     )
     .await
     {
-        return err_internal("Could not complete refund reconciliation operation", error);
+        return crud::db_error_internal(
+            error,
+            "Could not complete refund reconciliation operation",
+        );
     }
     refund_json(&updated, &refund)
 }
