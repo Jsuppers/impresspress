@@ -3437,9 +3437,9 @@ mod request_log_policy_tests {
 
         let (row, today_errors, daily_errors) = sole_row_and_dashboard_errors(&ctx).await;
         assert_eq!(row.status_code, 500, "the styled page is a 500");
-        assert_eq!(row.status, "ERROR", "a buffered 500 must be labelled ERROR");
         assert_eq!(today_errors, 1, "today_counts must count the 500");
         assert_eq!(daily_errors, 1, "daily_counts must count the 500");
+        assert_eq!(row.status, "ERROR", "a buffered 500 must be labelled ERROR");
     }
 
     /// A complete 4xx through the `Halt` terminal is an error row too.
@@ -3451,9 +3451,9 @@ mod request_log_policy_tests {
 
         let (row, today_errors, daily_errors) = sole_row_and_dashboard_errors(&ctx).await;
         assert_eq!(row.status_code, 403);
-        assert_eq!(row.status, "ERROR", "a halted 403 must be labelled ERROR");
         assert_eq!(today_errors, 1, "today_counts must count the 403");
         assert_eq!(daily_errors, 1, "daily_counts must count the 403");
+        assert_eq!(row.status, "ERROR", "a halted 403 must be labelled ERROR");
     }
 
     /// The buffered `Response` arm's success case: a 200 is not an error.

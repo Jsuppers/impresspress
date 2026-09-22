@@ -673,13 +673,16 @@ mod tests {
                     .unwrap_or_else(|e| panic!("seed request_log {id}: {e}"));
             }
         };
+        // Two errors stored as OK and one non-error stored as ERROR, so a
+        // label-reading count (1) cannot coincide with the code-reading one.
         seed_labelled("served_500_labelled_ok", 500, "OK").await;
+        seed_labelled("served_404_labelled_ok", 404, "OK").await;
         seed_labelled("served_302_labelled_error", 302, "ERROR").await;
 
         let counts = today_counts(&ctx, &today_start)
             .await
             .expect("today_counts");
-        assert_eq!((counts.requests, counts.errors), (2, 1), "today_counts");
+        assert_eq!((counts.requests, counts.errors), (3, 2), "today_counts");
 
         let daily = daily_counts(&ctx, &today_start)
             .await
@@ -689,7 +692,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.requests, r.errors))
                 .collect::<Vec<_>>(),
-            vec![(2, 1)],
+            vec![(3, 2)],
             "daily_counts",
         );
 
@@ -699,14 +702,20 @@ mod tests {
                 .iter()
                 .map(|s| (s.count, s.errors))
                 .collect::<Vec<_>>(),
-            vec![(2, 1)],
+            vec![(3, 2)],
             "summarise_by_path",
         );
 
-        let recent = list_recent_errors(&ctx, 5).await.expect("recent errors");
+        let mut recent: Vec<String> = list_recent_errors(&ctx, 5)
+            .await
+            .expect("recent errors")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        recent.sort();
         assert_eq!(
-            recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            vec!["served_500_labelled_ok"],
+            recent,
+            vec!["served_404_labelled_ok", "served_500_labelled_ok"],
             "list_recent_errors",
         );
     }
