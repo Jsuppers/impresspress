@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{admin_page, crumb};
+use super::{admin_page, crumb, status_code_badge_variant};
 use crate::{
     blocks::auth::repo::users::{self, DailySignups},
     platform_state::request_logs::{self, DailyCounts, TodayCounts},
     ui::{
-        components::{self, Badge, BadgeVariant},
+        components::{self, Badge},
         icons,
         shell::Topbar,
         templates::dashboard_page,
@@ -302,9 +302,8 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     @let rows: Vec<Vec<Markup>> = recent_errors.iter().map(|row| {
                         let code = row.status_code;
                         let created = row.created_at.as_str();
-                        let variant = if code >= 500 { BadgeVariant::Danger } else { BadgeVariant::Warning };
                         vec![
-                            Badge::new(variant).render(html! { (code) }),
+                            Badge::new(status_code_badge_variant(code)).render(html! { (code) }),
                             html! { span .font-medium { (row.method.to_uppercase()) } },
                             html! { (row.path) },
                             html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },

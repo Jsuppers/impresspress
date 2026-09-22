@@ -30,10 +30,14 @@ pub use users::*;
 pub use variables::*;
 use wafer_run::{context::Context, Message, OutputStream};
 
-use crate::ui::{
-    self,
-    shell::{Crumb, Topbar},
-    NavKind, Shell,
+use crate::{
+    platform_state::request_logs,
+    ui::{
+        self,
+        components::BadgeVariant,
+        shell::{Crumb, Topbar},
+        NavKind, Shell,
+    },
 };
 
 /// Wrap content in the admin shell: the shared [`ui::shell_page`] with the
@@ -62,6 +66,19 @@ pub(crate) async fn admin_page(
         content,
     )
     .await
+}
+
+/// The badge a request-log row's status code renders in, on every page that
+/// lists rows: a 5xx is `Danger`, any other error row
+/// ([`request_logs::is_error_status`]) is `Warning`, the rest `Success`.
+pub(crate) fn status_code_badge_variant(status_code: i64) -> BadgeVariant {
+    if status_code >= 500 {
+        BadgeVariant::Danger
+    } else if request_logs::is_error_status(status_code) {
+        BadgeVariant::Warning
+    } else {
+        BadgeVariant::Success
+    }
 }
 
 /// Convenience: a single top-level breadcrumb with no link.

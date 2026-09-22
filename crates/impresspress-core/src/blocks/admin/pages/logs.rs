@@ -3,7 +3,7 @@ use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
-use super::{admin_page, crumb};
+use super::{admin_page, crumb, status_code_badge_variant};
 use crate::{
     blocks::admin::AUDIT_LOGS_TABLE as AUDIT_LOGS,
     platform_state::request_logs,
@@ -86,20 +86,12 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
         @match &result {
             Ok(list) => {
                 @let rows: Vec<Vec<Markup>> = list.rows.iter().map(|row| {
-                    let status = row.status.as_str();
                     let path = row.path.as_str();
                     let user_id = row.user_id.as_str();
                     let created = row.created_at.as_str();
                     let status_code = row.status_code;
-                    let variant = if status == "ERROR" {
-                        BadgeVariant::Danger
-                    } else if status_code >= 400 {
-                        BadgeVariant::Warning
-                    } else {
-                        BadgeVariant::Success
-                    };
                     vec![
-                        Badge::new(variant).render(html! { (status_code) }),
+                        Badge::new(status_code_badge_variant(status_code)).render(html! { (status_code) }),
                         html! { span .font-medium { (row.method.to_uppercase()) } },
                         html! { (path) },
                         html! { span .text-muted { (row.duration_ms) "ms" } },

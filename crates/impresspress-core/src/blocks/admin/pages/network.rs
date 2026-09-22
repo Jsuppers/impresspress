@@ -1,6 +1,7 @@
 use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
+use super::status_code_badge_variant;
 use crate::{
     platform_state::request_logs,
     ui::{
@@ -184,15 +185,8 @@ fn detail_row(
     user_id: &str,
     created: &str,
 ) -> Vec<Markup> {
-    let variant = if status_code >= 500 {
-        BadgeVariant::Danger
-    } else if status_code >= 400 {
-        BadgeVariant::Warning
-    } else {
-        BadgeVariant::Success
-    };
     vec![
-        Badge::new(variant).render(html! { (status_code) }),
+        Badge::new(status_code_badge_variant(status_code)).render(html! { (status_code) }),
         html! { span .text-muted { span data-volatile-metric { (duration) "ms" } } },
         html! { span .text-muted { (client_ip) } },
         html! {
