@@ -168,8 +168,10 @@ fn like_filter(field: &str, pattern: &str) -> Filter {
 /// leaves the order of tied rows to the backend's plan — a page boundary
 /// through a tie can then repeat or skip an account between two pages, and
 /// "the most recent" can name the oldest of the second. `id` breaks the tie:
-/// it is unique, and [`insert`] mints it as a UUIDv7, which orders by
-/// creation, so the tie resolves newest first too.
+/// it is unique, so the order is total, which is what paging needs. [`insert`]
+/// mints it as a UUIDv7, which within one process orders by creation, so
+/// there the tie also resolves newest first; ids minted in the same
+/// millisecond by different processes (two Workers isolates) order at random.
 fn newest_first() -> Vec<SortField> {
     vec![
         SortField {
@@ -1160,9 +1162,9 @@ mod lifecycle_and_listing_tests {
 
     /// Accounts created in the same second tie on `created_at`. Both admin
     /// lists still come back newest first, and paging through the users tab
-    /// visits every account exactly once, in one order however often it is
-    /// asked. On SQLite a tie falls back to scan order — oldest first — so
-    /// "the two most recent" were the two oldest of the second.
+    /// visits every account exactly once. Without a tiebreak SQLite falls
+    /// back to scan order — oldest first — and "the two most recent" are the
+    /// two oldest of the second.
     #[tokio::test]
     async fn accounts_created_in_the_same_second_list_newest_first() {
         let ctx = ctx().await;
