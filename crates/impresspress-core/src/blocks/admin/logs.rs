@@ -128,6 +128,59 @@ mod tests {
         assert_eq!(body["page_size"], serde_json::json!(50));
     }
 
+    /// Entries that share a `created_at` page disjointly and completely,
+    /// newest-key first. **Fails on the previous wafer-run pin**, whose sorted
+    /// select had no tiebreak: SQLite left the tied rows in the order its sort
+    /// happened to produce (page 1 `[b, a]`, page 2 `[c]` there), an order no
+    /// query promised, so a tied row could land on two pages or on none.
+    /// Audit entries written by one request share a millisecond on wasm32.
+    #[tokio::test]
+    async fn entries_that_tie_on_created_at_page_in_one_stable_order() {
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        for id in ["c", "a", "b"] {
+            let mut data = std::collections::HashMap::new();
+            data.insert("id".to_string(), serde_json::json!(id));
+            data.insert("user_id".to_string(), serde_json::json!("admin-1"));
+            data.insert("action".to_string(), serde_json::json!("user.delete"));
+            data.insert(
+                "resource".to_string(),
+                serde_json::json!(format!("users/{id}")),
+            );
+            data.insert("ip_address".to_string(), serde_json::json!("203.0.113.7"));
+            data.insert(
+                "created_at".to_string(),
+                serde_json::json!("2026-09-23T00:00:00.000+00:00"),
+            );
+            db::create(&ctx, AUDIT_LOGS_TABLE, data)
+                .await
+                .expect("seed an audit entry");
+        }
+
+        let mut pages = Vec::new();
+        for page in ["1", "2"] {
+            let mut msg = admin_msg("retrieve", "/b/admin/api/logs");
+            msg.set_meta("req.query.page", page.to_string());
+            msg.set_meta("req.query.page_size", "2".to_string());
+            let body = output_json(handle_list(&ctx, &msg).await).await;
+            let ids: Vec<String> = body["records"]
+                .as_array()
+                .expect("a records array")
+                .iter()
+                .map(|row| row["id"].as_str().expect("an id").to_string())
+                .collect();
+            pages.push(ids);
+        }
+
+        assert_eq!(
+            pages,
+            vec![vec!["c", "b"], vec!["a"]],
+            "tied entries must page in primary-key order, newest-key first"
+        );
+    }
+
     /// `?action=` filters, and the filter reaches the query through
     /// `AdminAuditLogListQuery` — the type the published parameter schema is
     /// derived from.
