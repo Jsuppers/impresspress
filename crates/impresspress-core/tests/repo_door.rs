@@ -1251,8 +1251,14 @@ fn a_grouped_import_of_the_const_is_naming_it() {
         ),
         ("use crate::blocks::x::not_user_roles::{TABLE};", false),
         // another module's constant inside the group
-        ("use crate::platform_state::user_roles::{self, other::TABLE};", false),
-        ("use crate::platform_state::user_roles::{self, other::{TABLE}};", false),
+        (
+            "use crate::platform_state::user_roles::{self, other::TABLE};",
+            false,
+        ),
+        (
+            "use crate::platform_state::user_roles::{self, other::{TABLE}};",
+            false,
+        ),
     ] {
         assert_eq!(names_const(src, "user_roles::TABLE"), named, "{src}");
     }
