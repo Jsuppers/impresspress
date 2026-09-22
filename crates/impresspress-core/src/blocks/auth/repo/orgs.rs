@@ -1,24 +1,23 @@
 //! Row-level access over `wafer_run__auth__orgs`.
 //!
-//! Migration 001 creates the table with `UNIQUE(name)` and a partial unique
-//! index over `(verified_via, verified_ref) WHERE is_reserved = 0` — this repo
-//! surfaces the two distinct conflicts as two distinct error variants so the
-//! HTTP layer (Plan C Cluster 2) can map each to its own 409.
+//! Read-only: the rows come from migration 002's reserved-name seeds. No
+//! route claims an org yet; the claim write and its conflict errors belong
+//! with the route that ships it. Migration 001's `UNIQUE(name)` and the
+//! partial unique index over `(verified_via, verified_ref) WHERE is_reserved
+//! = 0` are the constraints that write will meet.
 
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use uuid::Uuid;
 use wafer_block::db::{Filter, FilterOp, SortField};
-use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
-use super::{db_failed, internal_error, map_bool, map_opt_str, map_str, now_iso};
+use super::{db_failed, internal_error, map_bool, map_opt_str, map_str};
 use crate::db_read::{self, Bound};
 
 pub const TABLE: &str = "wafer_run__auth__orgs";
 
-/// Full row shape returned by [`find_by_name`] and [`upsert_claimed`].
+/// Full row shape returned by [`find_by_name`] and [`list_for_user`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgRow {
     pub id: String,
@@ -30,32 +29,10 @@ pub struct OrgRow {
     pub created_at: String,
 }
 
-/// Errors surfaced by this repo. Two distinct unique-constraint violations
-/// produce two distinct variants — callers in Plan C Cluster 2 need to map
-/// each to its proper 409 message.
-///
-/// The third variant carries the database client's own error, not a string
-/// rendering of it, for the reason [`super`]'s deleted `RepoError` had to
-/// stop doing so: `Db(String)` erases the [`wafer_run::ErrorCode`], and with
-/// it the difference between a WRAP refusal (403), a missing row (404) and a
-/// fault (500). The two domain variants above stay variants because no
-/// `ErrorCode` distinguishes them — both are `AlreadyExists`, with different
-/// messages.
-#[derive(thiserror::Error, Debug)]
-pub enum OrgsRepoError {
-    #[error("org with that name already exists")]
-    NameTaken,
-    #[error("that provider org is already claimed by another user")]
-    AlreadyClaimed,
-    #[error("db: {0}")]
-    Db(WaferError),
-}
-
-fn row_from_map(m: &HashMap<String, Value>) -> Result<OrgRow, OrgsRepoError> {
+fn row_from_map(m: &HashMap<String, Value>) -> Result<OrgRow, WaferError> {
     Ok(OrgRow {
-        id: map_opt_str(m, "id").ok_or_else(|| OrgsRepoError::Db(internal_error("missing id")))?,
-        name: map_opt_str(m, "name")
-            .ok_or_else(|| OrgsRepoError::Db(internal_error("missing name")))?,
+        id: map_opt_str(m, "id").ok_or_else(|| internal_error("missing id"))?,
+        name: map_opt_str(m, "name").ok_or_else(|| internal_error("missing name"))?,
         owner_user_id: map_opt_str(m, "owner_user_id"),
         verified_via: map_opt_str(m, "verified_via"),
         verified_ref: map_opt_str(m, "verified_ref"),
@@ -66,7 +43,7 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<OrgRow, OrgsRepoError> {
 
 /// Look up a single org by its `name` column (UNIQUE). Returns `Ok(None)` if
 /// no such row exists.
-pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow>, OrgsRepoError> {
+pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow>, WaferError> {
     let rows = db_read::list_bounded(
         ctx,
         TABLE,
@@ -78,7 +55,7 @@ pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow
         Bound::UniqueKey("orgs.name is declared UNIQUE"),
     )
     .await
-    .map_err(|e| OrgsRepoError::Db(db_failed("orgs find_by_name", e)))?;
+    .map_err(|e| db_failed("orgs find_by_name", e))?;
     match rows.into_iter().next() {
         Some(r) => Ok(Some(row_from_map(&r.data)?)),
         None => Ok(None),
@@ -87,7 +64,7 @@ pub async fn find_by_name(ctx: &dyn Context, name: &str) -> Result<Option<OrgRow
 
 /// Return all orgs owned by `user_id`, ordered by `created_at` ASC for
 /// stable rendering. Empty Vec if the user owns none.
-pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<OrgRow>, OrgsRepoError> {
+pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<OrgRow>, WaferError> {
     let records = db_read::list_bounded_sorted(
         ctx,
         TABLE,
@@ -103,86 +80,52 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<OrgRo
         Bound::OnePer("org one user owns"),
     )
     .await
-    .map_err(|e| OrgsRepoError::Db(db_failed("orgs list_for_user", e)))?;
+    .map_err(|e| db_failed("orgs list_for_user", e))?;
     records.iter().map(|r| row_from_map(&r.data)).collect()
 }
 
-/// Payload for [`upsert_claimed`]. Borrowed fields — caller keeps ownership.
-#[derive(Debug, Clone, Copy)]
-pub struct NewClaim<'a> {
-    pub name: &'a str,
-    pub owner_user_id: &'a str,
-    pub verified_via: &'a str,
-    pub verified_ref: &'a str,
-}
+/// Row seeding for tests: with no claim route there is no production write
+/// to go through, so tests insert the row the claim would have written.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::collections::HashMap;
 
-/// Insert a new claimed (non-reserved) org row. The two unique-constraint
-/// conflicts are distinguished by running pre-checks against the table before
-/// the INSERT: the `wafer-run/database` surface doesn't currently let us
-/// inspect the constraint name that fired, so we fail fast with the right
-/// variant instead of relying on the underlying error string shape.
-///
-/// Returns the inserted [`OrgRow`].
-pub async fn upsert_claimed(
-    ctx: &dyn Context,
-    claim: NewClaim<'_>,
-) -> Result<OrgRow, OrgsRepoError> {
-    // 1) (verified_via, verified_ref) already claimed → AlreadyClaimed.
-    let n = db::count(
-        ctx,
-        TABLE,
-        &[
-            Filter {
-                field: "verified_via".into(),
-                operator: FilterOp::Equal,
-                value: json!(claim.verified_via),
-            },
-            Filter {
-                field: "verified_ref".into(),
-                operator: FilterOp::Equal,
-                value: json!(claim.verified_ref),
-            },
-            Filter {
-                field: "is_reserved".into(),
-                operator: FilterOp::Equal,
-                value: json!(false),
-            },
-        ],
-    )
-    .await
-    .map_err(|e| OrgsRepoError::Db(db_failed("orgs claim-check", e)))?;
-    if n > 0 {
-        return Err(OrgsRepoError::AlreadyClaimed);
+    use serde_json::{json, Value};
+    use wafer_core::clients::database as db;
+    use wafer_run::context::Context;
+
+    use super::TABLE;
+
+    /// Insert a claimed (non-reserved) org owned by `owner_user_id`.
+    pub(crate) async fn seed_claimed_org(
+        ctx: &dyn Context,
+        name: &str,
+        owner_user_id: &str,
+        verified_via: &str,
+        verified_ref: &str,
+        created_at: &str,
+    ) {
+        let data: HashMap<String, Value> = [
+            ("id", json!(format!("org-{name}"))),
+            ("name", json!(name)),
+            ("owner_user_id", json!(owner_user_id)),
+            ("verified_via", json!(verified_via)),
+            ("verified_ref", json!(verified_ref)),
+            ("is_reserved", json!(false)),
+            ("created_at", json!(created_at)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        db::create(ctx, TABLE, data)
+            .await
+            .expect("seed claimed org");
     }
-
-    // 2) `name` already taken (by any row, reserved or claimed) → NameTaken.
-    if find_by_name(ctx, claim.name).await?.is_some() {
-        return Err(OrgsRepoError::NameTaken);
-    }
-
-    // 3) Insert.
-    let id = Uuid::now_v7().to_string();
-    let now = now_iso();
-    let mut data: HashMap<String, Value> = HashMap::new();
-    data.insert("id".into(), json!(id));
-    data.insert("name".into(), json!(claim.name));
-    data.insert("owner_user_id".into(), json!(claim.owner_user_id));
-    data.insert("verified_via".into(), json!(claim.verified_via));
-    data.insert("verified_ref".into(), json!(claim.verified_ref));
-    data.insert("is_reserved".into(), json!(false));
-    data.insert("created_at".into(), json!(now));
-    db::create(ctx, TABLE, data)
-        .await
-        .map_err(|e| OrgsRepoError::Db(db_failed("orgs insert", e)))?;
-
-    find_by_name(ctx, claim.name)
-        .await?
-        .ok_or_else(|| OrgsRepoError::Db(internal_error("insert returned no row")))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{fixtures::seed_claimed_org, *};
     use crate::test_support::TestContext;
 
     #[tokio::test]
@@ -198,24 +141,22 @@ mod tests {
 
         // Create a user first (foreign key constraint on owner_user_id)
         ctx.seed_auth_user("user-a").await;
-
-        upsert_claimed(
+        seed_claimed_org(
             &ctx,
-            NewClaim {
-                name: "acme",
-                owner_user_id: "user-a",
-                verified_via: "github",
-                verified_ref: "gh-1",
-            },
+            "acme",
+            "user-a",
+            "github",
+            "gh-1",
+            "2026-01-01T00:00:00Z",
         )
-        .await
-        .unwrap();
+        .await;
 
         let row = find_by_name(&ctx, "acme").await.unwrap().unwrap();
         assert_eq!(row.name, "acme");
         assert_eq!(row.owner_user_id.as_deref(), Some("user-a"));
         assert_eq!(row.verified_via.as_deref(), Some("github"));
         assert_eq!(row.verified_ref.as_deref(), Some("gh-1"));
+        assert!(!row.is_reserved);
     }
 
     #[tokio::test]
@@ -227,40 +168,35 @@ mod tests {
             ctx.seed_auth_user(user_id).await;
         }
 
-        // user-a claims two orgs; user-b claims one.
-        upsert_claimed(
+        // user-a owns two orgs, seeded newest-first so the order is the
+        // sort's doing; user-b owns one.
+        seed_claimed_org(
             &ctx,
-            NewClaim {
-                name: "alpha",
-                owner_user_id: "user-a",
-                verified_via: "github",
-                verified_ref: "gh-1",
-            },
+            "beta",
+            "user-a",
+            "google",
+            "gg-2",
+            "2026-01-02T00:00:00Z",
         )
-        .await
-        .unwrap();
-        upsert_claimed(
+        .await;
+        seed_claimed_org(
             &ctx,
-            NewClaim {
-                name: "beta",
-                owner_user_id: "user-a",
-                verified_via: "google",
-                verified_ref: "gg-2",
-            },
+            "alpha",
+            "user-a",
+            "github",
+            "gh-1",
+            "2026-01-01T00:00:00Z",
         )
-        .await
-        .unwrap();
-        upsert_claimed(
+        .await;
+        seed_claimed_org(
             &ctx,
-            NewClaim {
-                name: "gamma",
-                owner_user_id: "user-b",
-                verified_via: "github",
-                verified_ref: "gh-3",
-            },
+            "gamma",
+            "user-b",
+            "github",
+            "gh-3",
+            "2026-01-03T00:00:00Z",
         )
-        .await
-        .unwrap();
+        .await;
 
         let a = list_for_user(&ctx, "user-a").await.unwrap();
         let b = list_for_user(&ctx, "user-b").await.unwrap();
@@ -271,5 +207,14 @@ mod tests {
         assert_eq!(names_a, vec!["alpha", "beta"]);
         assert_eq!(names_b, vec!["gamma"]);
         assert!(c.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_for_user_surfaces_a_read_failure() {
+        let ctx = TestContext::with_auth().await.break_reads();
+        assert!(
+            list_for_user(&ctx, "user-a").await.is_err(),
+            "a failed read must not look like a user with no orgs"
+        );
     }
 }
