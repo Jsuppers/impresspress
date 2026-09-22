@@ -60,6 +60,10 @@ pub const REQUEST_LOG_CONFIG_KEY: &str = "IMPRESSPRESS_REQUEST_LOG";
 /// [`crate::ui::assets::is_stale_builtin_asset_url`]).
 pub const LOGO_URL_KEY: &str = "WAFER_RUN_SHARED__LOGO_URL";
 
+/// Shared config key: whether signed-in users may create and sell their own
+/// products, not only the site admin.
+pub const ALLOW_USER_PRODUCTS_KEY: &str = "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS";
+
 /// Shared config key: cross-origin origins allowed to call the API.
 ///
 /// Fed to the `wafer-run/cors` middleware block's `allowed_origins` at boot
@@ -200,7 +204,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Favicon URL")
         .input_type(InputType::Url),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS",
+            ALLOW_USER_PRODUCTS_KEY,
             "Allow users to create their own products",
             "false",
         )

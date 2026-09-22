@@ -6,8 +6,8 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     contracts::{
-        AdminRoleDeleteResponse, AdminRoleListResponse, AdminRoleView, CreateRoleRequest,
-        UpdateRoleRequest,
+        AdminRoleDeleteResponse, AdminRoleListResponse, AdminRoleUpdateResponse, AdminRoleView,
+        CreateRoleRequest, UpdateRoleRequest,
     },
     logs::audit_log,
 };
@@ -140,13 +140,18 @@ pub(super) async fn handle_update_role(
         data.insert("permissions".to_string(), serde_json::json!(permissions));
     }
     crate::util::stamp_updated(&mut data);
-    // The role row is written first, and on its own: `roles.name` is UNIQUE,
+    // The role row is written first, and on its own: `roles.name` is unique,
     // so a rename onto a name another role holds is refused right here,
     // before a single grant has moved or a single token been invalidated.
-    // The refusal is classified AFTER it happened, as `ops::create_role`
-    // classifies the same collision — see `crud::taken_key_or_db_error` for
-    // why a probe after the refused write closes the race a read beforehand
-    // would leave open.
+    // What makes it unique everywhere is the
+    // `impresspress__admin__roles_name_uniq` index migration 001 creates: the
+    // column's own `UNIQUE` exists only on a table that migration created,
+    // not on one that predates it. The 409 below depends on that index —
+    // on such a table without it, the update lands and two roles share the
+    // name. The refusal is classified AFTER it happened, as
+    // `ops::create_role` classifies the same collision — see
+    // `crud::taken_key_or_db_error` for why a probe after the refused write
+    // closes the race a read beforehand would leave open.
     let record = match db::update(ctx, ROLES_TABLE, id, data).await {
         Ok(record) => record,
         Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
@@ -169,9 +174,28 @@ pub(super) async fn handle_update_role(
         },
     };
 
-    if let Some(new_name) = rename_to {
-        if let Err(out) = cascade_role_rename(ctx, &old_name, &new_name).await {
-            return out;
+    // From here the update HAS happened: the row carries the new values. A
+    // cascade that stops part-way is not a failed update, so it is answered
+    // 200 with the role as it now is, and the audit row is written either way
+    // — an error here would tell the caller the rename did not happen, and
+    // leave a mutation that did happen unaudited.
+    let mut resource = format!("roles/{id}");
+    let mut warning = None;
+    if let Some(new_name) = &rename_to {
+        if let Err(stopped) = cascade_role_rename(ctx, &old_name, new_name).await {
+            tracing::error!(
+                role_id = %id,
+                old_name = %old_name,
+                new_name = %new_name,
+                error = %stopped.error,
+                "role renamed, but its grants did not all follow: {}",
+                stopped.audit_detail()
+            );
+            resource = format!(
+                "roles/{id} (renamed from {old_name} to {new_name}; {})",
+                stopped.audit_detail()
+            );
+            warning = Some(stopped.warning(&old_name, new_name));
         }
     }
 
@@ -179,13 +203,88 @@ pub(super) async fn handle_update_role(
         ctx,
         msg.user_id(),
         "role.update",
-        &format!("roles/{id}"),
+        &resource,
         msg.remote_addr(),
     )
     .await;
 
     // Same projection as list/create, for the same reason.
-    ok_json(&AdminRoleView::from_record(&record))
+    ok_json(&AdminRoleUpdateResponse {
+        role: AdminRoleView::from_record(&record),
+        warning,
+    })
+}
+
+/// Where [`cascade_role_rename`] stopped, when it did not finish.
+struct CascadeStopped {
+    /// How many grants it had read, or `None` when the read itself failed.
+    total: Option<usize>,
+    /// How many grants it had moved onto the new name.
+    moved: usize,
+    /// The holder whose sessions it could not invalidate, when that is what
+    /// stopped it. Their grant has moved; a token they already hold still
+    /// carries the old name until it expires.
+    not_invalidated: Option<String>,
+    error: wafer_run::WaferError,
+}
+
+impl CascadeStopped {
+    /// The step it stopped at and how far it got, for the audit row and the
+    /// log line.
+    fn audit_detail(&self) -> String {
+        match (self.total, &self.not_invalidated) {
+            (None, _) => "the grant cascade could not read the grants; none moved".to_string(),
+            (Some(total), None) => format!(
+                "the grant cascade stopped after moving {} of {total} grants",
+                self.moved
+            ),
+            (Some(total), Some(user_id)) => format!(
+                "the grant cascade moved {} of {total} grants, then could not invalidate the \
+                 sessions of {user_id}",
+                self.moved
+            ),
+        }
+    }
+
+    /// What the caller is told: the rename happened, which grants did not
+    /// follow it, and how to move them.
+    fn warning(&self, old_name: &str, new_name: &str) -> String {
+        let finish = format!(
+            "Rename the role back to \"{old_name}\" and then to \"{new_name}\" again to move \
+             the rest."
+        );
+        let left = |left: usize| {
+            format!(
+                "{left} still name \"{old_name}\", which no role is called any more, so their \
+                 holders do not hold this role."
+            )
+        };
+        match (self.total, &self.not_invalidated) {
+            (None, _) => format!(
+                "Role renamed to \"{new_name}\", but its grants could not be read, so none of \
+                 them moved: every grant of \"{old_name}\" still names it, which no role is \
+                 called any more. {finish}"
+            ),
+            (Some(total), None) => format!(
+                "Role renamed to \"{new_name}\", but only {} of its {total} grants moved. {} \
+                 {finish}",
+                self.moved,
+                left(total - self.moved)
+            ),
+            (Some(total), Some(user_id)) if self.moved == total => format!(
+                "Role renamed to \"{new_name}\" and all {total} of its grants moved, but the \
+                 sessions of user {user_id} could not be invalidated: a token they already \
+                 hold carries \"{old_name}\" until it expires."
+            ),
+            (Some(total), Some(user_id)) => format!(
+                "Role renamed to \"{new_name}\", but only {} of its {total} grants moved, and \
+                 the sessions of user {user_id} could not be invalidated: a token they already \
+                 hold carries \"{old_name}\" until it expires. {} {finish}",
+                self.moved,
+                left(total - self.moved)
+            ),
+        }
+    }
 }
 
 /// Carry a role rename onto every `user_roles` row naming the old value, and
@@ -204,7 +303,8 @@ pub(super) async fn handle_update_role(
 /// Not atomic. The role update and each grant's rewrite and bump are
 /// separate writes, and there is no transaction primitive to put them in: a
 /// failure part-way leaves the role under its new name, the grants before
-/// the failing one moved, and the rest still naming the old one. Repeating
+/// the failing one moved, and the rest still naming the old one. It returns
+/// where it stopped, which `handle_update_role` audits and reports. Repeating
 /// the same PATCH does not finish the job — the name no longer differs, so
 /// no cascade runs. Renaming the role back and then forward again does,
 /// since each rename carries every grant naming the name it leaves.
@@ -212,31 +312,36 @@ async fn cascade_role_rename(
     ctx: &dyn Context,
     old_name: &str,
     new_name: &str,
-) -> Result<(), OutputStream> {
+) -> Result<(), CascadeStopped> {
     let grants = match user_roles::list_by_role(ctx, old_name).await {
         Ok(rows) => rows,
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(error) => {
+            return Err(CascadeStopped {
+                total: None,
+                moved: 0,
+                not_invalidated: None,
+                error,
+            })
+        }
     };
 
-    for grant in &grants {
-        if let Err(e) = user_roles::rename_role(ctx, grant, new_name).await {
-            return Err(err_internal(
-                "Role renamed but its grants did not follow",
-                e,
-            ));
+    for (moved, grant) in grants.iter().enumerate() {
+        if let Err(error) = user_roles::rename_role(ctx, grant, new_name).await {
+            return Err(CascadeStopped {
+                total: Some(grants.len()),
+                moved,
+                not_invalidated: None,
+                error,
+            });
         }
 
-        let user_id = grant.user_id.as_str();
-        if let Err(e) = bump_auth_version(ctx, user_id).await {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "role grant renamed but auth_version bump failed"
-            );
-            return Err(err_internal(
-                "Role renamed but session invalidation failed",
-                e,
-            ));
+        if let Err(error) = bump_auth_version(ctx, &grant.user_id).await {
+            return Err(CascadeStopped {
+                total: Some(grants.len()),
+                moved: moved + 1,
+                not_invalidated: Some(grant.user_id.clone()),
+                error,
+            });
         }
     }
     Ok(())
@@ -1714,6 +1819,248 @@ mod tests {
                  the delete failed while it was reading the grants)"
             ),
             "the audit row records the failed pass"
+        );
+    }
+
+    /// A rename whose grant cascade stops part-way has still renamed the
+    /// role: the row carries the new name before the first grant moves. It
+    /// was answered 500 with no `role.update` audit row — a mutation that
+    /// happened, reported as one that did not, and left unaudited. It is a
+    /// 200 carrying the renamed role and a `warning` saying which grants are
+    /// left, and the audit row records where the cascade stopped.
+    ///
+    /// The injector lets the first grant's rewrite through and fails the
+    /// second's, so the cascade genuinely stops between two grants.
+    ///
+    /// Names `user_roles::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn a_rename_whose_cascade_stops_part_way_is_audited_and_answered_as_a_rename() {
+        use crate::test_support::FailingDbOpContext;
+
+        let ctx = TestContext::with_auth().await;
+        let role_id = define_role(&ctx, "editor").await;
+        for user in ["u-1", "u-2"] {
+            ctx.seed_auth_user(user).await;
+            output_json(
+                handle_assign_role(
+                    &ctx,
+                    &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                    body_input(serde_json::json!({"user_id": user, "role": "editor"})),
+                )
+                .await,
+            )
+            .await;
+        }
+
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.update", user_roles::TABLE)])
+                .after_passing(1);
+        let out = handle_update_role(
+            &failing,
+            &update_role_msg(&role_id),
+            body_input(serde_json::json!({"name": "author"})),
+        )
+        .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&parts.body).expect("the answer is a JSON body");
+        assert_eq!(
+            parts.status, 200,
+            "the rename happened, so it must not be answered as a failure: {body}"
+        );
+        assert_eq!(
+            body["name"], "author",
+            "the answer is the renamed role: {body}"
+        );
+        assert_eq!(
+            body["warning"],
+            "Role renamed to \"author\", but only 1 of its 2 grants moved. 1 still name \
+             \"editor\", which no role is called any more, so their holders do not hold this \
+             role. Rename the role back to \"editor\" and then to \"author\" again to move \
+             the rest."
+        );
+
+        assert_eq!(
+            db::get(&ctx, ROLES_TABLE, &role_id)
+                .await
+                .expect("role row")
+                .str_field("name"),
+            "author",
+            "precondition: the role row really was renamed"
+        );
+        for role in ["author", "editor"] {
+            assert_eq!(
+                user_roles::list_by_role(&ctx, role)
+                    .await
+                    .expect("list grants")
+                    .len(),
+                1,
+                "precondition: the cascade really stopped between the two grants ({role})"
+            );
+        }
+
+        let audit = db_read::list_every(
+            &ctx,
+            super::super::logs::AUDIT_LOGS_TABLE,
+            vec![Filter {
+                field: "action".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("role.update"),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        assert_eq!(audit.len(), 1, "a rename that happened is audited");
+        assert_eq!(
+            audit[0].str_field("resource"),
+            format!(
+                "roles/{role_id} (renamed from editor to author; the grant cascade stopped after \
+                 moving 1 of 2 grants)"
+            ),
+            "the audit row records how far the cascade got"
+        );
+    }
+
+    /// `u-1` granted before the delete and `late` granted while it is in
+    /// flight, and a role delete driven over `wrap` — the context that lands
+    /// the `late` grants between the two revocation passes.
+    async fn delete_with_an_in_flight_assign(
+        late: &'static [&'static str],
+        wrap: impl FnOnce(TestContext) -> crate::test_support::FailingDbOpContext,
+    ) -> (TestContext, String, super::super::ops::RoleDeleted) {
+        use super::super::test_support::AssignBeforeGrantRead;
+
+        let ctx = TestContext::with_auth().await;
+        let role_id = define_role(&ctx, "editor").await;
+        for user in std::iter::once(&"u-1").chain(late) {
+            ctx.seed_auth_user(user).await;
+        }
+        output_json(
+            handle_assign_role(
+                &ctx,
+                &admin_msg("create", "/b/admin/api/iam/user-roles"),
+                body_input(serde_json::json!({"user_id": "u-1", "role": "editor"})),
+            )
+            .await,
+        )
+        .await;
+
+        let racing = AssignBeforeGrantRead::new(ctx.clone(), wrap(ctx.clone()), 2, late, "editor");
+        let deleted = super::super::ops::delete_role(
+            &racing,
+            &routed(admin_msg(
+                "delete",
+                &format!("/b/admin/api/iam/roles/{role_id}"),
+            )),
+            &role_id,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the role row is deleted, so the delete is not an error"));
+        (ctx, role_id, deleted)
+    }
+
+    /// A grant assigned while a role delete is in flight, which the pass after
+    /// the role row is gone reads but cannot revoke, outlives the role — and
+    /// creating a role of the same name would hand it back. The delete names
+    /// its holder: in the outcome the roles tab's toast is built from, and on
+    /// the audit row. It named no one, so the operator was told to "check its
+    /// former holders" with no way to know who they were.
+    ///
+    /// The injector fails the second revoke statement, which is the late
+    /// pass's; the first pass's goes through.
+    ///
+    /// Names `user_roles::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn a_late_grant_the_delete_could_not_revoke_is_reported_with_its_holder() {
+        use crate::test_support::FailingDbOpContext;
+
+        let (ctx, role_id, deleted) = delete_with_an_in_flight_assign(&["u-late"], |ctx| {
+            FailingDbOpContext::new(
+                ctx,
+                vec![("database.delete_where_count", user_roles::TABLE)],
+            )
+            .after_passing(1)
+        })
+        .await;
+
+        assert_eq!(
+            deleted,
+            super::super::ops::RoleDeleted::LateGrantsNotRevoked {
+                holders: Some(vec!["u-late".to_string()]),
+            }
+        );
+        let left: Vec<String> = user_roles::list_by_role(&ctx, "editor")
+            .await
+            .expect("list grants")
+            .into_iter()
+            .map(|g| g.user_id)
+            .collect();
+        assert_eq!(
+            left,
+            vec!["u-late"],
+            "precondition: the in-flight grant really outlived the role"
+        );
+
+        let audit = db_read::list_every(
+            &ctx,
+            super::super::logs::AUDIT_LOGS_TABLE,
+            vec![Filter {
+                field: "action".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!("role.delete"),
+            }],
+        )
+        .await
+        .expect("list audit rows");
+        assert_eq!(audit.len(), 1, "a deletion that happened is audited");
+        assert_eq!(
+            audit[0].str_field("resource"),
+            format!(
+                "roles/{role_id} (name: editor; grants revoked: 1; the revocation pass after \
+                 the delete failed while it was revoking the grants; holders it found: u-late)"
+            ),
+            "the audit row names the holder of the grant that may remain"
+        );
+    }
+
+    /// When the late pass revokes the in-flight grants and then fails to
+    /// invalidate a holder's sessions, no grant is left: the outcome says so,
+    /// rather than warning about a grant that is gone, and names only the
+    /// holders whose sessions were not invalidated. The pass stops at the
+    /// first failure, so the holder before it WAS invalidated and is not
+    /// named.
+    ///
+    /// Bumps run before and after each pass's revoke. The first pass bumps
+    /// `u-1` twice; the late pass bumps `u-late-a` and `u-late-b` before its
+    /// revoke, then `u-late-a` after it — five that pass. The sixth,
+    /// `u-late-b`'s after the revoke, fails.
+    ///
+    /// Names `users::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn a_late_pass_that_revoked_but_could_not_invalidate_names_the_sessions_left() {
+        use crate::{blocks::auth::repo::users, test_support::FailingDbOpContext};
+
+        let (ctx, _, deleted) = delete_with_an_in_flight_assign(&["u-late-a", "u-late-b"], |ctx| {
+            FailingDbOpContext::new(ctx, vec![("database.increment_field_where", users::TABLE)])
+                .after_passing(5)
+        })
+        .await;
+
+        assert_eq!(
+            deleted,
+            super::super::ops::RoleDeleted::LateSessionsNotInvalidated {
+                holders: vec!["u-late-b".to_string()],
+            }
+        );
+        assert!(
+            user_roles::list_by_role(&ctx, "editor")
+                .await
+                .expect("list grants")
+                .is_empty(),
+            "precondition: the late pass really revoked the in-flight grant"
         );
     }
 }

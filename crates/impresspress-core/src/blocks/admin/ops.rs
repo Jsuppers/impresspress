@@ -315,16 +315,32 @@ pub(super) async fn create_role(
 
 /// What [`delete_role`] did. Either way the role row is gone — a delete that
 /// did not happen is an `Err`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RoleDeleted {
     /// The role and every grant of it are gone.
     Clean,
     /// The role is gone, but the revocation pass that runs after its row was
-    /// deleted failed, so a grant assigned while the delete was in flight may
-    /// have outlived it. The failure is logged and recorded on the audit row;
-    /// such a grant can only be removed individually, since the role it names
-    /// no longer exists to be deleted again.
-    LateGrantsNotRevoked,
+    /// deleted failed before it removed the grants, so a grant assigned while
+    /// the delete was in flight may have outlived it.
+    ///
+    /// Such a grant is not inert. It keeps putting the role's name into every
+    /// token its holder is minted, and creating a role of the same name again
+    /// revives it: the new role is held by that user without anyone having
+    /// assigned it. Nothing can revoke it through the role any more, since the
+    /// role it names no longer exists to be deleted again — it has to be
+    /// removed from its holder individually.
+    ///
+    /// `holders` is who the pass found holding a grant of it when it read
+    /// them, or `None` when that read is what failed. The failure, and the
+    /// holders when known, are logged and recorded on the audit row.
+    LateGrantsNotRevoked { holders: Option<Vec<String>> },
+    /// The role is gone and the pass after the delete removed every grant it
+    /// found, but then stopped invalidating sessions part-way: `holders` is
+    /// the holder whose invalidation failed and every one after it, whose
+    /// sessions were not invalidated a second time (those before it were). A
+    /// token one of them was minted after their first invalidation and before
+    /// the revoke still carries the role until it expires. Logged and audited.
+    LateSessionsNotInvalidated { holders: Vec<String> },
 }
 
 /// Delete a role, revoking every grant of it, writing an audit-log row.
@@ -349,8 +365,9 @@ pub(super) enum RoleDeleted {
 ///
 /// A failure of that second pass is not reported as a failed delete: the
 /// role IS deleted, and answering with an error would tell the caller it is
-/// still there. It is [`RoleDeleted::LateGrantsNotRevoked`] instead, and the
-/// audit row for the deletion is written either way.
+/// still there. It is [`RoleDeleted::LateGrantsNotRevoked`] or
+/// [`RoleDeleted::LateSessionsNotInvalidated`] instead, naming the holders
+/// the pass found, and the audit row for the deletion is written either way.
 pub(super) async fn delete_role(
     ctx: &dyn Context,
     msg: &Message,
@@ -391,21 +408,33 @@ pub(super) async fn delete_role(
             format!("grants revoked: {}", revoked + late),
         ),
         Err(failure) => {
+            let holders = failure
+                .holders
+                .as_deref()
+                .map_or_else(|| "could not be listed".to_string(), |h| h.join(", "));
             tracing::error!(
                 role = %name,
                 step = failure.step.describe(),
+                holders = %holders,
                 error = %failure.error,
                 "role deleted, but the revocation pass after the delete failed; a grant \
                  assigned while the delete was in flight may outlive the role"
             );
-            (
-                RoleDeleted::LateGrantsNotRevoked,
-                format!(
-                    "grants revoked: {revoked}; the revocation pass after the delete failed \
-                     while it {}",
-                    failure.step.describe()
-                ),
-            )
+            let mut detail = format!(
+                "grants revoked: {revoked}; the revocation pass after the delete failed while \
+                 it {}",
+                failure.step.describe()
+            );
+            if let Some(found) = &failure.holders {
+                detail.push_str(&format!("; holders it found: {}", found.join(", ")));
+            }
+            let outcome = match (failure.step, failure.holders) {
+                (RevokeStep::BumpAfter, holders) => RoleDeleted::LateSessionsNotInvalidated {
+                    holders: holders.unwrap_or_default(),
+                },
+                (_, holders) => RoleDeleted::LateGrantsNotRevoked { holders },
+            };
+            (outcome, detail)
         }
     };
 
@@ -446,9 +475,14 @@ impl RevokeStep {
     }
 }
 
-/// A failed [`revoke_every_grant_of`]: which step, and the error it met.
+/// A failed [`revoke_every_grant_of`]: which step, the holders it concerns,
+/// and the error it met. `holders` is every holder the pass read — for
+/// [`RevokeStep::BumpAfter`], only the one whose invalidation failed and those
+/// after it, since the ones before it were invalidated — and `None` when
+/// reading them is what failed.
 struct RevokeFailure {
     step: RevokeStep,
+    holders: Option<Vec<String>>,
     error: wafer_run::WaferError,
 }
 
@@ -496,36 +530,58 @@ impl RevokeFailure {
 /// only token that can still carry the role is one minted between that
 /// assign and step 2.
 async fn revoke_every_grant_of(ctx: &dyn Context, role: &str) -> Result<i64, RevokeFailure> {
-    let failed = |step| move |error| RevokeFailure { step, error };
     let grants = user_roles::list_by_role(ctx, role)
         .await
-        .map_err(failed(RevokeStep::Read))?;
+        .map_err(|error| RevokeFailure {
+            step: RevokeStep::Read,
+            holders: None,
+            error,
+        })?;
     let mut holders: Vec<&str> = grants.iter().map(|g| g.user_id.as_str()).collect();
     holders.sort_unstable();
     holders.dedup();
+    let failed = |step| {
+        let holders = holders.iter().map(|h| h.to_string()).collect();
+        move |error| RevokeFailure {
+            step,
+            holders: Some(holders),
+            error,
+        }
+    };
 
     bump_each(ctx, &holders)
         .await
-        .map_err(failed(RevokeStep::BumpBefore))?;
+        .map_err(|(_, error)| failed(RevokeStep::BumpBefore)(error))?;
     let revoked = user_roles::revoke_role(ctx, role)
         .await
         .map_err(failed(RevokeStep::Revoke))?;
+    // The holders before the failing one WERE invalidated; only the failing
+    // one and those after it were not, so they are the ones reported.
     bump_each(ctx, &holders)
         .await
-        .map_err(failed(RevokeStep::BumpAfter))?;
+        .map_err(|(at, error)| RevokeFailure {
+            step: RevokeStep::BumpAfter,
+            holders: Some(holders[at..].iter().map(|h| h.to_string()).collect()),
+            error,
+        })?;
     Ok(revoked)
 }
 
-/// Bump each of `user_ids`' auth version, stopping at the first failure.
-async fn bump_each(ctx: &dyn Context, user_ids: &[&str]) -> Result<(), wafer_run::WaferError> {
-    for &user_id in user_ids {
+/// Bump each of `user_ids`' auth version, stopping at the first failure and
+/// returning its index: every holder before it was bumped, it and every one
+/// after it were not.
+async fn bump_each(
+    ctx: &dyn Context,
+    user_ids: &[&str],
+) -> Result<(), (usize, wafer_run::WaferError)> {
+    for (at, &user_id) in user_ids.iter().enumerate() {
         if let Err(e) = bump_auth_version(ctx, user_id).await {
             tracing::error!(
                 user_id = %user_id,
                 error = %e,
                 "role delete: auth_version bump failed"
             );
-            return Err(e);
+            return Err((at, e));
         }
     }
     Ok(())

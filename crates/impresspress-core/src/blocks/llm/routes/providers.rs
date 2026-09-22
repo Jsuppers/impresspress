@@ -444,6 +444,11 @@ pub(in crate::blocks::llm) async fn update_provider(
 }
 
 /// `DELETE /b/llm/api/providers/:id` — remove. Admin-only.
+///
+/// The providers table's Delete button swaps the answer over its own row
+/// (`hx-target="closest tr"`, `outerHTML`), so an `HX-Request` gets an empty
+/// HTML body — the row goes — while an API caller gets the JSON receipt. A
+/// JSON body swapped over the row replaced it with `{"deleted":true}` as text.
 pub(in crate::blocks::llm) async fn delete_provider(
     block: &LlmBlock,
     ctx: &dyn Context,
@@ -465,6 +470,9 @@ pub(in crate::blocks::llm) async fn delete_provider(
         return err_internal("reload_provider_service failed", e);
     }
 
+    if crate::ui::is_htmx(msg) {
+        return crate::ui::html_response(maud::html! {});
+    }
     ok_json(&ProviderDeleteResponse { deleted: true })
 }
 

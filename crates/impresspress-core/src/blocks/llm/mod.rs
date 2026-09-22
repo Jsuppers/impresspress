@@ -534,13 +534,17 @@ impl LlmBlock {
 
     /// `DELETE /b/llm/api/config/{id}` — remove one per-thread override. The
     /// settings page renders a delete control for every override row; this
-    /// is the route it targets.
+    /// is the route it targets. That control swaps the answer over its own
+    /// row (`hx-target="closest tr"`, `outerHTML`), so an `HX-Request` gets an
+    /// empty HTML body — the row goes — while an API caller gets the JSON
+    /// receipt.
     async fn handle_delete_config(&self, ctx: &dyn Context, msg: &Message) -> OutputStream {
         let id = match crud::path_id(msg, "Override") {
             Ok(value) => value.to_string(),
             Err(response) => return response,
         };
         match repo::settings::delete(ctx, &id).await {
+            Ok(()) if crate::ui::is_htmx(msg) => crate::ui::html_response(maud::html! {}),
             Ok(()) => ok_json(&contracts::ConfigDeleteResponse { deleted: true }),
             Err(e) => crud::db_error(e, "Override not found", "Database error"),
         }

@@ -95,6 +95,7 @@ enum Route {
     UserDelete,
     CreateRole,
     DeleteRole,
+    RevokeApiKey,
     BlockDetail,
     BlockToggle,
     CreateVariable,
@@ -233,7 +234,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .summary("Update role API")
     .path_params(role_id_path_schema)
     .input(request_schema_of::<contracts::UpdateRoleRequest>)
-    .output(response_schema_of::<contracts::AdminRoleView>),
+    .output(response_schema_of::<contracts::AdminRoleUpdateResponse>),
     EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/admin/api/iam/roles/{id}",
@@ -404,6 +405,12 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         .summary("Delete user"),
     EndpointRoute::admin(HttpMethod::Post, "/b/admin/iam/roles", Route::CreateRole)
         .summary("Create role (form)"),
+    EndpointRoute::admin(
+        HttpMethod::Post,
+        "/b/admin/api-keys/{id}/revoke",
+        Route::RevokeApiKey,
+    )
+    .summary("Revoke API key"),
     EndpointRoute::admin(
         HttpMethod::Delete,
         "/b/admin/iam/roles/{id}",
@@ -660,6 +667,7 @@ crate::impresspress_feature_block! {
             Route::UserDelete => pages::handle_user_delete(ctx, &msg).await,
             Route::CreateRole => pages::handle_create_role(ctx, &msg, input).await,
             Route::DeleteRole => pages::handle_delete_role(ctx, &msg).await,
+            Route::RevokeApiKey => pages::handle_revoke_api_key(ctx, &msg).await,
             Route::BlockDetail => pages::handle_block_detail(ctx, &msg).await,
             Route::BlockToggle => {
                 pages::handle_toggle_feature(ctx, &msg, &this.block_settings_handle).await
@@ -1379,6 +1387,104 @@ mod test_support {
         );
         msg
     }
+
+    /// Wraps `inner` and, just before the `nth` read of the grants table
+    /// (`database.list` on `user_roles::TABLE`) goes through, assigns `role`
+    /// to each of `users` on the unwrapped fixture: an assign landing while a role
+    /// delete is in flight. With `nth = 2` it lands after the delete's first
+    /// revocation pass has read and revoked, so only the pass after the role
+    /// row is gone can see it — the grant [`super::ops::RoleDeleted`]'s
+    /// late-pass outcomes are about. `inner` decides which later step fails.
+    ///
+    /// The assign goes to the fixture directly, so its own reads of the grants
+    /// table are not counted.
+    #[derive(Clone)]
+    pub(super) struct AssignBeforeGrantRead {
+        inner: crate::test_support::FailingDbOpContext,
+        fixture: crate::test_support::TestContext,
+        nth: usize,
+        users: &'static [&'static str],
+        role: &'static str,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AssignBeforeGrantRead {
+        pub(super) fn new(
+            fixture: crate::test_support::TestContext,
+            inner: crate::test_support::FailingDbOpContext,
+            nth: usize,
+            users: &'static [&'static str],
+            role: &'static str,
+        ) -> Self {
+            Self {
+                inner,
+                fixture,
+                nth,
+                users,
+                role,
+                reads: std::sync::Arc::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::context::Context for AssignBeforeGrantRead {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(
+            &self,
+            name: &str,
+            msg: Message,
+            input: wafer_run::InputStream,
+        ) -> wafer_run::OutputStream {
+            use crate::platform_state::user_roles;
+
+            if name != "wafer-run/database" || msg.action() != "database.list" {
+                return self.inner.call_block(name, msg, input).await;
+            }
+            let bytes = input.collect_to_bytes().await;
+            let collection =
+                wafer_block::codec::decode::<crate::test_support::CollectionPeek>(&bytes)
+                    .map(|peek| peek.collection)
+                    .unwrap_or_default();
+            if collection == user_roles::TABLE
+                && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth
+            {
+                for user in self.users {
+                    user_roles::assign(&self.fixture, user, self.role, "")
+                        .await
+                        .expect("the in-flight assign lands");
+                }
+            }
+            self.inner
+                .call_block(name, msg, wafer_run::InputStream::from_bytes(bytes))
+                .await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1639,6 +1745,12 @@ mod table_tests {
                 &[("id", "r-1")],
             ),
             (
+                "create",
+                "/b/admin/api-keys/k-1/revoke",
+                Route::RevokeApiKey,
+                &[("id", "k-1")],
+            ),
+            (
                 "retrieve",
                 "/b/admin/blocks/wafer-run--auth/detail",
                 Route::BlockDetail,
@@ -1835,7 +1947,10 @@ mod table_tests {
 /// the network rows' `data-detail-url`) against the table of the block that
 /// owns it, with the method the attribute implies.
 #[cfg(test)]
-mod page_link_tests {
+pub(crate) mod htmx_contract_tests;
+
+#[cfg(test)]
+pub(crate) mod page_link_tests {
     use std::collections::BTreeSet;
 
     use wafer_core::clients::database as db;
@@ -1888,11 +2003,11 @@ mod page_link_tests {
         out
     }
 
-    struct Seeds {
-        user_id: String,
-        role_id: String,
-        key_id: String,
-        grant_id: String,
+    pub(crate) struct Seeds {
+        pub(crate) user_id: String,
+        pub(crate) role_id: String,
+        pub(crate) key_id: String,
+        pub(crate) grant_id: String,
     }
 
     const PROBE_BLOCK: &str = "impresspress/probe";
@@ -1926,12 +2041,18 @@ mod page_link_tests {
     const ADMIN_PREFIX: &str = "/b/admin/";
     const AUTH_UI_PREFIX: &str = "/b/auth/";
 
-    /// One row behind every per-record control the pages render: a user
-    /// (enable/disable/delete), a custom role (delete), an active API key
+    /// One row behind every per-record control the pages render: an enabled
+    /// user (disable/delete) and a disabled one (enable), a custom role (delete), an active API key
     /// (revoke), a variable (edit, delete), a WRAP grant (delete), a request-log
     /// row (network detail) and a Feature block (detail, toggle).
-    async fn seeded_ctx() -> (TestContext, Seeds) {
-        let mut ctx = TestContext::with_auth().await;
+    pub(crate) async fn seeded_ctx() -> (TestContext, Seeds) {
+        // Crypto as well: the API-keys tab's Create form mints a key, and
+        // `htmx_contract_tests` submits it.
+        let mut ctx = TestContext::with_auth_and_crypto().await;
+        // The admin the requests come from (`admin_msg`'s user), as the real
+        // account a signed-in admin is: a key the Create form mints is theirs,
+        // and `api_keys.user_id` references the users table.
+        ctx.seed_auth_user("admin_1").await;
         let user = users::insert(
             &ctx,
             users::NewUser {
@@ -1945,6 +2066,24 @@ mod page_link_tests {
         )
         .await
         .expect("seed user");
+        // A second, DISABLED user, so the users tab renders the Enable
+        // control as well as Disable.
+        let disabled = users::insert(
+            &ctx,
+            users::NewUser {
+                email: "disabled@example.com".into(),
+                display_name: "Disabled".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: false,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed disabled user");
+        users::set_disabled(&ctx, &disabled.id, true)
+            .await
+            .expect("disable the second user");
         let key = api_keys::insert(
             &ctx,
             api_keys::NewApiKey {
@@ -2113,7 +2252,7 @@ mod page_link_tests {
     }
 
     /// `(action, path, query parameters)` of one page render.
-    type Page = (
+    pub(crate) type Page = (
         &'static str,
         &'static str,
         &'static [(&'static str, &'static str)],
@@ -2121,7 +2260,7 @@ mod page_link_tests {
 
     /// Every page and fragment the block serves as HTML, with the query
     /// parameters that select each tab.
-    const PAGES: &[Page] = &[
+    pub(crate) const PAGES: &[Page] = &[
         ("retrieve", "/b/admin/", &[]),
         ("retrieve", "/b/admin/users", &[]),
         ("retrieve", "/b/admin/users", &[("tab", "roles")]),
@@ -2199,7 +2338,10 @@ mod page_link_tests {
             ("create", "/b/admin/iam/roles".to_string()),
             ("delete", format!("/b/admin/iam/roles/{}", seeds.role_id)),
             ("create", "/b/auth/api/api-keys".to_string()),
-            ("update", format!("/b/auth/api/api-keys/{}", seeds.key_id)),
+            (
+                "create",
+                format!("/b/admin/api-keys/{}/revoke", seeds.key_id),
+            ),
             ("retrieve", "/b/admin/storage".to_string()),
             (
                 "retrieve",

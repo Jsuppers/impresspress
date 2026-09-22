@@ -24,10 +24,10 @@ use wafer_run::{
 /// returns `indexes` (storage stems, prefix retained); `count` answers
 /// from `counts` (0 for an unknown index); `query` returns `matches`.
 #[derive(Default)]
-pub(super) struct StubVectorBlock {
-    pub(super) indexes: Vec<String>,
-    pub(super) counts: HashMap<String, u64>,
-    pub(super) matches: Vec<VectorMatch>,
+pub(crate) struct StubVectorBlock {
+    pub(crate) indexes: Vec<String>,
+    pub(crate) counts: HashMap<String, u64>,
+    pub(crate) matches: Vec<VectorMatch>,
 }
 
 #[async_trait::async_trait]

@@ -63,6 +63,8 @@ pub mod db_read;
 pub mod endpoint_match;
 pub mod features;
 pub mod flows;
+#[cfg(test)]
+mod htmx_guard;
 pub mod http;
 pub mod isolate_cell;
 pub mod kv;

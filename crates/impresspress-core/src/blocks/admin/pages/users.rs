@@ -6,13 +6,13 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use super::{admin_page, crumb};
 use crate::{
     blocks::{
-        admin::{ops, ROLES_TABLE},
+        admin::{logs::audit_log, ops, ROLES_TABLE},
         auth::repo::{
             api_keys,
             users::{self, ActiveUserQuery, UserRow},
         },
     },
-    http::ResponseBuilder,
+    http::{err_internal, err_not_found, ResponseBuilder},
     ui::{
         self,
         components::{self, badge, pagination, Badge, BadgeVariant},
@@ -335,15 +335,77 @@ pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStrea
         Err(out) => return out,
     };
     let content = roles_tab(ctx).await;
-    match deleted {
-        ops::RoleDeleted::Clean => ui::html_response_with_toast(content, "Role deleted", "success"),
-        ops::RoleDeleted::LateGrantsNotRevoked => ui::html_response_with_toast(
-            content,
-            "Role deleted, but a grant assigned during the delete may remain. Check its \
-             former holders' roles.",
-            "warning",
-        ),
+    match late_pass_warning(&deleted) {
+        None => ui::html_response_with_toast(content, "Role deleted", "success"),
+        Some(warning) => ui::html_response_with_toast(content, &warning, "warning"),
     }
+}
+
+/// The warning toast for a role delete whose revocation pass after the row
+/// delete failed — what may be left, who holds it, and why it matters — or
+/// `None` for a clean delete.
+fn late_pass_warning(deleted: &ops::RoleDeleted) -> Option<String> {
+    let revives = "Creating a role with this name again would give it back to them.";
+    let warning = match deleted {
+        ops::RoleDeleted::Clean => return None,
+        ops::RoleDeleted::LateGrantsNotRevoked { holders: None } => format!(
+            "Role deleted, but checking for a grant assigned during the delete failed, so one \
+             may remain. Remove the role from anyone the Users tab still lists with it. \
+             {revives}"
+        ),
+        ops::RoleDeleted::LateGrantsNotRevoked {
+            holders: Some(holders),
+        } if holders.is_empty() => format!(
+            "Role deleted, but revoking any grant assigned during the delete failed. None was \
+             found, but one assigned in that moment may remain: remove the role from anyone \
+             the Users tab still lists with it. {revives}"
+        ),
+        ops::RoleDeleted::LateGrantsNotRevoked {
+            holders: Some(holders),
+        } => format!(
+            "Role deleted, but a grant of it assigned during the delete may remain for user(s) \
+             {}. Remove the role from them. {revives}",
+            holders.join(", ")
+        ),
+        ops::RoleDeleted::LateSessionsNotInvalidated { holders } => format!(
+            "Role deleted and every grant of it revoked, but the sessions of user(s) {} were \
+             not invalidated: a token they already hold may carry the role until it expires.",
+            holders.join(", ")
+        ),
+    };
+    Some(warning)
+}
+
+/// `POST /b/admin/api-keys/{id}/revoke` (from the API-keys tab). `{id}` is
+/// read only as the route table bound it.
+///
+/// The Revoke button swaps the answer into `#users-tab-content`, so the answer
+/// is this tab, re-rendered with the key shown revoked. auth-ui's
+/// `PATCH /b/auth/api/api-keys/{id}` revokes the same row through the same
+/// `api_keys::revoke`, but it answers with JSON, and a JSON body swapped into
+/// the tab replaces the key table with its own source text. The tab's markup
+/// is this block's to render, so the route that answers with it is too.
+pub async fn handle_revoke_api_key(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let key_id = msg.var("id");
+    // A read that could not run is not a missing key: answering 404 would
+    // tell the operator the key is already gone while it is still live.
+    match api_keys::find_by_id(ctx, key_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return err_not_found("API key not found"),
+        Err(e) => return err_internal("Could not load the API key", e),
+    }
+    if let Err(e) = api_keys::revoke(ctx, key_id).await {
+        return err_internal("Could not revoke the API key", e);
+    }
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "api_key.revoke",
+        &format!("api_keys/{key_id}"),
+        msg.remote_addr(),
+    )
+    .await;
+    ui::html_response_with_toast(api_keys_tab(ctx).await, "API key revoked", "success")
 }
 
 async fn roles_tab(ctx: &dyn Context) -> Markup {
@@ -458,12 +520,11 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                         },
                         html! {
                             @if revoked.is_empty() {
-                                // Revocation is auth-ui's
-                                // `PATCH /b/auth/api/api-keys/{id}`
-                                // (`Route::RevokeApiKey`); an admin
-                                // may revoke another user's key.
+                                // This block's own route, answered with
+                                // this tab re-rendered: see
+                                // `handle_revoke_api_key`.
                                 button .btn .btn--sm .btn--secondary
-                                    hx-patch={"/b/auth/api/api-keys/" (record.id)}
+                                    hx-post={"/b/admin/api-keys/" (record.id) "/revoke"}
                                     hx-target="#users-tab-content"
                                     hx-confirm="Revoke this API key?"
                                 { "Revoke" }
@@ -552,58 +613,7 @@ const API_KEY_COLUMNS: [components::TableCol<'static>; 6] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        blocks::auth::repo::{api_keys, users},
-        test_support::{admin_msg, output_html, TestContext},
-    };
-
-    /// The API-keys tab must revoke through the route auth-ui declares
-    /// (`PATCH /b/auth/api/api-keys/{id}`, `Route::RevokeApiKey`). The old
-    /// control posted to `.../{id}/revoke`, a path no block ever served, so
-    /// the button answered 404 in every deployment.
-    #[tokio::test]
-    async fn api_keys_tab_revokes_through_the_declared_patch_route() {
-        let ctx = TestContext::with_auth().await;
-        let owner = users::insert(
-            &ctx,
-            users::NewUser {
-                email: "owner@example.com".into(),
-                display_name: "Owner".into(),
-                avatar_url: None,
-                role: "user".into(),
-                email_verified: false,
-                verification_token_hash: None,
-            },
-        )
-        .await
-        .expect("seed user");
-        let key = api_keys::insert(
-            &ctx,
-            api_keys::NewApiKey {
-                user_id: &owner.id,
-                name: "ci",
-                key_hash: "hash-1",
-                key_prefix: "ipk_abc",
-                expires_at: None,
-            },
-        )
-        .await
-        .expect("seed api key");
-
-        let mut msg = admin_msg("retrieve", "/b/admin/users");
-        msg.set_meta("req.query.tab", "api-keys");
-        let html = output_html(users_page(&ctx, &msg).await).await;
-
-        let expected = format!("hx-patch=\"/b/auth/api/api-keys/{}\"", key.id);
-        assert!(
-            html.contains(&expected),
-            "the revoke control must PATCH the declared api-key route: {html}"
-        );
-        assert!(
-            !html.contains("/revoke"),
-            "no admin control may target the unserved `/revoke` path: {html}"
-        );
-    }
+    use crate::test_support::{admin_msg, TestContext};
 
     /// The roles tab's delete, when the revocation pass after the row delete
     /// fails: the tab re-renders without the role and the toast warns about
@@ -645,5 +655,69 @@ mod tests {
             .expect("a re-rendered tab carries its toast");
         let toast: serde_json::Value = serde_json::from_str(&trigger).expect("trigger JSON");
         assert_eq!(toast["showToast"]["type"], "warning", "{toast}");
+        assert_eq!(
+            toast["showToast"]["message"],
+            "Role deleted, but checking for a grant assigned during the delete failed, so one \
+             may remain. Remove the role from anyone the Users tab still lists with it. \
+             Creating a role with this name again would give it back to them.",
+            "the pass could not read the grants, so it cannot name a holder — the toast says \
+             where to look, and why it matters"
+        );
+    }
+
+    /// When the late pass did read the grants, the toast names who holds the
+    /// one that may remain, and says what recreating the role would do.
+    ///
+    /// Names `user_roles::TABLE` only to aim the fault injector;
+    /// `tests/repo_door.rs` allowlists it as one.
+    #[tokio::test]
+    async fn the_late_pass_warning_names_the_holder_of_the_grant_that_may_remain() {
+        use crate::{
+            blocks::admin::test_support::AssignBeforeGrantRead,
+            platform_state::user_roles,
+            test_support::{output_header, FailingDbOpContext},
+        };
+
+        let ctx = TestContext::with_auth().await;
+        let data = crate::util::json_map(serde_json::json!({
+            "name": "editor",
+            "description": "",
+            "permissions": [],
+            "is_system": false,
+        }));
+        let role_id = db::create(&ctx, ROLES_TABLE, data).await.expect("role").id;
+        for user in ["u-1", "u-late"] {
+            ctx.seed_auth_user(user).await;
+        }
+        user_roles::assign(&ctx, "u-1", "editor", "")
+            .await
+            .expect("grant");
+
+        let racing = AssignBeforeGrantRead::new(
+            ctx.clone(),
+            FailingDbOpContext::new(
+                ctx.clone(),
+                vec![("database.delete_where_count", user_roles::TABLE)],
+            )
+            .after_passing(1),
+            2,
+            &["u-late"],
+            "editor",
+        );
+        let msg = crate::blocks::admin::test_support::routed(admin_msg(
+            "delete",
+            &format!("/b/admin/iam/roles/{role_id}"),
+        ));
+        let trigger = output_header(handle_delete_role(&racing, &msg).await, "HX-Trigger")
+            .await
+            .expect("a re-rendered tab carries its toast");
+        let toast: serde_json::Value = serde_json::from_str(&trigger).expect("trigger JSON");
+        assert_eq!(toast["showToast"]["type"], "warning", "{toast}");
+        assert_eq!(
+            toast["showToast"]["message"],
+            "Role deleted, but a grant of it assigned during the delete may remain for user(s) \
+             u-late. Remove the role from them. Creating a role with this name again would give \
+             it back to them."
+        );
     }
 }

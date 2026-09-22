@@ -349,6 +349,9 @@ fn provider_row(id: &str, cfg: &ProviderConfig, manages: bool) -> Markup {
                         button
                             .btn.btn--sm.btn--secondary
                             hx-post={"/b/llm/api/providers/" (id) "/discover-models"}
+                            // The answer is the JSON model list; the page
+                            // reloads to show it, so nothing is swapped.
+                            hx-swap="none"
                             hx-confirm={"Discover models for \"" (cfg.name) "\" from its /v1/models endpoint?"}
                             hx-on--after-request="if(event.detail.successful){location.reload()}"
                         {

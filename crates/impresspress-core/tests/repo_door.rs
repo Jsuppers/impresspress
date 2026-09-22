@@ -467,6 +467,10 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     (
         "products",
         &[
+            // the htmx guard's products fixture: the block's repository is
+            // private to it, so the rows no API writes without Stripe are
+            // test-fixture rows written straight to the table
+            "htmx_guard/products.rs",
             "blocks/products/repo/products.rs",
             "blocks/products/migrations/mod.rs",
             "blocks/products/tests/handler_tests.rs",
@@ -504,6 +508,10 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     (
         "payment_links",
         &[
+            // the htmx guard's products fixture: the block's repository is
+            // private to it, so the rows no API writes without Stripe are
+            // test-fixture rows written straight to the table
+            "htmx_guard/products.rs",
             "blocks/products/repo/payment_links.rs",
             "blocks/products/migrations/mod.rs",
         ],
@@ -518,6 +526,10 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     (
         "purchases",
         &[
+            // the htmx guard's products fixture: the block's repository is
+            // private to it, so the rows no API writes without Stripe are
+            // test-fixture rows written straight to the table
+            "htmx_guard/products.rs",
             // the admin SQL explorer's refusal list names these two as
             // literals because their owning module is behind a block
             // feature and the table outlives the build that created it;
@@ -586,6 +598,10 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
     (
         "seller_accounts",
         &[
+            // the htmx guard's products fixture: the block's repository is
+            // private to it, so the rows no API writes without Stripe are
+            // test-fixture rows written straight to the table
+            "htmx_guard/products.rs",
             "blocks/products/repo/seller_accounts.rs",
             "blocks/products/migrations/mod.rs",
             // seeds a seller population past the unpaged read ceiling; see
@@ -619,7 +635,16 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("products_variables", &["blocks/products/repo/variables.rs"]),
-    ("groups", &["blocks/products/repo/groups.rs"]),
+    (
+        "groups",
+        &[
+            "blocks/products/repo/groups.rs",
+            // the htmx guard's products fixture: the block's repository is
+            // private to it, so the rows no API writes without Stripe are
+            // test-fixture rows written straight to the table
+            "htmx_guard/products.rs",
+        ],
+    ),
     ("types", &["blocks/products/repo/types.rs"]),
     (
         "group_templates",

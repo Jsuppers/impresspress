@@ -349,7 +349,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "A role definition as published by the admin API.",
+                "description": "`PATCH /b/admin/api/iam/roles/{id}` response body: the role as it now is.",
                 "properties": {
                   "created_at": {
                     "description": "RFC 3339 creation timestamp.",
@@ -381,6 +381,13 @@
                   "updated_at": {
                     "description": "RFC 3339 timestamp of the last modification.",
                     "type": "string"
+                  },
+                  "warning": {
+                    "description": "Present when the update was saved but a rename's grants did not all\nfollow it: says which still name the old role, and how to move them.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
                 "required": [
@@ -392,7 +399,7 @@
                   "created_at",
                   "updated_at"
                 ],
-                "title": "AdminRoleView",
+                "title": "AdminRoleUpdateResponse",
                 "type": "object"
               }
             }

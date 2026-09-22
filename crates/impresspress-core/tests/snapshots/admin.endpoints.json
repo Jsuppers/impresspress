@@ -44,6 +44,7 @@
   "PATCH /b/admin/api/settings/{key} admin",
   "PATCH /b/admin/api/users/{id} admin",
   "PATCH /b/admin/variables/{key} admin",
+  "POST /b/admin/api-keys/{id}/revoke admin",
   "POST /b/admin/api/database/query admin",
   "POST /b/admin/api/iam/permissions admin",
   "POST /b/admin/api/iam/roles admin",

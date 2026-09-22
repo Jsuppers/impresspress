@@ -275,6 +275,21 @@ pub struct UpdateRoleRequest {
     pub permissions: Option<Vec<String>>,
 }
 
+/// `PATCH /b/admin/api/iam/roles/{id}` response body: the role as it now is.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct AdminRoleUpdateResponse {
+    #[serde(flatten)]
+    pub role: AdminRoleView,
+    /// Present when the update was saved but a rename's grants did not all
+    /// follow it: says which still name the old role, and how to move them.
+    // A rename rewrites every `user_roles` row naming the old name, one
+    // write each; a failure part-way leaves the role renamed and some grants
+    // behind. That is still a 200 — the rename happened — and this is how
+    // a caller learns what is left (`iam::handle_update_role`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// `DELETE /b/admin/api/iam/roles/{id}` response body.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdminRoleDeleteResponse {

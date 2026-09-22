@@ -293,6 +293,11 @@ export interface paths {
                             permissions: string[];
                             /** @description RFC 3339 timestamp of the last modification. */
                             updated_at: string;
+                            /**
+                             * @description Present when the update was saved but a rename's grants did not all
+                             *     follow it: says which still name the old role, and how to move them.
+                             */
+                            warning?: string | null;
                         };
                     };
                 };
