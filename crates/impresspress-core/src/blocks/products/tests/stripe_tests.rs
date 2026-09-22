@@ -5012,6 +5012,595 @@ async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() 
     );
 }
 
+/// What the Stripe stand-in does with a create it has not seen under the key.
+#[derive(Clone, Copy)]
+enum FreshOutcome {
+    /// Create a Payment Link and save the 200 under the key.
+    Create,
+    /// Execute and refuse with a 400, saved under the key like Stripe saves
+    /// every result of a request whose execution began.
+    Reject,
+}
+
+/// Rendezvous points for pinning two concurrent creates under one key. When
+/// `armed`, the first fresh execution signals `started` once its key is in
+/// flight and parks until `release`. A request that meets a key in flight
+/// signals `conflict_met` and answers its 409 only after `answer_conflict`.
+#[derive(Default)]
+struct HeldExecution {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    conflict_met: tokio::sync::Notify,
+    answer_conflict: tokio::sync::Notify,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+/// Stripe's idempotency scope: the `Stripe-Account` a key was sent for, and
+/// the key.
+type IdempotencyScope = (String, String);
+
+/// What Stripe saved under a key: the request body, and the status and body
+/// it answered.
+type SavedResult = (Vec<u8>, u16, serde_json::Value);
+
+/// A Stripe stand-in that applies Stripe's idempotency rules to
+/// `POST /v1/payment_links`:
+///
+/// - the first `rate_limited` requests get a 429, which Stripe's rate limiter
+///   answers before the idempotency layer, so nothing is saved;
+/// - a key whose original request is still executing gets a 409;
+/// - a saved key replays its saved status and body, but only for the same
+///   parameters; different parameters get a 400 `idempotency_error`;
+/// - an unseen key executes (see [`FreshOutcome`]) and saves the result.
+///
+/// Keys are scoped to the `Stripe-Account` they were sent for. A request to
+/// `/v1/payment_links/{id}` (deactivation) answers the link as inactive.
+#[derive(Clone, Default)]
+struct IdempotentPaymentLinkStripe {
+    requests: Arc<Mutex<Vec<Request>>>,
+    saved: Arc<Mutex<HashMap<IdempotencyScope, SavedResult>>>,
+    in_flight: Arc<Mutex<std::collections::HashSet<IdempotencyScope>>>,
+    links_created: Arc<Mutex<Vec<String>>>,
+    rate_limited: Arc<Mutex<usize>>,
+    fresh_outcomes: Arc<Mutex<VecDeque<FreshOutcome>>>,
+    held: Arc<HeldExecution>,
+}
+
+fn stripe_response(status_code: u16, body: &serde_json::Value) -> Response {
+    Response {
+        status_code,
+        headers: HashMap::new(),
+        body: serde_json::to_vec(body).unwrap(),
+    }
+}
+
+#[async_trait]
+impl NetworkService for IdempotentPaymentLinkStripe {
+    async fn do_request(&self, request: &Request) -> Result<Response, NetworkError> {
+        self.requests.lock().unwrap().push(request.clone());
+        if !request.url.ends_with("/v1/payment_links") {
+            let id = request.url.rsplit('/').next().unwrap_or("").to_string();
+            return Ok(stripe_response(
+                200,
+                &serde_json::json!({"id": id, "active": false}),
+            ));
+        }
+        {
+            let mut remaining = self.rate_limited.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(stripe_response(
+                    429,
+                    &serde_json::json!({"error": {"type": "rate_limit_error"}}),
+                ));
+            }
+        }
+        let scope = (
+            request
+                .headers
+                .get("Stripe-Account")
+                .cloned()
+                .unwrap_or_default(),
+            request.headers["Idempotency-Key"].clone(),
+        );
+        let body = request.body.clone().unwrap_or_default();
+        if self.in_flight.lock().unwrap().contains(&scope) {
+            self.held.conflict_met.notify_one();
+            self.held.answer_conflict.notified().await;
+            return Ok(stripe_response(
+                409,
+                &serde_json::json!({"error": {"type": "idempotency_error"}}),
+            ));
+        }
+        let replay = self.saved.lock().unwrap().get(&scope).cloned();
+        if let Some((saved_body, status_code, response)) = replay {
+            if saved_body != body {
+                return Ok(stripe_response(
+                    400,
+                    &serde_json::json!({"error": {"type": "idempotency_error"}}),
+                ));
+            }
+            return Ok(stripe_response(status_code, &response));
+        }
+        self.in_flight.lock().unwrap().insert(scope.clone());
+        if self
+            .held
+            .armed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.held.started.notify_one();
+            self.held.release.notified().await;
+        }
+        let outcome = self
+            .fresh_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(FreshOutcome::Create);
+        let (status_code, response) = match outcome {
+            FreshOutcome::Create => {
+                let mut links = self.links_created.lock().unwrap();
+                let id = format!("plink_minted_{}", links.len() + 1);
+                links.push(id.clone());
+                (
+                    200,
+                    serde_json::json!({
+                        "id": id,
+                        "url": format!("https://buy.stripe.com/{id}"),
+                    }),
+                )
+            }
+            FreshOutcome::Reject => (
+                400,
+                serde_json::json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "account_invalid"
+                }}),
+            ),
+        };
+        self.saved
+            .lock()
+            .unwrap()
+            .insert(scope.clone(), (body, status_code, response.clone()));
+        self.in_flight.lock().unwrap().remove(&scope);
+        Ok(stripe_response(status_code, &response))
+    }
+}
+
+fn register_idempotent_payment_link_stripe(
+    ctx: &mut crate::test_support::TestContext,
+    rate_limited: usize,
+) -> IdempotentPaymentLinkStripe {
+    let stripe = IdempotentPaymentLinkStripe {
+        rate_limited: Arc::new(Mutex::new(rate_limited)),
+        ..Default::default()
+    };
+    let block: Arc<dyn Block> = Arc::new(wafer_core::service_blocks::network::NetworkBlock::new(
+        Arc::new(stripe.clone()),
+    ));
+    ctx.register_block("wafer-run/network", block);
+    stripe
+}
+
+/// The idempotency keys of every Payment Link create, in request order.
+fn idempotency_keys(stripe: &IdempotentPaymentLinkStripe) -> Vec<String> {
+    stripe
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.ends_with("/v1/payment_links"))
+        .map(|request| request.headers["Idempotency-Key"].clone())
+        .collect()
+}
+
+/// Seed a platform offer plus a named preset, and return the product record,
+/// the offer id and the create request a Payment Link call sends.
+async fn seed_payment_link_configuration(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+) -> (db::Record, String, PaymentLinkCreateRequest) {
+    let offer_id = seed_active_offer(ctx, product_id, "").await;
+    let preset = repo::checkout_presets::create(
+        ctx,
+        &offer_id,
+        "admin_1",
+        &serde_json::from_value(serde_json::json!({
+            "name": "Three pages",
+            "slug": "three-pages",
+            "inputs": {"pages": 3}
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let product = db::get(ctx, repo::products::TABLE, product_id)
+        .await
+        .unwrap();
+    (
+        product,
+        offer_id,
+        PaymentLinkCreateRequest {
+            preset_id: Some(preset.id),
+            after_completion_url: None,
+        },
+    )
+}
+
+/// A retry of a configuration whose first attempt failed at Stripe must reach
+/// Stripe under the SAME idempotency key and re-drive the same local row, not
+/// insert a second row with a fresh key.
+#[tokio::test]
+async fn payment_link_retry_reuses_one_idempotency_key_and_one_row() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 1);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_retry").await;
+
+    let error = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+    let failed = repo::payment_links::list_for_offer(&ctx, &offer_id)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].sync_status, "error");
+
+    let link = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect("the retry must succeed");
+    assert_eq!(link.sync_status, "synced");
+    let keys = idempotency_keys(&stripe);
+    assert_eq!(keys.len(), 2, "two attempts, two requests: {keys:?}");
+    assert_eq!(keys[0], keys[1], "both attempts must share one key");
+    assert!(keys[0].starts_with("impresspress_payment_link_"));
+    assert_eq!(
+        link.id, failed[0].id,
+        "the retry must re-drive the failed row"
+    );
+    let rows = repo::payment_links::list_for_offer(&ctx, &offer_id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "no orphan row may be left behind: {rows:?}");
+}
+
+/// Stripe created the link but recording it locally failed. The retry must
+/// adopt that same Stripe link into the same row — a second live Payment Link
+/// for one configuration is a second way to take the buyer's money.
+#[tokio::test]
+async fn payment_link_retry_adopts_the_link_stripe_created_when_recording_it_failed() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_adopt").await;
+
+    // Only `mark_synced` updates the table on a first attempt: the pending
+    // row is a create, so the Stripe call itself goes through.
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.update", repo::payment_links::TABLE)],
+    );
+    stripe::create_payment_link(&failing, &product, &offer_id, &request)
+        .await
+        .expect_err("the local write after Stripe succeeded fails");
+    assert_eq!(
+        stripe.links_created.lock().unwrap().len(),
+        1,
+        "Stripe holds one live link after the first attempt"
+    );
+    let stuck = repo::payment_links::list_for_offer(&ctx, &offer_id)
+        .await
+        .unwrap();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0].sync_status, "syncing");
+
+    let link = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect("the retry must succeed");
+    assert_eq!(
+        stripe.links_created.lock().unwrap().len(),
+        1,
+        "the retry must adopt the existing Stripe link, not mint a second"
+    );
+    assert_eq!(link.url, "https://buy.stripe.com/plink_minted_1");
+    assert_eq!(
+        link.id, stuck[0].id,
+        "the retry must re-drive the stuck row"
+    );
+    let stored = repo::payment_links::get_for_offer(&ctx, &offer_id, &link.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.stripe_payment_link_id, "plink_minted_1");
+    // The adopted link's metadata names the row that now records it, which is
+    // what a Payment Link checkout webhook resolves.
+    for request in stripe.requests.lock().unwrap().iter() {
+        let form = String::from_utf8(request.body.clone().unwrap()).unwrap();
+        assert!(form.contains(&format!(
+            "metadata[impresspress_payment_link_id]={}",
+            link.id
+        )));
+    }
+    assert_eq!(
+        repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A configuration that can never produce a valid Stripe request is refused
+/// before anything is written: retrying it must not pile up `syncing` rows.
+#[tokio::test]
+async fn an_invalid_payment_link_request_leaves_no_row_behind() {
+    // No offer country list and no platform country: the shipping section of
+    // the form cannot be built.
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let offer_id = seed_shipping_offer(&ctx, "product_link_no_country", &[]).await;
+    let product = db::get(&ctx, repo::products::TABLE, "product_link_no_country")
+        .await
+        .unwrap();
+    let request = PaymentLinkCreateRequest {
+        preset_id: None,
+        after_completion_url: None,
+    };
+    for _ in 0..2 {
+        let error = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument, "{error:?}");
+    }
+    assert!(
+        repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a request that fails to build must leave no row"
+    );
+
+    // A malformed platform country fails every attempt the same way.
+    ctx.set_config("IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY", "not-a-country");
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_bad_country").await;
+    for _ in 0..2 {
+        let error = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::FailedPrecondition, "{error:?}");
+    }
+    assert!(
+        repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a malformed platform country must leave no row"
+    );
+    assert!(stripe.requests.lock().unwrap().is_empty());
+}
+
+/// Deactivating a link and asking for the same configuration again is an
+/// ordinary admin flow. It must mint a fresh Stripe link, not collide with
+/// the deactivated link's idempotency key (a parameter mismatch) or replay
+/// the deactivated link.
+#[tokio::test]
+async fn a_deactivated_configuration_can_be_recreated_as_a_new_stripe_link() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_recreate").await;
+
+    let first = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect("the first link");
+    stripe::deactivate_payment_link(&ctx, &offer_id, &first.id)
+        .await
+        .expect("deactivate");
+    let second = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect("recreating a deactivated configuration must succeed");
+
+    assert_eq!(
+        stripe.links_created.lock().unwrap().clone(),
+        vec!["plink_minted_1".to_string(), "plink_minted_2".to_string()],
+        "the recreate must be a new Stripe link"
+    );
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.url, "https://buy.stripe.com/plink_minted_2");
+    assert_eq!(second.sync_status, "synced");
+    let keys = idempotency_keys(&stripe);
+    assert_ne!(keys[0], keys[1], "a recreate must not reuse the old key");
+}
+
+/// Two first attempts at one configuration that both find nothing must end
+/// as ONE row and ONE Stripe link, with neither request failing — not as two
+/// rows whose requests share a key with different parameters.
+#[tokio::test]
+async fn concurrent_first_attempts_share_one_row_and_one_stripe_link() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_race").await;
+
+    // Both racers finish the configuration lookup, and so both see no row,
+    // before either writes one.
+    let racing = crate::test_support::RendezvousDbOpContext::new(
+        ctx.clone(),
+        "database.list",
+        repo::payment_links::TABLE,
+        2,
+    );
+    let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            stripe::create_payment_link(&racing, &product, &offer_id, &request),
+            stripe::create_payment_link(&racing, &product, &offer_id, &request),
+        )
+    })
+    .await
+    .expect("the racers must not deadlock");
+    let left = left.expect("the first racer must succeed");
+    let right = right.expect("the second racer must succeed");
+
+    assert_eq!(left.id, right.id, "both racers must land on one row");
+    assert_eq!(
+        stripe.links_created.lock().unwrap().len(),
+        1,
+        "one configuration, one Stripe link"
+    );
+    let rows = repo::payment_links::list_for_offer(&ctx, &offer_id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "no race-loser row may be left: {rows:?}");
+    assert_eq!(rows[0].sync_status, "synced");
+}
+
+/// Stripe saves and replays the result of a request it began executing,
+/// including a 400 caused by Stripe-side state the seller can fix. A retry
+/// after such a refusal must reach Stripe under a fresh key, or it replays
+/// the stale refusal for as long as Stripe retains the key.
+#[tokio::test]
+async fn a_retry_after_a_definite_stripe_refusal_uses_a_fresh_key() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    stripe
+        .fresh_outcomes
+        .lock()
+        .unwrap()
+        .push_back(FreshOutcome::Reject);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_refused").await;
+
+    let error = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::FailedPrecondition, "{error:?}");
+
+    let link = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect("once the Stripe-side cause is fixed, the retry must succeed");
+    let keys = idempotency_keys(&stripe);
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0], keys[1], "a definite refusal must retire its key");
+    assert_eq!(link.url, "https://buy.stripe.com/plink_minted_1");
+    let rows = repo::payment_links::list_for_offer(&ctx, &offer_id)
+        .await
+        .unwrap();
+    let refused = rows
+        .iter()
+        .find(|row| row.id != link.id)
+        .expect("the refused attempt stays on record");
+    assert!(!refused.active, "a refused attempt is not a live link");
+    assert_eq!(refused.sync_status, "error");
+}
+
+/// Two concurrent retries of one unfinished row share its key. The one
+/// Stripe answers with a 409 (the other is still executing) must not mark
+/// the row failed after the other has recorded the live link.
+#[tokio::test]
+async fn a_conflicting_retry_cannot_unsync_the_link_its_twin_recorded() {
+    // The first attempt is rate limited, which leaves an unfinished row.
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 1);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_twins").await;
+    stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect_err("rate limited");
+
+    // The first retry parks inside Stripe with the key in flight; the second
+    // meets it there and gets a 409, which it only sees once the first has
+    // been let go and has recorded the link.
+    stripe
+        .held
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let held = stripe.held.clone();
+    let first = async {
+        let result = stripe::create_payment_link(&ctx, &product, &offer_id, &request).await;
+        held.answer_conflict.notify_one();
+        result
+    };
+    let second = async {
+        stripe.held.started.notified().await;
+        stripe::create_payment_link(&ctx, &product, &offer_id, &request).await
+    };
+    let let_first_go = async {
+        stripe.held.conflict_met.notified().await;
+        stripe.held.release.notify_one();
+    };
+    // A retry that never meets its twin in flight leaves the held execution
+    // parked; the timeout turns that into a failure instead of a hang.
+    let (first, second, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(first, second, let_first_go)
+    })
+    .await
+    .expect("the second retry must meet the first in flight at Stripe");
+    let first = first.expect("the executing retry records the link");
+    second.expect_err("the conflicting retry reports the conflict");
+
+    let stored = repo::payment_links::get_for_offer(&ctx, &offer_id, &first.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.managed.sync_status, "synced",
+        "a late conflict must not flip a recorded link to error"
+    );
+    assert!(stored.managed.active);
+    assert_eq!(stored.stripe_payment_link_id, "plink_minted_1");
+}
+
+/// The other order of the race above: the 409 reaches the conflicting retry
+/// while its twin is still executing. A 409 says nothing about the outcome,
+/// so it must not retire the row the twin is about to record the link on —
+/// a live link on a retired row would make the next request mint a second.
+#[tokio::test]
+async fn a_conflict_answered_mid_flight_does_not_retire_the_row() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 1);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_mid_flight").await;
+    stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect_err("rate limited");
+
+    stripe
+        .held
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // The conflict is answered as soon as it is met, and the first retry is
+    // let go only once the second has finished recording its failure.
+    stripe.held.answer_conflict.notify_one();
+    let first = stripe::create_payment_link(&ctx, &product, &offer_id, &request);
+    let second = async {
+        stripe.held.started.notified().await;
+        let result = stripe::create_payment_link(&ctx, &product, &offer_id, &request).await;
+        stripe.held.release.notify_one();
+        result
+    };
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("the second retry must meet the first in flight at Stripe");
+    let first = first.expect("the executing retry records the link");
+    second.expect_err("the conflicting retry reports the conflict");
+
+    let stored = repo::payment_links::get_for_offer(&ctx, &offer_id, &first.id)
+        .await
+        .unwrap();
+    assert!(
+        stored.managed.active,
+        "a 409 must not retire the row its twin records the link on"
+    );
+    assert_eq!(stored.managed.sync_status, "synced");
+    let again = stripe::create_payment_link(&ctx, &product, &offer_id, &request)
+        .await
+        .expect("the recorded link is reused");
+    assert_eq!(again.id, first.id);
+    assert_eq!(stripe.links_created.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn typed_checkout_can_use_validated_named_preset_without_runtime_inputs() {
     let mut ctx = ctx_with(&[

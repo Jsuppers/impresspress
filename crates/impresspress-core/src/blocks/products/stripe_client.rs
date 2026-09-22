@@ -151,11 +151,12 @@ impl StripeClient {
 
 /// The one place a Stripe HTTP status becomes an error code.
 ///
-/// 429 and 5xx are ambiguous: Stripe may have applied the mutation before
-/// failing, so they classify like a transport failure (`Internal`) — callers
-/// keep their durable claim and retry with the same idempotency key. Only the
-/// remaining 4xx responses are deterministic rejections that terminally fail
-/// an operation.
+/// 409, 429 and 5xx are ambiguous, so they classify like a transport failure
+/// (`Internal`) — callers keep their durable claim and retry with the same
+/// idempotency key. A 5xx may have applied the mutation before failing; a 409
+/// means another request under the same key is still executing and its
+/// outcome is not known yet. Only the remaining 4xx responses are definite
+/// rejections that terminally fail an operation.
 ///
 /// The provider's own body is logged, never returned: it can name the
 /// connected account and the request's parameters, and this error reaches a
@@ -169,7 +170,7 @@ fn classify(path: &str, status_code: u16, body: &[u8]) -> WaferError {
         body = %String::from_utf8_lossy(body),
         "Stripe request failed"
     );
-    if status_code == 429 || status_code >= 500 {
+    if matches!(status_code, 409 | 429) || status_code >= 500 {
         return WaferError::new(
             ErrorCode::Internal,
             format!("Stripe request could not be completed (HTTP {status_code}, code {code})"),
