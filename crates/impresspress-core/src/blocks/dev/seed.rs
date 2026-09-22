@@ -221,15 +221,22 @@ pub const DATA_CONTENT_TYPE: &str = "application/json";
 /// over a bundle whose own importer then rejects it — on a cold boot, where
 /// the refusal leaves the imported instance's site empty.
 ///
-/// Sized for a shop, not for an editable file. The snapshot carries every row
+/// Sized for a shop, not for an editable file: the snapshot carries every row
 /// of the exported tables — each account with its credentials and role, each
 /// product with its offers — so a limit on the scale of
 /// [`paths::MAX_FILE_BYTES`] would refuse an ordinary shop of a few hundred
-/// accounts. 8 MiB of compact JSON is over a thousand products or several
-/// thousand accounts, and still small for the service worker that imports it:
-/// the fetched bytes are dropped once they are parsed, so the peak is the
-/// bytes plus the parsed rows, briefly.
-pub const MAX_DATA_BYTES: usize = 8 * 1024 * 1024;
+/// accounts.
+///
+/// What bounds it from above is write cost, not memory. [`data_snapshot::import`]
+/// applies the snapshot one row per database call, and in the browser every
+/// call that returns has saved the WHOLE sql.js database to OPFS
+/// (`dbFlush` in `impresspress-browser`'s `bridge.js`). An import therefore
+/// writes roughly rows × database size, on the imported instance's cold boot,
+/// and that product grows with the square of the snapshot: at 2 MiB it is on
+/// the order of gigabytes, where 8 MiB would be on the order of a hundred.
+/// Raising the limit depends on a multi-row write in wafer-run's database
+/// interface, which today takes one row per call.
+pub const MAX_DATA_BYTES: usize = 2 * 1024 * 1024;
 
 /// The short workspace name of a registered block (`site/hello` → `hello`).
 ///
