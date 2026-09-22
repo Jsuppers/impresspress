@@ -1644,6 +1644,11 @@ pub struct ProviderReconcileResult {
     pub succeeded: u64,
     pub retry_scheduled: u64,
     pub dead_letter: u64,
+    /// Operations whose state could not be written; a later run retries them.
+    // A claim, dead-letter or outcome write that failed. The operation keeps
+    // its previous state (a lost outcome leaves it leased until the lease
+    // lapses) and each failure is logged with its operation id.
+    pub unrecorded: u64,
 }
 
 // ---------------------------------------------------------------------------

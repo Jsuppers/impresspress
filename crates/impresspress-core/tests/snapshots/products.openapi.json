@@ -5453,13 +5453,20 @@
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
+                  },
+                  "unrecorded": {
+                    "description": "Operations whose state could not be written; a later run retries them.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
                   }
                 },
                 "required": [
                   "claimed",
                   "succeeded",
                   "retry_scheduled",
-                  "dead_letter"
+                  "dead_letter",
+                  "unrecorded"
                 ],
                 "title": "ProviderReconcileResult",
                 "type": "object"

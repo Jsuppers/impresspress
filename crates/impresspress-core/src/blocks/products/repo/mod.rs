@@ -28,6 +28,18 @@ pub(crate) mod variables;
 
 use super::contracts::SubscriptionStatus;
 
+/// Attempts a leased unit of Stripe work gets before it dead-letters for
+/// operator review. One budget for both leased queues: webhook events
+/// (`stripe.rs`) and provider operations (`provider_operations`).
+pub(crate) const MAX_ATTEMPTS: u64 = 8;
+
+/// Local backoff after failed attempt number `attempts` (1-based):
+/// `30 · 2^(attempts-1)` seconds, capped at one hour.
+pub(crate) fn retry_delay_seconds(attempts: u64) -> i64 {
+    let exponent = attempts.saturating_sub(1).min(7) as u32;
+    (30_i64.saturating_mul(2_i64.pow(exponent))).min(3600)
+}
+
 // `subscription_status_rank` and `subscription_status_is_terminal` lived here
 // as `&str` functions, and the two spellings of the terminal state met in the
 // first one's `"canceled" | "cancelled"` arm. Both are methods on

@@ -8065,3 +8065,177 @@ async fn payment_link_account_mismatch_is_500_not_a_wrap_denial() {
         "a mismatched delivery must not create an order"
     );
 }
+
+/// Seed a `charge.refunded` event (for an unknown PaymentIntent, so
+/// processing it is a no-op) whose last attempt died holding the processing
+/// lease: `processing`, the whole budget spent, the lease long lapsed.
+/// Returns the event `webhook_msg` redelivers — the stored hash is of the
+/// exact bytes it sends, so the redelivery and a replay both match.
+async fn seed_event_out_of_attempts(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+) -> serde_json::Value {
+    use base64ct::{Base64, Encoding};
+
+    let event = serde_json::json!({
+        "id": id,
+        "type": "charge.refunded",
+        "livemode": false,
+        "data": { "object": { "payment_intent": "pi_lapsed_unknown", "livemode": false } }
+    });
+    let payload = serde_json::to_vec(&event).unwrap();
+    seed(
+        ctx,
+        "impresspress__products__stripe_events",
+        id,
+        HashMap::from([
+            (
+                "event_type".to_string(),
+                serde_json::json!("charge.refunded"),
+            ),
+            ("status".to_string(), serde_json::json!("processing")),
+            (
+                "attempts".to_string(),
+                serde_json::json!(repo::MAX_ATTEMPTS),
+            ),
+            (
+                "processing_owner".to_string(),
+                serde_json::json!("crashed-worker"),
+            ),
+            (
+                "processing_started_at".to_string(),
+                serde_json::json!(
+                    (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()
+                ),
+            ),
+            (
+                "payload_sha256".to_string(),
+                serde_json::json!(sha256_hex(&payload)),
+            ),
+            (
+                "payload_base64".to_string(),
+                serde_json::json!(Base64::encode_string(&payload)),
+            ),
+            (
+                "last_error".to_string(),
+                serde_json::json!("refund ledger unavailable"),
+            ),
+        ]),
+    )
+    .await;
+    event
+}
+
+/// An event whose last attempt died holding the processing lease has no
+/// outcome recorded. When a redelivery finds the budget spent, the webhook
+/// acknowledges it — Stripe then stops redelivering — so the row must be
+/// `dead_letter` with its reason by then: a row left `processing` can never
+/// be replayed from the admin queue.
+#[tokio::test]
+async fn an_event_out_of_attempts_on_a_lapsed_lease_is_dead_lettered_and_replayable() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let event = seed_event_out_of_attempts(&ctx, "evt_lapsed_last_attempt").await;
+
+    let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(
+        body,
+        serde_json::json!({ "received": true, "dead_letter": true })
+    );
+
+    let row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_lapsed_last_attempt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        row.data["status"], "dead_letter",
+        "an acknowledged event must not be left processing"
+    );
+    let reason = row.str_field("last_error");
+    assert!(
+        reason.contains("retry budget") && reason.contains("expired"),
+        "the reason must say the budget ran out on a lapsed lease: {reason:?}"
+    );
+    assert!(
+        reason.contains("refund ledger unavailable"),
+        "the earlier attempts' error must survive: {reason:?}"
+    );
+    assert!(!row.str_field("terminal_at").is_empty());
+    assert_eq!(row.str_field("processing_owner"), "");
+
+    let (replay, input) = admin_create_msg(
+        "/b/products/api/admin/webhook-events/evt_lapsed_last_attempt/replay",
+        serde_json::json!({}),
+    );
+    let replayed = output_to_json(dispatch(&ctx, replay, input).await).await;
+    assert_eq!(replayed["received"], true, "replay refused: {replayed}");
+    let row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_lapsed_last_attempt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(row.data["status"], "processed");
+}
+
+/// Two redeliveries of an out-of-budget event both read the row before
+/// either writes. Only the one whose dead-letter write still matches the row
+/// it read acknowledges; the other finds the row moved under it and must ask
+/// Stripe to retry (500) rather than acknowledge an outcome it did not
+/// record — and must leave the winner's row as the winner wrote it.
+#[tokio::test]
+async fn a_redelivery_that_loses_the_dead_letter_race_is_retried_not_acknowledged() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    let event = seed_event_out_of_attempts(&ctx, "evt_dead_letter_race").await;
+    // Each delivery's one `get` of the row is held until both have made it,
+    // so both read owner `crashed-worker` before either writes.
+    let racing = crate::test_support::RendezvousDbOpContext::new(
+        ctx.clone(),
+        "database.get",
+        "impresspress__products__stripe_events",
+        2,
+    );
+    let (first, first_input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let (second, second_input) = webhook_msg(&event, WEBHOOK_SECRET);
+    let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            dispatch(&racing, first, first_input),
+            dispatch(&racing, second, second_input),
+        )
+    })
+    .await
+    .expect("both deliveries must pass the rendezvous");
+    let mut statuses = vec![
+        crate::test_support::output_http_status(left).await,
+        crate::test_support::output_http_status(right).await,
+    ];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        vec![200, 500],
+        "exactly one delivery acknowledges; the loser is retried"
+    );
+
+    let row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_dead_letter_race",
+    )
+    .await
+    .unwrap();
+    assert_eq!(row.data["status"], "dead_letter");
+    assert_eq!(row.str_field("processing_owner"), "");
+    assert!(row.str_field("last_error").contains("retry budget"));
+}

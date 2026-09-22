@@ -6561,6 +6561,11 @@ export interface paths {
                             retry_scheduled: number;
                             /** Format: uint64 */
                             succeeded: number;
+                            /**
+                             * Format: uint64
+                             * @description Operations whose state could not be written; a later run retries them.
+                             */
+                            unrecorded: number;
                         };
                     };
                 };

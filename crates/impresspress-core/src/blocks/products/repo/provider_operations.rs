@@ -9,6 +9,7 @@ use wafer_block::{
 use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
+use super::{retry_delay_seconds, MAX_ATTEMPTS};
 use crate::{
     blocks::products::contracts::OperationStatus,
     util::{enum_column, wire_str, RecordExt},
@@ -17,7 +18,6 @@ use crate::{
 pub(crate) const TABLE: &str = "impresspress__products__provider_operations";
 pub(crate) const REFUND_RECONCILE: &str = "refund.reconcile";
 const LEASE_SECONDS: i64 = 300;
-const MAX_ATTEMPTS: u64 = 8;
 
 /// The `status` column of an operation row, as the enum that defines it.
 fn status_of(record: &Record) -> Result<OperationStatus, WaferError> {
@@ -30,15 +30,36 @@ pub(crate) struct OperationClaim {
     pub attempts: u64,
 }
 
+/// What one [`claim_due`] pass did with the due rows it looked at.
+pub(crate) struct ClaimBatch {
+    /// Rows this pass now holds the lease on.
+    pub claims: Vec<OperationClaim>,
+    /// Rows found out of attempts and moved to `dead_letter` instead.
+    pub dead_lettered: u64,
+    /// Rows whose claim or dead-letter write failed, by id. They keep the
+    /// state they had and are looked at again by the next pass.
+    pub failures: Vec<(String, WaferError)>,
+}
+
+/// Outcome of [`claim_one`] for a single candidate row.
+enum Candidate {
+    Claimed(OperationClaim),
+    DeadLettered,
+    /// Not due, or another worker changed the row first.
+    Skipped,
+}
+
+/// Whether [`mark_retry`] scheduled another attempt or spent the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryRecorded {
+    Scheduled,
+    DeadLettered,
+}
+
 fn timestamp(record: &Record, field: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(record.str_field(field))
         .ok()
         .map(|value| value.with_timezone(&chrono::Utc))
-}
-
-fn retry_delay_seconds(attempts: u64) -> i64 {
-    let exponent = attempts.saturating_sub(1).min(7) as u32;
-    (30_i64.saturating_mul(2_i64.pow(exponent))).min(3600)
 }
 
 pub(crate) async fn ensure(
@@ -148,9 +169,28 @@ pub(crate) async fn list(
     .await
 }
 
-async fn dead_letter_unclaimed(ctx: &dyn Context, record: &Record) -> Result<(), WaferError> {
+/// Move a row that is out of attempts to `dead_letter`, recording why. `true`
+/// when this call moved it; `false` when another worker changed it first.
+async fn dead_letter_unclaimed(
+    ctx: &dyn Context,
+    record: &Record,
+    status: OperationStatus,
+) -> Result<bool, WaferError> {
     let now = chrono::Utc::now().to_rfc3339();
-    db::update_by_filters_count(
+    let attempts = record.u64_field("attempts");
+    let mut reason = match status {
+        OperationStatus::Processing => format!(
+            "retry budget of {MAX_ATTEMPTS} attempts exhausted: the lease of attempt {attempts} \
+             expired without recording an outcome"
+        ),
+        _ => format!("retry budget of {MAX_ATTEMPTS} attempts exhausted after {attempts} attempts"),
+    };
+    let previous = record.str_field("last_error");
+    if !previous.is_empty() {
+        reason.push_str("; last recorded error: ");
+        reason.push_str(previous);
+    }
+    let rows = db::update_by_filters_count(
         ctx,
         TABLE,
         vec![
@@ -162,7 +202,7 @@ async fn dead_letter_unclaimed(ctx: &dyn Context, record: &Record) -> Result<(),
             Filter {
                 field: "status".to_string(),
                 operator: FilterOp::Equal,
-                value: serde_json::json!(wire_str(&status_of(record)?)),
+                value: serde_json::json!(wire_str(&status)),
             },
             Filter {
                 field: "processing_owner".to_string(),
@@ -178,18 +218,22 @@ async fn dead_letter_unclaimed(ctx: &dyn Context, record: &Record) -> Result<(),
             ("processing_owner".to_string(), serde_json::json!("")),
             ("processing_started_at".to_string(), serde_json::Value::Null),
             ("next_attempt_at".to_string(), serde_json::Value::Null),
+            (
+                "last_error".to_string(),
+                serde_json::json!(reason.chars().take(1000).collect::<String>()),
+            ),
             ("terminal_at".to_string(), serde_json::json!(&now)),
             ("updated_at".to_string(), serde_json::json!(&now)),
         ]),
     )
     .await?;
-    Ok(())
+    Ok(rows == 1)
 }
 
-pub(crate) async fn claim_due(
-    ctx: &dyn Context,
-    limit: usize,
-) -> Result<Vec<OperationClaim>, WaferError> {
+/// Lease up to `limit` due rows. One row's failed write does not stop the
+/// pass: it is reported in [`ClaimBatch::failures`] and the rest are still
+/// claimed, so a single bad row cannot starve the queue behind it.
+pub(crate) async fn claim_due(ctx: &dyn Context, limit: usize) -> Result<ClaimBatch, WaferError> {
     let now_value = chrono::Utc::now();
     let candidates = db::list(
         ctx,
@@ -215,75 +259,105 @@ pub(crate) async fn claim_due(
     )
     .await?
     .records;
-    let mut claimed = Vec::new();
+    let mut batch = ClaimBatch {
+        claims: Vec::new(),
+        dead_lettered: 0,
+        failures: Vec::new(),
+    };
     for record in candidates {
-        if claimed.len() >= limit {
+        if batch.claims.len() >= limit {
             break;
         }
-        let eligible = match status_of(&record)? {
-            OperationStatus::Pending | OperationStatus::Failed => {
-                timestamp(&record, "next_attempt_at").is_none_or(|next| next <= now_value)
-            }
-            OperationStatus::Processing => {
-                timestamp(&record, "processing_started_at").is_none_or(|started| {
-                    now_value.signed_duration_since(started).num_seconds() >= LEASE_SECONDS
-                })
-            }
-            // Terminal, and the query above does not select them anyway.
-            OperationStatus::Succeeded | OperationStatus::DeadLetter => false,
-        };
-        if !eligible {
-            continue;
-        }
-        let attempts = record.u64_field("attempts").saturating_add(1);
-        if attempts > MAX_ATTEMPTS {
-            dead_letter_unclaimed(ctx, &record).await?;
-            continue;
-        }
-        let owner = uuid::Uuid::now_v7().to_string();
-        let now = now_value.to_rfc3339();
-        let rows = db::update_by_filters_count(
-            ctx,
-            TABLE,
-            vec![
-                Filter {
-                    field: "id".to_string(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(&record.id),
-                },
-                Filter {
-                    field: "status".to_string(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(wire_str(&status_of(&record)?)),
-                },
-                Filter {
-                    field: "processing_owner".to_string(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(record.str_field("processing_owner")),
-                },
-            ],
-            HashMap::from([
-                (
-                    "status".to_string(),
-                    serde_json::json!(OperationStatus::Processing),
-                ),
-                ("attempts".to_string(), serde_json::json!(attempts)),
-                ("processing_owner".to_string(), serde_json::json!(&owner)),
-                ("processing_started_at".to_string(), serde_json::json!(&now)),
-                ("next_attempt_at".to_string(), serde_json::Value::Null),
-                ("updated_at".to_string(), serde_json::json!(&now)),
-            ]),
-        )
-        .await?;
-        if rows == 1 {
-            claimed.push(OperationClaim {
-                record: db::get(ctx, TABLE, &record.id).await?,
-                owner,
-                attempts,
-            });
+        let id = record.id.clone();
+        match claim_one(ctx, record, now_value).await {
+            Ok(Candidate::Claimed(claim)) => batch.claims.push(claim),
+            Ok(Candidate::DeadLettered) => batch.dead_lettered += 1,
+            Ok(Candidate::Skipped) => {}
+            Err(error) => batch.failures.push((id, error)),
         }
     }
-    Ok(claimed)
+    Ok(batch)
+}
+
+async fn claim_one(
+    ctx: &dyn Context,
+    record: Record,
+    now_value: chrono::DateTime<chrono::Utc>,
+) -> Result<Candidate, WaferError> {
+    let status = status_of(&record)?;
+    let eligible = match status {
+        OperationStatus::Pending | OperationStatus::Failed => {
+            timestamp(&record, "next_attempt_at").is_none_or(|next| next <= now_value)
+        }
+        OperationStatus::Processing => {
+            timestamp(&record, "processing_started_at").is_none_or(|started| {
+                now_value.signed_duration_since(started).num_seconds() >= LEASE_SECONDS
+            })
+        }
+        // Terminal, and the query above does not select them anyway.
+        OperationStatus::Succeeded | OperationStatus::DeadLetter => false,
+    };
+    if !eligible {
+        return Ok(Candidate::Skipped);
+    }
+    let attempts = record.u64_field("attempts").saturating_add(1);
+    if attempts > MAX_ATTEMPTS {
+        return Ok(if dead_letter_unclaimed(ctx, &record, status).await? {
+            Candidate::DeadLettered
+        } else {
+            Candidate::Skipped
+        });
+    }
+    let owner = uuid::Uuid::now_v7().to_string();
+    let now = now_value.to_rfc3339();
+    let claimed_fields = HashMap::from([
+        (
+            "status".to_string(),
+            serde_json::json!(OperationStatus::Processing),
+        ),
+        ("attempts".to_string(), serde_json::json!(attempts)),
+        ("processing_owner".to_string(), serde_json::json!(&owner)),
+        ("processing_started_at".to_string(), serde_json::json!(&now)),
+        ("next_attempt_at".to_string(), serde_json::Value::Null),
+        ("updated_at".to_string(), serde_json::json!(&now)),
+    ]);
+    let rows = db::update_by_filters_count(
+        ctx,
+        TABLE,
+        vec![
+            Filter {
+                field: "id".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(&record.id),
+            },
+            Filter {
+                field: "status".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(wire_str(&status)),
+            },
+            Filter {
+                field: "processing_owner".to_string(),
+                operator: FilterOp::Equal,
+                value: serde_json::json!(record.str_field("processing_owner")),
+            },
+        ],
+        claimed_fields.clone(),
+    )
+    .await?;
+    if rows != 1 {
+        return Ok(Candidate::Skipped);
+    }
+    // The CAS matched the row exactly as read, so the row now IS the read
+    // plus the fields just written. Building it here rather than reading it
+    // back means nothing can fail between taking the lease and handing it to
+    // the caller, which would strand the row leased with an attempt spent.
+    let mut record = record;
+    record.data.extend(claimed_fields);
+    Ok(Candidate::Claimed(OperationClaim {
+        record,
+        owner,
+        attempts,
+    }))
 }
 
 pub(crate) async fn mark_completed(
@@ -342,13 +416,16 @@ pub(crate) async fn mark_completed(
     }
 }
 
+/// Record a failed attempt under the caller's lease: another attempt is
+/// scheduled with backoff, or the row dead-letters when `attempts` was the
+/// last of [`MAX_ATTEMPTS`].
 pub(crate) async fn mark_retry(
     ctx: &dyn Context,
     id: &str,
     owner: &str,
     attempts: u64,
     message: &str,
-) -> Result<(), WaferError> {
+) -> Result<RetryRecorded, WaferError> {
     let now = chrono::Utc::now();
     let dead_letter = attempts >= MAX_ATTEMPTS;
     let rows = db::update_by_filters_count(
@@ -411,14 +488,17 @@ pub(crate) async fn mark_retry(
         ]),
     )
     .await?;
-    if rows == 1 {
-        Ok(())
-    } else {
-        Err(WaferError::new(
+    if rows != 1 {
+        return Err(WaferError::new(
             ErrorCode::FailedPrecondition,
             "provider-operation lease was lost before retry was recorded",
-        ))
+        ));
     }
+    Ok(if dead_letter {
+        RetryRecorded::DeadLettered
+    } else {
+        RetryRecorded::Scheduled
+    })
 }
 
 pub(crate) async fn resolve_unleased(
