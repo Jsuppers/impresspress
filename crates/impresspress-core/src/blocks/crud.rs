@@ -210,7 +210,9 @@ pub async fn taken_key_or_db_error(
     context: &str,
 ) -> OutputStream {
     match error.code {
-        // Already classified by the backend — nothing left to find out.
+        // For a backend that classifies the violation itself. No backend at
+        // the current wafer pin does: they answer `Internal`, which the arm
+        // below settles by re-reading the key.
         ErrorCode::AlreadyExists => return err_conflict(conflict),
         // The two codes a constraint violation can arrive as unclassified.
         ErrorCode::Internal | ErrorCode::Aborted => {}

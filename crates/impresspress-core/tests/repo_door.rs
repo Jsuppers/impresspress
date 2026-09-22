@@ -309,16 +309,38 @@ fn sources(walk: &SourceWalk) -> Vec<(String, String)> {
 /// Every file the walk reaches, as `(path, code, names)`: [`sources`]'s pair
 /// plus what the raw text names once its `use` items are resolved
 /// ([`Names`]). Parsed from the raw text, not the comment-stripped code, so
-/// the parse sees the file the compiler sees.
-fn parsed(walk: &SourceWalk) -> Vec<(String, String, Names)> {
-    walk.collect()
-        .into_iter()
-        .map(|file| {
-            let names = Names::parse(&file.rel, &file.text);
-            let code = strip_line_comments(&file.text);
-            (file.rel, code, names)
+/// the parse sees the file the compiler sees, and parsed once per test
+/// binary: every test that reads it shares the one walk.
+fn parsed() -> &'static [(String, String, Names)] {
+    static PARSED: std::sync::OnceLock<Vec<(String, String, Names)>> = std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        let files = scan().collect();
+        // `syn` in a debug test build takes seconds over the whole crate on
+        // one thread; the files are independent, so parse them across all.
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let chunk = files.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = files
+                .chunks(chunk)
+                .map(|batch| {
+                    scope.spawn(move || {
+                        batch
+                            .iter()
+                            .map(|file| {
+                                let names = Names::parse(&file.rel, &file.text);
+                                let code = strip_line_comments(&file.text);
+                                (file.rel.clone(), code, names)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("a parse worker panicked"))
+                .collect()
         })
-        .collect()
+    })
 }
 
 /// Whether `path` (relative to `src`) is one of `allowlist`'s entries.
@@ -1233,37 +1255,71 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
 
 /// What one source file's code names, resolved through its `use` items.
 ///
-/// Parsed, not pattern-matched: `syn` reads every `use` tree into the names
-/// it binds and the globs it opens, and the file's token stream supplies
-/// every path the code spells — comments and string literals are not tokens,
-/// so neither can name anything. An import is resolved the way the compiler
-/// would read it: `user_roles::{self as ur}` binds `ur`, `use ur::{TABLE}`
-/// then binds `TABLE` through `ur`, and `user_roles::{*}` opens a glob.
+/// Parsed, not pattern-matched: `syn` reads the file into its scopes — the
+/// file itself, each inline `mod`, each block — and records in each one the
+/// names its `use` items bind, the globs they open, the `const`/`static`
+/// items it defines, and every path its code spells. Paths inside macro
+/// arguments come from the macro's token stream; comments and string
+/// literals are not tokens, so neither can name anything. An import is
+/// resolved the way the compiler would read it: `user_roles::{self as ur}`
+/// binds `ur`, `use ur::{TABLE}` then binds `TABLE` through `ur`, and
+/// `user_roles::{*}` opens a glob.
+///
+/// A name is looked up in its own scope and every enclosing one, and a name
+/// bound more than once is resolved through every binding. That
+/// over-approximates (an inline `mod` does not really see its parent's
+/// imports), and deliberately: the gate is a ban, so a spelling it cannot
+/// place must count against the file rather than slip past it.
 struct Names {
-    /// Every maximal `a::b::c` path in the token stream, and whether a `::`
-    /// came before its first segment (`<T>::TABLE`, `::TABLE`), which makes a
-    /// one-segment path something other than a bare name in scope.
-    paths: Vec<(Vec<String>, bool)>,
-    /// Name bound by a `use` → the path it binds.
-    bindings: std::collections::HashMap<String, Vec<String>>,
+    scopes: Vec<Scope>,
+    /// Every path the file spells or imports, in every form it resolves to
+    /// ([`Names::resolve`]) — computed once, since it does not depend on
+    /// which constant is being asked about.
+    resolved: std::collections::HashSet<Vec<String>>,
+}
+
+#[derive(Default)]
+struct Scope {
+    parent: Option<usize>,
+    /// Name bound by a `use` → every path it is bound to in this scope.
+    bindings: std::collections::HashMap<String, Vec<Vec<String>>>,
     /// The module paths opened by a `use …::*`.
     globs: Vec<Vec<String>>,
-    /// `const` / `static` items the file defines: a bare name the file
-    /// defines itself is its own, never a glob's.
+    /// `const` / `static` items this scope defines: an explicit item beats a
+    /// glob of the same name in the same scope and every scope inside it.
     own_items: std::collections::HashSet<String>,
+    /// Every path the scope's code spells, and whether it is qualified by
+    /// something that is not a path segment (`::TABLE`, `<T>::TABLE`), which
+    /// makes a one-segment path something other than a bare name in scope.
+    paths: Vec<(Vec<String>, bool)>,
+    /// The names the scope's code spells bare (one segment, unqualified).
+    bare: std::collections::HashSet<String>,
+    /// `globs`, each in every form it resolves to.
+    resolved_globs: Vec<Vec<String>>,
 }
 
 impl Names {
     fn parse(rel: &str, text: &str) -> Self {
         use syn::visit::Visit;
 
-        #[derive(Default)]
-        struct Items {
-            bindings: std::collections::HashMap<String, Vec<String>>,
-            globs: Vec<Vec<String>>,
-            own_items: std::collections::HashSet<String>,
+        struct Builder {
+            scopes: Vec<Scope>,
+            current: usize,
         }
-        impl Items {
+        impl Builder {
+            fn scoped(&mut self, visit: impl FnOnce(&mut Self)) {
+                let outer = self.current;
+                self.scopes.push(Scope {
+                    parent: Some(outer),
+                    ..Scope::default()
+                });
+                self.current = self.scopes.len() - 1;
+                visit(self);
+                self.current = outer;
+            }
+            fn scope(&mut self) -> &mut Scope {
+                &mut self.scopes[self.current]
+            }
             fn tree(&mut self, prefix: &mut Vec<String>, tree: &syn::UseTree) {
                 match tree {
                     syn::UseTree::Path(p) => {
@@ -1273,7 +1329,10 @@ impl Names {
                     }
                     syn::UseTree::Name(n) => self.bind(prefix, &n.ident, None),
                     syn::UseTree::Rename(r) => self.bind(prefix, &r.ident, Some(&r.rename)),
-                    syn::UseTree::Glob(_) => self.globs.push(prefix.clone()),
+                    syn::UseTree::Glob(_) => {
+                        let glob = prefix.clone();
+                        self.scope().globs.push(glob);
+                    }
                     syn::UseTree::Group(g) => {
                         for item in &g.items {
                             self.tree(prefix, item);
@@ -1282,77 +1341,164 @@ impl Names {
                 }
             }
             fn bind(&mut self, prefix: &[String], ident: &syn::Ident, rename: Option<&syn::Ident>) {
-                let path = if ident == "self" {
-                    prefix.to_vec()
-                } else {
-                    let mut p = prefix.to_vec();
-                    p.push(ident.to_string());
-                    p
-                };
+                let mut path = prefix.to_vec();
+                if ident != "self" {
+                    path.push(ident.to_string());
+                }
                 let Some(last) = path.last().cloned() else {
                     return;
                 };
                 let name = rename.map_or(last, ToString::to_string);
                 if name != "_" {
-                    self.bindings.insert(name, path);
+                    self.scope().bindings.entry(name).or_default().push(path);
                 }
             }
+            fn record(&mut self, path: &syn::Path, from: usize, pathed: bool) {
+                let segments = path
+                    .segments
+                    .iter()
+                    .skip(from)
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                self.scope().paths.push((segments, pathed));
+            }
         }
-        impl<'ast> Visit<'ast> for Items {
+        impl<'ast> Visit<'ast> for Builder {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                if item.content.is_some() {
+                    self.scoped(|b| syn::visit::visit_item_mod(b, item));
+                } else {
+                    syn::visit::visit_item_mod(self, item);
+                }
+            }
+            fn visit_block(&mut self, block: &'ast syn::Block) {
+                self.scoped(|b| syn::visit::visit_block(b, block));
+            }
             fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
                 self.tree(&mut Vec::new(), &item.tree);
             }
             fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-                self.own_items.insert(item.ident.to_string());
+                self.scope().own_items.insert(item.ident.to_string());
                 syn::visit::visit_item_const(self, item);
             }
             fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-                self.own_items.insert(item.ident.to_string());
+                self.scope().own_items.insert(item.ident.to_string());
                 syn::visit::visit_item_static(self, item);
+            }
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                self.record(path, 0, path.leading_colon.is_some());
+                syn::visit::visit_path(self, path);
+            }
+            fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+                match &expr.qself {
+                    // `<T as Trait>::NAME`: the segments after the qualified
+                    // self are the trait's, never a bare name in scope.
+                    Some(q) => {
+                        self.visit_type(&q.ty);
+                        self.record(&expr.path, q.position, true);
+                    }
+                    None => syn::visit::visit_expr_path(self, expr),
+                }
+            }
+            fn visit_type_path(&mut self, ty: &'ast syn::TypePath) {
+                match &ty.qself {
+                    Some(q) => {
+                        self.visit_type(&q.ty);
+                        self.record(&ty.path, q.position, true);
+                    }
+                    None => syn::visit::visit_type_path(self, ty),
+                }
+            }
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                let mut paths = Vec::new();
+                collect_paths(mac.tokens.clone(), &mut paths);
+                self.scope().paths.extend(paths);
+                syn::visit::visit_macro(self, mac);
             }
         }
 
         let file = syn::parse_file(text)
             .unwrap_or_else(|e| panic!("{rel}: the gate cannot read what it cannot parse: {e}"));
-        let mut items = Items::default();
-        items.visit_file(&file);
-
-        let tokens: proc_macro2::TokenStream = text
-            .parse()
-            .unwrap_or_else(|e| panic!("{rel}: does not tokenize: {e:?}"));
-        let mut paths = Vec::new();
-        collect_paths(tokens, &mut paths);
-        Names {
-            paths,
-            bindings: items.bindings,
-            globs: items.globs,
-            own_items: items.own_items,
+        let mut builder = Builder {
+            scopes: vec![Scope::default()],
+            current: 0,
+        };
+        builder.visit_file(&file);
+        let mut names = Names {
+            scopes: builder.scopes,
+            resolved: std::collections::HashSet::new(),
+        };
+        for at in 0..names.scopes.len() {
+            let scope = &names.scopes[at];
+            let spelled = scope.paths.iter().map(|(path, _)| path);
+            let imported = scope.bindings.values().flatten();
+            let resolved: Vec<Vec<String>> = spelled
+                .chain(imported)
+                .flat_map(|path| names.resolve(at, path))
+                .collect();
+            let bare = scope
+                .paths
+                .iter()
+                .filter(|(path, pathed)| !pathed && path.len() == 1)
+                .map(|(path, _)| path[0].clone())
+                .collect();
+            let resolved_globs = scope
+                .globs
+                .iter()
+                .flat_map(|glob| names.resolve(at, glob))
+                .collect();
+            names.resolved.extend(resolved);
+            names.scopes[at].bare = bare;
+            names.scopes[at].resolved_globs = resolved_globs;
         }
+        names
     }
 
-    /// `path` with its first segment replaced by what a `use` bound it to,
-    /// repeatedly, so an alias of an alias lands on the real module.
-    fn resolve(&self, path: &[String]) -> Vec<String> {
-        let mut path = path.to_vec();
-        for _ in 0..8 {
-            let Some(bound) = path.first().and_then(|head| self.bindings.get(head)) else {
-                break;
-            };
-            if bound.len() == 1 && bound[0] == path[0] {
-                break; // `use user_roles;` binds the name to itself
-            }
-            path = bound
-                .iter()
-                .cloned()
-                .chain(path[1..].iter().cloned())
-                .collect();
+    /// `scope` and every scope enclosing it, innermost first, as indices.
+    fn chain(&self, scope: usize) -> impl Iterator<Item = usize> + '_ {
+        std::iter::successors(Some(scope), |s| self.scopes[*s].parent)
+    }
+
+    /// Every path `path` can stand for in `scope`: itself, and — through each
+    /// binding of its first segment visible there — the bound path with the
+    /// rest appended, recursively, so an alias of an alias lands on the real
+    /// module. A leading `self::` / `super::` is dropped first; the scopes it
+    /// would pick are already on the chain being searched.
+    fn resolve(&self, scope: usize, path: &[String]) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        self.resolve_into(scope, path, 8, &mut out);
+        out
+    }
+
+    fn resolve_into(&self, scope: usize, path: &[String], depth: u8, out: &mut Vec<Vec<String>>) {
+        let start = path
+            .iter()
+            .take_while(|s| *s == "self" || *s == "super")
+            .count();
+        let path = &path[start..];
+        let Some(head) = path.first() else {
+            return;
+        };
+        out.push(path.to_vec());
+        if depth == 0 {
+            return;
         }
-        path
+        for bound in self
+            .chain(scope)
+            .filter_map(|s| self.scopes[s].bindings.get(head))
+            .flatten()
+        {
+            if bound.as_slice() == [head.clone()] {
+                continue; // `use user_roles;` binds the name to itself
+            }
+            let next: Vec<String> = bound.iter().chain(&path[1..]).cloned().collect();
+            self.resolve_into(scope, &next, depth - 1, out);
+        }
     }
 }
 
 /// Every maximal `ident (:: ident)*` run in `tokens`, descending into groups
-/// (macro arguments included), each with whether a `::` preceded it.
+/// (nested macro arguments included), each with whether a `::` preceded it.
 fn collect_paths(tokens: proc_macro2::TokenStream, out: &mut Vec<(Vec<String>, bool)>) {
     use proc_macro2::{Spacing, TokenTree};
     let trees: Vec<TokenTree> = tokens.into_iter().collect();
@@ -1389,14 +1535,15 @@ fn collect_paths(tokens: proc_macro2::TokenStream, out: &mut Vec<(Vec<String>, b
 }
 
 /// Whether the code `names` describes names `ident` — by its path
-/// (`user_roles::TABLE`), by an import that binds the constant or its
-/// module under any name (`user_roles::{self, TABLE}`,
+/// (`user_roles::TABLE`, `self::ur::TABLE`), by an import that binds the
+/// constant or its module under any name (`user_roles::{self, TABLE}`,
 /// `user_roles::{self as ur}` then `ur::TABLE`, `use ur::{TABLE}` then a bare
 /// `TABLE`), or by a glob (`user_roles::*` or `user_roles::{*}`, then a bare
-/// `TABLE` the file does not define itself). An `ident` with no `::`
-/// (`PRODUCT_TEMPLATES_TABLE`) is named by any path ending in it. A bare
-/// `TABLE` alone is not evidence of anything, every door names its own; the
-/// import is what attributes it.
+/// `TABLE` that no `const`/`static` between the use and the glob's scope
+/// shadows). An import names the constant even before a call site uses it.
+/// An `ident` with no `::` (`PRODUCT_TEMPLATES_TABLE`) is named by any path
+/// ending in it. A bare `TABLE` alone is not evidence of anything, every
+/// door names its own; the import is what attributes it.
 fn names_const(names: &Names, ident: &str) -> bool {
     let (module, name) = match ident.rsplit_once("::") {
         Some((module, name)) => (Some(module), name),
@@ -1409,25 +1556,31 @@ fn names_const(names: &Names, ident: &str) -> bool {
                 .zip(tail)
                 .all(|(a, b)| a == b)
     };
+    let tail: Vec<&str> = module.into_iter().chain([name]).collect();
+    if names.resolved.iter().any(|path| ends_with(path, &tail)) {
+        return true;
+    }
     let Some(module) = module else {
-        return names
-            .paths
-            .iter()
-            .any(|(path, _)| names.resolve(path).last().is_some_and(|last| last == name));
+        return false;
     };
-    let by_path = names
-        .paths
-        .iter()
-        .any(|(path, _)| ends_with(&names.resolve(path), &[module, name]));
-    let by_glob = names
-        .globs
-        .iter()
-        .any(|glob| ends_with(&names.resolve(glob), &[module]))
-        && !names.own_items.contains(name)
-        && names.paths.iter().any(|(path, pathed)| {
-            !pathed && path.len() == 1 && path[0] == name && !names.bindings.contains_key(name)
-        });
-    by_path || by_glob
+    // A bare `name` resolves to a glob of `module` when, walking outwards
+    // from the scope that spells it, a scope opening that glob comes before
+    // any scope that defines or imports `name` explicitly.
+    for (at, scope) in names.scopes.iter().enumerate() {
+        if !scope.bare.contains(name) {
+            continue;
+        }
+        for outer_at in names.chain(at) {
+            let outer = &names.scopes[outer_at];
+            if outer.own_items.contains(name) || outer.bindings.contains_key(name) {
+                break;
+            }
+            if outer.resolved_globs.iter().any(|g| ends_with(g, &[module])) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[test]
@@ -1523,6 +1676,32 @@ fn a_grouped_import_of_the_const_is_naming_it() {
             "use crate::platform_state::user_roles::*;\nconst TABLE: &str = \"t\";\nfn f() { db::list(ctx, TABLE); }",
             false,
         ),
+        // a later alias of the same name in another scope does not hide
+        // the first one
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { ur::TABLE; }\nmod tests { use crate::other as ur; }",
+            true,
+        ),
+        // a `const TABLE` in one module does not shadow a glob in another
+        (
+            "mod a { const TABLE: &str = \"t\"; }\nmod b { use crate::platform_state::user_roles::*; fn f() { db::list(ctx, TABLE); } }",
+            true,
+        ),
+        // ... but the module that defines its own `TABLE` uses its own
+        (
+            "mod a { const TABLE: &str = \"t\"; fn f() { db::list(ctx, TABLE); } }\nmod b { use crate::platform_state::user_roles::*; }",
+            false,
+        ),
+        // a glob inside a fn body reaches a bare name in that body
+        (
+            "fn f() { use crate::platform_state::user_roles::*; db::list(ctx, TABLE); }",
+            true,
+        ),
+        // `self::` in front of an alias
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { self::ur::TABLE; }",
+            true,
+        ),
         // comments and strings name nothing
         (
             "/* use crate::platform_state::user_roles::*; */\nfn f() { db::list(ctx, TABLE); }",
@@ -1548,7 +1727,7 @@ fn a_grouped_import_of_the_const_is_naming_it() {
 
 #[test]
 fn only_the_allowlist_names_a_platform_table_via_the_const() {
-    let parsed = parsed(&scan());
+    let parsed = parsed();
     for (door, _, consts, qualifier) in TABLES {
         let allowed = IDENT_ALLOWED
             .iter()
@@ -1575,7 +1754,7 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
 /// dead exemption: it silently pre-approves whatever that file does next.
 #[test]
 fn no_allowlist_entry_is_dead() {
-    let parsed = parsed(&scan());
+    let parsed = parsed();
     let sources: Vec<(String, String)> = parsed
         .iter()
         .map(|(path, src, _)| (path.clone(), src.clone()))
