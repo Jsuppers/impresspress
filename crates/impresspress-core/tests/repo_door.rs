@@ -1216,11 +1216,13 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ("llm_settings", &["blocks/llm/mod.rs"]),
 ];
 
-/// Whether `src` names `ident` — by its path (`user_roles::TABLE`), or by a
+/// Whether `src` names `ident` — by its path (`user_roles::TABLE`), by a
 /// grouped import that brings the constant in under its bare name
-/// (`user_roles::{self, TABLE}`, `user_roles::{TABLE as T}`) and so never
-/// spells the path at a call site. A bare `TABLE` alone is not evidence of
-/// anything, every door names its own; the group is what attributes it.
+/// (`user_roles::{self, TABLE}`, `user_roles::{TABLE as T}`), by a module
+/// alias (`user_roles as ur` then `ur::TABLE`), or by a glob import
+/// (`user_roles::*` then a bare `TABLE`). The last three never spell the path
+/// at a call site. A bare `TABLE` alone is not evidence of anything, every
+/// door names its own; the import is what attributes it.
 fn names_const(src: &str, ident: &str) -> bool {
     if src.contains(ident) {
         return true;
@@ -1229,6 +1231,49 @@ fn names_const(src: &str, ident: &str) -> bool {
         return false;
     };
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // Every word-bounded occurrence of `word` in `hay`, as byte offsets.
+    let words = |hay: &str, word: &str| -> Vec<usize> {
+        hay.match_indices(word)
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                !hay[..at].chars().next_back().is_some_and(is_word)
+                    && !hay[at + word.len()..].chars().next().is_some_and(is_word)
+            })
+            .collect()
+    };
+    // `module as alias`, at the top level of a `use` or inside a group:
+    // `alias::NAME` then names the constant.
+    for at in words(src, module) {
+        let rest = src[at + module.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix("as") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue; // `module asx`, not an alias
+        }
+        let alias: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|&c| is_word(c))
+            .collect();
+        if !alias.is_empty() && !words(src, &format!("{alias}::{name}")).is_empty() {
+            return true;
+        }
+    }
+    // `module::*`: every bare `NAME` in the file may be the glob's.
+    let globbed = words(src, module).into_iter().any(|at| {
+        src[at + module.len()..]
+            .trim_start()
+            .strip_prefix("::")
+            .is_some_and(|rest| rest.trim_start().starts_with('*'))
+    });
+    if globbed
+        && words(src, name)
+            .into_iter()
+            .any(|at| !src[..at].trim_end().ends_with("::"))
+    {
+        return true;
+    }
     let opener = format!("{module}::{{");
     let mut from = 0;
     while let Some(at) = src[from..].find(&opener) {
@@ -1308,6 +1353,40 @@ fn a_grouped_import_of_the_const_is_naming_it() {
         ),
         (
             "use crate::platform_state::user_roles::{self, other::{TABLE}};",
+            false,
+        ),
+        // a module alias, at the top level and inside a group
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { ur::TABLE; }",
+            true,
+        ),
+        (
+            "use crate::platform_state::{user_roles as ur, variables};\nfn f() { ur::TABLE; }",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles as ur;\nfn f() { ur::UserRoleRow; }",
+            false,
+        ),
+        (
+            "use crate::x::not_user_roles as ur;\nfn f() { ur::TABLE; }",
+            false,
+        ),
+        // a glob import, then the bare name
+        (
+            "use crate::platform_state::user_roles::*;\nfn f() { db::list(ctx, TABLE); }",
+            true,
+        ),
+        (
+            "use crate::platform_state::user_roles::*;\nfn f() { db::list(ctx, OTHER_TABLE); }",
+            false,
+        ),
+        (
+            "use crate::platform_state::user_roles::*;\nfn f() { other::TABLE; }",
+            false,
+        ),
+        (
+            "use crate::x::not_user_roles::*;\nfn f() { db::list(ctx, TABLE); }",
             false,
         ),
     ] {
