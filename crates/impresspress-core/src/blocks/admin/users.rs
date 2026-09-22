@@ -38,8 +38,12 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
             // the wire — the previous code echoed the whole row and removed one
             // field by name.
             let user_ids: Vec<&str> = page.rows.iter().map(|r| r.id.as_str()).collect();
-            let roles_by_user = ops::fetch_roles(ctx, &user_ids).await;
-            ok_json(&AdminUserListResponse::from_page(&page, &roles_by_user))
+            match ops::fetch_roles(ctx, &user_ids).await {
+                Ok(roles_by_user) => {
+                    ok_json(&AdminUserListResponse::from_page(&page, &roles_by_user))
+                }
+                Err(e) => db_error_internal(e, "Could not load the users' roles"),
+            }
         }
         // A `NotFound` from a paginated list is a missing table, not a
         // missing user — `db_error_internal`, not `db_error`.
@@ -61,10 +65,10 @@ async fn get_user(ctx: &dyn Context, id: &str) -> OutputStream {
     match users::find_by_id(ctx, id).await {
         Ok(Some(row)) => {
             // Get roles via the shared single-query helper.
-            let roles = ops::fetch_roles(ctx, &[id])
-                .await
-                .remove(id)
-                .unwrap_or_default();
+            let roles = match ops::fetch_roles(ctx, &[id]).await {
+                Ok(mut roles) => roles.remove(id).unwrap_or_default(),
+                Err(e) => return db_error_internal(e, "Could not load the user's roles"),
+            };
             // Same projection as the list endpoint. This path used to emit a
             // third shape — the raw `{id, data: {…}}` record with `roles`
             // grafted on beside `data` rather than inside it — so the two read
@@ -104,10 +108,18 @@ pub(super) async fn handle_update(
             // `verification_token` / `last_verification_sent` / `auth_version`
             // are not reachable from here at all — they used to ride along in
             // the raw record this handler echoed.
-            let roles = ops::fetch_roles(ctx, &[id])
-                .await
-                .remove(id)
-                .unwrap_or_default();
+            //
+            // The update has landed by now; a failed roles read still answers
+            // 500 rather than a view claiming the user holds no roles.
+            let roles = match ops::fetch_roles(ctx, &[id]).await {
+                Ok(mut roles) => roles.remove(id).unwrap_or_default(),
+                Err(e) => {
+                    return db_error_internal(
+                        e,
+                        "User updated, but their roles could not be loaded",
+                    )
+                }
+            };
             ok_json(&AdminUserView::from_row(&row, roles))
         }
         Err(out) => out,
@@ -181,6 +193,31 @@ mod tests {
             .await
             .expect("apply auth migrations");
         ctx
+    }
+
+    /// A user whose roles cannot be read is a 500, not `"roles": []`.
+    ///
+    /// `break_list_reads` keeps the single-row user read working and fails the
+    /// roles query, the shape a wobbling database gives this handler.
+    #[tokio::test]
+    async fn a_failed_roles_read_is_a_500_not_an_empty_roles_list() {
+        let ctx = users_ctx().await;
+        let id = seed_user(&ctx).await;
+        crate::platform_state::user_roles::assign(&ctx, &id, "admin", "")
+            .await
+            .expect("grant");
+        let failing = ctx.break_list_reads();
+
+        let msg = routed(admin_msg("retrieve", &format!("/b/admin/api/users/{id}")));
+        let out = wafer_run::Block::handle(
+            &crate::blocks::admin::AdminBlock::new(),
+            &failing,
+            msg,
+            InputStream::empty(),
+        )
+        .await;
+
+        assert_eq!(output_http_status(out).await, 500);
     }
 
     /// The field set the endpoint publishes is exactly the contract's, no more.

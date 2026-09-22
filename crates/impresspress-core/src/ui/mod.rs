@@ -539,7 +539,7 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
 /// target is then still there for the next request to swap into. An
 /// `innerHTML` swap would nest a second element with the same id, and a
 /// table-part target (`<tr>`, `<tbody>`) would get a `div` where the parser
-/// only allows rows. The status is 200 because htmx 2's default
+/// only allows rows — a `<tr>` target uses [`swap_error_row_response`]. The status is 200 because htmx 2's default
 /// `responseHandling` swaps only 2xx: a 5xx body would be dropped and the
 /// stale fragment left on screen, which is the stale state this exists to
 /// replace. `message` is shown in both places
@@ -548,6 +548,28 @@ pub fn swap_error_response(target_id: &str, message: &str) -> wafer_run::OutputS
     let markup = maud::html! {
         div id=(target_id) {
             div class="alert alert--error" role="alert" { (message) }
+        }
+    };
+    html_response_with_toast(markup, message, "error")
+}
+
+/// [`swap_error_response`] for a table row: the control swaps one `<tr>`
+/// (`hx-target="#<target_id>"`, `hx-swap="outerHTML"`), so the notice is a
+/// `<tr>` carrying `target_id`, with one cell spanning the table's `colspan`
+/// columns. A `div` there would be moved out of the table by the HTML parser,
+/// leaving the target gone and the notice outside the table.
+///
+/// Same status and toast as [`swap_error_response`], for the same reason.
+pub fn swap_error_row_response(
+    target_id: &str,
+    colspan: usize,
+    message: &str,
+) -> wafer_run::OutputStream {
+    let markup = maud::html! {
+        tr id=(target_id) {
+            td colspan=(colspan) {
+                div class="alert alert--error" role="alert" { (message) }
+            }
         }
     };
     html_response_with_toast(markup, message, "error")

@@ -34,7 +34,9 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     // to "how many keys are pinned" depend on which snapshot you asked.
     let rows = variables::list_all(ctx).await;
     let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
-    let upgrade_pins = bulk_release_count(rows.as_deref().unwrap_or_default(), offer_reset);
+    let upgrade_pins = rows
+        .as_deref()
+        .map_or(0, |rows| bulk_release_count(rows, offer_reset));
 
     html! {
         div .mb-3 .flex .gap-1 {
@@ -65,7 +67,10 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
             @if active_tab == "all" {
                 (config_all_tab(&rows, offer_reset))
             } @else {
-                (config_by_block_tab(ctx, rows.as_deref().unwrap_or_default(), offer_reset))
+                @match &rows {
+                    Ok(rows) => (config_by_block_tab(ctx, rows, offer_reset)),
+                    Err(e) => (variables_read_error(e)),
+                }
             }
         }
 
@@ -481,9 +486,9 @@ fn reset_to_environment_button(key: &str) -> Markup {
 /// read that could have moved.
 ///
 /// An unreadable table reaches this as no rows and so as no control, which is
-/// the honest answer: the "All Variables" tab reports the failure, and a bulk
-/// button drawn from a count nobody could take would offer work it has no
-/// evidence exists.
+/// the honest answer: both tabs report the failure in place of their tables,
+/// and a bulk button drawn from a count nobody could take would offer work it
+/// has no evidence exists.
 fn bulk_release_count(rows: &[variables::VariableRow], offer_reset: bool) -> usize {
     if !offer_reset {
         return 0;
@@ -588,10 +593,7 @@ fn declared_shared_keys() -> std::collections::HashSet<String> {
 /// "All Variables" tab -- flat table of all config variables from the DB.
 ///
 /// The rows and `offer_reset` are the caller's — see [`settings_body`], which
-/// takes each exactly once for the whole page. This tab keeps the `Result`
-/// rather than the rows, because it is the surface that REPORTS a failed read;
-/// the "By Block" tab renders declared vars whether or not the table can be
-/// listed, so it takes the rows alone.
+/// takes each exactly once for the whole page.
 fn config_all_tab(
     settings: &Result<Vec<variables::VariableRow>, WaferError>,
     offer_reset: bool,
@@ -669,20 +671,28 @@ fn config_all_tab(
                     .empty(html! { p .text-center .text-muted { "No variables are set." } })
                     .render())
             }
-            Err(e) => {
-                div .login-error { "Failed to load variables: " (e.message) }
-            }
+            Err(e) => (variables_read_error(e)),
         }
+    }
+}
+
+/// What either tab shows in place of its table when the variables table
+/// cannot be listed.
+///
+/// The "By Block" tab cannot fall back to the declared vars and their
+/// defaults: a declared var reads as "at its default, not pinned" there, so a
+/// failed read would tell the operator every value they set is gone.
+fn variables_read_error(e: &WaferError) -> Markup {
+    html! {
+        div .login-error { "Failed to load variables: " (e.message) }
     }
 }
 
 /// "By Block" tab -- groups config variables by owning block with WRAP access info.
 ///
 /// `all_vars` and `offer_reset` are the caller's — see [`settings_body`]. The
-/// rows arrive already unwrapped: this tab's subject is the DECLARED config
-/// vars, which it renders with their defaults whether or not the table could be
-/// listed, so an unreadable table is an empty overlay here rather than an error
-/// page. [`config_all_tab`] is the surface that reports the failure.
+/// rows arrive already read: a failed read never reaches this tab, because
+/// [`settings_body`] renders [`variables_read_error`] instead.
 fn config_by_block_tab(
     ctx: &dyn Context,
     all_vars: &[variables::VariableRow],
@@ -1209,6 +1219,23 @@ pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputS
 mod tests {
     use super::*;
     use crate::test_support::{admin_msg, output_html, TestContext};
+
+    /// The "By Block" tab (the default) reports a failed read as the "All
+    /// Variables" tab does, instead of listing every declared var at its
+    /// default, unpinned — which tells the operator every value they set is
+    /// gone.
+    #[tokio::test]
+    async fn the_by_block_tab_reports_a_failed_read_instead_of_defaults() {
+        let ctx = TestContext::with_admin().await.break_reads();
+
+        let html = variables_page_html(&ctx, "").await;
+
+        assert!(html.contains("Failed to load variables"), "{html}");
+        assert!(
+            !html.contains("WAFER_RUN_SHARED__APP_NAME"),
+            "a declared var rendered from its default: {html}"
+        );
+    }
 
     /// Serialize a rendered form the way a BROWSER would, so a test posts what
     /// a real submit posts.
