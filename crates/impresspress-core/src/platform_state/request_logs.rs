@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 use wafer_block::{
-    db::{Filter, FilterOp, FilterTree, ListOptions, SortField},
+    db::{Filter, FilterOp, ListOptions, SortField},
     wire::database as wire,
 };
 use wafer_core::clients::database as db;
@@ -24,14 +24,41 @@ use crate::util::{daily_grouped, to_wire_filters, RecordExt};
 
 pub const TABLE: &str = "impresspress__admin__request_logs";
 
+/// The lowest status code a row counts as an error at: every 4xx and 5xx.
+/// [`is_error_status`] and every reader's filter compare against it, and the
+/// `status` column's label is derived from it, so a row's label, the
+/// dashboard's error tiles, the network page's error column and the "Recent
+/// Errors" card cannot disagree about one row.
+pub const ERROR_STATUS_FLOOR: i64 = 400;
+
+/// Whether a response with this status code is an error row.
+pub fn is_error_status(status_code: i64) -> bool {
+    status_code >= ERROR_STATUS_FLOOR
+}
+
+/// The `status` column's label for a status code: `ERROR` for an error row
+/// ([`is_error_status`]), `OK` otherwise. Derived here, at the one place a
+/// row is encoded, so no writer can hand-write a label that contradicts the
+/// code. No reader selects on the label: it is a display column for the SQL
+/// explorer, and rows written before it was derived can carry a label that
+/// contradicts their code.
+pub fn status_label(status_code: i64) -> &'static str {
+    if is_error_status(status_code) {
+        "ERROR"
+    } else {
+        "OK"
+    }
+}
+
 /// One request-log row as the pipeline writes it. Bundled into a struct so
 /// `write_request_log` stays a two-argument call (the row shape is shared by
-/// the buffered response tail and the streamed-download branch).
+/// the buffered response tail and the streamed-download branch). It carries
+/// no label: [`to_data`](Self::to_data) derives the `status` column from
+/// `status_code`.
 pub struct NewRequestLog<'a> {
     pub method: &'a str,
     pub path: &'a str,
-    /// `OK` or `ERROR`; stored in the `status` column.
-    pub status_label: &'a str,
+    /// The status code the client was served.
     pub status_code: i64,
     pub error_message: &'a str,
     pub duration_ms: i64,
@@ -47,7 +74,7 @@ impl NewRequestLog<'_> {
         let mut data = HashMap::new();
         data.insert("method".to_string(), json!(self.method));
         data.insert("path".to_string(), json!(self.path));
-        data.insert("status".to_string(), json!(self.status_label));
+        data.insert("status".to_string(), json!(status_label(self.status_code)));
         data.insert("status_code".to_string(), json!(self.status_code));
         data.insert("duration_ms".to_string(), json!(self.duration_ms));
         data.insert("error_message".to_string(), json!(self.error_message));
@@ -133,11 +160,13 @@ fn newest_first() -> Vec<SortField> {
     }]
 }
 
+/// The one error predicate every reader filters on: [`is_error_status`] as
+/// a filter on the stored `status_code`.
 fn is_error() -> Filter {
     Filter {
-        field: "status".into(),
-        operator: FilterOp::Equal,
-        value: json!("ERROR"),
+        field: "status_code".into(),
+        operator: FilterOp::GreaterEqual,
+        value: json!(ERROR_STATUS_FLOOR),
     }
 }
 
@@ -184,8 +213,8 @@ pub async fn paginated(
     })
 }
 
-/// The `limit` most recent rows that answered with `status = ERROR` or a
-/// 4xx/5xx status code. The dashboard's "Recent Errors" card.
+/// The `limit` most recent error rows ([`is_error_status`]). The dashboard's
+/// "Recent Errors" card.
 pub async fn list_recent_errors(
     ctx: &dyn Context,
     limit: i64,
@@ -199,14 +228,7 @@ pub async fn list_recent_errors(
             "duration_ms".into(),
             "created_at".into(),
         ]),
-        filter_tree: Some(vec![FilterTree::Any(vec![
-            FilterTree::Leaf(is_error()),
-            FilterTree::Leaf(Filter {
-                field: "status_code".into(),
-                operator: FilterOp::GreaterEqual,
-                value: json!(400),
-            }),
-        ])]),
+        filters: vec![is_error()],
         sort: newest_first(),
         limit,
         skip_count: true,
@@ -295,11 +317,7 @@ pub async fn summarise_by_path(
                 alias: "avg_ms".into(),
             },
             wire::AggregateColumnDef::CaseWhenSum {
-                when: vec![wire::FilterNode::Leaf(wire::FilterDef {
-                    field: "status_code".into(),
-                    operator: "gte".into(),
-                    value: json!(400),
-                })],
+                when: to_wire_filters(&[is_error()]),
                 alias: "errors".into(),
             },
             wire::AggregateColumnDef::Max {
@@ -343,7 +361,7 @@ pub async fn summarise_by_path(
         .collect())
 }
 
-/// Requests, errors (`status = ERROR`) and mean duration since `since` (an
+/// Requests, errors ([`is_error_status`]) and mean duration since `since` (an
 /// ISO timestamp, the start of today) in one statement. The dashboard's
 /// header tiles.
 pub async fn today_counts(ctx: &dyn Context, since_iso: &str) -> Result<TodayCounts, WaferError> {
@@ -380,7 +398,7 @@ pub async fn today_counts(ctx: &dyn Context, since_iso: &str) -> Result<TodayCou
     })
 }
 
-/// Requests and errors per day since `since` (one entry per day that has
+/// Requests and errors ([`is_error_status`]) per day since `since` (one entry per day that has
 /// rows), from one grouped statement. The dashboard's request and error
 /// series come from the same rows.
 pub async fn daily_counts(
@@ -419,13 +437,16 @@ mod tests {
     use super::*;
     use crate::test_support::{FailingDbOpContext, TestContext};
 
-    fn probe<'a>(status: &'a str, status_code: i64, duration_ms: i64) -> NewRequestLog<'a> {
+    fn probe(status_code: i64, duration_ms: i64) -> NewRequestLog<'static> {
         NewRequestLog {
             method: "GET",
             path: "/probe",
-            status_label: status,
             status_code,
-            error_message: if status == "ERROR" { "boom" } else { "" },
+            error_message: if is_error_status(status_code) {
+                "boom"
+            } else {
+                ""
+            },
             duration_ms,
             client_ip: "203.0.113.7",
             user_id: "u-1",
@@ -450,9 +471,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_paginated_round_trip_every_column() {
         let ctx = TestContext::with_admin().await;
-        insert(&ctx, &probe("ERROR", 500, 42))
-            .await
-            .expect("insert");
+        insert(&ctx, &probe(500, 42)).await.expect("insert");
 
         let page = paginated(&ctx, 1, 20, "").await.expect("paginated");
         assert_eq!(page.total_count, 1);
@@ -471,7 +490,7 @@ mod tests {
         assert!(!row.created_at.is_empty());
         assert_eq!(row.created_at, row.updated_at);
 
-        let again = RequestLogRow::from_record(&row.id, &probe("ERROR", 500, 42).to_data());
+        let again = RequestLogRow::from_record(&row.id, &probe(500, 42).to_data());
         assert_eq!(again.status_code, 500);
         assert_eq!(again.method, "GET");
     }
@@ -482,15 +501,15 @@ mod tests {
     async fn insert_surfaces_write_errors() {
         let ctx = TestContext::with_admin().await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.create", TABLE)]);
-        assert!(insert(&failing, &probe("OK", 200, 1)).await.is_err());
+        assert!(insert(&failing, &probe(200, 1)).await.is_err());
     }
 
     #[tokio::test]
     async fn paginated_filters_on_the_path_and_pages_newest_first() {
         let ctx = TestContext::with_admin().await;
-        seed_at(&ctx, "r1", probe("OK", 200, 1), "2026-01-01T00:00:00Z").await;
-        seed_at(&ctx, "r2", probe("OK", 200, 1), "2026-01-02T00:00:00Z").await;
-        let mut other = probe("OK", 200, 1);
+        seed_at(&ctx, "r1", probe(200, 1), "2026-01-01T00:00:00Z").await;
+        seed_at(&ctx, "r2", probe(200, 1), "2026-01-02T00:00:00Z").await;
+        let mut other = probe(200, 1);
         other.path = "/other";
         seed_at(&ctx, "r3", other, "2026-01-03T00:00:00Z").await;
 
@@ -507,9 +526,9 @@ mod tests {
     #[tokio::test]
     async fn list_for_path_pages_one_path_newest_first() {
         let ctx = TestContext::with_admin().await;
-        seed_at(&ctx, "r1", probe("OK", 200, 1), "2026-01-01T00:00:00Z").await;
-        seed_at(&ctx, "r2", probe("OK", 200, 2), "2026-01-02T00:00:00Z").await;
-        let mut other = probe("OK", 200, 3);
+        seed_at(&ctx, "r1", probe(200, 1), "2026-01-01T00:00:00Z").await;
+        seed_at(&ctx, "r2", probe(200, 2), "2026-01-02T00:00:00Z").await;
+        let mut other = probe(200, 3);
         other.path = "/other";
         seed_at(&ctx, "r3", other, "2026-01-03T00:00:00Z").await;
 
@@ -550,16 +569,16 @@ mod tests {
             (today - chrono::Duration::days(29)).format("%Y-%m-%d")
         );
 
-        // Today 4 (durations 100/200/300/400, one ERROR); 10d ago 2 (ok,
+        // Today 4 (durations 100/200/300/400, one 500); 10d ago 2 (ok,
         // 50/50); 40d ago 5 (outside the 30-day window).
-        seed_at(&ctx, "r_t0", probe("OK", 200, 100), &at(0)).await;
-        seed_at(&ctx, "r_t1", probe("OK", 200, 200), &at(0)).await;
-        seed_at(&ctx, "r_t2", probe("OK", 200, 300), &at(0)).await;
-        seed_at(&ctx, "r_t3", probe("ERROR", 500, 400), &at(0)).await;
-        seed_at(&ctx, "r_10d_0", probe("OK", 200, 50), &at(10)).await;
-        seed_at(&ctx, "r_10d_1", probe("OK", 200, 50), &at(10)).await;
+        seed_at(&ctx, "r_t0", probe(200, 100), &at(0)).await;
+        seed_at(&ctx, "r_t1", probe(200, 200), &at(0)).await;
+        seed_at(&ctx, "r_t2", probe(200, 300), &at(0)).await;
+        seed_at(&ctx, "r_t3", probe(500, 400), &at(0)).await;
+        seed_at(&ctx, "r_10d_0", probe(200, 50), &at(10)).await;
+        seed_at(&ctx, "r_10d_1", probe(200, 50), &at(10)).await;
         for i in 0..5 {
-            seed_at(&ctx, &format!("r_40d_{i}"), probe("OK", 200, 999), &at(40)).await;
+            seed_at(&ctx, &format!("r_40d_{i}"), probe(200, 999), &at(40)).await;
         }
 
         // --- today's tile counts vs. separate per-filter counts ---
@@ -569,9 +588,9 @@ mod tests {
             value: serde_json::json!(&today_start),
         };
         let error_filter = Filter {
-            field: "status".into(),
-            operator: FilterOp::Equal,
-            value: serde_json::json!("ERROR"),
+            field: "status_code".into(),
+            operator: FilterOp::GreaterEqual,
+            value: serde_json::json!(400),
         };
         let requests_expected = db::count(&ctx, TABLE, std::slice::from_ref(&today_filter))
             .await
@@ -619,11 +638,94 @@ mod tests {
             .expect("filtered summary")
             .is_empty());
 
-        // --- recent errors: the ERROR row and nothing else ---
+        // --- recent errors: the 500 row and nothing else ---
         let recent = list_recent_errors(&ctx, 5).await.expect("recent errors");
         assert_eq!(
             recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["r_t3"]
         );
+    }
+
+    /// Every reader counts a row by its `status_code`, whatever its stored
+    /// label says. Rows the pipeline wrote before the label was derived carry
+    /// the code the client was served beside a hand-written label: a buffered
+    /// 500 page labelled `OK`, and an error answered with a sub-400 override
+    /// labelled `ERROR`. Reading the code classifies both by the response
+    /// that was actually sent, with no backfill.
+    #[tokio::test]
+    async fn every_reader_classifies_a_mislabelled_row_by_its_code() {
+        let ctx = TestContext::with_admin().await;
+        let today = chrono::Utc::now().date_naive();
+        let at = format!("{}T12:00:00", today.format("%Y-%m-%d"));
+        let today_start = format!("{}T00:00:00", today.format("%Y-%m-%d"));
+
+        let seed_labelled = |id: &'static str, code: i64, label: &'static str| {
+            let ctx = &ctx;
+            let at = at.clone();
+            async move {
+                let mut data = probe(code, 10).to_data();
+                data.insert("id".to_string(), serde_json::json!(id));
+                data.insert("status".to_string(), serde_json::json!(label));
+                data.insert("created_at".to_string(), serde_json::json!(at));
+                data.insert("updated_at".to_string(), serde_json::json!(at));
+                db::create(ctx, TABLE, data)
+                    .await
+                    .unwrap_or_else(|e| panic!("seed request_log {id}: {e}"));
+            }
+        };
+        seed_labelled("served_500_labelled_ok", 500, "OK").await;
+        seed_labelled("served_302_labelled_error", 302, "ERROR").await;
+
+        let counts = today_counts(&ctx, &today_start)
+            .await
+            .expect("today_counts");
+        assert_eq!((counts.requests, counts.errors), (2, 1), "today_counts");
+
+        let daily = daily_counts(&ctx, &today_start)
+            .await
+            .expect("daily_counts");
+        assert_eq!(
+            daily
+                .iter()
+                .map(|r| (r.requests, r.errors))
+                .collect::<Vec<_>>(),
+            vec![(2, 1)],
+            "daily_counts",
+        );
+
+        let summary = summarise_by_path(&ctx, "", 50).await.expect("summary");
+        assert_eq!(
+            summary
+                .iter()
+                .map(|s| (s.count, s.errors))
+                .collect::<Vec<_>>(),
+            vec![(2, 1)],
+            "summarise_by_path",
+        );
+
+        let recent = list_recent_errors(&ctx, 5).await.expect("recent errors");
+        assert_eq!(
+            recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["served_500_labelled_ok"],
+            "list_recent_errors",
+        );
+    }
+
+    /// The label is a function of the code alone.
+    #[test]
+    fn the_stored_label_is_derived_from_the_code() {
+        for (code, label) in [
+            (200, "OK"),
+            (302, "OK"),
+            (399, "OK"),
+            (400, "ERROR"),
+            (500, "ERROR"),
+        ] {
+            assert_eq!(
+                probe(code, 1).to_data().get("status"),
+                Some(&serde_json::json!(label)),
+                "{code}",
+            );
+        }
     }
 }
