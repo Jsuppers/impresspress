@@ -8,7 +8,7 @@ use wafer_core::interfaces::network::service::{NetworkError, NetworkService, Req
 use wafer_run::{Block, ErrorCode};
 
 use super::harness::*;
-use crate::blocks::products::repo;
+use crate::{blocks::products::repo, util::RecordExt};
 
 #[derive(Clone)]
 struct SequencedStripeNetwork {
@@ -928,10 +928,11 @@ async fn provider_reconciliation_recovers_pending_refund_with_one_atomic_lease()
     .await
     .unwrap();
     let first_claim = repo::provider_operations::claim_due(&ctx, 1).await.unwrap();
-    assert_eq!(first_claim.len(), 1);
+    assert_eq!(first_claim.claims.len(), 1);
     assert!(repo::provider_operations::claim_due(&ctx, 1)
         .await
         .unwrap()
+        .claims
         .is_empty());
     wafer_core::clients::database::update(
         &ctx,
@@ -1556,4 +1557,237 @@ async fn refund_stripe_rate_limit_stays_500() {
         500
     );
     assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// Seed a provider operation that is due now. `created_at` is explicit so
+/// the claim pass meets the rows in a known order.
+async fn seed_due_operation(
+    ctx: &crate::test_support::TestContext,
+    id: &str,
+    operation_type: &str,
+    created_at: &str,
+    extra: &[(&str, serde_json::Value)],
+) {
+    let mut data = std::collections::HashMap::from([
+        (
+            "operation_type".to_string(),
+            serde_json::json!(operation_type),
+        ),
+        ("aggregate_type".to_string(), serde_json::json!("refund")),
+        (
+            "aggregate_id".to_string(),
+            serde_json::json!(format!("refund_{id}")),
+        ),
+        (
+            "idempotency_key".to_string(),
+            serde_json::json!(format!("key_{id}")),
+        ),
+        ("status".to_string(), serde_json::json!("pending")),
+        ("created_at".to_string(), serde_json::json!(created_at)),
+        ("updated_at".to_string(), serde_json::json!(created_at)),
+    ]);
+    for (field, value) in extra {
+        data.insert(field.to_string(), value.clone());
+    }
+    seed(ctx, repo::provider_operations::TABLE, id, data).await;
+}
+
+/// A `processing` row whose lease lapsed long ago, as a crashed worker leaves
+/// it.
+fn expired_lease(attempts: u64, last_error: &str) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("status", serde_json::json!("processing")),
+        ("attempts", serde_json::json!(attempts)),
+        ("processing_owner", serde_json::json!("crashed-worker")),
+        (
+            "processing_started_at",
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()),
+        ),
+        ("last_error", serde_json::json!(last_error)),
+    ]
+}
+
+async fn operation_row(
+    ctx: &dyn wafer_run::context::Context,
+    id: &str,
+) -> wafer_core::clients::database::Record {
+    wafer_core::clients::database::get(ctx, repo::provider_operations::TABLE, id)
+        .await
+        .unwrap()
+}
+
+async fn reconcile_due(ctx: &dyn wafer_run::context::Context) -> wafer_run::OutputStream {
+    let (reconcile, input) = admin_create_msg(
+        "/b/products/api/admin/provider-operations/reconcile",
+        serde_json::json!({}),
+    );
+    dispatch(ctx, reconcile, input).await
+}
+
+/// A failed outcome write for one operation is that operation's problem: the
+/// rest of the claimed batch still runs and records its outcome, and the
+/// response counts the one that could not be recorded instead of failing
+/// the whole request.
+///
+/// The first row's outcome is a terminal one (an unsupported operation type),
+/// written with `database.update`, which is the op made to fail. The second
+/// row's outcome is a retry (its refund row is missing), written with
+/// `database.update_where_count`, which keeps working.
+#[tokio::test]
+async fn one_operations_failed_outcome_write_does_not_abort_the_batch() {
+    let ctx = ctx().await;
+    seed_due_operation(
+        &ctx,
+        "op_first",
+        "unsupported.kind",
+        "2026-01-01T00:00:00Z",
+        &[],
+    )
+    .await;
+    seed_due_operation(
+        &ctx,
+        "op_second",
+        repo::provider_operations::REFUND_RECONCILE,
+        "2026-01-01T00:00:01Z",
+        &[],
+    )
+    .await;
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx,
+        vec![("database.update", repo::provider_operations::TABLE)],
+    );
+
+    let result = output_to_json(reconcile_due(&failing).await).await;
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "claimed": 2,
+            "succeeded": 0,
+            "retry_scheduled": 1,
+            "dead_letter": 0,
+            "unrecorded": 1,
+        })
+    );
+
+    let second = operation_row(&failing, "op_second").await;
+    assert_eq!(
+        second.data["status"], "failed",
+        "the row after the failed write must still get its outcome"
+    );
+    assert!(!second.str_field("last_error").is_empty());
+    assert!(!second.str_field("next_attempt_at").is_empty());
+    // The row whose write failed keeps its lease until the lease lapses.
+    assert_eq!(
+        operation_row(&failing, "op_first").await.data["status"],
+        "processing"
+    );
+}
+
+/// The claim pass has the same rule: a row whose dead-letter write fails is
+/// reported, and the rows already claimed in the same pass are still run
+/// rather than left leased with an attempt spent.
+#[tokio::test]
+async fn one_rows_failed_claim_write_does_not_strand_the_rows_already_claimed() {
+    let ctx = ctx().await;
+    seed_due_operation(
+        &ctx,
+        "op_claimed",
+        "unsupported.kind",
+        "2026-01-01T00:00:00Z",
+        &[],
+    )
+    .await;
+    seed_due_operation(
+        &ctx,
+        "op_exhausted",
+        repo::provider_operations::REFUND_RECONCILE,
+        "2026-01-01T00:00:01Z",
+        &expired_lease(repo::MAX_ATTEMPTS, ""),
+    )
+    .await;
+    // The first `update_where_count` is `op_claimed`'s claim; the second is
+    // `op_exhausted`'s dead-letter write, which fails.
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx,
+        vec![(
+            "database.update_where_count",
+            repo::provider_operations::TABLE,
+        )],
+    )
+    .after_passing(1);
+
+    let result = output_to_json(reconcile_due(&failing).await).await;
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "claimed": 1,
+            "succeeded": 0,
+            "retry_scheduled": 0,
+            "dead_letter": 1,
+            "unrecorded": 1,
+        })
+    );
+    assert_eq!(
+        operation_row(&failing, "op_claimed").await.data["status"],
+        "dead_letter",
+        "the claimed row must be run to its outcome"
+    );
+    assert_eq!(
+        operation_row(&failing, "op_exhausted").await.data["status"],
+        "processing"
+    );
+}
+
+/// An operation out of attempts is dead-lettered with the reason an operator
+/// needs, whichever path spends the last attempt: the claim pass finding a
+/// lapsed lease on the last attempt, or the last attempt failing.
+#[tokio::test]
+async fn an_operation_out_of_attempts_dead_letters_with_its_reason_and_is_counted() {
+    let ctx = ctx().await;
+    seed_due_operation(
+        &ctx,
+        "op_lapsed",
+        repo::provider_operations::REFUND_RECONCILE,
+        "2026-01-01T00:00:00Z",
+        &expired_lease(repo::MAX_ATTEMPTS, "Stripe timed out"),
+    )
+    .await;
+    seed_due_operation(
+        &ctx,
+        "op_last_try",
+        repo::provider_operations::REFUND_RECONCILE,
+        "2026-01-01T00:00:01Z",
+        &[("attempts", serde_json::json!(repo::MAX_ATTEMPTS - 1))],
+    )
+    .await;
+
+    let result = output_to_json(reconcile_due(&ctx).await).await;
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "claimed": 1,
+            "succeeded": 0,
+            "retry_scheduled": 0,
+            "dead_letter": 2,
+            "unrecorded": 0,
+        })
+    );
+
+    let lapsed = operation_row(&ctx, "op_lapsed").await;
+    assert_eq!(lapsed.data["status"], "dead_letter");
+    let reason = lapsed.str_field("last_error");
+    assert!(
+        reason.contains("retry budget") && reason.contains("expired"),
+        "the reason must say the budget ran out on a lapsed lease: {reason:?}"
+    );
+    assert!(
+        reason.contains("Stripe timed out"),
+        "the earlier attempts' error must survive: {reason:?}"
+    );
+    assert!(!lapsed.str_field("terminal_at").is_empty());
+
+    let last_try = operation_row(&ctx, "op_last_try").await;
+    assert_eq!(last_try.data["status"], "dead_letter");
+    assert_eq!(last_try.data["attempts"], repo::MAX_ATTEMPTS);
+    assert!(!last_try.str_field("last_error").is_empty());
 }

@@ -164,7 +164,7 @@ async function reconcileStripeProviderOperations(button){
     var response=await fetch('/b/products/api/admin/provider-operations/reconcile?limit=50',{method:'POST',credentials:'same-origin'});
     var data={};try{data=await response.json()}catch(_){}
     if(!response.ok)throw new Error(data.message||'Could not reconcile provider operations.');
-    result.textContent='Claimed '+data.claimed+'; completed '+data.succeeded+'; retry scheduled '+data.retry_scheduled+'; manual review '+data.dead_letter+'.';
+    result.textContent='Claimed '+data.claimed+'; completed '+data.succeeded+'; retry scheduled '+data.retry_scheduled+'; manual review '+data.dead_letter+'.'+(data.unrecorded>0?' '+data.unrecorded+' could not be recorded and will be retried; see the server log.':'');
     await loadStripeProviderOperations();
   }catch(err){error.textContent=err.message||'Could not reconcile provider operations.';error.hidden=false}
   finally{button.disabled=false;button.textContent='Reconcile due operations'}

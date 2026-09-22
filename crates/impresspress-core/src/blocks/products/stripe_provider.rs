@@ -777,66 +777,107 @@ async fn reconcile_refund_operation(
 /// Claim and reconcile a bounded batch. It is safe to invoke from an
 /// authenticated scheduler or the administrator recovery panel; leases prevent
 /// overlapping workers and Stripe mutations retain their original idempotency
-/// key.
+/// key. A write that fails for one operation is logged and counted in
+/// `unrecorded`; the rest of the batch still runs.
 pub(crate) async fn reconcile_provider_operations(
     ctx: &dyn Context,
     limit: usize,
 ) -> Result<ProviderReconcileResult, WaferError> {
-    let claims = repo::provider_operations::claim_due(ctx, limit.clamp(1, 100)).await?;
+    let batch = repo::provider_operations::claim_due(ctx, limit.clamp(1, 100)).await?;
     let mut result = ProviderReconcileResult {
-        claimed: claims.len() as u64,
+        claimed: batch.claims.len() as u64,
+        dead_letter: batch.dead_lettered,
+        unrecorded: batch.failures.len() as u64,
         ..ProviderReconcileResult::default()
     };
-    for claim in claims {
-        let outcome = match claim.record.str_field("operation_type") {
-            repo::provider_operations::REFUND_RECONCILE => {
-                reconcile_refund_operation(ctx, &claim.record).await
-            }
-            other => Ok(RefundReconcileOutcome::Terminal(
-                format!("unsupported provider operation type: {other}"),
-                "{}".to_string(),
-            )),
-        };
-        match outcome {
-            Ok(RefundReconcileOutcome::Succeeded(response_json)) => {
-                repo::provider_operations::mark_completed(
-                    ctx,
-                    &claim.record.id,
-                    &claim.owner,
-                    &response_json,
-                )
-                .await?;
-                result.succeeded += 1;
-            }
-            Ok(RefundReconcileOutcome::Terminal(message, response_json)) => {
-                repo::provider_operations::resolve_unleased(
-                    ctx,
-                    &claim.record.id,
-                    false,
-                    &response_json,
-                    &message,
-                )
-                .await?;
-                result.dead_letter += 1;
-            }
-            Ok(RefundReconcileOutcome::Retry(message)) | Err(WaferError { message, .. }) => {
-                repo::provider_operations::mark_retry(
-                    ctx,
-                    &claim.record.id,
-                    &claim.owner,
-                    claim.attempts,
-                    &message,
-                )
-                .await?;
-                if claim.attempts >= 8 {
-                    result.dead_letter += 1;
-                } else {
-                    result.retry_scheduled += 1;
-                }
+    for (id, error) in &batch.failures {
+        tracing::error!(
+            operation_id = %id,
+            error = %error,
+            "could not claim or dead-letter a due provider operation"
+        );
+    }
+    for claim in batch.claims {
+        match record_operation_outcome(ctx, &claim).await {
+            Ok(Recorded::Succeeded) => result.succeeded += 1,
+            Ok(Recorded::RetryScheduled) => result.retry_scheduled += 1,
+            Ok(Recorded::DeadLettered) => result.dead_letter += 1,
+            Err(error) => {
+                tracing::error!(
+                    operation_id = %claim.record.id,
+                    attempts = claim.attempts,
+                    error = %error,
+                    "could not record a provider operation's outcome"
+                );
+                result.unrecorded += 1;
             }
         }
     }
     Ok(result)
+}
+
+/// Where [`record_operation_outcome`] left one claimed operation.
+enum Recorded {
+    Succeeded,
+    RetryScheduled,
+    DeadLettered,
+}
+
+/// Run one claimed operation and write its outcome under the claim's lease.
+/// A failure of the operation itself is an outcome (retry or dead letter);
+/// only a failed bookkeeping write is an `Err`.
+async fn record_operation_outcome(
+    ctx: &dyn Context,
+    claim: &repo::provider_operations::OperationClaim,
+) -> Result<Recorded, WaferError> {
+    let outcome = match claim.record.str_field("operation_type") {
+        repo::provider_operations::REFUND_RECONCILE => {
+            reconcile_refund_operation(ctx, &claim.record).await
+        }
+        other => Ok(RefundReconcileOutcome::Terminal(
+            format!("unsupported provider operation type: {other}"),
+            "{}".to_string(),
+        )),
+    };
+    match outcome {
+        Ok(RefundReconcileOutcome::Succeeded(response_json)) => {
+            repo::provider_operations::mark_completed(
+                ctx,
+                &claim.record.id,
+                &claim.owner,
+                &response_json,
+            )
+            .await?;
+            Ok(Recorded::Succeeded)
+        }
+        Ok(RefundReconcileOutcome::Terminal(message, response_json)) => {
+            repo::provider_operations::resolve_unleased(
+                ctx,
+                &claim.record.id,
+                false,
+                &response_json,
+                &message,
+            )
+            .await?;
+            Ok(Recorded::DeadLettered)
+        }
+        Ok(RefundReconcileOutcome::Retry(message)) | Err(WaferError { message, .. }) => {
+            match repo::provider_operations::mark_retry(
+                ctx,
+                &claim.record.id,
+                &claim.owner,
+                claim.attempts,
+                &message,
+            )
+            .await?
+            {
+                repo::provider_operations::RetryRecorded::Scheduled => Ok(Recorded::RetryScheduled),
+                repo::provider_operations::RetryRecorded::DeadLettered => {
+                    Ok(Recorded::DeadLettered)
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn sync_connected_account(

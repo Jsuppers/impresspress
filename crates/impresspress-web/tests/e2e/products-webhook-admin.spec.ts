@@ -399,7 +399,13 @@ test.describe("products admin webhook recovery", () => {
         url.pathname === "/b/products/api/admin/provider-operations/reconcile"
       ) {
         reconciled = true;
-        return json(route, { claimed: 1, succeeded: 1, retry_scheduled: 0, dead_letter: 0 });
+        return json(route, {
+          claimed: 1,
+          succeeded: 1,
+          retry_scheduled: 0,
+          dead_letter: 0,
+          unrecorded: 1,
+        });
       }
       return json(route, { message: "Unexpected route" }, 404);
     });
@@ -415,7 +421,8 @@ test.describe("products admin webhook recovery", () => {
 
     await operations.getByRole("button", { name: "Reconcile due operations" }).click();
     await expect(operations.getByRole("status")).toHaveText(
-      "Claimed 1; completed 1; retry scheduled 0; manual review 0.",
+      "Claimed 1; completed 1; retry scheduled 0; manual review 0. " +
+        "1 could not be recorded and will be retried; see the server log.",
     );
     await expect(operations).toContainText("No matching provider operations.");
     await expect(operations.getByRole("button", { name: "Reconcile due operations" })).toBeEnabled();
