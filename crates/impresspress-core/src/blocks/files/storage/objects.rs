@@ -20,7 +20,7 @@ use crate::{
             repo,
         },
     },
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
 };
 
 /// Collect an `InputStream` into `Vec<u8>` with a hard size cap. Errors out
@@ -288,9 +288,8 @@ pub(in crate::blocks::files) async fn handle_upload_object(
 
     // Claim the key BEFORE uploading so concurrent quota checks see the
     // in-flight size. This closes the TOCTOU race between check_quota and the
-    // actual upload. On a re-upload the claim takes over the existing row —
-    // `(bucket, key)` is UNIQUE, so inserting a second one is refused by the
-    // database, which is what every re-upload used to answer 500 with.
+    // actual upload. `(bucket, key)` is UNIQUE: a re-upload, or an upload
+    // that lost the race to claim a new key, takes over the key's one row.
     let reservation = match repo::objects::reserve_upload(
         ctx,
         bucket,
@@ -302,6 +301,12 @@ pub(in crate::blocks::files) async fn handle_upload_object(
     .await
     {
         Ok(reservation) => reservation,
+        // A concurrency conflict on the key (see `reserve_upload`), which the
+        // client resolves by retrying — not a fault. The message is this
+        // handler's own, so no backend text reaches the client.
+        Err(e) if e.code == ErrorCode::Aborted => {
+            return err_conflict("Another upload of this key was in progress; retry the upload")
+        }
         // `db_error_internal`, not a bare `err_internal`: a WRAP refusal is a
         // 403 and a quota is a 429, and folding either into a 500 is what left
         // an operator unable to tell a missing grant from a broken row.
@@ -1006,6 +1011,166 @@ mod integration_tests {
         );
         assert_eq!(content_type, "text/markdown");
         assert_eq!(status, ObjectStatus::Complete);
+    }
+
+    /// Two first uploads of the same NEW key, racing: neither is a 500, and
+    /// the key still has exactly one row.
+    ///
+    /// Each upload reads the key's row twice — once for the quota (a
+    /// replacement is charged the difference) and once to reserve it. The
+    /// rendezvous lets each racer's first read through and holds both at the
+    /// reservation's read until both have made it, so both reserve believing
+    /// the key is free: the interleaving in which a plain insert has the
+    /// unique index refuse the loser.
+    ///
+    /// Names `repo::objects::TABLE` only to aim the rendezvous.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_first_uploads_of_a_new_key_both_succeed_on_one_row() {
+        use crate::test_support::{output_http_status, RendezvousDbOpContext};
+
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let gated =
+            RendezvousDbOpContext::new(ctx.clone(), "database.list", repo::objects::TABLE, 2);
+
+        let racers: Vec<_> = [&b"first racer"[..], &b"second racer"[..]]
+            .into_iter()
+            .map(|bytes| {
+                let racer = gated.passing_first(1);
+                tokio::spawn(async move {
+                    output_http_status(
+                        handle_upload_object(
+                            &racer,
+                            &upload_msg("assets", "same.txt", "text/plain"),
+                            InputStream::from_bytes(bytes.to_vec()),
+                        )
+                        .await,
+                    )
+                    .await
+                })
+            })
+            .collect();
+        let statuses = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both uploads must reach the rendezvous and finish")
+        .expect("upload task panicked");
+
+        assert_eq!(
+            statuses,
+            vec![200, 200],
+            "the upload that lost the race for a new key must join the row, not 500"
+        );
+        let rows = repo::objects::list_all(&ctx).await.expect("object rows");
+        assert_eq!(rows.len(), 1, "one key, one row: {rows:?}");
+        assert_eq!(rows[0].status, ObjectStatus::Complete);
+    }
+
+    /// A context on which another upload of the key claims it just before
+    /// this upload's reservation insert, and gives it up again just after:
+    /// the insert affects nothing, and the row that caused that is gone by
+    /// the time it is read back.
+    #[derive(Clone)]
+    struct ChurnedKeyContext {
+        inner: TestContext,
+        bucket: &'static str,
+        key: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::context::Context for ChurnedKeyContext {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+            if !(name == "wafer-run/database" && msg.action() == "database.upsert") {
+                return self.inner.call_block(name, msg, input).await;
+            }
+            let rival = repo::objects::seed(
+                &self.inner,
+                crate::util::json_map(serde_json::json!({
+                    "bucket": self.bucket,
+                    "key": self.key,
+                    "status": ObjectStatus::Pending,
+                    "uploaded_by": "bob",
+                })),
+            )
+            .await
+            .expect("the rival upload claims the key");
+            let out = self.inner.call_block(name, msg, input).await;
+            // Settled before the rival lets go, so the insert sees its row.
+            let answered = out
+                .collect_buffered()
+                .await
+                .unwrap_or_else(|_| panic!("the reservation insert must answer"));
+            repo::objects::delete(&self.inner, &rival.id)
+                .await
+                .expect("the rival upload releases the key");
+            OutputStream::respond_with_meta(answered.body, answered.meta)
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
+
+    /// The reservation lost the key to another upload that has since given it
+    /// up: nothing is left to join, so the upload is told to retry — a 409 —
+    /// rather than a 500, and nothing is stored.
+    #[tokio::test]
+    async fn an_upload_whose_rival_released_the_key_is_told_to_retry() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let churned = ChurnedKeyContext {
+            inner: ctx.clone(),
+            bucket: "assets",
+            key: "same.txt",
+        };
+
+        let out = handle_upload_object(
+            &churned,
+            &upload_msg("assets", "same.txt", "text/plain"),
+            InputStream::from_bytes(b"bytes".to_vec()),
+        )
+        .await;
+
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            409,
+            "a key that changed hands mid-reservation is a conflict to retry"
+        );
+        assert!(
+            repo::objects::list_all(&ctx)
+                .await
+                .expect("object rows")
+                .is_empty(),
+            "a refused reservation leaves no row"
+        );
+        assert!(
+            store::get(&ctx, "assets", "same.txt").await.is_err(),
+            "nothing may be stored for a refused upload"
+        );
     }
 
     /// A replacement costs the DIFFERENCE, not the whole file: the bytes it

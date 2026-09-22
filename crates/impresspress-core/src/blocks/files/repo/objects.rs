@@ -15,10 +15,10 @@ use std::collections::HashMap;
 
 use wafer_block::{
     db::{Filter, FilterOp, ListOptions, SortField},
-    wire::database as wire,
+    wire::database::{self as wire, OnConflict},
 };
 use wafer_core::clients::database::{self as db, Record};
-use wafer_run::{context::Context, WaferError};
+use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use super::{super::contracts::ObjectStatus, Page};
 use crate::{
@@ -196,34 +196,24 @@ pub struct Reservation {
 /// what closes the check-quota → upload TOCTOU race). `uploaded_at` is stamped
 /// with [`crate::util::now_rfc3339`].
 ///
-/// `(bucket, key)` is UNIQUE, so a re-upload cannot get a second row: when the
-/// key already holds an object the reservation TAKES OVER that row, flipping
+/// `(bucket, key)` is UNIQUE, so an upload never adds a second row for a key:
+/// when the key already has one, the reservation TAKES OVER that row, flipping
 /// it to [`ObjectStatus::Pending`] with the new size, content type and
-/// uploader. Inserting instead is what used to answer 500 for a re-upload of
-/// an existing key. Until the upload settles, the row charges the new
-/// (possibly larger) size against the new uploader — the conservative
-/// direction — and [`release_reservation`] puts the old values back if the
-/// upload fails.
+/// uploader. Until the upload settles, the row charges the new (possibly
+/// larger) size against the new uploader — the conservative direction — and
+/// [`release_reservation`] puts the old values back if the upload fails.
 ///
-/// The read and the write are two steps, not one, so this fixes the
-/// SEQUENTIAL case — a key that already held an object when the request
-/// arrived, which is every ordinary re-upload. Two requests uploading the same
-/// **new** key concurrently can still both find nothing and both insert; the
-/// unique index refuses the loser, and that request still answers 500.
+/// A key with no row is claimed by an insert that yields to the unique index
+/// (`ON CONFLICT (bucket, key) DO NOTHING`) rather than being refused by it.
+/// Two uploads of the same new key can both read no row; one insert lands,
+/// the other affects nothing, and the one that affected nothing reads the
+/// row back and takes it over exactly as a re-upload does. The read comes
+/// first, not the insert, because a re-upload — the common case — then costs
+/// one read and one write.
 ///
-/// Not because an atomic write is unavailable: `db::upsert` takes
-/// `conflict_columns`, and `idx_objects_bucket_key` is exactly the composite
-/// conflict target it wants. It is that `upsert` answers `rows_affected` and
-/// nothing else, while a reservation has to hand back two things a row count
-/// cannot carry — the row **id** that [`mark_complete`] and
-/// [`release_reservation`] address, and the replaced object's size, content
-/// type and uploader that `release_reservation` restores. Both come from
-/// reading the row, so the read stays whichever way the write is issued, and
-/// the residual race is between two writes to one key rather than the
-/// reproducible failure this function is about. Closing it means `upsert`
-/// followed by a read-back for the id — worth doing, but as its own change
-/// with a way to exercise two concurrent uploads, which this suite has no
-/// harness for.
+/// [`ErrorCode::Aborted`] (a 409) when that read-back finds no row either:
+/// the reservation this one lost to was released in between, because its
+/// upload failed. The key is free again and the client may retry.
 pub async fn reserve_upload(
     ctx: &dyn Context,
     bucket: &str,
@@ -232,35 +222,115 @@ pub async fn reserve_upload(
     content_type: &str,
     uploaded_by: &str,
 ) -> Result<Reservation, WaferError> {
-    let data = crate::util::json_map(serde_json::json!({
-        "bucket": bucket,
-        "key": key,
-        "size": size,
-        "content_type": content_type,
-        "status": ObjectStatus::Pending,
-        "uploaded_by": uploaded_by,
-        "uploaded_at": crate::util::now_rfc3339(),
-    }));
+    let uploaded_at = crate::util::now_rfc3339();
+    let claim = PendingClaim {
+        bucket,
+        key,
+        size,
+        content_type,
+        uploaded_by,
+        uploaded_at: &uploaded_at,
+    };
 
-    match find_by_bucket_key(ctx, bucket, key).await? {
-        Some(existing) => {
-            db::update(ctx, TABLE, &existing.id, data).await?;
-            Ok(Reservation {
-                id: existing.id,
-                replaced: Some(ReplacedObject {
-                    size: existing.size,
-                    content_type: existing.content_type,
-                    status: existing.status,
-                    uploaded_by: existing.uploaded_by,
-                    uploaded_at: existing.uploaded_at,
-                }),
-            })
-        }
-        None => Ok(Reservation {
-            id: db::create(ctx, TABLE, data).await?.id,
-            replaced: None,
-        }),
+    if let Some(existing) = find_by_bucket_key(ctx, bucket, key).await? {
+        return take_over(ctx, existing, &claim).await;
     }
+    if let Some(id) = insert_unless_taken(ctx, &claim).await? {
+        return Ok(Reservation { id, replaced: None });
+    }
+    match find_by_bucket_key(ctx, bucket, key).await? {
+        Some(existing) => take_over(ctx, existing, &claim).await,
+        None => Err(WaferError::new(
+            ErrorCode::Aborted,
+            "another upload of this key was in progress; retry the upload",
+        )),
+    }
+}
+
+/// The column values a [`Reservation`] writes.
+struct PendingClaim<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    size: usize,
+    content_type: &'a str,
+    uploaded_by: &'a str,
+    uploaded_at: &'a str,
+}
+
+/// Point `existing` at the upload `claim` describes, keeping what it said for
+/// [`release_reservation`].
+async fn take_over(
+    ctx: &dyn Context,
+    existing: ObjectRow,
+    claim: &PendingClaim<'_>,
+) -> Result<Reservation, WaferError> {
+    let data = crate::util::json_map(serde_json::json!({
+        "size": claim.size,
+        "content_type": claim.content_type,
+        "status": ObjectStatus::Pending,
+        "uploaded_by": claim.uploaded_by,
+        "uploaded_at": claim.uploaded_at,
+    }));
+    db::update(ctx, TABLE, &existing.id, data).await?;
+    Ok(Reservation {
+        id: existing.id,
+        replaced: Some(ReplacedObject {
+            size: existing.size,
+            content_type: existing.content_type,
+            status: existing.status,
+            uploaded_by: existing.uploaded_by,
+            uploaded_at: existing.uploaded_at,
+        }),
+    })
+}
+
+/// Insert the `Pending` row `claim` describes unless `(bucket, key)` already
+/// has one. `Some(id)` when this insert created the row; `None` when the
+/// unique index already held a row for the key and nothing was written.
+///
+/// The id is minted here, not by the database, because `db::upsert` answers
+/// only how many rows it affected: a row this call created has the id it
+/// was given.
+async fn insert_unless_taken(
+    ctx: &dyn Context,
+    claim: &PendingClaim<'_>,
+) -> Result<Option<String>, WaferError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::util::now_rfc3339();
+    let inserted = db::upsert(
+        ctx,
+        TABLE,
+        vec![
+            ("id".to_string(), serde_json::json!(id)),
+            ("bucket".to_string(), serde_json::json!(claim.bucket)),
+            ("key".to_string(), serde_json::json!(claim.key)),
+            ("size".to_string(), serde_json::json!(claim.size)),
+            (
+                "content_type".to_string(),
+                serde_json::json!(claim.content_type),
+            ),
+            (
+                "status".to_string(),
+                serde_json::json!(ObjectStatus::Pending),
+            ),
+            (
+                "uploaded_by".to_string(),
+                serde_json::json!(claim.uploaded_by),
+            ),
+            (
+                "uploaded_at".to_string(),
+                serde_json::json!(claim.uploaded_at),
+            ),
+            ("created_at".to_string(), serde_json::json!(now)),
+            ("updated_at".to_string(), serde_json::json!(now)),
+        ],
+        vec!["bucket".to_string(), "key".to_string()],
+        // No columns to set: a conflict is `DO NOTHING`, and the row that
+        // caused it is the one the caller reads back and takes over.
+        OnConflict::SetColumns(vec![]),
+    )
+    .await?;
+    Ok((inserted > 0).then_some(id))
 }
 
 /// Give up a [`Reservation`] whose storage upload failed: delete the row it
