@@ -68,10 +68,20 @@ impl Control {
         self.swap.as_deref() != Some("none")
     }
 
-    /// `(action, element name, field names)` — what identifies this control
-    /// across two renders of the same page over two fixtures, whose seeded
-    /// ids (and so URLs) differ.
-    fn signature(&self) -> String {
+    /// `(action, route template, element name, field names)` — what
+    /// identifies this control across two renders of the same page over two
+    /// fixtures, whose seeded ids (and so URLs) differ. The route is the
+    /// template `site` matches the URL against, so the Enable button of one
+    /// row and the Disable button of another are two controls, not one
+    /// `create <button>` that either row's position could stand in for.
+    fn signature(&self, site: &Site) -> String {
+        let path = self.url.split('?').next().unwrap_or_default();
+        let Some((_, route)) = site.owner(self.action, path) else {
+            panic!(
+                "{} reaches {} {path}, which no block in the fixture's site declares",
+                self.tag, self.action
+            );
+        };
         let name = tag_name(&self.tag);
         let fields: Vec<String> = self
             .form
@@ -83,7 +93,7 @@ impl Control {
                     .collect()
             })
             .unwrap_or_default();
-        format!("{} <{name}> {fields:?}", self.action)
+        format!("{} {route} <{name}> {fields:?}", self.action)
     }
 }
 
@@ -479,7 +489,7 @@ pub async fn fire_every_control(make: MakeFixture) -> BTreeSet<String> {
             let page = &fixture.pages[page_index];
             mutating_controls(&render(&fixture, page).await)
                 .iter()
-                .map(Control::signature)
+                .map(|control| control.signature(&fixture.site))
                 .collect()
         };
         for (index, signature) in signatures.iter().enumerate() {
@@ -488,7 +498,7 @@ pub async fn fire_every_control(make: MakeFixture) -> BTreeSet<String> {
             let controls = mutating_controls(&render(&fixture, &page).await);
             let control = &controls[index];
             assert_eq!(
-                &control.signature(),
+                &control.signature(&fixture.site),
                 signature,
                 "{page:?} rendered its controls in a different order over a second fixture"
             );
@@ -522,6 +532,35 @@ pub async fn fire_every_control(make: MakeFixture) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two controls a page renders at the same position over two fixtures are
+    /// the same control only if they reach the same route. The users tab's
+    /// rows each carry a bare `hx-post` button — Disable for an active user,
+    /// Enable for a disabled one — so a signature without the route let a
+    /// second render that listed the rows the other way round pass as
+    /// identical, and the guard fired Disable twice and Enable never.
+    #[test]
+    fn a_control_is_known_by_the_route_it_reaches() {
+        let site = Site(vec![Arc::new(crate::blocks::admin::AdminBlock::new())]);
+        let controls = mutating_controls(
+            r#"<button hx-post="/b/admin/users/u1/disable">Disable</button>
+               <button hx-post="/b/admin/users/u2/enable">Enable</button>
+               <button hx-post="/b/admin/users/u3/disable">Disable</button>"#,
+        );
+        let [disable, enable, other_disable] = &controls[..] else {
+            panic!("three controls: {controls:?}");
+        };
+        assert_ne!(
+            disable.signature(&site),
+            enable.signature(&site),
+            "Disable and Enable reach different routes"
+        );
+        assert_eq!(
+            disable.signature(&site),
+            other_disable.signature(&site),
+            "the same route on another row's id is the same control"
+        );
+    }
 
     /// The serializer submits what a browser submits, and nothing a browser
     /// leaves out.

@@ -19,7 +19,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{json, Value};
-use wafer_block::db::{Filter, FilterOp, ListOptions};
+use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
 use wafer_core::{clients::database as db, interfaces::database::service::DatabaseService};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -1816,11 +1816,25 @@ async fn repair_sensitive_flags_in(db: &Arc<dyn DatabaseService>, rows: &[Loaded
 // Runtime flavour: over `Context`, under WRAP.
 // ---------------------------------------------------------------------------
 
-/// Every row. A row that does not decode is skipped and warned about, the
-/// same policy [`load_all`] applies at boot.
+/// Every row, by key. A row that does not decode is skipped and warned
+/// about, the same policy [`load_all`] applies at boot.
+///
+/// The order is the query's, not the table's: without one, SQL returns rows
+/// in whatever order the backend's plan produces, and a Postgres update
+/// writes a new row version that a scan can return somewhere else — the All
+/// Variables tab could reshuffle after an edit.
 pub async fn list_all(ctx: &dyn Context) -> Result<Vec<VariableRow>, WaferError> {
-    let records =
-        db_read::list_bounded(ctx, TABLE, vec![], Bound::OnePer("declared config key")).await?;
+    let records = db_read::list_bounded_sorted(
+        ctx,
+        TABLE,
+        vec![],
+        vec![SortField {
+            field: "key".to_string(),
+            desc: false,
+        }],
+        Bound::OnePer("declared config key"),
+    )
+    .await?;
     Ok(records
         .iter()
         .filter_map(|r| match VariableRow::from_record(&r.id, &r.data) {
@@ -2175,6 +2189,26 @@ mod tests {
             "a field the patch leaves unset is preserved"
         );
         assert_eq!(list_all(&ctx).await.expect("list").len(), 1);
+    }
+
+    /// The All Variables tab and the settings API show the rows in the order
+    /// this returns, so it is the key's, not the order they were written in.
+    #[tokio::test]
+    async fn list_all_is_in_key_order_whatever_order_the_rows_were_written_in() {
+        let ctx = TestContext::with_admin().await;
+        for key in ["SITE_ZEBRA", "SITE_APPLE", "SITE_MANGO"] {
+            insert(&ctx, new_var(key)).await.expect("insert");
+        }
+        let keys: Vec<String> = list_all(&ctx)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|row| row.key)
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        assert!(keys.contains(&"SITE_ZEBRA".to_string()), "{keys:?}");
     }
 
     #[tokio::test]
