@@ -7289,7 +7289,7 @@ export interface paths {
                                 disabled_reason: string;
                                 /**
                                  * Format: uint32
-                                 * @description Platform fee applied to this seller's sales, in basis points.
+                                 * @description The platform application fee this seller's sales are charged now, in basis points.
                                  */
                                 fee_basis_points: number;
                                 id: string;
@@ -7481,7 +7481,7 @@ export interface paths {
                                 disabled_reason: string;
                                 /**
                                  * Format: uint32
-                                 * @description Platform fee applied to this seller's sales, in basis points.
+                                 * @description The platform application fee this seller's sales are charged now, in basis points.
                                  */
                                 fee_basis_points: number;
                                 id: string;
@@ -7572,7 +7572,7 @@ export interface paths {
                             disabled_reason: string;
                             /**
                              * Format: uint32
-                             * @description Platform fee applied to this seller's sales, in basis points.
+                             * @description The platform application fee this seller's sales are charged now, in basis points.
                              */
                             fee_basis_points: number;
                             id: string;
@@ -7652,7 +7652,7 @@ export interface paths {
                             disabled_reason: string;
                             /**
                              * Format: uint32
-                             * @description Platform fee applied to this seller's sales, in basis points.
+                             * @description The platform application fee this seller's sales are charged now, in basis points.
                              */
                             fee_basis_points: number;
                             id: string;
@@ -10113,7 +10113,7 @@ export interface paths {
                             disabled_reason: string;
                             /**
                              * Format: uint32
-                             * @description Platform fee applied to this seller's sales, in basis points.
+                             * @description The platform application fee this seller's sales are charged now, in basis points.
                              */
                             fee_basis_points: number;
                             id: string;
@@ -10251,7 +10251,7 @@ export interface paths {
                                 disabled_reason: string;
                                 /**
                                  * Format: uint32
-                                 * @description Platform fee applied to this seller's sales, in basis points.
+                                 * @description The platform application fee this seller's sales are charged now, in basis points.
                                  */
                                 fee_basis_points: number;
                                 id: string;

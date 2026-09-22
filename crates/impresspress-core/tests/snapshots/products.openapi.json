@@ -6767,7 +6767,7 @@
                           "type": "string"
                         },
                         "fee_basis_points": {
-                          "description": "Platform fee applied to this seller's sales, in basis points.",
+                          "description": "The platform application fee this seller's sales are charged now, in basis points.",
                           "format": "uint32",
                           "maximum": 10000,
                           "minimum": 0,
@@ -7135,7 +7135,7 @@
                         "type": "string"
                       },
                       "fee_basis_points": {
-                        "description": "Platform fee applied to this seller's sales, in basis points.",
+                        "description": "The platform application fee this seller's sales are charged now, in basis points.",
                         "format": "uint32",
                         "maximum": 10000,
                         "minimum": 0,
@@ -7297,7 +7297,7 @@
                     "type": "string"
                   },
                   "fee_basis_points": {
-                    "description": "Platform fee applied to this seller's sales, in basis points.",
+                    "description": "The platform application fee this seller's sales are charged now, in basis points.",
                     "format": "uint32",
                     "maximum": 10000,
                     "minimum": 0,
@@ -7447,7 +7447,7 @@
                     "type": "string"
                   },
                   "fee_basis_points": {
-                    "description": "Platform fee applied to this seller's sales, in basis points.",
+                    "description": "The platform application fee this seller's sales are charged now, in basis points.",
                     "format": "uint32",
                     "maximum": 10000,
                     "minimum": 0,
@@ -12717,7 +12717,7 @@
                     "type": "string"
                   },
                   "fee_basis_points": {
-                    "description": "Platform fee applied to this seller's sales, in basis points.",
+                    "description": "The platform application fee this seller's sales are charged now, in basis points.",
                     "format": "uint32",
                     "maximum": 10000,
                     "minimum": 0,
@@ -12926,7 +12926,7 @@
                         "type": "string"
                       },
                       "fee_basis_points": {
-                        "description": "Platform fee applied to this seller's sales, in basis points.",
+                        "description": "The platform application fee this seller's sales are charged now, in basis points.",
                         "format": "uint32",
                         "maximum": 10000,
                         "minimum": 0,
