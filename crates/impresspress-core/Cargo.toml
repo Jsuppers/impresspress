@@ -305,6 +305,13 @@ zip = { version = "2", default-features = false }
 # the sort of approximate second implementation that goes stale exactly like
 # the "keep in sync" comments that test replaces.
 toml = "0.8"
+# `tests/repo_door.rs` resolves each file's `use` trees (aliases, `self as`,
+# globs, imports through an alias) to decide which door constant a bare or
+# aliased path names. Parsing is the same choice as `toml` above: a text
+# matcher over `use` lines misses shapes rustfmt produces and matches inside
+# comments.
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+proc-macro2 = { version = "1", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
