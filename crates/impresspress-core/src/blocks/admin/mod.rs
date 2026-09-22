@@ -1388,6 +1388,24 @@ mod test_support {
         msg
     }
 
+    /// Send `msg` through the admin block's own `handle` as a browser does
+    /// (`Accept: text/html`, the route table dispatching) and read the answer
+    /// the way the HTTP adapters do.
+    pub(super) async fn browser_request(
+        ctx: &dyn wafer_run::context::Context,
+        mut msg: Message,
+    ) -> wafer_block::http_codec::HttpResponseParts {
+        msg.set_meta("http.header.accept", "text/html");
+        let out = wafer_run::Block::handle(
+            &super::AdminBlock::new(),
+            ctx,
+            msg,
+            wafer_run::InputStream::empty(),
+        )
+        .await;
+        wafer_block::http_codec::collect_http_response(out).await
+    }
+
     /// Wraps `inner` and, just before the `nth` read of the grants table
     /// (`database.list` on `user_roles::TABLE`) goes through, assigns `role`
     /// to each of `users` on the unwrapped fixture: an assign landing while a role

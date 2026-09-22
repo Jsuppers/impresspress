@@ -53,6 +53,11 @@ pub struct TestContext {
     /// `config_get` can return `Option<&str>` without holding a lock.
     /// Populated via [`set_config`].
     config: Arc<HashMap<String, String>>,
+    /// Whether `wafer-run/config` is the production
+    /// [`crate::blocks::config::VariablesConfigBlock`] over this fixture's
+    /// database — true once the `variables` table exists (admin migrations)
+    /// or a test booted the config service. See [`Self::install_config_block`].
+    config_store: bool,
     /// Placeholder for dynamically registered blocks — populated by Task 6.
     pub blocks: Arc<Mutex<HashMap<String, Arc<dyn Block>>>>,
     /// `BlockInfo` for every block registered via [`Self::register_block`],
@@ -212,6 +217,7 @@ impl TestContext {
             db_service: svc,
             database_block,
             config: Arc::new(HashMap::new()),
+            config_store: false,
             blocks: Arc::new(Mutex::new(HashMap::new())),
             block_infos: Vec::new(),
             caller_id: None,
@@ -236,11 +242,20 @@ impl TestContext {
     /// (`wafer_core::clients::config::get`/`get_default`) sees the same values
     /// as `config_get`. Without this, those client calls route to an
     /// unregistered block and silently fall back to their hardcoded default.
+    ///
+    /// On a fixture whose `wafer-run/config` is the production block (see
+    /// [`Self::install_config_block`]) the value joins that block's boot map
+    /// instead, as an environment value would: a non-empty `variables` row
+    /// for the same key still wins.
     pub fn set_config(&mut self, key: &str, value: &str) {
         let mut map = (*self.config).clone();
         map.insert(key.to_string(), value.to_string());
         self.config = Arc::new(map);
 
+        if self.config_store {
+            self.install_config_block();
+            return;
+        }
         let svc = wafer_core::service_blocks::config::EnvConfigService::new();
         for (k, v) in self.config.iter() {
             wafer_core::interfaces::config::service::ConfigService::set(&svc, k, v);
@@ -463,13 +478,17 @@ impl TestContext {
     /// [`Self::with_auth_added`]. Lets a constructor choose its database
     /// topology (in-memory or [`Self::new_on_disk`]) without restating the
     /// migration chain built on top of it.
-    pub async fn with_admin_added(self) -> Self {
+    ///
+    /// Also installs the production config block over the new `variables`
+    /// table ([`Self::install_config_block`]), as every target's builder does.
+    pub async fn with_admin_added(mut self) -> Self {
         self.apply_block_migrations(
             "impresspress/admin",
             crate::blocks::admin::migrations::SQLITE_MIGRATIONS,
             crate::blocks::admin::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
+        self.install_config_block();
         self
     }
 
@@ -1000,20 +1019,30 @@ impl TestContext {
             vars.insert((*key).to_string(), (*value).to_string());
         }
 
+        self.config = Arc::new(vars);
+        self.install_config_block();
+    }
+
+    /// Serve `wafer-run/config` from the production
+    /// [`crate::blocks::config::VariablesConfigBlock`]: this fixture's
+    /// `variables` table, over a boot map holding the synchronous snapshot.
+    ///
+    /// The block `builder::registration` registers, not wafer-core's: a
+    /// fixture that wired up a different config block would certify a path
+    /// production does not take, which is how the config-store defect
+    /// survived a green suite in the first place. It reads through the same
+    /// `DatabaseService` the database block does, as production's does, so
+    /// [`Self::break_reads`] and [`Self::break_writes`] reach it too.
+    fn install_config_block(&mut self) {
         let svc: Arc<dyn wafer_core::interfaces::config::service::ConfigService> =
             Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());
-        let svc = crate::builder::fill_config_service(svc, vars.clone());
-
-        self.config = Arc::new(vars);
-        // The block `builder::registration` registers, not wafer-core's: a
-        // fixture that wired up a different config block would certify a path
-        // production does not take, which is how the config-store defect
-        // survived a green suite in the first place.
+        let svc = crate::builder::fill_config_service(svc, (*self.config).clone());
         let block: Arc<dyn Block> = Arc::new(crate::blocks::config::VariablesConfigBlock::new(
             svc,
             self.db_service.clone(),
         ));
         self.register_block("wafer-run/config", block);
+        self.config_store = true;
     }
 
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
@@ -1085,6 +1114,9 @@ impl TestContext {
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
             broken,
         ));
+        if self.config_store {
+            self.install_config_block();
+        }
         self
     }
 
@@ -1125,6 +1157,9 @@ impl TestContext {
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
             broken,
         ));
+        if self.config_store {
+            self.install_config_block();
+        }
         self
     }
 
