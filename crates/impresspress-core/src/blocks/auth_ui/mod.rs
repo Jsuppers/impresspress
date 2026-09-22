@@ -342,10 +342,8 @@ const ROUTES: &[EndpointRoute<Route>] = &[
 /// new row is a rate-limit decision, not an omission.
 const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLimit)> {
     match route {
-        // Login / signup / bootstrap redemption, the token-issuing and
-        // token-consuming password-reset and verification endpoints, and the
-        // OAuth start (each hit writes a PKCE state row that stays until a
-        // callback redeems it or a maintenance sweep finds it expired) share
+        // Login / signup / bootstrap redemption, and the token-issuing and
+        // token-consuming password-reset and verification endpoints, share
         // the `auth` bucket.
         Route::Login
         | Route::Signup
@@ -353,8 +351,14 @@ const fn rate_limit_for(route: Route) -> Option<(LimitKey, &'static str, RateLim
         | Route::ForgotPassword
         | Route::ResetPassword
         | Route::ResendVerification
-        | Route::Verify
-        | Route::OauthStart => Some((LimitKey::Ip, "auth", RateLimit::AUTH)),
+        | Route::Verify => Some((LimitKey::Ip, "auth", RateLimit::AUTH)),
+        // Each OAuth start writes a PKCE state row that stays until a callback
+        // redeems it or a maintenance sweep finds it expired; this bounds that
+        // growth. Its own bucket, because a GET is reached by far more than a
+        // sign-in attempt (an `<img>` tag, a link prefetcher, a crawler, a user
+        // retrying the provider) and none of that should spend the password
+        // login budget.
+        Route::OauthStart => Some((LimitKey::Ip, "oauth_start", RateLimit::AUTH)),
         // Token refresh has its own (looser) category.
         Route::Refresh => Some((LimitKey::Ip, "refresh", RateLimit::REFRESH)),
         Route::Me | Route::ListApiKeys => Some((LimitKey::User, "auth_read", RateLimit::API_READ)),
@@ -703,7 +707,7 @@ mod rate_limit_tests {
             ),
             (Get, "/b/auth/api/verify", LimitKey::Ip, "auth"),
             (Post, "/b/auth/api/verify", LimitKey::Ip, "auth"),
-            (Get, "/b/auth/oauth/login", LimitKey::Ip, "auth"),
+            (Get, "/b/auth/oauth/login", LimitKey::Ip, "oauth_start"),
             (Get, "/b/auth/api/me", LimitKey::User, "auth_read"),
             (Get, "/b/auth/api/api-keys", LimitKey::User, "auth_read"),
             (Patch, "/b/auth/api/me", LimitKey::User, "auth_write"),
@@ -754,7 +758,7 @@ mod rate_limit_tests {
                 continue;
             };
             let expected = match category {
-                "auth" => RateLimit::AUTH,
+                "auth" | "oauth_start" => RateLimit::AUTH,
                 "refresh" => RateLimit::REFRESH,
                 "auth_read" => RateLimit::API_READ,
                 "auth_write" => RateLimit::API_WRITE,
@@ -976,6 +980,50 @@ mod oauth_start_limit_tests {
         assert_eq!(
             rows, budget as i64,
             "the refused request must not have written a PKCE state row"
+        );
+    }
+
+    /// OAuth starts spend their own bucket. A client address that has used
+    /// up the OAuth-start budget can still try a password login.
+    #[tokio::test]
+    async fn oauth_starts_do_not_spend_the_login_budget() {
+        let mut ctx = TestContext::with_auth_and_crypto().await;
+        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
+        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID", "client-id");
+        ctx.register_block("impresspress/auth-ui", Arc::new(AuthUiBlock::new()));
+
+        for _ in 0..=RateLimit::AUTH.max_requests {
+            output_http_status(
+                ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                    .await,
+            )
+            .await;
+        }
+        assert_eq!(
+            output_http_status(
+                ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                    .await,
+            )
+            .await,
+            429,
+            "precondition: the OAuth-start budget is spent"
+        );
+
+        let mut login = anon_msg("create", "/b/auth/api/login");
+        login.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.21");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "email": "nobody@example.com",
+            "password": "not-the-password",
+        }))
+        .expect("serialize body");
+        let status = output_http_status(
+            ctx.dispatch_with_input(login, InputStream::from_bytes(body))
+                .await,
+        )
+        .await;
+        assert_eq!(
+            status, 401,
+            "the login is judged on its credentials, not refused for the OAuth starts"
         );
     }
 }
