@@ -78,6 +78,19 @@ async fn a_reserved_name_cannot_be_claimed() {
     )
     .await
     .expect_err("UNIQUE(name) must refuse a claim of a reserved name");
+    // The database service reports a constraint violation as a scrubbed
+    // `Internal`, so the error cannot say which constraint fired. The control
+    // does: the identical row under an unreserved name lands, so the name is
+    // the only thing the refusal can have been about.
+    insert_org(
+        &ctx,
+        "wafer-run-fork",
+        Some(&uid),
+        Some(("github", "wafer-run")),
+        false,
+    )
+    .await
+    .expect("the same claim under an unreserved name must land");
 
     let row = orgs::find_by_name(&ctx, "wafer-run")
         .await
@@ -114,6 +127,12 @@ async fn a_provider_org_is_claimable_once_but_reserved_rows_are_exempt() {
     insert_org(&ctx, "acme-sh", Some(&b), Some(("github", "shared")), false)
         .await
         .expect_err("one provider org is claimable once");
+    // Control, for the reason given in `a_reserved_name_cannot_be_claimed`:
+    // the same row naming a different provider org lands, so the refusal was
+    // the claim index.
+    insert_org(&ctx, "acme-sh", Some(&b), Some(("github", "other")), false)
+        .await
+        .expect("a claim of a different provider org must land");
 
     let owned: Vec<String> = orgs::list_for_user(&ctx, &a)
         .await
@@ -122,8 +141,11 @@ async fn a_provider_org_is_claimable_once_but_reserved_rows_are_exempt() {
         .map(|o| o.name)
         .collect();
     assert_eq!(owned, vec!["acme".to_string()]);
-    assert!(orgs::list_for_user(&ctx, &b)
+    let owned_b: Vec<String> = orgs::list_for_user(&ctx, &b)
         .await
         .expect("list_for_user")
-        .is_empty());
+        .into_iter()
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(owned_b, vec!["acme-sh".to_string()]);
 }
