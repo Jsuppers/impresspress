@@ -7038,6 +7038,114 @@ async fn a_base_plan_item_contributes_no_addon_total() {
     );
 }
 
+/// A `customer.subscription.updated` delivery with no `status` reports
+/// nothing about the lifecycle, so the platform row keeps the status it has
+/// while the plan the payload does carry is applied. The empty status used to
+/// be written as-is, and it ranks with the live statuses, so a newer
+/// statusless event blanked an active subscription's status to `""`.
+#[tokio::test]
+async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(&ctx, "sub_statusless", "owner_statusless", "active").await;
+    seed_platform_subscription(
+        &ctx,
+        "sub_statusless_cancelled",
+        "owner_statusless_cancelled",
+        "cancelled",
+    )
+    .await;
+
+    let statusless = |event_id: &str, subscription_id: &str, created: i64, plan: &str| {
+        serde_json::json!({
+            "id": event_id,
+            "type": "customer.subscription.updated",
+            "created": created,
+            "livemode": false,
+            "data": {"object": {
+                "id": subscription_id,
+                "items": {"data": [{
+                    "quantity": 1,
+                    "metadata": {},
+                    "price": {"id": "price_plan", "lookup_key": plan, "metadata": {}}
+                }]}
+            }}
+        })
+    };
+    let deliver = |event: serde_json::Value| {
+        let ctx = &ctx;
+        async move {
+            let (msg, input) = webhook_msg(&event, WEBHOOK_SECRET);
+            let answer = output_to_json(stripe::handle_webhook(ctx, &msg, input).await).await;
+            assert_eq!(
+                answer["received"], true,
+                "{} was answered {answer}",
+                event["id"]
+            );
+        }
+    };
+    let row = |subscription_id: &'static str| {
+        let ctx = &ctx;
+        async move {
+            db::get(
+                ctx,
+                repo::subscriptions::SUBSCRIPTIONS_TABLE,
+                subscription_id,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    deliver(statusless(
+        "evt_statusless_newer",
+        "sub_statusless",
+        200,
+        "business",
+    ))
+    .await;
+    let subscription = row("sub_statusless").await;
+    assert_eq!(
+        subscription.data["status"], "active",
+        "an event without a status must not overwrite the stored one"
+    );
+    assert_eq!(subscription.data["plan"], "business");
+    assert_eq!(subscription.data["stripe_event_created"], 200);
+
+    // Guard (passes without the fix too): the ordering rule still refuses a
+    // strictly older statusless event, so it cannot put an old plan back.
+    deliver(statusless(
+        "evt_statusless_older",
+        "sub_statusless",
+        150,
+        "starter",
+    ))
+    .await;
+    let subscription = row("sub_statusless").await;
+    assert_eq!(subscription.data["plan"], "business");
+    assert_eq!(subscription.data["stripe_event_created"], 200);
+
+    // A statusless event on a terminal row restates the terminal status, so
+    // it applies; the row keeps its stored spelling, which re-serialising
+    // the parsed status would change. (On main this delivery is refused
+    // outright, so this part passes there; it pins the compare-and-swap
+    // below, which a statusless event can now reach on a `cancelled` row.)
+    deliver(statusless(
+        "evt_statusless_cancelled",
+        "sub_statusless_cancelled",
+        200,
+        "business",
+    ))
+    .await;
+    assert_eq!(
+        row("sub_statusless_cancelled").await.data["status"],
+        "cancelled"
+    );
+}
+
 /// `customer.subscription.deleted` stores the platform row as `cancelled`,
 /// which parses as [`SubscriptionStatus::Canceled`]. A later
 /// `customer.subscription.updated` that restates `canceled` is allowed by the

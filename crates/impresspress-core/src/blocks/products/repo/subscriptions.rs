@@ -253,6 +253,11 @@ pub(crate) async fn platform_subscription_exists(
 /// cancellation emits `updated` and `deleted` with the same `created` second
 /// — the deletion stays authoritative regardless of delivery order). Writes
 /// compare-and-swap on the exact (timestamp, status) pair that was read.
+///
+/// A `status` of [`SubscriptionStatus::Unset`] means the event reported no
+/// status: the stored status is kept, and the transition rules judge the
+/// event as if it restated that status, so only the ordering rule can refuse
+/// it. The plan (when given) and the event timestamp are still applied.
 /// Returns rows affected (0 = no matching row, or the event was refused).
 pub(crate) async fn update_status_plan(
     ctx: &dyn Context,
@@ -271,17 +276,27 @@ pub(crate) async fn update_status_plan(
         // re-serialised: a row holding `cancelled` parses as `Canceled`,
         // whose spelling would never match it.
         let stored_status = current.data.get("status").cloned().unwrap_or_default();
+        let incoming_status = if status == SubscriptionStatus::Unset {
+            current_status
+        } else {
+            status
+        };
         if !super::subscription_transition_allowed(
             current_status,
             current_created,
-            status,
+            incoming_status,
             event_created,
         ) {
             return Ok(0);
         }
         let now = chrono::Utc::now().to_rfc3339();
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-        data.insert("status".into(), serde_json::json!(status));
+        // Not rewritten from `current_status` when the event has none: the
+        // row may hold the `cancelled` spelling, which serialising the
+        // variant would silently change (see `cancel_and_reset_addons`).
+        if status != SubscriptionStatus::Unset {
+            data.insert("status".into(), serde_json::json!(status));
+        }
         data.insert("updated_at".into(), serde_json::json!(&now));
         data.insert(
             "stripe_event_created".into(),
