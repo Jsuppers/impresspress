@@ -7,7 +7,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use crate::{
     blocks::auth::repo::{local_credentials, provider_links, users},
     http::{err_internal, redirect, ResponseBuilder},
-    ui::SiteConfig,
+    ui::{self, SiteConfig},
 };
 
 /// The resend-verification button's behaviour, delegated.
@@ -50,18 +50,23 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    let links = provider_links::list_for_user(ctx, &user_id)
-        .await
-        .unwrap_or_default();
-
-    // Read verification status. On error (missing user / db hiccup), default
-    // to "unverified" + log — this matches the rest of the auth block's
-    // defensive style (login.rs treats missing `email_verified` as false).
+    // Both reads fail closed to the 500 page. An unreadable link list would
+    // render "No external accounts linked" — hiding exactly the sign-in
+    // routes this page exists to let a user audit — and an unreadable
+    // verification flag would tell a verified user they are not, with a
+    // Resend button beside it.
+    let links = match provider_links::list_for_user(ctx, &user_id).await {
+        Ok(links) => links,
+        Err(e) => {
+            tracing::error!(error = %e, user_id = %user_id, "userportal security: provider links read failed");
+            return ui::server_error_response(msg);
+        }
+    };
     let email_verified = match users::is_email_verified(ctx, &user_id).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, user_id = %user_id, "failed to read email_verified");
-            false
+            tracing::error!(error = %e, user_id = %user_id, "userportal security: email_verified read failed");
+            return ui::server_error_response(msg);
         }
     };
     let user_email = msg.get_meta("auth.user_email").to_string();

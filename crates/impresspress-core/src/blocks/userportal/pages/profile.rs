@@ -8,7 +8,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use crate::{
     blocks::auth::repo::users,
     http::redirect,
-    ui::{components, SiteConfig, UserInfo},
+    ui::{self, components, SiteConfig, UserInfo},
 };
 
 pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -23,15 +23,25 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // both are written together by `users::insert` and
     // `users::update_profile`, and `display_name` is the column migration
     // 001 declares NOT NULL, so it is the one that is always populated.
-    let row = users::find_by_id(ctx, &user_id).await.ok().flatten();
-    let display_name = row
-        .as_ref()
-        .map(|u| u.display_name.clone())
-        .unwrap_or_default();
-    let avatar_url = row
-        .as_ref()
-        .and_then(|u| u.avatar_url.clone())
-        .unwrap_or_default();
+    //
+    // The form below is pre-filled from this row and posts every field back,
+    // so it is never rendered without it: a form built from a blank default
+    // would write that blank over the real name on Save. A missing row for a
+    // signed-in user is the same internal inconsistency
+    // `handle_update_profile` reports, not an empty profile.
+    let row = match users::find_by_id(ctx, &user_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::error!(user_id = %user_id, "userportal profile: signed-in user has no users row");
+            return ui::server_error_response(msg);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, user_id = %user_id, "userportal profile: user read failed");
+            return ui::server_error_response(msg);
+        }
+    };
+    let display_name = row.display_name;
+    let avatar_url = row.avatar_url.unwrap_or_default();
     let email = user.as_ref().map(|u| u.email.as_str()).unwrap_or("");
 
     let body = html! {
@@ -63,8 +73,9 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
                 div .form-group {
                     label .form-label for="display-name" { "Display name" }
+                    // `required`: the update handler refuses an empty name.
                     input .form-input #display-name type="text" name="name"
-                        value=(display_name) placeholder="Enter your name";
+                        value=(display_name) placeholder="Enter your name" required;
                 }
                 button .btn .btn--primary type="submit" .w-full { "Save" }
             }
@@ -90,6 +101,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_renders_profile_form() {
         let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/profile", "user-a");
         let resp = profile_page(&ctx, &msg).await;
         let html = output_html(resp).await;
@@ -103,6 +115,7 @@ mod tests {
     #[tokio::test]
     async fn renders_back_link_to_dashboard() {
         let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/profile", "user-a");
         let resp = profile_page(&ctx, &msg).await;
         let html = output_html(resp).await;
@@ -115,6 +128,7 @@ mod tests {
     #[tokio::test]
     async fn shell_chrome_is_absent() {
         let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/profile", "user-a");
         let resp = profile_page(&ctx, &msg).await;
         let html = output_html(resp).await;

@@ -9,7 +9,7 @@ use wafer_run::{
 use crate::{
     blocks::crud,
     endpoint_match::{self, EndpointRoute},
-    http::{err_forbidden, err_not_found, ok_json},
+    http::{err_bad_request, err_forbidden, err_not_found, ok_json},
     ui::{self, components, icons, settings_form},
     util::parse_form_body,
 };
@@ -235,7 +235,12 @@ impl UserPortalBlock {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-async fn load_buttons(ctx: &dyn Context) -> Vec<wafer_core::clients::database::Record> {
+/// The configured portal buttons, in display order. A failed read is an
+/// error, not an empty list: callers render "no buttons" only for a table that
+/// was actually read and is empty.
+async fn load_buttons(
+    ctx: &dyn Context,
+) -> Result<Vec<wafer_core::clients::database::Record>, wafer_run::WaferError> {
     db::list(
         ctx,
         TABLE,
@@ -250,7 +255,6 @@ async fn load_buttons(ctx: &dyn Context) -> Vec<wafer_core::clients::database::R
     )
     .await
     .map(|r| r.records)
-    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +288,13 @@ async fn handle_update_profile(
         return err_forbidden("invalid or missing csrf token");
     }
 
-    let name = body.get("name").map(|s| s.as_str()).unwrap_or("");
+    // A blank name is refused rather than written: nothing legitimately
+    // clears a display name through this form, and a missing or empty field
+    // is what a form rendered without the user's row would post back.
+    let name = body.get("name").map(|s| s.trim()).unwrap_or("");
+    if name.is_empty() {
+        return err_bad_request("Display name is required");
+    }
 
     // `update_profile` dual-writes `display_name` and the `name` alias, so
     // the typed row and the raw column cannot drift apart.

@@ -15,6 +15,7 @@ use crate::{
     crypto::META_AUTH_FAMILY,
     http::{err_internal, redirect, ResponseBuilder},
     ui::{
+        self,
         components::{badge, BadgeVariant},
         SiteConfig,
     },
@@ -26,13 +27,14 @@ pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    // DB errors are tracing::warn'd (per repo convention) and we render the
-    // empty-state — the page is a UX surface, not a security gate.
+    // An unreadable list is the 500 page, not "No active sessions.": this is
+    // where a user looks for a device to sign out, and an empty list tells
+    // them there is nothing to revoke.
     let rows = match sessions::list_for_user(ctx, &user_id).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(user_id = %user_id, "userportal sessions list_for_user failed: {e}");
-            Vec::new()
+            tracing::error!(error = %e, user_id = %user_id, "userportal sessions: list_for_user failed");
+            return ui::server_error_response(msg);
         }
     };
 

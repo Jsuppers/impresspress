@@ -44,7 +44,15 @@ pub(crate) const ICON_OPTIONS: &[(&str, &str)] = &[
 ];
 
 pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let buttons = load_buttons(ctx).await;
+    // "No buttons configured" is what an empty table renders; an unreadable
+    // one is the 500 page, or the admin would add back buttons that exist.
+    let buttons = match load_buttons(ctx).await {
+        Ok(buttons) => buttons,
+        Err(e) => {
+            tracing::error!(error = %e, "userportal admin buttons page: buttons read failed");
+            return ui::server_error_response(msg);
+        }
+    };
 
     let content = html! {
         (components::page_header(
@@ -173,9 +181,24 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
 
 /// Re-load the buttons and render the `#buttons-table` fragment — the htmx
 /// swap target every mutating handler responds with.
-async fn buttons_table_response(ctx: &dyn Context) -> OutputStream {
-    let buttons = load_buttons(ctx).await;
-    ui::html_response(render_buttons_table(&buttons))
+///
+/// Called only after the mutation has been written, so a failed re-read must
+/// not render the empty table (which reads as "the change wiped every
+/// button"): the target becomes an error notice saying the change was
+/// `applied` and the list needs a reload.
+async fn buttons_table_response(ctx: &dyn Context, applied: &str) -> OutputStream {
+    match load_buttons(ctx).await {
+        Ok(buttons) => ui::html_response(render_buttons_table(&buttons)),
+        Err(e) => {
+            tracing::error!(error = %e, "userportal admin buttons: table re-read failed");
+            ui::swap_error_response(
+                "buttons-table",
+                &format!(
+                    "{applied}, but the button list could not be loaded. Reload the page to see it."
+                ),
+            )
+        }
+    }
 }
 
 /// Parse + validate the create/update button form (shared by both handlers):
@@ -221,7 +244,7 @@ pub async fn handle_create_button(ctx: &dyn Context, input: InputStream) -> Outp
         return err_internal("Failed to create button", e.message);
     }
 
-    buttons_table_response(ctx).await
+    buttons_table_response(ctx, "Button added").await
 }
 
 /// Validate that `id` is safe to interpolate into inline HTML/JS strings
@@ -328,7 +351,7 @@ pub async fn handle_update_button(ctx: &dyn Context, input: InputStream, id: &st
         return err_internal("Failed to update button", e.message);
     }
 
-    buttons_table_response(ctx).await
+    buttons_table_response(ctx, "Button saved").await
 }
 
 pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
@@ -339,7 +362,7 @@ pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
         return crud::db_error(e, "Button not found", "Failed to delete button");
     }
 
-    buttons_table_response(ctx).await
+    buttons_table_response(ctx, "Button deleted").await
 }
 
 #[cfg(test)]
