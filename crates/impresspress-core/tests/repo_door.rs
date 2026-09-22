@@ -320,21 +320,20 @@ fn parsed() -> &'static [(String, String, Names)] {
         let threads = std::thread::available_parallelism().map_or(1, usize::from);
         let chunk = files.len().div_ceil(threads).max(1);
         std::thread::scope(|scope| {
-            let workers: Vec<_> = files
-                .chunks(chunk)
-                .map(|batch| {
-                    scope.spawn(move || {
-                        batch
-                            .iter()
-                            .map(|file| {
-                                let names = Names::parse(&file.rel, &file.text);
-                                let code = strip_line_comments(&file.text);
-                                (file.rel.clone(), code, names)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
+            // Spawn every worker before joining any, or they run one by one.
+            let mut workers = Vec::new();
+            for batch in files.chunks(chunk) {
+                workers.push(scope.spawn(move || {
+                    batch
+                        .iter()
+                        .map(|file| {
+                            let names = Names::parse(&file.rel, &file.text);
+                            let code = strip_line_comments(&file.text);
+                            (file.rel.clone(), code, names)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
             workers
                 .into_iter()
                 .flat_map(|w| w.join().expect("a parse worker panicked"))
