@@ -30,10 +30,14 @@ pub use users::*;
 pub use variables::*;
 use wafer_run::{context::Context, Message, OutputStream};
 
-use crate::ui::{
-    self,
-    shell::{Crumb, Topbar},
-    NavKind, Shell,
+use crate::{
+    platform_state::request_logs,
+    ui::{
+        self,
+        components::BadgeVariant,
+        shell::{Crumb, Topbar},
+        NavKind, Shell,
+    },
 };
 
 /// Wrap content in the admin shell: the shared [`ui::shell_page`] with the
@@ -64,6 +68,19 @@ pub(crate) async fn admin_page(
     .await
 }
 
+/// The badge a request-log row's status code renders in, on every page that
+/// lists rows: a 5xx is `Danger`, any other error row
+/// ([`request_logs::is_error_status`]) is `Warning`, the rest `Success`.
+pub(crate) fn status_code_badge_variant(status_code: i64) -> BadgeVariant {
+    if status_code >= 500 {
+        BadgeVariant::Danger
+    } else if request_logs::is_error_status(status_code) {
+        BadgeVariant::Warning
+    } else {
+        BadgeVariant::Success
+    }
+}
+
 /// Convenience: a single top-level breadcrumb with no link.
 pub(crate) fn crumb(label: &'static str) -> Vec<Crumb<'static>> {
     vec![Crumb { label, href: None }]
@@ -73,6 +90,19 @@ pub(crate) fn crumb(label: &'static str) -> Vec<Crumb<'static>> {
 mod tests {
     use super::*;
     use crate::test_support::{admin_msg, output_body, TestContext};
+
+    /// The badge boundaries: the error floor turns a row amber, a 5xx red.
+    #[test]
+    fn status_code_badge_variant_splits_at_400_and_500() {
+        for (code, variant) in [
+            (399, BadgeVariant::Success),
+            (400, BadgeVariant::Warning),
+            (499, BadgeVariant::Warning),
+            (500, BadgeVariant::Danger),
+        ] {
+            assert_eq!(status_code_badge_variant(code), variant, "{code}");
+        }
+    }
 
     /// The admin shell must hide nav entries whose block isn't registered on
     /// this target, exactly as every other shelled page does — otherwise the

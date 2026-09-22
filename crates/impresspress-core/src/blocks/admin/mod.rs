@@ -2179,7 +2179,6 @@ pub(crate) mod page_link_tests {
             &request_logs::NewRequestLog {
                 method: "GET",
                 path: "/probe",
-                status_label: "OK",
                 status_code: 200,
                 error_message: "",
                 duration_ms: 5,
@@ -2191,7 +2190,7 @@ pub(crate) mod page_link_tests {
         .expect("seed request log");
         // A failing request as well as a succeeding one: the dashboard's
         // "Recent Errors" card reads `list_recent_errors`, whose filter is
-        // `status == "ERROR"` OR `status_code >= 400`, so the 200 above
+        // `status_code >= 400`, so the 200 above
         // renders that card's empty state and nothing else. Without this row
         // no render test ever exercises that card's table.
         request_logs::insert(
@@ -2199,7 +2198,6 @@ pub(crate) mod page_link_tests {
             &request_logs::NewRequestLog {
                 method: "POST",
                 path: "/probe/fail",
-                status_label: "ERROR",
                 status_code: 500,
                 error_message: "probe failure",
                 duration_ms: 9,

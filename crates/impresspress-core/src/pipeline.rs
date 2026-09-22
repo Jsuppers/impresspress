@@ -239,7 +239,6 @@ pub async fn refuse_oversized_body(
         NewRequestLog {
             method: msg.action(),
             path: msg.path(),
-            status_label: "ERROR",
             status_code: 413,
             error_message: "",
             duration_ms: 0,
@@ -520,7 +519,6 @@ pub async fn handle_request(
     if crate::streaming::wants_streaming(&leading_meta) {
         if crate::streaming::has_stream_marker(&leading_meta) {
             let status_code = i64::from(http_codec::resolve_status(&leading_meta, 200));
-            let status_label = if status_code >= 400 { "ERROR" } else { "OK" };
             let duration_ms = i64::try_from(crate::util::now_millis().saturating_sub(start_ms))
                 .unwrap_or(i64::MAX);
             write_request_log(
@@ -528,7 +526,6 @@ pub async fn handle_request(
                 NewRequestLog {
                     method: &method,
                     path: &path,
-                    status_label,
                     status_code,
                     error_message: "",
                     duration_ms,
@@ -543,73 +540,58 @@ pub async fn handle_request(
         return crate::streaming::rebuild_streaming(leading_meta, next_event, stream);
     }
 
-    let (status_label, status_code, error_message, reply): (
-        &'static str,
-        i64,
-        String,
-        OutputStream,
-    ) = match crate::streaming::collect_buffered_with_prelude(stream, leading_meta, next_event)
-        .await
-    {
-        Ok(buf) => {
-            let code = i64::from(http_codec::resolve_status(&buf.meta, 200));
-            (
-                "OK",
-                code,
-                String::new(),
-                replay_buffered(buf.body, buf.meta),
-            )
-        }
-        Err(TerminalNotResponse::Error(err)) => {
-            // The error's OWN code decides the logged status. This was
-            // hardcoded 500, so a `NotFound` was recorded as a server error.
-            //
-            // Only the audit row was wrong, never the response: every adapter
-            // builds its reply through `http_codec::collect_http_response`,
-            // whose `Error` arm already calls `resolve_error_status`, so the
-            // client has always been served the 404/403/401 the error means.
-            // The row simply disagreed with the response that was sent —
-            // which is what an audit row exists not to do, and what defeats
-            // `RequestLogPolicy::Errors`: it selects on `status_code`, so
-            // every attacker-minted junk URL would have counted as a 5xx and
-            // been kept. Same function as the adapters use, so the two cannot
-            // drift. See `an_unmatched_endpoint_is_logged_404_not_500`.
-            //
-            // The label is derived from the resolved code, not pinned to
-            // "ERROR", for the same reason the streamed-download branch above
-            // derives it: an error carrying an explicit `META_RESP_STATUS`
-            // override can resolve below 400, and a row labelled ERROR with a
-            // 2xx/3xx `status_code` would be the same disagreement in the
-            // other direction. See `the_label_follows_the_resolved_status`.
-            let message = err.message.clone();
-            let code = i64::from(http_codec::resolve_error_status(&err));
-            let label = if code >= 400 { "ERROR" } else { "OK" };
-            (label, code, message, OutputStream::error(err))
-        }
-        Err(TerminalNotResponse::Drop) => ("OK", 204, String::new(), OutputStream::drop_request()),
-        Err(TerminalNotResponse::Continue(m)) => {
-            ("OK", 200, String::new(), OutputStream::continue_with(m))
-        }
-        Err(TerminalNotResponse::Malformed) => (
-            "ERROR",
-            500,
-            "stream ended without terminal event".to_string(),
-            OutputStream::error(WaferError {
-                code: ErrorCode::Internal,
-                message: "stream ended without terminal event".to_string(),
-                meta: vec![],
-            }),
-        ),
-        Err(TerminalNotResponse::Halt(buf)) => {
-            let code = i64::from(http_codec::resolve_status(&buf.meta, 200));
-            (
-                "OK",
-                code,
-                String::new(),
-                OutputStream::from_buffered_response(buf),
-            )
-        }
-    };
+    let (status_code, error_message, reply): (i64, String, OutputStream) =
+        match crate::streaming::collect_buffered_with_prelude(stream, leading_meta, next_event)
+            .await
+        {
+            Ok(buf) => {
+                let code = i64::from(http_codec::resolve_status(&buf.meta, 200));
+                (code, String::new(), replay_buffered(buf.body, buf.meta))
+            }
+            Err(TerminalNotResponse::Error(err)) => {
+                // The error's OWN code decides the logged status. This was
+                // hardcoded 500, so a `NotFound` was recorded as a server error.
+                //
+                // Only the audit row was wrong, never the response: every adapter
+                // builds its reply through `http_codec::collect_http_response`,
+                // whose `Error` arm already calls `resolve_error_status`, so the
+                // client has always been served the 404/403/401 the error means.
+                // The row simply disagreed with the response that was sent —
+                // which is what an audit row exists not to do, and what defeats
+                // `RequestLogPolicy::Errors`: it selects on `status_code`, so
+                // every attacker-minted junk URL would have counted as a 5xx and
+                // been kept. Same function as the adapters use, so the two cannot
+                // drift. See `an_unmatched_endpoint_is_logged_404_not_500`.
+                //
+                // An error carrying an explicit `META_RESP_STATUS` override can
+                // resolve below 400; the row's label follows the code, as on every
+                // arm. See `the_label_follows_the_resolved_status`.
+                let message = err.message.clone();
+                let code = i64::from(http_codec::resolve_error_status(&err));
+                (code, message, OutputStream::error(err))
+            }
+            Err(TerminalNotResponse::Drop) => (204, String::new(), OutputStream::drop_request()),
+            Err(TerminalNotResponse::Continue(m)) => {
+                (200, String::new(), OutputStream::continue_with(m))
+            }
+            Err(TerminalNotResponse::Malformed) => (
+                500,
+                "stream ended without terminal event".to_string(),
+                OutputStream::error(WaferError {
+                    code: ErrorCode::Internal,
+                    message: "stream ended without terminal event".to_string(),
+                    meta: vec![],
+                }),
+            ),
+            Err(TerminalNotResponse::Halt(buf)) => {
+                let code = i64::from(http_codec::resolve_status(&buf.meta, 200));
+                (
+                    code,
+                    String::new(),
+                    OutputStream::from_buffered_response(buf),
+                )
+            }
+        };
 
     // 4. Log the request (best-effort, don't block the response).
     // `now_millis()` reads wall clock — saturating_sub guards against clock
@@ -622,7 +604,6 @@ pub async fn handle_request(
         NewRequestLog {
             method: &method,
             path: &path,
-            status_label,
             status_code,
             error_message: &error_message,
             duration_ms,
@@ -3263,15 +3244,59 @@ mod request_log_policy_tests {
         }
     }
 
+    /// Answers the styled HTML 500 page as a RESPONSE, the way a handler
+    /// that hit a failure it renders for a browser does. The pipeline sees a
+    /// buffered `Response` terminal carrying status 500, not an error.
+    struct HtmlServerErrorBlock;
+
+    #[wafer_block::wafer_async_trait]
+    impl RunBlock for HtmlServerErrorBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/page500", "0.1.0", "test/probe@v1", "html 500 probe")
+        }
+        async fn handle(&self, _c: &dyn Context, m: Message, _i: InputStream) -> OutputStream {
+            crate::ui::server_error_response(&m)
+        }
+        async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
+    /// Answers a complete 403 through the `Halt` terminal.
+    struct HaltForbiddenBlock;
+
+    #[wafer_block::wafer_async_trait]
+    impl RunBlock for HaltForbiddenBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/halt403", "0.1.0", "test/probe@v1", "halt 403 probe")
+        }
+        async fn handle(&self, _c: &dyn Context, _m: Message, _i: InputStream) -> OutputStream {
+            OutputStream::halt(
+                b"forbidden".to_vec(),
+                vec![MetaEntry {
+                    key: wafer_run::META_RESP_STATUS.into(),
+                    value: "403".into(),
+                }],
+            )
+        }
+        async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
+            Ok(())
+        }
+    }
+
     const OK_ROUTE: &str = "/x/ok";
     const BOOM_ROUTE: &str = "/x/boom";
     const MOVED_ROUTE: &str = "/x/moved";
+    const PAGE_500_ROUTE: &str = "/x/page500";
+    const HALT_403_ROUTE: &str = "/x/halt403";
 
     fn routes() -> Vec<ExtraRoute> {
         vec![
             ExtraRoute::new(OK_ROUTE, "test/ok", RouteAccess::Public),
             ExtraRoute::new(BOOM_ROUTE, "test/boom", RouteAccess::Public),
             ExtraRoute::new(MOVED_ROUTE, "test/moved", RouteAccess::Public),
+            ExtraRoute::new(PAGE_500_ROUTE, "test/page500", RouteAccess::Public),
+            ExtraRoute::new(HALT_403_ROUTE, "test/halt403", RouteAccess::Public),
         ]
     }
 
@@ -3283,6 +3308,8 @@ mod request_log_policy_tests {
         ctx.register_block("test/ok", Arc::new(OkBlock));
         ctx.register_block("test/boom", Arc::new(BoomBlock));
         ctx.register_block("test/moved", Arc::new(RedirectingErrorBlock));
+        ctx.register_block("test/page500", Arc::new(HtmlServerErrorBlock));
+        ctx.register_block("test/halt403", Arc::new(HaltForbiddenBlock));
         ctx
     }
 
@@ -3307,10 +3334,15 @@ mod request_log_policy_tests {
     /// the consumer-registered shape `resembles_a_declared_route` has to
     /// honour.
     async fn drive(ctx: &TestContext, path: &str) {
+        drive_msg(ctx, anon_msg("retrieve", path)).await;
+    }
+
+    /// [`drive`] with a caller-built request, for a test that needs headers.
+    async fn drive_msg(ctx: &TestContext, msg: Message) {
         set_request_log_mode(RequestLogMode::Inline);
         let out = handle_request(
             ctx,
-            anon_msg("retrieve", path),
+            msg,
             InputStream::empty(),
             None,
             "test-secret",
@@ -3345,11 +3377,10 @@ mod request_log_policy_tests {
         );
     }
 
-    /// The `status` label follows the resolved code rather than being pinned
-    /// to "ERROR" on the error arm. An error carrying an explicit
-    /// `META_RESP_STATUS` below 400 would otherwise produce a row labelled
-    /// ERROR with a 3xx `status_code` — the same row/response disagreement the
-    /// hardcoded 500 produced, in the other direction.
+    /// The `status` label follows the resolved code on the error arm too. An
+    /// error carrying an explicit `META_RESP_STATUS` below 400 is served a
+    /// 3xx, so a row labelled ERROR beside it would disagree with the
+    /// response that was sent.
     #[tokio::test]
     async fn the_label_follows_the_resolved_status() {
         let ctx = ctx_with(Some("all")).await;
@@ -3366,6 +3397,75 @@ mod request_log_policy_tests {
             rows[0].status, "OK",
             "a sub-400 status must not be labelled ERROR",
         );
+    }
+
+    /// The one stored row, and the dashboard's today/daily error counts over
+    /// it, after driving a single request.
+    async fn sole_row_and_dashboard_errors(
+        ctx: &TestContext,
+    ) -> (request_logs::RequestLogRow, i64, i64) {
+        let rows = request_logs::paginated(ctx, 1, 10, "")
+            .await
+            .expect("list request_logs")
+            .rows;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let today_start = format!("{}T00:00:00", chrono::Utc::now().format("%Y-%m-%d"));
+        let today = request_logs::today_counts(ctx, &today_start)
+            .await
+            .expect("today_counts");
+        assert_eq!(today.requests, 1);
+        let daily: i64 = request_logs::daily_counts(ctx, &today_start)
+            .await
+            .expect("daily_counts")
+            .iter()
+            .map(|d| d.errors)
+            .sum();
+        (rows[0].clone(), today.errors, daily)
+    }
+
+    /// A handler that renders the styled HTML 500 page answers with a
+    /// buffered `Response`, not an error terminal. The row is still an error:
+    /// labelled so, and counted by the dashboard's tiles and series, the same
+    /// as the network page's `status_code` column counts it.
+    #[tokio::test]
+    async fn a_buffered_html_500_response_is_an_error_row() {
+        let ctx = ctx_with(Some("all")).await;
+        reset_request_log_budget_for_test();
+        let mut msg = anon_msg("retrieve", PAGE_500_ROUTE);
+        msg.set_meta("http.header.accept", "text/html");
+        drive_msg(&ctx, msg).await;
+
+        let (row, today_errors, daily_errors) = sole_row_and_dashboard_errors(&ctx).await;
+        assert_eq!(row.status_code, 500, "the styled page is a 500");
+        assert_eq!(today_errors, 1, "today_counts must count the 500");
+        assert_eq!(daily_errors, 1, "daily_counts must count the 500");
+        assert_eq!(row.status, "ERROR", "a buffered 500 must be labelled ERROR");
+    }
+
+    /// A complete 4xx through the `Halt` terminal is an error row too.
+    #[tokio::test]
+    async fn a_halted_4xx_response_is_an_error_row() {
+        let ctx = ctx_with(Some("all")).await;
+        reset_request_log_budget_for_test();
+        drive(&ctx, HALT_403_ROUTE).await;
+
+        let (row, today_errors, daily_errors) = sole_row_and_dashboard_errors(&ctx).await;
+        assert_eq!(row.status_code, 403);
+        assert_eq!(today_errors, 1, "today_counts must count the 403");
+        assert_eq!(daily_errors, 1, "daily_counts must count the 403");
+        assert_eq!(row.status, "ERROR", "a halted 403 must be labelled ERROR");
+    }
+
+    /// The buffered `Response` arm's success case: a 200 is not an error.
+    #[tokio::test]
+    async fn a_buffered_200_response_is_not_an_error_row() {
+        let ctx = ctx_with(Some("all")).await;
+        reset_request_log_budget_for_test();
+        drive(&ctx, OK_ROUTE).await;
+
+        let (row, today_errors, daily_errors) = sole_row_and_dashboard_errors(&ctx).await;
+        assert_eq!((row.status_code, row.status.as_str()), (200, "OK"));
+        assert_eq!((today_errors, daily_errors), (0, 0));
     }
 
     /// The default must not change for anyone who does not set the var.
