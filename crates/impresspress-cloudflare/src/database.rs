@@ -37,10 +37,16 @@
 //!   [`set_strict_schema`](DatabaseService::set_strict_schema) for the one
 //!   service a Wafer runtime is built around (the shared `wafer-run/database`
 //!   handler reads the same var from `ctx.config_get`). When set the executor
-//!   trusts the migrated schema and skips introspection *entirely* — no
-//!   table-exists probe, no lazy column-add — removing it from the hot path.
+//!   trusts the migrated schema: no table-exists probe, no lazy column-add.
 //!   Production CF deploys enable it (wrangler `[vars]`); a write/query
 //!   referencing an unmigrated column then fails loudly, as intended.
+//!
+//!   One introspection survives strict mode: a sorted or paged `list` ends its
+//!   `ORDER BY` with the table's primary key, which the executor reads with a
+//!   `pragma_table_info` the first time it lists that table
+//!   ([`DbExec::get_primary_key`]) and memoizes in the schema cache (plus one
+//!   table-exists probe for a table with no key). A warm isolate pays nothing;
+//!   a request-scoped handle (below) pays it once per table it lists sorted.
 //!
 //!   Seeding at construction is what covers the D1 services that never reach
 //!   an `Init`: the request-log drain's batch handle, built per request inside
@@ -56,6 +62,7 @@ use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
     exec::{BatchOp, BatchResult, DbExec},
+    mint_record_id,
     schema_cache::SchemaCache,
     service::{
         AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table,
@@ -69,18 +76,20 @@ use worker::*;
 /// Async database service wrapping Cloudflare D1.
 pub struct D1DatabaseService {
     db: D1Database,
-    /// Memoized table-exists / column-list facts (see [`SchemaCache`]).
-    /// Consulted by the shared executor before introspection and invalidated
-    /// by it on every schema mutation. Unused while `strict_schema` is set
-    /// (strict mode skips introspection outright).
+    /// Memoized table-exists / column-list / primary-key facts (see
+    /// [`SchemaCache`]). Consulted by the shared executor before introspection
+    /// and invalidated by it on every schema mutation. While `strict_schema`
+    /// is set only the primary key a sorted or paged `list` orders by is
+    /// looked up, so that is all the cache holds then.
     schema_cache: SchemaCache,
     /// STRICT_SCHEMA flag. Seeded at construction from the deploy's
     /// `WAFER_RUN__DATABASE__STRICT_SCHEMA` var, and re-applied at lifecycle
     /// `Init` via [`DatabaseService::set_strict_schema`] for the one service a
-    /// Wafer runtime is built around. When set, the shared executor skips
-    /// schema introspection entirely. `AtomicBool` (not `Cell`) so the struct
-    /// keeps the `Sync` bound `Arc<dyn DatabaseService>` needs; on wasm32's
-    /// single thread the ordering is immaterial.
+    /// Wafer runtime is built around. When set, the shared executor skips the
+    /// table-exists probe and the lazy column-add; a sorted or paged `list`
+    /// still looks up the table's primary key. `AtomicBool` (not `Cell`) so
+    /// the struct keeps the `Sync` bound `Arc<dyn DatabaseService>` needs; on
+    /// wasm32's single thread the ordering is immaterial.
     strict_schema: AtomicBool,
 }
 
@@ -132,10 +141,13 @@ impl D1DatabaseService {
     /// column set is rejected rather than silently producing a
     /// short/misaligned INSERT.
     ///
-    /// Mirrors `DbExec::create`'s per-row policy — synthesizes a UUID v4
-    /// `id` when absent (D1 never overrides `table_autogenerates_id`, so
-    /// ids are always caller/UUID-supplied) and stamps `created_at`/
-    /// `updated_at` when absent — but adds missing columns only ONCE for
+    /// Mirrors `DbExec::create`'s per-row policy — mints the `id` with
+    /// wafer's [`mint_record_id`] (a UUIDv7, so a batch's ids sort in the
+    /// order its rows were queued and a `created_at` tie lists them in that
+    /// order) when absent (D1 never overrides `table_autogenerates_id`, so
+    /// ids are always supplied by the caller or minted here) and stamps
+    /// `created_at`/`updated_at` when absent (see [`prepare_batch_rows`]) —
+    /// but adds missing columns only ONCE for
     /// the whole batch (via the first row, which is representative since
     /// every row shares the same shape) rather than per row: the audit-log
     /// table's schema is migration-owned, so this is a safety net, not the
@@ -150,39 +162,7 @@ impl D1DatabaseService {
         }
         let table = wafer_sql_utils::ident::sanitize_ident(collection);
 
-        let mut prepared: Vec<Vec<(String, serde_json::Value)>> = Vec::with_capacity(rows.len());
-        let mut shape: Option<Vec<String>> = None;
-        for mut data in rows {
-            if !data.contains_key("id") {
-                data.insert(
-                    "id".to_string(),
-                    serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
-                );
-            }
-            let now = chrono::Utc::now().to_rfc3339();
-            data.entry("created_at".to_string())
-                .or_insert_with(|| serde_json::Value::String(now.clone()));
-            data.entry("updated_at".to_string())
-                .or_insert_with(|| serde_json::Value::String(now));
-
-            let mut pairs: Vec<(String, serde_json::Value)> = data
-                .into_iter()
-                .map(|(k, v)| (wafer_sql_utils::ident::sanitize_ident(&k), v))
-                .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let cols: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
-            match &shape {
-                None => shape = Some(cols),
-                Some(expected) if expected == &cols => {}
-                Some(_) => {
-                    return Err(DatabaseError::Internal(
-                        "create_many requires every row to share the same column set".into(),
-                    ));
-                }
-            }
-            prepared.push(pairs);
-        }
+        let prepared = prepare_batch_rows(rows)?;
 
         // Lazy column-add once (request_logs' schema is migration-owned;
         // this is a safety net, not the steady-state path) — every row has
@@ -215,6 +195,53 @@ impl D1DatabaseService {
         }
         Ok(results.len() as i64)
     }
+}
+
+/// Stamp and shape the rows of one [`D1DatabaseService::create_many`] batch:
+/// mint a missing `id` with [`mint_record_id`], stamp a missing
+/// `created_at`/`updated_at`, and turn each row into sanitized, column-sorted
+/// `(column, value)` pairs. Every row must end up with the same column set,
+/// because the batch runs one INSERT shape; a row that differs is an error.
+///
+/// Ids are minted in row order, so the batch's keys ascend in the order its
+/// rows were queued.
+fn prepare_batch_rows(
+    rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
+) -> Result<Vec<Vec<(String, serde_json::Value)>>, DatabaseError> {
+    let mut prepared: Vec<Vec<(String, serde_json::Value)>> = Vec::with_capacity(rows.len());
+    let mut shape: Option<Vec<String>> = None;
+    for mut data in rows {
+        if !data.contains_key("id") {
+            data.insert(
+                "id".to_string(),
+                serde_json::Value::String(mint_record_id()),
+            );
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        data.entry("created_at".to_string())
+            .or_insert_with(|| serde_json::Value::String(now.clone()));
+        data.entry("updated_at".to_string())
+            .or_insert_with(|| serde_json::Value::String(now));
+
+        let mut pairs: Vec<(String, serde_json::Value)> = data
+            .into_iter()
+            .map(|(k, v)| (wafer_sql_utils::ident::sanitize_ident(&k), v))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let cols: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        match &shape {
+            None => shape = Some(cols),
+            Some(expected) if expected == &cols => {}
+            Some(_) => {
+                return Err(DatabaseError::Internal(
+                    "create_many requires every row to share the same column set".into(),
+                ));
+            }
+        }
+        prepared.push(pairs);
+    }
+    Ok(prepared)
 }
 
 // SAFETY: `D1DatabaseService` holds a `D1Database` handle scoped to a single
@@ -778,6 +805,45 @@ mod tests {
         assert_eq!(scalar_f64(None), 0.0);
     }
 
+    /// A batch's minted ids are UUIDv7 and ascend in row order, so request-log
+    /// rows drained together — which share a `created_at` to the millisecond —
+    /// list newest-first in the reverse of the order they were queued once a
+    /// sorted `list` breaks the tie on `id`. A UUIDv4 would order them at random.
+    #[wasm_bindgen_test]
+    fn a_batch_mints_v7_ids_in_row_order() {
+        let rows: Vec<std::collections::HashMap<String, serde_json::Value>> = (0..64)
+            .map(|n| {
+                std::collections::HashMap::from([
+                    ("path".to_string(), serde_json::json!(format!("/r/{n}"))),
+                    (
+                        "created_at".to_string(),
+                        serde_json::json!("2026-09-23T00:00:00.000+00:00"),
+                    ),
+                ])
+            })
+            .collect();
+        let prepared = prepare_batch_rows(rows).expect("one shape");
+        let ids: Vec<String> = prepared
+            .iter()
+            .map(|pairs| {
+                let (_, id) = pairs.iter().find(|(k, _)| k == "id").expect("minted id");
+                id.as_str().expect("string id").to_string()
+            })
+            .collect();
+        for id in &ids {
+            let parsed = uuid::Uuid::parse_str(id).expect("a UUID");
+            assert_eq!(parsed.get_version_num(), 7, "{id} is not a UUIDv7");
+        }
+        for pair in ids.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{} then {} is out of row order",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
     /// A `D1Database` that is never queried.
     ///
     /// `unchecked_into` only re-types the `JsValue`; it calls nothing on it.
@@ -804,9 +870,9 @@ mod tests {
         let strict = D1DatabaseService::new(never_queried_handle(), true);
         assert!(
             DbExec::strict_schema(&strict),
-            "a service constructed with STRICT_SCHEMA on must already skip \
-             introspection — nothing calls `set_strict_schema` on the drain or \
-             pre-Init handles",
+            "a service constructed with STRICT_SCHEMA on must already skip the \
+             table-exists and column introspection — nothing calls \
+             `set_strict_schema` on the drain or pre-Init handles",
         );
 
         let lax = D1DatabaseService::new(never_queried_handle(), false);
