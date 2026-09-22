@@ -257,7 +257,9 @@ pub(crate) async fn platform_subscription_exists(
 /// A `status` of [`SubscriptionStatus::Unset`] means the event reported no
 /// status: the stored status is kept, and the transition rules judge the
 /// event as if it restated that status, so only the ordering rule can refuse
-/// it. The plan (when given) and the event timestamp are still applied.
+/// it. The plan (when given) and the event timestamp are still applied —
+/// including over a terminal row, which such an event does not try to move
+/// away from and so is no longer refused by the terminal rule.
 /// Returns rows affected (0 = no matching row, or the event was refused).
 pub(crate) async fn update_status_plan(
     ctx: &dyn Context,
@@ -274,8 +276,13 @@ pub(crate) async fn update_status_plan(
         let current_status: SubscriptionStatus = enum_column(&current, "status")?;
         // The CAS compares the stored text, not the parsed variant
         // re-serialised: a row holding `cancelled` parses as `Canceled`,
-        // whose spelling would never match it.
-        let stored_status = current.data.get("status").cloned().unwrap_or_default();
+        // whose spelling would never match it. An absent key reads as `""`,
+        // the same value `enum_column` above turns into `Unset`.
+        let stored_status = current
+            .data
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(""));
         let incoming_status = if status == SubscriptionStatus::Unset {
             current_status
         } else {
@@ -370,6 +377,12 @@ pub(crate) async fn mark_past_due(
         }
         let now = chrono::Utc::now();
         let grace_end = (now + chrono::Duration::days(7)).to_rfc3339();
+        // The `status` filter below may stay typed where
+        // [`update_status_plan`]'s had to become the stored text: the only
+        // status whose stored spelling differs from the variant's is the
+        // terminal `cancelled`, and `subscription_transition_allowed` refuses
+        // terminal → `past_due` above, so a terminal row never reaches this
+        // write. Relaxing that rule would have to move this filter too.
         let now = now.to_rfc3339();
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();
         data.insert(

@@ -3404,8 +3404,12 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
             // state: a delivery whose `status` this build does not know is a
             // fact about the subscription that would otherwise be dropped on
             // the floor. A 500 makes Stripe redeliver, so nothing is lost and
-            // the gap is visible. An absent or empty `status` keeps its old
-            // meaning — nothing to apply — because that is not a value.
+            // the gap is visible. An absent or empty `status` decodes to
+            // `Unset`, which is not a value the subscription is in: the
+            // commerce sync below is skipped entirely, and the platform
+            // projection keeps its stored status while the plan and the
+            // event timestamp the payload does carry still apply
+            // (`repo::subscriptions::update_status_plan`).
             let Ok(status) = serde_json::from_value::<SubscriptionStatus>(
                 serde_json::Value::String(status.to_string()),
             ) else {

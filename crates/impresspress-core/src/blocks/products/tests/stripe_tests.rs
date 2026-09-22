@@ -7225,6 +7225,73 @@ async fn a_canceled_update_after_the_deletion_is_applied_not_retried() {
     assert_eq!(subscription.data["addon_r2_bytes"], 0);
 }
 
+/// `mark_past_due` compare-and-swaps on the parsed status re-serialised,
+/// which a row holding `cancelled` would never match — and it may, because
+/// `subscription_transition_allowed` refuses terminal -> `past_due` before
+/// the write, so such a row never reaches it. This guard (it passes whatever
+/// the CAS filter compares) pins that precondition: the delivery is answered
+/// and sealed, not retried into the dead-letter queue, and no grace window
+/// appears. Relaxing the terminal rule without moving the filter to the
+/// stored text would break it.
+#[tokio::test]
+async fn a_failed_invoice_on_a_cancelled_row_is_refused_not_dead_lettered() {
+    let ctx = ctx_with(&[(
+        "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+        WEBHOOK_SECRET,
+    )])
+    .await;
+    seed_platform_subscription(
+        &ctx,
+        "sub_failed_invoice",
+        "owner_failed_invoice",
+        "cancelled",
+    )
+    .await;
+
+    let payment_failed = serde_json::json!({
+        "id": "evt_failed_invoice_cancelled",
+        "type": "invoice.payment_failed",
+        "created": 400,
+        "livemode": false,
+        "data": {"object": {
+            "parent": {"subscription_details": {"subscription": "sub_failed_invoice"}}
+        }}
+    });
+    let (msg, input) = webhook_msg(&payment_failed, WEBHOOK_SECRET);
+    assert_eq!(
+        output_to_json(stripe::handle_webhook(&ctx, &msg, input).await).await["received"],
+        true
+    );
+    let event_row = db::get(
+        &ctx,
+        "impresspress__products__stripe_events",
+        "evt_failed_invoice_cancelled",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_row.data["status"], "processed",
+        "a refused past-due write is not a failure to retry"
+    );
+
+    let subscription = db::get(
+        &ctx,
+        repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_failed_invoice",
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription.data["status"], "cancelled");
+    assert_eq!(subscription.data["stripe_event_created"], 100);
+    assert!(
+        subscription.data["grace_period_end"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "a refused past-due write must not grant a fresh grace window"
+    );
+}
+
 /// The add-on totals are summed from payload numbers, so an amount or a
 /// quantity big enough to wrap would write a negative quota — a subscriber
 /// billed for storage handed less than none. The delivery fails instead.
