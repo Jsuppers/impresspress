@@ -305,6 +305,7 @@ pub async fn summarise_by_path(
             field: "path".into(),
             operator: "like".into(),
             value: json!(format!("%{path_search}%")),
+            column: None,
         })]
     };
     let req = wire::AggregateRequest {
@@ -317,6 +318,7 @@ pub async fn summarise_by_path(
             wire::AggregateColumnDef::Avg {
                 field: "duration_ms".into(),
                 alias: "avg_ms".into(),
+                cast_as: None,
             },
             wire::AggregateColumnDef::CaseWhenSum {
                 when: to_wire_filters(&[is_error()]),
@@ -345,12 +347,13 @@ pub async fn summarise_by_path(
             method: r.data.str_field("method").to_string(),
             path: r.data.str_field("path").to_string(),
             count: r.data.i64_field("cnt"),
-            // `db::aggregate`'s Avg has no result-cast, so AVG(duration_ms)
-            // comes back as a JSON float; `as_i64()` is always `None` for the
-            // `Number::Float` variant, so read it as f64 and truncate. The
-            // old `CAST(AVG(duration_ms) AS INTEGER)` truncated toward zero;
-            // `duration_ms` is always >= 0, so `as i64` (which also truncates
-            // toward zero) is exact parity — no `.round()`.
+            // The Avg is requested uncast, so AVG(duration_ms) comes back as
+            // a JSON float; `as_i64()` is always `None` for the
+            // `Number::Float` variant, so read it as f64 and truncate. A
+            // `BIGINT` cast would round on PostgreSQL and truncate on SQLite;
+            // truncating here gives one answer on every backend, and
+            // `duration_ms` is always >= 0, so `as i64` (which truncates
+            // toward zero) needs no `.round()`.
             avg_ms: r
                 .data
                 .get("avg_ms")
@@ -381,6 +384,7 @@ pub async fn today_counts(ctx: &dyn Context, since_iso: &str) -> Result<TodayCou
             wire::AggregateColumnDef::Avg {
                 field: "duration_ms".into(),
                 alias: "avg_val".into(),
+                cast_as: None,
             },
         ],
         filters: to_wire_filters(&[since(since_iso)]),

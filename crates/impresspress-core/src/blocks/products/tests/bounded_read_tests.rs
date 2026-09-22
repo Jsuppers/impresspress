@@ -215,20 +215,21 @@ async fn the_seller_listing_reports_that_it_is_a_prefix() {
     );
 }
 
-/// Every money figure survives a backend that hands its sums back as floats.
+/// Every money figure reads as an integer on a backend that types an uncast
+/// sum as a float.
 ///
 /// PostgreSQL's `sum(bigint)` is `NUMERIC`, and `wafer-block-postgres`
-/// decodes `NUMERIC` through `f64`, so on a PostgreSQL deployment every money
-/// column in this block — all of them `BIGINT` in the `.postgres.sql` schema
-/// — reaches the analytics as a JSON float. `serde_json::Value::as_i64`
-/// refuses one, so reading a sum with `i64_field` answered `0` there while
-/// answering correctly on SQLite, and no SQLite test could see it.
+/// decodes `NUMERIC` through `f64`, so every money column in this block — all
+/// of them `BIGINT` in the `.postgres.sql` schema — would reach the analytics
+/// as a JSON float. `aggregate_i64` refuses a float, so the analytics have to
+/// ask for `CAST(... AS BIGINT)` on every sum; a sum that loses its cast fails
+/// this test rather than reading a wrong figure on PostgreSQL only.
 ///
-/// `FloatAggregateContext` reproduces exactly that decode over the real
-/// in-memory database, so this drives the real `commerce_analytics` rather
-/// than a copy of its arithmetic.
+/// `FloatAggregateContext` floats every uncast `Sum` over the real in-memory
+/// database, so this drives the real `commerce_analytics` rather than a copy
+/// of its arithmetic.
 #[tokio::test]
-async fn money_figures_survive_a_backend_that_sums_into_floats() {
+async fn money_figures_read_as_integers_where_an_uncast_sum_is_a_float() {
     let ctx = ctx().await;
     db::exec_raw(
         &ctx,
@@ -254,6 +255,26 @@ async fn money_figures_survive_a_backend_that_sums_into_floats() {
     )
     .await
     .expect("seed line items");
+    repo::disputes::reconcile(
+        &ctx,
+        &repo::disputes::DisputeSnapshot {
+            purchase_id: "ord_1".to_string(),
+            seller_account_id: String::new(),
+            stripe_account_id: String::new(),
+            provider_dispute_id: "dp_1".to_string(),
+            provider_charge_id: "ch_dp_1".to_string(),
+            payment_intent_id: "pi_dp_1".to_string(),
+            status: crate::blocks::products::contracts::DisputeStatus::Lost,
+            amount_minor: 900,
+            currency: "USD".to_string(),
+            reason: "fraudulent".to_string(),
+            evidence_due_by: None,
+            livemode: false,
+            event_created: 1_750_000_000,
+        },
+    )
+    .await
+    .expect("seed a dispute");
 
     let float_ctx = FloatAggregateContext::new(ctx);
     let analytics = repo::purchases::commerce_analytics(&float_ctx, None)
@@ -271,6 +292,8 @@ async fn money_figures_survive_a_backend_that_sums_into_floats() {
     assert_eq!(usd.top_products.len(), 1);
     assert_eq!(usd.top_products[0].quantity, 2);
     assert_eq!(usd.top_products[0].revenue_minor, 2500);
+    assert_eq!(usd.lost_dispute_count, 1);
+    assert_eq!(usd.lost_disputed_volume_minor, 900);
 }
 
 /// A keyset walk over a table whose rows do not all carry an `id` fails
