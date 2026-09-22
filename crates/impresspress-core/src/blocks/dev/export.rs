@@ -226,6 +226,29 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
         workspace::load(ctx).await.map_err(Refusal::Internal)?
     };
 
+    // --- the data snapshot -----------------------------------------------
+    //
+    // First, before the shell and before any stored content: it is the one
+    // part of the bundle with a size limit, and an export that is going to be
+    // refused should cost one snapshot, not the runtime's wasm and the whole
+    // site as well.
+    //
+    // Compact, not pretty-printed: the file's reader is the importer, and
+    // indentation repeated on every row would spend a sizeable share of
+    // [`seed::MAX_DATA_BYTES`] on whitespace.
+    let snapshot = data_snapshot::export(ctx)
+        .await
+        .map_err(Refusal::Internal)?;
+    let data_bytes = serde_json::to_vec(&snapshot)
+        .map_err(|e| Refusal::Internal(encoding_error("the data snapshot", e)))?;
+    // The importer's bound, applied here so an export is never a bundle its
+    // own importer refuses.
+    if data_bytes.len() > seed::MAX_DATA_BYTES {
+        return Err(Refusal::DataTooLarge {
+            bytes: data_bytes.len(),
+        });
+    }
+
     // --- the shell -------------------------------------------------------
     let listed = shared.shell.list().await.map_err(Refusal::Shell)?;
     let mut shell: Vec<Entry> = Vec::new();
@@ -255,11 +278,6 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
     }
 
     // --- the seed --------------------------------------------------------
-    let snapshot = data_snapshot::export(ctx)
-        .await
-        .map_err(Refusal::Internal)?;
-    let data_bytes = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|e| Refusal::Internal(encoding_error("the data snapshot", e)))?;
     let tables: BTreeMap<String, usize> = snapshot
         .tables
         .iter()
@@ -668,12 +686,19 @@ const WORKSPACE_CHANGED: &str = "the workspace changed while the export was bein
 /// Why an export could not be produced.
 ///
 /// Three shapes, because they reach the caller three different ways: a
-/// precondition the agent can act on (publish something first), a host-side
-/// failure the agent cannot (the shell would not read), and everything the
-/// storage or ledger refused, which is already a [`WaferError`].
+/// precondition the agent can act on (publish something first, trim the
+/// data), a host-side failure the agent cannot (the shell would not read),
+/// and everything the storage or ledger refused, which is already a
+/// [`WaferError`].
 enum Refusal {
     /// Nothing has been published, so there is no site to export.
     NothingPublished,
+    /// The data snapshot serializes to more than [`seed::MAX_DATA_BYTES`],
+    /// so the bundle would be refused by the importer it exists to feed.
+    DataTooLarge {
+        /// How large `data.json` would have been.
+        bytes: usize,
+    },
     /// A blob or artifact the manifest names is no longer in the store: the
     /// workspace was edited (and collected) while this export was being
     /// assembled. See [`content_gone`].
@@ -682,6 +707,18 @@ enum Refusal {
     Shell(String),
     /// A storage, ledger or encoding failure.
     Internal(WaferError),
+}
+
+/// What [`Refusal::DataTooLarge`] says, on both surfaces — one wording for
+/// the same reason [`WORKSPACE_CHANGED`] is one string.
+fn data_too_large(bytes: usize) -> String {
+    format!(
+        "the data snapshot (seed/data.json) would be {bytes} bytes, and a bundle may carry at \
+         most {} — the limit the importer enforces — so this export could not be imported. \
+         Remove rows the snapshot carries (products, offers, config variables, accounts) and \
+         export again.",
+        seed::MAX_DATA_BYTES
+    )
 }
 
 /// A content read that came back [`ErrorCode::NotFound`] is the export losing
@@ -739,6 +776,11 @@ impl Refusal {
             Self::WorkspaceChanged => {
                 no_store_error_status(ErrorCode::Aborted, 409, WORKSPACE_CHANGED)
             }
+            // 413 and `ResourceExhausted`, as every other over-a-limit refusal
+            // in `/b/dev` is (`super::files`' header).
+            Self::DataTooLarge { bytes } => {
+                no_store_error_status(ErrorCode::ResourceExhausted, 413, &data_too_large(bytes))
+            }
             Self::Shell(message) => err_internal("dev export shell", message),
             Self::Internal(error) => err_internal("dev export", error.message),
         }
@@ -753,6 +795,9 @@ impl Refusal {
                 "there is nothing to export yet: no generation is active",
             ),
             Self::WorkspaceChanged => WaferError::new(ErrorCode::Aborted, WORKSPACE_CHANGED),
+            Self::DataTooLarge { bytes } => {
+                WaferError::new(ErrorCode::ResourceExhausted, data_too_large(bytes))
+            }
             Self::Shell(message) => WaferError::new(
                 ErrorCode::Internal,
                 format!("the static shell could not be read: {message}"),

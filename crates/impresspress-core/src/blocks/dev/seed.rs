@@ -213,6 +213,31 @@ pub fn data_url(path: &str) -> String {
 /// spelled at both ends is a string that can be spelled two ways.
 pub const DATA_CONTENT_TYPE: &str = "application/json";
 
+/// Largest data snapshot a bundle may carry, in bytes.
+///
+/// One constant for both ends of the format: the importer refuses a larger
+/// `data.json` before fetching it, and `super::export` refuses to write one.
+/// A bound only the importer knew about would let an export succeed and hand
+/// over a bundle whose own importer then rejects it — on a cold boot, where
+/// the refusal leaves the imported instance's site empty.
+///
+/// Sized for a shop, not for an editable file: the snapshot carries every row
+/// of the exported tables — each account with its credentials and role, each
+/// product with its offers — so a limit on the scale of
+/// [`paths::MAX_FILE_BYTES`] would refuse an ordinary shop of a few hundred
+/// accounts.
+///
+/// What bounds it from above is write cost, not memory. [`data_snapshot::import`]
+/// applies the snapshot one row per database call, and in the browser every
+/// call that returns has saved the WHOLE sql.js database to OPFS
+/// (`dbFlush` in `impresspress-browser`'s `bridge.js`). An import therefore
+/// writes roughly rows × database size, on the imported instance's cold boot,
+/// and that product grows with the square of the snapshot: at 2 MiB it is on
+/// the order of gigabytes, where 8 MiB would be on the order of a hundred.
+/// Raising the limit depends on a multi-row write in wafer-run's database
+/// interface, which today takes one row per call.
+pub const MAX_DATA_BYTES: usize = 2 * 1024 * 1024;
+
 /// The short workspace name of a registered block (`site/hello` → `hello`).
 ///
 /// The workspace directory, the artifact URL and the route prefix are all
@@ -502,9 +527,16 @@ async fn import_bundle(
     // a bare `Option<String>` path could only ever be.
     if let Some(declared) = &manifest.data {
         let url = data_url(&declared.path);
-        let bytes = fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE).await?;
-        let snapshot: data_snapshot::DataSnapshot = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?;
+        // The raw bytes live only as long as the parse: the rows are applied
+        // from the parsed snapshot, so holding up to `MAX_DATA_BYTES` of JSON
+        // beside them through every database write would be a second copy of
+        // the snapshot for nothing.
+        let snapshot: data_snapshot::DataSnapshot = {
+            let bytes =
+                fetch_and_verify(fetch, &url, declared, DATA_CONTENT_TYPE, MAX_DATA_BYTES).await?;
+            serde_json::from_slice(&bytes)
+                .map_err(|e| format!("{url}: not a valid data snapshot: {e}"))?
+        };
         data_snapshot::import(ctx, &snapshot)
             .await
             .map_err(|e| format!("{url}: {}", e.message))?;
@@ -529,17 +561,21 @@ async fn import_bundle(
 /// actually be served as, so a bundle claiming a different one was produced
 /// by an exporter that does not agree with this build about how files are
 /// served.
+///
+/// `max_bytes` is the limit for this kind of file — [`paths::MAX_FILE_BYTES`]
+/// for a workspace file, [`MAX_DATA_BYTES`] for the data snapshot — and the
+/// declared size is checked against it before anything is fetched.
 async fn fetch_and_verify(
     fetch: &dyn SeedFetch,
     url: &str,
     declared: &SeedFile,
     served_as: &str,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    if declared.size > paths::MAX_FILE_BYTES as u64 {
+    if declared.size > max_bytes as u64 {
         return Err(format!(
-            "{url}: declares {} bytes; the per-file limit is {}",
+            "{url}: declares {} bytes; the limit for this file is {max_bytes}",
             declared.size,
-            paths::MAX_FILE_BYTES
         ));
     }
 
@@ -580,7 +616,7 @@ async fn fetch_verified(
     paths::validate_path(workspace_path)
         .map_err(|e| format!("the seed bundle names {workspace_path:?}: {e}"))?;
     let served = paths::content_type_for(workspace_path);
-    fetch_and_verify(fetch, url, declared, served).await
+    fetch_and_verify(fetch, url, declared, served, paths::MAX_FILE_BYTES).await
 }
 
 /// One block's refusal, with every diagnostic's message and code.

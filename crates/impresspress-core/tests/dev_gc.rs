@@ -20,6 +20,7 @@ use impresspress_core::{
         control::{DynamicBlockSpec, DynamicRoute, RouteAccessKind},
         gc::{self, GcInterleave},
         generation::{self, GenerationManifest},
+        paths,
         repo::{
             self,
             builds::{BuildStatus, NewBuild},
@@ -356,6 +357,246 @@ async fn dev_status_reports_the_stores_as_the_collector_shrinks_them() {
         collected["blobs_bytes"].as_u64().expect("bytes")
             > inside["blobs_bytes"].as_u64().expect("bytes"),
         "twenty three-byte blobs outweigh five two-byte ones: {collected}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The quota counters
+// ---------------------------------------------------------------------------
+
+/// What the blob store really holds, read off the store itself rather than off
+/// the counters under test.
+async fn stored_blobs(ctx: &TestContext) -> (u64, u32) {
+    let listing = storage::list(ctx, blobs::FOLDER, &storage::ListOptions::default())
+        .await
+        .expect("list the blob store");
+    (
+        listing.objects.iter().map(|o| o.size as u64).sum(),
+        listing.objects.len() as u32,
+    )
+}
+
+/// A write whose blob stores and whose manifest save fails leaves a blob no
+/// counter includes. The collector then frees it — it is unreachable — and the
+/// counters must come out saying what the store holds. Subtracting the freed
+/// size instead would take it off a total that never included it, and the
+/// quota would under-count for good: the refusal at the end is a write the
+/// workspace genuinely has no room for.
+///
+/// Sized so the difference is the verdict. The store sits 250 KiB under the
+/// limit; the lost 250 KiB charge, subtracted, would leave it looking 500 KiB
+/// under, and the final 400 KiB write would be let through.
+#[tokio::test]
+async fn a_blob_whose_charge_was_lost_leaves_the_quota_exact_after_collection() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+    const KIB: usize = 1024;
+
+    // Fixture: a workspace whose store is 250 KiB short of full, all of it
+    // one reachable blob. Staged directly in the object store — reaching it
+    // through the files API would be 128 writes of the largest file the API
+    // takes, and even one 64 MiB trip through the storage block's message
+    // codec costs seconds in a debug build — under a stand-in key rather than
+    // its hash, which nothing here reads back.
+    let headroom = 250 * KIB as u64;
+    let big = vec![b'b'; (paths::MAX_WORKSPACE_BYTES - headroom) as usize];
+    let big_key = "0".repeat(64);
+    ctx.storage_service()
+        .put(
+            &format!("impresspress/dev/{}", blobs::FOLDER),
+            &big_key,
+            &big,
+            "application/octet-stream",
+        )
+        .await
+        .expect("store the big blob");
+    let mut ws = workspace::Workspace::default();
+    ws.insert("blocks/shop/data.bin", big_key, big.len() as u64);
+    ws.record_blob_stored(big.len() as u64);
+    workspace::save(&ctx, &ws)
+        .await
+        .expect("stage the workspace");
+
+    // A 250 KiB write that exactly fits, and whose manifest save fails after its blob
+    // is down. A `blocks/` path, so no activation (and no collection) runs
+    // behind it.
+    ctx.fail_next_storage_put_to("impresspress/dev", "", "workspace.json", "disk is full");
+    let lost = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({
+            "path": "blocks/shop/lost.txt",
+            "content": "l".repeat(250 * KIB),
+            "expected_sha256": null,
+        }),
+    )
+    .await;
+    assert_eq!(output_http_status(lost).await, 500);
+    let (stored_bytes, _) = stored_blobs(&ctx).await;
+    assert_eq!(
+        stored_bytes,
+        paths::MAX_WORKSPACE_BYTES,
+        "the blob is in the store…",
+    );
+    assert_eq!(
+        workspace::load(&ctx).await.expect("load").blob_bytes,
+        paths::MAX_WORKSPACE_BYTES - headroom,
+        "…and no counter includes it",
+    );
+
+    let report = gc::collect(&ctx, &shared).await.expect("collect");
+    assert_eq!(report.blobs_deleted, 1, "the unreachable blob went");
+
+    let after = workspace::load(&ctx).await.expect("load");
+    assert_eq!(
+        (after.blob_bytes, after.blob_count),
+        stored_blobs(&ctx).await,
+        "the counters say what the store holds",
+    );
+
+    // 400 KiB more would take the store 150 KiB past the limit.
+    let over = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({
+            "path": "blocks/shop/over.txt",
+            "content": "o".repeat(400 * KIB),
+            "expected_sha256": null,
+        }),
+    )
+    .await;
+    assert_eq!(output_http_status(over).await, 413);
+}
+
+/// The collector takes the workspace lock BEFORE it lists the blob store, and
+/// the counters depend on it. A write that stored its blob and saved its charge
+/// after an unlocked listing would be charged in the workspace and absent from
+/// the listing, and the reset would drop the charge.
+///
+/// Forced, not hoped for: the write is parked inside its own lock hold (on its
+/// `workspace.json` read), the collection is started while it is parked, and
+/// the write is released only once the collection has had every chance to run
+/// as far as it can. Locked first, the collection waits for the write and
+/// lists its blob; listing first, it lists without it, waits, and resets the
+/// counters from a listing that is missing the write's blob.
+#[tokio::test]
+async fn a_write_landing_as_a_collection_starts_keeps_its_charge() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    let hold = ctx.hold_next_storage_get("impresspress/dev", "", "workspace.json");
+    let write = dev_post(
+        &ctx,
+        "/b/dev/api/files/write",
+        json!({"path": "blocks/shop/late.txt", "content": "late", "expected_sha256": null}),
+    );
+    let collection = async {
+        while !hold.was_reached() {
+            tokio::task::yield_now().await;
+        }
+        gc::collect(&ctx, &shared).await
+    };
+    let driver = async {
+        while !hold.was_reached() {
+            tokio::task::yield_now().await;
+        }
+        // Far fewer than the park's budget, far more than the collection
+        // needs to reach the lock (or, listing first, to list and then reach
+        // it).
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        hold.release();
+    };
+    let (written, collected, ()) = tokio::join!(write, collection, driver);
+    assert!(hold.was_reached());
+    assert!(
+        !hold.budget_expired(),
+        "the write was released, not timed out"
+    );
+    assert_eq!(output_http_status(written).await, 200);
+    collected.expect("collect");
+
+    let after = workspace::load(&ctx).await.expect("load");
+    assert_eq!(
+        (after.blob_bytes, after.blob_count),
+        stored_blobs(&ctx).await,
+        "the write's charge survived the collection",
+    );
+    assert_eq!(after.blob_count, 1);
+}
+
+/// A build row can outlive its artifact — the collector deletes the bytes and
+/// then the rows, and the second step can fail. The folder walk never meets
+/// such a row again, yet `dev_status` counts it and activation treats its
+/// artifact as stored. The next collection drops it; a staged row, whose
+/// bytes may simply not have arrived yet, it leaves alone.
+#[tokio::test]
+async fn a_settled_build_row_whose_artifact_is_gone_is_dropped() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    let (spec, bytes) = spec_only(&ctx, "gone").await;
+    let orphan = accept_build(&ctx, &spec, bytes.len() as u64).await;
+    artifacts::delete(&ctx, &spec.artifact_sha256)
+        .await
+        .expect("the bytes go, the row stays");
+    let pending = stage_build(&ctx, &blobs::sha256_hex(b"\0asm\x01pending"), 16).await;
+    assert_eq!(storage_of(&ctx).await["artifacts"], 2);
+
+    let report = gc::collect(&ctx, &shared).await.expect("collect");
+    assert_eq!(report.build_rows_dropped, 1);
+    assert!(
+        repo::builds::get(&ctx, &orphan).await.is_err(),
+        "the row naming nothing is gone"
+    );
+    repo::builds::get(&ctx, &pending)
+        .await
+        .expect("a staged row is a compile on its way, not an orphan");
+    assert_eq!(storage_of(&ctx).await["artifacts"], 1);
+}
+
+/// A delete that fails partway through a collection must not throw away the
+/// credit for the blobs the same pass already freed: the counters are saved
+/// before the failure is returned, and say what the store still holds —
+/// including the blob whose delete failed.
+#[tokio::test]
+async fn a_collection_that_fails_partway_keeps_what_it_already_freed() {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let shared = ctx.dev_shared();
+
+    // Two unreachable, charged blobs, named so the one whose delete fails
+    // sorts SECOND: the collector walks the listing in key order and stops
+    // at the failure, so the first has to be freed before it for the credit
+    // to be at stake.
+    let (mut first, mut second) = (b"garbage one".to_vec(), b"garbage two".to_vec());
+    if blobs::sha256_hex(&first) > blobs::sha256_hex(&second) {
+        std::mem::swap(&mut first, &mut second);
+    }
+    let mut ws = workspace::Workspace::default();
+    for bytes in [&first, &second] {
+        blobs::put(&ctx, bytes).await.expect("store");
+        ws.record_blob_stored(bytes.len() as u64);
+    }
+    workspace::save(&ctx, &ws)
+        .await
+        .expect("stage the workspace");
+
+    let second_sha = blobs::sha256_hex(&second);
+    ctx.fail_next_storage_delete_of("impresspress/dev", "blobs", &second_sha, "busy");
+    gc::collect(&ctx, &shared)
+        .await
+        .expect_err("the failed delete is reported");
+
+    assert!(!blobs::exists(&ctx, &blobs::sha256_hex(&first))
+        .await
+        .expect("exists"));
+    assert!(blobs::exists(&ctx, &second_sha).await.expect("exists"));
+    let after = workspace::load(&ctx).await.expect("load");
+    assert_eq!(
+        (after.blob_bytes, after.blob_count),
+        (second.len() as u64, 1),
+        "the first blob's credit survived the failure",
     );
 }
 
@@ -872,9 +1113,12 @@ async fn boot_accepts_the_staged_build_of_a_live_block_and_closes_the_rest() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let shared = ctx.dev_shared();
 
-    // A block that IS serving, whose build row never got as far as `valid`.
+    // A block that IS serving, whose build row never got as far as `valid`:
+    // staged before its activation, as `blocks_api` stages it, and still
+    // staged after it.
     let (spec, live_bytes) = spec_only(&ctx, "live").await;
     let live_artifact = spec.artifact_sha256.clone();
+    let live_build = stage_build(&ctx, &live_artifact, live_bytes.len() as u64).await;
     activation::request(
         &ctx,
         &shared,
@@ -886,7 +1130,6 @@ async fn boot_accepts_the_staged_build_of_a_live_block_and_closes_the_rest() {
     )
     .await
     .expect("the block activates");
-    let live_build = stage_build(&ctx, &live_artifact, live_bytes.len() as u64).await;
 
     // And a compile that got nowhere at all.
     let bytes = b"\0asm\x01abandoned";

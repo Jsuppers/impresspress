@@ -81,10 +81,10 @@ pub async fn get(ctx: &dyn Context, sha: &str) -> Result<Vec<u8>, WaferError> {
 
 /// Whether a blob is stored under `sha`.
 ///
-/// A keyed `get` rather than a prefix `list`, for two reasons that both
-/// matter on the sandbox's own target:
+/// A keyed read rather than a prefix `list`, for two reasons that both matter
+/// on the sandbox's own target:
 ///
-/// * `get` of an absent key is `NotFound` on every backend; what `list` does
+/// * a read of an absent key is `NotFound` on every backend; what `list` does
 ///   with a folder nothing has written yet is not part of the
 ///   `StorageService` contract, and the backends genuinely differ —
 ///   `wafer-block-local-storage` answers an empty listing, the OPFS backend
@@ -94,11 +94,16 @@ pub async fn get(ctx: &dyn Context, sha: &str) -> Result<Vec<u8>, WaferError> {
 ///   and filters in JS), so a prefix probe would make every write walk every
 ///   blob.
 ///
-/// The body it reads back is wasted only when the blob is already there —
-/// exactly the case where it saves rewriting the same bytes.
+/// And a *streaming* read, dropped unread: the object's metadata arrives
+/// ahead of its body, so the answer costs an open and at most the few chunks
+/// the backend's reader pulls before it sees the consumer has gone — not the
+/// whole blob, which the buffered `storage::get` would transfer to answer a yes
+/// or no (up to [`super::paths::MAX_FILE_BYTES`] per call, on the write path).
+/// Dropping the stream is how the body is declined: the OPFS backend the
+/// sandbox runs on releases its reader when the consumer goes away.
 pub async fn exists(ctx: &dyn Context, sha: &str) -> Result<bool, WaferError> {
-    match storage::get(ctx, FOLDER, sha).await {
-        Ok(_) => Ok(true),
+    match storage::get_stream(ctx, FOLDER, sha).await {
+        Ok(_unread) => Ok(true),
         Err(e) if e.code == ErrorCode::NotFound => Ok(false),
         Err(e) => Err(e),
     }

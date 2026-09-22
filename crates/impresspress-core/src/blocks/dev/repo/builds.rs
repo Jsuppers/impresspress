@@ -424,11 +424,64 @@ pub async fn artifact_index(ctx: &dyn Context) -> Result<BTreeMap<String, u64>, 
     }
 }
 
+/// A settled build row, as the collector needs it: which row, naming which
+/// artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRow {
+    /// The row's id.
+    pub id: String,
+    /// The artifact it names.
+    pub artifact_sha256: String,
+}
+
+/// Every row that is not [`BuildStatus::Staged`], as `(id, artifact)`.
+///
+/// For the collector's stale-row pass (`super::super::gc`), which needs to
+/// know which rows promise an artifact is already stored. Only the two columns
+/// it reads are selected, and it pages until the table is exhausted: a row
+/// past a page boundary would be a stale row nothing ever drops.
+pub async fn list_settled(ctx: &dyn Context) -> Result<Vec<SettledRow>, WaferError> {
+    let mut rows = Vec::new();
+    let mut offset = 0i64;
+    loop {
+        let list = db::list(
+            ctx,
+            TABLE,
+            &ListOptions {
+                columns: Some(vec!["id".into(), "artifact_sha256".into()]),
+                filters: vec![Filter {
+                    field: "status".into(),
+                    operator: FilterOp::NotEqual,
+                    value: serde_json::json!(BuildStatus::Staged.as_str()),
+                }],
+                sort: vec![SortField {
+                    field: "id".into(),
+                    desc: false,
+                }],
+                limit: MAX_LIST_LIMIT,
+                offset,
+                skip_count: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let count = list.records.len() as i64;
+        rows.extend(list.records.iter().map(|record| SettledRow {
+            id: record.id.clone(),
+            artifact_sha256: record.str_field("artifact_sha256").to_string(),
+        }));
+        if count < MAX_LIST_LIMIT {
+            return Ok(rows);
+        }
+        offset += count;
+    }
+}
+
 /// Delete one build row.
 ///
 /// Two callers, and both are undoing something: staging drops the row it
 /// inserted when the artifact it describes could not be stored, and the
-/// collector drops the rows of an artifact it has just deleted.
+/// collector drops settled rows whose artifact is no longer stored.
 pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
     db::delete(ctx, TABLE, id).await
 }

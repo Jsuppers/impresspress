@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 
 use super::{
-    artifacts, blobs,
+    blobs,
     contracts::{GenerationSummary, SiteManifest},
     control::DynamicBlockSpec,
     gc,
@@ -82,11 +82,13 @@ pub struct ProgressStep {
     pub detail: String,
 }
 
-/// Why an activation did not happen.
+/// Why an activation did not happen — or, for [`Self::RollbackNotAdopted`],
+/// why one that did happen did not finish.
 ///
-/// Three kinds, because they mean three different things to the caller: the
+/// Four kinds, because they mean four different things to the caller: the
 /// request described a state that cannot be built (fix the request), the host
-/// could not build it (retry or roll back), or persistence failed (retry).
+/// could not build it (retry or roll back), persistence failed (retry), or a
+/// rollback went live and left the workspace behind (retry the rollback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivationError {
     /// The manifest referenced content that is not stored. Reported as `422`:
@@ -97,6 +99,17 @@ pub enum ActivationError {
     Runtime(String),
     /// The ledger, the journal or the object store failed. `500`.
     Storage(String),
+    /// A rollback committed — the generation carrying the target's contents
+    /// is live and journalled — and replacing the workspace's `site/` half
+    /// with the target's then failed. `500`, because the request did not
+    /// finish; but the message says the rollback is live, because telling
+    /// the caller it failed would send them after a rollback that happened.
+    RollbackNotAdopted {
+        /// The generation that went live.
+        generation_id: String,
+        /// Why the workspace could not be updated.
+        message: String,
+    },
 }
 
 impl ActivationError {
@@ -104,7 +117,7 @@ impl ActivationError {
     pub fn status(&self) -> u16 {
         match self {
             Self::Validation(_) => 422,
-            Self::Runtime(_) | Self::Storage(_) => 500,
+            Self::Runtime(_) | Self::Storage(_) | Self::RollbackNotAdopted { .. } => 500,
         }
     }
 
@@ -122,7 +135,9 @@ impl ActivationError {
     pub fn into_response(self) -> OutputStream {
         let code = match self {
             Self::Validation(_) => ErrorCode::InvalidArgument,
-            Self::Runtime(_) | Self::Storage(_) => ErrorCode::Internal,
+            Self::Runtime(_) | Self::Storage(_) | Self::RollbackNotAdopted { .. } => {
+                ErrorCode::Internal
+            }
         };
         no_store_error_status(code, self.status(), &self.to_string())
     }
@@ -140,6 +155,22 @@ impl std::fmt::Display for ActivationError {
             }
             Self::Runtime(message) => write!(f, "the runtime could not be rebuilt: {message}"),
             Self::Storage(message) => write!(f, "the activation could not be stored: {message}"),
+            // Says what IS true before what is not, and what to do about it.
+            // The retry repairs because it is an ordinary rollback: staged
+            // against a live generation with the same manifests,
+            // `activate_staged` rebuilds nothing and publishes nothing, and
+            // `adopt_site` then runs again.
+            Self::RollbackNotAdopted {
+                generation_id,
+                message,
+            } => write!(
+                f,
+                "the rollback is live — generation {generation_id} is serving the rolled-back \
+                 site and blocks — but the workspace's site/ files could not be updated to \
+                 match it: {message}. Until they are, the next site write publishes the \
+                 pre-rollback site again. Retrying the same rollback repairs the workspace: it \
+                 stages the same contents, which are already live, and updates the files."
+            ),
         }
     }
 }
@@ -563,10 +594,17 @@ async fn activate(
     // workspace pointing at content the published site does not have. The
     // reverse order would rewrite the workspace on every refused rollback —
     // including the ordinary case of a target whose blobs have been collected.
+    //
+    // Which means a failure here arrives after the commit, with the rollback
+    // already serving — so it is reported as exactly that, never as a
+    // rollback that did not happen.
     if adopts_site {
-        adopt_site(ctx, shared, &manifest.site)
-            .await
-            .map_err(storage_error)?;
+        adopt_site(ctx, shared, &manifest.site).await.map_err(|e| {
+            ActivationError::RollbackNotAdopted {
+                generation_id: row.id.clone(),
+                message: e.message,
+            }
+        })?;
     }
     Ok(outcome)
 }
@@ -902,10 +940,30 @@ async fn load_previous(
 /// Content the manifest names that the stores do not hold — empty when
 /// everything is there.
 ///
-/// Presence *is* the hash check: both stores are content-addressed, so the key
-/// a manifest names is the hash of the bytes filed under it. Re-reading and
-/// re-hashing every blob would make each keystroke cost a full pass over the
-/// site to learn something the key already states.
+/// Only presence is checked, never content: both stores are content-addressed,
+/// so the key a manifest names is the hash of the bytes filed under it, and
+/// re-reading and re-hashing every blob would make each keystroke cost a full
+/// pass over the site to learn something the key already states.
+///
+/// Presence is asked as cheaply as each store allows, because this runs on
+/// every activation — every site-file save included — over the WHOLE manifest,
+/// not just what changed:
+///
+/// * **Artifacts** are answered by the builds ledger
+///   ([`repo::builds::artifact_index`]) with no storage call at all. Every
+///   stored artifact has a row — staging inserts the row before it stores the
+///   bytes, the seed importer records one for each artifact it stores, and the
+///   collector deletes the rows with the bytes — so the index is the store's
+///   own table of contents. One ledger read replaces a probe per block, and a
+///   block's artifact is up to [`super::validation::MAX_ARTIFACT_BYTES`]. The
+///   one way the two can disagree is a collection that deleted an artifact
+///   and then failed to drop its rows. Until the next collection drops them
+///   (`gc`'s stale-row pass), this answers "stored" for that artifact: a
+///   manifest that changes the block set then fails at the rebuild, which
+///   reads every artifact it loads, but one that keeps the block set — a site
+///   write — commits naming it, as the generation before it already did.
+/// * **Blobs** have no ledger, so each is probed with [`blobs::exists`], which
+///   opens the object and declines its body rather than reading it.
 ///
 /// The `Err` is a storage failure — the store could not answer — which is a
 /// different thing from the store answering that content is gone.
@@ -919,15 +977,17 @@ async fn missing_content(
             missing.push(format!("no blob is stored for site content {sha}"));
         }
     }
-    for spec in &manifest.blocks {
-        if !artifacts::exists(ctx, &spec.artifact_sha256)
+    if !manifest.blocks.is_empty() {
+        let stored = repo::builds::artifact_index(ctx)
             .await
-            .map_err(storage_error)?
-        {
-            missing.push(format!(
-                "no artifact is stored for block {} ({})",
-                spec.name, spec.artifact_sha256
-            ));
+            .map_err(storage_error)?;
+        for spec in &manifest.blocks {
+            if !stored.contains_key(&spec.artifact_sha256) {
+                missing.push(format!(
+                    "no artifact is stored for block {} ({})",
+                    spec.name, spec.artifact_sha256
+                ));
+            }
         }
     }
     Ok(missing)

@@ -152,6 +152,67 @@ async fn block_source_writes_do_not_create_generations() {
     assert_eq!(d["generation"], serde_json::Value::Null);
 }
 
+/// Validation asks whether every blob and artifact the manifest names is
+/// stored, over the WHOLE manifest, on every activation — every keystroke-save
+/// included. Asking by downloading would make each save transfer every blob of
+/// the site and every block's artifact (up to 4 MiB each), so an activation
+/// must read in full only what it publishes.
+///
+/// Counted at the object store, underneath the storage block: a buffered `get`
+/// is a full-body read, a `get_streaming` answers from the object's metadata
+/// and transfers only what its consumer reads.
+#[tokio::test]
+async fn a_site_write_reads_in_full_only_the_content_it_publishes() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let shared = ctx.dev_shared();
+
+    // A live block and two site files: everything validation has to vouch for
+    // on the next save.
+    write_file(&ctx, "site/index.html", "<h1>v1</h1>", None).await;
+    write_file(&ctx, "site/style.css", "h1{}", None).await;
+    let intent = compile_of(&ctx, &["hello"]).await;
+    activation::request(&ctx, &shared, GenerationCause::BlockCompile, intent)
+        .await
+        .expect("the block activates");
+
+    let before = ctx.storage_reads().len();
+    write_file(
+        &ctx,
+        "site/index.html",
+        "<h1>v2</h1>",
+        Some(&sha_of("<h1>v1</h1>")),
+    )
+    .await;
+    let reads: Vec<String> = ctx.storage_reads()[before..].to_vec();
+
+    // The one blob a full read is owed: the changed page, which the publisher
+    // copies into the site folder. Nothing else — not the unchanged
+    // stylesheet, not the new page a second time.
+    let published = format!("get impresspress/dev/blobs/{}", sha_of("<h1>v2</h1>"));
+    let full_blob_reads: Vec<&String> = reads
+        .iter()
+        .filter(|read| read.starts_with("get impresspress/dev/blobs/"))
+        .collect();
+    assert_eq!(full_blob_reads, vec![&published], "all reads: {reads:#?}");
+    // And no artifact read of any kind: the builds ledger answers for them.
+    assert!(
+        !reads
+            .iter()
+            .any(|read| read.contains("impresspress/dev/artifacts/")),
+        "all reads: {reads:#?}",
+    );
+    // The presence checks did run, as probes: the unchanged stylesheet was
+    // asked about without being transferred.
+    assert!(
+        reads.contains(&format!(
+            "get_streaming impresspress/dev/blobs/{}",
+            sha_of("h1{}")
+        )),
+        "all reads: {reads:#?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Driving the queue directly
 // ---------------------------------------------------------------------------
@@ -171,15 +232,37 @@ async fn site_of(ctx: &TestContext, content: &str) -> SiteManifest {
     }
 }
 
-/// One block named `name`, with its own artifact stored so validation passes.
+/// One block named `name`, stored the way staging stores one — a build row,
+/// then the artifact — so validation passes.
+///
+/// The row is not decoration: activation answers "is this artifact stored?"
+/// from the builds ledger (`activation::missing_content`), and every path that
+/// stores an artifact in production writes one. A spec whose bytes were put
+/// with no row is a state only a test can build.
 async fn block_spec(ctx: &TestContext, name: &str) -> DynamicBlockSpec {
     // Distinct bytes per block, so two specs are distinguishable by artifact
     // as well as by name.
-    let artifact_sha256 = artifacts::put(ctx, format!("\0asm\x01{name}").as_bytes())
+    let bytes = format!("\0asm\x01{name}").into_bytes();
+    let registered = format!("site/{name}");
+    repo::builds::insert(
+        ctx,
+        &repo::builds::NewBuild {
+            block_name: registered.clone(),
+            source_manifest_sha256: "src".to_string(),
+            artifact_sha256: blobs::sha256_hex(&bytes),
+            block_info_json: "null".to_string(),
+            diagnostics_json: "[]".to_string(),
+            compiler_version: "rubrc@pinned".to_string(),
+            artifact_bytes: bytes.len() as u64,
+        },
+    )
+    .await
+    .expect("record the build");
+    let artifact_sha256 = artifacts::put(ctx, &bytes)
         .await
         .expect("store the artifact a manifest names");
     DynamicBlockSpec {
-        name: format!("site/{name}"),
+        name: registered,
         artifact_sha256,
         routes: vec![DynamicRoute {
             prefix: format!("/b/{name}/"),
@@ -271,6 +354,85 @@ async fn rollback_republishes_an_earlier_generation_as_a_new_one() {
     .await;
     assert_eq!(read["content"], "v1");
     assert_eq!(read["sha256"], json!(sha1));
+}
+
+/// A rollback commits and only then adopts its site into the workspace, so an
+/// adoption that fails arrives with the rollback already serving. Reported as
+/// a plain failure, the caller would go after a rollback that happened; the
+/// refusal has to say it is live and what repairs the workspace — and the
+/// repair it names has to work.
+#[tokio::test]
+async fn a_rollback_whose_workspace_update_fails_says_it_is_live_and_a_retry_repairs_it() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let g1 = write_file(&ctx, "site/index.html", "v1", None).await;
+    let id1 = g1["generation"]["id"].as_str().expect("id").to_string();
+    write_file(&ctx, "site/index.html", "v2", Some(&sha_of("v1"))).await;
+
+    // The publish goes through; the save of `workspace.json` that adopts the
+    // rolled-back site does not.
+    ctx.fail_next_storage_put_to("impresspress/dev", "", "workspace.json", "disk is full");
+    let rollback_path = format!("/b/dev/api/generations/{id1}/rollback");
+    let refused = wafer_block::http_codec::collect_http_response(
+        dev_post(&ctx, &rollback_path, json!({})).await,
+    )
+    .await;
+    assert_eq!(refused.status, 500);
+    let body: serde_json::Value = serde_json::from_slice(&refused.body).expect("json refusal");
+    let message = body["message"].as_str().expect("message");
+    assert!(message.contains("the rollback is live"), "{message}");
+    assert!(message.contains("disk is full"), "{message}");
+    assert!(
+        message.contains("Retrying the same rollback repairs the workspace"),
+        "{message}"
+    );
+
+    // Which is true: the rolled-back site is what is served, and a
+    // generation carrying it is the active one.
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
+    let status = dev_status(&ctx).await;
+    let live = status["active_generation"]["id"]
+        .as_str()
+        .expect("an active generation")
+        .to_string();
+    assert!(
+        message.contains(&live),
+        "the message names {live}: {message}"
+    );
+    // And the workspace was left behind, still holding what the rollback
+    // replaced.
+    let read = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "site/index.html"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(read["content"], "v2");
+
+    // The retry the message prescribes.
+    let retried = output_json(dev_post(&ctx, &rollback_path, json!({})).await).await;
+    assert_eq!(retried["generation"]["cause"], "rollback", "{retried}");
+    let read = output_json(
+        dev_post(
+            &ctx,
+            "/b/dev/api/files/read",
+            json!({"path": "site/index.html"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(read["content"], "v1", "the retry adopted the site");
+    assert_eq!(
+        served(&ctx, "index.html").await.as_deref(),
+        Some(&b"v1"[..])
+    );
 }
 
 /// A rollback rewrites the workspace as well as publishing, and both have to
