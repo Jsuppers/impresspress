@@ -865,8 +865,13 @@ pub async fn import(
         let Some(rows) = snapshot.tables.get(table) else {
             continue;
         };
+        let rows = if table == user_roles::TABLE {
+            one_grant_per_user_and_role(rows)
+        } else {
+            rows.iter().collect()
+        };
         db::delete_by_filters(ctx, table, Vec::new()).await?;
-        for row in rows {
+        for row in &rows {
             import_row(ctx, table, Mode::Replace, row).await?;
         }
         report.tables.insert(table.to_string(), rows.len());
@@ -894,6 +899,44 @@ pub async fn import(
         report.tables.insert(table.clone(), rows.len());
     }
     Ok(report)
+}
+
+/// A snapshot's grant rows with every repeat of a `(user_id, role)` pair
+/// dropped, in the snapshot's own order otherwise.
+///
+/// A bundle exported before admin migration 004 can carry twin grants, and
+/// the destination's unique index over the pair would refuse the second —
+/// failing the import partway, after the table was already cleared. The twin
+/// grants nothing its survivor does not, so it is dropped rather than
+/// refused. The survivor is the least `(created_at, id)`, the pair 004 ranks
+/// by, compared bytewise so the choice does not depend on row order.
+fn one_grant_per_user_and_role(
+    rows: &[serde_json::Map<String, Value>],
+) -> Vec<&serde_json::Map<String, Value>> {
+    let text = |row: &serde_json::Map<String, Value>, field: &str| {
+        row.get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut survivor: HashMap<(String, String), usize> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let rank = |i: usize| (text(&rows[i], "created_at"), text(&rows[i], "id"));
+        survivor
+            .entry((text(row, "user_id"), text(row, "role")))
+            .and_modify(|kept| {
+                if rank(index) < rank(*kept) {
+                    *kept = index;
+                }
+            })
+            .or_insert(index);
+    }
+    let kept: std::collections::HashSet<usize> = survivor.into_values().collect();
+    rows.iter()
+        .enumerate()
+        .filter(|(index, _)| kept.contains(index))
+        .map(|(_, row)| row)
+        .collect()
 }
 
 /// Raise an imported `impresspress__admin__variables` row's `sensitive` column

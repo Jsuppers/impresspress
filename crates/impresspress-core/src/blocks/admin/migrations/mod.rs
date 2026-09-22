@@ -71,11 +71,23 @@ const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgr
 // next token. The index makes the insert itself the claim: the losing racer
 // is refused, and `assign` reads that refusal back as "already assigned".
 //
-// Rows that already repeat a grant are collapsed onto the earliest
-// (`created_at`, then `id`, so the result does not depend on row order).
-// Every deleted row names a `(user_id, role)` pair its survivor still grants,
-// so no user's effective roles change — what goes is the second row a revoke
-// could miss. `RELEASE.md` carries the operator-facing version.
+// Rows that already repeat a grant are collapsed onto one deterministic
+// survivor per pair: the least `(created_at, id)` in the database's own text
+// ordering, so the result does not depend on row order. Both dialect files
+// say "keeping the earliest" in their header; that holds under SQLite's
+// byte-order comparison of these ISO-8601 stamps, but a Postgres column under
+// a non-C collation orders text by locale rules, which need not be
+// chronological. The header is left as shipped (see 002's note on why), and
+// nothing depends on which twin survives: every deleted row names a
+// `(user_id, role)` pair its survivor still grants, so no user's effective
+// roles change — what goes is the second row a revoke could miss. `RELEASE.md`
+// carries the operator-facing version.
+//
+// Where it runs: native applies it before every boot, and a Cloudflare deploy
+// applies it through `/_deploy/init`. A browser install that already holds an
+// admin schema does not — nothing sets `IMPRESSPRESS_RUN_MIGRATIONS` there, so
+// the gate logs drift and skips it, and such a database keeps the old
+// non-unique table until it is recreated. `assign` behaves as before on it.
 //
 // Re-runnable, which admin's migrations must be twice over: the gate re-runs
 // the whole concatenated set from 001 whenever its hash changes, and the
@@ -205,7 +217,7 @@ mod user_roles_unique_tests {
     use super::{SQLITE_MIGRATIONS, USER_ROLES_UNIQUE};
     use crate::{
         migration_helper,
-        platform_state::user_roles::{self, UserRoleRow, TABLE},
+        platform_state::user_roles::{self, UserRoleRow},
         test_support::TestContext,
     };
 
@@ -253,7 +265,9 @@ mod user_roles_unique_tests {
             grant("ur_tie_a", "bob", "editor", "2026-03-01T00:00:00Z"),
             grant("ur_other", "bob", "admin", "2026-04-01T00:00:00Z"),
         ] {
-            db::create(&ctx, TABLE, row.to_data())
+            // Straight to the table: the fixture plants twins, which the
+            // only writer (`user_roles::assign`) now refuses to make.
+            db::create(&ctx, user_roles::TABLE, row.to_data())
                 .await
                 .expect("seed the repeated grant");
         }
@@ -275,14 +289,14 @@ mod user_roles_unique_tests {
         assert_eq!(
             ids,
             vec!["ur_b_first", "ur_other", "ur_tie_a"],
-            "each repeated grant collapses onto its earliest row, and nothing \
+            "each repeated grant collapses onto one survivor, and nothing \
              else is touched"
         );
 
         assert!(
             db::create(
                 &ctx,
-                TABLE,
+                user_roles::TABLE,
                 grant("ur_again", "alice", "admin", "2026-05-01T00:00:00Z").to_data(),
             )
             .await

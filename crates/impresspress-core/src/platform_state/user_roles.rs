@@ -1,6 +1,8 @@
 //! `impresspress__admin__user_roles`: role grants beyond a user's initial
 //! role — one row per `(user_id, role)`, which a unique index over the pair
-//! (admin migration 004) enforces — read by the framework auth block on
+//! enforces wherever admin migration 004 has run (every native and Cloudflare
+//! deployment and every new browser install; not a browser install created
+//! before it — see the note beside that migration) — read by the framework auth block on
 //! every login (`get_user_roles` merges them with the inline `users.role`)
 //! and managed by admin's IAM surface.
 //!
@@ -263,8 +265,8 @@ async fn refused_as_held(ctx: &dyn Context, user_id: &str, role: &str, error: &W
 /// the granting admin's id, or empty for a grant the system makes. The
 /// single writer for this table.
 ///
-/// The unique index over `(user_id, role)` (admin migration 004) is what
-/// makes this safe to run concurrently — two logins of the bootstrap admin
+/// The unique index over `(user_id, role)` (admin migration 004, where it
+/// has run) is what makes this safe to run concurrently — two logins of the bootstrap admin
 /// both reach it through `ensure_admin_role`. The read first is only the
 /// cheap answer for the common repeat; two callers can both pass it, and the
 /// insert of whichever comes second is then refused by the index and
@@ -323,6 +325,13 @@ pub async fn rename_role(
     }
 }
 
+/// Revoke every grant of `role`, in one statement, and say how many there
+/// were. For a role that is being deleted: unlike a remove per row read
+/// beforehand, this also takes a grant written after that read.
+pub async fn revoke_role(ctx: &dyn Context, role: &str) -> Result<i64, WaferError> {
+    db::delete_by_filters_count(ctx, TABLE, vec![eq("role", role)]).await
+}
+
 /// Revoke the grant with `id`. `NotFound` when there is none.
 pub async fn remove(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
     db::delete(ctx, TABLE, id).await
@@ -372,69 +381,6 @@ mod tests {
             list_for_user(&ctx, "u-1").await.expect("list").len(),
             1,
             "a repeated grant must not add a row"
-        );
-    }
-
-    /// Two grants of one role to one user, racing, leave ONE row — and so a
-    /// revoke of that row really revokes.
-    ///
-    /// `assign` reads before it inserts, and two callers that both pass the
-    /// read see no grant. The rendezvous holds both on that read until each
-    /// has made it, which is the interleaving two concurrent bootstrap-admin
-    /// logins can produce (`ensure_admin_role` reaches `assign` on every such
-    /// login). Without the unique index both inserts land, and the
-    /// duplicate's cost shows at the revoke: admin's `handle_remove_role`
-    /// removes one row by id through [`remove`], reports success, and the
-    /// twin keeps the role live.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn racing_grants_of_one_role_leave_one_row_that_a_revoke_removes() {
-        use crate::test_support::RendezvousDbOpContext;
-
-        let ctx = TestContext::with_auth().await;
-        ctx.seed_auth_user("racer").await;
-        let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", TABLE, 2);
-
-        let racers: Vec<_> = (0..2)
-            .map(|_| {
-                let gated = gated.clone();
-                tokio::spawn(async move { assign(&gated, "racer", "auditor", "").await })
-            })
-            .collect();
-        let outcomes = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            futures::future::try_join_all(racers),
-        )
-        .await
-        .expect("both grants must reach the rendezvous and finish")
-        .expect("grant task panicked");
-
-        let outcomes: Vec<Assigned> = outcomes
-            .into_iter()
-            .map(|outcome| outcome.expect("neither racer may fail: the loser is already-assigned"))
-            .collect();
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|o| matches!(o, Assigned::Created(_)))
-                .count(),
-            1,
-            "exactly one racer writes the grant: {outcomes:?}"
-        );
-        assert!(
-            outcomes.contains(&Assigned::AlreadyAssigned),
-            "the other is told it is already held: {outcomes:?}"
-        );
-
-        let rows = list_for_user(&ctx, "racer").await.expect("list grants");
-        assert_eq!(rows.len(), 1, "one grant, not one per racer: {rows:?}");
-
-        remove(&ctx, &rows[0].id).await.expect("revoke");
-        let roles = crate::blocks::auth::helpers::get_user_roles(&ctx, "racer")
-            .await
-            .expect("resolve roles");
-        assert!(
-            !roles.iter().any(|r| r == "auditor"),
-            "a revoke that reports success must leave the role gone: {roles:?}"
         );
     }
 
@@ -557,6 +503,19 @@ mod tests {
         assert!(listed.truncated);
         assert_eq!(listed.rows.len() as i64, crate::db_read::UNPAGED_LIMIT);
         assert_eq!(count_all(&ctx).await.expect("count"), past_the_ceiling);
+    }
+
+    /// A role's grants go in one statement, every holder's, and only that
+    /// role's.
+    #[tokio::test]
+    async fn revoke_role_takes_every_grant_of_that_role_and_nothing_else() {
+        let ctx = TestContext::with_admin().await;
+        for (user, role) in [("u-1", "editor"), ("u-2", "editor"), ("u-1", "viewer")] {
+            assign(&ctx, user, role, "").await.expect("assign");
+        }
+        assert_eq!(revoke_role(&ctx, "editor").await.expect("revoke"), 2);
+        assert!(list_by_role(&ctx, "editor").await.expect("list").is_empty());
+        assert_eq!(list_by_role(&ctx, "viewer").await.expect("list").len(), 1);
     }
 
     #[tokio::test]

@@ -368,7 +368,8 @@ fn invalidate_auth_version_cache(user_id: &str) {
 /// The single call site for every security-relevant mutation: password
 /// change (`auth_ui::api::change_password`), disable/soft-delete
 /// (`admin::ops::{set_user_disabled,delete_user,update_user_fields}`), and
-/// role change (`admin::iam::{handle_assign_role,handle_remove_role}`).
+/// role change (`admin::iam::{handle_assign_role,handle_remove_role,
+/// cascade_role_rename}` and `admin::ops::delete_role`).
 pub(crate) async fn bump_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
