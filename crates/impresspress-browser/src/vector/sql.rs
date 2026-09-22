@@ -201,6 +201,21 @@ pub fn parse_registry_row(row: &serde_json::Value) -> Result<(u32, DistanceMetri
     Ok((dimensions, metric, keyword_search))
 }
 
+/// Every table one index owns, in the order [`build_create_index_sql`]
+/// creates them.
+///
+/// The names are spelled here, beside the DDL that creates and drops them,
+/// so a caller that has to act on the whole set — invalidating the database
+/// service's cached schema for it, say — cannot drift from the builders.
+pub fn index_tables(prefixed_name: &str, keyword_search: bool) -> Vec<String> {
+    let mut out = vec![format!("{prefixed_name}_vectors")];
+    if keyword_search {
+        out.push(format!("{prefixed_name}_fts"));
+    }
+    out.push(format!("{prefixed_name}_meta"));
+    out
+}
+
 pub fn build_delete_index_sql(prefixed_name: &str, keyword_search: bool) -> Vec<String> {
     let mut out = vec![format!(r#"DROP TABLE IF EXISTS "{prefixed_name}_vectors""#)];
     if keyword_search {

@@ -27,9 +27,10 @@
 //! into sql.js, so this backend memoizes them in [`SCHEMA_CACHE`], one cache
 //! for the one database. The shared defaults invalidate it on every schema
 //! change they make (`exec_raw`, `ensure_schema_table`, lazy column-add); the
-//! schema changes made anywhere else — this file's own `schema_drop_table` /
-//! `schema_add_column`, `vector::service`'s DDL, and `db_init` reopening the
-//! database — call [`forget_schema`].
+//! schema changes made anywhere else invalidate it themselves: this file's own
+//! `schema_drop_table` / `schema_add_column`, `vector::service`'s DDL (through
+//! [`forget_table_schema`]), and `db_init` reopening the database (through
+//! [`forget_schema`]).
 //!
 //! ## The `DatabaseService` impl is a ledger, not a list of forwards
 //!
@@ -101,11 +102,17 @@ static STRICT_SCHEMA: AtomicBool = AtomicBool::new(false);
 /// run through the runtime's handle had already invalidated.
 static SCHEMA_CACHE: LazyLock<SchemaCache> = LazyLock::new(SchemaCache::new);
 
-/// Drop every memoized schema fact. Called after a schema change the shared
-/// executor did not make and so did not invalidate for: DDL run straight
-/// through the bridge, and the database being reopened.
+/// Drop every memoized schema fact. Called when the whole database changes
+/// under the cache — `db_init` reopening it — rather than one table's shape.
 pub(crate) fn forget_schema() {
     SCHEMA_CACHE.clear();
+}
+
+/// Drop the memoized schema facts for one table, for a schema change the
+/// shared executor did not make and so did not invalidate for: the DDL
+/// `vector::service` runs straight through the bridge.
+pub(crate) fn forget_table_schema(table: &str) {
+    SCHEMA_CACHE.invalidate(table);
 }
 
 /// Browser-side DatabaseService backed by sql.js via the JS bridge.
@@ -786,6 +793,65 @@ mod schema_cache_policy {
 
         forget_schema();
         assert_eq!(other.primary_key("cache_policy_t"), None);
+    }
+}
+
+/// The invalidation half of the cache: every schema change the shared executor
+/// does not make has to drop what the cache knows about the table it changed.
+///
+/// Each of these calls a bridge function, which rejects under
+/// `wasm-pack test --node` (there is no sql.js there) — which is the point:
+/// the invalidation has to happen whatever the statement returned, because a
+/// failed DDL may still have applied. The test seeds a fact, calls the real
+/// method, and asserts the fact is gone however the call ended.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod schema_invalidation {
+    use wafer_core::interfaces::database::{
+        exec::DbExec,
+        service::{Column, DatabaseService},
+    };
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::BrowserDatabaseService;
+
+    /// Seed a primary key for `table` and hand back the cache it went into.
+    fn seed(table: &str) -> &'static wafer_core::interfaces::database::schema_cache::SchemaCache {
+        let cache = DbExec::schema_cache(&BrowserDatabaseService).expect("a cache");
+        cache.set_primary_key_if_gen(table, vec!["id".into()], cache.generation());
+        assert_eq!(cache.primary_key(table), Some(vec!["id".to_string()]));
+        cache
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropping_a_table_forgets_it() {
+        let cache = seed("invalidate_drop_t");
+        let _ =
+            DatabaseService::schema_drop_table(&BrowserDatabaseService, "invalidate_drop_t").await;
+        assert_eq!(cache.primary_key("invalidate_drop_t"), None);
+    }
+
+    #[wasm_bindgen_test]
+    async fn adding_a_column_forgets_its_table() {
+        let cache = seed("invalidate_add_t");
+        let _ = DatabaseService::schema_add_column(
+            &BrowserDatabaseService,
+            "invalidate_add_t",
+            &Column::new(
+                "extra",
+                wafer_core::interfaces::database::service::DataType::Text,
+            ),
+        )
+        .await;
+        assert_eq!(cache.primary_key("invalidate_add_t"), None);
+    }
+
+    /// Reopening the database replaces everything the cache described, so it
+    /// drops the lot rather than one table.
+    #[wasm_bindgen_test]
+    async fn reopening_the_database_forgets_everything() {
+        let cache = seed("invalidate_init_t");
+        let _ = crate::db_init().await;
+        assert_eq!(cache.primary_key("invalidate_init_t"), None);
     }
 }
 

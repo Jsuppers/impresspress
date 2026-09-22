@@ -97,11 +97,10 @@ impl BrowserVectorService {
         // Idempotent — guarantees the table exists so the SELECT below
         // can't fail with "no such table" on a DB that has never had any
         // index created in it yet.
-        let created = bridge::db_exec_raw(&sql::build_registry_ddl(), db_codec::empty_params());
-        // DDL through the bridge, which the database service's schema cache
-        // never saw.
-        database::forget_schema();
-        created.map_err(|e| VectorError::Internal(js_err(e)))?;
+        exec_ddl(
+            &[sql::build_registry_ddl()],
+            &[sql::REGISTRY_TABLE.to_string()],
+        )?;
 
         let Some(state) = self.read_registry_row(name)? else {
             return Ok(None);
@@ -145,15 +144,8 @@ impl VectorService for BrowserVectorService {
         // registry DDL has already run. The hand-written `dbFlush()?` this
         // replaced returned early on that path and left the registry table
         // in memory only.
-        let written = database::with_flush_mapped(
-            self.create_index_statements(&config),
-            VectorError::Internal,
-        )
-        .await;
-        // DDL through the bridge, which the database service's schema cache
-        // never saw.
-        database::forget_schema();
-        written?;
+        database::with_flush_mapped(self.create_index_statements(&config), VectorError::Internal)
+            .await?;
 
         self.indexes
             .lock()
@@ -176,15 +168,11 @@ impl VectorService for BrowserVectorService {
             .lookup(name)?
             .ok_or_else(|| VectorError::IndexNotFound(name.into()))?;
 
-        let written = database::with_flush_mapped(
+        database::with_flush_mapped(
             self.delete_index_statements(name, state.keyword_search),
             VectorError::Internal,
         )
-        .await;
-        // DDL through the bridge, which the database service's schema cache
-        // never saw.
-        database::forget_schema();
-        written?;
+        .await?;
 
         self.indexes
             .lock()
@@ -419,8 +407,10 @@ impl BrowserVectorService {
     async fn create_index_statements(&self, config: &VectorIndexConfig) -> VResult<()> {
         // Idempotent — ensures the registry table exists before the select
         // and upsert below, on the very first index ever created in this DB.
-        bridge::db_exec_raw(&sql::build_registry_ddl(), db_codec::empty_params())
-            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        exec_ddl(
+            &[sql::build_registry_ddl()],
+            &[sql::REGISTRY_TABLE.to_string()],
+        )?;
 
         // Guard against a silent config-mismatched overwrite: the
         // `_vectors`/`_meta`/`_fts` DDL below is `IF NOT EXISTS` (idempotent,
@@ -449,11 +439,10 @@ impl BrowserVectorService {
             }
         }
 
-        let stmts = sql::build_create_index_sql(&config.name, config.keyword_search);
-        for s in stmts {
-            bridge::db_exec_raw(&s, db_codec::empty_params())
-                .map_err(|e| VectorError::Internal(js_err(e)))?;
-        }
+        exec_ddl(
+            &sql::build_create_index_sql(&config.name, config.keyword_search),
+            &sql::index_tables(&config.name, config.keyword_search),
+        )?;
 
         // Persist the config so a future cold cache (post-SW-restart) can
         // hydrate this index instead of returning `IndexNotFound`.
@@ -471,11 +460,10 @@ impl BrowserVectorService {
     /// Every statement `delete_index` writes, as one future. The in-memory
     /// cache eviction happens in the caller, after the write is durable.
     async fn delete_index_statements(&self, name: &str, keyword_search: bool) -> VResult<()> {
-        let stmts = sql::build_delete_index_sql(name, keyword_search);
-        for s in stmts {
-            bridge::db_exec_raw(&s, db_codec::empty_params())
-                .map_err(|e| VectorError::Internal(js_err(e)))?;
-        }
+        exec_ddl(
+            &sql::build_delete_index_sql(name, keyword_search),
+            &sql::index_tables(name, keyword_search),
+        )?;
 
         // Clear the registry row too — otherwise a later `lookup` miss
         // would hydrate a phantom `IndexState` for tables that no longer
@@ -487,6 +475,35 @@ impl BrowserVectorService {
             .map_err(|e| VectorError::Internal(js_err(e)))?;
         Ok(())
     }
+}
+
+/// Run `statements` — this module's DDL — through the bridge, then drop the
+/// database service's cached schema for `tables`.
+///
+/// The invalidation happens as soon as the statements have run, whatever they
+/// returned, and before this function yields: the DDL does not go through
+/// `DbExec`, so nothing else invalidates for it, and a `DatabaseService` read
+/// polled in between would otherwise memoize a schema fact this DDL has
+/// already invalidated (a table it just created as "missing", one it just
+/// dropped as "present"). A failed statement may still have applied some of
+/// its predecessors, so the failure path invalidates too.
+///
+/// Only the tables the statements touch are forgotten, so an index's DDL does
+/// not cost the rest of the database its memoized schema.
+fn exec_ddl(statements: &[String], tables: &[String]) -> VResult<()> {
+    let mut ran = Ok(());
+    for statement in statements {
+        ran = bridge::db_exec_raw(statement, db_codec::empty_params())
+            .map(|_| ())
+            .map_err(|e| VectorError::Internal(js_err(e)));
+        if ran.is_err() {
+            break;
+        }
+    }
+    for table in tables {
+        database::forget_table_schema(table);
+    }
+    ran
 }
 
 /// A loaded vector row: `(id, vector, metadata)`.
@@ -589,6 +606,79 @@ fn attach_metadata(
             score,
         })
         .collect()
+}
+
+/// This module's DDL does not go through `DbExec`, so it invalidates the
+/// database service's cached schema itself ([`exec_ddl`]). Under
+/// `wasm-pack test --node` every bridge call rejects — there is no sql.js —
+/// which is exactly the case the invalidation has to cover: a statement that
+/// failed may still have applied, and a later `DatabaseService` read must not
+/// be served a fact the DDL invalidated.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod schema_invalidation {
+    use wafer_core::interfaces::database::exec::DbExec;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{
+        exec_ddl, sql, BrowserVectorService, DistanceMetric, VectorIndexConfig, VectorService,
+    };
+    use crate::database::BrowserDatabaseService;
+
+    fn seed(table: &str) -> &'static wafer_core::interfaces::database::schema_cache::SchemaCache {
+        let cache = DbExec::schema_cache(&BrowserDatabaseService).expect("a cache");
+        cache.set_primary_key_if_gen(table, vec!["id".into()], cache.generation());
+        assert_eq!(cache.primary_key(table), Some(vec!["id".to_string()]));
+        cache
+    }
+
+    /// The helper forgets every table it was given even when the statements
+    /// failed, and forgets nothing else.
+    #[wasm_bindgen_test]
+    fn failed_ddl_still_forgets_its_tables_and_only_its_tables() {
+        let cache = seed("vec_ddl_t");
+        seed("vec_untouched_t");
+
+        let ran = exec_ddl(
+            &[r#"CREATE TABLE "vec_ddl_t" (id TEXT PRIMARY KEY)"#.to_string()],
+            &["vec_ddl_t".to_string()],
+        );
+
+        assert!(ran.is_err(), "there is no sql.js under Node");
+        assert_eq!(cache.primary_key("vec_ddl_t"), None);
+        assert_eq!(
+            cache.primary_key("vec_untouched_t"),
+            Some(vec!["id".to_string()]),
+            "another table's memoized schema is not collateral"
+        );
+    }
+
+    /// `create_index` runs the registry DDL first, so the registry table's
+    /// facts go whatever the rest of the call does.
+    #[wasm_bindgen_test]
+    async fn create_index_forgets_the_registry_table() {
+        let cache = seed(sql::REGISTRY_TABLE);
+        let _ = BrowserVectorService::new()
+            .create_index(VectorIndexConfig {
+                name: "vec_create_idx".to_string(),
+                model: "test-model".to_string(),
+                dimensions: 3,
+                metric: DistanceMetric::Cosine,
+                keyword_search: false,
+            })
+            .await;
+        assert_eq!(cache.primary_key(sql::REGISTRY_TABLE), None);
+    }
+
+    /// `delete_index` hydrates first, and the hydrate runs the same registry
+    /// DDL.
+    #[wasm_bindgen_test]
+    async fn delete_index_forgets_the_registry_table_through_hydrate() {
+        let cache = seed(sql::REGISTRY_TABLE);
+        let _ = BrowserVectorService::new()
+            .delete_index("vec_delete_idx")
+            .await;
+        assert_eq!(cache.primary_key(sql::REGISTRY_TABLE), None);
+    }
 }
 
 /// The hybrid-search fusion pin. `service.rs` is wasm32-only (it drives the
