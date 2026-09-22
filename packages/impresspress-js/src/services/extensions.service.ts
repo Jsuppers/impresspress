@@ -171,7 +171,11 @@ export class CloudStorageExtension extends ExtensionsService {
     usage: {
       /** Bytes stored, in-flight (`pending`) uploads included. */
       total_bytes: number;
-      /** Object rows owned by the caller, on the same basis. */
+      /**
+       * Objects the caller owns across all buckets, in-flight uploads
+       * included. Not what the per-bucket `max_files_per_bucket` cap is
+       * checked against.
+       */
       file_count: number;
     };
   }> {

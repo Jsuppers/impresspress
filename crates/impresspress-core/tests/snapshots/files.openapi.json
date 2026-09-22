@@ -452,12 +452,12 @@
                     "description": "The `usage` half of [`QuotaResponse`]. Both numbers are computed over the\ncaller's object rows, not read from a counter column.",
                     "properties": {
                       "file_count": {
-                        "description": "Number of object rows the caller owns, on the same basis.",
+                        "description": "Objects the caller owns across all buckets, `Pending` included; not\nwhat the per-bucket `max_files_per_bucket` cap is checked against.",
                         "format": "int64",
                         "type": "integer"
                       },
                       "total_bytes": {
-                        "description": "`SUM(size)` over the caller's rows, `Pending` reservations included —\nan in-flight upload is charged, which is what closes the quota\nTOCTOU window.",
+                        "description": "`SUM(size)` over the caller's rows, `Pending` reservations included.",
                         "format": "int64",
                         "type": "integer"
                       }

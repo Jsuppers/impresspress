@@ -286,9 +286,10 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         return r;
     }
 
-    // Claim the key BEFORE uploading so concurrent quota checks see the
-    // in-flight size. This closes the TOCTOU race between check_quota and the
-    // actual upload. `(bucket, key)` is UNIQUE: a re-upload takes over the
+    // Claim the key BEFORE uploading so a quota check that runs after this
+    // insert counts the in-flight size. That narrows the race between
+    // check_quota and the upload; it does not close it (see `check_quota`).
+    // `(bucket, key)` is UNIQUE: a re-upload takes over the
     // key's one row, and an upload that finds another upload of the key still
     // in flight is refused (see `reserve_upload`).
     let reservation = match repo::objects::reserve_upload(
@@ -1436,6 +1437,12 @@ mod integration_tests {
 
     /// Upload a small text file as alice through the real handler.
     async fn alice_uploads(ctx: &TestContext, bucket: &str, key: &str) -> OutputStream {
+        alice_uploads_as(ctx, bucket, key).await
+    }
+
+    /// [`alice_uploads`] through any context, so a race test can pass a
+    /// decorated one.
+    async fn alice_uploads_as(ctx: &dyn Context, bucket: &str, key: &str) -> OutputStream {
         handle_upload_object(
             ctx,
             &upload_msg(bucket, key, "text/plain"),
@@ -1505,10 +1512,11 @@ mod integration_tests {
     }
 
     /// An upload still in flight counts against the bucket's cap, as its bytes
-    /// count against the storage cap: otherwise uploads racing into a bucket
-    /// one short of the cap would all pass the check. A guard on the chosen
-    /// semantics — the cross-bucket count counted pending rows too, so this
-    /// passes before and after the per-bucket fix.
+    /// count against the storage cap: an upload whose check runs after
+    /// another upload's reservation has landed sees that reservation and is
+    /// refused. A guard on the chosen semantics — the cross-bucket count
+    /// counted pending rows too, so this passes before and after the
+    /// per-bucket fix.
     #[tokio::test]
     async fn an_upload_in_flight_counts_against_the_bucket_cap() {
         let ctx = alice_capped_at_files_per_bucket(1).await;
@@ -1520,6 +1528,56 @@ mod integration_tests {
         assert!(
             output_is_error(out, "InvalidArgument").await,
             "the pending reservation is the bucket's one file",
+        );
+    }
+
+    /// The per-bucket cap is NOT enforced atomically, and this pins that.
+    /// Two uploads of different keys into a bucket one short of its cap are
+    /// held until both have counted the bucket, so both see one file and
+    /// both are admitted: the bucket ends one over its cap. The count and the
+    /// reservation insert are separate calls, and a reservation is exclusive
+    /// per key, not per bucket. Tracked in `NICE_TO_HAVE.md` ("Files quota
+    /// caps are not enforced atomically"); when that lands, this test should
+    /// flip to one 200 and one refusal.
+    #[tokio::test]
+    async fn racing_uploads_of_different_keys_can_overshoot_the_bucket_cap() {
+        use crate::test_support::{output_http_status, RendezvousDbOpContext};
+
+        let ctx = alice_capped_at_files_per_bucket(2).await;
+        let first = alice_uploads(&ctx, "a", "one.txt").await;
+        assert_eq!(
+            output_json(first).await["uploaded"],
+            serde_json::json!(true)
+        );
+
+        // Each upload makes exactly one `count` on the objects table: the
+        // per-bucket file count in `check_quota`.
+        let gated =
+            RendezvousDbOpContext::new(ctx.clone(), "database.count", repo::objects::TABLE, 2);
+        let racers: Vec<_> = ["two.txt", "three.txt"]
+            .into_iter()
+            .map(|key| {
+                let racer = gated.clone();
+                tokio::spawn(async move {
+                    output_http_status(alice_uploads_as(&racer, "a", key).await).await
+                })
+            })
+            .collect();
+        let statuses = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("both uploads must reach the rendezvous and finish")
+        .expect("upload task panicked");
+
+        assert_eq!(statuses, vec![200, 200], "both racers pass the check");
+        assert_eq!(
+            repo::objects::count_for_uploader_in_bucket(&ctx, "alice", "a")
+                .await
+                .expect("count"),
+            3,
+            "the bucket ends one file over its cap of two",
         );
     }
 

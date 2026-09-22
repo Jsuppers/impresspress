@@ -3,8 +3,8 @@
 //! Object metadata rows — one row per uploaded file (sibling of the raw
 //! storage blob in `wafer-run/storage`). Tracks size, content type,
 //! status, uploader and timestamps. A row is claimed `pending` *before* the
-//! storage upload ([`reserve_upload`], which closes the quota TOCTOU window)
-//! and flipped to `complete` afterward; quota accounting sums/counts by
+//! storage upload ([`reserve_upload`], so a later quota check counts it —
+//! `quota::check_quota` says what that does and does not bound) and flipped to `complete` afterward; quota accounting sums/counts by
 //! `uploaded_by` (including in-flight `pending` reservations), while
 //! user-facing search and admin stats only see `complete` rows.
 //!
@@ -210,8 +210,10 @@ pub struct Reservation {
 }
 
 /// Claim `(bucket, key)` for an upload of `size` bytes, BEFORE the storage
-/// upload runs, so concurrent quota checks see the in-flight size (this is
-/// what closes the check-quota → upload TOCTOU race). `uploaded_at` is stamped
+/// upload runs, so a quota check that runs after this insert counts the
+/// in-flight size. It narrows the check-quota → upload race without closing
+/// it: the check and this claim are separate calls, and a claim is exclusive
+/// per key, not per bucket (see `quota::check_quota`). `uploaded_at` is stamped
 /// with [`crate::util::now_rfc3339`].
 ///
 /// `(bucket, key)` is UNIQUE, so the key has at most one row, and what that

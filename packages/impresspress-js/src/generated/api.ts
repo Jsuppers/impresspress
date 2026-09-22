@@ -1352,14 +1352,13 @@ export interface paths {
                             usage: {
                                 /**
                                  * Format: int64
-                                 * @description Number of object rows the caller owns, on the same basis.
+                                 * @description Objects the caller owns across all buckets, `Pending` included; not
+                                 *     what the per-bucket `max_files_per_bucket` cap is checked against.
                                  */
                                 file_count: number;
                                 /**
                                  * Format: int64
-                                 * @description `SUM(size)` over the caller's rows, `Pending` reservations included —
-                                 *     an in-flight upload is charged, which is what closes the quota
-                                 *     TOCTOU window.
+                                 * @description `SUM(size)` over the caller's rows, `Pending` reservations included.
                                  */
                                 total_bytes: number;
                             };

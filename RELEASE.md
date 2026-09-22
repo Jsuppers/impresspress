@@ -295,6 +295,27 @@ links now get the configured maximum instead. Existing links are unchanged
 by this — what bounds them is the repair above, which reproduces the
 lifetime their token already had.
 
+### Files: the file-count quota is per bucket, and `reset_period_days` is gone
+
+**The file-count cap is per bucket, as its name says.** `max_files_per_bucket`
+(default `10000`, shown as "Max Files/Bucket" on the storage admin's Quotas tab)
+used to be checked against a user's files summed over **all** their buckets,
+so filling one bucket blocked uploads everywhere. It is now checked against
+the files that user holds in the bucket being uploaded to. This **loosens**
+enforcement: a user with several buckets can now store up to
+`max_files_per_bucket` files in each. If you relied on it as a total cap,
+lower `max_storage_bytes` instead — that cap is still over everything a user
+stores. No migration is involved.
+
+**`reset_period_days` is removed — a breaking change for API clients.** It
+was stored and published, but nothing ever enforced a reset period. It is no
+longer in `GET /b/cloudstorage/quota`, `GET /b/cloudstorage/admin/quotas` or
+the `PATCH /b/cloudstorage/admin/quotas/{id}` response, and a PATCH that names
+it is refused with a 400 (`Unknown quota field`) instead of being stored. The
+SDK's `getQuota()` type no longer has it. Drop the field from anything that
+sends or reads it. The database column is left in place, unused; there is
+nothing to do about it.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one

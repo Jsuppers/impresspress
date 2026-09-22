@@ -40,18 +40,23 @@ const SQL_001_POSTGRES: &str = include_str!("001_initial_schema.postgres.sql");
 const SQL_002_SQLITE: &str = include_str!("002_bucket_name_unique.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_002_POSTGRES: &str = include_str!("002_bucket_name_unique.postgres.sql");
-// `cloud_quotas.reset_period_days`, declared in 001, is a column no code
-// reads or writes. Nothing enforces a reset period, so `QuotaConfig`, the
-// admin quota PATCH whitelist (`cloud::handle_update_quota`) and the published
-// contract do not carry it. The column itself stays because this block's
-// runner cannot drop it safely: `apply_if_blessed` re-runs the whole joined
-// migration SQL whenever its hash changes and tolerates only a duplicate
-// `ADD COLUMN`, so a `DROP COLUMN` would fail with "no such column" on the
-// next re-run on SQLite/D1 and fail the block's `Init`. It is
-// `NOT NULL DEFAULT 0`, so a row written without it is still accepted.
 const SQL_003_SQLITE: &str = include_str!("003_legacy_share_token_expiry.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_003_POSTGRES: &str = include_str!("003_legacy_share_token_expiry.postgres.sql");
+
+// The unused `cloud_quotas.reset_period_days` column.
+//
+// 001 declares it; no code reads or writes it. Nothing enforces a reset
+// period, so `QuotaConfig`, the admin quota PATCH whitelist
+// (`cloud::handle_update_quota`) and the published contract do not carry it.
+// The column stays because `DROP COLUMN` is unsafe under this block's runner:
+// `apply_if_blessed` re-runs the whole joined migration SQL whenever its hash
+// changes and tolerates only a duplicate `ADD COLUMN`, so a `DROP COLUMN`
+// would fail with "no such column" on the next re-run on SQLite/D1 and fail
+// the block's `Init`. A table rebuild (create, copy, drop, rename) can be
+// written to survive re-runs, but is not worth it for a column nothing
+// touches. It is
+// `NOT NULL DEFAULT 0`, so a row written without it is still accepted.
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle_init` apply path.

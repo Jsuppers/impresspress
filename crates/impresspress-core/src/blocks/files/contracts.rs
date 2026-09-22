@@ -27,8 +27,8 @@ use super::repo::Page;
 /// Where an object row is in its upload: the `status` column of
 /// `impresspress__files__objects`.
 ///
-/// A row is inserted `Pending` *before* the storage upload — that is what
-/// closes the quota TOCTOU window — and flipped to `Complete` afterwards.
+/// A row is inserted `Pending` *before* the storage upload, so a later quota
+/// check counts it, and flipped to `Complete` afterwards.
 /// The distinction is load-bearing in two directions at once: quota
 /// accounting counts both, so an in-flight reservation is charged, while
 /// search and the admin stats count only `Complete`, so a half-finished
@@ -226,11 +226,10 @@ pub struct ShareCreatedResponse {
 /// caller's object rows, not read from a counter column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct QuotaUsageView {
-    /// `SUM(size)` over the caller's rows, `Pending` reservations included —
-    /// an in-flight upload is charged, which is what closes the quota
-    /// TOCTOU window.
+    /// `SUM(size)` over the caller's rows, `Pending` reservations included.
     pub total_bytes: i64,
-    /// Number of object rows the caller owns, on the same basis.
+    /// Objects the caller owns across all buckets, `Pending` included; not
+    /// what the per-bucket `max_files_per_bucket` cap is checked against.
     pub file_count: i64,
 }
 

@@ -88,12 +88,23 @@ pub async fn get_user_usage(
 /// is per bucket, over the rows `user_id` holds in `bucket`
 /// ([`repo::objects::count_for_uploader_in_bucket`]), so being at the limit
 /// in one bucket does not stop an upload into another. Both count `pending`
-/// rows: a pending row is an upload in flight that will add a file once it
-/// settles, and it is counted for the same reason its bytes are — so that
-/// concurrent uploads each see the others' reservations instead of all
-/// passing the check against the same pre-upload count. A pending row left
-/// behind by a failed upload stops counting once [`sweep_stale_pending`],
-/// which the upload handler runs before this check, removes it.
+/// rows: a pending row is an upload in flight that will add a file (and its
+/// bytes) once it settles. A pending row left behind by a failed upload stops
+/// counting once [`sweep_stale_pending`], which the upload handler runs before
+/// this check, removes it.
+///
+/// Counting pending rows narrows the check-to-write race; it does not close
+/// it. The reservation is inserted before the storage write, so an upload
+/// whose check runs after another upload's reservation has landed sees it and
+/// is refused, and the window shrinks from check → `mark_complete` (which
+/// spans the storage write) to check → reservation insert. But this check (a
+/// `count` and a `sum`) and [`repo::objects::reserve_upload`] are separate
+/// database calls with no transaction or lock between them, and in-flight
+/// uploads are exclusive per `(bucket, key)`, not per bucket. Uploads of
+/// different keys whose checks all run before any of them reserves each see
+/// the same usage and are all admitted, so either cap can be exceeded by the
+/// uploads in flight at that moment. Atomic enforcement is tracked in
+/// `NICE_TO_HAVE.md`, "Files quota caps are not enforced atomically".
 ///
 /// Fails closed: if the quota or the current usage cannot be read, the
 /// upload is refused with an internal error rather than admitted against
@@ -144,8 +155,9 @@ pub async fn check_quota(
 
 /// Sweep the given user's `pending`-status object rows older than
 /// [`repo::objects::PENDING_RESERVATION_TTL_SECONDS`]. A row is claimed
-/// `pending` before the actual storage upload to close the quota TOCTOU
-/// window, and two failures can leave one behind: the upload errored AND
+/// `pending` before the actual storage upload so that a later quota check
+/// counts it (see [`check_quota`] for what that does and does not bound),
+/// and two failures can leave one behind: the upload errored AND
 /// `release_reservation` errored too, or the upload succeeded but
 /// `mark_complete` could not record it. Either way the row would otherwise
 /// inflate that user's quota usage forever. Calling this best-effort on each
