@@ -254,7 +254,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .optional(),
         ConfigVar::new(
             config::SELLER_APPLICATION_FEE_BPS,
-            "Default platform application fee for connected-account sales, in basis points (0-10000)",
+            "Platform application fee for connected-account sales, in basis points (0-10000)",
             "0",
         )
         .name("Seller Application Fee (bps)")

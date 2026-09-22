@@ -293,7 +293,7 @@ pub(crate) async fn seller_status(
     };
     let account_id = local.str_field("stripe_account_id").to_string();
     if account_id.is_empty() || repo::seller_accounts::is_suspended_record(&local)? {
-        return repo::seller_accounts::to_contract(&local);
+        return repo::seller_accounts::to_contract(&local, fee);
     }
     let Ok(client) = StripeClient::load(ctx).await else {
         let stale = repo::seller_accounts::mark_sync_error(
@@ -302,7 +302,7 @@ pub(crate) async fn seller_status(
             "Stripe account status could not be refreshed",
         )
         .await?;
-        return repo::seller_accounts::to_contract(&stale);
+        return repo::seller_accounts::to_contract(&stale, fee);
     };
     let path = format!("/v1/accounts/{}", crate::util::url_path_encode(&account_id));
     let Ok(remote) = client
@@ -315,11 +315,11 @@ pub(crate) async fn seller_status(
             "Stripe account status could not be refreshed",
         )
         .await?;
-        return repo::seller_accounts::to_contract(&stale);
+        return repo::seller_accounts::to_contract(&stale, fee);
     };
     let snapshot = account_snapshot(&remote, client.livemode)?;
     let record = repo::seller_accounts::sync_account(ctx, &local.id, &snapshot).await?;
-    repo::seller_accounts::to_contract(&record)
+    repo::seller_accounts::to_contract(&record, fee)
 }
 
 pub(crate) async fn start_seller_onboarding(
@@ -331,7 +331,7 @@ pub(crate) async fn start_seller_onboarding(
     validate_redirect(ctx, &request.refresh_url).await?;
     let fee = seller_fee_bps(ctx).await?;
     let client = StripeClient::load(ctx).await?;
-    let mut local = repo::seller_accounts::ensure_for_user(ctx, user_id, fee).await?;
+    let mut local = repo::seller_accounts::ensure_for_user(ctx, user_id).await?;
     if repo::seller_accounts::is_suspended_record(&local)? {
         return Err(WaferError::new(
             ErrorCode::PermissionDenied,
@@ -420,7 +420,7 @@ pub(crate) async fn start_seller_onboarding(
         ));
     }
     Ok(SellerOnboardingResponse {
-        account: repo::seller_accounts::to_contract(&local)?,
+        account: repo::seller_accounts::to_contract(&local, fee)?,
         url,
         expires_at,
     })

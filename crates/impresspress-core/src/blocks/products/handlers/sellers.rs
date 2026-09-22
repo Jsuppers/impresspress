@@ -12,6 +12,7 @@ use crate::{
                 AdminSellerDetail, ApprovalStatus, OfferStatus, ProductStatus, SellerAccountList,
                 SellerStatus,
             },
+            config::seller_fee_bps,
             repo, stripe,
         },
     },
@@ -30,8 +31,27 @@ fn admin_error(error: WaferError, not_found: &str) -> OutputStream {
     }
 }
 
+/// A stored seller row as the published account, the answer both
+/// suspension exits build. The platform fee is read here, after any write,
+/// for the reason the raw read in [`set_suspended`] gives: nothing but
+/// storage may stop the fraud control itself.
+async fn seller_json(ctx: &dyn Context, account: &wafer_core::clients::database::Record) -> OutputStream {
+    let fee = match seller_fee_bps(ctx).await {
+        Ok(fee) => fee,
+        Err(error) => return admin_error(error, "Seller not found"),
+    };
+    match repo::seller_accounts::to_contract(account, fee) {
+        Ok(seller) => ok_json(&seller),
+        Err(error) => admin_error(error, "Seller not found"),
+    }
+}
+
 pub(super) async fn list(ctx: &dyn Context) -> OutputStream {
-    let sellers = match repo::seller_accounts::list_contracts(ctx).await {
+    let fee = match seller_fee_bps(ctx).await {
+        Ok(fee) => fee,
+        Err(error) => return admin_error(error, "Seller not found"),
+    };
+    let sellers = match repo::seller_accounts::list_contracts(ctx, fee).await {
         Ok(sellers) => sellers,
         Err(error) => return admin_error(error, "Seller not found"),
     };
@@ -58,7 +78,11 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let seller = match repo::seller_accounts::get_contract(ctx, id).await {
+    let fee = match seller_fee_bps(ctx).await {
+        Ok(fee) => fee,
+        Err(error) => return admin_error(error, "Seller not found"),
+    };
+    let seller = match repo::seller_accounts::get_contract(ctx, id, fee).await {
         Ok(Some(seller)) => seller,
         Ok(None) => return err_not_found("Seller not found"),
         Err(error) => return admin_error(error, "Seller not found"),
@@ -179,9 +203,10 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
         Err(response) => return response,
     };
     // The stored row, not `get_contract`'s decoded contract: suspension is a
-    // fraud control, and a row whose `fee_basis_points` no longer decodes is
-    // exactly the account an operator most needs to be able to suspend. The
-    // decode happens where the answer is built, at the end.
+    // fraud control, and a row whose `status` no longer decodes is exactly
+    // the account an operator most needs to be able to suspend. The decode,
+    // and the platform-fee read the answer carries, happen where the answer
+    // is built, at the end.
     let account = match repo::seller_accounts::get(ctx, id).await {
         Ok(Some(account)) => account,
         Ok(None) => return err_not_found("Seller not found"),
@@ -192,10 +217,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
     // decodes can still be suspended, and decoding here would put that
     // failure mode back one line later.
     if (account.str_field("status") == wire_str(&SellerStatus::Suspended)) == suspended {
-        return match repo::seller_accounts::to_contract(&account) {
-            Ok(seller) => ok_json(&seller),
-            Err(error) => admin_error(error, "Seller not found"),
-        };
+        return seller_json(ctx, &account).await;
     }
     // EVERY product the seller owns, soft-deleted ones included. Deliberately
     // a different read from the catalog listing in `get` above: suspension is
@@ -265,10 +287,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
         }
     }
     match repo::seller_accounts::set_admin_suspended(ctx, id, suspended).await {
-        Ok(account) => match repo::seller_accounts::to_contract(&account) {
-            Ok(seller) => ok_json(&seller),
-            Err(error) => admin_error(error, "Seller not found"),
-        },
+        Ok(account) => seller_json(ctx, &account).await,
         Err(error) => admin_error(error, "Seller not found"),
     }
 }

@@ -481,7 +481,7 @@ async fn seed_seller_account(
     ctx: &crate::test_support::TestContext,
     id: &str,
     user_id: &str,
-    fee_basis_points: i64,
+    status: &str,
 ) {
     seed(
         ctx,
@@ -489,7 +489,7 @@ async fn seed_seller_account(
         id,
         HashMap::from([
             ("user_id".to_string(), serde_json::json!(user_id)),
-            ("status".to_string(), serde_json::json!("active")),
+            ("status".to_string(), serde_json::json!(status)),
             (
                 "stripe_account_id".to_string(),
                 serde_json::json!(format!("acct_{id}")),
@@ -498,10 +498,6 @@ async fn seed_seller_account(
             ("charges_enabled".to_string(), serde_json::json!(true)),
             ("payouts_enabled".to_string(), serde_json::json!(true)),
             ("requirements_json".to_string(), serde_json::json!("{}")),
-            (
-                "fee_basis_points".to_string(),
-                serde_json::json!(fee_basis_points),
-            ),
         ]),
     )
     .await;
@@ -512,21 +508,25 @@ async fn seed_seller_account(
 #[tokio::test]
 async fn list_contracts_equals_every_row_through_to_contract() {
     let ctx = ctx().await;
-    seed_seller_account(&ctx, "seller_a", "user_a", 250).await;
-    seed_seller_account(&ctx, "seller_b", "user_b", 100).await;
+    seed_seller_account(&ctx, "seller_a", "user_a", "active").await;
+    seed_seller_account(&ctx, "seller_b", "user_b", "restricted").await;
 
     let expected: Vec<_> = db::list_all(&ctx, repo::seller_accounts::TABLE, vec![])
         .await
         .expect("rows")
         .iter()
-        .map(repo::seller_accounts::to_contract)
+        .map(|record| repo::seller_accounts::to_contract(record, 250))
         .collect::<Result<Vec<_>, _>>()
         .expect("projections");
 
-    let actual = repo::seller_accounts::list_contracts(&ctx)
+    let actual = repo::seller_accounts::list_contracts(&ctx, 250)
         .await
         .expect("list_contracts");
     assert_eq!(actual.rows, expected);
+    assert!(
+        actual.rows.iter().all(|seller| seller.fee_basis_points == 250),
+        "every seller publishes the platform fee it was handed"
+    );
     assert_eq!(actual.rows.len(), 2, "both seeded rows are listed");
     assert!(!actual.truncated, "two rows is not a prefix");
 }
@@ -537,11 +537,11 @@ async fn list_contracts_equals_every_row_through_to_contract() {
 #[tokio::test]
 async fn list_contracts_fails_when_a_row_cannot_be_projected() {
     let ctx = ctx().await;
-    seed_seller_account(&ctx, "seller_ok", "user_ok", 250).await;
-    // 10_001 basis points is over the 100% ceiling `to_contract` enforces.
-    seed_seller_account(&ctx, "seller_bad", "user_bad", 10_001).await;
+    seed_seller_account(&ctx, "seller_ok", "user_ok", "active").await;
+    // Not a `SellerStatus` spelling, so `to_contract` cannot decode the row.
+    seed_seller_account(&ctx, "seller_bad", "user_bad", "dormant").await;
 
-    let error = repo::seller_accounts::list_contracts(&ctx)
+    let error = repo::seller_accounts::list_contracts(&ctx, 250)
         .await
         .expect_err("an unprojectable row fails the read");
     assert_eq!(error.code, wafer_run::ErrorCode::Internal);
@@ -552,21 +552,21 @@ async fn list_contracts_fails_when_a_row_cannot_be_projected() {
 #[tokio::test]
 async fn get_contract_projects_the_row_and_answers_none_for_a_missing_id() {
     let ctx = ctx().await;
-    seed_seller_account(&ctx, "seller_a", "user_a", 250).await;
+    seed_seller_account(&ctx, "seller_a", "user_a", "active").await;
 
     let record = db::get(&ctx, repo::seller_accounts::TABLE, "seller_a")
         .await
         .expect("row");
-    let expected = repo::seller_accounts::to_contract(&record).expect("projection");
+    let expected = repo::seller_accounts::to_contract(&record, 250).expect("projection");
 
     assert_eq!(
-        repo::seller_accounts::get_contract(&ctx, "seller_a")
+        repo::seller_accounts::get_contract(&ctx, "seller_a", 250)
             .await
             .expect("get_contract"),
         Some(expected)
     );
     assert_eq!(
-        repo::seller_accounts::get_contract(&ctx, "seller_missing")
+        repo::seller_accounts::get_contract(&ctx, "seller_missing", 250)
             .await
             .expect("get_contract"),
         None

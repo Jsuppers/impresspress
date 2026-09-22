@@ -1094,7 +1094,8 @@ pub struct SellerAccount {
     #[serde(default)]
     pub stripe_account_id: String,
     pub capabilities: SellerCapabilities,
-    /// Platform fee applied to this seller's sales, in basis points.
+    /// The platform application fee charged on this seller's sales now, in
+    /// basis points.
     #[schemars(range(max = 10000))]
     pub fee_basis_points: u32,
     #[serde(default)]

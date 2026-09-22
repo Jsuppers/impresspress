@@ -86,7 +86,6 @@ pub(crate) fn is_suspended_record(record: &db::Record) -> Result<bool, WaferErro
 pub(crate) struct ReadySellerAccount {
     pub id: String,
     pub stripe_account_id: String,
-    pub fee_basis_points: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,16 +123,19 @@ fn due_requirements(value: &Value) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn to_contract(record: &db::Record) -> Result<SellerAccount, WaferError> {
-    let fee_basis_points = u32::try_from(record.i64_field("fee_basis_points"))
-        .ok()
-        .filter(|value| *value <= 10_000)
-        .ok_or_else(|| {
-            WaferError::new(
-                ErrorCode::Internal,
-                "seller account has an invalid application fee",
-            )
-        })?;
+/// The stored row as the published [`SellerAccount`], carrying
+/// `fee_basis_points` — the platform application fee
+/// ([`crate::blocks::products::config::seller_fee_bps`]) that checkout and
+/// Payment Links charge this seller's sales now.
+///
+/// The fee is a platform setting, not a fact about the row, so the caller
+/// reads it once and hands it in. The table's `fee_basis_points` column is
+/// neither read nor written: no path ever changed it after a row's first
+/// insert, so what it holds is not what anyone is charged.
+pub(crate) fn to_contract(
+    record: &db::Record,
+    fee_basis_points: u16,
+) -> Result<SellerAccount, WaferError> {
     let requirements = requirements_value(record);
     let status = status_of(record)?;
     Ok(SellerAccount {
@@ -148,7 +150,7 @@ pub(crate) fn to_contract(record: &db::Record) -> Result<SellerAccount, WaferErr
             payouts_enabled: record.bool_field("payouts_enabled"),
             requirements_due: due_requirements(&requirements),
         },
-        fee_basis_points,
+        fee_basis_points: fee_basis_points.into(),
         livemode: record.bool_field("livemode"),
         country: record.str_field("country").to_string(),
         default_currency: record.str_field("default_currency").to_string(),
@@ -174,10 +176,11 @@ pub(crate) fn to_contract(record: &db::Record) -> Result<SellerAccount, WaferErr
 /// unacceptable, so the caller is handed the fact that it has a prefix.
 pub(crate) async fn list_contracts(
     ctx: &dyn Context,
+    fee_basis_points: u16,
 ) -> Result<CappedList<SellerAccount>, WaferError> {
     db_read::list_capped(ctx, TABLE, vec![])
         .await?
-        .try_map(|record| to_contract(&record))
+        .try_map(|record| to_contract(&record, fee_basis_points))
 }
 
 /// How many seller accounts exist, for the listing that shows a prefix.
@@ -190,8 +193,8 @@ pub(crate) async fn count_all(ctx: &dyn Context) -> Result<i64, WaferError> {
 ///
 /// Kept alongside [`get_contract`] for the one caller — suspension — that
 /// must be able to act on a row whose contract projection would fail: an
-/// account with a corrupt `fee_basis_points` is exactly the one an operator
-/// most needs to be able to suspend.
+/// account whose stored `status` no longer decodes is exactly the one an
+/// operator most needs to be able to suspend.
 pub(crate) async fn get(ctx: &dyn Context, id: &str) -> Result<Option<db::Record>, WaferError> {
     match db::get(ctx, TABLE, id).await {
         Ok(record) => Ok(Some(record)),
@@ -206,9 +209,10 @@ pub(crate) async fn get(ctx: &dyn Context, id: &str) -> Result<Option<db::Record
 pub(crate) async fn get_contract(
     ctx: &dyn Context,
     id: &str,
+    fee_basis_points: u16,
 ) -> Result<Option<SellerAccount>, WaferError> {
     match db::get(ctx, TABLE, id).await {
-        Ok(record) => to_contract(&record).map(Some),
+        Ok(record) => to_contract(&record, fee_basis_points).map(Some),
         Err(error) if error.code == ErrorCode::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -285,7 +289,6 @@ pub(crate) async fn set_admin_suspended(
 pub(crate) async fn ensure_for_user(
     ctx: &dyn Context,
     user_id: &str,
-    fee_basis_points: u16,
 ) -> Result<db::Record, WaferError> {
     let digest = wafer_block::hash::sha256_hex(user_id.as_bytes());
     let id = format!("seller_{}", &digest[..32]);
@@ -299,10 +302,6 @@ pub(crate) async fn ensure_for_user(
             (
                 "status".to_string(),
                 serde_json::json!(SellerStatus::NotStarted),
-            ),
-            (
-                "fee_basis_points".to_string(),
-                serde_json::json!(fee_basis_points),
             ),
             ("created_at".to_string(), serde_json::json!(&now)),
             ("updated_at".to_string(), serde_json::json!(&now)),
@@ -583,6 +582,9 @@ pub(crate) async fn mark_sync_error(
 
 /// Resolve the connected account used for direct charges. Capability state
 /// is checked at checkout time, so disabling charges in Stripe fails closed.
+///
+/// `FailedPrecondition` is the one answer about the seller — no account, or
+/// one that cannot take charges yet. Any other error is a fault reading it.
 pub(crate) async fn ready_for_user(
     ctx: &dyn Context,
     user_id: &str,
@@ -603,18 +605,8 @@ pub(crate) async fn ready_for_user(
             "seller Stripe account is not ready to accept charges",
         ));
     }
-    let fee_basis_points = u16::try_from(record.i64_field("fee_basis_points"))
-        .ok()
-        .filter(|value| *value <= 10_000)
-        .ok_or_else(|| {
-            WaferError::new(
-                ErrorCode::Internal,
-                "seller account has an invalid application fee",
-            )
-        })?;
     Ok(ReadySellerAccount {
         id: record.id,
         stripe_account_id,
-        fee_basis_points,
     })
 }

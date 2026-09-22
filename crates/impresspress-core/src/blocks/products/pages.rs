@@ -713,7 +713,11 @@ pub async fn deleted_product_close(
 // ---------------------------------------------------------------------------
 
 pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let sellers = match repo::seller_accounts::list_contracts(ctx).await {
+    let fee = match platform_fee(ctx).await {
+        Ok(fee) => fee,
+        Err(response) => return response,
+    };
+    let sellers = match repo::seller_accounts::list_contracts(ctx, fee).await {
         Ok(sellers) => sellers,
         Err(error) => return crate::http::err_internal("Could not list sellers", error),
     };
@@ -838,7 +842,11 @@ pub async fn admin_seller_detail(
     msg: &Message,
     seller_id: &str,
 ) -> OutputStream {
-    let seller = match repo::seller_accounts::get_contract(ctx, seller_id).await {
+    let fee = match platform_fee(ctx).await {
+        Ok(fee) => fee,
+        Err(response) => return response,
+    };
+    let seller = match repo::seller_accounts::get_contract(ctx, seller_id, fee).await {
         Ok(Some(seller)) => seller,
         Ok(None) => return crate::http::err_not_found("Seller not found"),
         Err(error) => return crate::http::err_internal("Could not load seller", error),
@@ -887,7 +895,7 @@ pub async fn admin_seller_detail(
                     (components::stat_card("Payments", if seller.capabilities.charges_enabled { "Enabled" } else { "Disabled" }, icons::dollar_sign(), None))
                     (components::stat_card("Payouts", if seller.capabilities.payouts_enabled { "Enabled" } else { "Disabled" }, icons::arrow_up_right(), None))
                     (components::stat_card("Verification", if seller.capabilities.details_submitted { "Complete" } else { "Incomplete" }, icons::info(), None))
-                    (components::stat_card("Platform fee", &format!("{:.2}%", seller.fee_basis_points as f64 / 100.0), icons::dollar_sign(), None))
+                    (components::stat_card("Platform fee", &fee_percent(seller.fee_basis_points), icons::dollar_sign(), None))
                 }
                 details .products-plain-details {
                     summary { "Technical account details" }
@@ -2254,6 +2262,18 @@ fn fee_percent(basis_points: u32) -> String {
     format!("{}.{:02}%", basis_points / 100, basis_points % 100)
 }
 
+/// The platform application fee every seller surface shows: the fee
+/// checkout and Payment Links charge, read from the one place they read it.
+///
+/// Rendered, so it must not be invented: a fee the platform cannot read
+/// would otherwise print as "0.00%" on the page an operator opens to check
+/// exactly that number.
+async fn platform_fee(ctx: &dyn Context) -> Result<u16, OutputStream> {
+    super::config::seller_fee_bps(ctx).await.map_err(|error| {
+        crate::http::err_internal("Platform application fee is misconfigured", error)
+    })
+}
+
 fn friendly_requirement(requirement: &str) -> String {
     requirement
         .replace('.', " › ")
@@ -2263,7 +2283,7 @@ fn friendly_requirement(requirement: &str) -> String {
         .join(" ")
 }
 
-fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) -> Markup {
+fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u16) -> Markup {
     let ready = account.is_some_and(|account| {
         account.capabilities.details_submitted
             && account.capabilities.charges_enabled
@@ -2297,7 +2317,7 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u32) ->
                     }
                     div {
                         p .text-muted .text-sm .m-0 { "Platform fee" }
-                        strong { (fee_percent(account.map_or(fee_basis_points, |a| a.fee_basis_points))) }
+                        strong { (fee_percent(fee_basis_points.into())) }
                     }
                     div {
                         p .text-muted .text-sm .m-0 { "Mode" }
@@ -2349,6 +2369,10 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let (product_count, seller_account, fee_basis_points) = if seller_enabled {
+        let fee = match platform_fee(ctx).await {
+            Ok(fee) => fee,
+            Err(response) => return response,
+        };
         // The soft-delete filter used to be hand-written above;
         // `repo::products::count` now appends it.
         let count = match repo::products::count(
@@ -2365,24 +2389,12 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Err(error) => return crate::http::err_internal("Database error", error),
         };
         let account = match repo::seller_accounts::get_for_user(ctx, &user_id).await {
-            Ok(Some(record)) => match repo::seller_accounts::to_contract(&record) {
+            Ok(Some(record)) => match repo::seller_accounts::to_contract(&record, fee) {
                 Ok(account) => Some(account),
                 Err(error) => return crate::http::err_internal("Seller account error", error),
             },
             Ok(None) => None,
             Err(error) => return crate::http::err_internal("Database error", error),
-        };
-        // Rendered, so it must not be invented: a fee the platform cannot
-        // read used to print as "0.00%" on the page an operator opens to
-        // check exactly that number.
-        let fee = match super::config::seller_fee_bps(ctx).await {
-            Ok(fee) => u32::from(fee),
-            Err(error) => {
-                return crate::http::err_internal(
-                    "Platform application fee is misconfigured",
-                    error,
-                )
-            }
         };
         (count, account, fee)
     } else {
@@ -2455,12 +2467,16 @@ fn seller_page_links(active: &str) -> Markup {
 }
 
 pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let fee_basis_points = match platform_fee(ctx).await {
+        Ok(fee) => fee,
+        Err(response) => return response,
+    };
     let account_record = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(account) => account,
         Err(error) => return crate::http::err_internal("Database error", error),
     };
     let account = match account_record.as_ref() {
-        Some(record) => match repo::seller_accounts::to_contract(record) {
+        Some(record) => match repo::seller_accounts::to_contract(record, fee_basis_points) {
             Ok(account) => Some(account),
             Err(error) => return crate::http::err_internal("Seller account error", error),
         },
@@ -2479,12 +2495,6 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
             Err(error) => return crate::http::err_internal("Database error", error),
         },
         None => Vec::new(),
-    };
-    let fee_basis_points = match super::config::seller_fee_bps(ctx).await {
-        Ok(fee) => u32::from(fee),
-        Err(error) => {
-            return crate::http::err_internal("Platform application fee is misconfigured", error)
-        }
     };
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
     let content = html! {

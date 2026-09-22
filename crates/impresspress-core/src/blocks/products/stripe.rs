@@ -1063,14 +1063,9 @@ async fn handle_offer_checkout(
         let Ok(seller) = repo::seller_accounts::ready_for_user(ctx, owner_id).await else {
             return err_bad_request("This seller's Stripe account is not ready to accept charges");
         };
-        let configured_fee = match seller_fee_bps(ctx).await {
+        let fee = match seller_fee_bps(ctx).await {
             Ok(fee) => fee,
             Err(error) => return err_internal("Platform application fee is misconfigured", error),
-        };
-        let fee = if seller.fee_basis_points == 0 {
-            configured_fee
-        } else {
-            seller.fee_basis_points
         };
         (seller.id, seller.stripe_account_id, fee)
     } else {
@@ -1357,12 +1352,7 @@ async fn payment_link_seller_context(
         ));
     }
     let seller = repo::seller_accounts::ready_for_user(ctx, product.str_field("owner_id")).await?;
-    let configured_fee = seller_fee_bps(ctx).await?;
-    let fee = if seller.fee_basis_points == 0 {
-        configured_fee
-    } else {
-        seller.fee_basis_points
-    };
+    let fee = seller_fee_bps(ctx).await?;
     Ok((seller.id, seller.stripe_account_id, fee))
 }
 
