@@ -180,11 +180,10 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         return err_forbidden("Access denied to this bucket");
     }
 
-    // Best-effort sweep before quota check: orphan `pending` rows (from
-    // previous uploads where the storage put failed AND the compensating
-    // delete also failed) would otherwise inflate this user's quota usage
-    // and lock them out. 1h cutoff.
-    crate::blocks::files::quota::sweep_stale_pending(ctx, msg.user_id(), 3600).await;
+    // Best-effort sweep before quota check: orphan `pending` rows (see
+    // `sweep_stale_pending`) would otherwise inflate this user's quota usage
+    // and lock them out.
+    crate::blocks::files::quota::sweep_stale_pending(ctx, msg.user_id()).await;
 
     // Read the upload body under the user's quota. Two bounds:
     //   - per-file `max_file_size_bytes` (cheap to check on the running
@@ -288,8 +287,9 @@ pub(in crate::blocks::files) async fn handle_upload_object(
 
     // Claim the key BEFORE uploading so concurrent quota checks see the
     // in-flight size. This closes the TOCTOU race between check_quota and the
-    // actual upload. `(bucket, key)` is UNIQUE: a re-upload, or an upload
-    // that lost the race to claim a new key, takes over the key's one row.
+    // actual upload. `(bucket, key)` is UNIQUE: a re-upload takes over the
+    // key's one row, and an upload that finds another upload of the key still
+    // in flight is refused (see `reserve_upload`).
     let reservation = match repo::objects::reserve_upload(
         ctx,
         bucket,
@@ -301,11 +301,14 @@ pub(in crate::blocks::files) async fn handle_upload_object(
     .await
     {
         Ok(reservation) => reservation,
-        // A concurrency conflict on the key (see `reserve_upload`), which the
-        // client resolves by retrying — not a fault. The message is this
-        // handler's own, so no backend text reaches the client.
+        // Another upload of the key holds it (see `reserve_upload`): a
+        // conflict the client resolves by retrying once that upload settles,
+        // not a fault. The message is this handler's own, so no backend text
+        // reaches the client.
         Err(e) if e.code == ErrorCode::Aborted => {
-            return err_conflict("Another upload of this key was in progress; retry the upload")
+            return err_conflict(
+                "Another upload of this key is in progress; retry once it finishes",
+            )
         }
         // `db_error_internal`, not a bare `err_internal`: a WRAP refusal is a
         // 403 and a quota is a 429, and folding either into a 500 is what left
@@ -319,8 +322,9 @@ pub(in crate::blocks::files) async fn handle_upload_object(
             // so an upload that cannot be recorded is not an upload. Left as
             // `pending` it is swept within the hour, and answering
             // `uploaded: true` anyway is how a stored object came to be
-            // charged to nobody. Report it instead: the blob is in place, and
-            // a retry re-claims this same row and completes it.
+            // charged to nobody. Report it instead: the blob is in place, but
+            // the row stays `pending`, so the key is held as in progress until
+            // `sweep_stale_pending` clears it and a retry can claim it.
             if let Err(e) = repo::objects::mark_complete(ctx, &reservation.id).await {
                 return crud::db_error_internal(e, "Upload stored but could not be recorded");
             }
@@ -1013,19 +1017,22 @@ mod integration_tests {
         assert_eq!(status, ObjectStatus::Complete);
     }
 
-    /// Two first uploads of the same NEW key, racing: neither is a 500, and
-    /// the key still has exactly one row.
+    /// Two first uploads of the same NEW key, racing: one claims the key and
+    /// stores its object, the other is told the key is taken (409) — neither
+    /// is a 500 — and the one row describes the bytes that are stored.
     ///
     /// Each upload reads the key's row twice — once for the quota (a
     /// replacement is charged the difference) and once to reserve it. The
     /// rendezvous lets each racer's first read through and holds both at the
     /// reservation's read until both have made it, so both reserve believing
     /// the key is free: the interleaving in which a plain insert has the
-    /// unique index refuse the loser.
+    /// unique index refuse the loser, and in which a loser that joined the
+    /// winner's row would leave it describing one upload's bytes with the
+    /// other's size and type.
     ///
     /// Names `repo::objects::TABLE` only to aim the rendezvous.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn racing_first_uploads_of_a_new_key_both_succeed_on_one_row() {
+    async fn racing_first_uploads_of_a_new_key_store_one_object_and_refuse_the_other() {
         use crate::test_support::{output_http_status, RendezvousDbOpContext};
 
         let ctx = ctx_with_storage().await;
@@ -1033,15 +1040,22 @@ mod integration_tests {
         let gated =
             RendezvousDbOpContext::new(ctx.clone(), "database.list", repo::objects::TABLE, 2);
 
-        let racers: Vec<_> = [&b"first racer"[..], &b"second racer"[..]]
+        let uploads: [(&'static [u8], &'static str); 2] = [
+            (b"the first racer's bytes", "text/plain"),
+            (
+                b"# the second racer, a longer markdown file",
+                "text/markdown",
+            ),
+        ];
+        let racers: Vec<_> = uploads
             .into_iter()
-            .map(|bytes| {
+            .map(|(bytes, content_type)| {
                 let racer = gated.passing_first(1);
                 tokio::spawn(async move {
                     output_http_status(
                         handle_upload_object(
                             &racer,
-                            &upload_msg("assets", "same.txt", "text/plain"),
+                            &upload_msg("assets", "same.txt", content_type),
                             InputStream::from_bytes(bytes.to_vec()),
                         )
                         .await,
@@ -1058,14 +1072,142 @@ mod integration_tests {
         .expect("both uploads must reach the rendezvous and finish")
         .expect("upload task panicked");
 
+        let mut sorted = statuses.clone();
+        sorted.sort_unstable();
         assert_eq!(
-            statuses,
-            vec![200, 200],
-            "the upload that lost the race for a new key must join the row, not 500"
+            sorted,
+            vec![200, 409],
+            "one upload claims the new key; the other is told it is taken, not 500"
         );
+        let (winner_bytes, winner_type) = uploads[statuses.iter().position(|s| *s == 200).unwrap()];
+
+        let (stored, info) = store::get(&ctx, "assets", "same.txt")
+            .await
+            .expect("the winner's object is stored");
+        assert_eq!(
+            stored, winner_bytes,
+            "the refused upload must not write the blob"
+        );
+        assert_eq!(info.content_type, winner_type);
+
         let rows = repo::objects::list_all(&ctx).await.expect("object rows");
         assert_eq!(rows.len(), 1, "one key, one row: {rows:?}");
-        assert_eq!(rows[0].status, ObjectStatus::Complete);
+        let row = &rows[0];
+        assert_eq!(row.status, ObjectStatus::Complete);
+        assert_eq!(
+            (row.size, row.content_type.as_str()),
+            (stored.len() as i64, info.content_type.as_str()),
+            "the row must describe the bytes that are stored"
+        );
+        assert_eq!(row.uploaded_by, "alice");
+    }
+
+    /// An upload of a key whose previous upload is still in flight — its row
+    /// `Pending` and fresh — is refused, and leaves that upload's row as it
+    /// was. Taking the row over is what let a failed second upload put the
+    /// first one's in-flight values back over the first one's finished
+    /// upload.
+    #[tokio::test]
+    async fn an_upload_of_a_key_another_upload_holds_is_refused() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let held =
+            repo::objects::reserve_upload(&ctx, "assets", "same.txt", 7, "text/plain", "bob")
+                .await
+                .expect("bob's upload claims the key");
+
+        let out = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "same.txt", "text/markdown"),
+            InputStream::from_bytes(b"alice's longer bytes".to_vec()),
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+        let rows = repo::objects::list_all(&ctx).await.expect("object rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, held.id);
+        assert_eq!(
+            (rows[0].size, rows[0].uploaded_by.as_str(), rows[0].status),
+            (7, "bob", ObjectStatus::Pending),
+            "the in-flight upload's row must be left alone"
+        );
+        assert!(
+            store::get(&ctx, "assets", "same.txt").await.is_err(),
+            "the refused upload must not write the blob"
+        );
+    }
+
+    /// Seed another user's `Pending` row for `assets/same.txt` that is past
+    /// the reservation TTL — an orphan, not an upload in flight. (Alice's own
+    /// orphans would be swept by her upload before it reserves.)
+    async fn seed_orphaned_reservation(ctx: &TestContext) {
+        let ttl = repo::objects::PENDING_RESERVATION_TTL_SECONDS;
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(2 * ttl)).to_rfc3339();
+        repo::objects::seed(
+            ctx,
+            crate::util::json_map(serde_json::json!({
+                "bucket": "assets",
+                "key": "same.txt",
+                "size": 7,
+                "status": ObjectStatus::Pending,
+                "uploaded_by": "bob",
+                "uploaded_at": stale,
+            })),
+        )
+        .await
+        .expect("seed an orphaned reservation");
+    }
+
+    /// An upload of a key held only by an orphaned reservation takes the row
+    /// over rather than waiting for a sweep that may never reach it.
+    #[tokio::test]
+    async fn an_orphaned_reservation_is_taken_over() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        seed_orphaned_reservation(&ctx).await;
+
+        let out = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "same.txt", "text/plain"),
+            InputStream::from_bytes(b"fresh bytes".to_vec()),
+        )
+        .await;
+
+        assert_eq!(output_json(out).await["uploaded"], serde_json::json!(true));
+        let rows = repo::objects::list_all(&ctx).await.expect("object rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].size, rows[0].uploaded_by.as_str(), rows[0].status),
+            ("fresh bytes".len() as i64, "alice", ObjectStatus::Complete),
+        );
+    }
+
+    /// A failed upload over an orphaned reservation does not put the orphan
+    /// back: there was no stored object to restore, and restoring a `Pending`
+    /// snapshot is what can bury a finished upload. The key is left free.
+    #[tokio::test]
+    async fn a_failed_upload_over_an_orphan_does_not_restore_it() {
+        let (ctx, storage) = ctx_with_storage_handle().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        seed_orphaned_reservation(&ctx).await;
+        storage.refuse("put");
+
+        let out = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "same.txt", "text/plain"),
+            InputStream::from_bytes(b"fresh bytes".to_vec()),
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 500);
+        assert!(
+            repo::objects::list_all(&ctx)
+                .await
+                .expect("object rows")
+                .is_empty(),
+            "a failed upload over an orphan must leave no row"
+        );
     }
 
     /// A context on which another upload of the key claims it just before

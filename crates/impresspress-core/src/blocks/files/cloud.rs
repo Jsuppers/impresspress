@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
 };
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -134,11 +134,17 @@ pub(super) async fn handle_create_share(
     // Only a stored object is shareable, and the object's row is what says
     // so: `(bucket, key)` is UNIQUE, so this is one indexed read, where
     // asking the object store would fetch the whole file to learn that it
-    // exists. A `Pending` row is an upload still in flight — no listing
-    // shows it yet, so no share link may point at it either.
+    // exists. A `Pending` row is an upload in flight — a first upload or a
+    // replacement — so which bytes a link would serve is not settled yet: a
+    // 409 to retry once it finishes.
     match repo::objects::find_by_bucket_key(ctx, &body.bucket, &body.key).await {
-        Ok(Some(object)) if object.status == ObjectStatus::Complete => {}
-        Ok(_) => return err_not_found("File not found"),
+        Ok(Some(object)) => match object.status {
+            ObjectStatus::Complete => {}
+            ObjectStatus::Pending => {
+                return err_conflict("File upload still in progress; retry once it finishes")
+            }
+        },
+        Ok(None) => return err_not_found("File not found"),
         Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
     }
 
@@ -522,8 +528,8 @@ mod tests {
         );
     }
 
-    /// An upload still in flight is not shareable: its row is `Pending`, and
-    /// no listing shows it until the upload settles. The blob is in place
+    /// An upload still in flight is not shareable yet: its row is `Pending`,
+    /// so the request is a 409 to retry once it settles. The blob is in place
     /// (the upload's `put` has landed, its `mark_complete` has not), which is
     /// exactly the state a storage-existence check reads as shareable.
     #[tokio::test]
@@ -536,7 +542,7 @@ mod tests {
             .await
             .expect("the upload's bytes land before its row settles");
 
-        assert!(output_is_error(share_a_png(&ctx).await, "NotFound").await);
+        assert!(output_is_error(share_a_png(&ctx).await, "AlreadyExists").await);
         assert!(
             repo::shares::list_for_user(&ctx, "alice", 10)
                 .await

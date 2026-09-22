@@ -166,14 +166,32 @@ fn bucket_key_filters(bucket: &str, key: &str) -> Vec<Filter> {
     ]
 }
 
-/// The object a [`Reservation`] took the place of, as its row read before the
-/// reservation overwrote it. [`release_reservation`] writes it back when the
-/// storage upload fails.
+/// How long a [`ObjectStatus::Pending`] row is taken to belong to an upload
+/// still in flight, in seconds. Past it the row is an orphan: an upload whose
+/// request died between claiming the key and settling it. The largest
+/// realistic upload finishes well inside an hour.
+///
+/// Two readers, one policy: [`reserve_upload`] refuses a key whose `Pending`
+/// row is younger than this and takes over one that is older, and
+/// `quota::sweep_stale_pending` deletes the uploader's rows past it.
+pub const PENDING_RESERVATION_TTL_SECONDS: i64 = 3600;
+
+/// The RFC 3339 instant before which a `Pending` row's `uploaded_at` makes it
+/// stale — compared as a string, the way the column is written and the way
+/// [`delete_stale_pending`] compares it.
+pub fn pending_reservation_cutoff() -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(PENDING_RESERVATION_TTL_SECONDS)).to_rfc3339()
+}
+
+/// The stored object a [`Reservation`] took the place of, as its row read
+/// before the reservation overwrote it. [`release_reservation`] writes it back
+/// when the storage upload fails. Always a `Complete` row: a reservation never
+/// takes over an upload still in flight, and a stale `Pending` row is not an
+/// object to restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplacedObject {
     pub size: i64,
     pub content_type: String,
-    pub status: ObjectStatus,
     pub uploaded_by: String,
     pub uploaded_at: String,
 }
@@ -183,11 +201,11 @@ pub struct ReplacedObject {
 /// [`release_reservation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
-    /// Row id of the reservation — a new row, or the row of the object being
-    /// replaced.
+    /// Row id of the reservation — a new row, or the row it took over.
     pub id: String,
     /// `Some` when this upload overwrites an object already stored under the
-    /// key, carrying what that object's row said. `None` for a new key.
+    /// key, carrying what that object's row said. `None` when there was no
+    /// stored object to put back: a new key, or a stale `Pending` row.
     pub replaced: Option<ReplacedObject>,
 }
 
@@ -196,24 +214,30 @@ pub struct Reservation {
 /// what closes the check-quota → upload TOCTOU race). `uploaded_at` is stamped
 /// with [`crate::util::now_rfc3339`].
 ///
-/// `(bucket, key)` is UNIQUE, so an upload never adds a second row for a key:
-/// when the key already has one, the reservation TAKES OVER that row, flipping
-/// it to [`ObjectStatus::Pending`] with the new size, content type and
-/// uploader. Until the upload settles, the row charges the new (possibly
-/// larger) size against the new uploader — the conservative direction — and
-/// [`release_reservation`] puts the old values back if the upload fails.
+/// `(bucket, key)` is UNIQUE, so the key has at most one row, and what that
+/// row says decides the claim:
 ///
-/// A key with no row is claimed by an insert that yields to the unique index
-/// (`ON CONFLICT (bucket, key) DO NOTHING`) rather than being refused by it.
-/// Two uploads of the same new key can both read no row; one insert lands,
-/// the other affects nothing, and the one that affected nothing reads the
-/// row back and takes it over exactly as a re-upload does. The read comes
-/// first, not the insert, because a re-upload — the common case — then costs
-/// one read and one write.
+/// - **No row**: an insert that yields to the unique index
+///   (`ON CONFLICT (bucket, key) DO NOTHING`) rather than being refused by
+///   it. If another upload's insert got there first, this one affects
+///   nothing and decides again on the row it reads back.
+/// - **`Complete`**: a re-upload. The reservation TAKES OVER the row,
+///   flipping it to [`ObjectStatus::Pending`] with the new size, content type
+///   and uploader. Until the upload settles the row charges the new (possibly
+///   larger) size against the new uploader — the conservative direction — and
+///   [`release_reservation`] puts the old values back if the upload fails.
+/// - **`Pending`, younger than [`PENDING_RESERVATION_TTL_SECONDS`]**: another
+///   upload of the key is in flight. Refused with [`ErrorCode::Aborted`] (a
+///   409): taking it over would leave two uploads writing one blob and one
+///   row, with the row describing whichever reservation wrote last and a
+///   failed one able to put the other's in-flight values back over a
+///   finished upload.
+/// - **`Pending`, older**: an orphan. Taken over as a fresh claim, with
+///   nothing to put back.
 ///
-/// [`ErrorCode::Aborted`] (a 409) when that read-back finds no row either:
-/// the reservation this one lost to was released in between, because its
-/// upload failed. The key is free again and the client may retry.
+/// Also [`ErrorCode::Aborted`] when the insert lost to another upload whose
+/// row is gone again by the read-back — that upload failed and released the
+/// key, which is free to retry.
 pub async fn reserve_upload(
     ctx: &dyn Context,
     bucket: &str,
@@ -233,18 +257,23 @@ pub async fn reserve_upload(
     };
 
     if let Some(existing) = find_by_bucket_key(ctx, bucket, key).await? {
-        return take_over(ctx, existing, &claim).await;
+        return claim_existing(ctx, existing, &claim).await;
     }
     if let Some(id) = insert_unless_taken(ctx, &claim).await? {
         return Ok(Reservation { id, replaced: None });
     }
     match find_by_bucket_key(ctx, bucket, key).await? {
-        Some(existing) => take_over(ctx, existing, &claim).await,
-        None => Err(WaferError::new(
-            ErrorCode::Aborted,
-            "another upload of this key was in progress; retry the upload",
-        )),
+        Some(existing) => claim_existing(ctx, existing, &claim).await,
+        None => Err(upload_in_progress()),
     }
+}
+
+/// The refusal a reservation answers when another upload holds the key.
+fn upload_in_progress() -> WaferError {
+    WaferError::new(
+        ErrorCode::Aborted,
+        "another upload of this key is in progress",
+    )
 }
 
 /// The column values a [`Reservation`] writes.
@@ -257,13 +286,23 @@ struct PendingClaim<'a> {
     uploaded_at: &'a str,
 }
 
-/// Point `existing` at the upload `claim` describes, keeping what it said for
-/// [`release_reservation`].
-async fn take_over(
+/// Claim the key's existing row per [`reserve_upload`]'s rules: take over a
+/// stored object or an orphaned reservation, refuse an upload in flight.
+async fn claim_existing(
     ctx: &dyn Context,
     existing: ObjectRow,
     claim: &PendingClaim<'_>,
 ) -> Result<Reservation, WaferError> {
+    let replaced = match existing.status {
+        ObjectStatus::Complete => Some(ReplacedObject {
+            size: existing.size,
+            content_type: existing.content_type,
+            uploaded_by: existing.uploaded_by,
+            uploaded_at: existing.uploaded_at,
+        }),
+        ObjectStatus::Pending if existing.uploaded_at < pending_reservation_cutoff() => None,
+        ObjectStatus::Pending => return Err(upload_in_progress()),
+    };
     let data = crate::util::json_map(serde_json::json!({
         "size": claim.size,
         "content_type": claim.content_type,
@@ -274,13 +313,7 @@ async fn take_over(
     db::update(ctx, TABLE, &existing.id, data).await?;
     Ok(Reservation {
         id: existing.id,
-        replaced: Some(ReplacedObject {
-            size: existing.size,
-            content_type: existing.content_type,
-            status: existing.status,
-            uploaded_by: existing.uploaded_by,
-            uploaded_at: existing.uploaded_at,
-        }),
+        replaced,
     })
 }
 
@@ -334,9 +367,9 @@ async fn insert_unless_taken(
 }
 
 /// Give up a [`Reservation`] whose storage upload failed: delete the row it
-/// created, or — when it took over the row of an object that is still stored —
-/// put that object's values back, so the surviving blob keeps being described
-/// and charged correctly.
+/// claimed, or — when it took over the row of an object that is still stored
+/// (`put` failed, so the old blob is in place) — put that object's values
+/// back, so the blob keeps being described and charged as it was.
 pub async fn release_reservation(
     ctx: &dyn Context,
     reservation: &Reservation,
@@ -347,7 +380,7 @@ pub async fn release_reservation(
             let data = crate::util::json_map(serde_json::json!({
                 "size": previous.size,
                 "content_type": previous.content_type,
-                "status": previous.status,
+                "status": ObjectStatus::Complete,
                 "uploaded_by": previous.uploaded_by,
                 "uploaded_at": previous.uploaded_at,
             }));
