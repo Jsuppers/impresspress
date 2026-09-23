@@ -266,6 +266,21 @@ pub async fn get(ctx: &dyn Context, id: &str) -> Result<GenerationRow, WaferErro
     decode(&db::get(ctx, TABLE, id).await?)
 }
 
+/// [`get`] for a caller that must tell the three outcomes apart: the outer
+/// `Result` is the read itself, `None` is no such row, and the inner `Result`
+/// is the row's decode. A missing or undecodable row is a fact about the
+/// ledger; a read that failed is not.
+pub async fn lookup(
+    ctx: &dyn Context,
+    id: &str,
+) -> Result<Option<Result<GenerationRow, WaferError>>, WaferError> {
+    match db::get(ctx, TABLE, id).await {
+        Ok(record) => Ok(Some(decode(&record))),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Move a generation to `status`, optionally recording why it failed and when
 /// it went live.
 ///
