@@ -2707,7 +2707,7 @@ pub fn admin_msg(action: &str, path: &str) -> Message {
 /// order.
 ///
 /// Lives here rather than in the admin block's test module because
-/// [`crate::blocks::admin::logs::audit_log`] is the ONE audit writer:
+/// `blocks::admin::logs::audit_log` is the ONE audit writer:
 /// userportal's portal buttons and `ui::settings_form`'s five settings pages
 /// write their rows into the same table under their own WRAP identity, so a
 /// test in any block asserts against it the same way.

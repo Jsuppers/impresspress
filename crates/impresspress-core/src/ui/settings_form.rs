@@ -371,7 +371,7 @@ pub async fn settings_form(
 ///
 /// Writes one `settings.update` audit row naming `block_label` and the keys
 /// this save actually wrote — the same trail
-/// [`crate::blocks::admin::ops::update_variable`] writes for the identical
+/// `ops::update_variable` writes for the identical
 /// keys edited on the admin Variables page, so which page an operator used
 /// stops deciding whether the change is recorded. `msg` carries the admin id
 /// and remote address the row is attributed to.
