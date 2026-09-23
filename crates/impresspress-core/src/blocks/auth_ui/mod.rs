@@ -267,7 +267,8 @@ const ROUTES: &[EndpointRoute<Route>] = &[
         "/b/auth/api/api-keys",
         Route::CreateApiKey,
     )
-    .summary("Create API key"),
+    .summary("Create API key")
+    .input(request_schema_of::<contracts::CreateApiKeyRequest>),
     // Authenticated; `api/api_keys.rs` additionally refuses a key the caller
     // does not own.
     EndpointRoute::authenticated(

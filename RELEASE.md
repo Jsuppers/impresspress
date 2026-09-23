@@ -628,16 +628,85 @@ boot, until it runs.
 **What the migration run also does: every device leaves the session list.**
 Auth migrations are re-run as a set whenever any auth migration changes, and
 migration 012 in that set drops and recreates `wafer_run__auth__sessions`. So
-the run that applies 014 also empties that table. **Nobody is signed out.**
-Nothing authenticates against that table: access tokens are verified on their
-own and refresh tokens live in a separate table. What the table feeds is the
-device list at **Account → Sessions**. After the upgrade that list is empty,
-and each device reappears when it next refreshes its tokens, which an active
-browser does within the access-token lifetime
-(`WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS`, 30 minutes by default). Until a
-device reappears, its user cannot revoke that one device from the list;
+the run that applies 014 also empties that table. Nothing authenticates against
+it: it feeds the device list at **Account → Sessions**. After the upgrade that
+list is empty, and each device reappears when it next refreshes its tokens.
+Until a device reappears, its user cannot revoke that one device from the list;
 **changing the password** still signs every device out, because it revokes the
 refresh tokens rather than reading the list.
+
+**Correction: this release's note said "nobody is signed out", and that was
+wrong.** The reason given was that refresh tokens live in a separate table —
+and so they do, in `wafer_run__auth__tokens`, which migration 004 in the same
+re-run set opened by dropping. So the 014 upgrade, and every earlier auth
+schema change, signed every user out within one access-token lifetime. 004 no
+longer drops the table (see the API-key expiry note below), so from this
+release onward an auth schema change keeps refresh tokens.
+
+### Auth: an API key's expiry is a timestamp, and broken ones are revoked (migration 015)
+
+**What changes.** `POST /b/auth/api/api-keys` used to store the `expires_at`
+string it was sent, exactly as sent, and the lookup on every request compared
+that string to the clock as **text**. Text order is time order only within one
+format and one offset, so two whole classes of value were read wrong:
+
+- an offset — `2026-09-23T20:00:00+09:00` is 11:00 UTC, but it sorts after
+  `2026-09-23T12:00:00Z`, so the key kept authenticating for eight hours after
+  it had expired;
+- anything that is not a timestamp — `never` sorts after every timestamp there
+  will ever be, so a key minted with it **never expired**.
+
+The endpoint now answers `400` for an `expires_at` it cannot read as RFC 3339,
+and for one already in the past; it accepts any offset and stores the instant
+as `YYYY-MM-DDTHH:MM:SSZ`. The lookup parses the stored value instead of
+comparing it as text, and treats an expiry it cannot parse as **expired** — a
+key whose end date cannot be read has no enforceable end. A key now expires
+*at* the instant it names rather than one second after it.
+
+**Some existing keys stop working the moment you deploy, migrations or not.**
+The parsing lookup is in the code half, so it applies immediately. Every stored
+expiry that is not RFC 3339 is now read as expired, and RFC 3339 **requires a
+UTC offset**. That includes shapes that look perfectly reasonable and that a
+browser produces by default:
+
+- `2027-01-31` — what `<input type="date">` posts;
+- `2027-01-31T09:00` — what `<input type="datetime-local">` posts;
+- `2027-01-31T09:00:00` — a timestamp with the offset left off;
+- `2027-01-31T09:00:00+0900` — an ISO 8601 basic-form offset (no colon).
+
+A key carrying any of these stops authenticating at once, **possibly months
+before the date it names**. If you integrated against this endpoint with a date
+picker, assume your keys are affected and reissue them with an explicit offset
+(`2027-01-31T09:00:00Z`). Keys with no expiry at all are unaffected.
+
+**Upgrade with `--run-migrations`** to make the column say so. Migration 015
+respells a UTC expiry (`Z`, `z`, `+00:00`, `-00:00`, a space separator) as
+`YYYY-MM-DDTHH:MM:SSZ` without moving the instant, and **revokes** every key
+whose stored expiry the lookup cannot read, so the admin API-keys tab shows a
+revoked key rather than one that quietly stopped working. The revoked set is
+exactly the set the lookup refuses: all four shapes above, anything that is not
+a timestamp at all, and timestamp-shaped values that name no instant — a day
+the month does not have (`2026-02-31`, 29 February outside a leap year), a
+field out of range (`T25:00:00Z`, a minute past 59, a second past 60 — 60
+is a leap second and is read — an offset past `23:59`), a fraction with no offset after
+it (`T12:00:00.5`), or anything trailing the offset. The stored text is left as
+it was found on those rows: it is the only record of why the key was revoked.
+Keys with no expiry are untouched. A sub-second fraction and a non-zero offset
+are left as they stand: both are read correctly, and respelling either needs
+arithmetic the migration deliberately does not do.
+
+**Deploying this keeps everyone signed in; the device list empties.** Adding
+migration 015 changes the auth block's SQL hash, so the migration run re-runs
+the whole auth set. Migration 004 in that set used to open with `DROP TABLE IF
+EXISTS wafer_run__auth__tokens`, the refresh-token table, and a refresh with no
+stored row is refused — which is how every earlier auth schema change signed
+every user out (see the correction in the migration-014 note above). This
+release removes that DROP, and the set a migration run applies is the one
+compiled into the binary doing the run, so this run already executes the 004
+without it: refresh tokens, accounts, passwords, OAuth links and API keys all
+survive. What does not is the session/device list at **Account → Sessions**:
+migration 012 in the same set drops and recreates it, and it refills as each
+device next refreshes its tokens.
 
 ### LLM: a provider can name its token-budget field (migration 002)
 

@@ -10,10 +10,40 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::{auth::repo::api_keys, crud},
+    blocks::{auth::repo::api_keys, auth_ui::contracts, crud},
     http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
     util::{hex_encode, sha256_hex},
 };
+
+/// Read the request's `expires_at` as the instant it names, or answer `400`.
+///
+/// The column used to take the caller's string as it stood and the lookup
+/// string-compared it against the clock, which gets two whole classes of
+/// value wrong: an offset (`…T20:00:00+09:00` is 11:00 UTC but sorts after
+/// `…T12:00:00Z`) and a non-timestamp (`"never"` sorts after every
+/// timestamp, so the key never expired). Refusing what cannot be read, here,
+/// is what keeps the stored column to instants the lookup can compare.
+///
+/// An absent field and an empty one both mean "no expiry" — an HTML form
+/// posts an untouched field as `""`, and no caller means "expire this key at
+/// a timestamp I did not give".
+fn parse_expiry(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, OutputStream> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) else {
+        return Err(err_bad_request(&format!(
+            "expires_at must be an RFC 3339 timestamp (e.g. 2027-01-31T09:00:00Z), got {raw:?}"
+        )));
+    };
+    let parsed = parsed.with_timezone(&chrono::Utc);
+    if parsed <= chrono::Utc::now() {
+        return Err(err_bad_request(&format!(
+            "expires_at must be in the future, got {raw:?}"
+        )));
+    }
+    Ok(Some(parsed))
+}
 
 pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id();
@@ -58,6 +88,10 @@ pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 }
 
+/// `POST /b/auth/api/api-keys`. Body: [`contracts::CreateApiKeyRequest`] —
+/// a non-empty `name`, and an optional `expires_at` that must be an RFC 3339
+/// timestamp in the future ([`parse_expiry`]). Answers the raw key once, as
+/// JSON, or as the reveal card when the caller is htmx.
 pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let user_id = msg.user_id();
     if user_id.is_empty() {
@@ -67,23 +101,22 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
         );
     }
 
-    #[derive(serde::Deserialize)]
-    struct CreateKeyReq {
-        name: String,
-        expires_at: Option<String>,
-    }
     let raw = input.collect_to_bytes().await;
     let parsed = match crate::util::parse_body_value(&raw) {
         Ok(value) => value,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
-    let body: CreateKeyReq = match serde_json::from_value(parsed) {
+    let body: contracts::CreateApiKeyRequest = match serde_json::from_value(parsed) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
     if body.name.is_empty() {
         return err_bad_request("API key name is required");
     }
+    let expires_at = match parse_expiry(body.expires_at.as_deref()) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     // Generate random key
     let random_bytes = match crypto::random_bytes(ctx, 24).await {
@@ -103,7 +136,7 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
             name: &body.name,
             key_hash: &key_hash,
             key_prefix: &key_prefix,
-            expires_at: body.expires_at.as_deref(),
+            expires_at,
         },
     )
     .await;
@@ -224,9 +257,11 @@ mod tests {
         test_support::{auth_msg, output_is_error, output_json, TestContext},
     };
 
-    /// A user row plus one API key it owns; returns `(user_id, key_id)`.
-    async fn seed_user_with_key(ctx: &TestContext) -> (String, String) {
-        let user = users::insert(
+    const KEYS_PATH: &str = "/b/auth/api/api-keys";
+
+    /// A user row with no keys; returns its id.
+    async fn seed_user(ctx: &TestContext) -> String {
+        users::insert(
             ctx,
             users::NewUser {
                 email: "owner@example.com".into(),
@@ -238,11 +273,27 @@ mod tests {
             },
         )
         .await
-        .expect("seed user");
+        .expect("seed user")
+        .id
+    }
+
+    /// `POST /b/auth/api/api-keys` with a JSON body, through the route table.
+    async fn create(ctx: &TestContext, owner: &str, body: serde_json::Value) -> OutputStream {
+        handle_create(
+            ctx,
+            &routed(auth_msg("create", KEYS_PATH, owner)),
+            InputStream::from_bytes(body.to_string().into_bytes()),
+        )
+        .await
+    }
+
+    /// A user row plus one API key it owns; returns `(user_id, key_id)`.
+    async fn seed_user_with_key(ctx: &TestContext) -> (String, String) {
+        let user_id = seed_user(ctx).await;
         let key = api_keys::insert(
             ctx,
             api_keys::NewApiKey {
-                user_id: &user.id,
+                user_id: &user_id,
                 name: "ci",
                 key_hash: "not-a-real-hash",
                 key_prefix: "sb_0000000",
@@ -251,7 +302,7 @@ mod tests {
         )
         .await
         .expect("seed api key");
-        (user.id, key.id)
+        (user_id, key.id)
     }
 
     /// `handle_revoke` reads `{id}` only as the route table bound it: the
@@ -321,6 +372,126 @@ mod tests {
             output_is_error(out, "Internal").await,
             "a failed ownership lookup must not answer 404: the key is still there"
         );
+    }
+
+    /// An expiry the lookup cannot compare is not an expiry. The column took
+    /// the caller's string as it stood, and the lookup compared it to the
+    /// clock as text: `"never"` sorts after every timestamp, so the key it
+    /// was minted with outlived every clock reading there will ever be.
+    #[tokio::test]
+    async fn create_refuses_an_expiry_that_is_not_a_timestamp() {
+        let ctx = TestContext::with_auth().await;
+        let owner = seed_user(&ctx).await;
+
+        for expires_at in ["never", "2027-01-31", "tomorrow", "0"] {
+            let out = create(
+                &ctx,
+                &owner,
+                serde_json::json!({
+                    "name": "ci",
+                    "expires_at": expires_at,
+                }),
+            )
+            .await;
+            assert!(
+                output_is_error(out, "InvalidArgument").await,
+                "{expires_at:?} is not a readable expiry"
+            );
+        }
+        assert!(
+            api_keys::list_for_user(&ctx, &owner)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused request must not mint a key"
+        );
+    }
+
+    /// An offset names an instant, and the row must record that instant.
+    /// Stored verbatim, `…T20:00:00+09:00` sorted eight hours ahead of the
+    /// 11:00 UTC it actually names, so the key stayed live for those hours.
+    #[tokio::test]
+    async fn create_stores_an_offset_expiry_as_the_instant_it_names() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let owner = seed_user(&ctx).await;
+        // Nine hours ahead of UTC, so the wall clock written here is always
+        // ahead of the UTC spelling of the same instant.
+        let offset = chrono::FixedOffset::east_opt(9 * 3600).expect("+09:00");
+        let instant = chrono::Utc::now() + chrono::Duration::days(30);
+        let sent = instant.with_timezone(&offset).to_rfc3339();
+
+        let out = create(
+            &ctx,
+            &owner,
+            serde_json::json!({
+                "name": "ci",
+                "expires_at": sent,
+            }),
+        )
+        .await;
+        assert_eq!(output_json(out).await["name"], "ci");
+
+        let keys = api_keys::list_for_user(&ctx, &owner).await.unwrap();
+        let [key] = keys.as_slice() else {
+            panic!("exactly one key, got {}", keys.len())
+        };
+        assert_eq!(
+            key.expires_at.as_deref(),
+            Some(instant.format("%Y-%m-%dT%H:%M:%SZ").to_string().as_str()),
+            "sent {sent}, which is that instant in UTC"
+        );
+        assert!(!key.is_expired(instant - chrono::Duration::seconds(1)));
+        assert!(key.is_expired(instant));
+    }
+
+    /// A key that is already dead when it is minted is a request that meant
+    /// something else — most often a timezone the caller did not intend.
+    #[tokio::test]
+    async fn create_refuses_an_expiry_already_past() {
+        let ctx = TestContext::with_auth().await;
+        let owner = seed_user(&ctx).await;
+        let offset = chrono::FixedOffset::east_opt(9 * 3600).expect("+09:00");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&offset)
+            .to_rfc3339();
+
+        let out = create(
+            &ctx,
+            &owner,
+            serde_json::json!({"name": "ci", "expires_at": past}),
+        )
+        .await;
+
+        assert!(
+            output_is_error(out, "InvalidArgument").await,
+            "{past} is an hour ago, whatever its offset makes it look like"
+        );
+        assert!(api_keys::list_for_user(&ctx, &owner)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A blank field is what an HTML form posts for "I did not fill this
+    /// in", and omitting it means the same. Neither is an expiry.
+    #[tokio::test]
+    async fn create_reads_an_absent_or_blank_expiry_as_no_expiry() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let owner = seed_user(&ctx).await;
+
+        for body in [
+            serde_json::json!({"name": "omitted"}),
+            serde_json::json!({"name": "blank", "expires_at": ""}),
+            serde_json::json!({"name": "spaces", "expires_at": "  "}),
+        ] {
+            let out = create(&ctx, &owner, body).await;
+            assert!(output_json(out).await["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("sb_")));
+        }
+        let keys = api_keys::list_for_user(&ctx, &owner).await.unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| k.expires_at.is_none()));
     }
 
     /// Same contract for `handle_delete`.

@@ -218,3 +218,19 @@ pub struct RefreshResponse {
     /// Access token lifetime in seconds
     pub expires_in: u64,
 }
+
+/// `POST /b/auth/api/api-keys` request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CreateApiKeyRequest {
+    /// Label shown in the key list. Required and non-empty.
+    pub name: String,
+    // The handler normalizes this to UTC before it is stored, so a request
+    // may state any offset and the row records the instant it named. An
+    // empty string is the absent value an HTML form posts for a blank field
+    // and means the same as omitting it.
+    /// Absolute expiry, RFC 3339 and in the future. Omit for a key that does
+    /// not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    pub expires_at: Option<String>,
+}
