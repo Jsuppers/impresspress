@@ -533,24 +533,22 @@ mod tests {
 
         assert_eq!(attempt(&ctx, "someone@example.com").await, 201);
         let fresh = ctx.take();
-        assert_eq!(
-            run_deferred().await,
-            1,
-            "a new account's verification mail goes out after the response"
-        );
+        let fresh_deferred = run_deferred().await;
         let deferred = ctx.take();
 
         assert_eq!(attempt(&ctx, "someone@example.com").await, 201);
         let registered = ctx.take();
-        assert_eq!(
-            run_deferred().await,
-            0,
-            "a registered address has no mail to send"
-        );
+        let registered_deferred = run_deferred().await;
 
         assert_eq!(
             fresh, registered,
             "a registered address must cost the handler exactly what a new one does"
+        );
+        assert_eq!(
+            (fresh_deferred, registered_deferred),
+            (1, 0),
+            "a new account's verification mail goes out after the response; a \
+             registered address has none to send"
         );
         assert_eq!(
             fresh
