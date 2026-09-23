@@ -57,18 +57,17 @@ use crate::{
 enum Exempt {
     /// A JSON endpoint that declares no response schema. No htmx control
     /// reads it and it renders no page, so there is nothing on it for the
-    /// guard to fire. Its answer must not be HTML.
+    /// guard to fire. It must succeed, and not with HTML.
     JsonApi,
     /// Answered with a redirect to a page the guard renders.
     Redirect,
-    /// A static asset (script, stylesheet), not a page. Its answer must not
-    /// be HTML.
+    /// A static asset (script, stylesheet), not a page. It must succeed, and
+    /// not with HTML.
     Asset,
     /// Some other answer that is not a page — a download, a plain-text probe,
-    /// a hand-off to an external site — with what it is. Its answer must not
-    /// be HTML, and a redirect it answers must leave the site: a redirect to
-    /// one of the site's own pages is a [`Exempt::Redirect`], whose target
-    /// is checked.
+    /// a hand-off to an external site — with what it is. It must succeed, not
+    /// with HTML, or redirect off the site: a redirect to one of the site's
+    /// own pages is an [`Exempt::Redirect`], whose target is checked.
     NotAPage(&'static str),
 }
 
@@ -367,16 +366,27 @@ async fn every_get_row_that_is_not_a_page_succeeds_without_answering_a_page() {
             }
             let redirect = (300..400).contains(&answer.status);
             let to = answer.location.as_deref().unwrap_or_default();
-            let fine = match exempt {
-                Some(Exempt::Redirect) => redirect && rendered.iter().any(|page| page == to),
-                Some(Exempt::NotAPage(_)) if redirect => to.starts_with("https://"),
-                _ => (200..300).contains(&answer.status),
+            let problem = match exempt {
+                Some(Exempt::Redirect) if !redirect || !rendered.iter().any(|page| page == to) => {
+                    Some(format!(
+                        "must redirect to a page the crawl renders ({rendered:?}); location {to:?}"
+                    ))
+                }
+                Some(Exempt::Redirect) => None,
+                Some(Exempt::NotAPage(_)) if redirect && !to.starts_with("https://") => {
+                    Some(format!(
+                        "redirects within the site to {to:?}; an internal redirect is an \
+                         Exempt::Redirect, whose target is checked"
+                    ))
+                }
+                Some(Exempt::NotAPage(_)) if redirect => None,
+                _ if !(200..300).contains(&answer.status) => Some("must succeed".to_string()),
+                _ => None,
             };
-            if !fine {
+            if let Some(problem) = problem {
                 wrong.push(format!(
-                    "{}: GET {url} ({label}) {answered} (location {:?}); a redirect must be \
-                     to a page the crawl renders, or leave the site under NotAPage",
-                    entry.block, answer.location
+                    "{}: GET {url} ({label}) {answered}: {problem}",
+                    entry.block
                 ));
             }
         }
