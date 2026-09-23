@@ -414,10 +414,10 @@ pub struct Fixture {
     /// The request message a visitor of these pages sends for
     /// `(action, path)` — their identity and roles.
     pub caller: fn(&str, &str) -> Message,
-    /// The pages the crawl starts from: every page reachable only by a
-    /// route (not by a link on another page), and every filter a page links
-    /// to with a parameter [`crawl`] does not follow. The tabs and views a
-    /// page links to are found by [`crawl`], not listed here.
+    /// The pages the crawl starts from: every page reached by its route
+    /// rather than by a tab link on another page, plus any filtered view (a
+    /// query [`crawl`] does not follow) worth rendering on its own. The tabs
+    /// and views a page links to are found by [`crawl`], not listed here.
     pub pages: Vec<Page>,
     /// What an operator types into the fields the pages render empty. Every
     /// entry is a value the page itself would accept.
