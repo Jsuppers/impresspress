@@ -4,13 +4,19 @@
 //! `blocks::config::get_many`, an operation on the config block this repo
 //! registers in place of wafer-core's. A `call_block` is validated against the
 //! TARGET's declared interface (`RuntimeContext::dispatch_call` →
-//! `runtime::validation::check_action_interface`), and nothing but a real
-//! runtime runs that check: `TestContext::call_block` enforces the caller's
-//! `requires` list and WRAP, and lets every action through. So a settings page
-//! can render in every unit test and 500 on the server, which is exactly what
-//! the first version of that read did — under `config@v1`, whose action map is
-//! `config.get` and `config.set`, the runtime refused the call before the
-//! block saw it, and all five settings pages answered 500.
+//! `runtime::validation::check_action_interface`), and under `config@v1` —
+//! whose action map is exactly `config.get` and `config.set` — the runtime
+//! refused that call before the block saw it, so all five settings pages
+//! answered 500 on a server while every unit test rendered them.
+//!
+//! `TestContext::call_block` runs the same check now, but against a
+//! hand-maintained spec set (`test_support::interface_specs`) and the block
+//! object a test registered by hand. Only here does the page meet the
+//! runtime's own set: the specs `Wafer::register_interface` collected, the
+//! blocks `register_block` collected, both frozen by `seal()`, and the
+//! validator reading what that boot produced. A spec the fixture lists but
+//! `builder::registration` never registers is invisible to every unit test
+//! and decisive here.
 //!
 //! This drives the page through `Wafer::run_block` — the entry point the HTTP
 //! listener uses — on a runtime from `build_native_runtime`, the binary's own.

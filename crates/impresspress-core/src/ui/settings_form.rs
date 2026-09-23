@@ -80,6 +80,12 @@ impl<'a> SettingsSection<'a> {
 /// that one answers an unreadable table from the boot map and then the
 /// default, and `submit_js` posts every field, so a form rendered from it and
 /// saved writes those over every stored value on the page.
+///
+/// `get_many` also refuses the whole batch when WRAP denies the caller ONE of
+/// the keys, where `config::get_default` swallowed the denial into that key's
+/// default. So a page that renders a var its block may not read is now a 500
+/// rather than a field showing the default: the page has no value to show and
+/// its Save would have written the default over the stored one.
 async fn current_values<'v>(
     ctx: &dyn Context,
     vars: impl IntoIterator<Item = &'v ConfigVar>,

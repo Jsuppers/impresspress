@@ -3867,6 +3867,118 @@ mod tests {
         );
     }
 
+    /// Gate 2: `call_block` refuses an action the TARGET's declared interface
+    /// does not list, as `RuntimeContext::dispatch_call` does — and admits
+    /// one it lists, so the gate is not simply refusing everything.
+    ///
+    /// Without this the gate has no test of its own: every other test calls
+    /// actions the target declares, so deleting the gate changes nothing they
+    /// assert. What it exists to catch is a call the fixture would certify
+    /// and the runtime refuse, which is how `impresspress.config.get_many`
+    /// reached a server under `config@v1`.
+    #[tokio::test]
+    async fn call_block_refuses_an_action_the_targets_interface_does_not_declare() {
+        /// A block declaring wafer-run's `database@v1`, whose action map is
+        /// the `database.*` op family.
+        struct DatabaseShaped;
+
+        #[wafer_block::wafer_async_trait]
+        impl Block for DatabaseShaped {
+            fn info(&self) -> wafer_run::BlockInfo {
+                wafer_run::BlockInfo::new(
+                    "test/database-shaped",
+                    "0.0.1",
+                    "database@v1",
+                    "declares database@v1 and answers anything it is handed",
+                )
+            }
+
+            async fn handle(
+                &self,
+                _ctx: &dyn Context,
+                _msg: Message,
+                _input: InputStream,
+            ) -> OutputStream {
+                OutputStream::respond(b"reached the block".to_vec())
+            }
+        }
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("test/database-shaped", Arc::new(DatabaseShaped));
+
+        let declared = ctx
+            .call_block(
+                "test/database-shaped",
+                Message::new(wafer_block::common::ServiceOp::DATABASE_LIST),
+                InputStream::empty(),
+            )
+            .await;
+        assert_eq!(
+            collect_or_panic(declared).await.body,
+            b"reached the block",
+            "a declared action must reach the block"
+        );
+
+        let refused = ctx
+            .call_block(
+                "test/database-shaped",
+                Message::new("database.teleport"),
+                InputStream::empty(),
+            )
+            .await;
+        match refused.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+                assert!(e.message.contains("database.teleport"), "{e:?}");
+                assert!(e.message.contains("database@v1"), "{e:?}");
+            }
+            other => panic!("an undeclared action must be refused, got {other:?}"),
+        }
+    }
+
+    /// The gate above validates against a HAND-MAINTAINED spec set
+    /// ([`interface_specs`]): wafer-run's well-known specs plus this repo's
+    /// own. A second `Wafer::register_interface` call site would put a spec on
+    /// the runtime that the fixture does not have, and every call to that
+    /// interface would then be checked here against nothing — the gate would
+    /// silently skip it (`ActionCheck::UnknownInterface`) while production
+    /// validated it.
+    #[test]
+    fn the_fixture_spec_set_matches_every_register_interface_call_site() {
+        use crate::test_support::source_scan::{
+            code_before_comment, strip_test_modules, SourceWalk,
+        };
+
+        let sites: Vec<(String, String)> = SourceWalk::crate_src()
+            .least(300)
+            .collect()
+            .iter()
+            .flat_map(|file| {
+                strip_test_modules(&file.text)
+                    .lines()
+                    .filter(|line| code_before_comment(line).contains("register_interface("))
+                    .map(|line| (file.rel.clone(), line.trim().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "this crate registers exactly one interface spec; every call site must be covered \
+             by `test_support::interface_specs`, so a new one belongs in that list too — found \
+             {sites:?}"
+        );
+        assert_eq!(sites[0].0, "blocks/config.rs", "{sites:?}");
+        assert!(sites[0].1.contains("interface_spec()"), "{sites:?}");
+        assert!(
+            interface_specs()
+                .iter()
+                .any(|spec| spec.name == crate::blocks::config::CONFIG_INTERFACE),
+            "the fixture's spec set must hold the spec that call site registers"
+        );
+    }
+
     #[tokio::test]
     async fn with_wrap_allows_call_when_grant_matches() {
         let grants = vec![ResourceGrant::read(

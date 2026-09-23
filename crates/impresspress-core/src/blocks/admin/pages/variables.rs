@@ -485,10 +485,10 @@ fn reset_to_environment_button(key: &str) -> Markup {
 /// filters that happen to agree, and from the same snapshot, not from a second
 /// read that could have moved.
 ///
-/// An unreadable table reaches this as no rows and so as no control, which is
-/// the honest answer: both tabs report the failure in place of their tables,
-/// and a bulk button drawn from a count nobody could take would offer work it
-/// has no evidence exists.
+/// An unreadable table means no count at all: [`settings_body`] does not call
+/// this, and the control does not render. That is the honest answer — both
+/// tabs report the failure in place of their tables, and a bulk button drawn
+/// from a count nobody could take would offer work it has no evidence exists.
 fn bulk_release_count(rows: &[variables::VariableRow], offer_reset: bool) -> usize {
     if !offer_reset {
         return 0;

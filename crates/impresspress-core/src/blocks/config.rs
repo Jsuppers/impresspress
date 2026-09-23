@@ -680,9 +680,10 @@ pub fn register_with(
     db: Arc<dyn DatabaseService>,
 ) -> Result<(), wafer_run::RuntimeError> {
     let block: Arc<dyn Block> = Arc::new(VariablesConfigBlock::new(boot, db));
-    // Before the block: `dispatch_call` validates a call's action against the
-    // spec registered for the target's declared interface, and an interface
-    // name with no spec only warns and lets every action through.
+    // The spec for the interface `info()` declares. `dispatch_call` validates
+    // a call's action against it, and an interface name with no spec only
+    // warns and lets every action through. Both registrations are snapshotted
+    // at `seal()`, so their order here does not matter.
     wafer.register_interface(interface_spec());
     wafer.register_block(CONFIG_BLOCK, block)?;
     Ok(())
