@@ -841,6 +841,55 @@ mod test_support {
         ctx
     }
 
+    /// Hold `bytes` for `bucket/key` the way a deployment from before
+    /// migration 005 holds an object: the blob at the object key itself, and
+    /// a `Complete` row owned by `owner` whose `blob_key` is NULL. Every
+    /// reader resolves such a row to the object key.
+    pub(in crate::blocks::files) async fn seed_legacy_object(
+        ctx: &TestContext,
+        bucket: &str,
+        key: &str,
+        bytes: &[u8],
+        content_type: &str,
+        owner: &str,
+    ) {
+        wafer_core::clients::storage::put(ctx, bucket, key, bytes, content_type)
+            .await
+            .expect("store the legacy blob at the object key");
+        super::repo::objects::seed(
+            ctx,
+            crate::util::json_map(serde_json::json!({
+                "bucket": bucket,
+                "key": key,
+                "size": bytes.len(),
+                "content_type": content_type,
+                "status": super::contracts::ObjectStatus::Complete,
+                "uploaded_by": owner,
+                "uploaded_at": "2026-01-01T00:00:00Z",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            })),
+        )
+        .await
+        .expect("seed the legacy object row");
+    }
+
+    /// The bytes and content type the object `bucket/key` serves, read the
+    /// way every reader reads them: through its row. `Err(NotFound)` when
+    /// the key has no row.
+    pub(in crate::blocks::files) async fn stored_object(
+        ctx: &dyn wafer_run::context::Context,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Vec<u8>, wafer_core::clients::storage::ObjectInfo), wafer_run::WaferError> {
+        let blob_key = super::repo::objects::find_blob_key(ctx, bucket, key)
+            .await?
+            .ok_or_else(|| {
+                wafer_run::WaferError::new(wafer_run::ErrorCode::NotFound, "no object row")
+            })?;
+        wafer_core::clients::storage::get(ctx, bucket, &blob_key).await
+    }
+
     /// The message the router hands the upload handler for
     /// `POST /b/storage/api/buckets/{bucket}/objects?key={key}` with a raw
     /// `content_type` body, sent by `uploader`.

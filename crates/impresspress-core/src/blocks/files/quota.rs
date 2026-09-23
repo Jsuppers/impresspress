@@ -153,12 +153,19 @@ pub async fn check_quota(
     Ok(())
 }
 
+/// How many stale reservations one sweep reclaims at most. The sweep runs
+/// on every upload, and each reclaimed row costs a database delete and a
+/// storage delete per blob it names; a small batch keeps the cost of one
+/// upload bounded (Workers cap subrequests per invocation), and the next
+/// upload takes the next batch.
+const STALE_SWEEP_BATCH: i64 = 10;
+
 /// Sweep the given user's `pending`-status object rows older than
-/// [`repo::objects::PENDING_RESERVATION_TTL_SECONDS`]. A row is claimed
-/// `pending` before the actual storage upload so that a later quota check
-/// counts it (see [`check_quota`] for what that does and does not bound),
-/// and two failures can leave one behind: the upload errored AND
-/// `release_reservation` errored too, or the upload succeeded but
+/// [`repo::objects::PENDING_RESERVATION_TTL_SECONDS`], and the blobs they
+/// name. A row is claimed `pending` before the actual storage upload so that
+/// a later quota check counts it (see [`check_quota`] for what that does and
+/// does not bound), and two failures can leave one behind: the upload errored
+/// AND `release_reservation` errored too, or the upload succeeded but
 /// `mark_complete` could not record it. Either way the row would otherwise
 /// inflate that user's quota usage forever. Calling this best-effort on each
 /// new upload keeps the table self-healing without a separate cron.
@@ -170,15 +177,32 @@ pub async fn check_quota(
 /// began, rather than as someone else's upload. The uploader's next upload
 /// after that sweeps the row first and claims the key afresh.
 ///
-/// It reclaims the ROW, not the blob. A swept row whose upload had in fact
-/// reached storage leaves that object behind, unreferenced and charged to
-/// nobody until a new upload of the key overwrites it — see
-/// `NICE_TO_HAVE.md`, "The files-block pending sweep does not reclaim the
-/// blob".
+/// Each row is deleted only while it is as it was listed
+/// ([`repo::objects::delete_if_unchanged`]), and only then are its blobs
+/// deleted: the ones it names are named by no other row
+/// ([`repo::objects::StoredRow::blobs`]), so an upload that took the key
+/// over meanwhile keeps its own. A blob whose delete fails is logged and left.
 pub async fn sweep_stale_pending(ctx: &dyn Context, user_id: &str) {
     let cutoff = repo::objects::pending_reservation_cutoff();
-    if let Err(e) = repo::objects::delete_stale_pending(ctx, user_id, &cutoff).await {
-        tracing::warn!(error = %e, user_id = %user_id, "failed to sweep stale pending uploads");
+    let stale = match repo::objects::list_stale_pending(ctx, user_id, &cutoff, STALE_SWEEP_BATCH)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, user_id = %user_id, "failed to list stale pending uploads");
+            return;
+        }
+    };
+    for row in stale {
+        match repo::objects::delete_if_unchanged(ctx, &row).await {
+            Ok(true) => {
+                super::storage::delete_blobs(ctx, &row.row.bucket, &row.blobs()).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, user_id = %user_id, "failed to sweep a stale pending upload");
+            }
+        }
     }
 }
 

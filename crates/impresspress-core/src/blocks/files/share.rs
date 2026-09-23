@@ -7,7 +7,7 @@ use crate::{
         crud,
         rate_limit::{check_rate_limit, RateLimit, RateLimitOutcome, UserRateLimiter},
     },
-    http::{err_forbidden, err_internal, err_internal_no_cause},
+    http::{err_forbidden, err_internal, err_internal_no_cause, err_not_found},
     util::hex_encode,
 };
 
@@ -120,11 +120,18 @@ pub async fn handle_direct_access(
         return err_internal_no_cause("Invalid share data");
     }
 
-    // Resolve the object BEFORE spending an access. `get_stream` resolves the
-    // `ObjectInfo` header eagerly, so a share whose object is missing fails
-    // here — without burning one of a capped share's accesses on a request
-    // that serves nothing.
-    let stream = match store::get_stream(ctx, bucket, key).await {
+    // Resolve the object BEFORE spending an access. The share names the
+    // object key; the bytes are wherever the object's row says they are (each
+    // upload stores them under a key of its own), so a key with no row is a
+    // missing file. `get_stream` resolves the `ObjectInfo` header eagerly, so
+    // a share whose object is missing fails here — without burning one of a
+    // capped share's accesses on a request that serves nothing.
+    let blob_key = match repo::objects::find_blob_key(ctx, bucket, key).await {
+        Ok(Some(blob_key)) => blob_key,
+        Ok(None) => return err_not_found("File not found"),
+        Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
+    };
+    let stream = match store::get_stream(ctx, bucket, &blob_key).await {
         Ok(stream) => stream,
         Err(e) => return crud::db_error(e, "File not found", "Storage error"),
     };
@@ -180,13 +187,12 @@ pub async fn handle_direct_access(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     use serde_json::json;
-    use wafer_core::clients::storage as store;
 
     use super::{
-        super::test_support::{routed, share_ctx},
+        super::test_support::{routed, seed_legacy_object, share_ctx, share_ctx_over, upload_msg},
         *,
     };
     use crate::{
@@ -255,9 +261,7 @@ mod tests {
     async fn a_live_share_row_is_served_whatever_its_token_claims() {
         let ctx = share_ctx("photos", "alice").await;
         let stored: &[u8] = b"PNG\x89bytes-that-must-come-back";
-        store::put(&ctx, "photos", "a.png", stored, "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(&ctx, "photos", "a.png", stored, "image/png", "alice").await;
         let a_year_out = (chrono::Utc::now() + chrono::Duration::days(365)).to_rfc3339();
         seed_share(&ctx, &[("expires_at", json!(a_year_out))]).await;
 
@@ -274,9 +278,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_share_is_refused() {
         let ctx = share_ctx("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"secret", "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(&ctx, "photos", "a.png", b"secret", "image/png", "alice").await;
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
         let id = seed_share(&ctx, &[("expires_at", json!(yesterday))]).await;
 
@@ -331,9 +333,15 @@ mod tests {
     async fn a_legacy_jwt_share_link_stays_dead_after_its_thirty_days() {
         let mut ctx = share_ctx("photos", "alice").await;
         ctx.set_config(crate::migration_helper::RUN_MIGRATIONS_KEY, "1");
-        store::put(&ctx, "photos", "a.png", b"once-shared", "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(
+            &ctx,
+            "photos",
+            "a.png",
+            b"once-shared",
+            "image/png",
+            "alice",
+        )
+        .await;
 
         // A row as the old code left it: a JWT token, minted well over 30
         // days ago, with no expiry on the row at all.
@@ -382,9 +390,7 @@ mod tests {
     #[tokio::test]
     async fn a_share_that_records_no_end_is_refused() {
         let ctx = share_ctx("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"secret", "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(&ctx, "photos", "a.png", b"secret", "image/png", "alice").await;
         let id = seed_share(&ctx, &[("expires_at", json!(null))]).await;
         assert_eq!(
             repo::shares::find_by_id(&ctx, &id)
@@ -409,9 +415,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_expiry_is_not_a_share_that_never_expires() {
         let ctx = share_ctx("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"secret", "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(&ctx, "photos", "a.png", b"secret", "image/png", "alice").await;
         seed_share(&ctx, &[("expires_at", json!("next tuesday"))]).await;
 
         assert!(
@@ -428,9 +432,7 @@ mod tests {
     #[tokio::test]
     async fn a_share_lookup_outage_is_not_a_missing_share() {
         let ctx = share_ctx("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"bytes", "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(&ctx, "photos", "a.png", b"bytes", "image/png", "alice").await;
         seed_share(&ctx, &[]).await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.list", repo::shares::TABLE)]);
 
@@ -465,9 +467,7 @@ mod tests {
         );
 
         let stored: &[u8] = b"the-bytes";
-        store::put(&ctx, "photos", "a.png", stored, "image/png")
-            .await
-            .expect("store the object the share points at");
+        seed_legacy_object(&ctx, "photos", "a.png", stored, "image/png", "alice").await;
         let body = served_bytes(direct_access(&ctx, OPAQUE_TOKEN).await).await;
         assert_eq!(
             body, stored,
@@ -505,9 +505,15 @@ mod tests {
     #[tokio::test]
     async fn an_access_that_cannot_be_recorded_is_not_served() {
         let ctx = share_ctx("photos", "alice").await;
-        store::put(&ctx, "photos", "a.png", b"paid-for-bytes", "image/png")
-            .await
-            .expect("seed the object being shared");
+        seed_legacy_object(
+            &ctx,
+            "photos",
+            "a.png",
+            b"paid-for-bytes",
+            "image/png",
+            "alice",
+        )
+        .await;
         seed_share(&ctx, &[("max_access_count", json!(1))]).await;
         let failing = FailingDbOpContext::new(
             ctx,
@@ -517,6 +523,42 @@ mod tests {
         assert!(
             output_is_error(direct_access(&failing, OPAQUE_TOKEN).await, "Internal").await,
             "an unrecordable access must refuse the download, not serve past the cap"
+        );
+    }
+
+    /// A share link serves the object the key holds NOW: its bytes are
+    /// resolved through the object's row, so after a replacement the link
+    /// serves the replacement — never the blob the replacement superseded,
+    /// which is deleted.
+    #[tokio::test]
+    async fn a_share_link_serves_the_bytes_the_objects_row_names() {
+        let storage = Arc::new(crate::test_support::InMemoryStorageService::new());
+        let ctx = share_ctx_over("photos", "alice", storage.clone()).await;
+        seed_legacy_object(&ctx, "photos", "a.png", b"first", "image/png", "alice").await;
+        seed_share(&ctx, &[]).await;
+        assert_eq!(
+            served_bytes(direct_access(&ctx, OPAQUE_TOKEN).await).await,
+            b"first"
+        );
+
+        let replaced = crate::blocks::files::storage::handle_upload_object(
+            &ctx,
+            &upload_msg("photos", "a.png", "image/png", "alice"),
+            wafer_run::InputStream::from_bytes(b"second".to_vec()),
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(replaced).await, 200);
+
+        assert_eq!(
+            served_bytes(direct_access(&ctx, OPAQUE_TOKEN).await).await,
+            b"second",
+            "the link serves the object's current bytes"
+        );
+        assert!(
+            wafer_core::clients::storage::get(&ctx, "photos", "a.png")
+                .await
+                .is_err(),
+            "the superseded blob at the object key is deleted"
         );
     }
 }

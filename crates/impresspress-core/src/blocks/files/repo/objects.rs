@@ -10,6 +10,13 @@
 //!
 //! `(bucket, key)` is UNIQUE, so a re-upload reuses the existing row rather
 //! than inserting a second one — see [`reserve_upload`].
+//!
+//! The row also says WHERE the object's bytes are: `blob_key`, the storage
+//! key within the bucket. Each reservation stores its bytes under a key of
+//! its own ([`claim_blob_key`]), so two uploads of one object key never write
+//! the same blob, and every reader resolves the bytes through the row
+//! ([`find_blob_key`]). A NULL `blob_key` is a row written before migration
+//! 005, whose bytes are at the object's own key.
 
 use std::collections::HashMap;
 
@@ -49,7 +56,7 @@ pub struct ObjectRow {
     pub status: ObjectStatus,
     pub uploaded_by: String,
     /// When the upload was reserved — the timestamp the object browser
-    /// renders as "modified", and the one `delete_stale_pending` compares.
+    /// renders as "modified", and the one `list_stale_pending` compares.
     pub uploaded_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -132,6 +139,48 @@ fn escape_like(input: &str) -> String {
     out
 }
 
+/// The storage key a reservation stores its upload's bytes under, within the
+/// object's bucket: the object's key with `claim_id` in front of its last
+/// segment — `reports/q3.pdf` becomes `reports/{claim_id}~q3.pdf`.
+///
+/// A key per reservation is what stops an upload that lost its claim from
+/// overwriting the bytes of the upload that took the key over: its late
+/// write lands on a blob no row names. The last segment keeps the object's
+/// file name, extension included, because the local-storage backend derives
+/// a blob's content type from its key. `claim_id` is a fresh UUID (no `/`,
+/// fixed length), so the key splits back into exactly one `(key, claim_id)`
+/// pair, and no object key a user uploaded before it was minted can equal it.
+pub fn claim_blob_key(key: &str, claim_id: &str) -> String {
+    match key.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/{claim_id}~{name}"),
+        None => format!("{claim_id}~{key}"),
+    }
+}
+
+/// The storage key the row's bytes are under: its `blob_key`, or — for a row
+/// written before migration 005, whose `blob_key` is NULL — its object key.
+fn stored_blob_key(key: &str, blob_key: Option<String>) -> String {
+    blob_key.unwrap_or_else(|| key.to_string())
+}
+
+/// The storage key that holds the bytes of `(bucket, key)`, or `None` when
+/// the key has no row.
+///
+/// The one way a reader finds an object's bytes. The bytes are not at the
+/// object key: they are wherever the reservation that stored them put them,
+/// and the row names that place. A `Pending` row names the blob it serves
+/// until its upload completes — the object it is replacing, or, for a first
+/// upload, the blob that upload is writing, which is absent until it lands.
+pub async fn find_blob_key(
+    ctx: &dyn Context,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<String>, WaferError> {
+    Ok(find_stored(ctx, bucket, key)
+        .await?
+        .map(|found| stored_blob_key(key, found.blob_key)))
+}
+
 /// The row for `(bucket, key)`, or `None` when the key holds no object.
 ///
 /// `(bucket, key)` is UNIQUE (`idx_objects_bucket_key`, migration 001), so
@@ -178,7 +227,7 @@ pub const PENDING_RESERVATION_TTL_SECONDS: i64 = 3600;
 
 /// The RFC 3339 instant before which a `Pending` row's `uploaded_at` makes it
 /// stale — compared as a string, the way the column is written and the way
-/// [`delete_stale_pending`] compares it.
+/// [`list_stale_pending`] compares it.
 pub fn pending_reservation_cutoff() -> String {
     (chrono::Utc::now() - chrono::Duration::seconds(PENDING_RESERVATION_TTL_SECONDS)).to_rfc3339()
 }
@@ -217,6 +266,32 @@ pub struct Reservation {
     /// key, carrying what that object's row said. `None` when there was no
     /// stored object to put back: a new key, or a stale `Pending` row.
     pub replaced: Option<ReplacedObject>,
+    /// The storage key this reservation stores its bytes under
+    /// ([`claim_blob_key`]) — the row's `blob_key` once [`mark_complete`]
+    /// settles it.
+    pub blob_key: String,
+    /// Blobs no row names once this reservation's bytes are the row's: the
+    /// object it replaces, and whatever an orphaned reservation it took over
+    /// had stored. Deleted after [`mark_complete`] points the row at
+    /// [`Self::blob_key`], or after [`release_reservation`] deletes the row —
+    /// see [`Self::blobs_released_by_rollback`].
+    pub superseded_blobs: Vec<String>,
+}
+
+impl Reservation {
+    /// What a failed upload deletes from storage once [`release_reservation`]
+    /// has settled the row: always its own blob (a `put` that failed may
+    /// still have written part of it), and — when the row was deleted rather
+    /// than put back — every blob the row named, since no row names them
+    /// now. When the reservation put a replaced object back, that object's
+    /// blob is served again and is kept.
+    pub fn blobs_released_by_rollback(&self) -> Vec<&str> {
+        let mut blobs = vec![self.blob_key.as_str()];
+        if self.replaced.is_none() {
+            blobs.extend(self.superseded_blobs.iter().map(String::as_str));
+        }
+        blobs
+    }
 }
 
 /// Why [`reserve_upload`] did not claim the key.
@@ -230,8 +305,8 @@ pub enum ReserveError {
     /// than [`PENDING_RESERVATION_TTL_SECONDS`]: an upload of theirs still in
     /// flight, or one whose storage write finished but whose row could not be
     /// marked complete. The row cannot say which, so it is not taken over
-    /// early — two uploads of one key in flight at once would leave the row
-    /// describing one of them and the blob holding whichever stored last.
+    /// early — the row describes one upload in flight, and a second would
+    /// leave the first with no row to settle.
     /// `since` is that reservation's `uploaded_at`; the key is free
     /// [`PENDING_RESERVATION_TTL_SECONDS`] after it.
     HeldByOwnEarlierUpload { since: String },
@@ -267,8 +342,8 @@ impl From<WaferError> for ReserveError {
 ///   [`release_reservation`] puts the old values back if the upload fails.
 /// - **`Pending`, younger than [`PENDING_RESERVATION_TTL_SECONDS`]**: an
 ///   upload of the key is in flight, or was and could not be recorded.
-///   Refused: taking it over would leave two uploads writing one blob and one
-///   row. [`ReserveError::HeldByOwnEarlierUpload`] when that reservation is
+///   Refused: the row records one upload in flight, and taking it over
+///   would leave that upload's completion nothing to settle. [`ReserveError::HeldByOwnEarlierUpload`] when that reservation is
 ///   this uploader's own, [`ReserveError::Held`] otherwise.
 /// - **`Pending`, older**: an orphan. Taken over as a fresh claim, with
 ///   nothing to put back.
@@ -298,7 +373,7 @@ pub async fn reserve_upload(
         claim_id: &claim_id,
     };
 
-    if let Some(existing) = find_claimable(ctx, bucket, key).await? {
+    if let Some(existing) = find_stored(ctx, bucket, key).await? {
         return claim_existing(ctx, existing, &claim).await;
     }
     if let Some(id) = insert_unless_taken(ctx, &claim).await? {
@@ -306,11 +381,13 @@ pub async fn reserve_upload(
             id,
             bucket: bucket.to_string(),
             key: key.to_string(),
+            blob_key: claim.blob_key(),
             claim_id,
             replaced: None,
+            superseded_blobs: Vec::new(),
         });
     }
-    match find_claimable(ctx, bucket, key).await? {
+    match find_stored(ctx, bucket, key).await? {
         Some(existing) => claim_existing(ctx, existing, &claim).await,
         None => Err(ReserveError::Held),
     }
@@ -327,22 +404,64 @@ struct PendingClaim<'a> {
     claim_id: &'a str,
 }
 
-/// The key's row as a reservation reads it: the decoded row, plus the
-/// `claim_id` a take-over is conditional on. Kept off [`ObjectRow`], which is
-/// published: the token is the row's lock, not something a reader of the
-/// object needs.
-struct ClaimableRow {
-    row: ObjectRow,
-    /// `None` for a row written before migration 004 added the column.
-    claim_id: Option<String>,
+impl PendingClaim<'_> {
+    /// Where this claim's upload stores its bytes.
+    fn blob_key(&self) -> String {
+        claim_blob_key(self.key, self.claim_id)
+    }
 }
 
-/// [`find_by_bucket_key`], keeping the row's `claim_id`.
-async fn find_claimable(
+/// The key's row as a writer reads it: the decoded row, plus the `claim_id`
+/// a take-over or a delete is conditional on and the `blob_key` it serves.
+/// Both are kept off [`ObjectRow`], which is published: the token is the
+/// row's lock and the blob key is where storage keeps the bytes, neither of
+/// which a reader of the object's metadata needs.
+pub struct StoredRow {
+    pub row: ObjectRow,
+    /// `None` for a row written before migration 004 added the column.
+    claim_id: Option<String>,
+    /// `None` for a row written before migration 005 added the column: its
+    /// bytes are at the object key ([`stored_blob_key`]).
+    blob_key: Option<String>,
+}
+
+impl StoredRow {
+    /// Every blob this row may have caused to be stored — what must be
+    /// deleted from storage once the row is gone: the one it serves; its
+    /// object key, where a row from before migration 005 kept its bytes and
+    /// where an isolate still running the previous release writes a
+    /// replacement during a rollout; and the one its latest reservation's
+    /// upload writes under [`claim_blob_key`].
+    ///
+    /// None of them is a blob another row serves. The object key is this
+    /// row's own (`(bucket, key)` is unique), and a legacy row serves only
+    /// its object key. A claim blob key is minted from a fresh random claim
+    /// id and never returned by any API, so it equals another row's key only
+    /// if a client uploaded an object whose key spells an unseen UUID in
+    /// that position. For a claim id written before 005 the claim blob key
+    /// was never written at all — the release that minted it stored at the
+    /// object key — so deleting it removes nothing.
+    pub fn blobs(&self) -> Vec<String> {
+        let mut blobs = vec![stored_blob_key(&self.row.key, self.blob_key.clone())];
+        let mut add = |blob: String| {
+            if !blobs.contains(&blob) {
+                blobs.push(blob);
+            }
+        };
+        add(self.row.key.clone());
+        if let Some(claim_id) = &self.claim_id {
+            add(claim_blob_key(&self.row.key, claim_id));
+        }
+        blobs
+    }
+}
+
+/// [`find_by_bucket_key`], keeping the row's `claim_id` and `blob_key`.
+pub async fn find_stored(
     ctx: &dyn Context,
     bucket: &str,
     key: &str,
-) -> Result<Option<ClaimableRow>, WaferError> {
+) -> Result<Option<StoredRow>, WaferError> {
     let records = db_read::list_bounded(
         ctx,
         TABLE,
@@ -350,15 +469,16 @@ async fn find_claimable(
         Bound::UniqueKey("idx_objects_bucket_key on (bucket, key)"),
     )
     .await?;
-    records
-        .first()
-        .map(|rec| {
-            Ok(ClaimableRow {
-                row: ObjectRow::from_record(rec)?,
-                claim_id: rec.opt_str_field("claim_id"),
-            })
-        })
-        .transpose()
+    records.first().map(stored_row).transpose()
+}
+
+/// Decode a record into a [`StoredRow`].
+fn stored_row(rec: &Record) -> Result<StoredRow, WaferError> {
+    Ok(StoredRow {
+        row: ObjectRow::from_record(rec)?,
+        claim_id: rec.opt_str_field("claim_id"),
+        blob_key: rec.opt_str_field("blob_key"),
+    })
 }
 
 /// Filters matching row `id` only while it still carries `claim_id` — the
@@ -392,10 +512,11 @@ fn still_claimed_by(id: &str, claim_id: Option<&str>) -> Vec<Filter> {
 /// refuse, the same way, a row another upload claimed since it was read.
 async fn claim_existing(
     ctx: &dyn Context,
-    existing: ClaimableRow,
+    existing: StoredRow,
     claim: &PendingClaim<'_>,
 ) -> Result<Reservation, ReserveError> {
-    let ClaimableRow { row, claim_id } = existing;
+    let superseded_blobs = existing.blobs();
+    let StoredRow { row, claim_id, .. } = existing;
     let replaced = match row.status {
         ObjectStatus::Complete => Some(ReplacedObject {
             size: row.size,
@@ -411,7 +532,7 @@ async fn claim_existing(
         }
         ObjectStatus::Pending => return Err(ReserveError::Held),
     };
-    let data = crate::util::json_map(serde_json::json!({
+    let mut data = crate::util::json_map(serde_json::json!({
         "size": claim.size,
         "content_type": claim.content_type,
         "status": ObjectStatus::Pending,
@@ -420,6 +541,14 @@ async fn claim_existing(
         "updated_at": claim.uploaded_at,
         "claim_id": claim.claim_id,
     }));
+    // A replaced object stays the row's blob, and is what readers get, until
+    // this upload completes: its bytes are still stored, and a failure puts
+    // its row back. An orphan has no object to serve — its bytes, if any
+    // landed, belong to an upload that lost the key — so the row stops naming
+    // them now.
+    if replaced.is_none() {
+        data.insert("blob_key".to_string(), serde_json::json!(claim.blob_key()));
+    }
     // Conditional on the row still carrying the claim it was read with: two
     // uploads that both read the same `Complete` row (or the same orphan) must
     // not both take it over, or the row ends up describing whichever wrote
@@ -436,7 +565,9 @@ async fn claim_existing(
         bucket: claim.bucket.to_string(),
         key: claim.key.to_string(),
         claim_id: claim.claim_id.to_string(),
+        blob_key: claim.blob_key(),
         replaced,
+        superseded_blobs,
     })
 }
 
@@ -478,6 +609,7 @@ async fn insert_unless_taken(
                 serde_json::json!(claim.uploaded_at),
             ),
             ("claim_id".to_string(), serde_json::json!(claim.claim_id)),
+            ("blob_key".to_string(), serde_json::json!(claim.blob_key())),
             ("created_at".to_string(), serde_json::json!(now)),
             ("updated_at".to_string(), serde_json::json!(now)),
         ],
@@ -551,7 +683,9 @@ pub enum Completion {
 
 /// Flip a reservation's [`ObjectStatus::Pending`] row to
 /// [`ObjectStatus::Complete`] after its storage upload succeeded — the only
-/// thing that settles a [`Reservation`] as a stored object.
+/// thing that settles a [`Reservation`] as a stored object — and point it at
+/// the reservation's blob. From then on the reservation's
+/// [`Reservation::superseded_blobs`] are named by no row.
 ///
 /// Only while the row still carries this reservation's `claim_id`. When it
 /// does not, nothing is written, and the key's row is read again to say why:
@@ -566,7 +700,10 @@ pub async fn mark_complete(
     ctx: &dyn Context,
     reservation: &Reservation,
 ) -> Result<Completion, WaferError> {
-    let data = crate::util::json_map(serde_json::json!({ "status": ObjectStatus::Complete }));
+    let data = crate::util::json_map(serde_json::json!({
+        "status": ObjectStatus::Complete,
+        "blob_key": reservation.blob_key,
+    }));
     let mine = still_claimed_by(&reservation.id, Some(&reservation.claim_id));
     if db::update_by_filters_count(ctx, TABLE, mine, data).await? > 0 {
         return Ok(Completion::Completed);
@@ -577,42 +714,6 @@ pub async fn mark_complete(
             None => Completion::Deleted,
         },
     )
-}
-
-/// Claim `(bucket, key)` only if it has no row at all, as a `Pending`
-/// reservation of zero bytes. `None` when any row holds the key.
-///
-/// For a caller that must touch the key's blob without an upload of its own
-/// — deleting bytes nothing records — and must not do so while an upload
-/// holds the key, whose bytes the blob may already be. Holding the row is
-/// what makes the blob this caller's to touch; [`release_reservation`] gives
-/// it back.
-pub async fn claim_vacant_key(
-    ctx: &dyn Context,
-    bucket: &str,
-    key: &str,
-    uploaded_by: &str,
-) -> Result<Option<Reservation>, WaferError> {
-    let uploaded_at = crate::util::now_rfc3339();
-    let claim_id = uuid::Uuid::new_v4().to_string();
-    let claim = PendingClaim {
-        bucket,
-        key,
-        size: 0,
-        content_type: "application/octet-stream",
-        uploaded_by,
-        uploaded_at: &uploaded_at,
-        claim_id: &claim_id,
-    };
-    Ok(insert_unless_taken(ctx, &claim)
-        .await?
-        .map(|id| Reservation {
-            id,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            claim_id,
-            replaced: None,
-        }))
 }
 
 /// Delete every object row in `bucket` (bucket-deletion metadata cleanup).
@@ -626,9 +727,23 @@ pub async fn delete_for_bucket(ctx: &dyn Context, bucket: &str) -> Result<(), Wa
     .await
 }
 
-/// Delete the object row for `(bucket, key)` (object-deletion metadata
-/// cleanup). Returns how many rows were removed, so the caller can tell a
-/// cleanup from a delete of something that never existed.
+/// Delete `stored`'s row only while it is as it was read: the same
+/// reservation's `claim_id` and the same status. `false` when it has changed
+/// since — taken over, completed or put back — so the blobs the caller
+/// deleted from what it read may not be all the row names now, and the
+/// caller reads it again.
+pub async fn delete_if_unchanged(
+    ctx: &dyn Context,
+    stored: &StoredRow,
+) -> Result<bool, WaferError> {
+    let mut unchanged = still_claimed_by(&stored.row.id, stored.claim_id.as_deref());
+    unchanged.push(status_is(stored.row.status));
+    Ok(db::delete_by_filters_count(ctx, TABLE, unchanged).await? > 0)
+}
+
+/// Test helper: delete the object row for `(bucket, key)` outright, as a
+/// concurrent request deleting the object does to an upload's row.
+#[cfg(test)]
 pub async fn delete_by_bucket_key(
     ctx: &dyn Context,
     bucket: &str,
@@ -637,15 +752,17 @@ pub async fn delete_by_bucket_key(
     db::delete_by_filters_count(ctx, TABLE, bucket_key_filters(bucket, key)).await
 }
 
-/// Delete `user_id`'s `pending`-status rows with `uploaded_at` strictly
-/// before `cutoff` (an RFC 3339 timestamp, string-compared the same way the
-/// column is written). See `quota::sweep_stale_pending` for the policy and
-/// why this is safe to run best-effort on every upload.
-pub async fn delete_stale_pending(
+/// Up to `limit` of `user_id`'s `pending`-status rows with `uploaded_at`
+/// strictly before `cutoff` (an RFC 3339 timestamp, string-compared the same
+/// way the column is written), oldest first. `quota::sweep_stale_pending`
+/// deletes each with [`delete_if_unchanged`] and then its blobs; see it for
+/// the policy.
+pub async fn list_stale_pending(
     ctx: &dyn Context,
     user_id: &str,
     cutoff: &str,
-) -> Result<(), WaferError> {
+    limit: i64,
+) -> Result<Vec<StoredRow>, WaferError> {
     let filters = vec![
         Filter {
             field: "uploaded_by".to_string(),
@@ -659,7 +776,22 @@ pub async fn delete_stale_pending(
             value: serde_json::Value::String(cutoff.to_string()),
         },
     ];
-    db::delete_by_filters(ctx, TABLE, filters).await
+    let opts = ListOptions {
+        filters,
+        sort: vec![SortField {
+            field: "uploaded_at".to_string(),
+            desc: false,
+        }],
+        limit,
+        skip_count: true,
+        ..Default::default()
+    };
+    db::list(ctx, TABLE, &opts)
+        .await?
+        .records
+        .iter()
+        .map(stored_row)
+        .collect()
 }
 
 /// Search `user_id`'s `complete` objects whose key contains `query`
@@ -695,6 +827,45 @@ pub async fn search_completed(
         sort: vec![SortField {
             field: "uploaded_at".to_string(),
             desc: true,
+        }],
+        limit,
+        offset,
+        skip_count: false,
+        ..Default::default()
+    };
+    Page::try_decode(db::list(ctx, TABLE, &opts).await?, ObjectRow::from_record)
+}
+
+/// One page of the object rows in `bucket` whose key starts with `prefix`
+/// (every row when it is empty), sorted by `key` ascending — the objects
+/// `GET /b/storage/api/buckets/{name}/objects` lists. The prefix is
+/// LIKE-escaped ([`escape_like`]), so `%`/`_` in it match literally; case
+/// follows the backend's `LIKE`, as in [`search_completed`] (SQLite and D1
+/// fold ASCII case, PostgreSQL does not).
+pub async fn list_page_for_bucket(
+    ctx: &dyn Context,
+    bucket: &str,
+    prefix: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Page<ObjectRow>, WaferError> {
+    let mut filters = vec![Filter {
+        field: "bucket".to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::Value::String(bucket.to_string()),
+    }];
+    if !prefix.is_empty() {
+        filters.push(Filter {
+            field: "key".to_string(),
+            operator: FilterOp::Like,
+            value: serde_json::Value::String(format!("{}%", escape_like(prefix))),
+        });
+    }
+    let opts = ListOptions {
+        filters,
+        sort: vec![SortField {
+            field: "key".to_string(),
+            desc: false,
         }],
         limit,
         offset,
@@ -827,6 +998,19 @@ pub async fn list_all(ctx: &dyn Context) -> Result<Vec<ObjectRow>, WaferError> {
         .collect()
 }
 
+/// Test helper: give the key's row a fresh `claim_id`, as another upload's
+/// reservation of it does.
+#[cfg(test)]
+pub async fn reclaim(ctx: &dyn Context, bucket: &str, key: &str) -> Result<i64, WaferError> {
+    db::update_by_filters_count(
+        ctx,
+        TABLE,
+        bucket_key_filters(bucket, key),
+        crate::util::json_map(serde_json::json!({ "claim_id": uuid::Uuid::new_v4().to_string() })),
+    )
+    .await
+}
+
 /// Test helper: set the `uploaded_at` of the key's row, to age a reservation.
 #[cfg(test)]
 pub async fn backdate_upload(
@@ -953,6 +1137,19 @@ mod tests {
         assert!(err.message.contains("half"), "{}", err.message);
     }
 
+    /// A claim's blob key keeps the object's directory and file name and puts
+    /// the claim in front of the name, so it splits back into one
+    /// `(key, claim)` pair and keeps the extension a content type is guessed
+    /// from.
+    #[test]
+    fn a_claims_blob_key_prefixes_the_file_name_with_the_claim() {
+        assert_eq!(claim_blob_key("a.png", "c1"), "c1~a.png");
+        assert_eq!(
+            claim_blob_key("reports/2026/q3.pdf", "c1"),
+            "reports/2026/c1~q3.pdf"
+        );
+    }
+
     /// A take-over is conditional on the claim the row was read with, not on
     /// a timestamp.
     ///
@@ -983,11 +1180,11 @@ mod tests {
         )
         .await
         .expect("seed a stored object");
-        let first_read = find_claimable(&ctx, "assets", "same.txt")
+        let first_read = find_stored(&ctx, "assets", "same.txt")
             .await
             .expect("read")
             .expect("the row");
-        let second_read = find_claimable(&ctx, "assets", "same.txt")
+        let second_read = find_stored(&ctx, "assets", "same.txt")
             .await
             .expect("read")
             .expect("the row");
@@ -1017,7 +1214,7 @@ mod tests {
             matches!(second, Err(ReserveError::Held)),
             "the row was claimed since it was read: {second:?}"
         );
-        let row = find_claimable(&ctx, "assets", "same.txt")
+        let row = find_stored(&ctx, "assets", "same.txt")
             .await
             .expect("read")
             .expect("the row");
