@@ -1,5 +1,7 @@
 mod contracts;
 mod database;
+#[cfg(test)]
+mod error_mapping_tests;
 mod iam;
 pub(crate) mod logs;
 pub mod migrations;

@@ -20,6 +20,9 @@ pub(crate) mod migrations;
 // `nav_icon` resolver in lockstep.
 pub(crate) mod pages;
 
+#[cfg(test)]
+mod error_mapping_tests;
+
 const TABLE: &str = "impresspress__userportal__buttons";
 
 /// Handler for one row of [`ROUTES`].

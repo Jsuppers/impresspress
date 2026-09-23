@@ -39,7 +39,7 @@
 //! the allowlist sent it to.
 //!
 //! That last blind spot is closed for every block in `GATED_BLOCKS` — the
-//! whole of `auth`, `auth_ui` and `products`. Whether an
+//! whole of `admin`, `auth`, `auth_ui`, `products` and `userportal`. Whether an
 //! `err_internal(label, cause)` there wraps a database call is a reading job
 //! per site, so the second gate below does not guess: every `err_internal`
 //! tail left in a gated file is inventoried by its label, with the reason it
@@ -325,7 +325,7 @@ fn the_walk_reaches_the_files_it_claims_to_scan() {
 /// [`evasions`]: a file under one of these that is not on the inventory may
 /// have no `err_internal` tail at all. Test code (`tests/` directories and
 /// `#[cfg(test)]` items) is not gated.
-const GATED_BLOCKS: &[&str] = &["auth", "auth_ui", "products"];
+const GATED_BLOCKS: &[&str] = &["admin", "auth", "auth_ui", "products", "userportal"];
 
 /// The walk the gated-file checks run over: every block source outside a
 /// `tests/` directory, floored like [`scan`].
@@ -375,8 +375,10 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// `refund_ledger_denial_is_403` and its siblings in
 /// `products/tests/provider_tests.rs`, one real route per products file in
 /// `products/tests/error_mapping_tests.rs`, one real route per auth handler
-/// family in `auth_ui/tests/error_mapping_tests.rs`, and the OAuth callback's
-/// `state_redemption_denial_is_403_not_500`.
+/// family in `auth_ui/tests/error_mapping_tests.rs`, the OAuth callback's
+/// `state_redemption_denial_is_403_not_500`, and the admin and user-portal
+/// routes in `admin/error_mapping_tests.rs` and
+/// `userportal/error_mapping_tests.rs`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
         "products/stripe.rs",
@@ -1462,7 +1464,6 @@ fn the_evasion_gate_catches_each_way_around() {
 /// `src/blocks/` is its own entry; `crud.rs` is the door and is not listed.
 /// `"unplanned"` is a block no plan item has scheduled yet.
 const NOT_YET_GATED: &[(&str, usize, &str)] = &[
-    ("admin", 9, "N20"),
     ("dev", 6, "N25"),
     ("fastembed.rs", 1, "unplanned"),
     ("files", 6, "N25"),
@@ -1471,7 +1472,6 @@ const NOT_YET_GATED: &[(&str, usize, &str)] = &[
     ("messages", 1, "unplanned"),
     ("signal", 1, "unplanned"),
     ("tickets", 1, "N25"),
-    ("userportal", 3, "N20"),
     ("vector", 1, "N21"),
 ];
 
@@ -1525,7 +1525,6 @@ const CAUSE_DROPPING: &[&str] = &["err_internal_no_cause", "server_error_respons
 /// `"read: …"` is a block whose every site was read and none drops a database
 /// error; `"unplanned"` is a block no plan item has scheduled yet.
 const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
-    ("admin", 4, "N20"),
     (
         "auth_ui",
         7,
@@ -1537,7 +1536,12 @@ const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
     ("llm", 3, "N21"),
     ("messages", 3, "unplanned"),
     ("products", 32, "unplanned"),
-    ("userportal", 8, "N20"),
+    (
+        "userportal",
+        1,
+        "read: the profile page's signed-in user with no users row — the read \
+         succeeded, so there is no cause to carry",
+    ),
     ("vector", 1, "N21"),
 ];
 
