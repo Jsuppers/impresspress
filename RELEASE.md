@@ -327,6 +327,15 @@ the blob held the other. Migration `004_object_claim_id` adds a nullable
 `claim_id` column to `impresspress__files__objects`; each reservation writes a
 random token there, and the take-over, the completion and the rollback of a
 failed upload each act only on the reservation the row still carries.
+While a rollout is part-way, isolates still running the previous release take
+rows over on the old `updated_at` check and leave `claim_id` unchanged, so the
+token check cannot catch those take-overs; the gap is transient and closes once
+every isolate runs this release.
+
+**When the object is deleted mid-upload.** An upload whose object or bucket is
+deleted while its bytes are being stored now answers `409` saying so (not that
+another upload took the key), and the bytes it stored are deleted rather than
+left recorded and charged nowhere.
 
 **A retry after "Upload stored but could not be recorded" says what holds the
 key.** Such an upload leaves its reservation in place for up to an hour, and
