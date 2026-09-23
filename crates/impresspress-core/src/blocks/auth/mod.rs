@@ -1274,7 +1274,7 @@ pub async fn authenticate_api_key(
     if key_row.is_revoked() {
         return;
     }
-    if key_row.is_expired(&crate::util::now_rfc3339()) {
+    if key_row.is_expired(chrono::Utc::now()) {
         return;
     }
 
@@ -1320,6 +1320,9 @@ pub async fn authenticate_api_key(
 
 #[cfg(test)]
 mod api_key_lifecycle_tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
     use wafer_run::{Message, META_AUTH_USER_ID};
 
     use super::{
@@ -1329,7 +1332,24 @@ mod api_key_lifecycle_tests {
     use crate::{test_support::TestContext, util::sha256_hex};
 
     async fn seed_user_and_key(ctx: &TestContext, raw_key: &str) -> String {
-        let user = users::insert(
+        let user_id = seed_user(ctx).await;
+        api_keys::insert(
+            ctx,
+            api_keys::NewApiKey {
+                user_id: &user_id,
+                name: "test-key",
+                key_hash: &sha256_hex(raw_key.as_bytes()),
+                key_prefix: "sb_test",
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        user_id
+    }
+
+    async fn seed_user(ctx: &TestContext) -> String {
+        users::insert(
             ctx,
             users::NewUser {
                 email: "key@e.co".into(),
@@ -1341,21 +1361,75 @@ mod api_key_lifecycle_tests {
             },
         )
         .await
-        .unwrap();
-        let key_hash = sha256_hex(raw_key.as_bytes());
-        api_keys::insert(
-            ctx,
-            api_keys::NewApiKey {
-                user_id: &user.id,
-                name: "test-key",
-                key_hash: &key_hash,
-                key_prefix: "sb_test",
-                expires_at: None,
-            },
-        )
-        .await
-        .unwrap();
-        user.id
+        .unwrap()
+        .id
+    }
+
+    /// Write an `api_keys` row with `expires_at` exactly as given, bypassing
+    /// `NewApiKey`'s typed expiry. Test-fixture setup: this is the shape of
+    /// row a deployment already holds, minted when the endpoint stored the
+    /// caller's string as it stood, and nothing in the crate can write one
+    /// any more.
+    async fn seed_key_with_stored_expiry(ctx: &TestContext, raw_key: &str, expires_at: &str) {
+        let user_id = seed_user(ctx).await;
+        let mut data: HashMap<String, serde_json::Value> = HashMap::new();
+        data.insert("user_id".into(), json!(user_id));
+        data.insert("name".into(), json!("legacy-key"));
+        data.insert("key_hash".into(), json!(sha256_hex(raw_key.as_bytes())));
+        data.insert("key_prefix".into(), json!("sb_test"));
+        data.insert("created_at".into(), json!("2026-01-01T00:00:00Z"));
+        data.insert("expires_at".into(), json!(expires_at));
+        wafer_core::clients::database::create(ctx, api_keys::TABLE, data)
+            .await
+            .expect("seed a legacy api-key row");
+    }
+
+    /// `…T20:00:00+09:00` is 11:00 UTC. Compared as text against the clock's
+    /// own `…T12:00:00…` it sorted eight hours into the future, so a key an
+    /// hour dead authenticated. The offset is fixed at +09:00 and the
+    /// instant an hour ago, so the string this writes is always ahead of the
+    /// one the clock reads — the divergence is forced, not sampled.
+    #[tokio::test]
+    async fn a_stored_offset_expiry_is_read_as_the_instant_it_names() {
+        let ctx = TestContext::with_auth().await.with_wrap(
+            "wafer-run/auth",
+            Vec::new(),
+            vec![],
+            "impresspress/admin",
+        );
+        let offset = chrono::FixedOffset::east_opt(9 * 3600).expect("+09:00");
+        let expired_an_hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&offset)
+            .to_rfc3339();
+        seed_key_with_stored_expiry(&ctx, "raw-offset-key", &expired_an_hour_ago).await;
+
+        let mut msg = Message::new("http");
+        authenticate_api_key(&ctx, "raw-offset-key", &mut msg).await;
+
+        assert_eq!(
+            msg.get_meta(META_AUTH_USER_ID),
+            "",
+            "{expired_an_hour_ago} named an instant an hour ago"
+        );
+    }
+
+    /// An expiry that is not a timestamp is not an expiry. `"never"` sorts
+    /// after every clock reading there will ever be, so text comparison gave
+    /// it the one property a key must not have.
+    #[tokio::test]
+    async fn a_stored_expiry_that_is_not_a_timestamp_does_not_authenticate() {
+        let ctx = TestContext::with_auth().await.with_wrap(
+            "wafer-run/auth",
+            Vec::new(),
+            vec![],
+            "impresspress/admin",
+        );
+        seed_key_with_stored_expiry(&ctx, "raw-never-key", "never").await;
+
+        let mut msg = Message::new("http");
+        authenticate_api_key(&ctx, "raw-never-key", &mut msg).await;
+
+        assert_eq!(msg.get_meta(META_AUTH_USER_ID), "");
     }
 
     #[tokio::test]

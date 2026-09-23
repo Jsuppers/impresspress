@@ -1,4 +1,48 @@
 {
+  "/b/auth/api/api-keys": {
+    "post": {
+      "requestBody": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "description": "`POST /b/auth/api/api-keys` request body.",
+              "properties": {
+                "expires_at": {
+                  "description": "Absolute expiry, RFC 3339 and in the future. Omit for a key that does\nnot expire.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "description": "Label shown in the key list. Required and non-empty.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "title": "CreateApiKeyRequest",
+              "type": "object"
+            }
+          }
+        },
+        "required": true
+      },
+      "responses": {
+        "200": {
+          "description": "Successful response"
+        }
+      },
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "summary": "Create API key"
+    }
+  },
   "/b/auth/api/change-password": {
     "post": {
       "responses": {

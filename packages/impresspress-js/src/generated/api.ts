@@ -538,6 +538,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/b/auth/api/api-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create API key */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /**
+                         * Format: date-time
+                         * @description Absolute expiry, RFC 3339 and in the future. Omit for a key that does
+                         *     not expire.
+                         */
+                        expires_at?: string | null;
+                        /** @description Label shown in the key list. Required and non-empty. */
+                        name: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/b/auth/api/change-password": {
         parameters: {
             query?: never;

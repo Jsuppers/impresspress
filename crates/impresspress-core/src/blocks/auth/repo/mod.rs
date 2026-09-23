@@ -20,12 +20,15 @@
 //! is what lets those call sites answer through `crud::db_error`.
 //!
 //! The small row-decoding utilities every submodule needs — the ISO-8601
-//! timestamp writer ([`now_iso`]), hex decoding ([`decode_hex`]), and the
-//! `&HashMap<String, Value>` map accessors ([`map_str`]/[`map_opt_str`]/
-//! [`map_bool`]) — live here so all auth tables share one implementation. In
-//! particular [`now_iso`] is **the** timestamp writer for auth-table rows:
+//! timestamp writer ([`now_iso`]/[`iso`]) and reader ([`parse_iso`]), hex
+//! decoding ([`decode_hex`]), and the `&HashMap<String, Value>` map accessors
+//! ([`map_str`]/[`map_opt_str`]/[`map_bool`]) — live here so all auth tables
+//! share one implementation. In particular [`iso`] is **the** timestamp
+//! writer for auth-table rows, including for a timestamp a caller supplied:
 //! keeping a single `…Z` formatter stops the documented `Z`/`+00:00`
-//! intermixing (see `service::is_expired`) from growing.
+//! intermixing (see `service::is_expired`) from growing. A stored timestamp
+//! is read back with [`parse_iso`] rather than compared as text — string
+//! order is time order only within one format and one offset.
 
 use std::collections::HashMap;
 
@@ -83,7 +86,34 @@ pub(crate) fn internal_error(what: impl Into<String>) -> WaferError {
 /// `expires_at < cutoff`) stay correct, and stops the historical
 /// `Z`-vs-`+00:00` intermixing documented in `service::is_expired`.
 pub(crate) fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    iso(chrono::Utc::now())
+}
+
+/// Format an instant in the one shape [`now_iso`] writes
+/// (`%Y-%m-%dT%H:%M:%SZ`, seconds resolution, UTC).
+///
+/// Anything an auth table stores in a timestamp column goes through here or
+/// through [`now_iso`], including a value a caller supplied: a column holding
+/// two spellings of the same instant cannot be ordered by a SQL comparison,
+/// and the API-key expiry column used to hold whatever string the caller
+/// sent.
+pub(crate) fn iso(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Read a timestamp column back as an instant, or `None` when the stored
+/// text is not RFC 3339.
+///
+/// Accepts any RFC 3339 offset, not only the `Z` [`iso`] writes, because rows
+/// written before this was the only writer carry whatever the caller sent —
+/// `…T20:00:00+09:00` names 11:00 UTC and must be read as that instant, not
+/// compared as the string `20:00`. Callers decide what an unreadable value
+/// means; for an expiry it is "expired" (see
+/// [`api_keys::ApiKeyRow::is_expired`]).
+pub(crate) fn parse_iso(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
 }
 
 /// Decode a lowercase hex string into raw bytes. Returns `None` for an
@@ -120,5 +150,53 @@ pub(crate) fn map_bool(m: &HashMap<String, Value>, key: &str) -> bool {
         Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
         Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{iso, parse_iso};
+
+    /// Which spellings a stored timestamp column can be read back from.
+    /// Migration `015_api_key_expiry_canonical` sorts rows by exactly this
+    /// rule, so its SQL and this function have to agree on the boundary.
+    #[test]
+    fn parse_iso_reads_rfc_3339_and_nothing_else() {
+        for (stored, utc) in [
+            ("2026-06-01T12:00:00Z", "2026-06-01T12:00:00Z"),
+            ("2026-06-01T12:00:00z", "2026-06-01T12:00:00Z"),
+            ("2026-06-01t12:00:00Z", "2026-06-01T12:00:00Z"),
+            // A space separator is RFC 3339's own permitted alternative to
+            // `T`, and chrono takes it.
+            ("2026-06-01 12:00:00Z", "2026-06-01T12:00:00Z"),
+            ("2026-06-01T12:00:00+00:00", "2026-06-01T12:00:00Z"),
+            ("2026-06-01T12:00:00.123456+00:00", "2026-06-01T12:00:00Z"),
+            ("2026-06-01T20:00:00+09:00", "2026-06-01T11:00:00Z"),
+        ] {
+            let parsed = parse_iso(stored).unwrap_or_else(|| panic!("{stored} is RFC 3339"));
+            assert_eq!(iso(parsed), utc, "{stored}");
+        }
+
+        for stored in [
+            // No offset at all: RFC 3339 requires one, and guessing UTC for a
+            // caller's local wall clock would move the instant.
+            "2026-06-01T12:00:00",
+            "2026-06-01",
+            // A basic-format offset (`+0900`, no colon) is ISO 8601, not
+            // RFC 3339.
+            "2026-06-01T12:00:00+0900",
+            // Shaped like a timestamp, names no day.
+            "2026-02-31T12:00:00Z",
+            "never",
+            "",
+        ] {
+            assert!(parse_iso(stored).is_none(), "{stored:?} is not RFC 3339");
+        }
+    }
+
+    #[test]
+    fn now_iso_is_what_parse_iso_reads() {
+        let now = super::now_iso();
+        assert_eq!(iso(parse_iso(&now).expect("now_iso is RFC 3339")), now);
     }
 }
