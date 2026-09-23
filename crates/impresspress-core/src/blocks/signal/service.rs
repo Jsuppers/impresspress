@@ -172,25 +172,23 @@ async fn fetch_live(ctx: &dyn Context, code: &str) -> Result<RoomRow, RoomError>
 
 /// What a failed [`create_row`] against `code`'s uniqueness actually means.
 ///
-/// No `DatabaseService` backend classifies a constraint violation today —
-/// `wafer_core`'s shared `create` surfaces a PK collision as
-/// `ErrorCode::Internal` (or, on a future backend that does classify it,
-/// `ErrorCode::AlreadyExists` directly) — so there is nothing in the error
-/// itself to match on beyond that. The same reasoning and the same
-/// probe-after-the-write shape is already written out at
-/// `crud::taken_key_or_db_error`, which this mirrors for this block's
-/// own error type: probing *after* the failed write, not before, is what
-/// closes the two-hosts-roll-the-same-code race — a pre-check that found
-/// the code free leaves a gap a competing create can still land in, and the
-/// loser of that race is exactly the request that would otherwise surface
-/// as a raw `Db` (500) instead of the documented `Taken` (409).
+/// Every backend in this workspace reports a PK collision as
+/// `ErrorCode::AlreadyExists`, which is `Taken` outright. One that does not
+/// classify it answers `Internal` (or `Aborted`), and that is settled by
+/// re-reading the code — the reasoning and the probe-after-the-write shape
+/// are written out at `crud::taken_key_or_db_error`, which this mirrors for
+/// this block's own error type: probing *after* the failed write, not
+/// before, is what closes the two-hosts-roll-the-same-code race — a
+/// pre-check that found the code free leaves a gap a competing create can
+/// still land in, and the loser of that race is exactly the request that
+/// would otherwise surface as a raw `Db` (500) instead of the documented
+/// `Taken` (409).
 async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> RoomError {
     match error.code {
-        // For a backend that classifies the violation itself. No backend at
-        // the current wafer pin does: they answer `Internal`, which the arm
-        // below settles by re-reading the code.
+        // Every backend in this workspace classifies the violation itself.
         ErrorCode::AlreadyExists => return RoomError::Taken,
-        // The two shapes a constraint violation can arrive as unclassified.
+        // The two shapes a constraint violation can arrive as from a backend
+        // that does not.
         ErrorCode::Internal | ErrorCode::Aborted => {}
         // Anything else (WRAP refusal, quota, ...) is not a code collision.
         _ => return RoomError::Db(error.message),

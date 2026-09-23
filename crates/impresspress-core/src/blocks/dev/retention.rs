@@ -193,10 +193,11 @@ mod tests {
 
         assert_eq!(prune(&ctx).await.expect("prune").len(), 5);
 
-        let log = log.lock().expect("log");
-        assert_eq!(log.deletes, 0, "no generation goes through a single delete");
-        assert_eq!(log.batch_ops, [5]);
-        drop(log);
+        {
+            let log = log.lock().expect("log");
+            assert_eq!(log.deletes, 0, "no generation goes through a single delete");
+            assert_eq!(log.batch_ops, [5]);
+        }
         assert_eq!(ledger(&ctx).await.len(), RETAINED_GENERATIONS);
     }
 

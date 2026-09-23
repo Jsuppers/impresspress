@@ -378,8 +378,8 @@ async fn table_template_creates_its_table_and_serves_its_endpoints() {
     let one: serde_json::Value = serde_json::from_slice(&out.body).expect("by-id body");
     assert_eq!(one["email"], "a@b.c", "{one}");
 
-    // The duplicate check the template makes explicitly, rather than leaning
-    // on the UNIQUE constraint.
+    // A second signup for the address: refused by the UNIQUE constraint,
+    // which the host reports to the guest as `AlreadyExists`.
     let out = wafer
         .run_block(
             "site/newsletter",

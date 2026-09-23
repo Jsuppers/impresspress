@@ -1443,11 +1443,10 @@ mod tests {
     /// Creating a variable whose key is already taken is a **409**, not a 500.
     ///
     /// The `key` column is `UNIQUE`, so the second insert is refused by the
-    /// database. No `DatabaseService` backend classifies a constraint
-    /// violation, so the refusal arrives as `ErrorCode::Internal` and used to
-    /// be forwarded as `err_internal("Database error", …)` — a `500 Internal
-    /// server error (ref: …)`, which tells an operator their request broke the
-    /// server when in fact the server is fine and the request named a key that
+    /// database, as `ErrorCode::AlreadyExists`. Forwarded as
+    /// `err_internal("Database error", …)` that is a `500 Internal server
+    /// error (ref: …)`, which tells an operator their request broke the server
+    /// when in fact the server is fine and the request named a key that
     /// exists. The row must also be left exactly as it was.
     #[tokio::test]
     async fn creating_a_variable_whose_key_is_taken_is_a_conflict() {
