@@ -3,10 +3,11 @@
 //! Object metadata rows — one row per uploaded file (sibling of the raw
 //! storage blob in `wafer-run/storage`). Tracks size, content type,
 //! status, uploader and timestamps. A row is claimed `pending` *before* the
-//! storage upload ([`reserve_upload`], so a later quota check counts it —
-//! `quota::check_quota` says what that does and does not bound) and flipped to `complete` afterward; quota accounting sums/counts by
-//! `uploaded_by` (including in-flight `pending` reservations), while
-//! user-facing search and admin stats only see `complete` rows.
+//! storage upload ([`reserve_upload`], whose write is refused when it would
+//! take the uploader past a quota cap) and flipped to `complete` afterward;
+//! quota accounting sums/counts by `uploaded_by` (including in-flight
+//! `pending` reservations), while user-facing search and admin stats only see
+//! `complete` rows.
 //!
 //! `(bucket, key)` is UNIQUE, so a re-upload reuses the existing row rather
 //! than inserting a second one — see [`reserve_upload`].
@@ -22,12 +23,15 @@ use std::collections::HashMap;
 
 use wafer_block::{
     db::{Filter, FilterOp, ListOptions, SortField},
-    wire::database::{self as wire, OnConflict},
+    wire::database::{self as wire, InsertGuardedResponse, UpdateGuardedResponse},
 };
-use wafer_core::clients::database::{self as db, Record};
+use wafer_core::clients::database::{self as db, CapGuard, Record};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use super::{super::contracts::ObjectStatus, Page};
+use super::{
+    super::{contracts::ObjectStatus, models::QuotaConfig},
+    Page,
+};
 use crate::{
     db_read::{self, Bound},
     util::{enum_column_or, RecordExt},
@@ -310,6 +314,14 @@ pub enum ReserveError {
     /// `since` is that reservation's `uploaded_at`; the key is free
     /// [`PENDING_RESERVATION_TTL_SECONDS`] after it.
     HeldByOwnEarlierUpload { since: String },
+    /// The upload would take its uploader past `max_storage_bytes`: the bytes
+    /// they store, in-flight reservations included, plus this upload's, less
+    /// those of the row it replaces when that row is theirs.
+    OverStorageQuota,
+    /// The upload would be one object more than `max_files_per_bucket` among
+    /// the rows its uploader holds in the bucket. Never for a row the
+    /// uploader already holds there: replacing it adds none.
+    OverFileCount,
     /// The database call itself failed.
     Db(WaferError),
 }
@@ -321,24 +333,30 @@ impl From<WaferError> for ReserveError {
 }
 
 /// Claim `(bucket, key)` for an upload of `size` bytes, BEFORE the storage
-/// upload runs, so a quota check that runs after this insert counts the
-/// in-flight size. It narrows the check-quota → upload race without closing
-/// it: the check and this claim are separate calls, and a claim is exclusive
-/// per key, not per bucket (see `quota::check_quota`). `uploaded_at` is stamped
-/// with [`crate::util::now_rfc3339`], and `claim_id` with a fresh random token
-/// the returned [`Reservation`] carries.
+/// upload runs, within `quota`'s caps. `uploaded_at` is stamped with
+/// [`crate::util::now_rfc3339`], and `claim_id` with a fresh random token the
+/// returned [`Reservation`] carries.
+///
+/// The caps are enforced by the write itself: every insert or take-over this
+/// makes is a guarded write ([`quota_guards`]) that the database refuses when
+/// the uploader's stored bytes, or their rows in the bucket, as they stand at
+/// that write, leave no room for it — [`ReserveError::OverStorageQuota`] or
+/// [`ReserveError::OverFileCount`]. The check and the write are one atomic
+/// step against every other guarded write to the table, so uploads racing
+/// for the same cap cannot all be admitted. Rows in flight count: a
+/// reservation charges its size to its uploader from the moment it is taken.
 ///
 /// `(bucket, key)` is UNIQUE, so the key has at most one row, and what that
 /// row says decides the claim:
 ///
-/// - **No row**: an insert that yields to the unique index
-///   (`ON CONFLICT (bucket, key) DO NOTHING`) rather than being refused by
-///   it. If another upload's insert got there first, this one affects
-///   nothing and decides again on the row it reads back.
+/// - **No row**: a guarded insert. If another upload's insert got there
+///   first — the unique index refuses this one — it decides again on the row
+///   it reads back.
 /// - **`Complete`**: a re-upload. The reservation TAKES OVER the row,
 ///   flipping it to [`ObjectStatus::Pending`] with the new size, content type
-///   and uploader. Until the upload settles the row charges the new (possibly
-///   larger) size against the new uploader — the conservative direction — and
+///   and uploader. The row stops counting against whoever it was charged to
+///   and charges the new size to the new uploader, so a user replacing their
+///   own object is charged the difference and adds no file.
 ///   [`release_reservation`] puts the old values back if the upload fails.
 /// - **`Pending`, younger than [`PENDING_RESERVATION_TTL_SECONDS`]**: an
 ///   upload of the key is in flight, or was and could not be recorded.
@@ -360,6 +378,7 @@ pub async fn reserve_upload(
     size: usize,
     content_type: &str,
     uploaded_by: &str,
+    quota: &QuotaConfig,
 ) -> Result<Reservation, ReserveError> {
     let uploaded_at = crate::util::now_rfc3339();
     let claim_id = uuid::Uuid::new_v4().to_string();
@@ -371,25 +390,33 @@ pub async fn reserve_upload(
         uploaded_by,
         uploaded_at: &uploaded_at,
         claim_id: &claim_id,
+        quota,
     };
 
     if let Some(existing) = find_stored(ctx, bucket, key).await? {
         return claim_existing(ctx, existing, &claim).await;
     }
-    if let Some(id) = insert_unless_taken(ctx, &claim).await? {
-        return Ok(Reservation {
-            id,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            blob_key: claim.blob_key(),
-            claim_id,
-            replaced: None,
-            superseded_blobs: Vec::new(),
-        });
-    }
+    let not_inserted = match insert_reservation(ctx, &claim).await? {
+        Inserted::Created(id) => {
+            return Ok(Reservation {
+                id,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                blob_key: claim.blob_key(),
+                claim_id,
+                replaced: None,
+                superseded_blobs: Vec::new(),
+            })
+        }
+        Inserted::KeyTaken => ReserveError::Held,
+        Inserted::Refused(refusal) => refusal,
+    };
+    // A refused insert is decided on the key's row as well when there is one
+    // by now: an insert is refused on the caps before the unique index is
+    // consulted, and a take-over of that row may fit where a new row did not.
     match find_stored(ctx, bucket, key).await? {
         Some(existing) => claim_existing(ctx, existing, &claim).await,
-        None => Err(ReserveError::Held),
+        None => Err(not_inserted),
     }
 }
 
@@ -402,12 +429,75 @@ struct PendingClaim<'a> {
     uploaded_by: &'a str,
     uploaded_at: &'a str,
     claim_id: &'a str,
+    /// The caps the claim's write must leave its uploader within.
+    quota: &'a QuotaConfig,
 }
 
 impl PendingClaim<'_> {
     /// Where this claim's upload stores its bytes.
     fn blob_key(&self) -> String {
         claim_blob_key(self.key, self.claim_id)
+    }
+}
+
+/// Index in [`quota_guards`] of the storage-bytes guard. It comes first, so an
+/// upload over both caps is refused for its bytes.
+const STORAGE_GUARD: usize = 0;
+/// Index in [`quota_guards`] of the per-bucket file-count guard, present when
+/// `max_files_per_bucket` is positive.
+const FILE_COUNT_GUARD: usize = 1;
+
+/// The caps `claim`'s write must leave its uploader within, measured over the
+/// table as it stands at the write. `replacing` is the id of the row the write
+/// takes over, which the guards leave out: its size and its place in the
+/// bucket are the claim's once the write lands, whoever they were charged to
+/// before.
+///
+/// - [`STORAGE_GUARD`]: the uploader's `SUM(size)`, plus the claim's size, is
+///   at most `max_storage_bytes`.
+/// - [`FILE_COUNT_GUARD`]: the uploader's rows in the bucket number fewer
+///   than `max_files_per_bucket`, so the write leaves at most that many. A
+///   cap of `0` or less is no cap, and adds no guard.
+fn quota_guards(claim: &PendingClaim<'_>, replacing: Option<&str>) -> Vec<CapGuard> {
+    let mut owned = owned_objects_filter(claim.uploaded_by);
+    if let Some(id) = replacing {
+        owned.push(Filter {
+            field: "id".to_string(),
+            operator: FilterOp::NotEqual,
+            value: serde_json::Value::String(id.to_string()),
+        });
+    }
+    let size = i64::try_from(claim.size).unwrap_or(i64::MAX);
+    let mut guards = vec![CapGuard::SumAtMost {
+        field: "size".to_string(),
+        filters: owned.clone(),
+        add: size,
+        cap: claim.quota.max_storage_bytes,
+    }];
+    if claim.quota.max_files_per_bucket > 0 {
+        let mut in_bucket = owned;
+        in_bucket.push(Filter {
+            field: "bucket".to_string(),
+            operator: FilterOp::Equal,
+            value: serde_json::Value::String(claim.bucket.to_string()),
+        });
+        guards.push(CapGuard::CountBelow {
+            filters: in_bucket,
+            cap: claim.quota.max_files_per_bucket,
+        });
+    }
+    guards
+}
+
+/// The refusal a guarded write reports by [`quota_guards`] index.
+fn refused_by(guard: usize) -> ReserveError {
+    match guard {
+        STORAGE_GUARD => ReserveError::OverStorageQuota,
+        FILE_COUNT_GUARD => ReserveError::OverFileCount,
+        other => ReserveError::Db(WaferError::new(
+            ErrorCode::Internal,
+            format!("an upload reservation was refused by guard {other}, which it did not set"),
+        )),
     }
 }
 
@@ -555,10 +645,14 @@ async fn claim_existing(
     // last while the other's failure puts values back over an upload in
     // flight. Every reservation writes a fresh random `claim_id`, so the first
     // take-over changes it and the second matches nothing — whatever the two
-    // clocks said.
+    // clocks said. And conditional on the caps, with this row left out of
+    // them: what it held is replaced by what this claim writes.
     let unchanged = still_claimed_by(&row.id, claim_id.as_deref());
-    if db::update_by_filters_count(ctx, TABLE, unchanged, data).await? == 0 {
-        return Err(ReserveError::Held);
+    let guards = quota_guards(claim, Some(&row.id));
+    match db::update_guarded(ctx, TABLE, &unchanged, data, &guards).await? {
+        UpdateGuardedResponse::Updated { .. } => {}
+        UpdateGuardedResponse::Refused { guard } => return Err(refused_by(guard)),
+        UpdateGuardedResponse::NoMatch => return Err(ReserveError::Held),
     }
     Ok(Reservation {
         id: row.id,
@@ -571,55 +665,46 @@ async fn claim_existing(
     })
 }
 
-/// Insert the `Pending` row `claim` describes unless `(bucket, key)` already
-/// has one. `Some(id)` when this insert created the row; `None` when the
-/// unique index already held a row for the key and nothing was written.
+/// What [`insert_reservation`] did.
+enum Inserted {
+    /// The row was inserted, with this id.
+    Created(String),
+    /// `(bucket, key)` already has a row; nothing was written.
+    KeyTaken,
+    /// A quota cap refused the insert; nothing was written.
+    Refused(ReserveError),
+}
+
+/// Insert the `Pending` row `claim` describes, as a guarded write under
+/// [`quota_guards`].
 ///
-/// The id is minted here, not by the database, because `db::upsert` answers
-/// only how many rows it affected: a row this call created has the id it
-/// was given.
-async fn insert_unless_taken(
+/// The id is minted here, so a created row is known by the id it was given.
+async fn insert_reservation(
     ctx: &dyn Context,
     claim: &PendingClaim<'_>,
-) -> Result<Option<String>, WaferError> {
+) -> Result<Inserted, WaferError> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = crate::util::now_rfc3339();
-    let inserted = db::upsert(
-        ctx,
-        TABLE,
-        vec![
-            ("id".to_string(), serde_json::json!(id)),
-            ("bucket".to_string(), serde_json::json!(claim.bucket)),
-            ("key".to_string(), serde_json::json!(claim.key)),
-            ("size".to_string(), serde_json::json!(claim.size)),
-            (
-                "content_type".to_string(),
-                serde_json::json!(claim.content_type),
-            ),
-            (
-                "status".to_string(),
-                serde_json::json!(ObjectStatus::Pending),
-            ),
-            (
-                "uploaded_by".to_string(),
-                serde_json::json!(claim.uploaded_by),
-            ),
-            (
-                "uploaded_at".to_string(),
-                serde_json::json!(claim.uploaded_at),
-            ),
-            ("claim_id".to_string(), serde_json::json!(claim.claim_id)),
-            ("blob_key".to_string(), serde_json::json!(claim.blob_key())),
-            ("created_at".to_string(), serde_json::json!(now)),
-            ("updated_at".to_string(), serde_json::json!(now)),
-        ],
-        vec!["bucket".to_string(), "key".to_string()],
-        // No columns to set: a conflict is `DO NOTHING`, and the row that
-        // caused it is the one the caller reads back and takes over.
-        OnConflict::SetColumns(vec![]),
-    )
-    .await?;
-    Ok((inserted > 0).then_some(id))
+    let data = crate::util::json_map(serde_json::json!({
+        "id": id,
+        "bucket": claim.bucket,
+        "key": claim.key,
+        "size": claim.size,
+        "content_type": claim.content_type,
+        "status": ObjectStatus::Pending,
+        "uploaded_by": claim.uploaded_by,
+        "uploaded_at": claim.uploaded_at,
+        "claim_id": claim.claim_id,
+        "blob_key": claim.blob_key(),
+        "created_at": now,
+        "updated_at": now,
+    }));
+    match db::insert_guarded(ctx, TABLE, data, &quota_guards(claim, None)).await {
+        Ok(InsertGuardedResponse::Inserted { .. }) => Ok(Inserted::Created(id)),
+        Ok(InsertGuardedResponse::Refused { guard }) => Ok(Inserted::Refused(refused_by(guard))),
+        Err(e) if e.code == ErrorCode::AlreadyExists => Ok(Inserted::KeyTaken),
+        Err(e) => Err(e),
+    }
 }
 
 /// The refusal [`release_reservation`] answers when the row no longer carries
@@ -642,6 +727,13 @@ fn claim_lost() -> WaferError {
 /// Only while the row still carries this reservation's `claim_id`; otherwise
 /// [`ErrorCode::Aborted`] and nothing is written, because the row now belongs
 /// to whichever upload took it over.
+///
+/// Putting a replaced object back is not held to the quota caps: its bytes
+/// are still stored, and the row describes them whatever the caps say. It can
+/// leave the object's uploader over a cap in one case — another user's
+/// upload took the row over, the object's uploader stored more in the room
+/// that freed, and the take-over then failed. Their next upload is refused
+/// until they are back under it.
 pub async fn release_reservation(
     ctx: &dyn Context,
     reservation: &Reservation,
@@ -954,10 +1046,10 @@ pub async fn count_for_uploader(ctx: &dyn Context, user_id: &str) -> Result<i64,
     db::count(ctx, TABLE, &owned_objects_filter(user_id)).await
 }
 
-/// Number of object rows `user_id` uploaded into `bucket` — what the
-/// per-bucket file-count cap (`QuotaConfig::max_files_per_bucket`) is
-/// checked against. Includes `pending` reservations, on the same basis as
-/// [`count_for_uploader`] and [`sum_size_for_uploader`].
+/// Test helper: number of object rows `user_id` uploaded into `bucket` — the
+/// rows [`reserve_upload`]'s file-count guard counts, `pending` reservations
+/// included.
+#[cfg(test)]
 pub async fn count_for_uploader_in_bucket(
     ctx: &dyn Context,
     user_id: &str,
@@ -1189,6 +1281,7 @@ mod tests {
             .expect("read")
             .expect("the row");
 
+        let quota = QuotaConfig::effective_default();
         let a = PendingClaim {
             bucket: "assets",
             key: "same.txt",
@@ -1197,6 +1290,7 @@ mod tests {
             uploaded_by: "alice",
             uploaded_at: read_at,
             claim_id: "claim-a",
+            quota: &quota,
         };
         claim_existing(&ctx, first_read, &a)
             .await
@@ -1236,9 +1330,17 @@ mod tests {
     #[tokio::test]
     async fn a_superseded_reservation_neither_completes_nor_releases_the_row() {
         let ctx = crate::test_support::TestContext::with_files().await;
-        let alice = reserve_upload(&ctx, "assets", "same.txt", 5, "text/plain", "alice")
-            .await
-            .expect("alice reserves");
+        let alice = reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            5,
+            "text/plain",
+            "alice",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("alice reserves");
         // Alice's upload stalls past the TTL.
         let stale = (chrono::Utc::now()
             - chrono::Duration::seconds(2 * PENDING_RESERVATION_TTL_SECONDS))
@@ -1251,9 +1353,17 @@ mod tests {
         )
         .await
         .expect("age alice's reservation");
-        let bob = reserve_upload(&ctx, "assets", "same.txt", 9, "text/csv", "bob")
-            .await
-            .expect("bob takes over the orphan");
+        let bob = reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            9,
+            "text/csv",
+            "bob",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("bob takes over the orphan");
         assert_eq!(bob.id, alice.id, "one key, one row");
 
         let completed = mark_complete(&ctx, &alice).await.expect("the row is read");
@@ -1289,17 +1399,43 @@ mod tests {
     #[tokio::test]
     async fn a_key_held_by_the_uploaders_own_reservation_says_so() {
         let ctx = crate::test_support::TestContext::with_files().await;
-        let first = reserve_upload(&ctx, "assets", "same.txt", 5, "text/plain", "alice")
-            .await
-            .expect("alice reserves");
+        let first = reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            5,
+            "text/plain",
+            "alice",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("alice reserves");
         let began = find_by_bucket_key(&ctx, "assets", "same.txt")
             .await
             .expect("read")
             .expect("the row")
             .uploaded_at;
 
-        let own = reserve_upload(&ctx, "assets", "same.txt", 5, "text/plain", "alice").await;
-        let other = reserve_upload(&ctx, "assets", "same.txt", 5, "text/plain", "bob").await;
+        let own = reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            5,
+            "text/plain",
+            "alice",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await;
+        let other = reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            5,
+            "text/plain",
+            "bob",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await;
 
         match own {
             Err(ReserveError::HeldByOwnEarlierUpload { since }) => assert_eq!(since, began),

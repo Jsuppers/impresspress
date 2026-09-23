@@ -20,8 +20,6 @@ Low-priority improvements identified during code review. None are blocking, but 
 
 ## Operations
 
-- **Files quota caps are not enforced atomically** — `quota::check_quota` reads the uploader's usage (a `sum` for `max_storage_bytes`, a per-bucket `count` for `max_files_per_bucket`) and `repo::objects::reserve_upload` then inserts the `pending` row, as separate database calls with no transaction or lock between them. Counting `pending` rows only narrows the window (an upload whose check runs after another's reservation landed is refused); it does not close it. In-flight uploads are exclusive per `(bucket, key)`, not per bucket or per user, so uploads of different keys whose checks all run before any of them reserves are all admitted and can exceed either cap by however many are in flight at once. `storage::objects::…::racing_uploads_of_different_keys_can_overshoot_the_bucket_cap` pins the overshoot. The fix is a conditional insert — insert the reservation only if the uploader's count / size sum stays under the cap, in one statement — which wants a builder in `wafer-sql-utils` covering both caps, not raw SQL in the block.
-
 - **Load/performance testing setup** — No load testing exists. A basic k6 or Artillery script targeting auth, storage, and admin endpoints would establish baseline throughput numbers and catch regressions.
 
 ## Scalability

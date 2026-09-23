@@ -534,9 +534,17 @@ mod tests {
     #[tokio::test]
     async fn create_share_refuses_an_upload_still_in_flight() {
         let ctx = ctx_for_share_round_trip("photos", "alice").await;
-        repo::objects::reserve_upload(&ctx, "photos", "a.png", 8, "image/png", "alice")
-            .await
-            .expect("reserve the upload");
+        repo::objects::reserve_upload(
+            &ctx,
+            "photos",
+            "a.png",
+            8,
+            "image/png",
+            "alice",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("reserve the upload");
         wafer_core::clients::storage::put(&ctx, "photos", "a.png", b"PNGBYTES", "image/png")
             .await
             .expect("the upload's bytes land before its row settles");
