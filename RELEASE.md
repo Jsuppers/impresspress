@@ -316,6 +316,48 @@ SDK's `getQuota()` type no longer has it. Drop the field from anything that
 sends or reads it. The database column is left in place, unused; there is
 nothing to do about it.
 
+### Files: an upload's claim on a key is exact (migration 004) — upgrade with `--run-migrations`
+
+**What changes.** An upload claims its `(bucket, key)` row before it stores
+the bytes, and a replacement takes over the existing row. That take-over was
+conditional on the row's `updated_at` timestamp, so two uploads of one key
+whose stamps landed in the same millisecond (or on two Workers isolates whose
+clocks disagreed) could both take the row: one row describing one upload while
+the blob held the other. Migration `004_object_claim_id` adds a nullable
+`claim_id` column to `impresspress__files__objects`; each reservation writes a
+random token there, and the take-over, the completion and the rollback of a
+failed upload each act only on the reservation the row still carries.
+
+**A retry after "Upload stored but could not be recorded" says what holds the
+key.** Such an upload leaves its reservation in place for up to an hour, and
+the user's retry used to be told "Another upload of this key is in progress".
+It now answers `409` with "Your earlier upload of this key, started at …, has
+not been recorded", saying when the key is released. The key is still held
+for that hour: the row cannot tell a failed upload from one still running.
+
+**Re-running the files migrations is safe for live data.** Adding 004 changes
+the hash of the files block's migration set, so the next `--run-migrations`
+boot (on Cloudflare, the first deploy of this release) re-runs **all** of them, 001 onwards, over
+the existing tables — the way a new auth migration re-runs the auth set. For
+files nothing is dropped and nothing live changes: 001 is `CREATE … IF NOT
+EXISTS` throughout, 002's duplicate-bucket `DELETE` finds nothing once its
+unique index exists, 003 only touches legacy share rows with no expiry, which
+its first run already dated, and 004 is an `ADD COLUMN` that PostgreSQL skips
+(`IF NOT EXISTS`) and SQLite/D1 answers with a duplicate-column error the
+runner treats as done. Share links, buckets, stored objects and uploads in
+flight come through byte-identical — pinned on SQLite by `replay_tests` and on
+PostgreSQL by the CI step that replays the set over seeded rows. Existing rows
+keep a `NULL` `claim_id`, which a take-over matches as it matches a token;
+nothing is backfilled, and nobody is signed out.
+
+**Without the migration.** Cloudflare deploys always run it. A native
+deployment that skips `--run-migrations` logs the generic `schema drift;
+redeploy with --run-migrations to apply` warning for the files block on each
+boot, and uploads keep working because strict schema is off by default there
+and the column is added on the first upload. If you have turned
+`WAFER_RUN__DATABASE__STRICT_SCHEMA` **on**, the migration is not optional:
+every upload fails on the missing column until it runs.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one

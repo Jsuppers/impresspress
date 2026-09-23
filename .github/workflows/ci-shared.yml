@@ -1541,6 +1541,34 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_in'")" = "2026-06-13T05:43:03Z"
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_before'")" = "2027-05-14T05:43:02Z"
 
+      # Files 004 adds `objects.claim_id`. Shipping it changes the hash of the
+      # files block's joined SQL, so an upgrading deployment re-runs EVERY
+      # files migration over its live rows. This replays the whole set over
+      # what the steps above left (the dated share links included) plus a
+      # stored object and a reservation in flight, and requires every row of
+      # every files table to come back byte-identical — no link re-dated, no
+      # bucket or object deleted, no claim cleared. `replay_tests` in
+      # `blocks/files/migrations` pins the same on SQLite.
+      - name: Files migrations replay over live rows without changing them
+        run: |
+          test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM information_schema.columns WHERE table_name = 'impresspress__files__objects' AND column_name = 'claim_id'")" -eq 1
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__files__buckets (id, name, public, created_by, created_at, updated_at) VALUES ('b_photos', 'photos', FALSE, 'alice', '2026-04-20T10:00:00Z', '2026-04-20T10:00:00Z')"
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__files__objects (id, bucket, key, size, content_type, status, uploaded_by, uploaded_at, claim_id, created_at, updated_at) VALUES ('o_stored', 'photos', 'a.png', 8, 'image/png', 'complete', 'alice', '2026-09-01T00:00:00Z', 'claim-stored', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z'), ('o_legacy', 'photos', 'b.png', 4, 'image/png', 'complete', 'alice', '2026-01-01T00:00:00Z', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('o_flight', 'photos', 'c.png', 2, 'image/png', 'pending', 'alice', '2026-09-24T00:00:00Z', 'claim-flight', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z')"
+          snapshot() {
+            for table in buckets objects views cloud_shares cloud_access_logs cloud_quotas; do
+              psql --tuples-only --no-align --set ON_ERROR_STOP=1 --command "SELECT coalesce(md5(string_agg(t::text, '|' ORDER BY t.id)), 'empty') FROM impresspress__files__${table} t"
+            done
+          }
+          before="$(snapshot)"
+          for migration in crates/impresspress-core/src/blocks/files/migrations/*.postgres.sql; do
+            echo "replaying ${migration}"
+            psql --set ON_ERROR_STOP=1 --file "${migration}"
+          done
+          after="$(snapshot)"
+          echo "before: ${before}"
+          echo "after:  ${after}"
+          test "${before}" = "${after}"
+
       # Auth 015 respells readable UTC API-key expiries and revokes the keys
       # whose expiry `repo::parse_iso` cannot read. The line between the two
       # is drawn by hand in each dialect, so each dialect is run against the
