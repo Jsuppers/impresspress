@@ -743,12 +743,9 @@ pub(crate) mod helpers {
         // freshly minted token reflects the true value, not a stale cache
         // hit — a lookup failure fails the mint closed rather than risk
         // embedding a version the caller can't vouch for.
-        let auth_version = repo::users::auth_version(ctx, user_id).await.map_err(|e| {
-            wafer_run::OutputStream::error(wafer_run::WaferError::new(
-                wafer_run::ErrorCode::Internal,
-                format!("auth_version lookup failed for {user_id}: {e}"),
-            ))
-        })?;
+        let auth_version = repo::users::auth_version(ctx, user_id)
+            .await
+            .map_err(|e| crate::blocks::crud::db_error_internal(e, "auth_version lookup failed"))?;
 
         let mut access_claims = HashMap::new();
         access_claims.insert(
@@ -1057,7 +1054,9 @@ pub(crate) mod helpers {
 
         store_refresh_token(ctx, user_id, &refresh_token, &issued_family, generation)
             .await
-            .map_err(|e| crate::http::err_internal("Could not persist the refresh token", e))?;
+            .map_err(|e| {
+                crate::blocks::crud::db_error_internal(e, "Could not persist the refresh token")
+            })?;
         record_login_family(
             ctx,
             user_id,

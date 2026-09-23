@@ -14,9 +14,10 @@ use crate::{
             contracts::{AuthenticatedUser, LoginRequest, LoginResponse, TokenType},
             redirect::{default_post_login_redirect, is_safe_local_redirect},
         },
+        crud,
         errors::{error_response, ErrorCode},
     },
-    http::{err_bad_request, err_internal, ResponseBuilder},
+    http::{err_bad_request, ResponseBuilder},
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
@@ -34,7 +35,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // credentials" — that would mask outages and silently log users out.
     let user_row = match users::find_by_email(ctx, &email_lower).await {
         Ok(opt) => opt,
-        Err(e) => return err_internal("User lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "User lookup failed"),
     };
 
     // The real stored credential, if this login has one at all. A user with
@@ -49,7 +50,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
                 Some(&stored_hash_owned)
             }
             Ok(None) => None,
-            Err(e) => return err_internal("Credential lookup failed", e),
+            Err(e) => return crud::db_error_internal(e, "Credential lookup failed"),
         },
         None => None,
     };
@@ -107,7 +108,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // (SB-3).
     let roles = match ensure_admin_role(ctx, &user.id, &email_lower).await {
         Ok(r) => r,
-        Err(e) => return err_internal("Failed to resolve user roles", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
 
     // Mint tokens, persist the refresh + session rows, build the cookie.

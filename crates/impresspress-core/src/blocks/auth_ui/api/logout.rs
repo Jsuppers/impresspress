@@ -12,9 +12,10 @@ use crate::{
             },
         },
         auth_ui::contracts::MessageResponse,
+        crud,
     },
     crypto::{META_AUTH_EXP, META_AUTH_JTI},
-    http::{err_internal, ResponseBuilder},
+    http::ResponseBuilder,
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -33,7 +34,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 error = %e,
                 "logout: refresh-token revocation failed"
             );
-            return err_internal("Logout could not fully revoke the session", e);
+            return crud::db_error_internal(e, "Logout could not fully revoke the session");
         }
 
         // [B12] Logout is an all-devices operation — the line above revokes
@@ -49,7 +50,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 error = %e,
                 "logout: session-row deletion failed"
             );
-            return err_internal("Logout could not fully revoke the session", e);
+            return crud::db_error_internal(e, "Logout could not fully revoke the session");
         }
 
         // SEC-042: the currently-presented access JWT stays structurally
@@ -98,7 +99,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     error = %e,
                     "logout: jwt blocklist insert failed"
                 );
-                return err_internal("Logout could not fully revoke the session", e);
+                return crud::db_error_internal(e, "Logout could not fully revoke the session");
             }
         }
     }

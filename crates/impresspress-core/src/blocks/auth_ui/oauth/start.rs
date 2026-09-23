@@ -23,7 +23,10 @@ use wafer_core::clients::config;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::oauth_pkce::{self, NewPkceState},
+    blocks::{
+        auth::repo::oauth_pkce::{self, NewPkceState},
+        crud,
+    },
     http::{err_bad_request, err_forbidden, err_internal, ResponseBuilder},
     util::urlencode,
 };
@@ -111,7 +114,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     )
     .await
     {
-        return err_internal("Failed to persist OAuth state", e);
+        return crud::db_error_internal(e, "Failed to persist OAuth state");
     }
 
     // urlencode every interpolation site uniformly. `client_id` / `redirect_uri`

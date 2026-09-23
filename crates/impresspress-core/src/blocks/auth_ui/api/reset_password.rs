@@ -10,6 +10,7 @@ use crate::{
             repo::{local_credentials, tokens, users},
         },
         auth_ui::contracts::MessageResponse,
+        crud,
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, ok_json},
@@ -48,7 +49,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         // the caller already holds the token — so nothing is protected by
         // calling an outage an expired link, and the advice that follows
         // ("request a new one") destroys the token they are holding.
-        Err(e) => return err_internal("Could not check the reset token", e),
+        Err(e) => return crud::db_error_internal(e, "Could not check the reset token"),
     };
 
     // Check expiry — reject if missing or malformed (tokens must have an expiry)
@@ -83,12 +84,12 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // Update credential row (typed path, no password_hash on users table).
     if let Err(e) = local_credentials::update_password(ctx, &user.id, &new_hash).await {
-        return err_internal("Failed to update password", e);
+        return crud::db_error_internal(e, "Failed to update password");
     }
 
     // Clear reset token on the users row.
     if let Err(e) = users::clear_reset_token(ctx, &user.id).await {
-        return err_internal("Failed to clear reset token", e.to_string());
+        return crud::db_error_internal(e, "Failed to clear reset token");
     }
 
     // A redeemed reset link is mailbox proof of exactly the same strength as
@@ -131,7 +132,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             error = %e,
             "password reset but refresh-token revocation failed"
         );
-        return err_internal("Password reset but session revocation failed", e);
+        return crud::db_error_internal(e, "Password reset but session revocation failed");
     }
 
     // P2c: invalidate already-issued access JWTs too — refresh revocation
@@ -145,7 +146,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             error = %e,
             "password reset but auth_version bump failed"
         );
-        return err_internal("Password reset but session invalidation failed", e);
+        return crud::db_error_internal(e, "Password reset but session invalidation failed");
     }
 
     ok_json(&MessageResponse {

@@ -75,6 +75,25 @@ pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputS
     seal(classify_db_error(error, None, context), context)
 }
 
+/// [`db_error_internal`] for a read a full page renders from.
+///
+/// A page whose read failed is never drawn from defaults (see
+/// [`crate::ui::server_error_response`]), and what it answers instead is
+/// classified here like every other failed database call: a WRAP denial is
+/// the 403 page and a quota the 429 page ([`crate::ui::refused_response`]),
+/// anything else is logged under `context` and answered with the styled 500.
+/// An API caller (an `Accept` without `text/html`) gets the same statuses as
+/// JSON.
+pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str) -> OutputStream {
+    match classify_db_error(error, None, context) {
+        DbFailure::Refused(error) => crate::ui::refused_response(msg, error),
+        DbFailure::Internal(error) => {
+            tracing::error!(context = %context, error = %error, "page read failed");
+            crate::ui::server_error_response(msg)
+        }
+    }
+}
+
 /// What [`db_error`] decided, before it is sealed into a response.
 ///
 /// [`db_error`] seals this itself and is what almost every call site wants.

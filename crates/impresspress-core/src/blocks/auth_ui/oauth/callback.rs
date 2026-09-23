@@ -17,6 +17,7 @@ use crate::{
             repo::{oauth_pkce, provider_links, users},
         },
         auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        crud,
         errors::{impresspress_error_code_to_wafer, ErrorCode},
     },
     http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, ResponseBuilder},
@@ -86,9 +87,11 @@ pub async fn handle(
 
     // From here the flow is spent however it ends. Every answer this handler
     // *decides* — the 302 and each `refuse` below — carries the expiry of its
-    // binding cookie. The internal errors do not: `err_internal` says this
-    // deployment failed, the flow is unfinished rather than concluded, and
-    // the cookie expires on its own with the state it names.
+    // binding cookie. The deployment's own failures do not — the
+    // `err_internal` 500s, and the 403/429 `crud::db_error_internal` answers
+    // for a database call WRAP refused or a quota stopped: the flow is
+    // unfinished rather than concluded, and the cookie expires on its own
+    // with the state it names.
     let clear_binding = super::state_binding::clear(ctx, state).await;
 
     // SEC-040: look up the server-side PKCE state by the opaque `state_id`
@@ -104,7 +107,7 @@ pub async fn handle(
                 &clear_binding,
             )
         }
-        Err(e) => return err_internal("OAuth state lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "OAuth state lookup failed"),
     };
     let provider = pkce_row.provider.clone();
     let code_verifier = pkce_row.code_verifier.clone();
@@ -197,7 +200,7 @@ pub async fn handle(
     };
     let roles = match roles_result {
         Ok(r) => r,
-        Err(e) => return err_internal("Failed to resolve user roles", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
 
     // Mint tokens, persist the refresh + session rows, build the cookie via
@@ -512,7 +515,7 @@ async fn resolve_user(
     let existing_link =
         match provider_links::find_by_provider_ref(ctx, provider, &info.provider_ref).await {
             Ok(l) => l,
-            Err(e) => return Err(err_internal("provider_links lookup failed", e)),
+            Err(e) => return Err(crud::db_error_internal(e, "provider_links lookup failed")),
         };
 
     // --- Step 2 / 3: resolve user_id ---
@@ -631,10 +634,10 @@ async fn resolve_user(
                 // rows password signup produces.
                 match users::insert(ctx, new_user).await {
                     Ok(u) => u.id,
-                    Err(e) => return Err(err_internal("Failed to create user", e)),
+                    Err(e) => return Err(crud::db_error_internal(e, "Failed to create user")),
                 }
             }
-            Err(e) => return Err(err_internal("User lookup failed", e)),
+            Err(e) => return Err(crud::db_error_internal(e, "User lookup failed")),
         }
     };
 
@@ -665,7 +668,7 @@ async fn resolve_user(
                 clear_binding,
             ))
         }
-        Err(e) => return Err(err_internal("User lookup failed", e)),
+        Err(e) => return Err(crud::db_error_internal(e, "User lookup failed")),
     };
 
     // --- Step 4: bind the provider identity to the account ---
@@ -702,7 +705,10 @@ async fn resolve_user(
         if !account.email_is_proven() {
             let proof = users::proof::oauth(provider);
             if let Err(e) = users::record_email_proof(ctx, &user_id, &proof).await {
-                return Err(err_internal("Failed to record the verified email", e));
+                return Err(crud::db_error_internal(
+                    e,
+                    "Failed to record the verified email",
+                ));
             }
         }
         true

@@ -11,6 +11,7 @@ use crate::{
             repo::{local_credentials, tokens, users},
         },
         auth_ui::contracts::MessageResponse,
+        crud,
         errors::{error_response, ErrorCode},
     },
     http::{err_bad_request, err_internal, err_not_found, ok_json},
@@ -58,7 +59,8 @@ fn changed_response(msg: &Message) -> OutputStream {
 ///
 /// Only refusals travel this way. A read that could not run or a write that
 /// did not land is not a sentence the caller can act on, and stays an error
-/// terminal so the status is honest and [`err_internal`]'s correlation id
+/// terminal so the status is honest — [`crud::db_error_internal`]'s 403 for a
+/// WRAP denial, 429 for a quota, and otherwise the 500 whose correlation id
 /// reaches the logs — the same split `handle_unlink` makes.
 ///
 /// JSON callers are untouched: `/b/auth/change-password`'s `fetch` reads
@@ -111,7 +113,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     match users::find_by_id(ctx, user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return err_not_found("User not found"),
-        Err(e) => return err_internal("Could not load the signed-in user", e),
+        Err(e) => return crud::db_error_internal(e, "Could not load the signed-in user"),
     };
 
     // Fetch existing credential row — must have one to change password.
@@ -124,7 +126,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
                 "No password set for this account",
             )
         }
-        Err(e) => return err_internal("Credential lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "Credential lookup failed"),
     };
 
     if crypto::compare_hash(ctx, &body.current_password, &cred.password_hash)
@@ -174,7 +176,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
                             error = %e,
                             "password changed but auth_version bump failed"
                         );
-                        return err_internal("Password changed but session invalidation failed", e);
+                        return crud::db_error_internal(
+                            e,
+                            "Password changed but session invalidation failed",
+                        );
                     }
                     changed_response(msg)
                 }
@@ -184,11 +189,11 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
                         error = %e,
                         "password changed but refresh-token revocation failed"
                     );
-                    err_internal("Password changed but session revocation failed", e)
+                    crud::db_error_internal(e, "Password changed but session revocation failed")
                 }
             }
         }
-        Err(e) => err_internal("Update failed", e),
+        Err(e) => crud::db_error_internal(e, "Update failed"),
     }
 }
 

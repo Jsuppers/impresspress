@@ -9,9 +9,10 @@ use crate::{
             repo::users::{self, UserRow},
         },
         auth_ui::contracts::{MeResponse, MeUser, UpdateMeRequest},
+        crud,
         errors::{error_response, ErrorCode},
     },
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_not_found, ok_json},
 };
 
 /// The one projection both handlers share. `PATCH` used to build its own
@@ -45,11 +46,11 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         // A read that could not run is not a deleted account. 404 is the one
         // answer a signed-in caller must never get from an outage — no
         // client retries it, and it reads as "you no longer exist".
-        Err(e) => return err_internal("Could not load the signed-in user", e),
+        Err(e) => return crud::db_error_internal(e, "Could not load the signed-in user"),
     };
     let roles = match get_user_roles(ctx, user_id).await {
         Ok(r) => r,
-        Err(e) => return err_internal("Failed to resolve user roles", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
     ok_json(&me_response(user, roles))
 }
@@ -79,11 +80,11 @@ pub async fn handle_update(ctx: &dyn Context, msg: &Message, input: InputStream)
         Ok(user) => {
             let roles = match get_user_roles(ctx, user_id).await {
                 Ok(r) => r,
-                Err(e) => return err_internal("Failed to resolve user roles", e),
+                Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
             };
             ok_json(&me_response(user, roles))
         }
-        Err(e) => err_internal("Update failed", e.to_string()),
+        Err(e) => crud::db_error(e, "User not found", "Update failed"),
     }
 }
 
