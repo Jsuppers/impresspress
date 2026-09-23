@@ -77,9 +77,9 @@ pub struct TestContext {
     /// WRAP-enforcement caller identity. `None` = WRAP checks skipped (the
     /// default — keeps existing tests untouched). Set via [`with_wrap`].
     caller_id: Option<String>,
-    /// The caller block's own `requires` allowlist — the *other* gate
-    /// production applies to a `call_block`, and the one that sits above the
-    /// grant check.
+    /// The caller block's own `requires` allowlist — the gate production
+    /// applies to a `call_block` itself, before the callee's handler makes
+    /// any grant check.
     ///
     /// `Wafer::make_block_context` installs a block's declared `requires` on
     /// every context that block's code runs in, and
@@ -267,17 +267,19 @@ impl TestContext {
         self.register_block("wafer-run/config", block);
     }
 
-    /// Opt the test into the two permission gates production applies to a
-    /// `call_block`: the caller's `requires` allowlist, and WRAP.
+    /// Opt the test into the two permission checks production applies to a
+    /// block's calls: the caller's `requires` allowlist, and WRAP.
     ///
-    /// Until called, `call_block` enforces neither — this matches
-    /// pre-existing test behaviour. After calling, a call is refused unless
-    /// the target is named in `requires` (when that list is non-empty), and
-    /// then the same WRAP rules the production runtime applies
-    /// (own-resource, admin override, grant match) gate every invocation
-    /// carrying `wrap.resource` meta. Typed clients
-    /// (`wafer_core::clients::database::*`, etc.) set that meta
-    /// automatically, so this is what makes a test exercise grants.
+    /// Until called, neither is enforced — this matches pre-existing test
+    /// behaviour. After calling, `call_block` refuses a target not named in
+    /// `requires` (when that list is non-empty), and
+    /// [`Context::check_resource_access`] applies the same WRAP rules the
+    /// production runtime does (own-resource, admin override, grant match,
+    /// and the access each op needs). WRAP is not a `call_block` gate, here
+    /// or in production: the service handler a call reaches authorizes the
+    /// op it decoded through that method — so a grant is exercised only
+    /// behind a handler that authorizes, such as the real
+    /// `wafer-run/database` block this fixture runs.
     ///
     /// `caller_id` is the block id the test is acting as — typically the
     /// block whose handler is under test.
@@ -2061,8 +2063,8 @@ impl Context for TestContext {
 
     /// The block identity a test opted into via [`Self::with_wrap`].
     ///
-    /// The same field already backs `check_resource_access` and the
-    /// `call_block` grant check; publishing it here is what makes handler code
+    /// The same field already backs `check_resource_access`; publishing it
+    /// here is what makes handler code
     /// that *reads* its caller — `blocks::storage::ImpresspressStorageBlock`
     /// namespaces every path under `ctx.caller_id()` — behave in a test the
     /// way it does in production. Without this it saw `None`, filed every

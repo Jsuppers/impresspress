@@ -31,18 +31,31 @@ use super::repo::{pats, users};
 use crate::blocks::crud::{classify_db_error, DbFailure};
 
 /// A failed lower-level call under an auth check, as the [`AuthError`] the
-/// caller gets: [`AuthError::Backend`], carrying the failure's code.
+/// caller gets.
 ///
 /// The auth handler passes a `Backend` error to the calling block
 /// untouched, and the HTTP boundary writes its message into the response
 /// body — while a raw WRAP refusal names the grant and the table. So the
 /// error goes through the database-error classifier every block uses
-/// ([`classify_db_error`]): a refusal arrives as `PermissionDenied "Access
-/// denied"` or `ResourceExhausted` with its detail logged under `context`,
-/// and anything else is logged here and sent on as a generic `Internal`.
+/// ([`classify_db_error`]): a refusal arrives as `Backend(PermissionDenied
+/// "Access denied")` or `Backend(ResourceExhausted)` with its detail logged
+/// under `context`. Of the rest, an unreachable or timed-out backend
+/// (`Unavailable`, `DeadlineExceeded`) is [`AuthError::ProviderDown`], which
+/// the auth handler answers `Unavailable` (503) so the client keeps its
+/// retry signal; any other failure is a genuine fault, logged here and sent
+/// on as a generic `Internal`.
 fn backend_error(error: WaferError, context: &str) -> AuthError {
     match classify_db_error(error, None, context) {
         DbFailure::Refused(refusal) => AuthError::Backend(refusal),
+        DbFailure::Internal(fault)
+            if matches!(
+                fault.code,
+                ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+            ) =>
+        {
+            tracing::warn!(context = %context, error = %fault, "auth backend unavailable");
+            AuthError::ProviderDown("Authentication is temporarily unavailable".to_string())
+        }
         DbFailure::Internal(fault) => {
             tracing::error!(context = %context, error = %fault, "auth backend call failed");
             AuthError::Backend(WaferError::new(
@@ -891,5 +904,52 @@ mod tests {
             !body.contains("personal_access_tokens") && !body.contains("impresspress/probe"),
             "the refusal's grant and table must not reach the body: {body}"
         );
+    }
+
+    /// An unreachable or timed-out backend under the same PAT lookup reaches
+    /// the caller route as a 503 — the retry signal — with a generic message,
+    /// while any other fault stays a 500. Neither carries the backend's text.
+    #[tokio::test]
+    async fn an_unavailable_token_lookup_reaches_the_caller_route_as_503() {
+        const DETAIL: &str = "d1 unreachable while reading wafer_run__auth__personal_access_tokens";
+
+        for (code, want_status) in [
+            (ErrorCode::Unavailable, 503),
+            (ErrorCode::DeadlineExceeded, 503),
+            (ErrorCode::Internal, 500),
+        ] {
+            let mut ctx = with_admin_and_jwt_secret().await;
+            AuthServiceImpl::new(BlockState::for_test(Arc::new(ctx.clone())))
+                .init(&ctx)
+                .await
+                .expect("auth init applies the auth migrations");
+            let failing = crate::test_support::FailingDbOpContext::failing_with(
+                ctx.clone(),
+                vec![("database.list", pats::TABLE)],
+                WaferError::new(code, DETAIL),
+            );
+            let service = AuthServiceImpl::new(BlockState::for_test(Arc::new(failing)));
+            ctx.register_block(
+                "wafer-run/auth",
+                Arc::new(wafer_core::service_blocks::auth::AuthBlock::new(Arc::new(
+                    service,
+                ))),
+            );
+
+            let mut request = Message::new("retrieve");
+            request.set_meta("http.header.authorization", "Bearer wafer_pat_down");
+            let out = match wafer_core::clients::auth::require_user(&ctx, &request).await {
+                Ok(id) => panic!("{code:?}: a failed token lookup must not authenticate {id}"),
+                Err(e) => wafer_run::OutputStream::error(e),
+            };
+            let response = wafer_block::http_codec::collect_http_response(out).await;
+            let body = String::from_utf8(response.body).expect("UTF-8 body");
+
+            assert_eq!(response.status, want_status, "{code:?}: {body}");
+            assert!(
+                !body.contains("personal_access_tokens") && !body.contains("d1 unreachable"),
+                "{code:?}: the backend's text must not reach the body: {body}"
+            );
+        }
     }
 }
