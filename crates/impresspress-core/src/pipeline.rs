@@ -4116,6 +4116,10 @@ mod credential_check_tests {
             location.is_empty(),
             "no redirect to the login form: {location}"
         );
+        assert!(
+            !body.contains("simulated database outage") && !body.contains(jwt_blocklist::TABLE),
+            "the fault's own text stays in the log: {body}"
+        );
     }
 
     /// A WRAP refusal keeps the code the database classifier gives it — the
@@ -4143,6 +4147,100 @@ mod credential_check_tests {
             !body.contains("impresspress/router"),
             "the refusal's grant and table stay in the log: {body}"
         );
+    }
+
+    /// `GET /b/auth/login` — a public page — with `authorization`, if any.
+    async fn get_login_page(
+        ctx: &dyn wafer_run::context::Context,
+        authorization: Option<&str>,
+    ) -> OutputStream {
+        let mut msg = anon_msg("retrieve", "/b/auth/login");
+        msg.set_meta("http.header.accept", "text/html");
+        handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            authorization,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await
+    }
+
+    /// A public route is refused too when it is presented a credential that
+    /// cannot be checked — the request names a caller, and the page would
+    /// otherwise be rendered for an anonymous one — while the same route
+    /// without a credential has nothing to check and is served as ever.
+    #[tokio::test]
+    async fn a_public_route_is_refused_only_when_it_presents_a_credential() {
+        let (ctx, uid) = signed_in_fixture().await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let (status, _, body) = answer(get_login_page(&down, None).await).await;
+        assert_eq!(status, 200, "no credential, nothing to check: {body}");
+
+        let (status, _, body) = answer(get_login_page(&down, Some(&bearer(&uid))).await).await;
+        assert_eq!(status, 503, "{body}");
+    }
+
+    /// A real key for a fresh user, so the API-key cases fail a read the
+    /// check actually reaches.
+    async fn seed_key(ctx: &TestContext) -> String {
+        let uid = seed_user(ctx).await;
+        let raw = format!("sb_test_{}", uuid::Uuid::new_v4().simple());
+        api_keys::insert(
+            ctx,
+            api_keys::NewApiKey {
+                user_id: &uid,
+                name: "test-key",
+                key_hash: &crate::util::sha256_hex(raw.as_bytes()),
+                key_prefix: "sb_test",
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("seed api key");
+        format!("ApiKey {raw}")
+    }
+
+    /// The control for the API-key cases: with the database up, the key
+    /// reaches the route as its user.
+    #[tokio::test]
+    async fn a_valid_api_key_reaches_the_route_while_the_database_answers() {
+        let (ctx, _) = signed_in_fixture().await;
+        let key = seed_key(&ctx).await;
+        let (status, _, body) = answer(get_me(&ctx, &key, false).await).await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// The key is found, and the read of its user fails: a 503, not the
+    /// anonymous answer.
+    #[tokio::test]
+    async fn a_failed_api_key_user_lookup_is_a_503() {
+        let (ctx, _) = signed_in_fixture().await;
+        let key = seed_key(&ctx).await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let (status, _, body) = answer(get_me(&down, &key, false).await).await;
+        assert_eq!(status, 503, "{body}");
+    }
+
+    /// The key and its user are found, and the roles read fails: a 503, not
+    /// the anonymous answer and not an identity stamped with no roles.
+    #[tokio::test]
+    async fn a_failed_api_key_roles_lookup_is_a_503() {
+        let (ctx, _) = signed_in_fixture().await;
+        let key = seed_key(&ctx).await;
+        let down = FailingDbOpContext::new(
+            ctx,
+            vec![("database.list", crate::platform_state::user_roles::TABLE)],
+        );
+
+        let (status, _, body) = answer(get_me(&down, &key, false).await).await;
+        assert_eq!(status, 503, "{body}");
     }
 
     /// The API-key path is the same check over a different credential: a

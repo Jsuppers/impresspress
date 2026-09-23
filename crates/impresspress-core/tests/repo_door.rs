@@ -839,6 +839,11 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // the table its database site reads or writes, so the denial
             // lands on the query under test.
             "blocks/admin/error_mapping_tests.rs",
+            // A fault injector: the API-key credential check reads the key,
+            // its user and THEN the user's grants, and
+            // `pipeline::credential_check_tests` fails exactly the grants
+            // read. `break_reads` would fail the key lookup first.
+            "pipeline.rs",
         ],
     ),
     (

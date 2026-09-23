@@ -267,15 +267,15 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         // bootstrap_tokens / orgs / api_keys without enumerating each.
         wafer_run::ResourceGrant::read_write("impresspress/auth-ui", "wafer_run__auth__*"),
         // The pipeline router (ImpresspressRouterBlock, id `impresspress/router`)
-        // calls `jwt_blocklist::contains()` from `crate::crypto::extract_auth_meta`
-        // during request preprocessing — SEC-042 logout invalidates JWTs
+        // calls `jwt_blocklist::contains()` from `crate::crypto::verify_access_token`
+        // (through `extract_auth_meta`) during request preprocessing — SEC-042 logout invalidates JWTs
         // via this table. The call runs in the router's context, so the
         // router needs read access. Without it WRAP denies the read and
         // every request bearing an access JWT is refused with 403 "Access
         // denied" (`blocks::auth::credential_check_failed`).
         wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__jwt_blocklist"),
         // P2c: same pipeline-preprocessing shape as the blocklist grant
-        // above — `crate::crypto::extract_auth_meta` also calls
+        // above — `crate::crypto::verify_access_token` also calls
         // `blocks::auth::current_auth_version()`, which reads the users row
         // through `repo::users::auth_version()`, in the router's context on
         // every request bearing an access JWT. Without this grant WRAP
@@ -651,7 +651,7 @@ mod tests {
             "grants must include products: {consumers:?}"
         );
         // The pipeline router (impresspress/router) calls
-        // jwt_blocklist::contains() during extract_auth_meta to honour
+        // jwt_blocklist::contains() from verify_access_token to honour
         // SEC-042 (logout invalidates JWT). Without a grant, WRAP denies
         // the read and every signed-in request is refused with a 403.
         assert!(

@@ -344,8 +344,9 @@ async fn current_auth_version_at(
 }
 
 /// Resolve `user_id`'s current `auth_version` through the short-lived cache,
-/// using the real wall clock. Called by `crate::crypto::extract_auth_meta` on
-/// every request that presents an access JWT. See the module docs above.
+/// using the real wall clock. Called by `crate::crypto::verify_access_token`
+/// for every access JWT it checks — the pipeline's and `AuthServiceImpl`'s.
+/// See the module docs above.
 pub(crate) async fn current_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
