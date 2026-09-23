@@ -159,7 +159,8 @@ mod tests {
 
     /// Which spellings a stored timestamp column can be read back from.
     /// Migration `015_api_key_expiry_canonical` sorts rows by exactly this
-    /// rule, so its SQL and this function have to agree on the boundary.
+    /// rule, so its SQL and this function have to agree on the boundary;
+    /// `migrations::api_key_expiry_tests` holds both to the same cases.
     #[test]
     fn parse_iso_reads_rfc_3339_and_nothing_else() {
         for (stored, utc) in [

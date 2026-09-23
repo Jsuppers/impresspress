@@ -1541,6 +1541,34 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_in'")" = "2026-06-13T05:43:03Z"
           test "$(psql --tuples-only --no-align --command "SELECT expires_at FROM impresspress__files__cloud_shares WHERE id = 'boundary_before'")" = "2027-05-14T05:43:02Z"
 
+      # Auth 015 respells readable UTC API-key expiries and revokes the keys
+      # whose expiry `repo::parse_iso` cannot read. The line between the two
+      # is drawn by hand in each dialect, so each dialect is run against the
+      # same cases: `015_api_key_expiry_canonical.cases.tsv`, which
+      # `api_key_expiry_tests` holds to `parse_iso` itself and to the SQLite
+      # dialect. Every row is seeded, the file is run twice (auth migrations
+      # re-run as a set, so the cases must hold after both passes), and any row
+      # whose expiry or revocation differs from its case is printed before
+      # the count fails the step. 015 already ran above against an empty
+      # table.
+      - name: Migration auth/015 agrees with the reader, row for row
+        env:
+          PGCLIENTENCODING: UTF8
+          CASES: crates/impresspress-core/src/blocks/auth/migrations/015_api_key_expiry_canonical.cases.tsv
+          MIGRATION: crates/impresspress-core/src/blocks/auth/migrations/015_api_key_expiry_canonical.postgres.sql
+        run: |
+          psql --set ON_ERROR_STOP=1 --command "CREATE TABLE auth_015_cases (stored TEXT PRIMARY KEY, after TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('active', 'revoked')))"
+          grep -v '^#' "${CASES}" | psql --set ON_ERROR_STOP=1 --command "\copy auth_015_cases FROM pstdin"
+          test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM auth_015_cases")" -eq "$(grep -vc '^#' "${CASES}")"
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO wafer_run__auth__users (id, email, display_name, created_at, updated_at) VALUES ('owner_015', 'owner-015@example.com', 'owner', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO wafer_run__auth__api_keys (id, user_id, name, key_hash, key_prefix, created_at, expires_at) SELECT stored, 'owner_015', stored, stored, 'sb_legacy', '2026-01-01T00:00:00Z', stored FROM auth_015_cases"
+          for pass in first second; do
+            echo "015, ${pass} pass"
+            psql --set ON_ERROR_STOP=1 --file "${MIGRATION}"
+            psql --set ON_ERROR_STOP=1 --command "SELECT c.stored, c.after, c.outcome, k.expires_at, k.revoked_at FROM auth_015_cases c JOIN wafer_run__auth__api_keys k ON k.id = c.stored WHERE k.expires_at IS DISTINCT FROM c.after OR (coalesce(k.revoked_at, '') <> '') <> (c.outcome = 'revoked')"
+            test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM auth_015_cases c JOIN wafer_run__auth__api_keys k ON k.id = c.stored WHERE k.expires_at IS NOT DISTINCT FROM c.after AND (coalesce(k.revoked_at, '') <> '') = (c.outcome = 'revoked')")" -eq "$(grep -vc '^#' "${CASES}")"
+          done
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

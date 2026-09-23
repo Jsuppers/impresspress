@@ -573,29 +573,77 @@ mod api_key_expiry_tests {
         assert!(key.is_expired(chrono::Utc::now()));
     }
 
-    /// The documented gap: both arms decide by SHAPE, and a shape is not an
-    /// instant. `2026-02-31T00:00:00Z` is well-formed and names no day, so
-    /// `parse_iso` rejects it while arm 2's test calls it readable. The key
-    /// is dead to the reader and the row still looks active — the migration
-    /// header, RELEASE.md and the PR all say so, and this pins it so the
-    /// claim cannot quietly become false in either direction.
+    /// Every case in `015_api_key_expiry_canonical.cases.tsv`, held to the
+    /// reader first and to the repair second. The migration's line between
+    /// "respell" and "revoke" is drawn by hand in SQL, so the one thing it
+    /// must never do is disagree with `repo::parse_iso`: a key the reader
+    /// refuses left looking active in the admin tab, or a key the reader
+    /// accepts revoked. The cases sit at every edge of chrono's RFC 3339
+    /// grammar — the calendar, each field's range, the fraction, the offset
+    /// and what may follow it. CI's PostgreSQL job runs the same file
+    /// through the PostgreSQL dialect.
     #[tokio::test]
-    async fn a_well_formed_impossible_instant_is_left_as_it_is() {
+    async fn every_case_is_revoked_exactly_when_the_reader_refuses_it() {
+        let cases: Vec<(&str, &str, bool)> = include_str!("015_api_key_expiry_canonical.cases.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| match line.split('\t').collect::<Vec<_>>()[..] {
+                [stored, after, "active"] => (stored, after, false),
+                [stored, after, "revoked"] => (stored, after, true),
+                _ => panic!("malformed case line {line:?}"),
+            })
+            .collect();
+
+        for &(stored, after, revoked) in &cases {
+            let read = crate::blocks::auth::repo::parse_iso(stored);
+            assert_eq!(
+                read.is_none(),
+                revoked,
+                "case {stored:?}: `revoked` must be exactly what parse_iso refuses"
+            );
+            if let Some(instant) = read {
+                assert_eq!(
+                    crate::blocks::auth::repo::parse_iso(after),
+                    Some(instant),
+                    "case {stored:?}: a respelling must name the same instant"
+                );
+            } else {
+                assert_eq!(
+                    after, stored,
+                    "case {stored:?}: a revoked row keeps its text"
+                );
+            }
+        }
+
         let ctx = upgrading_deployment().await;
-        let stored = "2026-02-31T00:00:00Z";
-        assert!(
-            crate::blocks::auth::repo::parse_iso(stored).is_none(),
-            "{stored} names no day"
-        );
-        let id = seed_key(&ctx, "impossible", Some(stored)).await;
+        let mut seeded = Vec::new();
+        for &(stored, after, revoked) in &cases {
+            seeded.push((
+                stored,
+                after,
+                revoked,
+                seed_key(&ctx, stored, Some(stored)).await,
+            ));
+        }
 
         apply_the_repair(&ctx).await;
 
-        let key = row(&ctx, &id).await;
-        assert_eq!(key.expires_at.as_deref(), Some(stored));
-        assert!(!key.is_revoked(), "the shape tests cannot see this one");
-        // Dead anyway: the reader is what enforces the expiry.
-        assert!(key.is_expired(chrono::Utc::now()));
+        let mut wrong = Vec::new();
+        for (stored, after, revoked, id) in seeded {
+            let key = row(&ctx, &id).await;
+            if key.expires_at.as_deref() != Some(after) || key.is_revoked() != revoked {
+                wrong.push(format!(
+                    "{stored:?}: expires_at {:?}, revoked {} (want {after:?}, revoked {revoked})",
+                    key.expires_at,
+                    key.is_revoked()
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "015 disagrees with the reader on:\n{}",
+            wrong.join("\n")
+        );
     }
 
     /// What `<input type="date">` and `<input type="datetime-local">` post.
