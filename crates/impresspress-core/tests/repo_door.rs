@@ -1131,6 +1131,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // assertion that a one-shot read of the seeded tables stops at
             // the ceiling.
             "blocks/products/tests/bounded_read_tests.rs",
+            // Fault injector: the list pages' WRAP-denial test refuses the
+            // order read so the denial lands on the page's own query.
+            "blocks/products/tests/error_mapping_tests.rs",
         ],
     ),
     (
@@ -1266,6 +1269,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/page_link_tests.rs",
             "blocks/products/tests/repo_tests.rs",
+            // Fault injector: the groups page's WRAP-denial test refuses the
+            // group read so the denial lands on the page's own query.
+            "blocks/products/tests/error_mapping_tests.rs",
         ],
     ),
     (
@@ -1298,12 +1304,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/handler_tests.rs",
         ],
     ),
-    // The llm settings door. One entry, and it is a fault injector: the
-    // block's `config_tests` name the table so `FailingDbOpContext` lands on
-    // the settings read under test rather than on some other table's. Same
-    // category as `blocks/admin/pages/blocks.rs` and `blocks/files/quota.rs`
-    // above.
-    ("llm_settings", &["blocks/llm/mod.rs"]),
+    // The llm settings door. Both entries are fault injectors: the block's
+    // `config_tests` and its WRAP-denial tests name the table so
+    // `FailingDbOpContext` lands on the settings read or write under test
+    // rather than on some other table's. Same category as
+    // `blocks/admin/pages/blocks.rs` and `blocks/files/quota.rs` above.
+    (
+        "llm_settings",
+        &["blocks/llm/mod.rs", "blocks/llm/error_mapping_tests.rs"],
+    ),
 ];
 
 /// What one source file's code names, resolved through its `use` items.

@@ -39,7 +39,9 @@
 //! the allowlist sent it to.
 //!
 //! That last blind spot is closed for every block in `GATED_BLOCKS` — the
-//! whole of `admin`, `auth`, `auth_ui`, `products` and `userportal`. Whether an
+//! whole of `admin`, `auth`, `auth_ui`, `legalpages`, `llm`, `messages`,
+//! `products`, `signal`, `userportal` and `vector`, and the top-level
+//! `email.rs` and `fastembed.rs`. Whether an
 //! `err_internal(label, cause)` there wraps a database call is a reading job
 //! per site, so the second gate below does not guess: every `err_internal`
 //! tail left in a gated file is inventoried by its label, with the reason it
@@ -62,7 +64,7 @@
 //! A failure printed into a page as its own text (`"Failed to load …: " (e)`)
 //! is a third shape that neither sees: it answers 200, and a WRAP denial's
 //! grant and table names reach the page. `ERROR_TEXT_RENDERED` counts it per
-//! block, exactly.
+//! block, exactly, and it is empty.
 //!
 //! `auth::repo::RepoError` used to be named here as a site the gate could
 //! not help: it was `NotFound | Db(String)`, so the wafer code was gone
@@ -328,9 +330,23 @@ fn the_walk_reaches_the_files_it_claims_to_scan() {
 
 /// The blocks whose every file is held to [`INVENTORIED_TAILS`] and to
 /// [`evasions`]: a file under one of these that is not on the inventory may
-/// have no `err_internal` tail at all. Test code (`tests/` directories and
-/// `#[cfg(test)]` items) is not gated.
-const GATED_BLOCKS: &[&str] = &["admin", "auth", "auth_ui", "products", "userportal"];
+/// have no `err_internal` tail at all. A top-level file under `src/blocks/`
+/// (`email.rs`) is its own entry, as in [`NOT_YET_GATED`]. Test code
+/// (`tests/` directories and `#[cfg(test)]` items) is not gated.
+const GATED_BLOCKS: &[&str] = &[
+    "admin",
+    "auth",
+    "auth_ui",
+    "email.rs",
+    "fastembed.rs",
+    "legalpages",
+    "llm",
+    "messages",
+    "products",
+    "signal",
+    "userportal",
+    "vector",
+];
 
 /// The walk the gated-file checks run over: every block source outside a
 /// `tests/` directory, floored like [`scan`].
@@ -340,11 +356,14 @@ fn gated_scan() -> SourceWalk {
         .least(100)
 }
 
-/// The gated block `rel` belongs to, if any.
+/// The gated block `rel` belongs to, if any: a file under a gated block's
+/// directory, or a gated top-level file itself.
 fn gated_block(rel: &str) -> Option<&'static str> {
     GATED_BLOCKS.iter().copied().find(|block| {
-        rel.strip_prefix(block)
-            .is_some_and(|rest| rest.starts_with('/'))
+        rel == *block
+            || rel
+                .strip_prefix(block)
+                .is_some_and(|rest| rest.starts_with('/'))
     })
 }
 
@@ -360,8 +379,10 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// - **Stripe**: the cause is a Stripe API call. `stripe_client::classify`
 ///   gives it `Internal` or `FailedPrecondition`, never a WRAP code, and a
 ///   Stripe 429 is Stripe's rate limit, not the database's.
-/// - **Provider**: the cause is an OAuth provider's token or userinfo
-///   endpoint — the request, or the body it answered.
+/// - **Provider**: the cause is an outside party's answer — an OAuth
+///   provider's token or userinfo endpoint, an LLM provider behind the
+///   router (an `LlmError`, which carries no database code), or an embedding
+///   block's reply that broke its own contract.
 /// - **Crypto**: the cause is the `wafer-run/crypto` service hashing a
 ///   password or drawing random bytes, which reads no table.
 /// - **Invariant**: the cause is this process, not a service — a row outside
@@ -383,7 +404,11 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// family in `auth_ui/tests/error_mapping_tests.rs`, the OAuth callback's
 /// `state_redemption_denial_is_403_not_500`, and the admin and user-portal
 /// routes in `admin/error_mapping_tests.rs` and
-/// `userportal/error_mapping_tests.rs`.
+/// `userportal/error_mapping_tests.rs`, and one real route or page per
+/// converted site in `llm/error_mapping_tests.rs`,
+/// `vector/error_mapping_tests.rs`, `messages/error_mapping_tests.rs` and
+/// `legalpages/error_mapping_tests.rs`, and `signal`'s
+/// `a_refused_room_store_is_403` in `signal/mod.rs`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
         "products/stripe.rs",
@@ -617,6 +642,45 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
                 why: "provider: an undecodable userinfo body",
             },
         ],
+    ),
+    (
+        "llm/routes/providers.rs",
+        &[
+            Tail {
+                label: "Stored provider row invalid",
+                count: 2,
+                why: "invariant: an undecodable provider row",
+            },
+            Tail {
+                label: "context",
+                count: 1,
+                why: "provider: `llm_error_response`'s `LlmError` from the provider router",
+            },
+        ],
+    ),
+    (
+        "vector/pages.rs",
+        &[Tail {
+            label: "embedding/chunk count mismatch",
+            count: 1,
+            why: "provider: the embedding block answered a vector count unlike its chunk count",
+        }],
+    ),
+    (
+        "messages/rest.rs",
+        &[Tail {
+            label: "add_entry card render failed",
+            count: 1,
+            why: "invariant: an undecodable entry row the insert just returned",
+        }],
+    ),
+    (
+        "fastembed.rs",
+        &[Tail {
+            label: "fastembed service unavailable",
+            count: 1,
+            why: "invariant: loading the embedding model into this process",
+        }],
     ),
 ];
 
@@ -995,17 +1059,25 @@ enum Evasion {
 }
 
 /// The wrappers a gated file may keep, each with why nothing its callers can
-/// pass is a database failure — `"invariant: …"`, the one reason there is.
+/// pass is a database failure — `"invariant: …"`, or `"provider: …"` for a
+/// wrapper whose parameter's type cannot carry a database error at all.
 /// Checked both ways, like [`INVENTORIED_TAILS`]: an unlisted wrapper fails,
 /// and so does a listed one that is gone.
 ///
 /// A wrapper's own `err_internal` call is on its file's tail inventory once,
 /// however many callers it has; this list is what says the callers were read.
-const LISTED_WRAPPERS: &[(&str, &str, &str)] = &[(
-    "products/purchase.rs",
-    "child_rows",
-    "invariant: every caller passes `…View::from_record` decodes of rows it already holds",
-)];
+const LISTED_WRAPPERS: &[(&str, &str, &str)] = &[
+    (
+        "products/purchase.rs",
+        "child_rows",
+        "invariant: every caller passes `…View::from_record` decodes of rows it already holds",
+    ),
+    (
+        "llm/routes/providers.rs",
+        "llm_error_response",
+        "provider: its cause is an `LlmError` from the provider router, a type with no database code",
+    ),
+];
 
 /// Every way `src` could send a database failure through `err_internal`
 /// without [`err_internal_labels`] seeing the call site, one per finding.
@@ -1385,8 +1457,8 @@ fn gated_files_call_err_internal_only_by_name() {
     );
     for entry in LISTED_WRAPPERS {
         assert!(
-            entry.2.starts_with("invariant: "),
-            "{entry:?} must say why it is an invariant"
+            entry.2.starts_with("invariant: ") || entry.2.starts_with("provider: "),
+            "{entry:?} must say why it is an invariant, or which provider type it takes"
         );
         assert!(
             listed_and_found.contains(&entry),
@@ -1470,14 +1542,8 @@ fn the_evasion_gate_catches_each_way_around() {
 /// `"unplanned"` is a block no plan item has scheduled yet.
 const NOT_YET_GATED: &[(&str, usize, &str)] = &[
     ("dev", 6, "N25"),
-    ("fastembed.rs", 1, "unplanned"),
     ("files", 6, "N25"),
-    ("legalpages", 1, "unplanned"),
-    ("llm", 5, "N21"),
-    ("messages", 1, "unplanned"),
-    ("signal", 1, "unplanned"),
     ("tickets", 1, "N25"),
-    ("vector", 1, "N21"),
 ];
 
 /// The block a `src/blocks`-relative path belongs to: its first component.
@@ -1537,9 +1603,6 @@ const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
          admin row bootstrap has just inserted — none carries a cause",
     ),
     ("files", 11, "N25"),
-    ("legalpages", 1, "unplanned"),
-    ("llm", 3, "N21"),
-    ("messages", 3, "unplanned"),
     ("products", 32, "unplanned"),
     (
         "userportal",
@@ -1547,7 +1610,12 @@ const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
         "read: the profile page's signed-in user with no users row — the read \
          succeeded, so there is no cause to carry",
     ),
-    ("vector", 1, "N21"),
+    (
+        "vector",
+        1,
+        "read: the embedding block answered success with no vectors — the call \
+         did not fail, so there is no cause to carry",
+    ),
 ];
 
 #[test]
@@ -1589,10 +1657,8 @@ fn cause_dropped_is_the_whole_backlog() {
 // Where a failure's own text is printed into a page
 // ---------------------------------------------------------------------------
 
-/// The markup interpolations in `src` that print a failed call's own text:
-/// an `Err(e) => { … (e) … }` arm whose body interpolates `(e)` or
-/// `(e.message)` before it closes, and any `"…" (x.message)` — a maud string
-/// followed by an error's message.
+/// How many maud interpolations in `src`'s production code print a failed
+/// call's own text.
 ///
 /// That shape answers a failed read as a page: the status is 200, the empty
 /// table's place is taken by the failure, and a WRAP denial's own text (the
@@ -1600,73 +1666,183 @@ fn cause_dropped_is_the_whole_backlog() {
 /// Nothing classified it on the way, so no inventory of `err_internal` tails
 /// can see it either. A page answers a failed read through
 /// `crud::db_error_page`, and a fragment through `crud::db_error_notice`.
+///
+/// Read from the token stream ([`production_tokens`]), so a group ends where
+/// its brace does, however deeply the markup inside it nests. An
+/// interpolation is a parenthesized group inside an `html!` invocation that
+/// is not a call's argument list (it does not follow an identifier or a
+/// macro's `!`). It prints the failure when either:
+///
+/// - it is inside the body of an `Err(e)` binding — a `match` arm (`Err(e) =>
+///   { … }` or `Err(e) => html! { … }`, in Rust or in maud's `@match`) or an
+///   `if let Err(e) = … { … }` (maud's `@if let` too), with `ref`/`mut`
+///   patterns alike — and its expression starts from `e` (`(e)`,
+///   `(e.message)`, `(e.to_string())`, `(&e.message.clone())`) or is a
+///   `format!` naming `e` as an argument or inline (`format!("…{e}")`); or
+/// - its expression starts from `x.message` for any `x` — an error handed to
+///   a helper as a parameter, which no binding scan sees.
+///
+/// What it does NOT follow: the text laundered through something else first
+/// (`@let text = e.to_string();` and then `(text)`, or a helper called with
+/// `e` that returns its message). A classified reason — `(crud::
+/// db_error_notice(e, "…"))` — starts from the door, not from `e`, and is
+/// not the shape.
 fn error_text_renders(src: &str) -> usize {
-    let code = production_code(src).join("\n");
-    let bytes = code.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    // Where each interpolation opens (its `(`), so a site both shapes match
-    // is counted once.
-    let mut sites = std::collections::BTreeSet::new();
+    use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
-    // Shape 1: an `Err(name) => {` arm interpolating `(name)` or
-    // `(name.message)` before its first closing brace, opened after
-    // whitespace, a quote or a brace — an interpolation, not a call like
-    // `Err(e)` or `f(e)`.
-    for (at, _) in code.match_indices("Err(") {
-        if at > 0 && is_ident(bytes[at - 1]) {
-            continue;
+    fn is_punct(tree: Option<&TokenTree>, ch: char) -> bool {
+        matches!(tree, Some(TokenTree::Punct(p)) if p.as_char() == ch)
+    }
+
+    fn is_ident(tree: Option<&TokenTree>, name: &str) -> bool {
+        matches!(tree, Some(TokenTree::Ident(ident)) if ident == name)
+    }
+
+    /// `e` in `(e)`, `(ref e)`, `(mut e)`, `(ref mut e)`; `None` for `(_)`
+    /// or any other pattern.
+    fn bound_name(pattern: TokenStream) -> Option<String> {
+        let idents: Vec<String> = pattern
+            .into_iter()
+            .map(|tree| match tree {
+                TokenTree::Ident(ident) => Some(ident.to_string()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        match idents.as_slice() {
+            [.., name]
+                if name != "_"
+                    && idents[..idents.len() - 1]
+                        .iter()
+                        .all(|m| m == "ref" || m == "mut") =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
         }
-        let rest_at = at + 4;
-        let rest = &code[rest_at..];
-        let Some(close) = rest.find(')') else {
-            continue;
-        };
-        let name = rest[..close].trim();
-        if name.is_empty() || !name.bytes().all(is_ident) {
-            continue;
-        }
-        let after = &rest[close + 1..];
-        let after_at = rest_at + close + 1 + (after.len() - after.trim_start().len());
-        let Some(after) = after.trim_start().strip_prefix("=>") else {
-            continue;
-        };
-        let body_at = after_at + 2 + (after.len() - after.trim_start().len());
-        let Some(body) = after.trim_start().strip_prefix('{') else {
-            continue;
-        };
-        let body_at = body_at + 1;
-        let body = &body[..body.find('}').unwrap_or(body.len())];
-        for needle in [format!("({name})"), format!("({name}.message)")] {
-            for (hit, _) in body.match_indices(needle.as_str()) {
-                if hit > 0 && matches!(body.as_bytes()[hit - 1], b' ' | b'\n' | b'\t' | b'"' | b'{')
-                {
-                    sites.insert(body_at + hit);
+    }
+
+    /// For each sibling index, the names an `Err(name)` binding before it
+    /// holds there: an arm's body (a brace group, or everything up to the
+    /// arm's comma) or an `if let`'s block.
+    fn bindings(trees: &[TokenTree]) -> Vec<Vec<String>> {
+        let mut held = vec![Vec::new(); trees.len()];
+        for at in 0..trees.len() {
+            if !is_ident(trees.get(at), "Err") {
+                continue;
+            }
+            let Some(TokenTree::Group(pattern)) = trees.get(at + 1) else {
+                continue;
+            };
+            if pattern.delimiter() != Delimiter::Parenthesis {
+                continue;
+            }
+            let Some(name) = bound_name(pattern.stream()) else {
+                continue;
+            };
+            let next = at + 2;
+            if is_punct(trees.get(next), '=') && is_punct(trees.get(next + 1), '>') {
+                // An arm: its brace body, or everything up to its comma.
+                let start = next + 2;
+                let end = match trees.get(start) {
+                    Some(TokenTree::Group(body)) if body.delimiter() == Delimiter::Brace => {
+                        start + 1
+                    }
+                    _ => (start..trees.len())
+                        .find(|&i| is_punct(trees.get(i), ','))
+                        .unwrap_or(trees.len()),
+                };
+                for slot in &mut held[start..end] {
+                    slot.push(name.clone());
+                }
+            } else if is_punct(trees.get(next), '=') {
+                // `if let Err(name) = … { body }`: the first block after `=`.
+                if let Some(body) = (next + 1..trees.len()).find(|&i| {
+                    matches!(&trees[i], TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)
+                }) {
+                    held[body].push(name.clone());
                 }
             }
         }
+        held
     }
 
-    // Shape 2: `"…" (x.message)` anywhere — outside an `Err` arm too, as in
-    // a helper handed the error.
-    for (at, _) in code.match_indices(".message)") {
-        let mut start = at;
-        while start > 0 && is_ident(bytes[start - 1]) {
-            start -= 1;
-        }
-        if start == at || start == 0 || bytes[start - 1] != b'(' {
-            continue;
-        }
-        if code[..start - 1].trim_end().ends_with('"') {
-            sites.insert(start - 1);
+    /// Whether `tokens` mention `name` as an identifier, or as an inline
+    /// format argument (`{name}`, `{name:?}`) in a string literal, at any
+    /// depth.
+    fn mentions(tokens: TokenStream, name: &str) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            TokenTree::Ident(ident) => ident == name,
+            TokenTree::Literal(literal) => {
+                let text = literal.to_string();
+                text.contains(&format!("{{{name}}}")) || text.contains(&format!("{{{name}:"))
+            }
+            TokenTree::Group(group) => mentions(group.stream(), name),
+            TokenTree::Punct(_) => false,
+        })
+    }
+
+    /// Whether the interpolated expression `tokens` prints an error: one of
+    /// `bound` as its root or as a `format!` argument, or any `x.message`.
+    fn prints_an_error(tokens: TokenStream, bound: &[String]) -> bool {
+        let trees: Vec<TokenTree> = tokens.into_iter().collect();
+        let start = trees
+            .iter()
+            .position(
+                |tree| !matches!(tree, TokenTree::Punct(p) if matches!(p.as_char(), '&' | '*')),
+            )
+            .unwrap_or(trees.len());
+        let expr = &trees[start..];
+        match expr {
+            [TokenTree::Ident(root), ..] if bound.iter().any(|name| root == name) => true,
+            [TokenTree::Ident(_), TokenTree::Punct(dot), TokenTree::Ident(field), ..]
+                if dot.as_char() == '.' && field == "message" =>
+            {
+                true
+            }
+            [TokenTree::Ident(mac), TokenTree::Punct(bang), TokenTree::Group(args), ..]
+                if (mac == "format" || mac == "format_args") && bang.as_char() == '!' =>
+            {
+                bound.iter().any(|name| mentions(args.stream(), name))
+            }
+            _ => false,
         }
     }
-    sites.len()
+
+    fn walk(trees: &[TokenTree], in_html: bool, bound: &[String], found: &mut usize) {
+        let held = bindings(trees);
+        for (at, tree) in trees.iter().enumerate() {
+            let TokenTree::Group(group) = tree else {
+                continue;
+            };
+            let mut scope = bound.to_vec();
+            scope.extend(held[at].iter().cloned());
+            let previous = at.checked_sub(1).and_then(|i| trees.get(i));
+            let is_call = matches!(previous, Some(TokenTree::Ident(_))) || is_punct(previous, '!');
+            if in_html
+                && group.delimiter() == Delimiter::Parenthesis
+                && !is_call
+                && prints_an_error(group.stream(), &scope)
+            {
+                *found += 1;
+            }
+            let opens_html =
+                is_punct(previous, '!') && at >= 2 && is_ident(trees.get(at - 2), "html");
+            let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+            walk(&inner, in_html || opens_html, &scope, found);
+        }
+    }
+
+    let trees: Vec<TokenTree> = production_tokens(src).into_iter().collect();
+    let mut found = 0;
+    walk(&trees, false, &[], &mut found);
+    found
 }
 
 /// Every block that still prints a failure's own text into a page, how many
 /// times, and the plan item that reads it — exact both ways, like
-/// [`CAUSE_DROPPED`].
-const ERROR_TEXT_RENDERED: &[(&str, usize, &str)] = &[("products", 6, "unplanned")];
+/// [`CAUSE_DROPPED`]. **Empty**: products' six list pages were the last, and
+/// they answer `crud::db_error_page` now.
+const ERROR_TEXT_RENDERED: &[(&str, usize, &str)] = &[];
 
 #[test]
 fn error_text_rendered_is_the_whole_backlog() {
@@ -1724,11 +1900,68 @@ fn the_error_text_scan_catches_the_shapes() {
             "fn a() { html! { Err(a) => { p { \"x\" (a) } } Err(b) => { p { \"y\" (b.message) } } } }\n",
             2,
         ),
-        // Not the shape: calls, a classified reason, a test.
+        // The error's text by any spelling.
+        (
+            "fn a() { html! { @match r { Err(e) => { p { \"x\" (e.to_string()) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (format!(\"Failed: {e}\")) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (format!(\"Failed: {:?}\", e)) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (e.message.clone()) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (&e.message) } } } } }\n",
+            1,
+        ),
+        // Bound by `@if let`, by `ref`, or in a Rust arm whose body is an
+        // `html!` with no braces around it.
+        (
+            "fn a() { html! { @if let Err(e) = &r { p { \"x\" (e) } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match &r { Err(ref e) => { p { (e) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() -> Markup { match r { Ok(v) => html! { (v) }, Err(e) => html! { p { (e) } }, } }\n",
+            1,
+        ),
+        (
+            "fn a() -> Markup { if let Err(e) = r { return html! { p { (e) } }; } html! {} }\n",
+            1,
+        ),
+        // Nested markup: the arm does not end at the first closing brace.
+        (
+            "fn a() { html! { @match r { Err(e) => { div { span { \"a\" } } div { p { (e) } } } } } }\n",
+            1,
+        ),
+        // Not the shape: calls, a classified reason, an unbound name, the Ok
+        // arm, markup outside the arm, a test.
         ("fn a() { match r { Err(e) => { return Err(e) } } }\n", 0),
         ("fn a() { match r { Err(e) => { return crud::db_error_internal(e, \"x\") } } }\n", 0),
         ("fn a() { match r { Err(e) => { RoomError::Db(e.message) } } }\n", 0),
         ("fn a() { html! { div { \"Failed: \" (reason) } } }\n", 0),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { \"Failed: \" (crud::db_error_notice(e, \"x\")) } } } } }\n",
+            0,
+        ),
+        (
+            "fn a() { html! { @match r { Ok(e) => { (e) } Err(_) => { p { \"failed\" } } } } }\n",
+            0,
+        ),
+        (
+            "fn a() { match r { Err(e) => log(e), _ => {} } html! { (e) } }\n",
+            0,
+        ),
         (
             "#[cfg(test)]\nmod tests { fn t() { html! { Err(e) => { p { \"x\" (e) } } } } }\n",
             0,

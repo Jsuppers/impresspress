@@ -22,7 +22,7 @@ use crate::{
             LlmBlock,
         },
     },
-    http::{err_bad_request, err_internal, ok_json},
+    http::{err_bad_request, ok_json},
 };
 
 /// `(backend_id, model_id)` as bound by the block's route table for
@@ -46,7 +46,7 @@ pub(in crate::blocks::llm) async fn list_models(
         Ok(models) => ok_json(&ModelListResponse {
             models: models.into_iter().map(ModelInfoView::from).collect(),
         }),
-        Err(e) => err_internal("llm list_models failed", e.message),
+        Err(e) => crud::db_error_internal(e, "llm list_models failed"),
     }
 }
 

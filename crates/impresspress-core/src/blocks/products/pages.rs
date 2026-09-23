@@ -367,6 +367,12 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     } else {
         repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await
     };
+    let list = match result {
+        Ok(list) => list,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "products admin list page: product read failed")
+        }
+    };
 
     let new_product_button = html! {
         a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ New Product" }
@@ -409,96 +415,91 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
 
         div #products-content {
-            @match &result {
-                Ok(list) => {
-                    @if deleted_view {
-                        @let cols = [
-                            components::TableCol { label: "Name", width: None },
-                            components::TableCol { label: "Owner", width: None },
-                            components::TableCol { label: "Currency", width: None },
-                            components::TableCol { label: "Deleted", width: None },
-                            components::TableCol { label: "", width: None },
-                        ];
-                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
-                            let deleted_at = record.str_field("deleted_at");
-                            let seller_owned = record.str_field("owner_kind") == "user";
-                            // Percent-encoded, like every `encodeURIComponent`
-                            // call in this file's browser-side URLs. A
-                            // product id is not guaranteed URL-safe: the
-                            // database layer synthesizes a UUID only when the
-                            // body omits `id`, and the admin create endpoint
-                            // forwarded the body verbatim until this branch
-                            // began refusing it — so an id holding `/`, `?` or
-                            // `#` exists wherever a seeding client ever chose
-                            // its own keys. Unencoded, such an id splits the
-                            // path and the Restore button posts somewhere
-                            // that matches no route, on the only door out of
-                            // soft delete. maud escapes HTML, not URLs.
-                            let encoded_id = crate::util::url_path_encode(&record.id);
-                            let restore_url =
-                                format!("/b/products/api/admin/products/{encoded_id}/restore");
-                            // Restore is the DANGEROUS half of what an admin
-                            // can do here: it puts an active, approved product
-                            // straight back into the public catalog. Soft
-                            // delete takes nothing down in Stripe, so the row
-                            // also needs the other half — a way to shut the
-                            // product's Prices and Payment Links down without
-                            // relisting it. That is what
-                            // `ProductState::LiveOrDeleted` exists for, and
-                            // until this link nothing reached it.
-                            let close_url =
-                                format!("/b/products/admin/products/{encoded_id}/close");
-                            vec![
-                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
-                                html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
-                                html! { span .font-medium { (record.str_field("currency")) } },
-                                html! { span .text-muted .text-sm { (deleted_at.get(..10).unwrap_or("—")) } },
-                                html! {
-                                    div .products-actions {
-                                        a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
-                                        button .btn .btn--secondary .btn--sm type="button"
-                                            hx-post=(restore_url)
-                                            hx-swap="none"
-                                            data-error-label="Could not restore this product"
-                                            hx-on--after-request=(reload_on_success())
-                                        { "Restore" }
-                                    }
-                                },
-                            ]
-                        }).collect();
-                        (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
-                            (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
-                        }))
-                    } @else {
-                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&record.id))).collect();
-                        @let cols = [
-                            components::TableCol { label: "Name", width: None },
-                            components::TableCol { label: "Availability", width: None },
-                            components::TableCol { label: "Owner", width: None },
-                            components::TableCol { label: "Currency", width: None },
-                            components::TableCol { label: "Updated", width: None },
-                        ];
-                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
-                            let updated = record.str_field("updated_at");
-                            let seller_owned = record.str_field("owner_kind") == "user";
-                            vec![
-                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Open to edit pricing and checkout" } } },
-                                html! { div .products-status-stack { (components::status_badge(record.str_field("status"))) @if seller_owned { (components::status_badge(record.str_field("approval_status"))) } } },
-                                html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
-                                html! { span .font-medium { (record.str_field("currency")) } },
-                                html! { span .text-muted .text-sm { (updated.get(..10).unwrap_or("—")) } },
-                            ]
-                        }).collect();
-                        (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {
-                            (components::empty_state(icons::package(), "No products found", "Try a different search, or create your first product.", Some(html! {
-                                a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
-                            })))
-                        }))
-                    }
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
+                @if deleted_view {
+                    @let cols = [
+                        components::TableCol { label: "Name", width: None },
+                        components::TableCol { label: "Owner", width: None },
+                        components::TableCol { label: "Currency", width: None },
+                        components::TableCol { label: "Deleted", width: None },
+                        components::TableCol { label: "", width: None },
+                    ];
+                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                        let deleted_at = record.str_field("deleted_at");
+                        let seller_owned = record.str_field("owner_kind") == "user";
+                        // Percent-encoded, like every `encodeURIComponent`
+                        // call in this file's browser-side URLs. A
+                        // product id is not guaranteed URL-safe: the
+                        // database layer synthesizes a UUID only when the
+                        // body omits `id`, and the admin create endpoint
+                        // forwarded the body verbatim until this branch
+                        // began refusing it — so an id holding `/`, `?` or
+                        // `#` exists wherever a seeding client ever chose
+                        // its own keys. Unencoded, such an id splits the
+                        // path and the Restore button posts somewhere
+                        // that matches no route, on the only door out of
+                        // soft delete. maud escapes HTML, not URLs.
+                        let encoded_id = crate::util::url_path_encode(&record.id);
+                        let restore_url =
+                            format!("/b/products/api/admin/products/{encoded_id}/restore");
+                        // Restore is the DANGEROUS half of what an admin
+                        // can do here: it puts an active, approved product
+                        // straight back into the public catalog. Soft
+                        // delete takes nothing down in Stripe, so the row
+                        // also needs the other half — a way to shut the
+                        // product's Prices and Payment Links down without
+                        // relisting it. That is what
+                        // `ProductState::LiveOrDeleted` exists for, and
+                        // until this link nothing reached it.
+                        let close_url =
+                            format!("/b/products/admin/products/{encoded_id}/close");
+                        vec![
+                            html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
+                            html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
+                            html! { span .font-medium { (record.str_field("currency")) } },
+                            html! { span .text-muted .text-sm { (deleted_at.get(..10).unwrap_or("—")) } },
+                            html! {
+                                div .products-actions {
+                                    a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
+                                    button .btn .btn--secondary .btn--sm type="button"
+                                        hx-post=(restore_url)
+                                        hx-swap="none"
+                                        data-error-label="Could not restore this product"
+                                        hx-on--after-request=(reload_on_success())
+                                    { "Restore" }
+                                }
+                            },
+                        ]
+                    }).collect();
+                    (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
+                        (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
+                    }))
+                } @else {
+                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/products/{}", crate::util::url_path_encode(&record.id))).collect();
+                    @let cols = [
+                        components::TableCol { label: "Name", width: None },
+                        components::TableCol { label: "Availability", width: None },
+                        components::TableCol { label: "Owner", width: None },
+                        components::TableCol { label: "Currency", width: None },
+                        components::TableCol { label: "Updated", width: None },
+                    ];
+                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                        let updated = record.str_field("updated_at");
+                        let seller_owned = record.str_field("owner_kind") == "user";
+                        vec![
+                            html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Open to edit pricing and checkout" } } },
+                            html! { div .products-status-stack { (components::status_badge(record.str_field("status"))) @if seller_owned { (components::status_badge(record.str_field("approval_status"))) } } },
+                            html! { span .text-muted .text-sm { @if seller_owned { "Seller" } @else { "Your store" } } },
+                            html! { span .font-medium { (record.str_field("currency")) } },
+                            html! { span .text-muted .text-sm { (updated.get(..10).unwrap_or("—")) } },
+                        ]
+                    }).collect();
+                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! {
+                        (components::empty_state(icons::package(), "No products found", "Try a different search, or create your first product.", Some(html! {
+                            a .btn .btn--primary .btn--sm href="/b/products/admin/new" { "+ Create product" }
+                        })))
+                    }))
                 }
-                Err(e) => { div .login-error { "Error: " (e.message) } }
-            }
+                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
         }
     };
 
@@ -1880,6 +1881,10 @@ pub async fn product_manager(
 
 pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let result = repo::groups::list_by_name(ctx, vec![], 100).await;
+    let list = match result {
+        Ok(list) => list,
+        Err(e) => return crud::db_error_page(msg, e, "products groups page: group read failed"),
+    };
 
     let content = html! {
         (admin_tabs("groups"))
@@ -1918,31 +1923,26 @@ pub async fn groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
 
         div #groups-content {
-            @match &result {
-                Ok(list) => {
-                    @let cols = [
-                        components::TableCol { label: "Name", width: None },
-                        components::TableCol { label: "Description", width: None },
-                        components::TableCol { label: "Status", width: None },
-                        components::TableCol { label: "Created", width: None },
-                        components::TableCol { label: "Actions", width: None },
-                    ];
-                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| vec![
-                        html! { span .font-medium { (r.str_field("name")) } },
-                        html! { span .text-muted .text-sm { (r.str_field("description")) } },
-                        components::status_badge(r.str_field("status")),
-                        html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
-                        html! { div .flex .gap-2 .flex-wrap {
-                            button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-record-description=(r.str_field("description")) data-record-status=(r.str_field("status")) data-action="pc-edit-group" { "Edit" }
-                            button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-action="pc-delete" { "Delete" }
-                        } },
-                    ]).collect();
-                    (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
-                        (components::empty_state(icons::folder(), "No groups yet", "Groups are optional. Add one when you want to organize related products.", Some(html! { button .btn .btn--primary .btn--sm type="button" data-action="pc-new" { "+ Create group" } })))
-                    }))
-                }
-                Err(e) => { div .login-error { "Error: " (e.message) } }
-            }
+                @let cols = [
+                    components::TableCol { label: "Name", width: None },
+                    components::TableCol { label: "Description", width: None },
+                    components::TableCol { label: "Status", width: None },
+                    components::TableCol { label: "Created", width: None },
+                    components::TableCol { label: "Actions", width: None },
+                ];
+                @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| vec![
+                    html! { span .font-medium { (r.str_field("name")) } },
+                    html! { span .text-muted .text-sm { (r.str_field("description")) } },
+                    components::status_badge(r.str_field("status")),
+                    html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
+                    html! { div .flex .gap-2 .flex-wrap {
+                        button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-record-description=(r.str_field("description")) data-record-status=(r.str_field("status")) data-action="pc-edit-group" { "Edit" }
+                        button .btn .btn--secondary .btn--sm type="button" data-record-id=(r.id) data-record-name=(r.str_field("name")) data-action="pc-delete" { "Delete" }
+                    } },
+                ]).collect();
+                (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
+                    (components::empty_state(icons::folder(), "No groups yet", "Groups are optional. Add one when you want to organize related products.", Some(html! { button .btn .btn--primary .btn--sm type="button" data-action="pc-new" { "+ Create group" } })))
+                }))
         }
         script src=(assets::catalog_admin_js_url()) {}
     };
@@ -1974,6 +1974,10 @@ pub async fn purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 
     let result = repo::purchases::list_paginated(ctx, filters, page as i64, page_size as i64).await;
+    let list = match result {
+        Ok(list) => list,
+        Err(e) => return crud::db_error_page(msg, e, "products purchases page: order read failed"),
+    };
 
     let content = html! {
         (admin_tabs("orders"))
@@ -1994,32 +1998,27 @@ pub async fn purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
 
         div #purchases-content {
-            @match &result {
-                Ok(list) => {
-                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/purchases/{}", record.id)).collect();
-                    @let cols = [
-                        components::TableCol { label: "Order", width: None },
-                        components::TableCol { label: "Customer", width: None },
-                        components::TableCol { label: "Status", width: None },
-                        components::TableCol { label: "Total", width: None },
-                        components::TableCol { label: "Placed", width: None },
-                    ];
-                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| {
-                        let amount = display_money(r.i64_field("total_cents"), r.str_field("currency"));
-                        let buyer = if !r.str_field("buyer_email").is_empty() { r.str_field("buyer_email") } else if !r.str_field("buyer_user_id").is_empty() { r.str_field("buyer_user_id") } else { r.str_field("user_id") };
-                        vec![
-                            html! { code .text-sm { (r.id.get(..8).unwrap_or(&r.id)) } },
-                            html! { span .text-sm { (if buyer.is_empty() { "Guest" } else { buyer }) } },
-                            components::status_badge(r.str_field("status")),
-                            html! { span .font-medium { (amount) } },
-                            html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("—")) } },
-                        ]
-                    }).collect();
-                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { (components::empty_state(icons::shopping_cart(), "No orders yet", "Customer orders will appear here after checkout starts.", None)) }))
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/admin/purchases"))
-                }
-                Err(e) => { div .login-error { "Error: " (e.message) } }
-            }
+                @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/admin/purchases/{}", record.id)).collect();
+                @let cols = [
+                    components::TableCol { label: "Order", width: None },
+                    components::TableCol { label: "Customer", width: None },
+                    components::TableCol { label: "Status", width: None },
+                    components::TableCol { label: "Total", width: None },
+                    components::TableCol { label: "Placed", width: None },
+                ];
+                @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| {
+                    let amount = display_money(r.i64_field("total_cents"), r.str_field("currency"));
+                    let buyer = if !r.str_field("buyer_email").is_empty() { r.str_field("buyer_email") } else if !r.str_field("buyer_user_id").is_empty() { r.str_field("buyer_user_id") } else { r.str_field("user_id") };
+                    vec![
+                        html! { code .text-sm { (r.id.get(..8).unwrap_or(&r.id)) } },
+                        html! { span .text-sm { (if buyer.is_empty() { "Guest" } else { buyer }) } },
+                        components::status_badge(r.str_field("status")),
+                        html! { span .font-medium { (amount) } },
+                        html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("—")) } },
+                    ]
+                }).collect();
+                (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { (components::empty_state(icons::shopping_cart(), "No orders yet", "Customer orders will appear here after checkout starts.", None)) }))
+                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/admin/purchases"))
         }
     };
 
@@ -2553,6 +2552,12 @@ pub async fn seller_orders(ctx: &dyn Context, msg: &Message) -> OutputStream {
         });
     }
     let result = repo::purchases::list_paginated(ctx, filters, page as i64, page_size as i64).await;
+    let list = match result {
+        Ok(list) => list,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "products seller orders page: order read failed")
+        }
+    };
     let content = html! {
         (portal_tabs("selling", seller_enabled))
         (seller_page_links("orders"))
@@ -2563,28 +2568,23 @@ pub async fn seller_orders(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     href={"/b/products/selling/orders?status=" (*status)} { (status.replace('_', " ")) }
             }
         }
-        @match &result {
-            Ok(list) => {
-                @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/selling/orders/{}", record.id)).collect();
-                @let cols = [
-                    components::TableCol { label: "Buyer", width: None },
-                    components::TableCol { label: "Status", width: None },
-                    components::TableCol { label: "Total", width: None },
-                    components::TableCol { label: "Subscription", width: None },
-                    components::TableCol { label: "Date", width: None },
-                ];
-                @let rows: Vec<Vec<Markup>> = list.records.iter().map(|order| vec![
-                    html! { span .text-sm { (if order.str_field("buyer_email").is_empty() { order.str_field("buyer_user_id") } else { order.str_field("buyer_email") }) } },
-                    components::status_badge(order.str_field("status")),
-                    html! { span .font-medium { (display_money(order.i64_field("total_cents"), order.str_field("currency"))) } },
-                    html! { @if order.str_field("stripe_subscription_id").is_empty() { span .text-muted { "—" } } @else { (components::status_badge(order.str_field("subscription_status"))) } },
-                    html! { span .text-muted .text-sm { (order.str_field("created_at").get(..10).unwrap_or("")) } },
-                ]).collect();
-                (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No seller orders yet" } }))
-                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/selling/orders"))
-            }
-            Err(error) => { div .login-error { "Error: " (error.message) } }
-        }
+            @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/selling/orders/{}", record.id)).collect();
+            @let cols = [
+                components::TableCol { label: "Buyer", width: None },
+                components::TableCol { label: "Status", width: None },
+                components::TableCol { label: "Total", width: None },
+                components::TableCol { label: "Subscription", width: None },
+                components::TableCol { label: "Date", width: None },
+            ];
+            @let rows: Vec<Vec<Markup>> = list.records.iter().map(|order| vec![
+                html! { span .text-sm { (if order.str_field("buyer_email").is_empty() { order.str_field("buyer_user_id") } else { order.str_field("buyer_email") }) } },
+                components::status_badge(order.str_field("status")),
+                html! { span .font-medium { (display_money(order.i64_field("total_cents"), order.str_field("currency"))) } },
+                html! { @if order.str_field("stripe_subscription_id").is_empty() { span .text-muted { "—" } } @else { (components::status_badge(order.str_field("subscription_status"))) } },
+                html! { span .text-muted .text-sm { (order.str_field("created_at").get(..10).unwrap_or("")) } },
+            ]).collect();
+            (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No seller orders yet" } }))
+            (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/selling/orders"))
     };
     ui::shell_page(
         ctx,
@@ -2998,6 +2998,12 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     } else {
         repo::products::list_page(ctx, page as i64, page_size as i64, filters, Some(sort)).await
     };
+    let list = match result {
+        Ok(list) => list,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "products my-products page: product read failed")
+        }
+    };
 
     let view_tabs = html! {
         div .products-tabs {
@@ -3035,71 +3041,66 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (view_tabs)
 
         div #my-products-content {
-            @match &result {
-                Ok(list) => {
-                    @if deleted_view {
-                        @let cols = [
-                            components::TableCol { label: "Name", width: None },
-                            components::TableCol { label: "Currency", width: None },
-                            components::TableCol { label: "Deleted", width: None },
-                            components::TableCol { label: "", width: None },
-                        ];
-                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
-                            // Percent-encoded for the same reason the admin
-                            // Deleted view encodes: a product id is not
-                            // guaranteed URL-safe, and maud escapes HTML, not
-                            // URLs. Unencoded, an id holding `/`, `?` or `#`
-                            // splits the path and both buttons below aim at
-                            // nothing.
-                            let encoded_id = crate::util::url_path_encode(&record.id);
-                            let restore_url = format!("/b/products/api/products/{encoded_id}/restore");
-                            // Restore is the DANGEROUS half: it returns an
-                            // active, approved product to the public catalog
-                            // at once. Soft delete takes nothing down in
-                            // Stripe, so the row needs the other half too — a
-                            // way to shut this product's Prices and Payment
-                            // Links off WITHOUT relisting it.
-                            let close_url = format!("/b/products/my-products/{encoded_id}/close");
-                            vec![
-                                html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
-                                html! { span .font-medium { (record.str_field("currency")) } },
-                                html! { span .text-muted .text-sm { (record.str_field("deleted_at").get(..10).unwrap_or("—")) } },
-                                html! {
-                                    div .products-actions {
-                                        a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
-                                        button .btn .btn--secondary .btn--sm type="button"
-                                            hx-post=(restore_url)
-                                            hx-swap="none"
-                                            data-error-label="Could not restore this product"
-                                            hx-on--after-request=(reload_on_success())
-                                        { "Restore" }
-                                    }
-                                },
-                            ]
-                        }).collect();
-                        (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
-                            (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
-                        }))
-                    } @else {
-                        @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-products/{}", crate::util::url_path_encode(&record.id))).collect();
-                        @let cols = [
-                            components::TableCol { label: "Name", width: None },
-                            components::TableCol { label: "Status", width: None },
-                            components::TableCol { label: "Currency", width: None },
-                            components::TableCol { label: "Created", width: None },
-                        ];
-                        @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| vec![
-                            html! { span .font-medium { (r.str_field("name")) } },
-                            components::status_badge(r.str_field("status")),
-                            html! { span .font-medium { (r.str_field("currency")) } },
-                            html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
-                        ]).collect();
-                        (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No products yet" } }))
-                    }
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
+                @if deleted_view {
+                    @let cols = [
+                        components::TableCol { label: "Name", width: None },
+                        components::TableCol { label: "Currency", width: None },
+                        components::TableCol { label: "Deleted", width: None },
+                        components::TableCol { label: "", width: None },
+                    ];
+                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|record| {
+                        // Percent-encoded for the same reason the admin
+                        // Deleted view encodes: a product id is not
+                        // guaranteed URL-safe, and maud escapes HTML, not
+                        // URLs. Unencoded, an id holding `/`, `?` or `#`
+                        // splits the path and both buttons below aim at
+                        // nothing.
+                        let encoded_id = crate::util::url_path_encode(&record.id);
+                        let restore_url = format!("/b/products/api/products/{encoded_id}/restore");
+                        // Restore is the DANGEROUS half: it returns an
+                        // active, approved product to the public catalog
+                        // at once. Soft delete takes nothing down in
+                        // Stripe, so the row needs the other half too — a
+                        // way to shut this product's Prices and Payment
+                        // Links off WITHOUT relisting it.
+                        let close_url = format!("/b/products/my-products/{encoded_id}/close");
+                        vec![
+                            html! { div { span .font-medium { (record.str_field("name")) } br; span .text-muted .text-sm { "Restore to edit pricing and checkout again" } } },
+                            html! { span .font-medium { (record.str_field("currency")) } },
+                            html! { span .text-muted .text-sm { (record.str_field("deleted_at").get(..10).unwrap_or("—")) } },
+                            html! {
+                                div .products-actions {
+                                    a .btn .btn--secondary .btn--sm href=(close_url) { "Close Stripe surface" }
+                                    button .btn .btn--secondary .btn--sm type="button"
+                                        hx-post=(restore_url)
+                                        hx-swap="none"
+                                        data-error-label="Could not restore this product"
+                                        hx-on--after-request=(reload_on_success())
+                                    { "Restore" }
+                                }
+                            },
+                        ]
+                    }).collect();
+                    (components::data_table(&cols, rows, None::<fn(usize) -> Option<String>>, html! {
+                        (components::empty_state(icons::trash(), "No deleted products", "Products stay here after deletion until you restore them.", None))
+                    }))
+                } @else {
+                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-products/{}", crate::util::url_path_encode(&record.id))).collect();
+                    @let cols = [
+                        components::TableCol { label: "Name", width: None },
+                        components::TableCol { label: "Status", width: None },
+                        components::TableCol { label: "Currency", width: None },
+                        components::TableCol { label: "Created", width: None },
+                    ];
+                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| vec![
+                        html! { span .font-medium { (r.str_field("name")) } },
+                        components::status_badge(r.str_field("status")),
+                        html! { span .font-medium { (r.str_field("currency")) } },
+                        html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
+                    ]).collect();
+                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No products yet" } }))
                 }
-                Err(e) => { div .login-error { "Error: " (e.message) } }
-            }
+                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
         }
     };
 
@@ -3127,35 +3128,36 @@ pub async fn my_purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
         value: serde_json::Value::String(user_id),
     }];
     let result = repo::purchases::list_paginated(ctx, filters, page as i64, page_size as i64).await;
+    let list = match result {
+        Ok(list) => list,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "products my-purchases page: order read failed")
+        }
+    };
 
     let content = html! {
         (portal_tabs("purchases", seller_enabled))
         (components::page_header("My Purchases", Some("Receipts, payment status, and subscription details"), None))
 
         div #my-purchases-content {
-            @match &result {
-                Ok(list) => {
-                    @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-purchases/{}", record.id)).collect();
-                    @let cols = [
-                        components::TableCol { label: "Status", width: None },
-                        components::TableCol { label: "Total", width: None },
-                        components::TableCol { label: "Provider", width: None },
-                        components::TableCol { label: "Date", width: None },
-                    ];
-                    @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| {
-                        let amount = display_money(r.i64_field("total_cents"), r.str_field("currency"));
-                        vec![
-                            components::status_badge(r.str_field("status")),
-                            html! { span .font-medium { (amount) } },
-                            html! { span .text-muted .text-sm { (r.str_field("provider")) } },
-                            html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
-                        ]
-                    }).collect();
-                    (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No purchases yet" } }))
-                    (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/my-purchases"))
-                }
-                Err(e) => { div .login-error { "Error: " (e.message) } }
-            }
+                @let row_hrefs: Vec<String> = list.records.iter().map(|record| format!("/b/products/my-purchases/{}", record.id)).collect();
+                @let cols = [
+                    components::TableCol { label: "Status", width: None },
+                    components::TableCol { label: "Total", width: None },
+                    components::TableCol { label: "Provider", width: None },
+                    components::TableCol { label: "Date", width: None },
+                ];
+                @let rows: Vec<Vec<maud::Markup>> = list.records.iter().map(|r| {
+                    let amount = display_money(r.i64_field("total_cents"), r.str_field("currency"));
+                    vec![
+                        components::status_badge(r.str_field("status")),
+                        html! { span .font-medium { (amount) } },
+                        html! { span .text-muted .text-sm { (r.str_field("provider")) } },
+                        html! { span .text-muted .text-sm { (r.str_field("created_at").get(..10).unwrap_or("")) } },
+                    ]
+                }).collect();
+                (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No purchases yet" } }))
+                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/my-purchases"))
         }
     };
 

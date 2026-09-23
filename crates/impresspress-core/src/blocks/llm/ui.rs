@@ -24,8 +24,8 @@ use super::{
     LlmBlock,
 };
 use crate::{
+    blocks::crud,
     db_read::{self, Bound},
-    http::err_internal,
     ui::{self, components},
 };
 
@@ -69,7 +69,7 @@ pub(super) async fn providers_page(
             .into_iter()
             .filter_map(|rec| row_to_config(&rec).ok().map(|cfg| (rec.id, cfg)))
             .collect(),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_page(msg, e, "llm providers page: provider read failed"),
     };
 
     let manages = block.provider_admin.manages_providers();
@@ -395,7 +395,7 @@ pub(super) async fn models_page(
 
     let models = match wafer_core::clients::llm::list_models(ctx).await {
         Ok(m) => m,
-        Err(e) => return err_internal("llm list_models failed", e.message),
+        Err(e) => return crud::db_error_page(msg, e, "llm models page: list_models failed"),
     };
 
     let content = html! {

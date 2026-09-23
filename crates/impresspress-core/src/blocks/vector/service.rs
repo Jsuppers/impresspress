@@ -24,7 +24,9 @@ pub struct IndexRow {
     pub name: String,
     pub model: String,
     pub dimensions: u32,
-    pub vector_count: u64,
+    /// `None` when there is no count to report: this runtime has no vector
+    /// backend, or the backend holds no index by this name.
+    pub vector_count: Option<u64>,
     pub keyword_search: bool,
 }
 
@@ -113,11 +115,17 @@ pub fn validate_index_name(name: &str) -> Result<&str, WaferError> {
 }
 
 /// Map one registry record into an `IndexRow`, asking the vector service
-/// for the live vector count. Returns `None` if the row has no
-/// `prefixed_name`. Shared between the list and detail loaders so the
-/// column-extraction quirks (TEXT-as-string round-trip from the SQLite
-/// service) live in exactly one place.
-async fn map_index_row(ctx: &dyn Context, rec: &db::Record) -> Option<IndexRow> {
+/// for the live vector count. `Ok(None)` if the row has no `prefixed_name`.
+/// Shared between the list and detail loaders so the column-extraction
+/// quirks (TEXT-as-string round-trip from the SQLite service) live in
+/// exactly one place.
+///
+/// A count the service refused is an error, carried back with its code: a
+/// refusal shown as "0 vectors" is a claim about the index nobody checked.
+async fn map_index_row(
+    ctx: &dyn Context,
+    rec: &db::Record,
+) -> Result<Option<IndexRow>, WaferError> {
     let storage_name = rec
         .data
         .get("prefixed_name")
@@ -125,7 +133,7 @@ async fn map_index_row(ctx: &dyn Context, rec: &db::Record) -> Option<IndexRow> 
         .unwrap_or("")
         .to_string();
     if storage_name.is_empty() {
-        return None;
+        return Ok(None);
     }
     let model = rec
         .data
@@ -141,18 +149,26 @@ async fn map_index_row(ctx: &dyn Context, rec: &db::Record) -> Option<IndexRow> 
 
     // Count through the vector service boundary — the same `vclient::count`
     // the API `stats()` route uses — instead of reaching around it with a
-    // `db::count` on the backend-private `{storage}_meta` table. An absent
-    // backend or a just-dropped index degrades to a count of 0, matching
-    // the stats route's own fallback.
-    let count = vclient::count(ctx, &storage_name).await.unwrap_or(0);
+    // `db::count` on the backend-private `{storage}_meta` table. No backend,
+    // or a backend holding no such index, has no count to report; any other
+    // failure is the caller's to answer.
+    let count = if vector_backend_available(ctx) {
+        match vclient::count(ctx, &storage_name).await {
+            Ok(n) => Some(n),
+            Err(e) if e.code == ErrorCode::NotFound => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
 
-    Some(IndexRow {
+    Ok(Some(IndexRow {
         name: storage_name,
         model,
         dimensions,
         vector_count: count,
         keyword_search,
-    })
+    }))
 }
 
 /// Read every registered vector index plus its current vector count
@@ -181,7 +197,7 @@ pub async fn list_index_rows(ctx: &dyn Context) -> Result<Vec<IndexRow>, WaferEr
 
     let mut rows = Vec::with_capacity(records.len());
     for rec in records {
-        if let Some(row) = map_index_row(ctx, &rec).await {
+        if let Some(row) = map_index_row(ctx, &rec).await? {
             rows.push(row);
         }
     }
@@ -206,7 +222,7 @@ pub async fn get_index_row(
         Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    Ok(map_index_row(ctx, &rec).await)
+    map_index_row(ctx, &rec).await
 }
 
 #[cfg(test)]

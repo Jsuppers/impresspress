@@ -161,7 +161,7 @@ pub(super) async fn create_index(
     };
 
     if let Err(e) = vclient::create_index(ctx, cfg.clone()).await {
-        return err_internal("create_index failed", e);
+        return crud::db_error_internal(e, "create_index failed");
     }
 
     // Record the index in the registry so queries against it can look up
@@ -195,7 +195,7 @@ pub(super) async fn create_index(
     )
     .await
     {
-        return err_internal("registry write failed", e);
+        return crud::db_error_internal(e, "registry write failed");
     }
 
     // htmx callers (the admin modal) want HTML back so the swap renders
@@ -204,7 +204,7 @@ pub(super) async fn create_index(
     if !msg.get_meta("http.header.hx-request").is_empty() {
         let body_html = match super::pages_ui::render_index_list_fragment(ctx).await {
             Ok(m) => m,
-            Err(e) => return err_internal("Failed to refresh", e),
+            Err(e) => return crud::db_error_internal(e, "Failed to refresh"),
         };
         let trigger = r#"{"showToast":{"message":"Index created","type":"success"},"closeModal":{"id":"create-vector-index"}}"#;
         return crate::http::ResponseBuilder::new()
@@ -239,7 +239,7 @@ pub(super) async fn list_indexes(ctx: &dyn Context) -> OutputStream {
     }
     match discover_indexes(ctx).await {
         Ok(indexes) => ok_json(&IndexListResponse { indexes }),
-        Err(e) => err_internal("list indexes failed", e),
+        Err(e) => crud::db_error_internal(e, "list indexes failed"),
     }
 }
 
@@ -282,24 +282,31 @@ pub(super) async fn delete_index(ctx: &dyn Context, msg: &Message) -> OutputStre
     }
 
     let prefixed = service::prefixed_index_name(name);
-    match vclient::delete_index(ctx, &prefixed).await {
-        Ok(()) => {
-            // Clear the registry row. Best-effort — a missing registry table
-            // (pre-registry deployment) is not a failure, so we only surface
-            // errors that aren't about the table itself. The row-level
-            // `OR REPLACE` in create_index makes this robustly idempotent.
-            let _ = db::delete_by_filters(
-                ctx,
-                REGISTRY_TABLE,
-                vec![Filter {
-                    field: "prefixed_name".into(),
-                    operator: FilterOp::Equal,
-                    value: serde_json::json!(prefixed),
-                }],
-            )
-            .await;
-            ok_json(&AckResponse { ok: true })
+    let deleted = vclient::delete_index(ctx, &prefixed).await;
+    if let Err(e) = &deleted {
+        if e.code != ErrorCode::NotFound {
+            return crud::db_error_internal(e.clone(), "delete_index failed");
         }
+    }
+    // Clear the registry row — also when the backend no longer holds the
+    // index, so a delete whose registry step failed can be retried to
+    // completion. The table is the block's own migration, so a failed delete
+    // is a failure: a row left behind keeps listing an index that is gone.
+    if let Err(e) = db::delete_by_filters(
+        ctx,
+        REGISTRY_TABLE,
+        vec![Filter {
+            field: "prefixed_name".into(),
+            operator: FilterOp::Equal,
+            value: serde_json::json!(prefixed),
+        }],
+    )
+    .await
+    {
+        return crud::db_error_internal(e, "registry delete failed");
+    }
+    match deleted {
+        Ok(()) => ok_json(&AckResponse { ok: true }),
         Err(e) => crud::db_error(
             e,
             &format!("index not found: {name}"),
@@ -390,16 +397,20 @@ pub(super) async fn stats(ctx: &dyn Context) -> OutputStream {
     }
     let indexes = match discover_indexes(ctx).await {
         Ok(v) => v,
-        Err(e) => return err_internal("stats failed", e),
+        Err(e) => return crud::db_error_internal(e, "stats failed"),
     };
 
     let mut out: Vec<IndexStatsView> = Vec::with_capacity(indexes.len());
     for name in indexes {
         let prefixed = service::prefixed_index_name(&name);
-        // If count fails for a single index (e.g. table was dropped between
-        // discovery and count), fall back to 0 and keep going — stats should
-        // not 500 on a transient partial-state issue.
-        let count = vclient::count(ctx, &prefixed).await.unwrap_or(0);
+        // An index dropped between discovery and count is simply gone: it is
+        // left out. Any other failure is answered with its code — a refused
+        // count reported as `0` would be a claim nobody checked.
+        let count = match vclient::count(ctx, &prefixed).await {
+            Ok(count) => count,
+            Err(e) if e.code == ErrorCode::NotFound => continue,
+            Err(e) => return crud::db_error_internal(e, "stats count failed"),
+        };
         out.push(IndexStatsView { name, count });
     }
 
@@ -521,8 +532,11 @@ async fn load_index_metadata(
     ctx: &dyn Context,
     prefixed_index: &str,
 ) -> Result<(String, bool), WaferError> {
-    // First try the registry. An error here (e.g. the table doesn't exist)
-    // is treated as "no row", not fatal — we fall through to the scan.
+    // First try the registry. The registry table is created by the block's
+    // migration, so a failed read is a failure — answered with its code, never
+    // a fall-through to `DEFAULT_MODEL`, which would embed the query with a
+    // model the index may not have been built with. Only a missing ROW (an
+    // index created before the registry existed) falls through to the scan.
     let rows = db::list(
         ctx,
         REGISTRY_TABLE,
@@ -538,24 +552,22 @@ async fn load_index_metadata(
             ..Default::default()
         },
     )
-    .await;
+    .await?;
 
-    if let Ok(rows) = rows {
-        if let Some(row) = rows.records.into_iter().next() {
-            let model = row
-                .data
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_MODEL)
-                .to_string();
-            let kw = row
-                .data
-                .get("keyword_search")
-                .and_then(|v| v.as_i64())
-                .map(|n| n != 0)
-                .unwrap_or(false);
-            return Ok((model, kw));
-        }
+    if let Some(row) = rows.records.into_iter().next() {
+        let model = row
+            .data
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_MODEL)
+            .to_string();
+        let kw = row
+            .data
+            .get("keyword_search")
+            .and_then(|v| v.as_i64())
+            .map(|n| n != 0)
+            .unwrap_or(false);
+        return Ok((model, kw));
     }
 
     // Fallback path: infer keyword_search from the typed describe op.
@@ -741,7 +753,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     if body.contextual {
         match ingestion::add_context(ctx, &body.text, chunks).await {
             Ok(c) => chunks = c,
-            Err(e) => return err_internal("add_context failed", e),
+            Err(e) => return crud::db_error_internal(e, "add_context failed"),
         }
     }
     if chunks.is_empty() {
@@ -753,7 +765,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     let (_model_name, _dims, vectors) =
         match vclient::embed(ctx, embedding_block, chunks.clone()).await {
             Ok(tuple) => tuple,
-            Err(e) => return err_internal("embed failed", e),
+            Err(e) => return crud::db_error_internal(e, "embed failed"),
         };
 
     if vectors.len() != chunks.len() {
@@ -827,7 +839,7 @@ pub(super) async fn embed(ctx: &dyn Context, input: InputStream) -> OutputStream
             vectors,
         }),
         Err(e) if e.code == ErrorCode::InvalidArgument => err_bad_request(&e.message),
-        Err(e) => err_internal("embed failed", e),
+        Err(e) => crud::db_error_internal(e, "embed failed"),
     }
 }
 

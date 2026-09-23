@@ -5,6 +5,8 @@
 ///
 /// [`EntryRole`]: contracts::EntryRole
 pub mod contracts;
+#[cfg(test)]
+mod error_mapping_tests;
 pub(crate) mod migrations;
 pub mod pages;
 pub mod rest;

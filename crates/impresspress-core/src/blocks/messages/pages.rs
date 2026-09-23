@@ -115,10 +115,7 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     // deployment renders; a failed read must never reach it.
     let contexts = match service::list_contexts(ctx, &params).await {
         Ok(r) => r.records,
-        Err(e) => {
-            tracing::error!(error = %e, "messages context list page: read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "messages context list page: read failed"),
     };
 
     let content = html! {
@@ -213,10 +210,7 @@ pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStre
     // conversation looks like, so the read failing has to fail the page.
     let entries = match service::list_entries(ctx, context_id, &entries_params).await {
         Ok(r) => r.records,
-        Err(e) => {
-            tracing::error!(error = %e, context_id = %context_id, "messages detail page: entry list failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "messages detail page: entry list failed"),
     };
 
     // Sibling conversations only loaded when this is a conversation context;
@@ -237,8 +231,7 @@ pub async fn context_detail_page(ctx: &dyn Context, msg: &Message) -> OutputStre
         match service::list_contexts(ctx, &sibling_params).await {
             Ok(r) => r.records,
             Err(e) => {
-                tracing::error!(error = %e, context_id = %context_id, "messages detail page: sibling list failed");
-                return ui::server_error_response(msg);
+                return crud::db_error_page(msg, e, "messages detail page: sibling list failed")
             }
         }
     } else {

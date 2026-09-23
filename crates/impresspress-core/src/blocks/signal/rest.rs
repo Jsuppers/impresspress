@@ -11,7 +11,7 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use super::service::{self, RoomError};
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_conflict, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_not_found, ok_json},
 };
 
 /// Request body of both `POST .../offer` and `POST .../answer`.
@@ -30,7 +30,7 @@ fn error_response(e: RoomError) -> OutputStream {
         RoomError::Gone => err_not_found("Room not found or expired"),
         RoomError::BadCode => err_bad_request("Invalid room code"),
         RoomError::TooBig => err_bad_request("SDP too large"),
-        RoomError::Db(msg) => err_internal("signal store error", msg),
+        RoomError::Db(e) => crud::db_error_internal(e, "signal store error"),
     }
 }
 

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use wafer_block::{
     common::ServiceOp,
     wire::vector::{
-        CountRequest, CountResponse, EmbedRequest, EmbedResponse, ListIndexesResponse,
-        QueryResponse, VectorMatch,
+        CountRequest, CountResponse, DescribeIndexRequest, DescribeIndexResponse, EmbedRequest,
+        EmbedResponse, ListIndexesResponse, QueryResponse, VectorMatch,
     },
 };
 use wafer_run::{
@@ -22,7 +22,9 @@ use wafer_run::{
 /// Stub `wafer-run/vector` block. Writes (`create_index`, `delete_index`,
 /// `upsert`, `delete`) acknowledge with an empty body; `list_indexes`
 /// returns `indexes` (storage stems, prefix retained); `count` answers
-/// from `counts` (0 for an unknown index); `query` returns `matches`.
+/// from `counts` (0 for an unknown index); `describe_index` reports an index
+/// in `indexes` as existing with no columns, any other as absent; `query`
+/// returns `matches`.
 #[derive(Default)]
 pub(crate) struct StubVectorBlock {
     pub(crate) indexes: Vec<String>,
@@ -59,6 +61,17 @@ impl Block for StubVectorBlock {
                 let req: CountRequest = wafer_block::codec::decode(&bytes).expect("count request");
                 let resp = CountResponse {
                     count: self.counts.get(&req.index).copied().unwrap_or(0),
+                };
+                OutputStream::respond(wafer_block::codec::encode(&resp).expect("encode"))
+            }
+            ServiceOp::VECTOR_DESCRIBE_INDEX => {
+                let bytes = input.collect_to_bytes().await;
+                let req: DescribeIndexRequest =
+                    wafer_block::codec::decode(&bytes).expect("describe request");
+                let resp = DescribeIndexResponse {
+                    exists: self.indexes.contains(&req.index),
+                    columns: Vec::new(),
+                    keyword_search: false,
                 };
                 OutputStream::respond(wafer_block::codec::encode(&resp).expect("encode"))
             }
