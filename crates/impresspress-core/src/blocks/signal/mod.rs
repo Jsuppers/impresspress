@@ -307,6 +307,41 @@ mod tests {
             .await
     }
 
+    /// A room store the block was never granted answered `500 Internal server
+    /// error` on every route: `RoomError::Db` carried only the failure's text,
+    /// so its `PermissionDenied` was gone before the route could answer it. It
+    /// is the database door's 403 now, on the room write and on the room read.
+    #[tokio::test]
+    async fn a_refused_room_store_is_403() {
+        use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};
+
+        let ctx = crate::test_support::TestContext::with_signal()
+            .await
+            .with_wrap(
+                "test/ungranted",
+                Vec::new(),
+                Vec::new(),
+                "impresspress/admin",
+            );
+        let block = SignalBlock::new();
+        let offer_path = "/b/signal/rooms/AB2CD3/offer";
+        let mut misses = Vec::new();
+        for (action, body) in [("create", r#"{"sdp":"v=0"}"#), ("retrieve", "")] {
+            let out = call_from(&block, &ctx, "203.0.113.9", action, offer_path, body).await;
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(error))
+                    if (error.code, error.message.as_str())
+                        == (ErrorCode::PermissionDenied, "Access denied") => {}
+                Err(TerminalNotResponse::Error(error)) => {
+                    misses.push(format!("{action}: {:?} {:?}", error.code, error.message))
+                }
+                Ok(_) => misses.push(format!("{action}: a response")),
+                Err(_) => misses.push(format!("{action}: another terminal")),
+            }
+        }
+        assert!(misses.is_empty(), "{misses:?}");
+    }
+
     /// Regression for the live incident: the host's own 60-second poll loop
     /// is capacity enough by itself to starve a guest sharing its IP (two
     /// players on one home network, or one machine testing with two tabs).

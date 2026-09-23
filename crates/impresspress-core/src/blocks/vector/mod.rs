@@ -1,4 +1,6 @@
 pub mod contracts;
+#[cfg(test)]
+mod error_mapping_tests;
 pub mod ingestion;
 pub(crate) mod migrations;
 pub mod pages;

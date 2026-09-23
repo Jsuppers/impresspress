@@ -1274,9 +1274,14 @@ mod tests {
             "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS",
             "*@example.com, admin@*",
         );
-        assert!(check_recipient_allowed(&ctx, "intruder@other.io")
+        let refusal = check_recipient_allowed(&ctx, "intruder@other.io")
             .await
-            .is_err());
+            .expect_err("an unmatched recipient is refused");
+        assert_eq!(
+            refusal.code,
+            ErrorCode::InvalidArgument,
+            "the caller's recipient, so a 400"
+        );
     }
 
     #[tokio::test]

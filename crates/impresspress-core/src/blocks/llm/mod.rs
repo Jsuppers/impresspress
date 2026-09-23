@@ -1,5 +1,7 @@
 pub mod assets;
 pub mod contracts;
+#[cfg(test)]
+mod error_mapping_tests;
 pub mod migrations;
 pub mod pages;
 pub mod provider_admin;

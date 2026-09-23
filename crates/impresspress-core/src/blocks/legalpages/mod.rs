@@ -1,4 +1,6 @@
 mod contracts;
+#[cfg(test)]
+mod error_mapping_tests;
 pub(crate) mod migrations;
 mod pages;
 mod repo;

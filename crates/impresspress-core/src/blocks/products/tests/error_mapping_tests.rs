@@ -595,3 +595,104 @@ async fn settings_page_config_denial_is_the_403_page_not_a_500() {
     assert_eq!(parts.status, 403, "{html}");
     assert!(!html.contains("settings-form"), "{html}");
 }
+
+/// Records a miss unless `msg` answers the styled 403 page a refused read
+/// gets — not a 200 page printing the refusal's own text where the table
+/// would be, which is what these six list pages answered.
+async fn expect_refused_page(
+    misses: &mut Vec<String>,
+    ctx: &dyn wafer_run::context::Context,
+    (mut msg, input): (wafer_run::Message, wafer_run::InputStream),
+) {
+    let path = msg.path().to_string();
+    msg.set_meta("http.header.accept", "text/html");
+    let parts =
+        wafer_block::http_codec::collect_http_response(dispatch(ctx, msg, input).await).await;
+    let html = String::from_utf8_lossy(&parts.body);
+    if parts.status != 403 || !html.contains("Go home") || html.contains("refused by") {
+        misses.push(format!("{path}: {} {html}", parts.status));
+    }
+}
+
+#[tokio::test]
+async fn refused_list_page_reads_are_the_403_page() {
+    let ctx = ctx_with(SELLING).await;
+    // The seller orders page lists orders only for a seller with an account.
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_acct_1",
+        HashMap::from([
+            ("user_id".to_string(), json!("seller_1")),
+            ("status".to_string(), json!("active")),
+            ("stripe_account_id".to_string(), json!("acct_seller_1")),
+            ("details_submitted".to_string(), json!(true)),
+            ("charges_enabled".to_string(), json!(true)),
+            ("payouts_enabled".to_string(), json!(true)),
+            ("requirements_json".to_string(), json!("{}")),
+        ]),
+    )
+    .await;
+    let products = || {
+        refusing(
+            &ctx,
+            vec![("database.list", repo::products::TABLE)],
+            ErrorCode::PermissionDenied,
+        )
+    };
+    let purchases = || {
+        refusing(
+            &ctx,
+            vec![("database.list", repo::purchases::PURCHASES_TABLE)],
+            ErrorCode::PermissionDenied,
+        )
+    };
+    let mut misses = Vec::new();
+
+    expect_refused_page(
+        &mut misses,
+        &products(),
+        admin_get_msg("/b/products/admin/manage"),
+    )
+    .await;
+    expect_refused_page(
+        &mut misses,
+        &refusing(
+            &ctx,
+            vec![("database.list", repo::groups::TABLE)],
+            ErrorCode::PermissionDenied,
+        ),
+        admin_get_msg("/b/products/admin/groups"),
+    )
+    .await;
+    expect_refused_page(
+        &mut misses,
+        &purchases(),
+        admin_get_msg("/b/products/admin/purchases"),
+    )
+    .await;
+    expect_refused_page(
+        &mut misses,
+        &purchases(),
+        get_msg("/b/products/selling/orders", "seller_1"),
+    )
+    .await;
+    expect_refused_page(
+        &mut misses,
+        &products(),
+        get_msg("/b/products/my-products", "seller_1"),
+    )
+    .await;
+    expect_refused_page(
+        &mut misses,
+        &purchases(),
+        get_msg("/b/products/my-purchases", "buyer_1"),
+    )
+    .await;
+
+    assert!(
+        misses.is_empty(),
+        "expected the 403 page at every list page:\n{}",
+        misses.join("\n")
+    );
+}
