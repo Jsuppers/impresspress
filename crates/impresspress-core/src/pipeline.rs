@@ -3931,7 +3931,18 @@ mod oversized_body_tests {
     }
 }
 
-#[cfg(test)]
+// Every case routes through `test_support::real_block_infos()`, the real
+// route table the router's access gate reads, which is gated on the full
+// block set.
+#[cfg(all(
+    test,
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
+))]
 mod credential_check_tests {
     //! A credential whose check could not be completed — its database read
     //! failed — refuses the request instead of letting it continue as
