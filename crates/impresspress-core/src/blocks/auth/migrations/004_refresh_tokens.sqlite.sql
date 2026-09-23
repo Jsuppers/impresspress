@@ -1,5 +1,6 @@
 -- Refresh-token storage with explicit schema (replaces the legacy
--- `ensure_table`-materialized `wafer_run__auth__tokens` row layout).
+-- `ensure_table`-materialized row layout, which only ever existed under the
+-- table's earlier name, `suppers_ai__auth__tokens`).
 --
 -- SEC-032: refresh tokens are stored as SHA-256 hashes, never as raw JWTs.
 -- SEC-039: family ID is preserved across rotation; `generation` increments
@@ -7,7 +8,7 @@
 -- a subsequent attempt with the same token reveals a reuse attack.
 --
 -- THIS FILE MUST NOT DROP THE TABLE. It used to open with
--- `DROP TABLE IF EXISTS wafer_run__auth__tokens;`, to discard the legacy
+-- a `DROP TABLE IF EXISTS` of this table, written to discard the legacy
 -- row layout on the one upgrade that introduced this schema. But auth
 -- migrations re-run AS A SET whenever any one of them changes, so that DROP
 -- ran again on every later schema change and deleted every live refresh
@@ -17,17 +18,10 @@
 -- `re_run_survival_tests::refresh_tokens_survive_a_full_re_run` pins that
 -- they survive.
 --
--- What that costs: a database still carrying the PRE-004 layout keeps its
--- legacy table, and `CREATE TABLE IF NOT EXISTS` is a no-op on it, so the
--- columns below are missing and the first refresh write fails on a missing
--- column. That is a database which has not applied the auth set since this
--- file first shipped. Booting does not apply it: once a hash is recorded, a
--- schema change waits for `--run-migrations` or a blessed hash
--- (`migration_helper::apply_if_blessed`), so such a database can have
--- booted any number of times. The remedy there is one statement —
--- `DROP TABLE wafer_run__auth__tokens` by hand, then run migrations — and it
--- costs that deployment exactly what this DROP used to cost EVERY deployment
--- on EVERY auth schema change.
+-- Removing it strands nobody. The legacy layout only ever existed as
+-- `suppers_ai__auth__tokens`, and the auth tables moved to the
+-- `wafer_run__auth__*` names with no data migration, so every
+-- `wafer_run__auth__tokens` there is was created by the statement below.
 
 CREATE TABLE IF NOT EXISTS wafer_run__auth__tokens (
     id           TEXT PRIMARY KEY,

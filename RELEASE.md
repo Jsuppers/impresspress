@@ -708,17 +708,6 @@ survive. What does not is the session/device list at **Account → Sessions**:
 migration 012 in the same set drops and recreates it, and it refills as each
 device next refreshes its tokens.
 
-**If your deployment has not applied the auth migrations since 004 shipped**,
-check before this upgrade. Booting alone does not apply an auth schema change
-to a database that has migrated before: without `--run-migrations` or an
-operator-blessed hash, a boot logs `schema drift` and changes nothing. So a
-database created before migration 004 and not migrated since still carries the
-legacy `wafer_run__auth__tokens` row layout, however many times it has booted. The removed DROP is what used to discard that layout. Such
-a database keeps its legacy table, `CREATE TABLE IF NOT EXISTS` leaves it as it
-is, and the first refresh write fails on a missing column. The remedy is one
-statement before migrating: `DROP TABLE wafer_run__auth__tokens` — exactly what
-the removed DROP would have done to it — then run migrations.
-
 ### LLM: a provider can name its token-budget field (migration 002)
 
 **What changes.** Which field carries the output-token budget in a chat request
