@@ -406,8 +406,9 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// routes in `admin/error_mapping_tests.rs` and
 /// `userportal/error_mapping_tests.rs`, and one real route or page per
 /// converted site in `llm/error_mapping_tests.rs`,
-/// `vector/error_mapping_tests.rs`, `messages/error_mapping_tests.rs`,
-/// `legalpages/error_mapping_tests.rs` and `signal/error_mapping_tests.rs`.
+/// `vector/error_mapping_tests.rs`, `messages/error_mapping_tests.rs` and
+/// `legalpages/error_mapping_tests.rs`, and `signal`'s
+/// `a_refused_room_store_is_403` in `signal/mod.rs`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
         "products/stripe.rs",
@@ -656,14 +657,6 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
                 why: "provider: `llm_error_response`'s `LlmError` from the provider router",
             },
         ],
-    ),
-    (
-        "llm/routes/chat.rs",
-        &[Tail {
-            label: "resolve_backend_id failed",
-            count: 1,
-            why: "invariant: this process's provider router holds no enabled provider",
-        }],
     ),
     (
         "vector/pages.rs",

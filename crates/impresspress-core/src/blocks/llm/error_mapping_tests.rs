@@ -477,3 +477,69 @@ async fn refused_page_reads_are_the_403_page() {
 
     report(misses);
 }
+
+/// A deployment whose default provider is the legacy router with no enabled
+/// provider is configured that way, not broken: the chat answers 503 naming
+/// what an admin has to do, not the sanitized 500.
+#[tokio::test]
+async fn a_chat_with_no_enabled_provider_is_a_503_that_says_why() {
+    let (mut ctx, thread) = chat_fixture(StubLlmServiceBlock::default()).await;
+    ctx.set_config(DEFAULT_PROVIDER_VAR, super::DEFAULT_PROVIDER);
+    match api(&ctx, chat_msg(), &chat_body(&thread))
+        .await
+        .collect_buffered()
+        .await
+    {
+        Err(TerminalNotResponse::Error(error)) => {
+            assert_eq!(error.code, ErrorCode::Unavailable, "{}", error.message);
+            assert!(
+                error.message.contains("/b/llm/providers"),
+                "the refusal names where an admin fixes it: {}",
+                error.message
+            );
+        }
+        Ok(_) => panic!("expected a 503, got a response"),
+        Err(_) => panic!("expected a 503, got another terminal"),
+    }
+}
+
+/// Answers the messages block's thread list with a body that has no
+/// `records` array.
+#[derive(Clone)]
+struct ThreadListUnreadable(TestContext);
+
+#[async_trait::async_trait]
+impl Context for ThreadListUnreadable {
+    async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+        if name == "impresspress/messages" {
+            return OutputStream::respond(br#"{"total_count":0}"#.to_vec());
+        }
+        self.0.call_block(name, msg, input).await
+    }
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.0.registered_blocks()
+    }
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.0.config_get(key)
+    }
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
+/// A thread list the chat page cannot read is a failed page, not an empty
+/// sidebar claiming the caller has no threads.
+#[tokio::test]
+async fn an_unreadable_thread_list_fails_the_chat_page() {
+    let ctx = TestContext::with_llm().await;
+    let parts = page(&ThreadListUnreadable(ctx), "/b/llm/").await;
+    assert_eq!(
+        parts.status,
+        500,
+        "{}",
+        String::from_utf8_lossy(&parts.body)
+    );
+}

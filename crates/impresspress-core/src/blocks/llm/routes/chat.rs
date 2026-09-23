@@ -27,7 +27,7 @@ use crate::{
         },
         messages::contracts::EntryRole,
     },
-    http::{err_bad_request, err_internal, ok_json},
+    http::{err_bad_request, err_unavailable, ok_json},
 };
 
 /// Legacy default provider block name that must be replaced with the first
@@ -99,10 +99,11 @@ fn history_to_messages(history: &[serde_json::Value]) -> Vec<ChatMessage> {
 /// Resolve a legacy `impresspress/provider-llm` default into a concrete
 /// backend_id by reading the in-memory provider cache (loaded at `Init` and
 /// refreshed on every provider CRUD write) via the [`ProviderAdmin`] handle.
-/// Returns `Err` if no enabled provider is configured.
+/// With no enabled provider, that is the deployment's configuration, not a
+/// fault: the answer is a 503 telling the caller what an admin has to do.
 ///
 /// [`ProviderAdmin`]: crate::blocks::llm::provider_admin::ProviderAdmin
-fn resolve_backend_id(block: &LlmBlock, provider_block: &str) -> Result<String, &'static str> {
+fn resolve_backend_id(block: &LlmBlock, provider_block: &str) -> Result<String, OutputStream> {
     if provider_block != LEGACY_PROVIDER_BLOCK {
         // `provider_block` is the backend_id directly (non-legacy path).
         return Ok(provider_block.to_string());
@@ -114,7 +115,12 @@ fn resolve_backend_id(block: &LlmBlock, provider_block: &str) -> Result<String, 
         .into_iter()
         .find(|cfg| cfg.enabled)
         .map(|cfg| cfg.name)
-        .ok_or("no enabled provider configured")
+        .ok_or_else(|| {
+            err_unavailable(
+                "No LLM provider is enabled on this deployment: an admin must add \
+                 and enable one on the LLM Providers page (/b/llm/providers)",
+            )
+        })
 }
 
 /// Common prelude for both chat handlers: parse the body, persist the user
@@ -193,7 +199,7 @@ async fn dispatch_chat(
     //    backend_id (first enabled provider). Non-legacy values pass through.
     let backend_id = match resolve_backend_id(block, &provider_block) {
         Ok(id) => id,
-        Err(e) => return Err(err_internal("resolve_backend_id failed", e)),
+        Err(refusal) => return Err(refusal),
     };
 
     // 5. Build the service request and dispatch via the typed client.

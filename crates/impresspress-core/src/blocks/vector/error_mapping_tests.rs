@@ -16,7 +16,10 @@ use std::sync::Arc;
 
 use wafer_block::{
     common::ServiceOp,
-    wire::{database::OnConflict, vector::ListIdsResponse},
+    wire::{
+        database::OnConflict,
+        vector::{CountResponse, ListIdsResponse, ListIndexesResponse},
+    },
 };
 use wafer_core::{clients::database as db, interfaces::vector::DEFAULT_MODEL};
 use wafer_run::{
@@ -39,14 +42,18 @@ fn wrap_denial() -> WaferError {
     )
 }
 
-/// A service block named `name`, implementing `interface`, that answers every
-/// op with [`wrap_denial`] when `refuse` is set, and otherwise acknowledges
-/// the vector writes and lists no prior chunks.
+/// A service block named `name`, implementing `interface`, that answers the
+/// ops in `refuse` (every op, for [`ALL`]) with [`wrap_denial`], and otherwise
+/// acknowledges the vector writes, lists `docs` as its one index holding
+/// three vectors, and lists no prior chunks.
 struct Service {
     name: &'static str,
     interface: &'static str,
-    refuse: bool,
+    refuse: &'static [&'static str],
 }
+
+/// Every op refused.
+const ALL: &[&str] = &["*"];
 
 #[async_trait::async_trait]
 impl Block for Service {
@@ -56,13 +63,23 @@ impl Block for Service {
     }
 
     async fn handle(&self, _ctx: &dyn Context, msg: Message, _input: InputStream) -> OutputStream {
-        if self.refuse {
+        if self.refuse.iter().any(|op| *op == "*" || *op == msg.kind) {
             return OutputStream::error(wrap_denial());
         }
         match msg.kind.as_str() {
             ServiceOp::VECTOR_CREATE_INDEX
+            | ServiceOp::VECTOR_DELETE_INDEX
             | ServiceOp::VECTOR_UPSERT
             | ServiceOp::VECTOR_DELETE => OutputStream::respond(Vec::new()),
+            ServiceOp::VECTOR_LIST_INDEXES => OutputStream::respond(
+                wafer_block::codec::encode(&ListIndexesResponse {
+                    indexes: vec![prefixed_index_name("docs")],
+                })
+                .expect("encode"),
+            ),
+            ServiceOp::VECTOR_COUNT => OutputStream::respond(
+                wafer_block::codec::encode(&CountResponse { count: 3 }).expect("encode"),
+            ),
             ServiceOp::VECTOR_LIST_IDS => OutputStream::respond(
                 wafer_block::codec::encode(&ListIdsResponse { ids: Vec::new() }).expect("encode"),
             ),
@@ -78,9 +95,9 @@ impl Block for Service {
     }
 }
 
-/// A vector fixture whose `wafer-run/vector` refuses every op when
-/// `refuse_vector` is set, with an embedding block that refuses every op.
-async fn fixture(refuse_vector: bool) -> TestContext {
+/// A vector fixture whose `wafer-run/vector` refuses `refuse_vector`, with
+/// an embedding block that refuses every op.
+async fn fixture(refuse_vector: &'static [&'static str]) -> TestContext {
     let mut ctx = TestContext::with_vector().await;
     ctx.register_block(
         "wafer-run/vector",
@@ -95,7 +112,7 @@ async fn fixture(refuse_vector: bool) -> TestContext {
         Arc::new(Service {
             name: "impresspress/fastembed",
             interface: "embedding@v1",
-            refuse: true,
+            refuse: ALL,
         }),
     );
     ctx
@@ -180,7 +197,7 @@ const CREATE_DOCS: &str = r#"{"name":"docs"}"#;
 /// Every JSON route whose vector-service call is refused.
 #[tokio::test]
 async fn a_refused_vector_service_is_403() {
-    let ctx = fixture(true).await;
+    let ctx = fixture(ALL).await;
     let mut misses = Vec::new();
     for (msg, body, site) in [
         (
@@ -209,7 +226,7 @@ async fn a_refused_vector_service_is_403() {
 /// is a 403.
 #[tokio::test]
 async fn a_refused_registry_write_or_refresh_is_403() {
-    let ctx = fixture(false).await;
+    let ctx = fixture(&[]).await;
     let mut misses = Vec::new();
 
     expect_wrap_denial(
@@ -245,7 +262,7 @@ async fn a_refused_registry_write_or_refresh_is_403() {
 /// block, and both answer its refusal with the door's 403.
 #[tokio::test]
 async fn a_refused_embedding_block_is_403() {
-    let ctx = fixture(false).await;
+    let ctx = fixture(&[]).await;
     seed_docs(&ctx).await;
     let mut misses = Vec::new();
     expect_wrap_denial(
@@ -277,7 +294,7 @@ async fn a_refused_embedding_block_is_403() {
 /// vector indexes yet" — and on the detail page — not a 404.
 #[tokio::test]
 async fn refused_registry_reads_are_the_403_page() {
-    let ctx = fixture(false).await;
+    let ctx = fixture(&[]).await;
     seed_docs(&ctx).await;
     let every_op = ServiceOp::DATABASE_OPS;
     let mut misses = Vec::new();
@@ -286,6 +303,75 @@ async fn refused_registry_reads_are_the_403_page() {
         &mut misses,
         &registry_denied(&ctx, every_op),
         "/b/vector/docs/",
+    )
+    .await;
+    report(misses);
+}
+
+/// A query reads the index's registry row for the model its text is embedded
+/// with. A refused read is answered with its code — never a fall-through to
+/// `DEFAULT_MODEL`, which could embed the query with a model the index was
+/// not built with.
+#[tokio::test]
+async fn a_refused_query_metadata_read_is_403() {
+    let ctx = fixture(&[]).await;
+    seed_docs(&ctx).await;
+    let mut misses = Vec::new();
+    expect_wrap_denial(
+        &mut misses,
+        api(
+            &registry_denied(&ctx, &[ServiceOp::DATABASE_LIST]),
+            admin_msg("create", "/b/vector/api/query"),
+            r#"{"index":"docs","vector":[0.5,0.5]}"#,
+        )
+        .await,
+        "POST /b/vector/api/query (registry read)",
+    )
+    .await;
+    report(misses);
+}
+
+/// A refused count is never "0 vectors": the stats API answers the door's
+/// 403, and the list and detail pages the 403 page. A refused describe is
+/// never an empty schema.
+#[tokio::test]
+async fn a_refused_count_or_describe_is_never_drawn_as_empty() {
+    let mut misses = Vec::new();
+
+    let ctx = fixture(&[ServiceOp::VECTOR_COUNT]).await;
+    seed_docs(&ctx).await;
+    expect_wrap_denial(
+        &mut misses,
+        api(&ctx, admin_msg("retrieve", "/b/vector/api/stats"), "").await,
+        "GET /b/vector/api/stats (count)",
+    )
+    .await;
+    expect_refused_page(&mut misses, &ctx, "/b/vector/").await;
+    expect_refused_page(&mut misses, &ctx, "/b/vector/docs/").await;
+
+    let ctx = fixture(&[ServiceOp::VECTOR_DESCRIBE_INDEX]).await;
+    seed_docs(&ctx).await;
+    expect_refused_page(&mut misses, &ctx, "/b/vector/docs/").await;
+
+    report(misses);
+}
+
+/// Deleting an index clears its registry row; a refused delete is answered,
+/// not acknowledged over a row that keeps listing an index that is gone.
+#[tokio::test]
+async fn a_refused_registry_delete_is_403() {
+    let ctx = fixture(&[]).await;
+    seed_docs(&ctx).await;
+    let mut misses = Vec::new();
+    expect_wrap_denial(
+        &mut misses,
+        api(
+            &registry_denied(&ctx, ServiceOp::DATABASE_OPS),
+            admin_msg("delete", "/b/vector/api/indexes/docs"),
+            "",
+        )
+        .await,
+        "DELETE /b/vector/api/indexes/docs (registry delete)",
     )
     .await;
     report(misses);

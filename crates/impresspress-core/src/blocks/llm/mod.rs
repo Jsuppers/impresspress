@@ -338,14 +338,21 @@ async fn answer_of(out: OutputStream, what: &str) -> Result<serde_json::Value, W
 }
 
 /// The records of a `{records: [...], total_count: n}` list answer, or the
-/// error the callee terminated with.
+/// error the callee terminated with. An answer with no `records` array is an
+/// internal failure, not an empty list: the sidebar and the history would
+/// otherwise claim a thread holds nothing.
 async fn records_of(out: OutputStream, what: &str) -> Result<Vec<serde_json::Value>, WaferError> {
-    Ok(answer_of(out, what)
+    answer_of(out, what)
         .await?
         .get("records")
         .and_then(serde_json::Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .ok_or_else(|| {
+            WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("{what}: the messages block's answer has no `records` array"),
+            )
+        })
 }
 
 /// Call the messages block to list the caller's threads — the chat page's

@@ -82,7 +82,7 @@ pub fn render_index_list_table(rows: &[IndexRow]) -> Markup {
                         td data-label="Name" { (display) }
                         td data-label="Model" { (r.model) }
                         td data-label="Dimensions" { (r.dimensions) }
-                        td data-label="Vectors" { (r.vector_count) }
+                        td data-label="Vectors" { (vector_count_text(r.vector_count)) }
                         td data-label="Keyword search" {
                             @if r.keyword_search {
                                 span .badge.badge-success { "Yes" }
@@ -97,6 +97,12 @@ pub fn render_index_list_table(rows: &[IndexRow]) -> Markup {
     }
 }
 
+/// A vector count as the tables show it: the number, or `—` when there is
+/// none to report (no vector backend, or no such index in it).
+fn vector_count_text(count: Option<u64>) -> String {
+    count.map_or_else(|| "—".to_string(), |n| n.to_string())
+}
+
 /// Render the body sections for an index detail page: a Stats section
 /// (counts/model/dimensions/keyword toggle) and a Schema section showing
 /// the underlying storage table name plus introspected columns. Pure
@@ -109,7 +115,7 @@ pub fn render_index_detail_sections(
         section .section {
             h3 { "Stats" }
             dl .kv-list {
-                dt { "Vector count" } dd { (row.vector_count) }
+                dt { "Vector count" } dd { (vector_count_text(row.vector_count)) }
                 dt { "Dimensions" }   dd { (row.dimensions) }
                 dt { "Model" }        dd { (row.model) }
                 dt { "Keyword search" }
@@ -256,17 +262,27 @@ pub async fn index_detail_page(ctx: &dyn Context, msg: &Message, name: &str) -> 
     };
 
     // Real column state of the meta table via the typed `vector.describe_index`
-    // op (WRAP-authorized on the index). Lenient like before: any error — or a
-    // missing index (`exists: false`) — renders an empty schema section.
-    let schema_cols: Vec<(String, String)> = vclient::describe_index(ctx, &storage_name)
-        .await
-        .map(|d| {
-            d.columns
+    // op (WRAP-authorized on the index). A missing index (`exists: false`) or
+    // a runtime with no vector backend has no columns to show; a refused
+    // describe is answered, not drawn as an empty schema.
+    let schema_cols: Vec<(String, String)> = if vector_backend_available(ctx) {
+        match vclient::describe_index(ctx, &storage_name).await {
+            Ok(d) => d
+                .columns
                 .into_iter()
                 .map(|c| (c.name, c.sql_type))
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect(),
+            Err(e) => {
+                return crate::blocks::crud::db_error_page(
+                    msg,
+                    e,
+                    "vector index detail page: describe_index failed",
+                )
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     let display = display_index_name(&row.name);
     let subtitle = format!(
@@ -325,7 +341,7 @@ mod tests {
             name: name.into(),
             model: model.into(),
             dimensions: dims,
-            vector_count: count,
+            vector_count: Some(count),
             keyword_search: kw,
         }
     }
@@ -367,7 +383,7 @@ mod tests {
             name: "impresspress__vector__docs".into(),
             model: "fastembed".into(),
             dimensions: 384,
-            vector_count: 42,
+            vector_count: Some(42),
             keyword_search: true,
         };
         let schema_cols = vec![
@@ -393,7 +409,7 @@ mod tests {
             name: "x".into(),
             model: "fastembed".into(),
             dimensions: 16,
-            vector_count: 0,
+            vector_count: Some(0),
             keyword_search: false,
         };
         let html = join(&render_index_detail_sections(&row, &[]));
@@ -552,11 +568,10 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn index_list_page_count_degrades_to_zero_without_backend() {
-        // No `wafer-run/vector` block registered: `vclient::count` fails
-        // with NotFound and `map_index_row` must degrade the count to 0
-        // (same fallback the API stats route uses) instead of erroring
-        // the whole listing.
+    async fn index_list_page_has_no_count_without_backend() {
+        // No `wafer-run/vector` block registered: there is no count to
+        // report, so the cell says so (`—`) instead of claiming 0 vectors
+        // or erroring the whole listing.
         let ctx = TestContext::with_vector().await;
         seed_docs_index(&ctx).await;
 
@@ -566,8 +581,8 @@ mod integration_tests {
 
         assert!(body.contains(">docs<"), "seeded row missing: {body}");
         assert!(
-            body.contains(r#"data-label="Vectors">0<"#),
-            "vector count cell should degrade to 0, got: {body}"
+            body.contains(r#"data-label="Vectors">—<"#),
+            "vector count cell should say there is no count, got: {body}"
         );
     }
 
