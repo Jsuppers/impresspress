@@ -9,7 +9,9 @@
 # the call. A reference to `crate::platform_state::<module>` from a block is
 # walked the same way: that module's functions run under the calling block's
 # WRAP identity, so the reference is a database access on the module's
-# `TABLE` (Phase 3.7).
+# `TABLE` (Phase 3.7). So are the two references that reach the admin audit
+# table through its shared writer — `logs::audit_log` and
+# `ui::settings_form::save_settings` (Phase 3.8).
 #
 # Background: WRAP enforces cross-block table access at runtime, but only
 # when the calling site routes through the typed `db::*` client AND the
@@ -821,10 +823,27 @@ while IFS= read -r line; do
   # The args may be string literals or constant identifiers (with optional `super::module::` qualifier).
   # Bash requires the regex stored in a variable when it contains parens.
   re_grant='ResourceGrant::(read|read_write)\(([^,]+),[[:space:]]*([^)]+)\)'
-  if [[ "$rest" =~ $re_grant ]]; then
+  # rustfmt breaks a declaration whose arguments do not fit onto continuation
+  # lines, leaving only `ResourceGrant::read_write(` on the matched line. Read
+  # the rest of the statement before testing: a grant the audit cannot see is
+  # reported as a MISSING grant for a call that IS granted, and the obvious
+  # way to silence that is a duplicate grant or a pragma.
+  stmt="$rest"
+  if ! [[ "$stmt" =~ $re_grant ]]; then
+    probe=$((lineno + 1))
+    until [[ "$stmt" == *')'* ]] || [ "$probe" -gt $((lineno + 8)) ]; do
+      stmt="$stmt $(sed -n "${probe}p" "$file" 2>/dev/null)"
+      probe=$((probe + 1))
+    done
+  fi
+  if [[ "$stmt" =~ $re_grant ]]; then
     kind="${BASH_REMATCH[1]}"
     grantee_raw="${BASH_REMATCH[2]// /}"
     resource_raw="${BASH_REMATCH[3]// /}"
+    # A joined statement keeps rustfmt's trailing comma inside the captured
+    # final argument.
+    grantee_raw="${grantee_raw%,}"
+    resource_raw="${resource_raw%,}"
     grantee="$(resolve_token "$grantee_raw" "$file")"
     resource="$(resolve_token "$resource_raw" "$file")"
     # Grant type: default Database; `.typed(...)` on the same line picks
@@ -836,7 +855,7 @@ while IFS= read -r line; do
     # reported.
     type="Database"
     re_typed='\.typed\(([^)]*ResourceType::)?([A-Za-z]+)\)'
-    if [[ "$rest" =~ $re_typed ]]; then
+    if [[ "$stmt" =~ $re_typed ]]; then
       type="${BASH_REMATCH[2]}"
     else
       next_line="$(sed -n "$((lineno + 1))p" "$file" 2>/dev/null)"
@@ -1069,6 +1088,56 @@ while IFS= read -r file; do
   done
 done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
 
+# ---------- Phase 3.8: walk admin-audit writer references ----------
+# The admin audit trail is one table with one writer,
+# `blocks::admin::logs::audit_log`, and blocks other than admin reach it:
+# directly (userportal's portal buttons) and through
+# `ui::settings_form::save_settings`, which audits every settings page it
+# serves. Like `platform_state`, that writer is a helper rather than a
+# service — it runs under the CALLING block's WRAP identity, so the row lands
+# only when the admin block grants that block the table.
+#
+# Neither reference is a `db::*` callsite in the caller's own file, and
+# `save_settings` does not even live under `src/blocks/`, so Phase 3
+# attributes both writes to the admin block and sees nothing to check. This
+# phase attributes them to the block that made the call, checked exactly like
+# a `db::*` callsite naming the table (same pragmas, same report).
+AUDIT_WRITER_TABLE="${CONST_VALUE[AUDIT_LOGS_TABLE]:-}"
+if [ -z "$AUDIT_WRITER_TABLE" ]; then
+  echo "::error::AUDIT_LOGS_TABLE not indexed — the admin audit writer cannot be walked." >&2
+  exit 2
+fi
+declare -i audit_writer_total=0
+while IFS= read -r line; do
+  file="${line%%:*}"
+  rest="${line#*:}"
+  lineno="${rest%%:*}"
+  caller="$(file_to_block_id "$file")"
+  pair_key="${caller}|${AUDIT_WRITER_TABLE}"
+  [ -n "${SEEN_PAIRS[$pair_key]:-}" ] && continue
+  SEEN_PAIRS["$pair_key"]=1
+  audit_writer_total=$((audit_writer_total + 1))
+  total=$((total + 1))
+  if file_allows_audit_skip "$file" || has_allow_pragma "$file" "$lineno"; then
+    allowed=$((allowed + 1))
+    ALLOWED_LINES+=("${file}:${lineno}: ${caller} → ${AUDIT_WRITER_TABLE} (via the audit writer)")
+    continue
+  fi
+  result="$(check_coverage "$caller" "$AUDIT_WRITER_TABLE")"
+  case "$result" in
+    OK|OWN) ;;
+    MISSING)
+      missing=$((missing + 1))
+      owner="$(table_to_owner "$AUDIT_WRITER_TABLE")"
+      MISSING_LINES+=("${file}:${lineno}: ${caller} → ${AUDIT_WRITER_TABLE} (owned by ${owner}, via the audit writer)")
+      ;;
+    NON_CONVENTIONAL)
+      nonconv=$((nonconv + 1))
+      NONCONV_LINES+=("${file}:${lineno}: ${caller} → ${AUDIT_WRITER_TABLE} (via the audit writer)")
+      ;;
+  esac
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "(audit_log|settings_form::save_settings)\(" "$BLOCKS_DIR" 2>/dev/null || true)
+
 # ---------- Phase 3.5: walk storage callsites and check coverage ----------
 # Mirrors Phase 3 but for typed Storage grants.
 
@@ -1127,7 +1196,7 @@ echo
 echo "WRAP grant audit — $(date)"
 echo
 echo "Indexed: ${#CONST_VALUE[@]} constants, ${#GRANTS[@]} grant decls."
-echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed (${ps_total} reached through platform_state)."
+echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed (${ps_total} reached through platform_state, ${audit_writer_total} through the audit writer)."
 echo "Storage:  ${storage_total} unique (caller, resource) pairs; ${storage_allowed} pragma-allowed."
 echo
 
