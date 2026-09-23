@@ -4117,7 +4117,7 @@ mod credential_check_tests {
             vec![("database.get", users::TABLE)],
             WaferError::new(
                 ErrorCode::PermissionDenied,
-                "WRAP: impresspress/router may not read wafer_run__auth__users",
+                "WRAP: impresspress/router may not read the users table",
             ),
         );
 
@@ -4129,7 +4129,7 @@ mod credential_check_tests {
         );
         assert!(body.contains("Access denied"), "{body}");
         assert!(
-            !body.contains("wafer_run__auth__users"),
+            !body.contains("impresspress/router"),
             "the refusal's grant and table stay in the log: {body}"
         );
     }
