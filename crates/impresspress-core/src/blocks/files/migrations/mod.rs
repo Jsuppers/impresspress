@@ -77,6 +77,32 @@ const SQL_003_POSTGRES: &str = include_str!("003_legacy_share_token_expiry.postg
 const SQL_004_SQLITE: &str = include_str!("004_object_claim_id.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_004_POSTGRES: &str = include_str!("004_object_claim_id.postgres.sql");
+// 005 records, on every object row, the storage key its bytes live under.
+//
+// An upload used to store its bytes at the object's own key, so every upload
+// of one key wrote the same blob. The claim token (004) made the ROW exact,
+// but not the blob: an upload whose reservation outlived its TTL and was
+// taken over could still land its bytes after the upload that took over had
+// finished, and overwrite them — leaving that upload's row serving the first
+// upload's content. Each reservation now stores its bytes under a key of its
+// own (`repo::objects::claim_blob_key`), and the row names the blob it serves
+// in `blob_key`; every reader resolves the bytes through the row.
+//
+// Rows written before 005 have a NULL `blob_key`, and NULL means exactly what
+// those rows were written under: the bytes are at the object's own key. No
+// row is rewritten and no blob is copied — an old object keeps being served
+// from where it is until an upload replaces it, which then deletes it.
+//
+// Re-running is harmless on every backend, for the reason 004's is: `ADD
+// COLUMN IF NOT EXISTS` on PostgreSQL, and on SQLite/D1 the duplicate-column
+// error `apply_if_blessed` tolerates for an `ALTER TABLE … ADD COLUMN`. The
+// replay of the whole set is pinned by `replay_tests` below. A native
+// deployment that has not run it still uploads while strict schema is off,
+// through the same lazy column-add `uploads_work_before_migration_005_has_run`
+// in `storage::objects` exercises.
+const SQL_005_SQLITE: &str = include_str!("005_object_blob_key.sqlite.sql");
+#[cfg(any(feature = "postgres", test))]
+const SQL_005_POSTGRES: &str = include_str!("005_object_blob_key.postgres.sql");
 
 // The unused `cloud_quotas.reset_period_days` column.
 //
@@ -100,6 +126,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("002_bucket_name_unique", SQL_002_SQLITE),
     (LEGACY_SHARE_TOKEN_EXPIRY, SQL_003_SQLITE),
     ("004_object_claim_id", SQL_004_SQLITE),
+    ("005_object_blob_key", SQL_005_SQLITE),
 ];
 
 /// Basename of the share-expiry repair, named once so the migration list and
@@ -119,6 +146,7 @@ const POSTGRES_MIGRATION_FILES: &[&str] = &[
     SQL_002_POSTGRES,
     SQL_003_POSTGRES,
     SQL_004_POSTGRES,
+    SQL_005_POSTGRES,
 ];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`]. Empty

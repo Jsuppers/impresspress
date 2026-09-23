@@ -32,7 +32,8 @@ pub(in crate::blocks::files) use buckets::{
     handle_create_bucket, handle_delete_bucket, handle_list_buckets,
 };
 pub(in crate::blocks::files) use objects::{
-    handle_delete_object, handle_get_object, handle_list_objects, handle_upload_object,
+    delete_blobs, handle_delete_object, handle_get_object, handle_list_objects,
+    handle_upload_object,
 };
 pub(in crate::blocks::files) use search::{handle_recent, handle_search};
 pub(in crate::blocks::files) use validation::{
@@ -119,6 +120,21 @@ mod test_helpers {
         /// with a backend-internal error.
         pub(super) fn refuse(&self, op: &'static str) {
             self.refused.lock().unwrap().insert(op);
+        }
+
+        /// Every blob key stored in `folder`, sorted — what a test asserts
+        /// to show that an upload left nothing behind, or exactly one blob.
+        pub(super) fn blob_keys(&self, folder: &str) -> Vec<String> {
+            let mut keys: Vec<String> = self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(f, _)| f == folder)
+                .map(|(_, key)| key.clone())
+                .collect();
+            keys.sort();
+            keys
         }
 
         fn refusal(&self, op: &str) -> Option<StorageError> {
