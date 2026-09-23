@@ -1,7 +1,7 @@
 use maud::{html, Markup};
 use wafer_block::db::{ListOptions, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{admin_page, crumb};
 use crate::{
@@ -117,9 +117,16 @@ async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> M
 
         @match &result {
             Ok(list) => {
-                (users_table(&list.rows, ctx, current_user_id).await)
+                @match users_table(&list.rows, ctx, current_user_id).await {
+                    Ok(table) => {
+                        (table)
 
-                (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
+                        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
+                    }
+                    Err(e) => {
+                        div .login-error { "Failed to load the users' roles: " (e) }
+                    }
+                }
             }
             Err(e) => {
                 div .login-error { "Failed to load users: " (e) }
@@ -129,11 +136,17 @@ async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> M
 }
 
 /// Render the users table body. Async because it enriches each user with roles.
-async fn users_table(records: &[UserRow], ctx: &dyn Context, current_user_id: &str) -> Markup {
+///
+/// A failed roles read is an error, not a table of users with no roles.
+async fn users_table(
+    records: &[UserRow],
+    ctx: &dyn Context,
+    current_user_id: &str,
+) -> Result<Markup, WaferError> {
     // Bulk-fetch all roles for the visible users in a single query (was N+1:
     // one `list_all` per row), via the shared `ops::fetch_roles` helper.
     let user_ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
-    let user_roles = ops::fetch_roles(ctx, &user_ids).await;
+    let user_roles = ops::fetch_roles(ctx, &user_ids).await?;
 
     let rows: Vec<components::TableRow> = records
         .iter()
@@ -143,10 +156,10 @@ async fn users_table(records: &[UserRow], ctx: &dyn Context, current_user_id: &s
         })
         .collect();
 
-    components::DataTable::new(&USER_COLUMNS)
+    Ok(components::DataTable::new(&USER_COLUMNS)
         .rows(rows)
         .empty(html! { p .text-center .text-muted { "No users found" } })
-        .render()
+        .render())
 }
 
 /// The users table's columns. Declared once so the `<td data-label>` the
@@ -245,18 +258,51 @@ fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> com
 /// It goes back through the shared component against the same
 /// [`USER_COLUMNS`], so the row htmx swaps in carries the same classes and the
 /// same `data-label` cells as the row it replaces.
-async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Markup {
-    let Ok(Some(record)) = users::find_by_id(ctx, user_id).await else {
-        return html! {};
+///
+/// `None` when the row cannot be re-read: the user read or the roles read
+/// failed, or the user is gone. The caller swaps in an error row instead —
+/// an empty body would delete the row from the table under a success toast,
+/// and a row built from a failed roles read would show the user holding none.
+async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Option<Markup> {
+    let record = match users::find_by_id(ctx, user_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            tracing::error!(
+                user_id,
+                "admin users: row re-read found no user after a mutation"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(user_id, error = %e, "admin users: row re-read failed");
+            return None;
+        }
     };
 
     // Single-user lookup via the shared roles helper (the `[one]` case).
-    let roles = ops::fetch_roles(ctx, &[user_id])
-        .await
-        .remove(user_id)
-        .unwrap_or_default();
+    let roles = match ops::fetch_roles(ctx, &[user_id]).await {
+        Ok(mut roles) => roles.remove(user_id).unwrap_or_default(),
+        Err(e) => {
+            tracing::error!(user_id, error = %e, "admin users: roles re-read failed");
+            return None;
+        }
+    };
 
-    single_user_row(&record, &roles, "").render(&USER_COLUMNS, None)
+    Some(single_user_row(&record, &roles, "").render(&USER_COLUMNS, None))
+}
+
+/// The answer to an Enable/Disable that landed: the re-rendered row under a
+/// success toast, or — when the row cannot be re-read — an error row in its
+/// place saying the change was made.
+async fn user_row_response(ctx: &dyn Context, user_id: &str, done: &str) -> OutputStream {
+    match user_row_fragment(ctx, user_id).await {
+        Some(row) => ui::html_response_with_toast(row, done, "success"),
+        None => ui::swap_error_row_response(
+            &format!("user-row-{user_id}"),
+            USER_COLUMNS.len(),
+            &format!("{done}, but the row could not be reloaded. Reload the page to see it."),
+        ),
+    }
 }
 
 /// `POST /b/admin/users/{id}/disable`. `{id}` is read only as the route
@@ -268,8 +314,7 @@ pub async fn handle_user_disable(ctx: &dyn Context, msg: &Message) -> OutputStre
     if let Err(out) = ops::set_user_disabled(ctx, msg, user_id, true).await {
         return out;
     }
-    let row = user_row_fragment(ctx, user_id).await;
-    ui::html_response_with_toast(row, "User disabled", "success")
+    user_row_response(ctx, user_id, "User disabled").await
 }
 
 /// `POST /b/admin/users/{id}/enable`. `{id}` is read only as the route
@@ -279,8 +324,7 @@ pub async fn handle_user_enable(ctx: &dyn Context, msg: &Message) -> OutputStrea
     if let Err(out) = ops::set_user_disabled(ctx, msg, user_id, false).await {
         return out;
     }
-    let row = user_row_fragment(ctx, user_id).await;
-    ui::html_response_with_toast(row, "User enabled", "success")
+    user_row_response(ctx, user_id, "User enabled").await
 }
 
 /// `DELETE /b/admin/users/{id}`. `{id}` is read only as the route table
@@ -614,6 +658,60 @@ const API_KEY_COLUMNS: [components::TableCol<'static>; 6] = [
 mod tests {
     use super::*;
     use crate::test_support::{admin_msg, TestContext};
+
+    /// Disable answers one `<tr>`, swapped over the user's row. When the row
+    /// cannot be re-read after the write landed, the answer is an error row
+    /// under an error toast: not a row built from a failed roles read, which
+    /// shows an admin holding no roles, and not an empty body, which deletes
+    /// the row from the table under a "User disabled" success toast.
+    ///
+    /// `break_list_reads` keeps the user read working and fails the roles
+    /// query, so this reaches the roles half of the re-read.
+    #[tokio::test]
+    async fn a_failed_row_reread_after_disable_swaps_an_error_row() {
+        use crate::platform_state::user_roles;
+
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("u-1").await;
+        user_roles::assign(&ctx, "u-1", "admin", "")
+            .await
+            .expect("grant");
+        let failing = ctx.clone().break_list_reads();
+
+        let parts = crate::blocks::admin::test_support::browser_request(
+            &failing,
+            admin_msg("create", "/b/admin/users/u-1/disable"),
+        )
+        .await;
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+
+        assert_eq!(parts.status, 200, "htmx swaps only a 2xx");
+        assert!(
+            html.starts_with(r#"<tr id="user-row-u-1">"#),
+            "the swap target is a row, and the answer must be one: {html}"
+        );
+        assert!(html.contains("alert--error"), "{html}");
+        assert!(html.contains("User disabled, but"), "{html}");
+        assert!(
+            !html.contains("\u{2014}"),
+            "a row claiming the user holds no roles: {html}"
+        );
+        let trigger = parts
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("HX-Trigger"))
+            .map(|(_, value)| value.clone())
+            .expect("an error toast must be triggered");
+        let toast: serde_json::Value = serde_json::from_str(&trigger).expect("trigger JSON");
+        assert_eq!(toast["showToast"]["type"], "error", "{toast}");
+
+        // The write did land — the notice is right to say so.
+        let row = users::find_by_id(&ctx, "u-1")
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(row.disabled);
+    }
 
     /// The roles tab's delete, when the revocation pass after the row delete
     /// fails: the tab re-renders without the role and the toast warns about

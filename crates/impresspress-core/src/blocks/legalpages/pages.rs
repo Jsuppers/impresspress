@@ -594,6 +594,16 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
 
     let saved = msg.query("saved") == "1";
+    let form =
+        match settings_form::settings_form(ctx, "/b/legalpages/admin/settings", &sections, preview)
+            .await
+        {
+            Ok(form) => form,
+            Err(e) => {
+                tracing::error!(error = %e, "legalpages settings: current values read failed");
+                return ui::server_error_response(msg);
+            }
+        };
 
     let content = html! {
         (components::page_header("Settings", Some("Customize the public legal pages appearance"), None))
@@ -605,7 +615,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             }
         }
 
-        (settings_form::settings_form(ctx, "/b/legalpages/admin/settings", &sections, preview).await)
+        (form)
     };
 
     ui::shell_page(

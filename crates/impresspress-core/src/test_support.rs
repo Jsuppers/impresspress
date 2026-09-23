@@ -53,6 +53,11 @@ pub struct TestContext {
     /// `config_get` can return `Option<&str>` without holding a lock.
     /// Populated via [`set_config`].
     config: Arc<HashMap<String, String>>,
+    /// Whether `wafer-run/config` is the production
+    /// [`crate::blocks::config::VariablesConfigBlock`] over this fixture's
+    /// database — true once the `variables` table exists (admin migrations)
+    /// or a test booted the config service. See [`Self::install_config_block`].
+    config_store: bool,
     /// Placeholder for dynamically registered blocks — populated by Task 6.
     pub blocks: Arc<Mutex<HashMap<String, Arc<dyn Block>>>>,
     /// `BlockInfo` for every block registered via [`Self::register_block`],
@@ -212,6 +217,7 @@ impl TestContext {
             db_service: svc,
             database_block,
             config: Arc::new(HashMap::new()),
+            config_store: false,
             blocks: Arc::new(Mutex::new(HashMap::new())),
             block_infos: Vec::new(),
             caller_id: None,
@@ -236,11 +242,20 @@ impl TestContext {
     /// (`wafer_core::clients::config::get`/`get_default`) sees the same values
     /// as `config_get`. Without this, those client calls route to an
     /// unregistered block and silently fall back to their hardcoded default.
+    ///
+    /// On a fixture whose `wafer-run/config` is the production block (see
+    /// [`Self::install_config_block`]) the value joins that block's boot map
+    /// instead, as an environment value would: a non-empty `variables` row
+    /// for the same key still wins.
     pub fn set_config(&mut self, key: &str, value: &str) {
         let mut map = (*self.config).clone();
         map.insert(key.to_string(), value.to_string());
         self.config = Arc::new(map);
 
+        if self.config_store {
+            self.install_config_block();
+            return;
+        }
         let svc = wafer_core::service_blocks::config::EnvConfigService::new();
         for (k, v) in self.config.iter() {
             wafer_core::interfaces::config::service::ConfigService::set(&svc, k, v);
@@ -463,13 +478,17 @@ impl TestContext {
     /// [`Self::with_auth_added`]. Lets a constructor choose its database
     /// topology (in-memory or [`Self::new_on_disk`]) without restating the
     /// migration chain built on top of it.
-    pub async fn with_admin_added(self) -> Self {
+    ///
+    /// Also installs the production config block over the new `variables`
+    /// table ([`Self::install_config_block`]), as every target's builder does.
+    pub async fn with_admin_added(mut self) -> Self {
         self.apply_block_migrations(
             "impresspress/admin",
             crate::blocks::admin::migrations::SQLITE_MIGRATIONS,
             crate::blocks::admin::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
+        self.install_config_block();
         self
     }
 
@@ -1000,20 +1019,44 @@ impl TestContext {
             vars.insert((*key).to_string(), (*value).to_string());
         }
 
+        self.config = Arc::new(vars);
+        self.install_config_block();
+    }
+
+    /// Serve `wafer-run/config` from the production
+    /// [`crate::blocks::config::VariablesConfigBlock`]: this fixture's
+    /// `variables` table, over a boot map holding the synchronous snapshot.
+    ///
+    /// The block `builder::registration` registers, not wafer-core's: a
+    /// fixture that wired up a different config block would certify a path
+    /// production does not take, which is how the config-store defect
+    /// survived a green suite in the first place. It reads through the same
+    /// `DatabaseService` the database block does, as production's does, so
+    /// [`Self::break_reads`] and [`Self::break_writes`] reach it too.
+    fn install_config_block(&mut self) {
         let svc: Arc<dyn wafer_core::interfaces::config::service::ConfigService> =
             Arc::new(wafer_core::service_blocks::config::EnvConfigService::new());
-        let svc = crate::builder::fill_config_service(svc, vars.clone());
-
-        self.config = Arc::new(vars);
-        // The block `builder::registration` registers, not wafer-core's: a
-        // fixture that wired up a different config block would certify a path
-        // production does not take, which is how the config-store defect
-        // survived a green suite in the first place.
+        let svc = crate::builder::fill_config_service(svc, (*self.config).clone());
         let block: Arc<dyn Block> = Arc::new(crate::blocks::config::VariablesConfigBlock::new(
             svc,
             self.db_service.clone(),
         ));
         self.register_block("wafer-run/config", block);
+        self.config_store = true;
+    }
+
+    /// The interface the block registered under `name` declares, or `None`
+    /// when this fixture has no such block. See the action gate in
+    /// [`Context::call_block`].
+    fn callee_interface(&self, name: &str) -> Option<String> {
+        if name == "wafer-run/database" {
+            return Some(self.database_block.info().interface);
+        }
+        let block = {
+            let guard = self.blocks.lock().expect("blocks mutex poisoned");
+            guard.get(name).cloned()
+        };
+        block.map(|block| block.info().interface)
     }
 
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
@@ -1085,6 +1128,9 @@ impl TestContext {
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
             broken,
         ));
+        if self.config_store {
+            self.install_config_block();
+        }
         self
     }
 
@@ -1125,6 +1171,9 @@ impl TestContext {
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
             broken,
         ));
+        if self.config_store {
+            self.install_config_block();
+        }
         self
     }
 
@@ -1683,7 +1732,36 @@ impl Context for TestContext {
             ));
         }
 
-        // Gate 2: WRAP (only when the test opted in via `with_wrap`).
+        // Gate 2: interface action validation, which production runs on EVERY
+        // `call_block` — `RuntimeContext::dispatch_call` checks the message's
+        // action (the `req.action` meta, else the message kind) against the
+        // spec registered for the TARGET block's declared interface. A block
+        // whose interface has no registered spec is skipped, as upstream skips
+        // it (`ActionCheck::UnknownInterface` warns once and proceeds), and so
+        // is a target this fixture cannot resolve to a block.
+        //
+        // The gap this closes is not hypothetical: `blocks::config`'s
+        // `CONFIG_GET_MANY` passed every unit test and was refused by the real
+        // runtime under `config@v1`, which took every settings page with it.
+        if let Some(interface) = self.callee_interface(name) {
+            let action = if msg.action().is_empty() {
+                msg.kind.as_str()
+            } else {
+                msg.action()
+            };
+            if let wafer_run::runtime::validation::ActionCheck::Invalid { message } =
+                wafer_run::runtime::validation::check_action_interface(
+                    name,
+                    &interface,
+                    action,
+                    &interface_specs(),
+                )
+            {
+                return OutputStream::error(WaferError::new(ErrorCode::InvalidArgument, message));
+            }
+        }
+
+        // Gate 3: WRAP (only when the test opted in via `with_wrap`).
         // Mirrors `RuntimeContext::check_resource_access`, which production
         // reaches from the service handler's `decode_and_authorize` — same
         // `check_access` callsite shape, one frame earlier.
@@ -2418,6 +2496,17 @@ impl<'a> SeedUser<'a> {
         .await
         .unwrap_or_else(|e| panic!("seed user {}: {e:?}", self.email))
     }
+}
+
+/// Every interface spec a block in this workspace can declare: wafer-run's
+/// well-known ones plus impresspress's own, which is the config block's
+/// ([`crate::blocks::config::CONFIG_INTERFACE`]). `Wafer` holds the same two
+/// sets — `wafer_block::interfaces::all()` at construction, plus whatever
+/// `register_interface` adds, which in this repo is that one spec.
+fn interface_specs() -> Vec<wafer_block::InterfaceSpec> {
+    let mut specs = wafer_block::interfaces::all();
+    specs.push(crate::blocks::config::interface_spec());
+    specs
 }
 
 /// Build an anonymous request `Message`. No `auth.user_id` meta set.
@@ -3775,6 +3864,118 @@ mod tests {
                 .await
                 .expect("a broken read layer must not fail a filtered delete"),
             1,
+        );
+    }
+
+    /// Gate 2: `call_block` refuses an action the TARGET's declared interface
+    /// does not list, as `RuntimeContext::dispatch_call` does — and admits
+    /// one it lists, so the gate is not simply refusing everything.
+    ///
+    /// Without this the gate has no test of its own: every other test calls
+    /// actions the target declares, so deleting the gate changes nothing they
+    /// assert. What it exists to catch is a call the fixture would certify
+    /// and the runtime refuse, which is how `impresspress.config.get_many`
+    /// reached a server under `config@v1`.
+    #[tokio::test]
+    async fn call_block_refuses_an_action_the_targets_interface_does_not_declare() {
+        /// A block declaring wafer-run's `database@v1`, whose action map is
+        /// the `database.*` op family.
+        struct DatabaseShaped;
+
+        #[wafer_block::wafer_async_trait]
+        impl Block for DatabaseShaped {
+            fn info(&self) -> wafer_run::BlockInfo {
+                wafer_run::BlockInfo::new(
+                    "test/database-shaped",
+                    "0.0.1",
+                    "database@v1",
+                    "declares database@v1 and answers anything it is handed",
+                )
+            }
+
+            async fn handle(
+                &self,
+                _ctx: &dyn Context,
+                _msg: Message,
+                _input: InputStream,
+            ) -> OutputStream {
+                OutputStream::respond(b"reached the block".to_vec())
+            }
+        }
+
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("test/database-shaped", Arc::new(DatabaseShaped));
+
+        let declared = ctx
+            .call_block(
+                "test/database-shaped",
+                Message::new(wafer_block::common::ServiceOp::DATABASE_LIST),
+                InputStream::empty(),
+            )
+            .await;
+        assert_eq!(
+            collect_or_panic(declared).await.body,
+            b"reached the block",
+            "a declared action must reach the block"
+        );
+
+        let refused = ctx
+            .call_block(
+                "test/database-shaped",
+                Message::new("database.teleport"),
+                InputStream::empty(),
+            )
+            .await;
+        match refused.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+                assert!(e.message.contains("database.teleport"), "{e:?}");
+                assert!(e.message.contains("database@v1"), "{e:?}");
+            }
+            other => panic!("an undeclared action must be refused, got {other:?}"),
+        }
+    }
+
+    /// The gate above validates against a HAND-MAINTAINED spec set
+    /// ([`interface_specs`]): wafer-run's well-known specs plus this repo's
+    /// own. A second `Wafer::register_interface` call site would put a spec on
+    /// the runtime that the fixture does not have, and every call to that
+    /// interface would then be checked here against nothing — the gate would
+    /// silently skip it (`ActionCheck::UnknownInterface`) while production
+    /// validated it.
+    #[test]
+    fn the_fixture_spec_set_matches_every_register_interface_call_site() {
+        use crate::test_support::source_scan::{
+            code_before_comment, strip_test_modules, SourceWalk,
+        };
+
+        let sites: Vec<(String, String)> = SourceWalk::crate_src()
+            .least(300)
+            .collect()
+            .iter()
+            .flat_map(|file| {
+                strip_test_modules(&file.text)
+                    .lines()
+                    .filter(|line| code_before_comment(line).contains("register_interface("))
+                    .map(|line| (file.rel.clone(), line.trim().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "this crate registers exactly one interface spec; every call site must be covered \
+             by `test_support::interface_specs`, so a new one belongs in that list too — found \
+             {sites:?}"
+        );
+        assert_eq!(sites[0].0, "blocks/config.rs", "{sites:?}");
+        assert!(sites[0].1.contains("interface_spec()"), "{sites:?}");
+        assert!(
+            interface_specs()
+                .iter()
+                .any(|spec| spec.name == crate::blocks::config::CONFIG_INTERFACE),
+            "the fixture's spec set must hold the spec that call site registers"
         );
     }
 

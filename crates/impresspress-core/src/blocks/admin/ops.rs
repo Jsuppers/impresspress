@@ -67,22 +67,22 @@ use crate::{
 /// `pages/users.rs::user_row_fragment` re-implemented. The single-row lookup is
 /// the `user_ids = [one]` case, so this is the only roles-fetch helper.
 ///
-/// On query failure every requested user maps to an empty role list (the prior
-/// per-surface code swallowed the error the same way).
+/// A failed query is the caller's error to report. A user with no roles is
+/// absent from the map, so an empty list must never stand in for "could not
+/// read": the Users tab would show "no roles" for an admin, and the JSON API
+/// would answer `roles: []`.
 pub(super) async fn fetch_roles(
     ctx: &dyn Context,
     user_ids: &[&str],
-) -> HashMap<String, Vec<String>> {
+) -> Result<HashMap<String, Vec<String>>, wafer_run::WaferError> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     if user_ids.is_empty() {
-        return out;
+        return Ok(out);
     }
-    if let Ok(rows) = user_roles::list_for_users(ctx, user_ids).await {
-        for row in rows {
-            out.entry(row.user_id).or_default().push(row.role);
-        }
+    for row in user_roles::list_for_users(ctx, user_ids).await? {
+        out.entry(row.user_id).or_default().push(row.role);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

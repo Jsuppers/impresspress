@@ -11,12 +11,13 @@
 
 use maud::{html, Markup};
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, Message, OutputStream};
+use wafer_run::{context::Context, Message, OutputStream, WaferError};
 
 use super::{admin_page, crumb};
 use crate::{
     blocks::admin::database::{
-        introspect_columns, introspect_table_summaries, validate_readonly_query, TableSummary,
+        introspect_columns, introspect_table_summaries, validate_readonly_query, IntrospectError,
+        TableSummary,
     },
     ui::{
         components::{self, Badge, BadgeVariant},
@@ -235,60 +236,79 @@ fn right_pane_tabs(selected: Option<&str>, tab: Tab) -> Markup {
     ])
 }
 
-async fn schema_panel(ctx: &dyn Context, table: Option<&str>) -> Markup {
+/// The schema panel for the selected table, or `Err` when a read failed —
+/// the page then answers 500 rather than an empty schema and a `0` count.
+async fn schema_panel(ctx: &dyn Context, table: Option<&str>) -> Result<Markup, WaferError> {
     let Some(name) = table else {
-        return html! {
+        return Ok(html! {
             div .empty-state {
                 p { "Select a table on the left to view its schema." }
             }
-        };
+        });
     };
 
-    // The selected name is user input; an invalid identifier renders the same
-    // empty state as a table the backend can't introspect. Columns + row count
+    // The selected name is user input: a name the backend cannot quote, or
+    // one it has no table for, is said so in the panel. Columns + row count
     // come from the shared introspection routine used by the JSON API too.
-    let (columns, row_count) = introspect_columns(ctx, name).await;
+    let (columns, row_count) = match introspect_columns(ctx, name).await {
+        Ok(schema) => schema,
+        Err(IntrospectError::InvalidName) => {
+            return Ok(html! {
+                div .empty-state { p { "\"" (name) "\" is not a valid table name." } }
+            })
+        }
+        Err(IntrospectError::NoSuchTable) => {
+            return Ok(html! {
+                div .empty-state { p { "There is no table named \"" (name) "\"." } }
+            })
+        }
+        Err(IntrospectError::Read(e)) => return Err(e),
+    };
 
-    html! {
+    let rows: Vec<Vec<Markup>> = columns
+        .iter()
+        .map(|c| {
+            vec![
+                html! { span .font-medium { (c.name) } },
+                html! { span .text-muted { (c.ty) } },
+                html! { @if c.notnull { span aria-label="Yes" { (icons::check()) } } },
+                html! { @if c.pk { span aria-label="Yes" { (icons::check()) } } },
+                html! { span .text-muted { (c.default_value.as_deref().unwrap_or("")) } },
+            ]
+        })
+        .collect();
+
+    Ok(html! {
         div .db-panel {
             header .db-panel__head {
                 h3 { (name) }
                 span .text-muted .text-sm { (row_count) " rows" }
             }
-            @if columns.is_empty() {
-                div .empty-state { p { "No columns introspected (table may be empty or backend doesn't support it)." } }
-            } @else {
-                @let rows: Vec<Vec<Markup>> = columns.iter().map(|c| vec![
-                    html! { span .font-medium { (c.name) } },
-                    html! { span .text-muted { (c.ty) } },
-                    html! { @if c.notnull { span aria-label="Yes" { (icons::check()) } } },
-                    html! { @if c.pk { span aria-label="Yes" { (icons::check()) } } },
-                    html! { span .text-muted { (c.default_value.as_deref().unwrap_or("")) } },
-                ]).collect();
-
-                (components::data_table::<fn(usize) -> Option<String>>(
-                    &SCHEMA_COLUMNS,
-                    rows,
-                    None,
-                    html! {},
-                ))
-            }
+            (components::data_table::<fn(usize) -> Option<String>>(
+                &SCHEMA_COLUMNS,
+                rows,
+                None,
+                html! {},
+            ))
         }
-    }
+    })
 }
 
-async fn right_pane(ctx: &dyn Context, selected: Option<&str>, tab: Tab) -> Markup {
-    html! {
+async fn right_pane(
+    ctx: &dyn Context,
+    selected: Option<&str>,
+    tab: Tab,
+) -> Result<Markup, WaferError> {
+    let panel = match tab {
+        Tab::Schema => schema_panel(ctx, selected).await?,
+        Tab::Sql => sql_panel(selected, None, None),
+    };
+    Ok(html! {
         section .db-pane .db-pane--right {
             (right_pane_tabs(selected, tab))
-            div .db-panel-body {
-                @match tab {
-                    Tab::Schema => (schema_panel(ctx, selected).await),
-                    Tab::Sql => (sql_panel(selected, None, None)),
-                }
-            }
+            div .db-panel-body { (panel) }
         }
-    }
+    })
 }
 
 fn sql_panel(selected: Option<&str>, query: Option<&str>, result: Option<Markup>) -> Markup {
@@ -395,17 +415,31 @@ fn render_sql_error(msg: &str) -> Markup {
 }
 
 pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let tables = introspect_table_summaries(ctx).await;
     let backend = crate::db_backend(ctx).await;
     let selected = msg.query("table");
+    let selected = (!selected.is_empty()).then_some(selected);
     let tab = Tab::from_query(msg.query("tab"));
+
+    // A failed listing, count or column read is a 500, not an empty database.
+    let read = async {
+        let tables = introspect_table_summaries(ctx).await?;
+        let right = right_pane(ctx, selected, tab).await?;
+        Ok::<_, WaferError>((tables, right))
+    };
+    let (tables, right) = match read.await {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::error!(error = %e, "admin database page: introspection read failed");
+            return crate::ui::server_error_response(msg);
+        }
+    };
 
     let body = list_page(
         None,
         html! {
             div .db-layout {
-                (left_pane(&tables, if selected.is_empty() { None } else { Some(selected) }, tab))
-                (right_pane(ctx, if selected.is_empty() { None } else { Some(selected) }, tab).await)
+                (left_pane(&tables, selected, tab))
+                (right)
             }
         },
         None,
@@ -480,6 +514,56 @@ const SCHEMA_COLUMNS: [components::TableCol<'static>; 5] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        blocks::admin::test_support::browser_request,
+        test_support::{admin_msg, TestContext},
+    };
+
+    /// A failed table listing is a 500, not a database with no tables.
+    #[tokio::test]
+    async fn a_failed_introspection_is_a_500_not_an_empty_database() {
+        let ctx = TestContext::with_admin().await.break_reads();
+
+        let parts = browser_request(&ctx, admin_msg("retrieve", "/b/admin/database")).await;
+
+        assert_eq!(parts.status, 500);
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+        assert!(!html.contains("db-layout"), "{html}");
+    }
+
+    /// A selected name the backend has no table for says so, rather than an
+    /// empty schema with "0 rows" — and it is the visitor's typo, not a 500.
+    #[tokio::test]
+    async fn an_unknown_table_says_so() {
+        let ctx = TestContext::with_admin().await;
+        let mut msg = admin_msg("retrieve", "/b/admin/database");
+        msg.set_meta("req.query.table", "no_such_table");
+
+        let parts = browser_request(&ctx, msg).await;
+
+        assert_eq!(parts.status, 200);
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+        assert!(
+            html.contains("There is no table named &quot;no_such_table&quot;."),
+            "{html}"
+        );
+        assert!(!html.contains("0 rows"), "{html}");
+    }
+
+    /// Control: a real table still shows its columns and count.
+    #[tokio::test]
+    async fn a_real_table_shows_its_schema() {
+        let ctx = TestContext::with_admin().await;
+        let mut msg = admin_msg("retrieve", "/b/admin/database");
+        msg.set_meta("req.query.table", crate::blocks::admin::ROLES_TABLE);
+
+        let parts = browser_request(&ctx, msg).await;
+
+        assert_eq!(parts.status, 200);
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+        assert!(html.contains(" rows<"), "{html}");
+        assert!(html.contains(">name<"), "{html}");
+    }
 
     #[test]
     fn group_label_translates_underscores_to_dashes_in_org() {
