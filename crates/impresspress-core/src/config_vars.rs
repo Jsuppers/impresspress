@@ -63,6 +63,15 @@ pub const LOGO_URL_KEY: &str = "WAFER_RUN_SHARED__LOGO_URL";
 /// Shared config key: whether third-party (OAuth) sign-in is offered.
 pub const ENABLE_OAUTH_KEY: &str = "WAFER_RUN_SHARED__ENABLE_OAUTH";
 
+/// Shared config key: the deployment's display name — page titles, the
+/// auth pages, and the subject line and From name of every email it sends.
+pub const APP_NAME_KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+
+/// Declared default for [`APP_NAME_KEY`], and the value a reader falls back
+/// to when the row is missing or blank. Spelled once so the product name
+/// lives here rather than in each block that shows it.
+pub const DEFAULT_APP_NAME: &str = "Impresspress";
+
 /// Shared config key: whether signed-in users may create and sell their own
 /// products, not only the site admin.
 pub const ALLOW_USER_PRODUCTS_KEY: &str = "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS";
@@ -114,9 +123,9 @@ pub const DEFAULT_AUTH_TAGLINE: &str = "One binary. Batteries included. No lock-
 pub fn shared_config_vars() -> Vec<ConfigVar> {
     let mut vars = vec![
         ConfigVar::new(
-            "WAFER_RUN_SHARED__APP_NAME",
+            APP_NAME_KEY,
             "Display name shown in UI and emails",
-            "Impresspress",
+            DEFAULT_APP_NAME,
         )
         .name("App Name")
         .input_type(InputType::Text),
@@ -147,13 +156,6 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
             "http://localhost:5173",
         )
         .name("Frontend URL")
-        .input_type(InputType::Url),
-        ConfigVar::new(
-            "WAFER_RUN_SHARED__SITE_URL",
-            "Marketing site URL for docs and pricing links",
-            "https://impresspress.org",
-        )
-        .name("Site URL")
         .input_type(InputType::Url),
         ConfigVar::new(
             LOGO_URL_KEY,
@@ -779,6 +781,23 @@ mod shared_vars_tests {
                 "default CSP must allow {host} for embedded Checkout"
             );
         }
+    }
+    /// `WAFER_RUN_SHARED__SITE_URL` was declared with a hardcoded marketing
+    /// domain as its default, and its one reader was an email template
+    /// nothing sent. A declaration is not inert: `seed_defaults` writes it
+    /// into every deployment's `variables` table and the admin Variables page
+    /// lists it. Nothing may declare it again — shared or block-owned.
+    #[test]
+    fn the_retired_site_url_var_is_declared_nowhere() {
+        const RETIRED: &str = "WAFER_RUN_SHARED__SITE_URL";
+        assert!(
+            shared_config_vars().iter().all(|v| v.key != RETIRED),
+            "{RETIRED} must not be a shared var"
+        );
+        assert!(
+            !super::is_declared_key(RETIRED),
+            "{RETIRED} must not be declared by any block"
+        );
     }
 }
 

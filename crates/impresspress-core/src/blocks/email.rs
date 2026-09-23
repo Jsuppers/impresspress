@@ -2,7 +2,8 @@
 //!
 //! Routes:
 //! - `email.send` — Send a raw email (to, subject, html, text)
-//! - `email.send_template` — Send a templated email (template name + variables)
+//! - `email.send_template` — Send one of the auth emails (`verification`,
+//!   `password_reset`) by template name
 //!
 //! Uses the `wafer-run/network` block to make HTTP requests to Mailgun,
 //! and `wafer-run/config` for MAILGUN_API_KEY, MAILGUN_DOMAIN, MAILGUN_FROM.
@@ -82,7 +83,8 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__EMAIL__MAILGUN_FROM",
-            "Sender address for emails. Leave empty for default (noreply@domain).",
+            "Sender address for emails. Leave empty to send from \
+             noreply@<Mailgun domain> under the App Name.",
             "",
         )
         .name("From Address")
@@ -155,7 +157,7 @@ crate::impresspress_feature_block! {
             .instance_mode(InstanceMode::Singleton)
             .requires(vec!["wafer-run/network".into(), "wafer-run/config".into()])
             .category(wafer_run::BlockCategory::Service)
-            .description("Email sending service via Mailgun HTTP API. Supports raw email sending and templated emails for verification, password reset, welcome messages, and payment notifications. Used internally by the auth block for email verification and password reset flows.")
+            .description("Email sending service via Mailgun HTTP API. Supports raw email sending and templated emails for email verification and password reset. Used internally by the auth block for email verification and password reset flows.")
             .config_keys(config_vars())
     },
     handle: |this, ctx, msg, input| {
@@ -235,11 +237,7 @@ struct TemplateReq {
     template: String,
     to: String,
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
     token: Option<String>,
-    #[serde(default)]
-    days_remaining: Option<u32>,
 }
 
 async fn handle_send_template(
@@ -269,13 +267,7 @@ async fn handle_send_template(
         "http://localhost:5173",
     )
     .await;
-    let site_url = config::get_default(
-        ctx,
-        "WAFER_RUN_SHARED__SITE_URL",
-        "https://impresspress.org",
-    )
-    .await;
-    let app_name = config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await;
+    let app_name = app_name(ctx).await;
     // Brand accent for CTA buttons and links. Same contract as the admin
     // chrome: a configured PRIMARY_COLOR wins, blank means the built-in
     // brand accent. (The old hardcoded `#0ea5e9` sky-blue predated the
@@ -324,52 +316,6 @@ async fn handle_send_template(
                 format!("Reset your {app_name} password: {url}"),
             )
         }
-        "payment_failed" => {
-            let days = req.days_remaining.unwrap_or(7);
-            let settings_url = format!("{base_url}/b/admin/#settings");
-            let body = format!(
-                r#"<p style="color:#64748b;line-height:1.6">We were unable to process your subscription payment. Your service will remain active for <strong>{days} more days</strong>. After that, your projects will be suspended.</p>"#
-            );
-            (
-                format!("{app_name}: Payment failed — action required"),
-                email_shell(
-                    "Payment failed",
-                    "#dc2626",
-                    &body,
-                    Some((&settings_url, "Update Payment Method", "#dc2626")),
-                    Some(
-                        "If you've already updated your payment method, you can ignore this email.",
-                    ),
-                ),
-                format!(
-                    "Your {app_name} payment failed. Update your payment method within {days} days."
-                ),
-            )
-        }
-        "welcome" => {
-            let name = req.name.as_deref().unwrap_or("");
-            let greeting = if name.is_empty() {
-                "Welcome!".to_string()
-            } else {
-                format!("Welcome, {name}!")
-            };
-            let pricing_url = format!("{site_url}/pricing/");
-            let dashboard_url = format!("{base_url}/b/admin/");
-            let docs_url = format!("{site_url}/docs/");
-            let body = format!(
-                r#"<p style="color:#64748b;line-height:1.6">Your {app_name} account is ready. Here's how to get started:</p>
-<ol style="color:#64748b;line-height:1.8">
-<li>Choose a plan on the <a href="{pricing_url}" style="color:{accent}">pricing page</a></li>
-<li>Create your first project from the <a href="{dashboard_url}" style="color:{accent}">dashboard</a></li>
-<li>Read the <a href="{docs_url}" style="color:{accent}">documentation</a></li>
-</ol>"#
-            );
-            (
-                format!("Welcome to {app_name}!"),
-                email_shell(&greeting, "#1e293b", &body, None, None),
-                format!("Welcome to {app_name}! Get started: {dashboard_url}"),
-            )
-        }
         other => {
             return err_bad_request(&format!("unknown email template: {other}"));
         }
@@ -377,6 +323,22 @@ async fn handle_send_template(
 
     let sent = send_email(ctx, &req.to, &subject, &html, Some(&text)).await;
     ok_json(&SendResp { sent })
+}
+
+/// The configured display name, or the declared default when the row is
+/// missing or blank — the same answer the admin settings page shows.
+async fn app_name(ctx: &dyn Context) -> String {
+    let name = config::get_default(
+        ctx,
+        crate::config_vars::APP_NAME_KEY,
+        crate::config_vars::DEFAULT_APP_NAME,
+    )
+    .await;
+    if name.trim().is_empty() {
+        crate::config_vars::DEFAULT_APP_NAME.to_string()
+    } else {
+        name
+    }
 }
 
 /// Shared HTML wrapper for the templated emails: the outer card `div`
@@ -429,7 +391,7 @@ async fn send_email(
     let from = {
         let f = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_FROM", "").await;
         if f.is_empty() {
-            format!("Impresspress <noreply@{domain}>")
+            default_from(&app_name(ctx).await, &domain)
         } else {
             f
         }
@@ -496,6 +458,79 @@ async fn send_email(
             false
         }
     }
+}
+
+/// The From mailbox used when `IMPRESSPRESS__EMAIL__MAILGUN_FROM` is unset:
+/// the app name as the display name, at `noreply@{domain}`.
+///
+/// The app name is admin-edited free text and becomes part of a mail header,
+/// so it goes through [`display_name_phrase`] rather than being pasted in —
+/// a comma would otherwise split the From header into two mailboxes, and a
+/// CR/LF would start a header of its own.
+fn default_from(app_name: &str, domain: &str) -> String {
+    let address = format!("noreply@{domain}");
+    match display_name_phrase(app_name) {
+        Some(phrase) => format!("{phrase} <{address}>"),
+        None => address,
+    }
+}
+
+/// Encode `name` as an RFC 5322 display-name phrase, or `None` when nothing
+/// printable is left.
+///
+/// Control characters — CR and LF above all — cannot appear in a header
+/// phrase, so each is turned into a space, and every run of whitespace then
+/// collapses to one. Printable ASCII becomes a quoted-string with `\` and
+/// `"` escaped, which keeps `,` `<` `@` `;` from being read as address
+/// syntax. Anything else becomes RFC 2047 `B` encoded-words, split on
+/// character boundaries so each stays within the 75-character limit.
+fn display_name_phrase(name: &str) -> Option<String> {
+    let cleaned = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.is_ascii() {
+        let escaped = cleaned.replace('\\', "\\\\").replace('"', "\\\"");
+        return Some(format!("\"{escaped}\""));
+    }
+    Some(encoded_words(&cleaned))
+}
+
+/// Most UTF-8 bytes one RFC 2047 `B` encoded-word may carry: 45 bytes encode
+/// to 60 base64 characters, and with the 12-character `=?UTF-8?B?` … `?=`
+/// wrapper that is 72, inside the 75-character cap.
+const ENCODED_WORD_MAX_BYTES: usize = 45;
+
+/// `text` as space-separated `=?UTF-8?B?…?=` encoded-words. A chunk never
+/// splits a character, since RFC 2047 requires each word to decode on its
+/// own.
+fn encoded_words(text: &str) -> String {
+    use base64ct::Encoding;
+    let mut words = Vec::new();
+    let mut chunk = String::new();
+    for c in text.chars() {
+        if chunk.len() + c.len_utf8() > ENCODED_WORD_MAX_BYTES {
+            words.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(c);
+    }
+    words.push(chunk);
+    words
+        .iter()
+        .map(|w| {
+            format!(
+                "=?UTF-8?B?{}?=",
+                base64ct::Base64::encode_string(w.as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -727,22 +762,47 @@ mod tests {
     };
 
     use wafer_block::{codec, wire::config as cfg_wire};
+    use wafer_core::interfaces::network::service::{
+        NetworkError, NetworkService, Request as NetRequest, Response as NetResponse,
+    };
     use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
     use super::*;
 
     /// Minimal Context routing `wafer-run/config` `config.get` to an in-memory
     /// map. Mirrors `MockContext::handle_config_call` in products' tests but
-    /// trimmed to the surface the email block needs.
+    /// trimmed to the surface the email block needs. `wafer-run/network` is
+    /// answered only when a test installs a block for it
+    /// ([`ConfigCtx::with_mailgun`]).
     struct ConfigCtx {
         cfg: Mutex<HashMap<String, String>>,
+        network: Option<Arc<dyn wafer_run::Block>>,
     }
 
     impl ConfigCtx {
         fn new() -> Self {
             Self {
                 cfg: Mutex::new(HashMap::new()),
+                network: None,
             }
+        }
+
+        /// A context with Mailgun configured and `wafer-run/network` served by
+        /// the real `NetworkBlock` over a recording transport that answers
+        /// 200, so a test can read the exact request the block sent.
+        fn with_mailgun() -> (Self, Arc<Mutex<Vec<NetRequest>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = Self::new();
+            ctx.network = Some(Arc::new(
+                wafer_core::service_blocks::network::NetworkBlock::new(Arc::new(
+                    RecordingMailgun {
+                        requests: requests.clone(),
+                    },
+                )),
+            ));
+            ctx.set("IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "key-test");
+            ctx.set("IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN", "mg.example.com");
+            (ctx, requests)
         }
         fn set(&self, k: &str, v: &str) {
             self.cfg
@@ -757,6 +817,7 @@ mod tests {
             let cfg = self.cfg.lock().unwrap().clone();
             Self {
                 cfg: Mutex::new(cfg),
+                network: self.network.clone(),
             }
         }
     }
@@ -795,6 +856,11 @@ mod tests {
                     )),
                 };
             }
+            if block_name == "wafer-run/network" {
+                if let Some(network) = &self.network {
+                    return network.handle(self, msg, input).await;
+                }
+            }
             OutputStream::error(wafer_run::WaferError::new(
                 ErrorCode::NotFound,
                 format!("unhandled call: {block_name}/{}", msg.kind),
@@ -806,9 +872,272 @@ mod tests {
         fn config_get(&self, _key: &str) -> Option<&str> {
             None
         }
+        /// Outbound network access is what the email block is granted in
+        /// production; this context stands in for that grant and nothing
+        /// else.
+        fn check_resource_access(
+            &self,
+            _resource: &str,
+            resource_type: wafer_run::ResourceType,
+            _is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            if resource_type == wafer_run::ResourceType::Network {
+                Ok(())
+            } else {
+                Err(wafer_run::WaferError::new(
+                    ErrorCode::PermissionDenied,
+                    "ConfigCtx grants network access only",
+                ))
+            }
+        }
         fn clone_arc(&self) -> Arc<dyn Context> {
             Arc::new(self.clone())
         }
+    }
+
+    /// A Mailgun stand-in: records every request and accepts it.
+    struct RecordingMailgun {
+        requests: Arc<Mutex<Vec<NetRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NetworkService for RecordingMailgun {
+        async fn do_request(&self, request: &NetRequest) -> Result<NetResponse, NetworkError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(NetResponse {
+                status_code: 200,
+                headers: HashMap::new(),
+                body: br#"{"message":"Queued. Thank you."}"#.to_vec(),
+            })
+        }
+    }
+
+    /// Drive `email.send_template` through the block's real dispatch and
+    /// return the HTTP status it answered with and its body.
+    async fn send_template(ctx: &ConfigCtx, body: serde_json::Value) -> (u16, String) {
+        let out = wafer_run::Block::handle(
+            &EmailBlock::new(),
+            ctx,
+            Message {
+                kind: "email.send_template".to_string(),
+                meta: Vec::new(),
+            },
+            InputStream::from_bytes(serde_json::to_vec(&body).expect("serialize body")),
+        )
+        .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        (
+            parts.status,
+            String::from_utf8(parts.body).expect("UTF-8 body"),
+        )
+    }
+
+    /// The `from` field of the one form-encoded request sent to Mailgun.
+    fn sent_from(requests: &Mutex<Vec<NetRequest>>) -> String {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "exactly one Mailgun request");
+        let body = requests[0].body.as_deref().expect("a form body");
+        crate::util::parse_form_body(body)
+            .remove("from")
+            .expect("a from field")
+    }
+
+    /// Decode one RFC 2047 `=?UTF-8?B?…?=` word, failing on anything else.
+    fn decode_encoded_word(word: &str) -> String {
+        use base64ct::Encoding;
+        let b64 = word
+            .strip_prefix("=?UTF-8?B?")
+            .and_then(|w| w.strip_suffix("?="))
+            .unwrap_or_else(|| panic!("not a UTF-8 B encoded-word: {word}"));
+        String::from_utf8(base64ct::Base64::decode_vec(b64).expect("valid base64"))
+            .expect("each word decodes to UTF-8 on its own")
+    }
+
+    // ---- templates ------------------------------------------------------------
+
+    /// Only the two auth templates exist. `welcome` and `payment_failed` had
+    /// no sender anywhere, and `welcome` linked to a hardcoded marketing
+    /// domain; asking for either is now what asking for any unknown template
+    /// is — a 400, and nothing is sent.
+    #[tokio::test]
+    async fn a_template_nothing_sends_is_refused() {
+        for template in ["welcome", "payment_failed"] {
+            let (ctx, requests) = ConfigCtx::with_mailgun();
+            let (status, body) = send_template(
+                &ctx,
+                serde_json::json!({"template": template, "to": "a@example.com"}),
+            )
+            .await;
+            assert_eq!(status, 400, "{template}: {body}");
+            assert!(
+                body.contains("unknown email template"),
+                "{template}: {body}"
+            );
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "{template}: nothing may reach Mailgun"
+            );
+        }
+    }
+
+    /// The live templates still send, through the same recording transport,
+    /// so the refusal above is about the template and not the harness.
+    #[tokio::test]
+    async fn the_auth_templates_still_send() {
+        for template in ["verification", "password_reset"] {
+            let (ctx, requests) = ConfigCtx::with_mailgun();
+            let (status, body) = send_template(
+                &ctx,
+                serde_json::json!({"template": template, "to": "a@example.com", "token": "t"}),
+            )
+            .await;
+            assert_eq!(status, 200, "{template}: {body}");
+            assert!(body.contains(r#""sent":true"#), "{template}: {body}");
+            assert_eq!(requests.lock().unwrap().len(), 1, "{template}");
+        }
+    }
+
+    // ---- From header ------------------------------------------------------------
+
+    /// With no `MAILGUN_FROM` set, the display name on a sent mail is the
+    /// deployment's configured App Name — not the product's name spelled in
+    /// this block.
+    #[tokio::test]
+    async fn the_default_from_carries_the_configured_app_name() {
+        let (ctx, requests) = ConfigCtx::with_mailgun();
+        ctx.set(crate::config_vars::APP_NAME_KEY, "Acme Mail");
+        let (status, body) = send_template(
+            &ctx,
+            serde_json::json!({"template": "verification", "to": "a@example.com", "token": "t"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            sent_from(&requests),
+            r#""Acme Mail" <noreply@mg.example.com>"#
+        );
+    }
+
+    /// A blank App Name falls back to the declared default rather than
+    /// sending an empty display name.
+    #[tokio::test]
+    async fn a_blank_app_name_sends_under_the_declared_default() {
+        let (ctx, requests) = ConfigCtx::with_mailgun();
+        ctx.set(crate::config_vars::APP_NAME_KEY, "   ");
+        send_template(
+            &ctx,
+            serde_json::json!({"template": "verification", "to": "a@example.com", "token": "t"}),
+        )
+        .await;
+        assert_eq!(
+            sent_from(&requests),
+            format!(
+                "\"{}\" <noreply@mg.example.com>",
+                crate::config_vars::DEFAULT_APP_NAME
+            )
+        );
+    }
+
+    /// An App Name carrying CR/LF, a comma and a quote still produces ONE
+    /// mailbox on ONE header line: the line break cannot start a `Bcc:`
+    /// header, and the comma cannot start a second address.
+    #[tokio::test]
+    async fn a_hostile_app_name_cannot_inject_a_header_or_a_mailbox() {
+        let (ctx, requests) = ConfigCtx::with_mailgun();
+        ctx.set(
+            crate::config_vars::APP_NAME_KEY,
+            "Acme, \"Inc\"\r\nBcc: victim@evil.test",
+        );
+        send_template(
+            &ctx,
+            serde_json::json!({"template": "password_reset", "to": "a@example.com", "token": "t"}),
+        )
+        .await;
+        let from = sent_from(&requests);
+        assert!(!from.contains('\r') && !from.contains('\n'), "{from}");
+        assert_eq!(
+            from,
+            r#""Acme, \"Inc\" Bcc: victim@evil.test" <noreply@mg.example.com>"#
+        );
+    }
+
+    /// An explicitly configured `MAILGUN_FROM` is sent as the operator wrote
+    /// it; the App Name only fills the default.
+    #[tokio::test]
+    async fn a_configured_from_address_wins() {
+        let (ctx, requests) = ConfigCtx::with_mailgun();
+        ctx.set(crate::config_vars::APP_NAME_KEY, "Acme Mail");
+        ctx.set(
+            "IMPRESSPRESS__EMAIL__MAILGUN_FROM",
+            "Support <help@acme.test>",
+        );
+        send_template(
+            &ctx,
+            serde_json::json!({"template": "verification", "to": "a@example.com", "token": "t"}),
+        )
+        .await;
+        assert_eq!(sent_from(&requests), "Support <help@acme.test>");
+    }
+
+    #[test]
+    fn plain_ascii_names_are_quoted_and_escaped() {
+        assert_eq!(
+            default_from("Acme", "mg.x.test"),
+            r#""Acme" <noreply@mg.x.test>"#
+        );
+        // `,` `<` `@` `;` are address syntax outside a quoted-string.
+        assert_eq!(
+            default_from("A, B <c@d>; e", "mg.x.test"),
+            r#""A, B <c@d>; e" <noreply@mg.x.test>"#
+        );
+        // `"` and `\` are the two characters a quoted-string must escape.
+        assert_eq!(
+            default_from(r#"Say "hi" \ bye"#, "mg.x.test"),
+            r#""Say \"hi\" \\ bye" <noreply@mg.x.test>"#
+        );
+    }
+
+    #[test]
+    fn control_characters_become_single_spaces() {
+        assert_eq!(
+            default_from("  Acme\r\n\tMail\u{0}  ", "mg.x.test"),
+            r#""Acme Mail" <noreply@mg.x.test>"#
+        );
+        assert_eq!(
+            default_from("\u{85}Acme\u{2028}Mail", "mg.x.test"),
+            r#""Acme Mail" <noreply@mg.x.test>"#
+        );
+    }
+
+    #[test]
+    fn a_name_with_nothing_printable_sends_the_bare_address() {
+        assert_eq!(default_from("", "mg.x.test"), "noreply@mg.x.test");
+        assert_eq!(default_from(" \r\n\t ", "mg.x.test"), "noreply@mg.x.test");
+    }
+
+    #[test]
+    fn non_ascii_names_are_rfc2047_encoded_words() {
+        let from = default_from("Café \"Zoë\", Ltd", "mg.x.test");
+        let (phrase, address) = from.split_once(" <").expect("phrase then address");
+        assert_eq!(address, "noreply@mg.x.test>");
+        assert!(from.is_ascii(), "{from}");
+        assert_eq!(decode_encoded_word(phrase), "Café \"Zoë\", Ltd");
+    }
+
+    /// A long non-ASCII name splits into several words, each inside RFC
+    /// 2047's 75-character cap and each decoding on its own — no multi-byte
+    /// character is cut in half.
+    #[test]
+    fn long_non_ascii_names_split_on_character_boundaries() {
+        let name = "Ärzte-Genossenschaft für Übersetzungen und Größenordnungen 日本語テキスト";
+        let phrase = display_name_phrase(name).expect("printable");
+        let words: Vec<&str> = phrase.split(' ').collect();
+        assert!(words.len() > 1, "{phrase}");
+        for word in &words {
+            assert!(word.len() <= 75, "{word} is {} chars", word.len());
+        }
+        let decoded: String = words.iter().map(|w| decode_encoded_word(w)).collect();
+        assert_eq!(decoded, name);
     }
 
     // ---- resolve_base_url ---------------------------------------------------
