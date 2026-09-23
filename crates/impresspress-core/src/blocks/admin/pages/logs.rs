@@ -135,7 +135,7 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
                         href=(all_rows_href)
                         hx-get=(all_rows_href)
                         hx-target="#content"
-                    { (icons::x()) " Clear" }
+                    { (icons::x()) " Show all" }
                 }
             } @else {
                 a .btn .btn--ghost .btn--sm
@@ -458,6 +458,17 @@ mod tests {
         assert!(
             html.contains("Errors only"),
             "the active filter is named on the page: {html}"
+        );
+        // The search box's own Clear and the error filter's way out are two
+        // controls; they must not share a label.
+        assert_eq!(
+            html.matches(" Clear<").count(),
+            1,
+            "only the search box offers Clear: {html}"
+        );
+        assert!(
+            html.contains(" Show all<"),
+            "the error filter's way out is labelled apart from Clear: {html}"
         );
 
         // A search the URL must encode rides along the same way.
