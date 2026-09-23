@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{
     blocks::auth::repo::{api_keys, users},
-    platform_state::{block_settings, user_roles, variables, wrap_grants},
+    platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
     test_support::{admin_msg, output_json, FailingDbOpContext, TestContext},
 };
 
@@ -101,11 +101,29 @@ async fn assert_refused_page(
     ctx: &dyn wafer_run::context::Context,
     path: &str,
 ) {
-    let parts = browser_request(ctx, routed(admin_msg("retrieve", path))).await;
+    let parts = browser_request(ctx, page_msg(path)).await;
     let html = String::from_utf8_lossy(&parts.body);
-    if parts.status != 403 || !html.contains("Go home") {
+    if parts.status != 403 || !html.contains("Go home") || shows_the_denial(&html) {
         misses.push(format!("{path}: {} {html}", parts.status));
     }
+}
+
+/// A `GET` of `path` as the route table binds it, its `?k=v` query moved into
+/// the request meta the way the HTTP adapters put it there.
+fn page_msg(path: &str) -> wafer_run::Message {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    let mut msg = routed(admin_msg("retrieve", route));
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        msg.set_meta(format!("req.query.{key}"), value);
+    }
+    msg
+}
+
+/// Whether `html` carries the WRAP denial's own text — the grant it names —
+/// which is logged, never shown.
+fn shows_the_denial(html: &str) -> bool {
+    html.contains("holds no grant") || html.contains("WRAP")
 }
 
 /// An admin fixture with a user to act on, a role (`editor`) that user
@@ -480,8 +498,189 @@ async fn page_read_denials_are_the_403_page() {
             every_op_on(wrap_grants::TABLE),
             "/b/admin/settings/permissions",
         ),
+        // The tabs that printed the failure's own text into a 200 page.
+        (every_op_on(request_logs::TABLE), "/b/admin/logs"),
+        (every_op_on(AUDIT_LOGS_TABLE), "/b/admin/logs?tab=audit"),
+        (every_op_on(users::TABLE), "/b/admin/users"),
+        (every_op_on(ROLES_TABLE), "/b/admin/users?tab=roles"),
+        (every_op_on(api_keys::TABLE), "/b/admin/users?tab=api-keys"),
+        (every_op_on(variables::TABLE), "/b/admin/settings/variables"),
+        (
+            every_op_on(variables::TABLE),
+            "/b/admin/settings/variables?tab=all",
+        ),
     ] {
         assert_refused_page(&mut misses, &denied(&ctx, ops), path).await;
     }
+    report(misses);
+}
+
+// --- re-renders after a write --------------------------------------------
+
+/// A write that landed and then could not re-read the fragment its control
+/// swaps answers the notice htmx can swap: 200, saying the write happened and
+/// that access was denied, never the denial's own text.
+#[tokio::test]
+async fn reread_denials_after_a_write_are_the_classified_notice() {
+    let mut misses = Vec::new();
+    let (ctx, _) = fixture().await;
+    let key = api_keys::insert(
+        &ctx,
+        api_keys::NewApiKey {
+            user_id: TARGET,
+            name: "ci",
+            key_hash: "hash-of-the-key",
+            key_prefix: "ip_test",
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("seed an api key");
+    output_json(
+        api(
+            &ctx,
+            "create",
+            "/b/admin/api/settings",
+            r#"{"key":"MY_SETTING","value":"x"}"#,
+        )
+        .await,
+    )
+    .await;
+    let roles = output_json(api(&ctx, "retrieve", "/b/admin/api/iam/roles", "").await).await;
+    let editor = roles["roles"]
+        .as_array()
+        .or_else(|| roles["records"].as_array())
+        .expect("role list")
+        .iter()
+        .find(|r| r["name"] == "editor")
+        .expect("editor role")["id"]
+        .as_str()
+        .expect("role id")
+        .to_string();
+
+    let revoke = format!("/b/admin/api-keys/{}/revoke", key.id);
+    let delete_role = format!("/b/admin/iam/roles/{editor}");
+    // (action, path, form, refused ops, reads of them the write makes first,
+    // what the notice says landed)
+    type Case<'a> = (
+        &'a str,
+        String,
+        &'a str,
+        Vec<(&'static str, &'static str)>,
+        usize,
+        &'a str,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "create",
+            "/b/admin/iam/roles".to_string(),
+            "name=auditor",
+            vec![("database.list", ROLES_TABLE)],
+            0,
+            "Role created",
+        ),
+        (
+            "delete",
+            delete_role,
+            "",
+            vec![("database.list", ROLES_TABLE)],
+            0,
+            "Role deleted",
+        ),
+        (
+            "create",
+            revoke,
+            "",
+            vec![("database.list", api_keys::TABLE)],
+            0,
+            "API key revoked",
+        ),
+        (
+            "create",
+            "/b/admin/variables".to_string(),
+            "key=OTHER_SETTING&value=y&sensitive=0",
+            vec![("database.list", variables::TABLE)],
+            0,
+            "Variable created",
+        ),
+        (
+            "update",
+            "/b/admin/variables/MY_SETTING".to_string(),
+            "value=z&sensitive=0",
+            vec![("database.list", variables::TABLE)],
+            // The update reads the row's stored flag and its pin first.
+            2,
+            "Variable updated",
+        ),
+        (
+            "create",
+            "/b/admin/users/u-target/disable".to_string(),
+            "",
+            vec![("database.get", users::TABLE)],
+            0,
+            "User disabled",
+        ),
+    ];
+    for (action, path, body, ops, passes, done) in cases {
+        let failing = denied(&ctx, ops).after_passing(passes);
+        let mut msg = routed(admin_msg(action, &path));
+        msg.set_meta("http.header.accept", "text/html");
+        msg.set_meta("http.header.hx-request", "true");
+        let parts = wafer_block::http_codec::collect_http_response(
+            AdminBlock::new()
+                .handle(
+                    &failing,
+                    msg,
+                    InputStream::from_bytes(body.as_bytes().to_vec()),
+                )
+                .await,
+        )
+        .await;
+        let html = String::from_utf8_lossy(&parts.body);
+        let notice = "could not be reloaded: access to it was denied";
+        if parts.status != 200
+            || !html.contains(done)
+            || !html.contains(notice)
+            || shows_the_denial(&html)
+        {
+            misses.push(format!("{action} {path}: {} {html}", parts.status));
+        }
+    }
+    report(misses);
+}
+
+/// The unfiltered grant list reads past its cap only when the table holds
+/// more than `db_read::UNPAGED_LIMIT` grants, and only then counts them; a
+/// denied count is a 403 like every other read.
+#[tokio::test]
+async fn grant_count_denial_past_the_cap_is_403() {
+    let mut misses = Vec::new();
+    let (ctx, _) = fixture().await;
+    // Fixture setup, one statement: one grant each for more users than the
+    // listing returns.
+    wafer_core::clients::database::exec_raw(
+        &ctx,
+        &format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i <= ?) \
+             INSERT INTO {} (id, user_id, role, assigned_by, created_at, updated_at) \
+             SELECT 'bulk-' || i, 'bulk-user-' || i, 'editor', '', '2026-01-01', '2026-01-01' \
+             FROM n",
+            user_roles::TABLE
+        ),
+        &[serde_json::json!(crate::db_read::UNPAGED_LIMIT)],
+    )
+    .await
+    .expect("seed grants past the cap");
+    let failing = denied(&ctx, vec![("database.count", user_roles::TABLE)]);
+    let path = "/b/admin/api/iam/user-roles";
+    assert_wrap_denial(&mut misses, api(&failing, "retrieve", path, "").await, path).await;
+
+    // The control: the same read granted reports the whole count.
+    let list = output_json(api(&ctx, "retrieve", path, "").await).await;
+    assert_eq!(
+        list["total_count"],
+        crate::db_read::UNPAGED_LIMIT + 2,
+        "the listing must be past its cap for this test to reach the count"
+    );
     report(misses);
 }

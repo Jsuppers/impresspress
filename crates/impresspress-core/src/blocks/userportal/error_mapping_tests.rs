@@ -350,3 +350,36 @@ async fn updating_a_missing_button_is_404() {
     .await;
     assert_eq!(output_http_status(out).await, 404);
 }
+
+/// A button write that landed and then could not re-read the table answers
+/// the swappable notice, saying access was denied — never the denial's text.
+#[tokio::test]
+async fn button_list_reread_denial_is_the_classified_notice() {
+    let ctx = fixture().await;
+    let failing = FailingDbOpContext::failing_with(
+        ctx.clone(),
+        vec![("database.list", TABLE)],
+        WaferError::new(
+            ErrorCode::PermissionDenied,
+            "WRAP: impresspress/userportal holds no grant on this table",
+        ),
+    );
+    let mut msg = admin_msg("create", "/b/userportal/admin/buttons");
+    msg.set_meta("http.header.hx-request", "true");
+    let parts = wafer_block::http_codec::collect_http_response(
+        fragment(
+            &failing,
+            msg,
+            "label=Files&path=%2Fb%2Fstorage%2F&icon=folder",
+        )
+        .await,
+    )
+    .await;
+    let html = String::from_utf8_lossy(&parts.body);
+    assert_eq!(parts.status, 200, "{html}");
+    assert!(
+        html.contains("could not be loaded: access to it was denied"),
+        "{html}"
+    );
+    assert!(!html.contains("holds no grant"), "{html}");
+}
