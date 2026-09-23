@@ -49,6 +49,13 @@ const SQL_013_POSTGRES: &str = include_str!("013_email_proof.postgres.sql");
 const SQL_014_SQLITE: &str = include_str!("014_clear_provider_access_tokens.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_014_POSTGRES: &str = include_str!("014_clear_provider_access_tokens.postgres.sql");
+const SQL_015_SQLITE: &str = include_str!("015_api_key_expiry_canonical.sqlite.sql");
+#[cfg(feature = "postgres")]
+const SQL_015_POSTGRES: &str = include_str!("015_api_key_expiry_canonical.postgres.sql");
+
+/// Basename of the API-key expiry repair, named once so the migration list
+/// and the test that drives it cannot drift apart.
+pub(crate) const API_KEY_EXPIRY_CANONICAL: &str = "015_api_key_expiry_canonical";
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle(Init)` apply path (auth's `init`).
@@ -68,6 +75,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("012_sessions_family", SQL_012_SQLITE),
     ("013_email_proof", SQL_013_SQLITE),
     ("014_clear_provider_access_tokens", SQL_014_SQLITE),
+    (API_KEY_EXPIRY_CANONICAL, SQL_015_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`] one
@@ -90,6 +98,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_012_POSTGRES,
     SQL_013_POSTGRES,
     SQL_014_POSTGRES,
+    SQL_015_POSTGRES,
 ];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
@@ -325,9 +334,9 @@ mod provider_token_clearing_tests {
             Arc::new(SQLiteDatabaseService::open_in_memory().unwrap());
         let before = migrations_before_014();
         assert_eq!(
-            before.len() + 1,
-            SQLITE_MIGRATIONS.len(),
-            "precondition: 014 is in the list, and last"
+            SQLITE_MIGRATIONS[before.len()].0,
+            "014_clear_provider_access_tokens",
+            "precondition: 014 is in the list, and `before` stops right at it"
         );
         apply_ddl_via_service(&db, &before)
             .await
@@ -372,5 +381,230 @@ mod provider_token_clearing_tests {
             .await
             .expect("a second re-run succeeds");
         assert_eq!(stored_tokens(&db).await, vec!["", ""]);
+    }
+}
+
+#[cfg(test)]
+mod api_key_expiry_tests {
+    //! What `015_api_key_expiry_canonical` does to the `expires_at` values a
+    //! deployment already holds.
+    //!
+    //! `POST /b/auth/api/api-keys` stored the caller's string as it stood,
+    //! so the column holds whatever was sent. The reader is fail-closed now,
+    //! which is what makes those rows safe; this repair is what makes the
+    //! column one format, and a key whose expiry names no instant visibly
+    //! revoked rather than quietly inert.
+    //!
+    //! Driven through `apply_migrations` — the path `--run-migrations`
+    //! takes — and read back through `repo::api_keys`, so what is asserted
+    //! is what the block sees.
+
+    use std::collections::HashMap;
+
+    use serde_json::{json, Value};
+
+    use super::{API_KEY_EXPIRY_CANONICAL, SQLITE_MIGRATIONS};
+    use crate::{blocks::auth::repo::api_keys, migration_helper, test_support::TestContext};
+
+    /// A fixture with the auth schema in place whose operator has opted into
+    /// migrations, as `--run-migrations` does.
+    async fn upgrading_deployment() -> TestContext {
+        let mut ctx = TestContext::with_auth().await;
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+        ctx.seed_auth_user("owner").await;
+        ctx
+    }
+
+    /// The repair onwards, sliced out of the shipped list rather than read
+    /// from `SQL_015_SQLITE` directly: an unwired migration yields an empty
+    /// slice and trips this assert instead of silently testing nothing.
+    fn the_repair() -> Vec<&'static str> {
+        let sql: Vec<&str> = SQLITE_MIGRATIONS
+            .iter()
+            .skip_while(|(name, _)| *name != API_KEY_EXPIRY_CANONICAL)
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert!(
+            !sql.is_empty(),
+            "{API_KEY_EXPIRY_CANONICAL} must be wired into SQLITE_MIGRATIONS to reach a deployed \
+             database"
+        );
+        sql
+    }
+
+    /// `block_name` keys the recorded-hash row, so naming a different one is
+    /// how a re-run is forced: the shipped set re-runs in full whenever any
+    /// auth migration changes, and this repair has to be a no-op the second
+    /// time through.
+    async fn apply_the_repair_as(ctx: &TestContext, block_name: &str) {
+        migration_helper::apply_migrations(ctx, block_name, &the_repair(), &[])
+            .await
+            .expect("apply the api-key expiry repair");
+    }
+
+    async fn apply_the_repair(ctx: &TestContext) {
+        apply_the_repair_as(ctx, "wafer-run/auth").await;
+    }
+
+    /// Write an `api_keys` row with `expires_at` exactly as given. Nothing in
+    /// the crate can write one any more — `NewApiKey::expires_at` is an
+    /// instant — so the pre-upgrade row has to be built here.
+    async fn seed_key(ctx: &TestContext, key_hash: &str, expires_at: Option<&str>) -> String {
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("user_id".into(), json!("owner"));
+        row.insert("name".into(), json!(key_hash));
+        row.insert("key_hash".into(), json!(key_hash));
+        row.insert("key_prefix".into(), json!("sb_legacy"));
+        row.insert("created_at".into(), json!("2026-01-01T00:00:00Z"));
+        if let Some(expiry) = expires_at {
+            row.insert("expires_at".into(), json!(expiry));
+        }
+        wafer_core::clients::database::create(ctx, api_keys::TABLE, row)
+            .await
+            .unwrap_or_else(|e| panic!("seed {key_hash}: {e}"))
+            .id
+    }
+
+    async fn row(ctx: &TestContext, id: &str) -> api_keys::ApiKeyRow {
+        api_keys::find_by_id(ctx, id)
+            .await
+            .unwrap_or_else(|e| panic!("read {id}: {e}"))
+            .unwrap_or_else(|| panic!("{id} is gone"))
+    }
+
+    /// `Z`, `z`, `+00:00`, `-00:00` and a space separator all name the same
+    /// instant; the column keeps one spelling of it.
+    #[tokio::test]
+    async fn a_utc_expiry_is_respelled_without_moving_the_instant() {
+        let ctx = upgrading_deployment().await;
+        let ids = [
+            ("plus-zero", "2026-06-01T12:00:00+00:00"),
+            ("minus-zero", "2026-06-01T12:00:00-00:00"),
+            ("lower-z", "2026-06-01T12:00:00z"),
+            ("spaced", "2026-06-01 12:00:00Z"),
+            ("lower-t", "2026-06-01t12:00:00Z"),
+            ("already-canonical", "2026-06-01T12:00:00Z"),
+        ];
+        let mut seeded = Vec::new();
+        for (hash, stored) in ids {
+            seeded.push((hash, seed_key(&ctx, hash, Some(stored)).await));
+        }
+
+        apply_the_repair(&ctx).await;
+
+        for (hash, id) in seeded {
+            let key = row(&ctx, &id).await;
+            assert_eq!(
+                key.expires_at.as_deref(),
+                Some("2026-06-01T12:00:00Z"),
+                "{hash}"
+            );
+            assert!(
+                !key.is_revoked(),
+                "{hash} names an instant, so it is not revoked"
+            );
+        }
+    }
+
+    /// An expiry that names no instant is what the string comparison got
+    /// most wrong — `never` sorted after every clock reading. The key is
+    /// already dead to the reader; the repair records that as a revocation.
+    #[tokio::test]
+    async fn an_expiry_that_names_no_instant_is_revoked() {
+        let ctx = upgrading_deployment().await;
+        let mut seeded = Vec::new();
+        // The last two are timestamp-shaped and still name no instant: RFC
+        // 3339 requires an offset, and `+0900` is ISO 8601's basic form,
+        // which `repo::parse_iso` rejects.
+        for stored in [
+            "never",
+            "2026-06-01",
+            "0",
+            "2026-06-01T12:00:00",
+            "2026-06-01T12:00:00+0900",
+        ] {
+            seeded.push((stored, seed_key(&ctx, stored, Some(stored)).await));
+        }
+
+        apply_the_repair(&ctx).await;
+
+        for (stored, id) in seeded {
+            let key = row(&ctx, &id).await;
+            assert!(key.is_revoked(), "{stored:?} names no instant");
+            let expiry = key.expires_at.clone().expect("the repair stamps an expiry");
+            assert!(
+                crate::blocks::auth::repo::parse_iso(&expiry).is_some(),
+                "{stored:?} was replaced by {expiry}, which must itself be readable"
+            );
+            assert!(key.is_expired(chrono::Utc::now()));
+        }
+    }
+
+    /// A key with no expiry at all is not a key with a broken one. Both
+    /// spellings of "unset" survive the repair untouched.
+    #[tokio::test]
+    async fn a_key_with_no_expiry_is_left_alone() {
+        let ctx = upgrading_deployment().await;
+        let absent = seed_key(&ctx, "absent", None).await;
+        let empty = seed_key(&ctx, "empty", Some("")).await;
+
+        apply_the_repair(&ctx).await;
+
+        for id in [&absent, &empty] {
+            let key = row(&ctx, id).await;
+            assert!(!key.is_revoked());
+            assert!(key.expires_at.as_deref().unwrap_or("").is_empty());
+            assert!(!key.is_expired(chrono::Utc::now()));
+        }
+    }
+
+    /// The two shapes the repair deliberately does not touch: respelling
+    /// either needs arithmetic, and the reader reads both correctly as they
+    /// stand.
+    #[tokio::test]
+    async fn an_offset_or_fractional_expiry_is_kept_as_it_is() {
+        let ctx = upgrading_deployment().await;
+        let offset = seed_key(&ctx, "offset", Some("2026-06-01T20:00:00+09:00")).await;
+        let fraction = seed_key(&ctx, "fraction", Some("2026-06-01T12:00:00.123456+00:00")).await;
+
+        apply_the_repair(&ctx).await;
+
+        let offset = row(&ctx, &offset).await;
+        assert_eq!(
+            offset.expires_at.as_deref(),
+            Some("2026-06-01T20:00:00+09:00")
+        );
+        assert!(!offset.is_revoked());
+        // 20:00+09:00 is 11:00Z, and that is the instant the reader uses.
+        assert!(offset.is_expired(
+            crate::blocks::auth::repo::parse_iso("2026-06-01T11:00:01Z").expect("test timestamp")
+        ));
+
+        let fraction = row(&ctx, &fraction).await;
+        assert_eq!(
+            fraction.expires_at.as_deref(),
+            Some("2026-06-01T12:00:00.123456+00:00")
+        );
+        assert!(!fraction.is_revoked());
+    }
+
+    /// Auth migrations re-run in full whenever any of them changes, so the
+    /// second pass must change nothing — in particular it must not push the
+    /// revoked row's expiry forward again.
+    #[tokio::test]
+    async fn a_second_pass_changes_nothing() {
+        let ctx = upgrading_deployment().await;
+        let broken = seed_key(&ctx, "never", Some("never")).await;
+        let utc = seed_key(&ctx, "utc", Some("2026-06-01T12:00:00+00:00")).await;
+
+        apply_the_repair(&ctx).await;
+        let after_first = (row(&ctx, &broken).await, row(&ctx, &utc).await);
+
+        apply_the_repair_as(&ctx, "wafer-run/auth#rerun").await;
+
+        assert_eq!(
+            (row(&ctx, &broken).await, row(&ctx, &utc).await),
+            after_first
+        );
     }
 }

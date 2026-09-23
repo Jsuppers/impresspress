@@ -639,6 +639,49 @@ device reappears, its user cannot revoke that one device from the list;
 **changing the password** still signs every device out, because it revokes the
 refresh tokens rather than reading the list.
 
+### Auth: an API key's expiry is a timestamp, and broken ones are revoked (migration 015)
+
+**What changes.** `POST /b/auth/api/api-keys` used to store the `expires_at`
+string it was sent, exactly as sent, and the lookup on every request compared
+that string to the clock as **text**. Text order is time order only within one
+format and one offset, so two whole classes of value were read wrong:
+
+- an offset — `2026-09-23T20:00:00+09:00` is 11:00 UTC, but it sorts after
+  `2026-09-23T12:00:00Z`, so the key kept authenticating for eight hours after
+  it had expired;
+- anything that is not a timestamp — `never` sorts after every timestamp there
+  will ever be, so a key minted with it **never expired**.
+
+The endpoint now answers `400` for an `expires_at` it cannot read as RFC 3339,
+and for one already in the past; it accepts any offset and stores the instant
+as `YYYY-MM-DDTHH:MM:SSZ`. The lookup parses the stored value instead of
+comparing it as text, and treats an expiry it cannot parse as **expired** — a
+key whose end date cannot be read has no enforceable end.
+
+**Existing keys are read correctly without the migration.** The parsing
+lookup ships in the code half, so from this release an offset expiry is
+honoured at the instant it names and a `never`-style expiry stops
+authenticating, whether or not you run migrations.
+
+**Upgrade with `--run-migrations`** to make the column say so. Migration 015
+respells a UTC expiry (`Z`, `z`, `+00:00`, `-00:00`, a space separator) as
+`YYYY-MM-DDTHH:MM:SSZ` without moving the instant, and **revokes** every key
+whose stored expiry names no instant, so the admin API-keys tab shows a
+revoked key rather than one that quietly stopped working. Keys with no expiry
+are untouched. A sub-second fraction and a non-zero offset are left as they
+stand: both are read correctly, and respelling either needs arithmetic the
+migration deliberately does not do (a cast is the one thing that can fail, and
+a failed migration is never stamped, so it would re-run and re-fail on every
+boot).
+
+**If a key is revoked by this migration**, issue a new one; its expiry was
+never enforceable. Nothing else in the product reads the column.
+
+**The migration run also empties the device list** — 015 changes the auth
+block's SQL hash, so the whole auth set re-runs, 012's `sessions` drop
+included. That is the same one-time cost the migration-014 note above
+describes, for the same reason, and nobody is signed out.
+
 ### LLM: a provider can name its token-budget field (migration 002)
 
 **What changes.** Which field carries the output-token budget in a chat request
