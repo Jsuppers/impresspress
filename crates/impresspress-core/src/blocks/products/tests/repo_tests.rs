@@ -231,52 +231,64 @@ async fn complete_atomic_only_from_pending_or_checkout_started() {
     );
 }
 
-/// `refund_atomic` only transitions a completed purchase; a pending one is a
-/// 0-row no-op (prevents double-refund / refunding incomplete orders).
+/// A refund is reconciled only onto a paid order. A pending one is refused
+/// as not refundable, before any write, and is left exactly as it was; a
+/// completed one takes the provider's total and becomes `refunded`.
+///
+/// The refusal's message is asserted, not just its code: the write below the
+/// check also filters on status, so without the check the pending row would
+/// still be left alone — but refused as a concurrent change, which tells the
+/// operator to retry an order no retry can ever refund.
 #[tokio::test]
-async fn refund_atomic_only_from_completed() {
+async fn reconcile_refund_total_refuses_an_unpaid_order_and_leaves_it_untouched() {
+    use crate::util::RecordExt as _;
+
     let ctx = ctx().await;
-    let mut completed = HashMap::new();
-    completed.insert("user_id".to_string(), serde_json::json!("user_1"));
-    completed.insert("status".to_string(), serde_json::json!("completed"));
-    seed(
-        &ctx,
-        "impresspress__products__purchases",
-        "pur_done",
-        completed,
-    )
-    .await;
-    let mut pending = HashMap::new();
-    pending.insert("user_id".to_string(), serde_json::json!("user_1"));
-    pending.insert("status".to_string(), serde_json::json!("pending"));
-    seed(
-        &ctx,
-        "impresspress__products__purchases",
-        "pur_pending",
-        pending,
-    )
-    .await;
+    for (id, status) in [("pur_done", "completed"), ("pur_pending", "pending")] {
+        seed(
+            &ctx,
+            "impresspress__products__purchases",
+            id,
+            HashMap::from([
+                ("user_id".to_string(), serde_json::json!("user_1")),
+                ("status".to_string(), serde_json::json!(status)),
+                ("total_cents".to_string(), serde_json::json!(1000)),
+                ("refunded_total_cents".to_string(), serde_json::json!(0)),
+            ]),
+        )
+        .await;
+    }
+    let pending_before = db::get(&ctx, "impresspress__products__purchases", "pur_pending")
+        .await
+        .unwrap()
+        .data;
 
-    let ok = repo::purchases::refund_atomic(&ctx, "pur_done", "admin_1", "duplicate")
-        .await
-        .expect("refund ok");
-    assert_eq!(ok, 1);
-    let rec = db::get(&ctx, "impresspress__products__purchases", "pur_done")
-        .await
-        .unwrap();
-    assert_eq!(
-        rec.data.get("status").and_then(|v| v.as_str()),
-        Some("refunded")
+    let refused =
+        repo::purchases::reconcile_refund_total(&ctx, "pur_pending", 1000, "admin_1", "x")
+            .await
+            .expect_err("a pending order cannot be refunded");
+    assert_eq!(refused.code, wafer_run::ErrorCode::FailedPrecondition);
+    assert!(
+        refused.message.contains("not in a refundable state"),
+        "refused for the wrong reason: {}",
+        refused.message
     );
     assert_eq!(
-        rec.data.get("refunded_by").and_then(|v| v.as_str()),
-        Some("admin_1")
+        db::get(&ctx, "impresspress__products__purchases", "pur_pending")
+            .await
+            .unwrap()
+            .data,
+        pending_before,
+        "the refused order is unchanged"
     );
 
-    let noop = repo::purchases::refund_atomic(&ctx, "pur_pending", "admin_1", "x")
-        .await
-        .expect("noop ok");
-    assert_eq!(noop, 0, "pending purchase cannot be refunded");
+    let refunded =
+        repo::purchases::reconcile_refund_total(&ctx, "pur_done", 1000, "admin_1", "duplicate")
+            .await
+            .expect("a completed order is refunded");
+    assert_eq!(refunded.str_field("status"), "refunded");
+    assert_eq!(refunded.i64_field("refunded_total_cents"), 1000);
+    assert_eq!(refunded.str_field("refunded_by"), "admin_1");
 }
 
 /// `subscription_for_user` (refactored to `db::get_by_field` + a curated

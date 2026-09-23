@@ -9,10 +9,10 @@ use impresspress_core::{
         repo::{self, TicketFilters},
         service, TicketsBlock,
     },
-    test_support::{admin_msg, output_html, TestContext},
+    test_support::{admin_msg, output_html, output_json, TestContext},
 };
 use wafer_core::clients::database as db;
-use wafer_run::{Block as _, InputStream};
+use wafer_run::{Block as _, HttpMethod, InputStream};
 
 fn ticket_type(key: &str) -> TicketTypeInput {
     TicketTypeInput {
@@ -265,7 +265,14 @@ async fn inbox_projection_omits_report_body_and_analysis_is_append_only() {
     .await
     .expect("append analysis");
     assert_eq!(service::str_field(&analysis, "source"), "triage-agent");
-    assert_eq!(service::str_field(&created, "status"), "new");
+    let after = repo::get_ticket(&ctx, &created.id)
+        .await
+        .expect("re-read ticket");
+    assert_eq!(
+        service::str_field(&after, "status"),
+        "new",
+        "an analysis is advisory: it does not move the ticket"
+    );
 
     let detail = service::detail(&ctx, &created.id).await.expect("detail");
     assert_eq!(
@@ -510,5 +517,87 @@ async fn admin_inbox_renders_all_filters_age_and_filter_preserving_pagination() 
     assert!(
         html.contains("status=new&source=admin&assignee_id=admin%26one&page_size=1&page="),
         "pagination must retain encoded filters: {html}"
+    );
+}
+
+/// The analyses surface as an admin client reaches it: through the router,
+/// with the JSON body the endpoint declares. Appending twice leaves two
+/// analyses, the first exactly as written; the ticket itself is not moved;
+/// and the block declares no endpoint that could rewrite or remove one.
+#[tokio::test]
+async fn analyses_posted_through_the_route_are_append_only() {
+    let ctx = TestContext::with_tickets().await;
+    let kind = service::create_type(&ctx, ticket_type("analysis-route"))
+        .await
+        .expect("create type");
+    let created = service::create_ticket(
+        &ctx,
+        ticket(&kind.id),
+        TicketSource::Admin,
+        ActorType::Admin,
+        "admin-1",
+        None,
+    )
+    .await
+    .expect("create ticket");
+    let before = repo::get_ticket(&ctx, &created.id)
+        .await
+        .expect("read ticket");
+    let path = format!("/b/tickets/api/admin/tickets/{}/analyses", created.id);
+
+    let mut posted = Vec::new();
+    for (summary, priority) in [("First pass", "high"), ("Second pass", "low")] {
+        let out = ctx
+            .dispatch_json(
+                admin_msg("create", &path),
+                &serde_json::json!({
+                    "source": "triage-agent",
+                    "prompt_version": "tickets-v1",
+                    "summary": summary,
+                    "suggested_priority": priority,
+                    "confidence": 0.5,
+                }),
+            )
+            .await;
+        let body = output_json(out).await;
+        assert_eq!(body["summary"], summary, "201 body is the stored analysis");
+        posted.push(body);
+    }
+
+    let after = repo::get_ticket(&ctx, &created.id)
+        .await
+        .expect("re-read ticket");
+    for field in ["status", "priority", "updated_at"] {
+        assert_eq!(
+            service::str_field(&after, field),
+            service::str_field(&before, field),
+            "appending an analysis must not change the ticket's {field}"
+        );
+    }
+
+    let listed = output_json(ctx.dispatch(admin_msg("retrieve", &path)).await).await;
+    let records = listed["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 2, "both analyses are kept: {listed}");
+    let first = records
+        .iter()
+        .find(|r| r["id"] == posted[0]["id"])
+        .expect("the first analysis is still listed");
+    assert_eq!(
+        first, &posted[0],
+        "the second append left the first exactly as written"
+    );
+
+    let rewriting: Vec<String> = TicketsBlock::new()
+        .info()
+        .endpoints
+        .iter()
+        .filter(|e| {
+            e.path.contains("/analyses") && !matches!(e.method, HttpMethod::Get | HttpMethod::Post)
+        })
+        .map(|e| format!("{:?} {}", e.method, e.path))
+        .collect();
+    assert!(
+        rewriting.is_empty(),
+        "analyses are append-only, but these endpoints could rewrite one: {rewriting:?}"
     );
 }

@@ -1046,6 +1046,86 @@ mod tests {
         );
     }
 
+    /// Another user's thread is a 404 on both chat endpoints, reached the way
+    /// a browser reaches them: through the router, as the signed-in caller.
+    ///
+    /// The owner check is not in this block — the prelude's first read of
+    /// the thread is a write through `impresspress/messages`, which refuses a
+    /// thread the caller does not own. So what is asserted is the whole
+    /// chain: the refusal becomes the caller's 404, the model is never
+    /// called, and the owner's thread gains no turn.
+    #[tokio::test]
+    async fn a_chat_on_another_users_thread_is_a_404_and_never_reaches_the_model() {
+        use std::sync::Arc;
+
+        use crate::blocks::messages::service::{self, ListEntriesParams};
+
+        let (mut ctx, thread_id, chat_calls) = chat_fixture().await;
+        ctx.register_block("impresspress/llm", Arc::new(stub_block()));
+
+        let paths = ["/b/llm/api/chat", "/b/llm/api/chat/stream"];
+        let mut refused = Vec::new();
+        for path in paths {
+            let out = ctx
+                .dispatch_with_input(
+                    crate::test_support::auth_msg("create", path, "user-b"),
+                    chat_body(&thread_id),
+                )
+                .await;
+            let status = crate::test_support::output_http_status(out).await;
+            if status != 404 {
+                refused.push(format!("{path}: {status}"));
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "user-b must not be able to post into user-a's thread, expected 404 on: {refused:?}"
+        );
+
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused thread must not be paid for"
+        );
+        let entries = service::list_entries(
+            &ctx,
+            &thread_id,
+            &ListEntriesParams {
+                kind: None,
+                role: None,
+                page_size: 100,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("read the owner's thread");
+        assert!(
+            entries.records.is_empty(),
+            "user-a's thread gained turns it never wrote: {:?}",
+            entries.records
+        );
+
+        // The same dispatch as the owner succeeds on both paths, so the 404s
+        // above are the owner check and not a route that failed to match.
+        let mut failed = Vec::new();
+        for path in paths {
+            let out = ctx
+                .dispatch_with_input(
+                    crate::test_support::auth_msg("create", path, "user-a"),
+                    chat_body(&thread_id),
+                )
+                .await;
+            let status = crate::test_support::output_http_status(out).await;
+            if status != 200 {
+                failed.push(format!("{path}: {status}"));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "the thread's owner must be able to chat on both paths, got: {failed:?}"
+        );
+    }
+
     /// The assistant turn the store refused is not a 200.
     ///
     /// `handle_chat` used to publish `message_id: ""` and a `content` the
