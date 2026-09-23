@@ -237,7 +237,8 @@ fn right_pane_tabs(selected: Option<&str>, tab: Tab) -> Markup {
 }
 
 /// The schema panel for the selected table, or `Err` when a read failed —
-/// the page then answers 500 rather than an empty schema and a `0` count.
+/// the page then answers an error page rather than an empty schema and a
+/// `0` count.
 async fn schema_panel(ctx: &dyn Context, table: Option<&str>) -> Result<Markup, WaferError> {
     let Some(name) = table else {
         return Ok(html! {
@@ -420,7 +421,8 @@ pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let selected = (!selected.is_empty()).then_some(selected);
     let tab = Tab::from_query(msg.query("tab"));
 
-    // A failed listing, count or column read is a 500, not an empty database.
+    // A failed listing, count or column read is an error page (403 for a WRAP
+    // denial, 429 for a quota, else 500), not an empty database.
     let read = async {
         let tables = introspect_table_summaries(ctx).await?;
         let right = right_pane(ctx, selected, tab).await?;
@@ -429,8 +431,11 @@ pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (tables, right) = match read.await {
         Ok(read) => read,
         Err(e) => {
-            tracing::error!(error = %e, "admin database page: introspection read failed");
-            return crate::ui::server_error_response(msg);
+            return crate::blocks::crud::db_error_page(
+                msg,
+                e,
+                "admin database page: introspection read failed",
+            )
         }
     };
 

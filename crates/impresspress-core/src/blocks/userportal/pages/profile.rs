@@ -6,7 +6,7 @@ use maud::html;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::users,
+    blocks::{auth::repo::users, crud},
     http::redirect,
     ui::{self, components, SiteConfig, UserInfo},
 };
@@ -35,10 +35,7 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             tracing::error!(user_id = %user_id, "userportal profile: signed-in user has no users row");
             return ui::server_error_response(msg);
         }
-        Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "userportal profile: user read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "userportal profile: user read failed"),
     };
     let display_name = row.display_name;
     let avatar_url = row.avatar_url.unwrap_or_default();

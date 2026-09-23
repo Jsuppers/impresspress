@@ -27,8 +27,11 @@ pub async fn storage_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let logs_tab = match storage_logs_tab(ctx, msg).await {
         Ok(markup) => markup,
         Err(e) => {
-            tracing::error!(error = %e, "admin storage page: access-log read failed");
-            return crate::ui::server_error_response(msg);
+            return crate::blocks::crud::db_error_page(
+                msg,
+                e,
+                "admin storage page: access-log read failed",
+            )
         }
     };
 

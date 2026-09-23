@@ -76,8 +76,11 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
     let body_markup = match body_markup {
         Ok(markup) => markup,
         Err(e) => {
-            tracing::error!(error = %e, tab = %active, "admin settings page: tab read failed");
-            return crate::ui::server_error_response(msg);
+            return crate::blocks::crud::db_error_page(
+                msg,
+                e,
+                "admin settings page: tab read failed",
+            )
         }
     };
 

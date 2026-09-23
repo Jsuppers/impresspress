@@ -51,7 +51,7 @@ use crate::{
         },
         crud::{db_error, db_error_internal, taken_key_or_db_error},
     },
-    http::{err_bad_request, err_forbidden, err_internal},
+    http::{err_bad_request, err_forbidden},
     platform_state::{
         user_roles,
         variables::{self, NewVariable, VariablePatch, VariableRow},
@@ -121,9 +121,9 @@ pub(super) async fn set_user_disabled(
             error = %e,
             "user disabled/enabled but auth_version bump failed"
         );
-        return Err(err_internal(
-            "User updated but session invalidation failed",
+        return Err(db_error_internal(
             e,
+            "User updated but session invalidation failed",
         ));
     }
 
@@ -167,9 +167,9 @@ pub(super) async fn delete_user(
             error = %e,
             "user deleted but auth_version bump failed"
         );
-        return Err(err_internal(
-            "User deleted but session invalidation failed",
+        return Err(db_error_internal(
             e,
+            "User deleted but session invalidation failed",
         ));
     }
 
@@ -218,9 +218,9 @@ pub(super) async fn update_user_fields(
                 error = %e,
                 "user updated but auth_version bump failed"
             );
-            return Err(err_internal(
-                "User updated but session invalidation failed",
+            return Err(db_error_internal(
                 e,
+                "User updated but session invalidation failed",
             ));
         }
     }
@@ -494,15 +494,15 @@ impl RevokeFailure {
         match self.step {
             RevokeStep::Read => db_error_internal(self.error, "Database error"),
             RevokeStep::BumpBefore => {
-                err_internal("Role not deleted: session invalidation failed", self.error)
+                db_error_internal(self.error, "Role not deleted: session invalidation failed")
             }
             RevokeStep::Revoke => db_error_internal(
                 self.error,
                 "Role not deleted: its grants could not be revoked",
             ),
-            RevokeStep::BumpAfter => err_internal(
-                "Role not deleted: its grants were revoked but session invalidation failed",
+            RevokeStep::BumpAfter => db_error_internal(
                 self.error,
+                "Role not deleted: its grants were revoked but session invalidation failed",
             ),
         }
     }
@@ -774,7 +774,7 @@ async fn release_to_environment(
                 ReleaseGuard::StillPinnedAtUpgrade => Ok(false),
             };
         }
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error_internal(e, "Database error")),
     };
     if matches!(guard, ReleaseGuard::StillPinnedAtUpgrade)
         && variables::pin_of(&row) != Some(variables::Pin::PreUpgrade)
@@ -782,7 +782,7 @@ async fn release_to_environment(
         return Ok(false);
     }
     if let Err(e) = variables::reset_to_environment(ctx, key).await {
-        return Err(err_internal("Database error", e));
+        return Err(db_error_internal(e, "Database error"));
     }
     audit_log(
         ctx,
@@ -845,7 +845,7 @@ pub(super) async fn release_keys_pinned_at_upgrade(
 ) -> Result<Vec<String>, OutputStream> {
     let pinned = match variables::keys_pinned_at_upgrade(ctx).await {
         Ok(keys) => keys,
-        Err(e) => return Err(err_internal("Database error", e)),
+        Err(e) => return Err(db_error_internal(e, "Database error")),
     };
     release_each(ctx, msg, &pinned).await
 }
@@ -1095,8 +1095,8 @@ pub(super) struct VariableUpdate<'a> {
 ///
 /// Its own function because two of [`update_variable`]'s guards need it and
 /// neither fires on an ordinary write: reading it lazily is what keeps the
-/// common write path at one statement. A read failure is a 500 rather than a
-/// guessed `0` — guessing would decide a security question by assuming the
+/// common write path at one statement. A read failure is an error rather than
+/// a guessed `0` — guessing would decide a security question by assuming the
 /// answer that lets the write through.
 async fn stored_sensitive_flag(ctx: &dyn Context, key: &str) -> Result<i64, OutputStream> {
     match variables::get_by_key(ctx, key).await {

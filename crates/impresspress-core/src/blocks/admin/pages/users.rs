@@ -11,8 +11,9 @@ use crate::{
             api_keys,
             users::{self, ActiveUserQuery, UserRow},
         },
+        crud,
     },
-    http::{err_internal, err_not_found, ResponseBuilder},
+    http::{err_not_found, ResponseBuilder},
     ui::{
         self,
         components::{self, badge, pagination, Badge, BadgeVariant},
@@ -436,10 +437,10 @@ pub async fn handle_revoke_api_key(ctx: &dyn Context, msg: &Message) -> OutputSt
     match api_keys::find_by_id(ctx, key_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return err_not_found("API key not found"),
-        Err(e) => return err_internal("Could not load the API key", e),
+        Err(e) => return crud::db_error_internal(e, "Could not load the API key"),
     }
     if let Err(e) = api_keys::revoke(ctx, key_id).await {
-        return err_internal("Could not revoke the API key", e);
+        return crud::db_error_internal(e, "Could not revoke the API key");
     }
     audit_log(
         ctx,

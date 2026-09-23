@@ -2,8 +2,8 @@ use maud::{html, Markup};
 use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::admin::ops,
-    http::{err_internal, err_not_found},
+    blocks::{admin::ops, crud},
+    http::err_not_found,
     // `key_can_be_seeded_from_env` lives in `platform_state::variables` because
     // it mirrors the two gates between the process environment and that table —
     // `cli::server_config::filter_to_declared_keys` and `seed_and_load`'s own
@@ -900,7 +900,7 @@ pub async fn handle_edit_variable_form(ctx: &dyn Context, msg: &Message) -> Outp
     let row = match variables::get_by_key(ctx, var_key).await {
         Ok(Some(row)) => row,
         Ok(None) => return err_not_found("Variable not found"),
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
 
     let key = row.key;

@@ -3,7 +3,7 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use super::contracts::{AdminAuditLogListQuery, AdminAuditLogListResponse};
-use crate::http::{err_internal, ok_json};
+use crate::{blocks::crud, http::ok_json};
 
 /// Audit log entries (admin-initiated mutations).
 pub(crate) const AUDIT_LOGS_TABLE: &str = "impresspress__admin__audit_logs";
@@ -54,7 +54,7 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
     .await
     {
         Ok(result) => ok_json(&AdminAuditLogListResponse::from_record_list(&result)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 

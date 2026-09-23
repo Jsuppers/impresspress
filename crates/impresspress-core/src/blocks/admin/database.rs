@@ -4,7 +4,7 @@ use wafer_sql_utils::{introspect, Backend};
 
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_forbidden, err_not_found, ok_json},
 };
 
 /// Lightweight per-table summary: name + row count. Shared by the JSON
@@ -142,7 +142,7 @@ pub(super) async fn handle_info(ctx: &dyn Context) -> OutputStream {
     let sql = introspect::build_list_tables(backend);
     let tables = match db::query_raw(ctx, &sql, &[]).await {
         Ok(t) => t,
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
 
     let table_names: Vec<&str> = tables
