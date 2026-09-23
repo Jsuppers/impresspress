@@ -272,6 +272,27 @@ mod test_helpers {
         with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
     }
 
+    /// [`ctx_with_storage_handle`] on a database with every files migration
+    /// but `004_object_claim_id` — a deployment that took this code without
+    /// `--run-migrations`, so its objects table has no `claim_id` column.
+    pub(super) async fn ctx_with_storage_before_004() -> (TestContext, Arc<MemStorage>) {
+        let ctx = TestContext::with_auth().await;
+        let sql: Vec<&str> = crate::blocks::files::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .filter(|(basename, _)| *basename != "004_object_claim_id")
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert_eq!(
+            sql.len() + 1,
+            crate::blocks::files::migrations::SQLITE_MIGRATIONS.len(),
+            "004 is still shipped, under this name"
+        );
+        crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &sql, &[])
+            .await
+            .expect("001-003 apply");
+        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+    }
+
     fn with_storage(mut ctx: TestContext) -> (TestContext, Arc<MemStorage>) {
         let service = Arc::new(MemStorage::default());
         ctx.register_block(

@@ -163,10 +163,12 @@ pub async fn check_quota(
 /// inflate that user's quota usage forever. Calling this best-effort on each
 /// new upload keeps the table self-healing without a separate cron.
 ///
-/// Until it is swept, such a row also holds the key: `reserve_upload` cannot
+/// Until it is swept, such a row also holds the key. `reserve_upload` cannot
 /// tell it from an upload still in flight, so an upload of that key is
-/// refused as in progress until the row passes the TTL. The uploader's next
-/// upload after that sweeps the row first and claims the key afresh.
+/// refused until the row passes the TTL — for the row's own uploader with
+/// `ReserveError::HeldByOwnEarlierUpload`, which names when the reservation
+/// began, rather than as someone else's upload. The uploader's next upload
+/// after that sweeps the row first and claims the key afresh.
 ///
 /// It reclaims the ROW, not the blob. A swept row whose upload had in fact
 /// reached storage leaves that object behind, unreferenced and charged to
