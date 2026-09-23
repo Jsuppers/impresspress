@@ -86,6 +86,6 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-pub async fn handle_post(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    settings_form::save_settings(ctx, input, &sections().all(), "auth-ui").await
+pub async fn handle_post(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
+    settings_form::save_settings(ctx, msg, input, &sections().all(), "auth-ui").await
 }

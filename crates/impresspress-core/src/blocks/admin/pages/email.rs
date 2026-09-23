@@ -50,10 +50,10 @@ pub async fn settings_body(ctx: &dyn Context, _msg: &Message) -> Result<Markup, 
 
 pub async fn handle_save_email_settings(
     ctx: &dyn Context,
-    _msg: &Message,
+    msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    settings_form::save_settings(ctx, input, &mailgun_vars(), "email").await
+    settings_form::save_settings(ctx, msg, input, &mailgun_vars(), "email").await
 }
 
 #[cfg(test)]
@@ -62,7 +62,11 @@ mod tests {
     use wafer_run::{streams::output::TerminalNotResponse, InputStream};
 
     use super::*;
-    use crate::test_support::{anon_msg, output_json, TestContext};
+    use crate::{
+        blocks::admin::{test_support::routed, AdminBlock},
+        test_support::{admin_msg, anon_msg, audit_rows, output_json, TestContext},
+        util::RecordExt,
+    };
 
     fn email_body() -> serde_json::Value {
         serde_json::json!({
@@ -119,6 +123,35 @@ mod tests {
         // The value was actually persisted, not just reported as saved.
         let stored = config::get_default(&ctx, "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "").await;
         assert_eq!(stored, "key-123");
+    }
+
+    /// Editing these same keys on the admin Variables page writes a
+    /// `variable.update` row (`ops::update_variable`). Saving them here wrote
+    /// none, so whether an admin's change was recorded depended on which page
+    /// they used. Driven through the block's own route table, so the handler
+    /// gets the `Message` the router hands it.
+    #[tokio::test]
+    async fn saving_the_email_settings_page_audits_the_keys_it_wrote() {
+        let ctx = TestContext::with_admin().await;
+
+        let out = wafer_run::Block::handle(
+            &AdminBlock::new(),
+            &ctx,
+            routed(admin_msg("create", "/b/admin/email")),
+            InputStream::from_bytes(serde_json::to_vec(&email_body()).unwrap()),
+        )
+        .await;
+        assert_eq!(output_json(out).await["message"], "Settings saved");
+
+        let rows = audit_rows(&ctx, "settings.update").await;
+        assert_eq!(rows.len(), 1, "one row per save");
+        assert_eq!(rows[0].str_field("user_id"), "admin_1");
+        assert_eq!(
+            rows[0].str_field("resource"),
+            "settings/email (IMPRESSPRESS__EMAIL__MAILGUN_API_KEY, \
+             IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN)",
+            "the row names the page and the keys this save actually wrote"
+        );
     }
 
     #[tokio::test]

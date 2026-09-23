@@ -1,7 +1,7 @@
 mod contracts;
 mod database;
 mod iam;
-mod logs;
+pub(crate) mod logs;
 pub mod migrations;
 mod ops;
 mod pages;
@@ -584,6 +584,50 @@ crate::impresspress_feature_block! {
                 // Infrastructure logging: storage wrapper + pipeline write logs
                 wafer_run::ResourceGrant::read_write("*", STORAGE_ACCESS_LOGS_TABLE),
                 wafer_run::ResourceGrant::read_write("*", request_logs::TABLE),
+                // The admin audit trail is one table, so an admin mutation
+                // served by another block writes its row here rather than
+                // into a second log nobody reads. `logs::audit_log` runs
+                // under the CALLING block's WRAP identity, so each such block
+                // is named. The four below reach it through
+                // `ui::settings_form::save_settings`, which audits the
+                // settings page it served; userportal also audits its portal
+                // buttons. Named rather than `"*"`: the two wildcard grants
+                // above are for logs every block writes by construction,
+                // where this list is the set of admin surfaces that happen
+                // not to live in the admin block.
+                //
+                // What these grants actually confer, stated plainly because
+                // it is more than appending a row. WRAP carries ONE write
+                // bit: `wrap::grant_allows` refuses a write only when
+                // `!grant.write`, and every mutating database op —
+                // `database.create`, `.update`, `.delete` alike — authorizes
+                // as `(collection, ResourceType::Db, true)`
+                // (`wafer-core`'s `interfaces/database/handler.rs`). So each
+                // grantee can rewrite and DELETE audit rows, not only add
+                // them, and `read_write` has no read-less form to narrow it
+                // to. The grant is also block-scoped, not route-scoped: it
+                // covers every code path in that block, not just the
+                // settings-save and portal-button handlers that need it.
+                // Tightening this needs an append-only channel in wafer-run,
+                // not a different grant here.
+                //
+                // `.typed(Db)` because an UNtyped grant is a wildcard across
+                // every resource type (`grant_allows` skips the type check
+                // when `grant.resource_type` is `None`), which would let this
+                // table name authorize a Config, Storage, Crypto, Network or
+                // Vector access too. Nothing reaches those under this name
+                // today; the type is declared so nothing can.
+                wafer_run::ResourceGrant::read_write("impresspress/userportal", AUDIT_LOGS_TABLE)
+                    .typed(wafer_run::ResourceType::Db),
+                wafer_run::ResourceGrant::read_write("impresspress/products", AUDIT_LOGS_TABLE)
+                    .typed(wafer_run::ResourceType::Db),
+                wafer_run::ResourceGrant::read_write("impresspress/legalpages", AUDIT_LOGS_TABLE)
+                    .typed(wafer_run::ResourceType::Db),
+                wafer_run::ResourceGrant::read_write(
+                    super::auth_ui::AUTH_UI_BLOCK_ID,
+                    AUDIT_LOGS_TABLE,
+                )
+                .typed(wafer_run::ResourceType::Db),
                 // Default: allow all blocks to make outbound network requests.
                 // Remove this grant via the admin UI to restrict network access.
                 wafer_run::ResourceGrant::read("*", "*")
@@ -635,7 +679,7 @@ crate::impresspress_feature_block! {
             Route::UpdateRoleApi => iam::handle_update_role(ctx, &msg, input).await,
             Route::DeleteRoleApi => iam::handle_delete_role(ctx, &msg).await,
             Route::ListPermissionsApi => iam::handle_list_permissions(ctx).await,
-            Route::CreatePermissionApi => iam::handle_create_permission(ctx, input).await,
+            Route::CreatePermissionApi => iam::handle_create_permission(ctx, &msg, input).await,
             Route::DeletePermissionApi => iam::handle_delete_permission(ctx, &msg).await,
             Route::ListUserRolesApi => iam::handle_list_user_roles(ctx, &msg).await,
             Route::AssignRoleApi => iam::handle_assign_role(ctx, &msg, input).await,
@@ -946,10 +990,8 @@ mod tests {
         );
         // Synthetic on purpose: this entry exists only to pin the
         // "no stored row ⇒ enabled" branch, and naming a real block here
-        // would both imply something about that block and hand
-        // `tests/repo_door.rs` the qualifier half of a door match (its
-        // `products_variables` door pairs the substring `products` with the
-        // `variables::TABLE` const this file already carries).
+        // would imply something about that block's default state that this
+        // test does not mean to assert.
         ctx.register_block_info(
             "example/widget",
             wafer_run::BlockInfo::new("example/widget", "1.0.0", "http.handler", "widget"),
@@ -1109,23 +1151,7 @@ mod wrap_grant_mutation_tests {
     use wafer_run::InputStream;
 
     use super::{test_support::routed, *};
-    use crate::test_support::{admin_msg, output_is_error, TestContext};
-
-    /// Count audit-log rows whose `action` matches.
-    async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
-        crate::db_read::list_every(
-            ctx,
-            AUDIT_LOGS_TABLE,
-            vec![wafer_block::db::Filter {
-                field: "action".to_string(),
-                operator: wafer_block::db::FilterOp::Equal,
-                value: serde_json::Value::String(action.to_string()),
-            }],
-        )
-        .await
-        .map(|rows| rows.len())
-        .unwrap_or(0)
-    }
+    use crate::test_support::{admin_msg, audit_count, output_is_error, TestContext};
 
     #[tokio::test]
     async fn create_wrap_grant_success_persists_and_audits() {

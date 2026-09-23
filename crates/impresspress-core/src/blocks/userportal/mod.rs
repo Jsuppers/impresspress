@@ -168,17 +168,19 @@ crate::impresspress_feature_block! {
             Route::UnlinkProvider => pages::security::handle_unlink(ctx, &msg).await,
             Route::Config => this.handle_config(ctx, &msg).await,
             Route::AdminSettingsPage => admin_settings_page(ctx, &msg).await,
-            Route::AdminSaveSettings => handle_save_settings(ctx, input).await,
+            Route::AdminSaveSettings => handle_save_settings(ctx, &msg, input).await,
             Route::AdminButtonsPage => pages::admin_buttons::admin_buttons_page(ctx, &msg).await,
-            Route::AdminCreateButton => pages::admin_buttons::handle_create_button(ctx, input).await,
+            Route::AdminCreateButton => {
+                pages::admin_buttons::handle_create_button(ctx, &msg, input).await
+            }
             Route::AdminEditButtonForm => {
                 pages::admin_buttons::handle_edit_button_form(ctx, msg.var("id")).await
             }
             Route::AdminUpdateButton => {
-                pages::admin_buttons::handle_update_button(ctx, input, msg.var("id")).await
+                pages::admin_buttons::handle_update_button(ctx, &msg, input, msg.var("id")).await
             }
             Route::AdminDeleteButton => {
-                pages::admin_buttons::handle_delete_button(ctx, msg.var("id")).await
+                pages::admin_buttons::handle_delete_button(ctx, &msg, msg.var("id")).await
             }
         }
     },
@@ -500,8 +502,12 @@ async fn admin_settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-async fn handle_save_settings(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    settings_form::save_settings(ctx, input, &branding_vars(), "userportal").await
+async fn handle_save_settings(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
+    settings_form::save_settings(ctx, msg, input, &branding_vars(), "userportal").await
 }
 
 #[cfg(test)]
