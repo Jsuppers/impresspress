@@ -4,7 +4,7 @@
 //! offers, the owner's own account. [`export`] reads an explicit table
 //! allowlist into a [`DataSnapshot`]; [`import`] applies it back through the
 //! typed database client. **No SQL text is generated or executed anywhere in
-//! this module** — every write is `db::create`, `db::upsert` or
+//! this module** — every write is `db::create_many`, `db::batch` or
 //! `db::delete_by_filters`, exactly as amendment 9 requires and as
 //! `CLAUDE.md`'s "no raw SQL in block code" rule already demands of every
 //! other block.
@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use wafer_block::wire::database::OnConflict;
+use wafer_block::wire::database::{BatchWrite, OnConflict, UpsertRequest, MAX_BATCH_WRITES};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -61,13 +61,12 @@ use crate::{
             orgs, pats, provider_links, rate_limits, sessions, tokens, users,
         },
         products::{
-            list_live_products, upsert_product_from_snapshot, CHECKOUT_PRESETS_TABLE,
-            DISPUTES_TABLE, ENTITLEMENTS_TABLE, GROUPS_TABLE, GROUP_TEMPLATES_TABLE,
-            LINE_ITEMS_TABLE, OFFERS_TABLE, OFFER_COMPONENTS_TABLE, PAYMENT_LINKS_TABLE,
-            PRODUCT_TEMPLATES_TABLE, PRODUCT_VERSIONS_TABLE, PROVIDER_OPERATIONS_TABLE,
-            PURCHASES_TABLE, REFUNDS_TABLE, SELLER_ACCOUNTS_TABLE, STRIPE_EVENTS_TABLE,
-            SUBSCRIPTIONS_TABLE, SUBSCRIPTION_ITEMS_TABLE, TYPES_TABLE,
-            VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
+            list_live_products, product_snapshot_upsert, CHECKOUT_PRESETS_TABLE, DISPUTES_TABLE,
+            ENTITLEMENTS_TABLE, GROUPS_TABLE, GROUP_TEMPLATES_TABLE, LINE_ITEMS_TABLE,
+            OFFERS_TABLE, OFFER_COMPONENTS_TABLE, PAYMENT_LINKS_TABLE, PRODUCT_TEMPLATES_TABLE,
+            PRODUCT_VERSIONS_TABLE, PROVIDER_OPERATIONS_TABLE, PURCHASES_TABLE, REFUNDS_TABLE,
+            SELLER_ACCOUNTS_TABLE, STRIPE_EVENTS_TABLE, SUBSCRIPTIONS_TABLE,
+            SUBSCRIPTION_ITEMS_TABLE, TYPES_TABLE, VARIABLES_TABLE as PRODUCTS_VARIABLES_TABLE,
         },
     },
     // audit-allow: names the platform tables for the export allowlist/exclusion bookkeeping below — the two it reads (`variables`, `user_roles`) are granted by `dev::wrap_grants()`, which maps every `TABLE_ALLOWLIST` entry to `read_write(BLOCK_NAME, table)` and which the runtime honours from its flat grant list, and the audit attributes grants to the declaring file's block and cannot see it
@@ -104,7 +103,7 @@ pub const BY_ID: &[&str] = &["id"];
 /// How [`import`] applies one allowlisted table's rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// `db::upsert` each row, with the named columns as the conflict target.
+    /// Upsert each row, with the named columns as the conflict target.
     /// Safe to run repeatedly — a second import of the same snapshot updates
     /// the same rows rather than duplicating them — and never removes a row
     /// the destination already has that the snapshot doesn't mention.
@@ -118,17 +117,17 @@ pub enum Mode {
     /// `UNIQUE` (`roles.name`, `permissions.name`, `variables.key`). Keyed on
     /// `id` those rows do not conflict on the id at all: they are INSERTs
     /// that then violate the unique index on the natural key, and the whole
-    /// import fails with a bare "internal database error". Design §10.2's
+    /// import fails on it. Design §10.2's
     /// promise that a bundle imports into a fresh instance is exactly the
     /// case where the destination has already seeded its own copies of these
     /// rows, so this is not a corner.
     ///
     /// On a conflict the destination keeps its OWN `id` (and its own value of
     /// the conflict columns, which are equal by definition) and takes every
-    /// other column from the snapshot — see [`import_row`].
+    /// other column from the snapshot — see [`upsert_op`].
     Upsert(&'static [&'static str]),
-    /// Delete every row in the destination table first, then `db::create`
-    /// each exported row. Reserved for the tables whose *set* must match the
+    /// Delete every row in the destination table first, then insert the
+    /// exported rows with `db::create_many`. Reserved for the tables whose *set* must match the
     /// snapshot exactly: a fresh instance's own bootstrap admin (and its
     /// role assignment, and its local credentials) must be gone once someone
     /// else's account is imported, not merged alongside it.
@@ -145,10 +144,10 @@ pub const TABLE_ALLOWLIST: &[(&str, Mode)] = &[
     // specific buyer, subscription or provider account — the shop's shape,
     // not its history. ---
     // Read and written through `products::list_live_products`/
-    // `upsert_product_from_snapshot`, never through the generic
-    // `db::list_all`/`db::upsert` path below — this table alone carries a
+    // `product_snapshot_upsert`, never through the generic
+    // `db::list_all`/upsert path below — this table alone carries a
     // soft-delete filter its own repo module's door tests enforce (see
-    // `export`/`import_row`).
+    // `export`/`upsert_op`).
     (PRODUCTS_COLLECTION, Mode::Upsert(BY_ID)),
     (GROUPS_TABLE, Mode::Upsert(BY_ID)),
     (TYPES_TABLE, Mode::Upsert(BY_ID)),
@@ -774,17 +773,22 @@ mod replace_order_tests {
 /// the module docs for why a name outside it is refused (`InvalidArgument`)
 /// rather than silently skipped or written anyway.
 ///
-/// **Not atomic.** Each table is deleted-then-recreated (`Replace`) or
-/// upserted (`Upsert`) independently — the typed database client this
-/// module is required to use (CLAUDE.md: no raw SQL in block code) exposes
-/// no cross-call transaction, so a crash or error partway through leaves
-/// whatever tables were already written in their new state and the rest in
-/// their old one. This is worth a `wafer-run` ticket (a transaction/batch op
-/// on `wafer_core::clients::database`) rather than working around it here.
-/// What keeps this safe in the meantime: every write is keyed on the
-/// snapshot's own row ids, so importing the same snapshot again (after a
-/// partial failure, or on purpose) converges to the same end state —
-/// `tests/dev_data_snapshot.rs`'s
+/// Each table is written in as few calls as the database allows: a `Replace`
+/// table is one `db::delete_by_filters` and then one `db::create_many`, and
+/// every `Upsert` row of every table goes into `db::batch` calls. Each of
+/// those calls is one transaction — all of its rows or none — and one OPFS
+/// flush in the browser, where a row-per-call import flushed the whole
+/// database once per row. A call carries at most [`MAX_BATCH_WRITES`] rows or
+/// ops, the most the database handler accepts, so a table past that is
+/// written in several.
+///
+/// **Not atomic as a whole.** The delete that clears a `Replace` table is its
+/// own call (`db::batch` has no filtered delete), and the calls are separate
+/// transactions, so a failure partway through leaves the tables already
+/// written in their new state and the rest in their old one. What keeps that
+/// safe: every write is keyed on the snapshot's own row ids, so importing the
+/// same snapshot again (after a partial failure, or on purpose) converges to
+/// the same end state — `tests/dev_data_snapshot.rs`'s
 /// `import_replaces_users_and_upserts_products_so_ownership_survives` test
 /// re-imports and asserts no duplication.
 pub async fn import(
@@ -872,11 +876,22 @@ pub async fn import(
             rows.iter().collect()
         };
         db::delete_by_filters(ctx, table, Vec::new()).await?;
-        for row in &rows {
-            import_row(ctx, table, Mode::Replace, row).await?;
+        let written = rows.len();
+        let mut rows = rows
+            .into_iter()
+            .map(|row| {
+                imported_row(table, row)
+                    .into_iter()
+                    .collect::<HashMap<_, _>>()
+            })
+            .peekable();
+        while rows.peek().is_some() {
+            let call: Vec<_> = rows.by_ref().take(MAX_BATCH_WRITES).collect();
+            db::create_many(ctx, table, call).await?;
         }
-        report.tables.insert(table.to_string(), rows.len());
+        report.tables.insert(table.to_string(), written);
     }
+    let mut upserts = Vec::new();
     for (table, rows) in &snapshot.tables {
         if REPLACE_ORDER.contains(&table.as_str()) {
             continue; // already applied above, in dependency order
@@ -888,16 +903,21 @@ pub async fn import(
         // the list, so a lookup miss here is unreachable — and is reported
         // rather than defaulted, because defaulting to `BY_ID` is precisely
         // the assumption this field exists to stop making.
-        let Some((_, mode)) = TABLE_ALLOWLIST.iter().find(|(name, _)| name == table) else {
+        let Some((_, Mode::Upsert(conflict))) =
+            TABLE_ALLOWLIST.iter().find(|(name, _)| name == table)
+        else {
             return Err(WaferError::new(
                 ErrorCode::Internal,
-                format!("{table:?} passed the allowlist check but has no import mode"),
+                format!("{table:?} passed the allowlist check but has no upsert conflict target"),
             ));
         };
-        for row in rows {
-            import_row(ctx, table, *mode, row).await?;
-        }
+        upserts.extend(rows.iter().map(|row| upsert_op(table, conflict, row)));
         report.tables.insert(table.clone(), rows.len());
+    }
+    let mut upserts = upserts.into_iter().peekable();
+    while upserts.peek().is_some() {
+        let call: Vec<_> = upserts.by_ref().take(MAX_BATCH_WRITES).collect();
+        db::batch(ctx, call).await?;
     }
     Ok(report)
 }
@@ -946,7 +966,7 @@ fn one_grant_per_user_and_role(
 /// row this instance creates itself.
 ///
 /// Import is the one write to this table that does NOT go through that funnel —
-/// it upserts the bundle's own columns straight through `db::upsert` — and its
+/// it upserts the bundle's own columns straight through `db::batch` — and its
 /// pre-flight refuses only [`crate::config_vars::is_instance_owned_key`]. So a
 /// bundle carrying `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD` with
 /// `sensitive: 0` would re-create exactly the row this masking work exists to
@@ -998,79 +1018,66 @@ fn raise_imported_sensitive_flag(row: &mut serde_json::Map<String, Value>) {
 ///   version of this missed. On `Mode::Upsert` the bundle's columns are written
 ///   over the destination's, so a blank would erase a marker a local admin had
 ///   set and hand their key back to the local `.env`. That is why
-///   `updated_by` is dropped from the update column set in [`import_row`]
+///   `updated_by` is dropped from the update column set in [`upsert_op`]
 ///   rather than merely blanked: on a conflict the destination keeps its own.
 fn neutralise_imported_owner(row: &mut serde_json::Map<String, Value>) {
     row.insert("updated_by".to_string(), serde_json::json!(""));
 }
 
-/// Write one row into `table` under `mode`. Split out of [`import`] because
-/// the two modes' typed calls take different shapes (`create`'s owned
-/// `HashMap` vs. `upsert`'s ordered pair list) that don't share a body.
-async fn import_row(
-    ctx: &dyn Context,
+/// `row` as it is written into `table`: unchanged, except that a variables
+/// row — the table whose columns carry a security decision, and the one
+/// import writes without passing through `NewVariable::into_row` — has its
+/// `sensitive` flag raised and its admin-ownership marker neutralised.
+fn imported_row(
     table: &str,
-    mode: Mode,
     row: &serde_json::Map<String, Value>,
-) -> Result<(), WaferError> {
-    // The variables table is the one whose columns carry a security decision,
-    // and the one import writes without passing through `NewVariable::into_row`.
-    let owned;
-    let row = if table == variables::TABLE {
-        let mut copy = row.clone();
-        raise_imported_sensitive_flag(&mut copy);
-        neutralise_imported_owner(&mut copy);
-        owned = copy;
-        &owned
-    } else {
-        row
-    };
-    match mode {
-        Mode::Replace => {
-            let data: HashMap<String, Value> = row.clone().into_iter().collect();
-            db::create(ctx, table, data).await?;
-        }
-        Mode::Upsert(conflict) => {
-            let data: Vec<(String, Value)> = row.clone().into_iter().collect();
-            // Neither `id` nor the conflict columns are updated on a
-            // conflict. The conflict columns are equal by definition (that is
-            // what conflicted), and `id` must stay the DESTINATION's: an
-            // import that rewrote it would break every row already pointing
-            // at it — a `user_roles.role_id`, say — to graft on an id whose
-            // only merit is that another instance happened to mint it.
-            //
-            // `variables.updated_by` is excluded for a related reason: it is
-            // the DESTINATION's admin-ownership marker, so writing the
-            // bundle's over it on a conflict would revoke a local admin's
-            // claim and hand their key back to the local `.env`. Excluded
-            // rather than blanked — a blank is still a write — so a row this
-            // instance already has keeps whatever it had. See
-            // `neutralise_imported_owner`, which covers the insert direction.
-            let update_columns: Vec<String> = row
-                .keys()
-                .filter(|key| key.as_str() != "id" && !conflict.contains(&key.as_str()))
-                .filter(|key| !(table == variables::TABLE && key.as_str() == "updated_by"))
-                .cloned()
-                .collect();
-            let conflict: Vec<String> = conflict.iter().map(|c| (*c).to_string()).collect();
-            // Products alone: written through the repo module's own
-            // wholesale-upsert door, never the raw table name — see the
-            // comment on `TABLE_ALLOWLIST`'s products entry. The door takes
-            // the conflict target the allowlist declared, exactly as
-            // `db::upsert` does below, so there is one statement of it.
-            if table == PRODUCTS_COLLECTION {
-                upsert_product_from_snapshot(ctx, data, conflict, update_columns).await?;
-            } else {
-                db::upsert(
-                    ctx,
-                    table,
-                    data,
-                    conflict,
-                    OnConflict::SetColumns(update_columns),
-                )
-                .await?;
-            }
-        }
+) -> serde_json::Map<String, Value> {
+    let mut row = row.clone();
+    if table == variables::TABLE {
+        raise_imported_sensitive_flag(&mut row);
+        neutralise_imported_owner(&mut row);
     }
-    Ok(())
+    row
+}
+
+/// The `db::batch` write that upserts one snapshot `row` into `table` on
+/// `conflict`.
+fn upsert_op(table: &str, conflict: &[&str], row: &serde_json::Map<String, Value>) -> BatchWrite {
+    let row = imported_row(table, row);
+    // Neither `id` nor the conflict columns are updated on a
+    // conflict. The conflict columns are equal by definition (that is
+    // what conflicted), and `id` must stay the DESTINATION's: an
+    // import that rewrote it would break every row already pointing
+    // at it — a `user_roles.role_id`, say — to graft on an id whose
+    // only merit is that another instance happened to mint it.
+    //
+    // `variables.updated_by` is excluded for a related reason: it is
+    // the DESTINATION's admin-ownership marker, so writing the
+    // bundle's over it on a conflict would revoke a local admin's
+    // claim and hand their key back to the local `.env`. Excluded
+    // rather than blanked — a blank is still a write — so a row this
+    // instance already has keeps whatever it had. See
+    // `neutralise_imported_owner`, which covers the insert direction.
+    let update_columns: Vec<String> = row
+        .keys()
+        .filter(|key| key.as_str() != "id" && !conflict.contains(&key.as_str()))
+        .filter(|key| !(table == variables::TABLE && key.as_str() == "updated_by"))
+        .cloned()
+        .collect();
+    let data: Vec<(String, Value)> = row.into_iter().collect();
+    let conflict: Vec<String> = conflict.iter().map(|c| (*c).to_string()).collect();
+    // Products alone: built by the repo module's own wholesale-upsert
+    // door, never on the raw table name — see the comment on
+    // `TABLE_ALLOWLIST`'s products entry. The door takes the conflict
+    // target the allowlist declared, exactly as the generic op below does,
+    // so there is one statement of it.
+    if table == PRODUCTS_COLLECTION {
+        return product_snapshot_upsert(data, conflict, update_columns);
+    }
+    BatchWrite::Upsert(UpsertRequest {
+        collection: table.to_string(),
+        data,
+        conflict_columns: conflict,
+        on_conflict: OnConflict::SetColumns(update_columns),
+    })
 }

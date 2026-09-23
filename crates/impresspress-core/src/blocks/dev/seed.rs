@@ -227,15 +227,15 @@ pub const DATA_CONTENT_TYPE: &str = "application/json";
 /// [`paths::MAX_FILE_BYTES`] would refuse an ordinary shop of a few hundred
 /// accounts.
 ///
-/// What bounds it from above is write cost, not memory. [`data_snapshot::import`]
-/// applies the snapshot one row per database call, and in the browser every
-/// call that returns has saved the WHOLE sql.js database to OPFS
-/// (`dbFlush` in `impresspress-browser`'s `bridge.js`). An import therefore
-/// writes roughly rows × database size, on the imported instance's cold boot,
-/// and that product grows with the square of the snapshot: at 2 MiB it is on
-/// the order of gigabytes, where 8 MiB would be on the order of a hundred.
-/// Raising the limit depends on a multi-row write in wafer-run's database
-/// interface, which today takes one row per call.
+/// What bounded it from above was write cost, not memory: in the browser
+/// every database call that returns has saved the WHOLE sql.js database to
+/// OPFS (`dbFlush` in `impresspress-browser`'s `bridge.js`), and
+/// [`data_snapshot::import`] used to apply the snapshot one row per call. It
+/// now writes each table in `db::create_many`/`db::batch` calls of up to
+/// `MAX_BATCH_WRITES` rows, so an import costs a few whole-database saves
+/// rather than one per row. The limit stays at 2 MiB until a batched import
+/// of a larger snapshot has been timed on a real browser cold boot; that
+/// measurement, not the write count, is what a higher value has to rest on.
 pub const MAX_DATA_BYTES: usize = 2 * 1024 * 1024;
 
 /// The short workspace name of a registered block (`site/hello` → `hello`).

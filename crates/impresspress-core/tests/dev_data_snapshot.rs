@@ -29,7 +29,7 @@ use impresspress_core::{
         products::ProductsBlock,
     },
     platform_state::{user_roles, variables},
-    test_support::TestContext,
+    test_support::{TestContext, WriteLog},
     util::json_map,
 };
 use serde_json::json;
@@ -1505,4 +1505,112 @@ fn sqlite_migration_sql() -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Write cost: one call per table, not one per row.
+// ---------------------------------------------------------------------------
+
+/// `n` users (a `Mode::Replace` table) and `n` products (a `Mode::Upsert`
+/// one).
+fn wide_snapshot(users_n: usize, products_n: usize) -> DataSnapshot {
+    let mut tables = std::collections::BTreeMap::new();
+    tables.insert(
+        users::TABLE.to_string(),
+        (0..users_n)
+            .map(|i| {
+                json_map(json!({
+                    "id": format!("user_{i}"),
+                    "email": format!("owner{i}@example.com"),
+                    "display_name": format!("Owner {i}"),
+                }))
+                .into_iter()
+                .collect()
+            })
+            .collect(),
+    );
+    tables.insert(
+        PRODUCTS_TABLE.to_string(),
+        (0..products_n)
+            .map(|i| {
+                json_map(json!({
+                    "id": format!("prod_{i}"),
+                    "name": format!("Widget {i}"),
+                    "status": "active",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                }))
+                .into_iter()
+                .collect()
+            })
+            .collect(),
+    );
+    DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables,
+    }
+}
+
+async fn counting_ctx() -> (TestContext, std::sync::Arc<std::sync::Mutex<WriteLog>>) {
+    TestContext::with_products()
+        .await
+        .with_auth_added()
+        .await
+        .record_writes()
+}
+
+/// **An N-row table is one write, not N.** The replaced table's rows go in
+/// one `create_many` and every upserted row in one `batch`; not one row goes
+/// through a single-row `create` or `upsert`. In the browser each database
+/// call is a whole-database save to OPFS, so this is the difference between
+/// a few saves and one per row. Before, the import made 30 `create` and 30
+/// `upsert` calls here.
+#[tokio::test]
+async fn an_import_writes_each_table_in_one_call_not_one_per_row() {
+    let (ctx, log) = counting_ctx().await;
+
+    let report = data_snapshot::import(&ctx, &wide_snapshot(30, 30))
+        .await
+        .expect("import");
+
+    {
+        let log = log.lock().unwrap();
+        assert_eq!(log.creates, 0, "no row goes through a single-row create");
+        assert_eq!(log.upserts, 0, "no row goes through a single-row upsert");
+        assert_eq!(log.create_many_rows, [30], "one create_many for the users");
+        assert_eq!(log.batch_ops, [30], "one batch for the products");
+    }
+    assert_eq!(report.tables.get(users::TABLE), Some(&30));
+    assert_eq!(report.tables.get(PRODUCTS_TABLE), Some(&30));
+    assert_eq!(
+        db::list_all(&ctx, users::TABLE, Vec::new())
+            .await
+            .unwrap()
+            .len(),
+        30
+    );
+    assert_eq!(
+        db::list_all(&ctx, PRODUCTS_TABLE, Vec::new())
+            .await
+            .unwrap()
+            .len(),
+        30
+    );
+}
+
+/// A table larger than one call may carry is split at
+/// `wafer_block::wire::database::MAX_BATCH_WRITES`, the most the database
+/// handler accepts — one row past it is a second call, not a refused import.
+#[tokio::test]
+async fn a_table_past_one_calls_limit_is_written_in_several() {
+    let max = wafer_block::wire::database::MAX_BATCH_WRITES;
+    let (ctx, log) = counting_ctx().await;
+
+    data_snapshot::import(&ctx, &wide_snapshot(max + 1, max + 1))
+        .await
+        .expect("import");
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.create_many_rows, [max, 1]);
+    assert_eq!(log.batch_ops, [max, 1]);
 }

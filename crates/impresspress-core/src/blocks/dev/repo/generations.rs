@@ -4,7 +4,10 @@
 //! Rolling back publishes a *new* generation that copies an old one's
 //! manifests (design §7.2), so the history stays a straight line.
 
-use wafer_block::db::{Filter, FilterOp, FilterTree, ListOptions, SortField};
+use wafer_block::{
+    db::{Filter, FilterOp, FilterTree, ListOptions, SortField},
+    wire::database::BatchWrite,
+};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -430,13 +433,28 @@ pub async fn list_prunable(
     list.records.iter().map(decode).collect()
 }
 
-/// Delete one row.
+/// Delete the rows `ids` names, as one transaction.
 ///
 /// Retention is the only caller: the ledger is append-only for as long as a
 /// generation is retained, and the one thing that removes a row is falling
-/// out of the window.
-pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
-    db::delete(ctx, TABLE, id).await
+/// out of the window. One `db::batch` for a page of [`list_prunable`] —
+/// never more than [`MAX_LIST_LIMIT`] ids, well inside what one batch takes —
+/// so a pass deletes a page in one write (one OPFS flush in the browser)
+/// rather than one per row. An id no row has any more is not an error: the
+/// row is gone, which is what was asked.
+pub async fn delete_many(ctx: &dyn Context, ids: &[String]) -> Result<(), WaferError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ops = ids
+        .iter()
+        .map(|id| BatchWrite::Delete {
+            collection: TABLE.to_string(),
+            id: id.clone(),
+        })
+        .collect();
+    db::batch(ctx, ops).await?;
+    Ok(())
 }
 
 /// A `status IN (…)` filter over the statuses `keep` accepts.
@@ -875,17 +893,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_the_row_from_the_ledger() {
+    async fn delete_many_removes_exactly_the_named_rows_from_the_ledger() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
-        let row = insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.push(
+                insert(&ctx, &new_generation(GenerationCause::SiteWrite))
+                    .await
+                    .expect("insert"),
+            );
+        }
+        let gone = [rows[0].id.clone(), rows[2].id.clone()];
+        delete_many(&ctx, &gone).await.expect("delete");
+        for id in &gone {
+            assert_eq!(
+                get(&ctx, id).await.expect_err("gone").code,
+                ErrorCode::NotFound
+            );
+        }
+        let left: Vec<String> = list_recent(&ctx, 10)
             .await
-            .expect("insert");
-        delete(&ctx, &row.id).await.expect("delete");
-        assert_eq!(
-            get(&ctx, &row.id).await.expect_err("gone").code,
-            ErrorCode::NotFound
-        );
-        assert!(list_recent(&ctx, 10).await.expect("list").is_empty());
+            .expect("list")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(left, [rows[1].id.clone()]);
+
+        // An id no row has any more is not an error, and nothing is left to
+        // delete for an empty list.
+        delete_many(&ctx, &gone).await.expect("already gone");
+        delete_many(&ctx, &[]).await.expect("nothing to delete");
     }
 
     #[test]
