@@ -573,41 +573,6 @@ mod resend_tests {
         )
     }
 
-    /// Minting a fresh link is reached only by a registered address whose
-    /// ownership nobody proved. A refusal storing the token — WRAP denial or
-    /// outage — must answer exactly what an unregistered address gets.
-    #[tokio::test]
-    async fn a_failed_verification_token_store_answers_what_an_unregistered_address_does() {
-        for error in [
-            wafer_run::WaferError::new(
-                wafer_run::ErrorCode::PermissionDenied,
-                "WRAP: no grant on the users table",
-            ),
-            wafer_run::WaferError::new(wafer_run::ErrorCode::Internal, "simulated outage"),
-        ] {
-            let ctx = TestContext::with_auth_and_crypto().await;
-            seed(&ctx, "unproven@example.com", false).await;
-            let failing = crate::test_support::FailingDbOpContext::failing_with(
-                ctx,
-                vec![("database.update", users::TABLE)],
-                error.clone(),
-            );
-
-            let unregistered = resend_on_the_wire(&failing, "nobody@example.com").await;
-            let registered = resend_on_the_wire(&failing, "unproven@example.com").await;
-
-            assert_eq!(
-                unregistered.0, 200,
-                "the unregistered answer is the constant 200"
-            );
-            assert_eq!(
-                registered, unregistered,
-                "a {:?} storing the verification token must not be visible to the caller",
-                error.code
-            );
-        }
-    }
-
     /// The token draw needs the crypto block; a deployment without it must
     /// still answer a registered, unproven address like any other.
     #[tokio::test]

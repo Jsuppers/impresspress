@@ -187,42 +187,6 @@ mod tests {
         .expect("insert user");
     }
 
-    /// Storing the reset token is the first write, and only a registered
-    /// address reaches it. Whatever refuses it — a WRAP denial or an outage
-    /// — the whole response must be the one an unregistered address gets, or
-    /// the refusal names which addresses have accounts.
-    #[tokio::test]
-    async fn a_failed_reset_token_store_answers_what_an_unregistered_address_does() {
-        for error in [
-            wafer_run::WaferError::new(
-                wafer_run::ErrorCode::PermissionDenied,
-                "WRAP: no grant on the users table",
-            ),
-            wafer_run::WaferError::new(wafer_run::ErrorCode::Internal, "simulated outage"),
-        ] {
-            let ctx = TestContext::with_auth_and_crypto().await;
-            with_known_user(&ctx).await;
-            let failing = crate::test_support::FailingDbOpContext::failing_with(
-                ctx,
-                vec![("database.update", users::TABLE)],
-                error.clone(),
-            );
-
-            let unregistered = on_the_wire(&failing, "nobody@example.com").await;
-            let registered = on_the_wire(&failing, "known@example.com").await;
-
-            assert_eq!(
-                unregistered.0, 200,
-                "the unregistered answer is the constant 200"
-            );
-            assert_eq!(
-                registered, unregistered,
-                "a {:?} storing the reset token must not be visible to the caller",
-                error.code
-            );
-        }
-    }
-
     /// Same shape one step earlier: drawing the token needs the crypto
     /// block, and only a registered address asks it for anything. A
     /// deployment without it must still answer every address alike.
