@@ -426,18 +426,31 @@ pub struct StoredRow {
 }
 
 impl StoredRow {
-    /// Every blob this row may have caused to be stored: the one it serves,
-    /// and the one its latest reservation's upload writes. What must be
-    /// deleted from storage once the row is gone. No other row can name
-    /// either: both keys embed this row's object key, and a claim's blob key
-    /// its own claim id.
+    /// Every blob this row may have caused to be stored — what must be
+    /// deleted from storage once the row is gone: the one it serves; its
+    /// object key, where a row from before migration 005 kept its bytes and
+    /// where an isolate still running the previous release writes a
+    /// replacement during a rollout; and the one its latest reservation's
+    /// upload writes under [`claim_blob_key`].
+    ///
+    /// None of them is a blob another row serves. The object key is this
+    /// row's own (`(bucket, key)` is unique), and a legacy row serves only
+    /// its object key. A claim blob key is minted from a fresh random claim
+    /// id and never returned by any API, so it equals another row's key only
+    /// if a client uploaded an object whose key spells an unseen UUID in
+    /// that position. For a claim id written before 005 the claim blob key
+    /// was never written at all — the release that minted it stored at the
+    /// object key — so deleting it removes nothing.
     pub fn blobs(&self) -> Vec<String> {
         let mut blobs = vec![stored_blob_key(&self.row.key, self.blob_key.clone())];
-        if let Some(claim_id) = &self.claim_id {
-            let own = claim_blob_key(&self.row.key, claim_id);
-            if !blobs.contains(&own) {
-                blobs.push(own);
+        let mut add = |blob: String| {
+            if !blobs.contains(&blob) {
+                blobs.push(blob);
             }
+        };
+        add(self.row.key.clone());
+        if let Some(claim_id) = &self.claim_id {
+            add(claim_blob_key(&self.row.key, claim_id));
         }
         blobs
     }
@@ -983,6 +996,19 @@ pub async fn list_all(ctx: &dyn Context) -> Result<Vec<ObjectRow>, WaferError> {
         .iter()
         .map(ObjectRow::from_record)
         .collect()
+}
+
+/// Test helper: give the key's row a fresh `claim_id`, as another upload's
+/// reservation of it does.
+#[cfg(test)]
+pub async fn reclaim(ctx: &dyn Context, bucket: &str, key: &str) -> Result<i64, WaferError> {
+    db::update_by_filters_count(
+        ctx,
+        TABLE,
+        bucket_key_filters(bucket, key),
+        crate::util::json_map(serde_json::json!({ "claim_id": uuid::Uuid::new_v4().to_string() })),
+    )
+    .await
 }
 
 /// Test helper: set the `uploaded_at` of the key's row, to age a reservation.

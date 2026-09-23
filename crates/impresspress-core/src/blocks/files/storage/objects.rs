@@ -409,8 +409,21 @@ pub(in crate::blocks::files) async fn handle_upload_object(
                          progress, so the upload was not recorded",
                     );
                 }
+                // The bytes are stored under this reservation's blob key and
+                // nothing is recorded. While the row still carries this
+                // reservation, the pending sweep reclaims that blob with the
+                // row (`StoredRow::blobs`). If another upload has taken the
+                // row meanwhile, no row will ever name the blob and the sweep
+                // cannot find it — finding it would mean listing storage for
+                // blobs no row names — so it is logged here, with its key.
                 Err(e) => {
-                    return crud::db_error_internal(e, "Upload stored but could not be recorded")
+                    tracing::error!(
+                        error = %e,
+                        bucket,
+                        blob = %reservation.blob_key,
+                        "upload stored but not recorded; if its reservation was taken over, this blob is named by no row"
+                    );
+                    return crud::db_error_internal(e, "Upload stored but could not be recorded");
                 }
             }
             ok_json(&ObjectUploadedResponse {
@@ -458,8 +471,10 @@ pub(in crate::blocks::files) async fn delete_blobs<B: AsRef<str>>(
         match store::delete(ctx, bucket, blob).await {
             Ok(()) => {}
             Err(e) if e.code == ErrorCode::NotFound => {}
+            // Nothing names this blob any more, so nothing will retry it:
+            // error level, with its key, is how it is found.
             Err(e) => {
-                tracing::warn!(error = %e, bucket, blob, "could not delete a blob no object names");
+                tracing::error!(error = %e, bucket, blob, "could not delete a blob no object names; it is left in storage");
             }
         }
     }
@@ -490,36 +505,29 @@ pub(in crate::blocks::files) async fn handle_delete_object(
         return err_forbidden("Access denied to this bucket");
     }
 
-    // The row says which blobs are the object's: the one it serves and, while
-    // an upload holds it, the one that upload writes. No row, no object.
+    // The row says which blobs are the object's (`StoredRow::blobs`). No row,
+    // no object.
     //
-    // Storage first, tolerating "already gone": if an earlier attempt removed
-    // the blobs but failed the metadata cleanup below, the retry must still
-    // reach that cleanup instead of stopping at "not found". The row delete
-    // is conditional on the row being as it was read, because an upload of
-    // the key that settles in between points the row at a blob this round
-    // did not delete; the next round reads it again.
+    // The row goes first, conditional on it being as it was read — an upload
+    // of the key that settles in between points it at a blob this read did
+    // not see, and the next round reads it again — and only then its blobs.
+    // In that order no path leaves a row naming a deleted blob: a row that
+    // changed under every round is left whole, still served and charged. A
+    // blob whose delete fails after its row is gone is named by nothing; it
+    // is logged at error level by `delete_blobs` so it can be found.
     for _ in 0..DELETE_ATTEMPTS {
         let stored = match repo::objects::find_stored(ctx, bucket, key).await {
             Ok(Some(stored)) => stored,
             Ok(None) => return err_not_found("Object not found"),
             Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
         };
-        for blob in stored.blobs() {
-            match store::delete(ctx, bucket, &blob).await {
-                Ok(()) => {}
-                Err(e) if e.code == ErrorCode::NotFound => {}
-                Err(e) => return crud::db_error_internal(e, "Delete failed"),
-            }
-        }
-        // The metadata cleanup is reported, never swallowed: a surviving row
-        // keeps charging the uploader's quota for a blob that no longer exists.
         match repo::objects::delete_if_unchanged(ctx, &stored).await {
-            Ok(true) => return ok_json(&DeletedResponse { deleted: true }),
-            Ok(false) => {}
-            Err(e) => {
-                return crud::db_error_internal(e, "Delete failed to clean up object metadata")
+            Ok(true) => {
+                delete_blobs(ctx, bucket, &stored.blobs()).await;
+                return ok_json(&DeletedResponse { deleted: true });
             }
+            Ok(false) => {}
+            Err(e) => return crud::db_error_internal(e, "Delete failed"),
         }
     }
     err_conflict("The object changed while it was being deleted; retry")
@@ -776,14 +784,19 @@ mod integration_tests {
         );
     }
 
-    /// After a failed cleanup the blob may already be gone; a retry must
-    /// still finish the cleanup instead of stopping at "object not found".
+    /// A delete whose row delete failed leaves the object whole — row and
+    /// blob — so it is still served, and a retry finishes the delete.
     #[tokio::test]
     async fn delete_object_retry_finishes_cleanup_after_partial_failure() {
         let ctx = ctx_with_stored_object().await;
         let failing = FailingDbOpContext::new(ctx.clone(), object_row_delete_ops());
         let first = handle_delete_object(&failing, &delete_msg("assets", "pic.png")).await;
         assert!(output_is_error(first, "Internal").await);
+        assert_eq!(
+            download_body(handle_get_object(&ctx, &download_msg("assets", "pic.png")).await).await,
+            b"PNGDATA",
+            "the failed delete left the object served"
+        );
 
         let retry = handle_delete_object(&ctx, &delete_msg("assets", "pic.png")).await;
 
@@ -2713,6 +2726,98 @@ mod integration_tests {
             storage.blob_keys("assets").len(),
             2,
             "one blob per stored object: {:?}",
+            storage.blob_keys("assets")
+        );
+    }
+
+    /// A context on which another upload re-claims the key's row just before
+    /// every conditional delete of it, so the delete never finds the row as
+    /// it read it.
+    #[derive(Clone)]
+    struct ReclaimedBeforeEveryDelete {
+        inner: TestContext,
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::context::Context for ReclaimedBeforeEveryDelete {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+            if name == "wafer-run/database" && msg.action() == "database.delete_where_count" {
+                repo::objects::reclaim(&self.inner, "assets", "pic.png")
+                    .await
+                    .expect("another upload claims the row");
+            }
+            self.inner.call_block(name, msg, input).await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
+
+    /// **Fails on the pre-fix-round tree.** A delete that loses its row to
+    /// concurrent uploads on every attempt answers 409 and leaves the object
+    /// whole. Deleting the blobs before the conditional row delete left a row
+    /// that still listed and still charged quota while its download 404ed.
+    #[tokio::test]
+    async fn a_delete_that_loses_every_round_leaves_the_object_whole() {
+        let ctx = ctx_with_stored_object().await;
+        let racing = ReclaimedBeforeEveryDelete { inner: ctx.clone() };
+
+        let out = handle_delete_object(&racing, &delete_msg("assets", "pic.png")).await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 409);
+        assert_eq!(
+            download_body(handle_get_object(&ctx, &download_msg("assets", "pic.png")).await).await,
+            b"PNGDATA",
+            "the row the delete could not remove must still have its blob"
+        );
+    }
+
+    /// During a rollout an isolate on the previous release writes a
+    /// replacement at the object key while the row names a claim blob. That
+    /// object-key blob is one of the row's, so deleting the object removes it.
+    #[tokio::test]
+    async fn deleting_an_object_also_removes_a_blob_at_its_object_key() {
+        let (ctx, storage) = ctx_with_storage_handle().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let uploaded = alice_uploads(&ctx, "assets", "doc.txt").await;
+        assert_eq!(
+            output_json(uploaded).await["uploaded"],
+            serde_json::json!(true)
+        );
+        store::put(&ctx, "assets", "doc.txt", b"old release", "text/plain")
+            .await
+            .expect("an old isolate writes at the object key");
+        assert_eq!(storage.blob_keys("assets").len(), 2);
+
+        let out = handle_delete_object(&ctx, &delete_msg("assets", "doc.txt")).await;
+
+        assert_eq!(output_json(out).await["deleted"], serde_json::json!(true));
+        assert!(
+            storage.blob_keys("assets").is_empty(),
+            "{:?}",
             storage.blob_keys("assets")
         );
     }

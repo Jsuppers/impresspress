@@ -420,8 +420,15 @@ deployment with strict schema off adds the column on the first upload, one with
 Cloudflare deploys always run it. While a rollout is part-way, an isolate still
 on the previous release writes a replacement's bytes at the object key and
 leaves `blob_key` as it was, so that row keeps serving the blob it named before
-rather than the replacement, until the next upload of the key; the gap closes
-once every isolate runs this release.
+rather than the replacement, until the next upload of the key. The bytes that
+isolate wrote at the object key are deleted when the object is next replaced,
+deleted or swept; the gap closes once every isolate runs this release.
+
+**Blobs that are logged, not reclaimed.** An upload whose bytes were stored but
+whose row could not be recorded, and whose reservation another upload has since
+taken over, leaves a blob no row names; the sweep cannot find it without
+listing storage. It is logged at error level ("upload stored but not recorded")
+with its blob key, as is any blob whose delete fails after its row is gone.
 
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
