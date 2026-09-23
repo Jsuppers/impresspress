@@ -26,6 +26,13 @@
 //! A deferred task has no response to report into, so it logs its own
 //! failures. Anything whose failure the caller must hear about does not
 //! belong here.
+//!
+//! A task can also be dropped before it finishes: a native process shutting
+//! down drops every task its runtime still holds, a browser tab closing drops
+//! its `spawn_local` tasks, and a queue nothing drains is dropped with the
+//! isolate. Each task carries a guard that logs a warning when that happens
+//! ([`Unfinished`]), so a mail lost to a restart leaves a line. A Cloudflare
+//! hard stop is the exception: it runs no destructors at all.
 
 use std::{cell::Cell, future::Future, pin::Pin};
 
@@ -61,6 +68,11 @@ pub fn defer<F>(task: F)
 where
     F: Future<Output = ()> + MaybeSend + 'static,
 {
+    let unfinished = Unfinished;
+    let task = async move {
+        task.await;
+        std::mem::forget(unfinished);
+    };
     match MODE.with(Cell::get) {
         DeferMode::Spawn => wafer_block::spawn_producer(task),
         DeferMode::Queued => QUEUE.with(|queue| {
@@ -75,6 +87,39 @@ where
 /// this after each dispatch.
 pub fn drain() -> Vec<DeferredTask> {
     QUEUE.with(|queue| queue.take().unwrap_or_default())
+}
+
+/// How many tasks are queued and not yet drained. For an entry point that
+/// does not drain, to say so when something is waiting.
+pub fn pending() -> usize {
+    QUEUE.with(|queue| {
+        let tasks = queue.take();
+        let n = tasks.as_ref().map_or(0, Vec::len);
+        if let Some(tasks) = tasks {
+            queue.set(tasks);
+        }
+        n
+    })
+}
+
+/// Travels inside every deferred task and is forgotten when the task
+/// completes, so its `Drop` runs only for a task dropped unfinished.
+struct Unfinished;
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        tracing::warn!(
+            "a deferred task was dropped before it finished (runtime shutdown, closed page or \
+             an undrained queue); work it carried, such as an auth mail, did not happen"
+        );
+        #[cfg(test)]
+        DROPPED_UNFINISHED.with(|n| n.set(n.get() + 1));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DROPPED_UNFINISHED: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -117,5 +162,31 @@ mod tests {
         });
         assert!(drain().is_empty(), "a spawned task is never queued");
         rx.await.expect("the spawned task ran");
+    }
+
+    #[tokio::test]
+    async fn a_task_dropped_unfinished_is_reported_and_a_finished_one_is_not() {
+        set_mode(DeferMode::Queued);
+        let before = DROPPED_UNFINISHED.with(Cell::get);
+
+        defer(async {});
+        for task in drain() {
+            task.await;
+        }
+        assert_eq!(
+            DROPPED_UNFINISHED.with(Cell::get),
+            before,
+            "a finished task reports nothing"
+        );
+
+        defer(std::future::pending());
+        assert_eq!(pending(), 1);
+        drop(drain());
+        assert_eq!(
+            DROPPED_UNFINISHED.with(Cell::get),
+            before + 1,
+            "a task dropped before it finished is reported"
+        );
+        set_mode(DeferMode::Spawn);
     }
 }

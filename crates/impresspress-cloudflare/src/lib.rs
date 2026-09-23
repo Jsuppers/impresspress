@@ -574,6 +574,21 @@ pub async fn run_scheduled_with_config<F, G>(
         ),
     }
 
+    // Nothing on this path drains the deferred queue (see the note above), so
+    // anything still in it waits for the next fetch on this isolate — or is
+    // lost with the isolate. Say so rather than let it vanish; a fetch in
+    // flight on this isolate would also drain it, which the line cannot tell.
+    let undrained = impresspress_core::deferred::pending();
+    if undrained > 0 {
+        worker::console_warn!(
+            "{}",
+            impresspress_core::metrics::metric_line(
+                "deferred_tasks_undrained",
+                &[("entry", "scheduled"), ("tasks", &undrained.to_string())],
+            )
+        );
+    }
+
     retry_pending_config_version(&env, |task| ctx.wait_until(task));
 }
 
@@ -878,5 +893,103 @@ mod middleware_blocks_tests {
                  does it still invoke `register_static_block!` under that name?"
             );
         }
+    }
+}
+
+/// The deferred-work hand-off on the request path: work a handler queues
+/// during a dispatch must reach `defer` (production's `ctx.wait_until`) and run
+/// inside that request's service scope. Driven through the real `dispatch`
+/// with a real `Wafer` running a `site-main` flow whose one block defers.
+#[cfg(test)]
+mod deferred_drain_tests {
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use wafer_run::{Block, BlockInfo, InputStream, Message, OutputStream};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    /// Answers every request, after queueing one task that records the
+    /// marker of the service bundle it ran under.
+    struct Defers(Arc<AtomicUsize>);
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for Defers {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/defers", "0.0.1", "http-handler@v1", "defers one task")
+        }
+        async fn handle(
+            &self,
+            _ctx: &dyn wafer_run::context::Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            let seen = Arc::clone(&self.0);
+            impresspress_core::deferred::defer(async move {
+                seen.store(
+                    request_services::current_marker().unwrap_or(0),
+                    Ordering::SeqCst,
+                );
+            });
+            impresspress_core::http::ok_json(&serde_json::json!({ "ok": true }))
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_task_deferred_during_a_request_runs_in_that_requests_scope() {
+        init_isolate();
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut wafer = wafer_run::Wafer::new(Arc::new(wafer_run::StaticConfigSource::default()))
+            .expect("Wafer::new");
+        wafer
+            .register_block("test/defers", Arc::new(Defers(Arc::clone(&seen))))
+            .expect("register");
+        wafer
+            .add_flow_json(
+                r#"{"id":"site-main","name":"t","version":"0.1.0","description":"t",
+                    "steps":[{"id":"defers","block":"test/defers"}],
+                    "config":{"on_error":"stop"}}"#,
+            )
+            .expect("flow");
+        wafer.seal().await.expect("seal");
+
+        let handed: Rc<RefCell<Vec<BoxedTask>>> = Rc::default();
+        let sink = Rc::clone(&handed);
+        let req = worker::Request::new("https://example.test/anything", worker::Method::Get)
+            .expect("request");
+        let response = dispatch(
+            &wafer,
+            req,
+            request_services::RequestServices::marker(7),
+            &move |task| sink.borrow_mut().push(task),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(response.status_code(), 200);
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "the task waits for the response"
+        );
+        let tasks = std::mem::take(&mut *handed.borrow_mut());
+        assert_eq!(tasks.len(), 1, "the queued task was handed to wait_until");
+        for task in tasks {
+            task.await;
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            7,
+            "it ran, inside the dispatching request's service scope"
+        );
+        assert_eq!(impresspress_core::deferred::pending(), 0);
     }
 }

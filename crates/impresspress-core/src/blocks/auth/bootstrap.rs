@@ -58,6 +58,10 @@ pub(crate) async fn bootstrap_with_email_password(
     password: &str,
 ) -> Result<(), WaferError> {
     let hash = crypto::hash(ctx, password).await?;
+    // Stored as signup stores it. `BOOTSTRAP_ADMIN_EMAIL` is whatever the
+    // operator typed, and a mixed-case row is one no login finds (they look
+    // the normalized address up) and one signup does not see as taken.
+    let email = users::normalize_email(email);
 
     // The account and its password in one atomic write. As two writes, a
     // failure between them left an admin with no password — and since `run`
@@ -70,7 +74,7 @@ pub(crate) async fn bootstrap_with_email_password(
     users::insert_with_password(
         ctx,
         users::NewUser {
-            email: email.to_string(),
+            email,
             display_name: "Admin".to_string(),
             avatar_url: None,
             role: "admin".to_string(),
@@ -141,6 +145,42 @@ mod tests {
                 .await
                 .expect("credentials lookup"),
             "and it has its password"
+        );
+    }
+
+    /// `BOOTSTRAP_ADMIN_EMAIL` as the operator typed it, mixed case and
+    /// padded: the admin is stored under the normalized address, so the
+    /// login (which normalizes what it is given) finds it and signup sees
+    /// the address as taken.
+    #[tokio::test]
+    async fn a_mixed_case_bootstrap_address_is_stored_normalized() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        bootstrap_with_email_password(&ctx, " Admin@Example.COM ", "correct-horse-battery")
+            .await
+            .expect("bootstrap");
+
+        assert!(
+            users::find_by_email(&ctx, "admin@example.com")
+                .await
+                .expect("lookup")
+                .is_some(),
+            "the admin is stored under the normalized address"
+        );
+        let login = serde_json::json!({
+            "email": "Admin@Example.COM",
+            "password": "correct-horse-battery",
+        });
+        let signed_in = crate::test_support::output_json(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(serde_json::to_vec(&login).expect("body")),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            signed_in["access_token"].is_string(),
+            "the bootstrapped admin can sign in: {signed_in}"
         );
     }
 }

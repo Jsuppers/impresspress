@@ -55,7 +55,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         _ => return err_bad_request("missing token"),
     };
     let email = match form.get("email") {
-        Some(e) if !e.is_empty() => e.trim().to_lowercase(),
+        Some(e) if !e.is_empty() => users::normalize_email(e),
         _ => return err_bad_request("missing email"),
     };
     let password = match form.get("password") {

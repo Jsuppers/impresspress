@@ -179,6 +179,14 @@ fn newest_first() -> Vec<SortField> {
     }]
 }
 
+/// The form every address is stored and looked up in: trimmed and
+/// lowercased. `users.email` is UNIQUE byte for byte, so an address written
+/// in any other form cannot be found by the lookups that normalize theirs,
+/// and the same mailbox can then hold a second account.
+pub fn normalize_email(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
 /// The row [`insert`] writes for `new`, keyed by the id it mints.
 fn new_row(new: NewUser) -> (String, HashMap<String, Value>) {
     let id = Uuid::now_v7().to_string();

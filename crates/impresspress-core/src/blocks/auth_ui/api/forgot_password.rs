@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(registered, unregistered, "the reply is the same");
         assert_eq!(
             registered_calls, unregistered_calls,
-            "and so is the work before it"
+            "and so are the operations performed before it"
         );
         assert!(
             inbox.lock().expect("inbox").is_empty(),

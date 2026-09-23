@@ -65,7 +65,7 @@ pub async fn handle(
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
-    let email_lower = body.email.trim().to_lowercase();
+    let email_lower = users::normalize_email(&body.email);
     let parts: Vec<&str> = email_lower.splitn(2, '@').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() || !parts[1].contains('.') {
         return error_response(ErrorCode::InvalidEmail, "Invalid email address");
@@ -542,7 +542,7 @@ mod tests {
 
         assert_eq!(
             fresh, registered,
-            "a registered address must cost the handler exactly what a new one does"
+            "a registered address must perform the same operations, in the same order, as a new one (a failed write aborts where a new one commits; the calls are the same)"
         );
         assert_eq!(
             (fresh_deferred, registered_deferred),

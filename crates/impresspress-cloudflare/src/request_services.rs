@@ -270,7 +270,7 @@ impl RequestServices {
     }
 
     #[cfg(test)]
-    fn marker(marker: usize) -> Rc<Self> {
+    pub(crate) fn marker(marker: usize) -> Rc<Self> {
         Rc::new(Self {
             database: None,
             storage: None,
@@ -324,6 +324,13 @@ thread_local! {
 
 fn current() -> Option<Rc<RequestServices>> {
     CURRENT.with(IsolateCell::get)
+}
+
+/// The marker of the bundle in scope, for a test outside this module that
+/// needs to know which request's services a future ran under.
+#[cfg(test)]
+pub(crate) fn current_marker() -> Option<usize> {
+    current().map(|services| services.marker)
 }
 
 /// Request-current immutable release identity, available only while the

@@ -636,7 +636,7 @@ mod resend_tests {
         assert_eq!(unproven, unknown);
         assert_eq!(
             unproven_calls, unknown_calls,
-            "an unproven account must cost the handler exactly what an unknown address does"
+            "an unproven account must perform the same operations, in the same order, as an unknown address"
         );
 
         assert_eq!(

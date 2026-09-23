@@ -236,7 +236,7 @@ pub(crate) fn log_email_not_sent(flow: &str, user_id: &str, failure: &EmailNotSe
 /// with the same body; if only the registered path also drew a token, wrote
 /// it and called the email block before answering, the same body would come
 /// back measurably later for it. Those steps run here instead, once the
-/// handler has answered, so both paths cost the handler the same.
+/// handler has answered, so both paths perform the same operations before it answers.
 ///
 /// Owns what the send needs from the request — the block's limiter, the
 /// context and the request message (for the client address the outbound
