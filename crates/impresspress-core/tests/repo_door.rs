@@ -1131,6 +1131,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // assertion that a one-shot read of the seeded tables stops at
             // the ceiling.
             "blocks/products/tests/bounded_read_tests.rs",
+            // Fault injector: the list pages' WRAP-denial test refuses the
+            // order read so the denial lands on the page's own query.
+            "blocks/products/tests/error_mapping_tests.rs",
         ],
     ),
     (
@@ -1266,6 +1269,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/page_link_tests.rs",
             "blocks/products/tests/repo_tests.rs",
+            // Fault injector: the groups page's WRAP-denial test refuses the
+            // group read so the denial lands on the page's own query.
+            "blocks/products/tests/error_mapping_tests.rs",
         ],
     ),
     (
