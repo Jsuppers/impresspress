@@ -601,3 +601,82 @@ async fn analyses_posted_through_the_route_are_append_only() {
         "analyses are append-only, but these endpoints could rewrite one: {rewriting:?}"
     );
 }
+
+/// A read the inbox, the detail page or the status route depends on, beside
+/// the one it is about, fails closed: the inbox's type filter, the detail
+/// page's escalation and the status route's audit flag each answer the
+/// door's refusal rather than an empty list, "none" or "healthy".
+#[tokio::test]
+async fn a_refused_dependent_read_is_a_refusal_not_a_default() {
+    use impresspress_core::test_support::FailingDbOpContext;
+    use wafer_block::ServiceOp;
+    use wafer_run::{ErrorCode, WaferError};
+
+    let ctx = TestContext::with_tickets().await;
+    let kind = service::create_type(&ctx, ticket_type("incorrect-info"))
+        .await
+        .expect("create type");
+    let created = service::create_ticket(
+        &ctx,
+        ticket(&kind.id),
+        TicketSource::Admin,
+        ActorType::Admin,
+        "admin-1",
+        None,
+    )
+    .await
+    .expect("create ticket");
+    let denied = |table: &'static str| {
+        FailingDbOpContext::failing_with(
+            ctx.clone(),
+            ServiceOp::DATABASE_OPS
+                .iter()
+                .map(|op| (*op, table))
+                .collect(),
+            WaferError::new(
+                ErrorCode::PermissionDenied,
+                "WRAP: impresspress/tickets holds no grant on this table",
+            ),
+        )
+    };
+    let mut misses = Vec::new();
+
+    for (table, path) in [
+        (repo::TYPES, "/b/tickets/admin/tickets".to_string()),
+        (
+            repo::TYPES,
+            format!("/b/tickets/admin/tickets/{}", created.id),
+        ),
+    ] {
+        let mut msg = admin_msg("retrieve", &path);
+        msg.set_meta("http.header.accept", "text/html");
+        let out = TicketsBlock::new()
+            .handle(&denied(table), msg, InputStream::empty())
+            .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        let html = String::from_utf8_lossy(&parts.body);
+        if parts.status != 403 || !html.contains("Go home") || html.contains("holds no grant") {
+            misses.push(format!("{path}: {} {html}", parts.status));
+        }
+    }
+
+    let mut msg = admin_msg("retrieve", "/b/tickets/api/admin/status");
+    msg.set_meta("http.header.accept", "application/json");
+    let out = TicketsBlock::new()
+        .handle(&denied(repo::MAINTENANCE), msg, InputStream::empty())
+        .await;
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+    if (parts.status, body["message"].as_str()) != (403, Some("Access denied")) {
+        misses.push(format!(
+            "/b/tickets/api/admin/status: {} {body}",
+            parts.status
+        ));
+    }
+
+    assert!(
+        misses.is_empty(),
+        "expected the door's refusal at every site:\n{}",
+        misses.join("\n")
+    );
+}

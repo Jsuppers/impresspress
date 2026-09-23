@@ -53,10 +53,12 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Ok(rows) => rows,
             Err(error) => return crud::db_error_page(msg, error, "Could not load tickets"),
         };
-    let types = repo::list_types(ctx, false, 100, 0)
-        .await
-        .map(|rows| rows.records)
-        .unwrap_or_default();
+    // The type filter is drawn from this list, so an empty one would say the
+    // deployment has no ticket types; a failed read fails the page instead.
+    let types = match repo::list_types(ctx, false, 100, 0).await {
+        Ok(rows) => rows.records,
+        Err(error) => return crud::db_error_page(msg, error, "Could not load ticket types"),
+    };
     let pagination_base = inbox_pagination_base(msg);
     let content = html! {
         style {
@@ -187,9 +189,13 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let ticket = &detail.ticket;
     let report = &detail.untrusted_report;
     let current_duplicate = service::nullable_str_field(ticket, "duplicate_of").unwrap_or("");
-    let ticket_type = repo::get_type(ctx, service::str_field(ticket, "type_id"))
-        .await
-        .ok();
+    // A ticket whose type row is gone has no escalation; a read that failed
+    // does not say so, and fails the page rather than showing "none".
+    let ticket_type = match repo::get_type(ctx, service::str_field(ticket, "type_id")).await {
+        Ok(row) => Some(row),
+        Err(error) if error.code == wafer_run::ErrorCode::NotFound => None,
+        Err(error) => return crud::db_error_page(msg, error, "Could not load ticket type"),
+    };
     let escalation = ticket_type
         .as_ref()
         .map(|row| service::str_field(row, "escalation_kind"))

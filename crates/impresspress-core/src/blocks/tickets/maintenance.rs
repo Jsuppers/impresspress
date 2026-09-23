@@ -152,7 +152,13 @@ pub async fn status(ctx: &dyn Context) -> Result<OperationalStatus, WaferError> 
         }],
     )
     .await?;
-    let stored = db::get(ctx, repo::MAINTENANCE, "singleton").await.ok();
+    // No row yet is an instance that has never run maintenance; a read that
+    // failed is not that, and must not report the audit trail as healthy.
+    let stored = match db::get(ctx, repo::MAINTENANCE, "singleton").await {
+        Ok(record) => Some(record),
+        Err(error) if error.code == wafer_run::ErrorCode::NotFound => None,
+        Err(error) => return Err(error),
+    };
     let audit_degraded = stored
         .as_ref()
         .is_some_and(|record| super::service::bool_field(record, "audit_degraded"));
