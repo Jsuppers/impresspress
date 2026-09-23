@@ -51,7 +51,9 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-BLOCKS_DIR="crates/impresspress-core/src/blocks"
+# The tree this audit walks. Overridable ONLY so the self-check below can
+# point a real run at a synthetic fixture; nothing else sets it.
+BLOCKS_DIR="${AUDIT_WRAP_GRANTS_FIXTURE_DIR:-crates/impresspress-core/src/blocks}"
 # The dev block's guest TEMPLATES are not host code: they are the sources of
 # sandbox blocks (`site/<name>`) that Rubrc compiles for wasm32-wasip1 in the
 # browser. Their `db::*` calls run inside the guest, as the guest block, and
@@ -579,10 +581,10 @@ done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' 
 # Each grant entry is encoded as:
 #   "${owner_block_id}|${grantee}|${resource}|${type}"
 # where TYPE is "Db" by default or the `ResourceType` variant named in
-# `.typed()`. The default and the `.typed()` spelling have to be the SAME
-# string: they were "Database" and the variant name until a `.typed(Db)`
-# grant was declared, which indexed as "Db", matched nothing, and was
-# silently ignored by the coverage check.
+# `.typed()`. The default and the `.typed()` spelling must be the SAME
+# string, and both must be a name upstream defines: a grant indexed under
+# any other type matches nothing in `check_coverage` and is dropped from
+# the audit without saying so.
 
 GRANTS=()
 
@@ -837,8 +839,24 @@ strip_rust_line_comment() {
   }''' <<< "$1"
 }
 
+# The `ResourceType` variants upstream defines
+# (wafer-block/src/types/grants.rs). Kept as the Rust variant spelling
+# because that is what `.typed(..)` writes and what this script indexes on;
+# anything else captured from a `.typed(..)` is a name one side made up.
+KNOWN_RESOURCE_TYPES="Db Config Storage Crypto Network Vector"
+
+is_known_resource_type() {
+  local candidate="$1" known
+  for known in $KNOWN_RESOURCE_TYPES; do
+    [ "$candidate" = "$known" ] && return 0
+  done
+  return 1
+}
+
 declare -i unparsed_grants=0
+declare -i bad_type_grants=0
 UNPARSED_GRANT_LINES=()
+BAD_TYPE_GRANT_LINES=()
 
 while IFS= read -r line; do
   file="${line%%:*}"
@@ -885,8 +903,7 @@ while IFS= read -r line; do
     #
     # The default is spelled the way `ResourceType::Db` is, so a grant that
     # declares its type explicitly indexes the same as one that leaves it
-    # open. An unrecognized variant is warned about below rather than
-    # quietly indexed as a type nothing matches.
+    # open.
     type="Db"
     re_typed='\.typed\(([^)]*ResourceType::)?([A-Za-z]+)\)'
     if [[ "$stmt" =~ $re_typed ]]; then
@@ -896,6 +913,17 @@ while IFS= read -r line; do
       if [[ "$next_line" =~ ^[[:space:]]*\.typed ]] && [[ "$next_line" =~ $re_typed ]]; then
         type="${BASH_REMATCH[2]}"
       fi
+    fi
+    # The variant is captured as free text, so a name this script does not
+    # know is a grant indexed under a type nothing ever matches — invisible
+    # to `check_coverage`, and visible only as a false MISSING somewhere
+    # else. A typo and a genuine upstream addition look identical here, and
+    # both need a human, so the captured name is checked against the set
+    # upstream defines rather than trusted.
+    if ! is_known_resource_type "$type"; then
+      bad_type_grants=$((bad_type_grants + 1))
+      BAD_TYPE_GRANT_LINES+=("${file}:${lineno}: .typed(${type})")
+      echo "::warning file=${file},line=${lineno}::WRAP grant audit does not know ResourceType variant '${type}' (expected one of: ${KNOWN_RESOURCE_TYPES}); this grant is indexed under a type nothing matches"
     fi
     # Owning block = the block this file lives in
     owner="$(file_to_block_id "$file")"
@@ -1241,15 +1269,128 @@ while IFS= read -r line; do
   fi
 done < <(grep -rEn "${GREP_EXCLUDE[@]}" "clients::storage::(get|put|delete|list|create_folder|delete_folder|list_folders|get_stream)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
+# ---------- Phase 3.9: self-check ----------
+# Both ways this parser can fail are silent by construction: a declaration it
+# cannot read, and one whose `.typed(..)` names a variant it does not know,
+# each drop a grant out of the index and show up — if at all — as a MISSING
+# finding somewhere unrelated. Nothing downstream can tell that apart from a
+# grant that was never written, so the guards need their own proof.
+#
+# So the guards are exercised on every invocation, against synthetic
+# fixtures, through this same script: the real grep, the real multi-line
+# join, the real validation and the real exit code. `$AUDIT_WRAP_GRANTS_
+# FIXTURE_DIR` is what points a child run at a fixture instead of the repo,
+# and its presence is also what stops a child recursing.
+run_self_check() {
+  local tmp out status failures=0
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  # Writes a two-block fixture: the admin block declaring the grant handed
+  # on stdin, and a userportal file whose `db::create` on the admin table is
+  # covered by exactly that grant. The callsite is what makes a misread
+  # grant observable — a dropped or corrupted one stops covering the call,
+  # so the walk reports MISSING and the run fails.
+  _fixture() {
+    rm -rf "${tmp:?}/blocks"
+    mkdir -p "$tmp/blocks/admin" "$tmp/blocks/userportal"
+    {
+      echo 'pub const FIXTURE_TABLE: &str = "impresspress__admin__fixture";'
+      # Phase 3.8 refuses to run without this constant, so the fixture
+      # carries it the way the admin block does.
+      echo 'pub const AUDIT_LOGS_TABLE: &str = "impresspress__admin__audit_logs";'
+      cat
+    } > "$tmp/blocks/admin/mod.rs"
+    cat > "$tmp/blocks/userportal/pages.rs" <<'CALLER'
+use crate::blocks::admin::FIXTURE_TABLE;
+async fn writes_the_admin_table(ctx: &dyn Context) {
+    let _ = db::create(ctx, FIXTURE_TABLE, data).await;
+}
+CALLER
+  }
+  _run() {
+    AUDIT_WRAP_GRANTS_FIXTURE_DIR="$tmp/blocks" bash "$0" 2>&1
+  }
+  _expect() {
+    local what="$1" want_status="$2" want_text="$3"
+    if [ "$status" != "$want_status" ]; then
+      echo "::error::WRAP grant audit self-check [$what]: expected exit $want_status, got $status" >&2
+      failures=$((failures + 1))
+    fi
+    if ! grep -qF "$want_text" <<< "$out"; then
+      echo "::error::WRAP grant audit self-check [$what]: output did not contain: $want_text" >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  # A variant name neither side defines. Parses cleanly, so only an explicit
+  # check against the upstream set can catch it by name (it also stops
+  # covering the callsite, which is the mystery MISSING it used to be).
+  _fixture <<'FIXTURE'
+    wafer_run::ResourceGrant::read_write("impresspress/userportal", FIXTURE_TABLE)
+        .typed(wafer_run::ResourceType::Database),
+FIXTURE
+  out="$(_run)" && status=0 || status=$?
+  _expect "unknown variant" 1 "does not know ResourceType variant 'Database'"
+
+  # A declaration whose closing paren never arrives.
+  _fixture <<'FIXTURE'
+    wafer_run::ResourceGrant::read_write(
+        "impresspress/userportal",
+FIXTURE
+  out="$(_run)" && status=0 || status=$?
+  _expect "unparsed declaration" 1 "could not parse this ResourceGrant declaration"
+
+  # The same grant spelled correctly: no warning, and a verdict is given.
+  _fixture <<'FIXTURE'
+    wafer_run::ResourceGrant::read_write("impresspress/userportal", FIXTURE_TABLE)
+        .typed(wafer_run::ResourceType::Db),
+FIXTURE
+  out="$(_run)" && status=0 || status=$?
+  _expect "well-formed grant" 0 "OK — no missing WRAP grants."
+
+  # A `//` note on an argument's own line must not become part of that
+  # argument: the grantee it corrupts is what turns covered calls MISSING.
+  _fixture <<'FIXTURE'
+    wafer_run::ResourceGrant::read_write(
+        // the portal writes the admin audit trail
+        "impresspress/userportal",
+        FIXTURE_TABLE,
+    )
+    .typed(wafer_run::ResourceType::Db),
+FIXTURE
+  out="$(_run)" && status=0 || status=$?
+  _expect "comment inside a declaration" 0 "OK — no missing WRAP grants."
+
+  if [ "$failures" -gt 0 ]; then
+    echo "::error::WRAP grant audit self-check failed (${failures} assertion(s)); the grant walk cannot be trusted." >&2
+    return 1
+  fi
+  return 0
+}
+
+if [ -z "${AUDIT_WRAP_GRANTS_FIXTURE_DIR:-}" ]; then
+  run_self_check || exit 2
+  self_check_note="self-check: parser guards verified against fixtures."
+else
+  self_check_note=""
+fi
+
 # ---------- Phase 4: report ----------
 
 echo
 echo "WRAP grant audit — $(date)"
 echo
 echo "Indexed: ${#CONST_VALUE[@]} constants, ${#GRANTS[@]} grant decls."
+[ -n "$self_check_note" ] && echo "$self_check_note"
 if [ "${#UNPARSED_GRANT_LINES[@]}" -gt 0 ]; then
   echo "UNPARSED ResourceGrant declarations (${unparsed_grants}) — absent from the index above:"
   printf '  %s\n' "${UNPARSED_GRANT_LINES[@]}"
+fi
+if [ "${#BAD_TYPE_GRANT_LINES[@]}" -gt 0 ]; then
+  echo "UNKNOWN ResourceType variants (${bad_type_grants}) — indexed under a type nothing matches:"
+  printf '  %s\n' "${BAD_TYPE_GRANT_LINES[@]}"
 fi
 echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed (${ps_total} reached through platform_state, ${audit_writer_total} through the audit writer)."
 echo "Storage:  ${storage_total} unique (caller, resource) pairs; ${storage_allowed} pragma-allowed."
@@ -1300,6 +1441,17 @@ fi
 if [ "$missing" -gt 0 ] || [ "$storage_missing" -gt 0 ]; then
   total_missing=$((missing + storage_missing))
   echo "::error::WRAP grant audit found ${total_missing} missing grant(s) (${missing} db + ${storage_missing} storage)."
+  exit 1
+fi
+
+# A grant the index could not read, or read under a name nothing matches, is
+# a hole in the very thing this script asserts. Whether it also produced a
+# MISSING finding is luck — another grant may happen to cover the same call
+# — so "no missing grants" is not a verdict this run is entitled to give.
+# Failing here is what keeps a knowingly incomplete index from riding into
+# main green.
+if [ "$unparsed_grants" -gt 0 ] || [ "$bad_type_grants" -gt 0 ]; then
+  echo "::error::WRAP grant audit index is incomplete: ${unparsed_grants} unparsed declaration(s), ${bad_type_grants} unknown ResourceType variant(s). No verdict on missing grants is possible until they are resolved."
   exit 1
 fi
 
