@@ -509,7 +509,7 @@ crate::impresspress_feature_block! {
         }
         match route {
             Route::AdminSettingsPage => pages::settings::handle_get(ctx, &msg).await,
-            Route::AdminSaveSettings => pages::settings::handle_post(ctx, input).await,
+            Route::AdminSaveSettings => pages::settings::handle_post(ctx, &msg, input).await,
             Route::LoginPage => pages::login::handle(ctx, &msg).await,
             Route::SignupPage => pages::signup::handle(ctx, &msg).await,
             Route::ChangePasswordPage => {

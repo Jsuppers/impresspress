@@ -3324,6 +3324,10 @@ pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-pub async fn handle_save_settings(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    settings_form::save_settings(ctx, input, &settings_vars(ctx).await.all(), "products").await
+pub async fn handle_save_settings(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
+    settings_form::save_settings(ctx, msg, input, &settings_vars(ctx).await.all(), "products").await
 }

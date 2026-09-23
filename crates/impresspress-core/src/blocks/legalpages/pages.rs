@@ -627,8 +627,12 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-pub async fn handle_save_settings(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    settings_form::save_settings(ctx, input, &super::config_vars(), "legalpages").await
+pub async fn handle_save_settings(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
+    settings_form::save_settings(ctx, msg, input, &super::config_vars(), "legalpages").await
 }
 
 // ---------------------------------------------------------------------------

@@ -21,10 +21,11 @@ use std::collections::HashMap;
 
 use maud::{html, Markup, PreEscaped};
 use wafer_core::clients::config;
-use wafer_run::{context::Context, InputStream, OutputStream, WaferError};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 pub use wafer_run::{ConfigVar, InputType};
 
 use crate::{
+    blocks::admin::logs::audit_log,
     config_vars::is_truthy,
     http::{err_bad_request, err_internal, ok_json},
     util::{is_sensitive_key, validate_url_value, MASKED_VALUE},
@@ -367,8 +368,16 @@ pub async fn settings_form(
 /// declared). Parse failure returns a real `400` (htmx clients branch on the
 /// status, not a 200-with-`error`-key body — the residual finding folded in
 /// from S1-I).
+///
+/// Writes one `settings.update` audit row naming `block_label` and the keys
+/// this save actually wrote — the same trail
+/// [`crate::blocks::admin::ops::update_variable`] writes for the identical
+/// keys edited on the admin Variables page, so which page an operator used
+/// stops deciding whether the change is recorded. `msg` carries the admin id
+/// and remote address the row is attributed to.
 pub async fn save_settings(
     ctx: &dyn Context,
+    msg: &Message,
     input: InputStream,
     allowed: &[ConfigVar],
     block_label: &str,
@@ -488,6 +497,13 @@ pub async fn save_settings(
             ));
         }
     }
+    // Which keys this save actually wrote, in allowlist order. Collected
+    // rather than assumed from the body: a sensitive field submitted blank
+    // means "not touched" and is skipped below, and a write can fail
+    // mid-loop. The audit row names what happened, so a half-applied save is
+    // recorded as the keys that landed rather than not at all.
+    let mut written: Vec<&str> = Vec::new();
+    let mut write_failure = None;
     for var in allowed {
         let Some(value) = body.get(&var.key) else {
             continue;
@@ -525,11 +541,29 @@ pub async fn save_settings(
         // in the allowlist have — the residual half-applied save this module
         // cannot close without the stored flag it is not allowed to read.
         if let Err(e) = config::set(ctx, &var.key, value).await {
-            if e.code == wafer_run::ErrorCode::InvalidArgument {
-                return OutputStream::error(e);
-            }
-            return err_internal(&format!("Failed to save {block_label} settings"), e);
+            write_failure = Some(if e.code == wafer_run::ErrorCode::InvalidArgument {
+                OutputStream::error(e)
+            } else {
+                err_internal(&format!("Failed to save {block_label} settings"), e)
+            });
+            break;
         }
+        written.push(&var.key);
+    }
+    if !written.is_empty() {
+        // Keys only, never values: a settings page writes secrets, and the
+        // audit log is readable by every admin.
+        audit_log(
+            ctx,
+            msg.user_id(),
+            "settings.update",
+            &format!("settings/{block_label} ({})", written.join(", ")),
+            msg.remote_addr(),
+        )
+        .await;
+    }
+    if let Some(failure) = write_failure {
+        return failure;
     }
     ok_json(&serde_json::json!({"message": "Settings saved"}))
 }
@@ -715,7 +749,14 @@ mod tests {
         body: serde_json::Value,
     ) -> OutputStream {
         let input = InputStream::from_bytes(serde_json::to_vec(&body).unwrap());
-        save_settings(ctx, input, allowed, "test").await
+        save_settings(
+            ctx,
+            &crate::test_support::admin_msg("create", "/b/admin/settings"),
+            input,
+            allowed,
+            "test",
+        )
+        .await
     }
 
     #[tokio::test]
@@ -991,6 +1032,89 @@ mod tests {
         assert_eq!(
             config::get_default(&ctx, "X__PLAIN_NOTE", "").await,
             "operator-flagged-value",
+        );
+    }
+
+    // --- the save's audit row ---
+
+    /// A save that wrote nothing must not claim in the trail that it did.
+    /// A sensitive field submitted blank means "I did not touch this", so a
+    /// form of one such field is a no-op, not a `settings.update`.
+    #[tokio::test]
+    async fn a_save_that_wrote_nothing_writes_no_audit_row() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config("X__API_SECRET", "original-secret");
+        let allowed = [var("X__API_SECRET", "API Secret", InputType::Password)];
+
+        let out = run_save(&ctx, &allowed, serde_json::json!({"X__API_SECRET": ""})).await;
+        assert_eq!(output_json(out).await["message"], "Settings saved");
+        assert_eq!(
+            crate::test_support::audit_count(&ctx, "settings.update").await,
+            0,
+        );
+    }
+
+    /// The residual half-applied save this module cannot close still has to
+    /// be readable afterwards: the writer refuses a var mid-loop, everything
+    /// ahead of it in the allowlist is already written, and the audit row
+    /// names exactly those keys rather than being skipped along with the
+    /// failure.
+    ///
+    /// Same fixture as `an_operator_flagged_var_is_refused_before_anything_
+    /// is_written`, submitting an EMPTY value instead of the mask: the
+    /// pre-pass only looks for the mask, so this one reaches the writer,
+    /// which refuses an empty value for a row the operator flagged.
+    #[tokio::test]
+    async fn a_half_applied_save_audits_the_keys_that_landed() {
+        use crate::platform_state::variables::{self, NewVariable};
+
+        let ctx = TestContext::with_admin().await;
+        variables::insert(
+            &ctx,
+            NewVariable {
+                key: "X__PLAIN_NOTE".to_string(),
+                value: "operator-flagged-value".to_string(),
+                name: String::new(),
+                description: String::new(),
+                warning: String::new(),
+                sensitive: true,
+                updated_by: String::new(),
+                block: None,
+            },
+        )
+        .await
+        .expect("seed the flagged note");
+
+        let allowed = [
+            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var("X__PLAIN_NOTE", "Note", InputType::Text),
+        ];
+        let out = run_save(
+            &ctx,
+            &allowed,
+            serde_json::json!({
+                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                "X__PLAIN_NOTE": "",
+            }),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_http_status(out).await,
+            400,
+            "precondition: the writer refuses the second var mid-loop"
+        );
+        assert_eq!(
+            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            "Renamed",
+            "precondition: the first var was written before the refusal"
+        );
+
+        let rows = crate::test_support::audit_rows(&ctx, "settings.update").await;
+        assert_eq!(rows.len(), 1, "the writes that landed are recorded");
+        assert_eq!(
+            crate::util::RecordExt::str_field(&rows[0], "resource"),
+            "settings/test (WAFER_RUN_SHARED__APP_NAME)",
+            "and only the keys that landed are named"
         );
     }
 
@@ -1327,7 +1451,14 @@ mod config_store_reproduction {
         let body =
             serde_json::to_vec(&serde_json::json!({ KEY: saved })).expect("serialize request body");
         let status = crate::test_support::output_status(
-            save_settings(&ctx, InputStream::from_bytes(body), &allowed, "branding").await,
+            save_settings(
+                &ctx,
+                &crate::test_support::admin_msg("create", "/b/admin/settings"),
+                InputStream::from_bytes(body),
+                &allowed,
+                "branding",
+            )
+            .await,
         )
         .await;
         assert_eq!(status, 200, "the settings form reported the save succeeded");

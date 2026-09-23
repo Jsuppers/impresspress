@@ -696,7 +696,7 @@ crate::impresspress_feature_block! {
             Route::AdminSave => pages::handle_save(ctx, &msg, input).await,
             Route::AdminRenderPreview => pages::handle_render_preview(ctx, input).await,
             Route::AdminPublish => pages::handle_publish(ctx, &msg, input).await,
-            Route::AdminSaveSettings => pages::handle_save_settings(ctx, input).await,
+            Route::AdminSaveSettings => pages::handle_save_settings(ctx, &msg, input).await,
             Route::ApiList => this.handle_admin_list(ctx, &msg).await,
             Route::ApiGet => this.handle_admin_get(ctx, &msg).await,
             Route::ApiCreate => this.handle_admin_create(ctx, &msg, input).await,

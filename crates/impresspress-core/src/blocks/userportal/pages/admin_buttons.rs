@@ -14,7 +14,11 @@ use super::super::load_buttons;
 // to this block's table.
 use crate::blocks::userportal::TABLE;
 use crate::{
-    blocks::crud,
+    // The portal's buttons are admin-only configuration, so their mutations
+    // belong in the one audit trail an operator reads — the admin block's
+    // `audit_logs` table, reached under this block's own WRAP identity via
+    // the grant `admin::AdminBlock` declares for it.
+    blocks::{admin::logs::audit_log, crud},
     http::{err_bad_request, err_internal, err_not_found},
     ui::{self, components, icons, sidebar::nav_icon},
     util::{json_map, parse_form_body, stamp_created, stamp_updated, RecordExt},
@@ -232,7 +236,11 @@ fn parse_button_form(raw: &[u8]) -> Result<HashMap<String, serde_json::Value>, O
     })))
 }
 
-pub async fn handle_create_button(ctx: &dyn Context, input: InputStream) -> OutputStream {
+pub async fn handle_create_button(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+) -> OutputStream {
     let raw = input.collect_to_bytes().await;
     let mut data = match parse_button_form(&raw) {
         Ok(d) => d,
@@ -240,9 +248,18 @@ pub async fn handle_create_button(ctx: &dyn Context, input: InputStream) -> Outp
     };
     stamp_created(&mut data);
 
-    if let Err(e) = db::create(ctx, TABLE, data).await {
-        return err_internal("Failed to create button", e.message);
-    }
+    let record = match db::create(ctx, TABLE, data).await {
+        Ok(record) => record,
+        Err(e) => return err_internal("Failed to create button", e.message),
+    };
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "portal_button.create",
+        &format!("portal_buttons/{}", record.id),
+        msg.remote_addr(),
+    )
+    .await;
 
     buttons_table_response(ctx, "Button added").await
 }
@@ -339,7 +356,12 @@ pub async fn handle_edit_button_form(ctx: &dyn Context, id: &str) -> OutputStrea
     ui::html_response_opening_modal(markup, &modal_id)
 }
 
-pub async fn handle_update_button(ctx: &dyn Context, input: InputStream, id: &str) -> OutputStream {
+pub async fn handle_update_button(
+    ctx: &dyn Context,
+    msg: &Message,
+    input: InputStream,
+    id: &str,
+) -> OutputStream {
     let raw = input.collect_to_bytes().await;
     let mut data = match parse_button_form(&raw) {
         Ok(d) => d,
@@ -350,17 +372,33 @@ pub async fn handle_update_button(ctx: &dyn Context, input: InputStream, id: &st
     if let Err(e) = db::update(ctx, TABLE, id, data).await {
         return err_internal("Failed to update button", e.message);
     }
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "portal_button.update",
+        &format!("portal_buttons/{id}"),
+        msg.remote_addr(),
+    )
+    .await;
 
     buttons_table_response(ctx, "Button saved").await
 }
 
-pub async fn handle_delete_button(ctx: &dyn Context, id: &str) -> OutputStream {
+pub async fn handle_delete_button(ctx: &dyn Context, msg: &Message, id: &str) -> OutputStream {
     if let Err(e) = db::delete(ctx, TABLE, id).await {
         // `DbExec::delete` answers `NotFound` when no row matched, so a stale
         // id in the caller's own page is their 404 — not this site reporting
         // an internal fault and inviting a retry.
         return crud::db_error(e, "Button not found", "Failed to delete button");
     }
+    audit_log(
+        ctx,
+        msg.user_id(),
+        "portal_button.delete",
+        &format!("portal_buttons/{id}"),
+        msg.remote_addr(),
+    )
+    .await;
 
     buttons_table_response(ctx, "Button deleted").await
 }
@@ -375,7 +413,9 @@ mod tests {
     use super::*;
     use crate::{
         blocks::userportal::UserPortalBlock,
-        test_support::{admin_msg, output_header, output_html, output_is_error, TestContext},
+        test_support::{
+            admin_msg, audit_rows, output_header, output_html, output_is_error, TestContext,
+        },
     };
 
     async fn ctx_with_userportal() -> TestContext {
@@ -385,6 +425,12 @@ mod tests {
             std::sync::Arc::new(UserPortalBlock::new()),
         );
         ctx
+    }
+
+    /// The `Message` the route table hands the delete handler, with `{id}`
+    /// bound the way it is on the wire.
+    fn delete_msg(id: &str) -> Message {
+        admin_msg("delete", &format!("/b/userportal/admin/buttons/{id}"))
     }
 
     fn button_data(label: &str, icon: &str, path: &str) -> HashMap<String, serde_json::Value> {
@@ -545,7 +591,7 @@ mod tests {
             .unwrap();
         let failing = ctx.break_list_reads();
 
-        let out = handle_delete_button(&failing, &record.id).await;
+        let out = handle_delete_button(&failing, &delete_msg(&record.id), &record.id).await;
         let trigger = output_header(out, "HX-Trigger")
             .await
             .expect("an error toast must be triggered");
@@ -572,11 +618,169 @@ mod tests {
     async fn deleting_a_missing_button_is_not_found_not_internal() {
         let ctx = ctx_with_userportal().await;
 
-        let out = handle_delete_button(&ctx, "btn_does_not_exist").await;
+        let out = handle_delete_button(
+            &ctx,
+            &delete_msg("btn_does_not_exist"),
+            "btn_does_not_exist",
+        )
+        .await;
 
         assert!(
             output_is_error(out, "NotFound").await,
             "a missing button must answer NotFound, not an internal error"
+        );
+    }
+
+    /// The form body the browser posts, in the field names the add/edit
+    /// forms use.
+    fn button_form(label: &str, path: &str) -> InputStream {
+        InputStream::from_bytes(
+            format!("label={label}&path={path}&icon=folder&sort_order=0").into_bytes(),
+        )
+    }
+
+    /// Dispatch one admin request through the block's own `handle`, so the
+    /// route table binds `{id}` and hands each handler the `Message`.
+    async fn portal(
+        ctx: &dyn Context,
+        action: &str,
+        path: &str,
+        input: InputStream,
+    ) -> OutputStream {
+        wafer_run::Block::handle(&UserPortalBlock::new(), ctx, admin_msg(action, path), input).await
+    }
+
+    /// The portal buttons are admin-only configuration — they decide what
+    /// every user sees in the portal nav — and they were the one admin
+    /// surface whose create/update/delete wrote no audit row at all.
+    #[tokio::test]
+    async fn button_mutations_are_audited_in_the_admin_trail() {
+        let ctx = ctx_with_userportal().await;
+
+        portal(
+            &ctx,
+            "create",
+            "/b/userportal/admin/buttons",
+            button_form("Files", "/b/storage/"),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("the create is answered with the table fragment");
+
+        let created = audit_rows(&ctx, "portal_button.create").await;
+        assert_eq!(created.len(), 1, "one row per created button");
+        assert_eq!(created[0].str_field("user_id"), "admin_1");
+        let id = created[0]
+            .str_field("resource")
+            .strip_prefix("portal_buttons/")
+            .expect("the row names the button it created")
+            .to_string();
+
+        portal(
+            &ctx,
+            "update",
+            &format!("/b/userportal/admin/buttons/{id}"),
+            button_form("Storage", "/b/storage/"),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("the update is answered with the table fragment");
+        let updated = audit_rows(&ctx, "portal_button.update").await;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0].str_field("resource"),
+            format!("portal_buttons/{id}")
+        );
+
+        portal(
+            &ctx,
+            "delete",
+            &format!("/b/userportal/admin/buttons/{id}"),
+            InputStream::empty(),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("the delete is answered with the table fragment");
+        let deleted = audit_rows(&ctx, "portal_button.delete").await;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(
+            deleted[0].str_field("resource"),
+            format!("portal_buttons/{id}")
+        );
+    }
+
+    /// A delete that matched no row changed nothing, so it writes no row.
+    #[tokio::test]
+    async fn a_delete_that_matched_nothing_is_not_audited() {
+        let ctx = ctx_with_userportal().await;
+
+        let out = portal(
+            &ctx,
+            "delete",
+            "/b/userportal/admin/buttons/btn_does_not_exist",
+            InputStream::empty(),
+        )
+        .await;
+        assert!(output_is_error(out, "NotFound").await);
+        assert_eq!(audit_rows(&ctx, "portal_button.delete").await.len(), 0);
+    }
+
+    /// `logs::audit_log` writes the ADMIN block's table, and it runs under
+    /// this block's WRAP identity — so the row lands only because the admin
+    /// block declares a grant for `impresspress/userportal` on it. Sourced
+    /// from the admin block's own declaration, never re-listed here: a grant
+    /// dropped from `AdminBlock::info()` has to fail this test rather than
+    /// silently turn every portal-button mutation back into an unrecorded
+    /// one (the write is fire-and-forget, so a denial is a `warn!` and a
+    /// green 200).
+    #[tokio::test]
+    async fn the_admin_grant_is_what_carries_the_row_across_the_block_boundary() {
+        let base = ctx_with_userportal().await;
+        let as_portal = |grants| {
+            base.clone().with_wrap(
+                "impresspress/userportal",
+                wafer_run::Block::info(&UserPortalBlock::new()).requires,
+                grants,
+                crate::blocks::admin::ADMIN_BLOCK_ID,
+            )
+        };
+
+        let ungranted = as_portal(Vec::new());
+        portal(
+            &ungranted,
+            "create",
+            "/b/userportal/admin/buttons",
+            button_form("Files", "/b/storage/"),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("the create still succeeds — the audit write is fire-and-forget");
+        assert_eq!(
+            audit_rows(&base, "portal_button.create").await.len(),
+            0,
+            "without the grant WRAP refuses the audit write, and nothing says so"
+        );
+
+        let granted =
+            as_portal(wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants);
+        portal(
+            &granted,
+            "create",
+            "/b/userportal/admin/buttons",
+            button_form("Docs", "/b/legal/"),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("the create is answered with the table fragment");
+        assert_eq!(
+            audit_rows(&base, "portal_button.create").await.len(),
+            1,
+            "admin's declared grants must cover the portal's audit write"
         );
     }
 }
