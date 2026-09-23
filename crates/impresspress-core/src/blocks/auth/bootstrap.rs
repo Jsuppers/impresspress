@@ -19,7 +19,7 @@ use wafer_run::{context::Context, WaferError};
 
 use super::{
     config::AuthConfig,
-    repo::{bootstrap_tokens, local_credentials, users},
+    repo::{bootstrap_tokens, users},
     service::hash_token,
 };
 
@@ -58,36 +58,33 @@ pub(crate) async fn bootstrap_with_email_password(
     password: &str,
 ) -> Result<(), WaferError> {
     let hash = crypto::hash(ctx, password).await?;
+    // Stored as signup stores it. `BOOTSTRAP_ADMIN_EMAIL` is whatever the
+    // operator typed, and a mixed-case row is one no login finds (they look
+    // the normalized address up) and one signup does not see as taken.
+    let email = users::normalize_email(email);
 
-    // One insert through the repo. The hand-built column map this replaced
-    // justified itself with "the legacy columns the rest of impresspress
-    // still reads (`name`, `disabled`, `deleted_at`)"; migration 006 creates
-    // all three — `disabled INTEGER NOT NULL DEFAULT 0` and a nullable
-    // `deleted_at`, which are exactly the values the map wrote — and
-    // `users::insert` already dual-writes `name` with `display_name`. The
-    // only value the map still carried on its own was `email_verified`,
-    // which is now a `NewUser` field.
+    // The account and its password in one atomic write. As two writes, a
+    // failure between them left an admin with no password — and since `run`
+    // only bootstraps an EMPTY users table, no later boot would repair it.
     //
     // A bootstrapped admin is inherently trusted (the operator set
     // BOOTSTRAP_ADMIN_PASSWORD), so it is verified on creation; without
     // that, /b/userportal/security would show them unverified on first
     // login.
-    let user = users::insert(
+    users::insert_with_password(
         ctx,
         users::NewUser {
-            email: email.to_string(),
+            email,
             display_name: "Admin".to_string(),
             avatar_url: None,
             role: "admin".to_string(),
             email_verified: true,
             verification_token_hash: None,
         },
+        &hash,
     )
     .await
     .map_err(bootstrap_failed)?;
-    local_credentials::insert(ctx, &user.id, &hash, false)
-        .await
-        .map_err(bootstrap_failed)?;
     Ok(())
 }
 
@@ -104,4 +101,86 @@ async fn bootstrap_with_token(ctx: &dyn Context, token: &str) -> Result<(), Wafe
 /// redemption route (`auth_ui::api::bootstrap`) is a 403 there, not a 500.
 fn bootstrap_failed(error: WaferError) -> WaferError {
     super::repo::db_failed("auth bootstrap", error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        blocks::auth::repo::{
+            local_credentials,
+            test_faults::{drop_trigger, fail_inserts_into},
+        },
+        test_support::TestContext,
+    };
+
+    /// The admin and its password are one write. As two, a failure between
+    /// them left an admin with no password in a users table that is no
+    /// longer empty — and `run` bootstraps only an empty one, so no later
+    /// boot could repair it.
+    #[tokio::test]
+    async fn a_failed_password_write_leaves_the_table_empty_for_the_next_boot() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let trigger = fail_inserts_into(&ctx, local_credentials::TABLE).await;
+
+        bootstrap_with_email_password(&ctx, "admin@example.com", "correct-horse-battery")
+            .await
+            .expect_err("the password write fails");
+        assert_eq!(
+            users::count(&ctx).await.expect("count users"),
+            0,
+            "no admin row may outlive its failed password write"
+        );
+
+        drop_trigger(&ctx, &trigger).await;
+        bootstrap_with_email_password(&ctx, "admin@example.com", "correct-horse-battery")
+            .await
+            .expect("the next attempt bootstraps");
+        let admin = users::find_by_email(&ctx, "admin@example.com")
+            .await
+            .expect("lookup")
+            .expect("the admin exists");
+        assert!(
+            local_credentials::has_password(&ctx, &admin.id)
+                .await
+                .expect("credentials lookup"),
+            "and it has its password"
+        );
+    }
+
+    /// `BOOTSTRAP_ADMIN_EMAIL` as the operator typed it, mixed case and
+    /// padded: the admin is stored under the normalized address, so the
+    /// login (which normalizes what it is given) finds it and signup sees
+    /// the address as taken.
+    #[tokio::test]
+    async fn a_mixed_case_bootstrap_address_is_stored_normalized() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        bootstrap_with_email_password(&ctx, " Admin@Example.COM ", "correct-horse-battery")
+            .await
+            .expect("bootstrap");
+
+        assert!(
+            users::find_by_email(&ctx, "admin@example.com")
+                .await
+                .expect("lookup")
+                .is_some(),
+            "the admin is stored under the normalized address"
+        );
+        let login = serde_json::json!({
+            "email": "Admin@Example.COM",
+            "password": "correct-horse-battery",
+        });
+        let signed_in = crate::test_support::output_json(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(serde_json::to_vec(&login).expect("body")),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            signed_in["access_token"].is_string(),
+            "the bootstrapped admin can sign in: {signed_in}"
+        );
+    }
 }

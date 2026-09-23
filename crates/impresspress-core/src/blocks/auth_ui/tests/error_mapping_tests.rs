@@ -44,6 +44,78 @@ fn denied(ctx: TestContext, failing: Vec<(&'static str, &'static str)>) -> Faili
     FailingDbOpContext::failing_with(ctx, failing, wrap_denial())
 }
 
+/// `ctx` with every `database.batch` that writes to `table` refused by WRAP.
+///
+/// A batch carries one op per row, each naming its own collection, so the
+/// table-matching `FailingDbOpContext` (which reads a single top-level
+/// `collection`) cannot select one. Account creation is a batch — the account
+/// row with its credentials or provider link — and this is how its denial is
+/// reached.
+#[derive(Clone)]
+struct BatchDenied {
+    inner: TestContext,
+    table: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Context for BatchDenied {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: Message,
+        input: InputStream,
+    ) -> wafer_run::OutputStream {
+        if name != "wafer-run/database" || msg.action() != "database.batch" {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = input.collect_to_bytes().await;
+        let request: wafer_block::wire::database::BatchRequest =
+            wafer_block::codec::decode(&bytes).expect("a batch request");
+        if request.ops.iter().any(|op| op.collection() == self.table) {
+            return wafer_run::OutputStream::error(wrap_denial());
+        }
+        self.inner
+            .call_block(name, msg, InputStream::from_bytes(bytes))
+            .await
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
 /// `msg` with a client address, as the pipeline stamps one: the IP-keyed
 /// rate-limit buckets and the outbound-mail limiter key on it.
 fn from_client(mut msg: Message) -> Message {
@@ -156,17 +228,16 @@ async fn auth_version_read_denial_is_403_not_500() {
 
 // --- api/signup.rs ---------------------------------------------------------
 
-/// The "is this address taken" probe returned `Result<bool, String>`, so its
-/// code was gone before the handler mapped it.
+/// Signup finds out an address is taken by writing the account, so the
+/// write is the one call a denial on signup can reach; it is the
+/// deployment's grant, not an outage, and must not read as "registered"
+/// either.
 #[tokio::test]
-async fn signup_existing_account_probe_denial_is_403_not_500() {
-    let ctx = denied(
-        TestContext::with_auth_and_crypto().await,
-        vec![
-            ("database.get", users::TABLE),
-            ("database.list", users::TABLE),
-        ],
-    );
+async fn signup_account_write_denial_is_403_not_500() {
+    let ctx = BatchDenied {
+        inner: TestContext::with_auth_and_crypto().await,
+        table: users::TABLE,
+    };
     assert_eq!(
         status(
             &ctx,
@@ -337,7 +408,10 @@ async fn bootstrap_admin_insert_denial_is_403_not_500() {
         "token={raw}&email=admin@example.com&password={PASSWORD}&csrf_token={}",
         crate::csrf::token(&ctx, &msg)
     );
-    let ctx = denied(ctx, vec![("database.create", users::TABLE)]);
+    let ctx = BatchDenied {
+        inner: ctx,
+        table: users::TABLE,
+    };
     let out = AuthUiBlock::default()
         .handle(&ctx, msg, InputStream::from_bytes(form.into_bytes()))
         .await;
@@ -469,6 +543,9 @@ async fn forgot_password_reset_token_store_failure_answers_like_an_unregistered_
             error.clone(),
         );
 
+        // The token is stored after the response; queue that work so the
+        // store — and its failure — really runs below.
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
         let path = "/b/auth/api/forgot-password";
         let unregistered = wire(&failing, path, "nobody@example.com").await;
         let registered = wire(&failing, path, "known@example.com").await;
@@ -481,6 +558,11 @@ async fn forgot_password_reset_token_store_failure_answers_like_an_unregistered_
             registered, unregistered,
             "a {:?} storing the reset token must not be visible to the caller",
             error.code
+        );
+        assert_eq!(
+            crate::blocks::auth_ui::api::run_deferred().await,
+            1,
+            "the failing store runs after the response, and fails there"
         );
     }
 }
@@ -496,6 +578,9 @@ async fn resend_verification_token_store_failure_answers_like_an_unregistered_ad
             error.clone(),
         );
 
+        // The token is stored after the response; queue that work so the
+        // store — and its failure — really runs below.
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
         let path = "/b/auth/api/resend-verification";
         let unregistered = wire(&failing, path, "nobody@example.com").await;
         let registered = wire(&failing, path, "unproven@example.com").await;
@@ -508,6 +593,11 @@ async fn resend_verification_token_store_failure_answers_like_an_unregistered_ad
             registered, unregistered,
             "a {:?} storing the verification token must not be visible to the caller",
             error.code
+        );
+        assert_eq!(
+            crate::blocks::auth_ui::api::run_deferred().await,
+            1,
+            "the failing store runs after the response, and fails there"
         );
     }
 }

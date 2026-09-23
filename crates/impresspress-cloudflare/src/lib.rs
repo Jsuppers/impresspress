@@ -133,18 +133,22 @@ thread_local! {
 
 /// One-time isolate initialization: selects [`RequestLogMode::Queued`]
 /// (audit rows drain into `ctx.wait_until` off the response path — see
-/// `run`). Consumers should call this from their worker's
-/// `#[event(start)]` handler; `run()` also invokes it behind a
-/// once-per-isolate guard, so isolates stay correct either way and repeat
-/// calls are no-ops.
+/// `run`) and [`DeferMode::Queued`] (work a handler defers until after its
+/// response drains into `ctx.wait_until` too — see `dispatch`; spawned any
+/// other way it would be cancelled with the response). Consumers should call
+/// this from their worker's `#[event(start)]` handler; `run()` also invokes
+/// it behind a once-per-isolate guard, so isolates stay correct either way
+/// and repeat calls are no-ops.
 ///
 /// [`RequestLogMode::Queued`]: impresspress_core::pipeline::RequestLogMode::Queued
+/// [`DeferMode::Queued`]: impresspress_core::deferred::DeferMode::Queued
 pub fn init_isolate() {
     ISOLATE_INITIALIZED.with(|done| {
         if !done.get() {
             impresspress_core::pipeline::set_request_log_mode(
                 impresspress_core::pipeline::RequestLogMode::Queued,
             );
+            impresspress_core::deferred::set_mode(impresspress_core::deferred::DeferMode::Queued);
             done.set(true);
         }
     });
@@ -352,6 +356,7 @@ where
         &request_config,
         register_blocks,
         register_post_build,
+        &|task| ctx.wait_until(task),
     )
     .await;
 
@@ -524,6 +529,10 @@ pub async fn run_scheduled_with_config<F, G>(
     // thread-local nothing empties, on an isolate that may serve fetches for
     // hours. Add the drain (through `ctx.wait_until`, exactly as `run` does)
     // in the same change that adds such a dispatch.
+    //
+    // The same holds for `impresspress_core::deferred`'s queue: only the
+    // auth-ui mail handlers defer, and the sweep reaches none of them. A
+    // task queued here would run on the next fetch's drain instead.
     let cron = event.cron();
     match run_scheduled_inner(
         &env,
@@ -563,6 +572,21 @@ pub async fn run_scheduled_with_config<F, G>(
                 &[("cron", &cron), ("error", &error.to_string())],
             )
         ),
+    }
+
+    // Nothing on this path drains the deferred queue (see the note above), so
+    // anything still in it waits for the next fetch on this isolate — or is
+    // lost with the isolate. Say so rather than let it vanish; a fetch in
+    // flight on this isolate would also drain it, which the line cannot tell.
+    let undrained = impresspress_core::deferred::pending();
+    if undrained > 0 {
+        worker::console_warn!(
+            "{}",
+            impresspress_core::metrics::metric_line(
+                "deferred_tasks_undrained",
+                &[("entry", "scheduled"), ("tasks", &undrained.to_string())],
+            )
+        );
     }
 
     retry_pending_config_version(&env, |task| ctx.wait_until(task));
@@ -691,12 +715,23 @@ type BoxedTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 
 /// Convert a worker request into a WAFER message (preserving the auth header)
 /// and dispatch it through the `"site-main"` flow.
+///
+/// Work the handlers deferred ([`impresspress_core::deferred`]) is handed to
+/// `defer` — `ctx.wait_until` — each task wrapped in this request's service
+/// scope: the bindings its database, crypto and network calls reach are
+/// request-scoped here, and outside a scope they are refused. It is handed
+/// over whether or not the dispatch succeeded, so a failed conversion does
+/// not drop a mail a handler already queued. A task another interleaved
+/// request queued may be drained here instead; it then runs on this
+/// request's bindings, which are the same deployment's.
 async fn dispatch(
     wafer: &wafer_run::Wafer,
     req: worker::Request,
     services: std::rc::Rc<request_services::RequestServices>,
+    defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>> {
-    request_services::scope(services, async move {
+    let deferred_services = std::rc::Rc::clone(&services);
+    let response = request_services::scope(services, async move {
         // 7. Convert request → message; preserve auth header in meta.
         let auth_header = req.headers().get("authorization")?;
         let (mut msg, input) = convert::worker_request_to_message(&req).await?;
@@ -709,7 +744,14 @@ async fn dispatch(
         let output = wafer.run("site-main", msg, input).await;
         Ok(convert::output_to_response(output).await?)
     })
-    .await
+    .await;
+    for task in impresspress_core::deferred::drain() {
+        defer(Box::pin(request_services::scope(
+            std::rc::Rc::clone(&deferred_services),
+            task,
+        )));
+    }
+    response
 }
 
 async fn run_inner<F, G>(
@@ -719,6 +761,7 @@ async fn run_inner<F, G>(
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
+    defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>>
 where
     F: FnOnce(ImpresspressBuilder) -> Result<ImpresspressBuilder, Box<dyn std::error::Error>>,
@@ -740,7 +783,7 @@ where
     .await?;
     let services =
         warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
-    let mut response = dispatch(&rt.wafer, req, services).await?;
+    let mut response = dispatch(&rt.wafer, req, services, defer).await?;
 
     // Cheap observability signal (2026-07-16 audit follow-up): one header
     // assembly from a value already computed by `get_or_build`. Gated to
@@ -850,5 +893,103 @@ mod middleware_blocks_tests {
                  does it still invoke `register_static_block!` under that name?"
             );
         }
+    }
+}
+
+/// The deferred-work hand-off on the request path: work a handler queues
+/// during a dispatch must reach `defer` (production's `ctx.wait_until`) and run
+/// inside that request's service scope. Driven through the real `dispatch`
+/// with a real `Wafer` running a `site-main` flow whose one block defers.
+#[cfg(test)]
+mod deferred_drain_tests {
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use wafer_run::{Block, BlockInfo, InputStream, Message, OutputStream};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    /// Answers every request, after queueing one task that records the
+    /// marker of the service bundle it ran under.
+    struct Defers(Arc<AtomicUsize>);
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for Defers {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/defers", "0.0.1", "http-handler@v1", "defers one task")
+        }
+        async fn handle(
+            &self,
+            _ctx: &dyn wafer_run::context::Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            let seen = Arc::clone(&self.0);
+            impresspress_core::deferred::defer(async move {
+                seen.store(
+                    request_services::current_marker().unwrap_or(0),
+                    Ordering::SeqCst,
+                );
+            });
+            impresspress_core::http::ok_json(&serde_json::json!({ "ok": true }))
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_task_deferred_during_a_request_runs_in_that_requests_scope() {
+        init_isolate();
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut wafer = wafer_run::Wafer::new(Arc::new(wafer_run::StaticConfigSource::default()))
+            .expect("Wafer::new");
+        wafer
+            .register_block("test/defers", Arc::new(Defers(Arc::clone(&seen))))
+            .expect("register");
+        wafer
+            .add_flow_json(
+                r#"{"id":"site-main","name":"t","version":"0.1.0","description":"t",
+                    "steps":[{"id":"defers","block":"test/defers"}],
+                    "config":{"on_error":"stop"}}"#,
+            )
+            .expect("flow");
+        wafer.seal().await.expect("seal");
+
+        let handed: Rc<RefCell<Vec<BoxedTask>>> = Rc::default();
+        let sink = Rc::clone(&handed);
+        let req = worker::Request::new("https://example.test/anything", worker::Method::Get)
+            .expect("request");
+        let response = dispatch(
+            &wafer,
+            req,
+            request_services::RequestServices::marker(7),
+            &move |task| sink.borrow_mut().push(task),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(response.status_code(), 200);
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "the task waits for the response"
+        );
+        let tasks = std::mem::take(&mut *handed.borrow_mut());
+        assert_eq!(tasks.len(), 1, "the queued task was handed to wait_until");
+        for task in tasks {
+            task.await;
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            7,
+            "it ran, inside the dispatching request's service scope"
+        );
+        assert_eq!(impresspress_core::deferred::pending(), 0);
     }
 }

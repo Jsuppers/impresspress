@@ -60,6 +60,7 @@ pub mod config_vars;
 pub mod crypto;
 pub mod csrf;
 pub mod db_read;
+pub mod deferred;
 pub mod endpoint_match;
 pub mod features;
 pub mod flows;

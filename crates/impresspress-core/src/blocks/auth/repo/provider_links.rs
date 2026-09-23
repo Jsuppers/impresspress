@@ -18,7 +18,10 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use wafer_block::db::{Filter, FilterOp, SortField};
+use wafer_block::{
+    db::{Filter, FilterOp, SortField},
+    wire::database::BatchWrite,
+};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
@@ -64,7 +67,6 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<ProviderLink, WaferError> 
 /// same `(provider, provider_ref)` already exists. Manual two-step (list → update_by_filters or create) since
 /// `db::*` has no two-key upsert primitive.
 pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferError> {
-    let now = now_iso();
     let filters = vec![
         Filter {
             field: "provider".into(),
@@ -86,28 +88,47 @@ pub async fn upsert(ctx: &dyn Context, new: NewLink<'_>) -> Result<(), WaferErro
     .await
     .map_err(|e| db_failed("provider_links upsert lookup", e))?;
 
-    let mut data: HashMap<String, Value> = HashMap::new();
-    data.insert("user_id".into(), json!(new.user_id));
-    data.insert("provider_login".into(), json!(new.provider_login));
-    data.insert("access_token".into(), json!(""));
-    data.insert("linked_at".into(), json!(now));
-
     if existing.is_empty() {
-        // Insert: include the natural-key columns + a fresh synthetic id.
-        let id = uuid::Uuid::now_v7().to_string();
-        data.insert("id".into(), json!(id));
-        data.insert("provider".into(), json!(new.provider));
-        data.insert("provider_ref".into(), json!(new.provider_ref));
-        db::create(ctx, TABLE, data)
+        db::create(ctx, TABLE, new_row(new))
             .await
             .map_err(|e| db_failed("provider_links insert", e))?;
     } else {
         // Update by the same (provider, provider_ref) filters — no synthetic id needed.
+        let mut data: HashMap<String, Value> = HashMap::new();
+        data.insert("user_id".into(), json!(new.user_id));
+        data.insert("provider_login".into(), json!(new.provider_login));
+        data.insert("access_token".into(), json!(""));
+        data.insert("linked_at".into(), json!(now_iso()));
         db::update_by_filters(ctx, TABLE, filters, data)
             .await
             .map_err(|e| db_failed("provider_links update", e))?;
     }
     Ok(())
+}
+
+/// A new link row as one write of a batch: for an account created by the
+/// sign-in that links it, so the account and the identity that owns it land
+/// together. A pair that is already linked fails the batch with
+/// `AlreadyExists` (the `(provider, provider_ref)` UNIQUE constraint).
+pub fn create_op(new: NewLink<'_>) -> BatchWrite {
+    BatchWrite::Create {
+        collection: TABLE.to_string(),
+        data: new_row(new),
+    }
+}
+
+/// The row a new link inserts: the natural key, a fresh synthetic id, and
+/// the columns [`upsert`] refreshes.
+fn new_row(new: NewLink<'_>) -> HashMap<String, Value> {
+    let mut data: HashMap<String, Value> = HashMap::new();
+    data.insert("id".into(), json!(uuid::Uuid::now_v7().to_string()));
+    data.insert("provider".into(), json!(new.provider));
+    data.insert("provider_ref".into(), json!(new.provider_ref));
+    data.insert("user_id".into(), json!(new.user_id));
+    data.insert("provider_login".into(), json!(new.provider_login));
+    data.insert("access_token".into(), json!(""));
+    data.insert("linked_at".into(), json!(now_iso()));
+    data
 }
 
 /// Look up a link by `(provider, provider_ref)`. Returns `Ok(None)` if no

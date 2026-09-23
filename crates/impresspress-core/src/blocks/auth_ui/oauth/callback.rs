@@ -519,9 +519,11 @@ async fn resolve_user(
         };
 
     // --- Step 2 / 3: resolve user_id ---
-    let user_id: String = if let Some(link) = existing_link {
+    // `created` is whether this sign-in created the account — and with it,
+    // its provider link.
+    let (user_id, created): (String, bool) = if let Some(link) = existing_link {
         // Known provider link — reuse the bound user.
-        link.user_id
+        (link.user_id, false)
     } else {
         // No link yet. An account already holding this address may be adopted
         // only when BOTH sides have PROVEN control of the mailbox.
@@ -570,7 +572,7 @@ async fn resolve_user(
                     clear_binding,
                 ));
             }
-            Ok(Some(existing_user)) => existing_user.id,
+            Ok(Some(existing_user)) => (existing_user.id, false),
             Ok(None) => {
                 // Brand-new user — enforce signup gates. Shared with the JSON
                 // signup handler so the ALLOW_SIGNUP / ALLOWED_EMAIL_DOMAINS /
@@ -632,8 +634,32 @@ async fn resolve_user(
                 // `get_user_roles` reads first; a `user_roles` row means a
                 // grant beyond it, so none is written at signup — the same
                 // rows password signup produces.
-                match users::insert(ctx, new_user).await {
-                    Ok(u) => u.id,
+                //
+                // The account, the link that is its only way in, and — when
+                // the provider asserted the address — the proof of it, in
+                // one atomic write. Written apart, a failure after the
+                // account left one with no link and no password; the next
+                // sign-in then met it down the email path above, and a
+                // provider that asserts nothing is refused adoption there
+                // for good.
+                let proof = info.email_verified.then(|| users::proof::oauth(provider));
+                let inserted = users::insert_with_ops(ctx, new_user, |id| {
+                    let mut ops = vec![provider_links::create_op(provider_links::NewLink {
+                        provider,
+                        provider_ref: &info.provider_ref,
+                        user_id: id,
+                        provider_login: &info.provider_login,
+                    })];
+                    ops.extend(
+                        proof
+                            .as_deref()
+                            .map(|proof| users::record_email_proof_op(id, proof)),
+                    );
+                    ops
+                })
+                .await;
+                match inserted {
+                    Ok(u) => (u.id, true),
                     Err(e) => return Err(crud::db_error_internal(e, "Failed to create user")),
                 }
             }
@@ -672,28 +698,30 @@ async fn resolve_user(
     };
 
     // --- Step 4: bind the provider identity to the account ---
-    // Before the verification gate, deliberately. This flow may have just
-    // created the account it is about to refuse, and without the link a
-    // retry would meet its own account down the email path and be refused
-    // adoption forever — a lockout built out of two correct-looking rules.
-    // The link records which provider identity this account is, which is
-    // true whether or not the account may sign in yet.
-    if let Err(e) = provider_links::upsert(
-        ctx,
-        provider_links::NewLink {
-            provider,
-            provider_ref: &info.provider_ref,
-            user_id: &user_id,
-            provider_login: &info.provider_login,
-        },
-    )
-    .await
-    {
-        // Log but don't fail — the account is resolved and the sign-in can
-        // proceed; link persistence is bookkeeping. A failed upsert means the
-        // next sign-in resolves the account by address again, which only
-        // succeeds under the adoption rule above.
-        tracing::warn!("Failed to upsert provider_links: {e}");
+    // Before the verification gate, deliberately: the link records which
+    // provider identity this account is, which is true whether or not the
+    // account may sign in yet. An account this sign-in created already has
+    // its link (written with it, above); a known link is refreshed here; an
+    // adopted account gets its link here.
+    if !created {
+        if let Err(e) = provider_links::upsert(
+            ctx,
+            provider_links::NewLink {
+                provider,
+                provider_ref: &info.provider_ref,
+                user_id: &user_id,
+                provider_login: &info.provider_login,
+            },
+        )
+        .await
+        {
+            // Log but don't fail — the account is resolved and the sign-in
+            // can proceed. A failed refresh leaves the known link as it was;
+            // a failed adoption link means the next sign-in resolves the
+            // account by address again, which succeeds under the same
+            // adoption rule that admitted this one.
+            tracing::warn!("Failed to upsert provider_links: {e}");
+        }
     }
 
     // A provider assertion about the account's OWN address is a proof, so an
@@ -1351,6 +1379,9 @@ mod security_regression_tests {
     async fn signup_password_account(ctx: &TestContext, email: &str) {
         let body = serde_json::json!({ "email": email, "password": FIXTURE_PASSWORD }).to_string();
         let (signup_limiter, signup_msg) = crate::blocks::auth_ui::api::test_mail_request();
+        // Signup mails its verification link after the response; run it, as
+        // the platform would, so the link is in the mail log.
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
         let out = crate::blocks::auth_ui::api::signup::handle(
             &signup_limiter,
             ctx,
@@ -1358,6 +1389,7 @@ mod security_regression_tests {
             wafer_run::InputStream::from_bytes(body.into_bytes()),
         )
         .await;
+        crate::blocks::auth_ui::api::run_deferred().await;
         assert_eq!(
             crate::test_support::output_status(out).await,
             201,
@@ -1664,6 +1696,9 @@ mod security_regression_tests {
         .await
         .collect_buffered()
         .await;
+        // The link is minted and mailed after the response; the signup
+        // fixture left deferred work queued, so run it as the platform would.
+        crate::blocks::auth_ui::api::run_deferred().await;
         prove_address_by_email_link(&ctx, &mail, email).await;
 
         // And now the same sign-in completes, into the same account.
@@ -1864,6 +1899,72 @@ mod security_regression_tests {
             .expect("link lookup ok")
             .expect("the link keys on the OIDC `sub`");
         assert_eq!(link.user_id, user.id);
+    }
+
+    /// The account a sign-in creates, its provider link and any proof are
+    /// one write. As separate writes, a failed link left an account with no
+    /// link and no password; for a provider that asserts nothing (Microsoft)
+    /// the retry then met that account down the email path and was refused
+    /// adoption for good.
+    #[tokio::test]
+    async fn a_failed_link_write_leaves_no_account_and_the_retry_signs_in() {
+        use crate::blocks::auth::repo::test_faults::{drop_trigger, fail_inserts_into};
+
+        let email = "halfway-ms@example.com";
+        let ctx = OauthFlow::microsoft(email).ctx().await;
+        let trigger = fail_inserts_into(&ctx, provider_links::TABLE).await;
+
+        let status = crate::test_support::output_http_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
+        assert_eq!(
+            status, 500,
+            "the sign-in whose account write failed is told so"
+        );
+        assert!(
+            users::find_by_email(&ctx, email)
+                .await
+                .expect("user lookup ok")
+                .is_none(),
+            "no account may outlive its failed link write"
+        );
+
+        drop_trigger(&ctx, &trigger).await;
+        seed_state(&ctx, STATE_ID, "microsoft").await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
+        assert_eq!(status, 302, "the retry signs in");
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("the retry created the account");
+        let link = provider_links::find_by_provider_ref(&ctx, "microsoft", MICROSOFT_SUB)
+            .await
+            .expect("link lookup ok")
+            .expect("with its link");
+        assert_eq!(link.user_id, user.id);
+    }
+
+    /// An account created by a provider that asserts its address carries the
+    /// proof from its first write, not from a later one that could fail.
+    #[tokio::test]
+    async fn a_created_account_carries_its_provider_proof_from_the_first_write() {
+        let email = "proven-at-birth@example.com";
+        let ctx = OauthFlow::google(email).ctx().await;
+        let status = crate::test_support::output_status(
+            handle(&limiter(), &ctx, &callback_msg(&ctx).await).await,
+        )
+        .await;
+        assert_eq!(status, 302);
+        let user = users::find_by_email(&ctx, email)
+            .await
+            .expect("user lookup ok")
+            .expect("account created");
+        assert_eq!(user.email_verified_by.as_deref(), Some("oauth.google"));
+        assert!(user.email_verified);
     }
 
     /// GitHub's profile address is not authoritative: the flow reads
