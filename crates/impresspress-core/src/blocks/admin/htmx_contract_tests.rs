@@ -7,7 +7,7 @@ use std::sync::Arc;
 use wafer_run::{Block, Message};
 
 use super::{
-    page_link_tests::{seeded_ctx, PAGES},
+    page_link_tests::{seeded_ctx, PAGES, PROBE_VARIABLE},
     AdminBlock,
 };
 use crate::{
@@ -36,7 +36,7 @@ const OPERATOR_INPUT: &[(&str, &str)] = &[
 /// admin. The pages post to this block and, for API keys, to auth-ui.
 pub(crate) fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
     Box::pin(async {
-        let (ctx, _) = seeded_ctx().await;
+        let (ctx, seeds) = seeded_ctx().await;
         Fixture {
             ctx: Arc::new(ctx),
             site: Site(vec![
@@ -48,10 +48,27 @@ pub(crate) fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fi
                 .iter()
                 .map(|(_, path, query)| {
                     query.iter().fold(Page::at(*path), |page, (name, value)| {
-                        page.with(name, *value)
+                        page.with(*name, *value)
                     })
                 })
                 .collect(),
+            probes: vec![
+                (
+                    "/b/admin/api/users/{id}",
+                    format!("/b/admin/api/users/{}", seeds.user_id),
+                ),
+                (
+                    "/b/admin/api/database/tables/{name}/columns",
+                    format!(
+                        "/b/admin/api/database/tables/{}/columns",
+                        super::ROLES_TABLE
+                    ),
+                ),
+                (
+                    "/b/admin/api/settings/{key}",
+                    format!("/b/admin/api/settings/{PROBE_VARIABLE}"),
+                ),
+            ],
             operator_input: OPERATOR_INPUT,
         }
     })

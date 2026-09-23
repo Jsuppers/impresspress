@@ -16,9 +16,12 @@
 //! have gone quietly vacuous the day the scripts moved to files, which is the
 //! failure mode the whole module exists to prevent.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
-use wafer_run::{Block as _, InputStream};
+use wafer_run::{Block, Message};
 
 use super::{
     super::{
@@ -31,7 +34,10 @@ use super::{
 };
 use crate::{
     endpoint_match::{self, endpoint_auth},
-    test_support::{admin_msg, anon_msg, auth_msg, output_html},
+    test_support::{
+        admin_msg, anon_msg, auth_msg,
+        htmx::{self, crawl, Fixture, Site},
+    },
 };
 
 /// `(needle in the rendered HTML, action the carrier implies)`. htmx maps
@@ -422,65 +428,73 @@ async fn seeded_ctx() -> (crate::test_support::TestContext, Seeds) {
 }
 
 /// Who renders a page.
-#[derive(Clone, Copy)]
-enum As {
-    Admin,
-    Seller,
-    Buyer,
+/// Who renders `path`: the admin under `/admin`, the buyer (`user_1`) on
+/// their purchase pages, the seller (`seller_a`) everywhere else.
+fn viewer(action: &str, path: &str) -> Message {
+    if path.starts_with("/b/products/admin") {
+        admin_msg(action, path)
+    } else if path.starts_with("/b/products/my-purchases") {
+        auth_msg(action, path, "user_1")
+    } else {
+        auth_msg(action, path, "seller_a")
+    }
 }
 
-/// `(viewer, path, query parameters)` of one page render.
-type Page = (As, &'static str, &'static [(&'static str, &'static str)]);
+/// `(path, query parameters)` of one page the crawl starts from.
+type Page = (&'static str, &'static [(&'static str, &'static str)]);
 
-/// Every `GET` row of section E of the plan's inventory, with the query
-/// parameters that select the views carrying extra controls.
+/// Every `GET` row of section E of the plan's inventory, with the purchases
+/// filter the admin list links to. The Deleted views are reached by
+/// [`crawl`] from the Live lists' own links.
 const PAGES: &[Page] = &[
-    (As::Seller, "/b/products", &[]),
-    (As::Seller, "/b/products/", &[]),
-    (As::Seller, "/b/products/my-products", &[]),
-    (
-        As::Seller,
-        "/b/products/my-products",
-        &[("view", "deleted")],
-    ),
-    (As::Seller, "/b/products/my-products/new", &[]),
-    (As::Seller, "/b/products/my-products/mine", &[]),
-    (As::Seller, "/b/products/my-products/mine_gone/close", &[]),
-    (As::Buyer, "/b/products/my-purchases", &[]),
-    (As::Buyer, "/b/products/my-purchases/pur_1", &[]),
-    (As::Seller, "/b/products/selling", &[]),
-    (As::Seller, "/b/products/selling/orders", &[]),
-    (As::Seller, "/b/products/selling/orders/pur_1", &[]),
-    (As::Admin, "/b/products/admin", &[]),
-    (As::Admin, "/b/products/admin/", &[]),
-    (As::Admin, "/b/products/admin/manage", &[]),
-    (
-        As::Admin,
-        "/b/products/admin/manage",
-        &[("view", "deleted")],
-    ),
-    (As::Admin, "/b/products/admin/new", &[]),
-    (As::Admin, "/b/products/admin/products/live", &[]),
-    (As::Admin, "/b/products/admin/products/gone/close", &[]),
-    (As::Admin, "/b/products/admin/groups", &[]),
-    (As::Admin, "/b/products/admin/purchases", &[]),
-    (
-        As::Admin,
-        "/b/products/admin/purchases",
-        &[("status", "completed")],
-    ),
-    (As::Admin, "/b/products/admin/purchases/pur_1", &[]),
-    (As::Admin, "/b/products/admin/sellers", &[]),
-    (As::Admin, "/b/products/admin/sellers/seller_1", &[]),
-    (As::Admin, "/b/products/admin/stripe", &[]),
-    (As::Admin, "/b/products/admin/settings", &[]),
+    ("/b/products", &[]),
+    ("/b/products/", &[]),
+    ("/b/products/my-products", &[]),
+    ("/b/products/my-products/new", &[]),
+    ("/b/products/my-products/mine", &[]),
+    ("/b/products/my-products/mine_gone/close", &[]),
+    ("/b/products/my-purchases", &[]),
+    ("/b/products/my-purchases/pur_1", &[]),
+    ("/b/products/selling", &[]),
+    ("/b/products/selling/orders", &[]),
+    ("/b/products/selling/orders/pur_1", &[]),
+    ("/b/products/admin", &[]),
+    ("/b/products/admin/", &[]),
+    ("/b/products/admin/manage", &[]),
+    ("/b/products/admin/new", &[]),
+    ("/b/products/admin/products/live", &[]),
+    ("/b/products/admin/products/gone/close", &[]),
+    ("/b/products/admin/groups", &[]),
+    ("/b/products/admin/purchases", &[]),
+    ("/b/products/admin/purchases", &[("status", "completed")]),
+    ("/b/products/admin/purchases/pur_1", &[]),
+    ("/b/products/admin/sellers", &[]),
+    ("/b/products/admin/sellers/seller_1", &[]),
+    ("/b/products/admin/stripe", &[]),
+    ("/b/products/admin/settings", &[]),
 ];
 
 #[tokio::test]
 async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
     let (ctx, seeds) = seeded_ctx().await;
     let other_blocks = crate::blocks::all_block_infos();
-    let block = ProductsBlock::new();
+    let fixture = Fixture {
+        ctx: Arc::new(ctx),
+        site: Site(vec![Arc::new(ProductsBlock::new()) as Arc<dyn Block>]),
+        caller: viewer,
+        pages: PAGES
+            .iter()
+            .map(|(path, query)| {
+                query
+                    .iter()
+                    .fold(htmx::Page::at(*path), |page, (name, value)| {
+                        page.with(*name, *value)
+                    })
+            })
+            .collect(),
+        probes: Vec::new(),
+        operator_input: &[],
+    };
 
     // Every GET page row is rendered at least once (the settings POST is
     // the form's save target, collected below rather than rendered).
@@ -491,7 +505,7 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
         assert!(
             PAGES
                 .iter()
-                .any(|(_, path, _)| endpoint_match::match_template(row.template, path).is_some()),
+                .any(|(path, _)| endpoint_match::match_template(row.template, path).is_some()),
             "page row {} is not rendered by this guard",
             row.template
         );
@@ -499,16 +513,10 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
 
     let mut collected: BTreeSet<(String, String)> = BTreeSet::new();
     let mut scanned_scripts: BTreeSet<&'static str> = BTreeSet::new();
-    for (viewer, path, query) in PAGES {
-        let mut msg = match viewer {
-            As::Admin => admin_msg("retrieve", path),
-            As::Seller => auth_msg("retrieve", path, "seller_a"),
-            As::Buyer => auth_msg("retrieve", path, "user_1"),
-        };
-        for (name, value) in *query {
-            msg.set_meta(format!("req.query.{name}"), *value);
-        }
-        let html = output_html(block.handle(&ctx, msg, InputStream::empty()).await).await;
+    for view in crawl(&fixture).await {
+        let page = view.page(&fixture);
+        let path = &page.path;
+        let html = htmx::render(&fixture, &page).await;
         let mut targets = attribute_targets(&html);
         targets.extend(fetch_targets(&html));
         #[cfg(feature = "embed-assets")]

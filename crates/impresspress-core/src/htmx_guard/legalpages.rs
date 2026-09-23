@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use wafer_run::{Block, LifecycleEvent, LifecycleType, Message};
 
-use super::{Entry, JSON_API};
+use super::{Entry, Exempt};
 use crate::{
     blocks::legalpages::LegalPagesBlock,
     test_support::{
@@ -25,10 +25,12 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/legalpages",
         fixture: Some(|| Box::pin(fixture())),
         exempt: &[
-            ("/b/legalpages/api/documents", JSON_API),
-            ("/b/legalpages/api/documents/{id}", JSON_API),
+            ("/b/legalpages/api/documents", Exempt::JsonApi),
+            ("/b/legalpages/api/documents/{id}", Exempt::JsonApi),
         ],
         // No mutating htmx control on any legalpages page; see the module doc.
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[],
     }
 }
@@ -59,6 +61,23 @@ async fn fixture() -> Fixture {
         .await
         .expect("legalpages Init");
 
+    // A document Init published, for the by-id row to read.
+    let listed = crate::test_support::htmx::answer(
+        LegalPagesBlock::new()
+            .handle(
+                &ctx,
+                admin_msg("retrieve", "/b/legalpages/api/documents"),
+                wafer_run::InputStream::empty(),
+            )
+            .await,
+    )
+    .await;
+    let listed: serde_json::Value = serde_json::from_str(&listed.body).expect("the list is JSON");
+    let document = listed["records"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Init published a document: {listed}"))
+        .to_string();
+
     Fixture {
         ctx: Arc::new(ctx),
         site: Site(vec![Arc::new(LegalPagesBlock::new()) as Arc<dyn Block>]),
@@ -72,6 +91,10 @@ async fn fixture() -> Fixture {
             Page::at("/b/legalpages/admin/settings"),
             Page::at("/b/legalpages/admin/endpoints"),
         ],
+        probes: vec![(
+            "/b/legalpages/api/documents/{id}",
+            format!("/b/legalpages/api/documents/{document}"),
+        )],
         operator_input: &[],
     }
 }

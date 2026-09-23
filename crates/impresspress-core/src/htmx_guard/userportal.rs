@@ -6,7 +6,7 @@ use std::sync::Arc;
 use wafer_core::clients::crypto;
 use wafer_run::{Block, InputStream, Message};
 
-use super::Entry;
+use super::{Entry, Exempt};
 use crate::{
     blocks::{
         auth::repo::{local_credentials, provider_links, sessions},
@@ -41,8 +41,10 @@ pub(super) fn entry() -> Entry {
         fixture: Some(fixture),
         exempt: &[(
             "/b/userportal/config",
-            "public JSON the chrome reads for the portal's branding; renders no page",
+            Exempt::NotAPage("public JSON the chrome reads for the portal's branding"),
         )],
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[
             "delete /b/userportal/sessions/{family}",
             "delete /b/userportal/security/providers/{provider}",
@@ -151,6 +153,7 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
                 Page::at("/b/userportal/admin/buttons"),
                 Page::at(format!("/b/userportal/admin/buttons/{button_id}/edit")),
             ],
+            probes: Vec::new(),
             operator_input: OPERATOR_INPUT,
         }
     })

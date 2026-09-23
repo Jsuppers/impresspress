@@ -1998,7 +1998,7 @@ pub(crate) mod page_link_tests {
     use std::collections::BTreeSet;
 
     use wafer_core::clients::database as db;
-    use wafer_run::{Block as _, BlockCategory, BlockInfo, InputStream};
+    use wafer_run::{Block as _, BlockCategory, BlockInfo};
 
     use super::*;
     use crate::{
@@ -2007,7 +2007,11 @@ pub(crate) mod page_link_tests {
             auth_ui::AuthUiBlock,
         },
         endpoint_match::endpoint_auth,
-        test_support::{admin_msg, anon_msg, output_html, TestContext},
+        test_support::{
+            anon_msg,
+            htmx::{self, crawl, Fixture},
+            TestContext,
+        },
     };
 
     /// `(URL prefix in the rendered HTML, action it implies)`. htmx maps
@@ -2055,7 +2059,7 @@ pub(crate) mod page_link_tests {
     }
 
     const PROBE_BLOCK: &str = "impresspress/probe";
-    const PROBE_VARIABLE: &str = "PROBE_SETTING";
+    pub(crate) const PROBE_VARIABLE: &str = "PROBE_SETTING";
 
     /// A variables row an admin surface has PINNED, so the pages render the
     /// "Reset to environment" control for it. Separate from [`PROBE_VARIABLE`]
@@ -2300,13 +2304,13 @@ pub(crate) mod page_link_tests {
         &'static [(&'static str, &'static str)],
     );
 
-    /// Every page and fragment the block serves as HTML, with the query
-    /// parameters that select each tab.
+    /// Every page and fragment the block serves as HTML that no other page's
+    /// tab links to, with the query parameters of the filters and fragments
+    /// that need them. The tabs are reached by
+    /// [`crate::test_support::htmx::crawl`] from these pages' own links.
     pub(crate) const PAGES: &[Page] = &[
         ("retrieve", "/b/admin/", &[]),
         ("retrieve", "/b/admin/users", &[]),
-        ("retrieve", "/b/admin/users", &[("tab", "roles")]),
-        ("retrieve", "/b/admin/users", &[("tab", "api-keys")]),
         ("retrieve", "/b/admin/storage", &[]),
         ("retrieve", "/b/admin/blocks", &[]),
         (
@@ -2315,10 +2319,8 @@ pub(crate) mod page_link_tests {
             &[],
         ),
         ("retrieve", "/b/admin/database", &[]),
-        ("retrieve", "/b/admin/database", &[("tab", "sql")]),
         ("retrieve", "/b/admin/logs", &[]),
         ("retrieve", "/b/admin/logs", &[("errors", "1")]),
-        ("retrieve", "/b/admin/logs", &[("tab", "audit")]),
         ("retrieve", "/b/admin/settings/email", &[]),
         ("retrieve", "/b/admin/settings/network", &[]),
         (
@@ -2327,14 +2329,8 @@ pub(crate) mod page_link_tests {
             &[("method", "GET"), ("path", "/probe")],
         ),
         ("retrieve", "/b/admin/settings/variables", &[]),
-        ("retrieve", "/b/admin/settings/variables", &[("tab", "all")]),
         ("retrieve", "/b/admin/variables/PROBE_SETTING/edit", &[]),
         ("retrieve", "/b/admin/settings/permissions", &[]),
-        (
-            "retrieve",
-            "/b/admin/settings/permissions",
-            &[("subtab", "database")],
-        ),
         ("retrieve", "/b/admin/grants", &[]),
     ];
 
@@ -2342,15 +2338,16 @@ pub(crate) mod page_link_tests {
     async fn every_link_an_admin_page_emits_resolves_to_a_declared_row() {
         let (ctx, seeds) = seeded_ctx().await;
         let auth_endpoints = AuthUiBlock::new().info().endpoints;
-        let block = AdminBlock::new();
+        let fixture = Fixture {
+            ctx: Arc::new(ctx),
+            ..super::htmx_contract_tests::fixture().await
+        };
 
         let mut collected: BTreeSet<(String, String)> = BTreeSet::new();
-        for (action, path, query) in PAGES {
-            let mut msg = admin_msg(action, path);
-            for (name, value) in *query {
-                msg.set_meta(format!("req.query.{name}"), *value);
-            }
-            let html = output_html(block.handle(&ctx, msg, InputStream::empty()).await).await;
+        for view in crawl(&fixture).await {
+            let page = view.page(&fixture);
+            let path = &page.path;
+            let html = htmx::render(&fixture, &page).await;
             for (link_action, link_path) in links_in(&html) {
                 if link_path.starts_with(ADMIN_PREFIX) {
                     assert!(

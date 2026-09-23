@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 use serde_json::json;
 use wafer_run::{Block, Message};
 
-use super::Entry;
+use super::{Entry, Exempt};
 use crate::{
     blocks::files::{repo, test_wrap, FilesBlock},
     test_support::{
@@ -22,7 +22,7 @@ use crate::{
 
 /// The files block's own download routes: they answer with the object's
 /// bytes under its stored content type, not a page.
-const DOWNLOAD: &str = "file download (the object's bytes), not a page";
+const DOWNLOAD: Exempt = Exempt::NotAPage("file download (the object's bytes)");
 
 pub(super) fn entry() -> Entry {
     Entry {
@@ -32,10 +32,12 @@ pub(super) fn entry() -> Entry {
             ("/b/storage/api/buckets/{name}/objects/{key...}", DOWNLOAD),
             (
                 "/b/storage/direct/{token}",
-                "a share link's download (the object's bytes), not a page",
+                Exempt::NotAPage("a share link's download (the object's bytes)"),
             ),
         ],
         // No mutating htmx control on any files page; see the module doc.
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[],
     }
 }
@@ -73,6 +75,11 @@ async fn fixture() -> Fixture {
             ("uploaded_by".into(), json!("admin_1")),
         ]);
         repo::objects::seed(&ctx, row).await.expect("seed object");
+        // The object's bytes, through the storage block the way the upload
+        // route stores them, so a download answers them.
+        wafer_core::clients::storage::put(&ctx, "photos", key, b"png", "image/png")
+            .await
+            .expect("store the object's bytes");
     }
     let share: HashMap<String, serde_json::Value> = HashMap::from([
         ("token".into(), json!("tok123abc")),
@@ -106,6 +113,24 @@ async fn fixture() -> Fixture {
             Page::at("/b/cloudstorage/"),
             Page::at("/b/storage/photos/"),
             Page::at("/b/storage/photos/nested/"),
+        ],
+        probes: vec![
+            (
+                "/b/storage/api/buckets/{name}/objects",
+                "/b/storage/api/buckets/photos/objects".to_string(),
+            ),
+            (
+                "/b/storage/api/buckets/{name}/objects/{key...}",
+                "/b/storage/api/buckets/photos/objects/nested/b.png".to_string(),
+            ),
+            (
+                "/b/storage/api/search",
+                "/b/storage/api/search?q=png".to_string(),
+            ),
+            (
+                "/b/storage/direct/{token}",
+                "/b/storage/direct/tok123abc".to_string(),
+            ),
         ],
         operator_input: &[],
     }

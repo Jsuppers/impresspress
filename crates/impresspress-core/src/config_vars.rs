@@ -60,6 +60,9 @@ pub const REQUEST_LOG_CONFIG_KEY: &str = "IMPRESSPRESS_REQUEST_LOG";
 /// [`crate::ui::assets::is_stale_builtin_asset_url`]).
 pub const LOGO_URL_KEY: &str = "WAFER_RUN_SHARED__LOGO_URL";
 
+/// Shared config key: whether third-party (OAuth) sign-in is offered.
+pub const ENABLE_OAUTH_KEY: &str = "WAFER_RUN_SHARED__ENABLE_OAUTH";
+
 /// Shared config key: whether signed-in users may create and sell their own
 /// products, not only the site admin.
 pub const ALLOW_USER_PRODUCTS_KEY: &str = "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS";
@@ -125,7 +128,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Allow Signup")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__ENABLE_OAUTH",
+            ENABLE_OAUTH_KEY,
             "Enable third-party OAuth login",
             "false",
         )
