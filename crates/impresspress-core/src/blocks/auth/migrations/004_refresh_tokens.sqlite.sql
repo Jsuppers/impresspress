@@ -17,15 +17,17 @@
 -- `re_run_survival_tests::refresh_tokens_survive_a_full_re_run` pins that
 -- they survive.
 --
--- What that costs: a database still carrying the PRE-004 layout (one that
--- has not applied this file even once — impossible for any deployment that
--- has booted since 005 landed, since the set re-runs together) keeps its
+-- What that costs: a database still carrying the PRE-004 layout keeps its
 -- legacy table, and `CREATE TABLE IF NOT EXISTS` is a no-op on it, so the
--- columns below are missing and the first refresh write fails "no such
--- column". The remedy there is one statement — `DROP TABLE
--- wafer_run__auth__tokens` by hand, then re-run migrations — and it costs
--- that deployment exactly what this DROP used to cost EVERY deployment on
--- EVERY auth schema change.
+-- columns below are missing and the first refresh write fails on a missing
+-- column. That is a database which has not applied the auth set since this
+-- file first shipped. Booting does not apply it: once a hash is recorded, a
+-- schema change waits for `--run-migrations` or a blessed hash
+-- (`migration_helper::apply_if_blessed`), so such a database can have
+-- booted any number of times. The remedy there is one statement —
+-- `DROP TABLE wafer_run__auth__tokens` by hand, then run migrations — and it
+-- costs that deployment exactly what this DROP used to cost EVERY deployment
+-- on EVERY auth schema change.
 
 CREATE TABLE IF NOT EXISTS wafer_run__auth__tokens (
     id           TEXT PRIMARY KEY,
