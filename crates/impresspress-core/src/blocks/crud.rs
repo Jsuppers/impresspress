@@ -94,6 +94,30 @@ pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str)
     }
 }
 
+/// [`db_error_page`] for a read behind an htmx swap: what the notice in place
+/// of the fragment says went wrong.
+///
+/// A swap cannot answer the 403, 429 or 500 a page does — htmx 2 swaps only a
+/// 2xx body, so the stale fragment would stay on screen — and so the caller
+/// answers a 2xx notice ([`crate::ui::swap_error_response`] and its row
+/// variant, or an alert in the swapped body) and puts this reason in it. It is
+/// classified like every other failed database call: a WRAP denial says access
+/// was denied and a quota says the usage limit, with the denial's own text
+/// (grant and table names) logged, never shown. Anything else is logged under
+/// `context` and said as a fault.
+pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static str {
+    match classify_db_error(error, None, context) {
+        DbFailure::Refused(error) if error.code == ErrorCode::ResourceExhausted => {
+            "it is over its usage limit right now"
+        }
+        DbFailure::Refused(_) => "access to it was denied",
+        DbFailure::Internal(error) => {
+            tracing::error!(context = %context, error = %error, "fragment read failed");
+            "something went wrong"
+        }
+    }
+}
+
 /// What [`db_error`] decided, before it is sealed into a response.
 ///
 /// [`db_error`] seals this itself and is what almost every call site wants.

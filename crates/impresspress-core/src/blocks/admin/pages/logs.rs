@@ -1,11 +1,11 @@
 use maud::{html, Markup};
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::database as db;
-use wafer_run::{context::Context, Message, OutputStream};
+use wafer_run::{context::Context, Message, OutputStream, WaferError};
 
 use super::{admin_page, crumb, status_code_badge_variant};
 use crate::{
-    blocks::admin::AUDIT_LOGS_TABLE as AUDIT_LOGS,
+    blocks::{admin::AUDIT_LOGS_TABLE as AUDIT_LOGS, crud},
     platform_state::request_logs,
     ui::{
         components::{self, badge, pagination, Badge, BadgeVariant},
@@ -67,6 +67,19 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         { (icons::refresh_cw()) " Refresh" }
     };
 
+    // "No request logs yet" is what an untouched deployment renders; a log
+    // that could not be read must not borrow it, nor print the failure's own
+    // text into the page.
+    let tab_body = if active_tab == "system" {
+        system_logs_tab(ctx, msg).await
+    } else {
+        audit_logs_tab(ctx, msg).await
+    };
+    let tab_body = match tab_body {
+        Ok(markup) => markup,
+        Err(e) => return crud::db_error_page(msg, e, "admin logs page: log read failed"),
+    };
+
     let tabs_and_body = html! {
         (components::tab_navigation(vec![
             components::Tab {
@@ -83,13 +96,7 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             },
         ]))
 
-        div #logs-tab-content {
-            @if active_tab == "system" {
-                (system_logs_tab(ctx, msg).await)
-            } @else {
-                (audit_logs_tab(ctx, msg).await)
-            }
-        }
+        div #logs-tab-content { (tab_body) }
     };
 
     let body = list_page(None, tabs_and_body, None);
@@ -109,13 +116,14 @@ pub async fn logs_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     .await
 }
 
-async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
+/// `Err` when the read failed; [`logs_page`] answers it, never an empty table.
+async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Result<Markup, WaferError> {
     let (page, page_size, _) = msg.pagination_params(50);
     let search = msg.query("search").to_string();
     let errors_only = errors_only(msg);
 
-    let result =
-        request_logs::paginated(ctx, page as i64, page_size as i64, &search, errors_only).await;
+    let list =
+        request_logs::paginated(ctx, page as i64, page_size as i64, &search, errors_only).await?;
 
     // The search box appends its own `search` field to whatever URL it is
     // given, so it gets the filter without one; everything else carries both.
@@ -124,7 +132,7 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
     let errors_href = system_logs_href(&search, true);
     let page_href = system_logs_href(&search, errors_only);
 
-    html! {
+    Ok(html! {
         div .filter-bar {
             (components::search_input_with_value("search", "Search by path...", &search_href, "#content", &search))
 
@@ -146,48 +154,42 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
             }
         }
 
-        @match &result {
-            Ok(list) => {
-                @let rows: Vec<Vec<Markup>> = list.rows.iter().map(|row| {
-                    let path = row.path.as_str();
-                    let user_id = row.user_id.as_str();
-                    let created = row.created_at.as_str();
-                    let status_code = row.status_code;
-                    vec![
-                        Badge::new(status_code_badge_variant(status_code)).render(html! { (status_code) }),
-                        html! { span .font-medium { (row.method.to_uppercase()) } },
-                        html! { (path) },
-                        html! { span .text-muted { (row.duration_ms) "ms" } },
-                        html! {
-                            @if !user_id.is_empty() {
-                                span .text-muted { (user_id.get(..8).unwrap_or(user_id)) }
-                            }
-                        },
-                        html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
-                    ]
-                }).collect();
+        @let rows: Vec<Vec<Markup>> = list.rows.iter().map(|row| {
+            let path = row.path.as_str();
+            let user_id = row.user_id.as_str();
+            let created = row.created_at.as_str();
+            let status_code = row.status_code;
+            vec![
+                Badge::new(status_code_badge_variant(status_code)).render(html! { (status_code) }),
+                html! { span .font-medium { (row.method.to_uppercase()) } },
+                html! { (path) },
+                html! { span .text-muted { (row.duration_ms) "ms" } },
+                html! {
+                    @if !user_id.is_empty() {
+                        span .text-muted { (user_id.get(..8).unwrap_or(user_id)) }
+                    }
+                },
+                html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
+            ]
+        }).collect();
 
-                (components::data_table::<fn(usize) -> Option<String>>(
-                    &SYSTEM_LOG_COLUMNS,
-                    rows,
-                    None,
-                    html! {
-                        p .text-center .text-muted {
-                            @if errors_only { "No error request logs" } @else { "No request logs yet" }
-                        }
-                    },
-                ))
+        (components::data_table::<fn(usize) -> Option<String>>(
+            &SYSTEM_LOG_COLUMNS,
+            rows,
+            None,
+            html! {
+                p .text-center .text-muted {
+                    @if errors_only { "No error request logs" } @else { "No request logs yet" }
+                }
+            },
+        ))
 
-                (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, &page_href))
-            }
-            Err(e) => {
-                div .login-error { "Failed to load request logs: " (e.message) }
-            }
-        }
-    }
+        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, &page_href))
+    })
 }
 
-async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
+/// `Err` when the read failed; [`logs_page`] answers it, never an empty table.
+async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Result<Markup, WaferError> {
     let (page, page_size, _) = msg.pagination_params(50);
     let search = msg.query("search").to_string();
 
@@ -204,7 +206,7 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
         field: "created_at".into(),
         desc: true,
     }];
-    let result = db::paginated_list(
+    let list = db::paginated_list(
         ctx,
         AUDIT_LOGS,
         page as i64,
@@ -212,41 +214,34 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
         filters,
         sort,
     )
-    .await;
+    .await?;
 
-    html! {
+    Ok(html! {
         div .filter-bar {
             (components::search_input_with_value("search", "Search by resource...", "/b/admin/logs?tab=audit", "#content", &search))
         }
 
-        @match &result {
-            Ok(list) => {
-                @let rows: Vec<Vec<Markup>> = list.records.iter().map(|record| {
-                    let user_id = record.str_field("user_id");
-                    let created = record.str_field("created_at");
-                    vec![
-                        badge(BadgeVariant::Info, record.str_field("action")),
-                        html! { (record.str_field("resource")) },
-                        html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
-                        html! { span .text-muted { (record.str_field("ip_address")) } },
-                        html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
-                    ]
-                }).collect();
+        @let rows: Vec<Vec<Markup>> = list.records.iter().map(|record| {
+            let user_id = record.str_field("user_id");
+            let created = record.str_field("created_at");
+            vec![
+                badge(BadgeVariant::Info, record.str_field("action")),
+                html! { (record.str_field("resource")) },
+                html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
+                html! { span .text-muted { (record.str_field("ip_address")) } },
+                html! { span .text-muted { (created.get(..19).unwrap_or(created)) } },
+            ]
+        }).collect();
 
-                (components::data_table::<fn(usize) -> Option<String>>(
-                    &AUDIT_LOG_COLUMNS,
-                    rows,
-                    None,
-                    html! { p .text-center .text-muted { "No audit logs yet" } },
-                ))
+        (components::data_table::<fn(usize) -> Option<String>>(
+            &AUDIT_LOG_COLUMNS,
+            rows,
+            None,
+            html! { p .text-center .text-muted { "No audit logs yet" } },
+        ))
 
-                (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/logs?tab=audit"))
-            }
-            Err(e) => {
-                div .login-error { "Failed to load audit logs: " (e.message) }
-            }
-        }
-    }
+        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/logs?tab=audit"))
+    })
 }
 
 /// The two log tables' columns. Declared once each so the `<td data-label>`

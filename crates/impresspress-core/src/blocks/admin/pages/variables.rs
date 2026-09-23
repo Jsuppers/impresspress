@@ -24,7 +24,10 @@ use crate::{
 /// Add-Variable modal renders its own `<form hx-post="/b/admin/variables">`
 /// (and the htmx-loaded edit modal its own `<form hx-put=...>`), which is
 /// only valid because the shell contributes no outer `<form>` to nest in.
-pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
+///
+/// `Err` when the variables table could not be listed: the caller answers
+/// it, never a table drawn without the rows.
+pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Result<Markup, WaferError> {
     let tab = msg.query("tab");
     let active_tab = if tab == "all" { "all" } else { "blocks" };
     // ONE read of the table and one of the process-environment marker per
@@ -32,13 +35,11 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
     // control's count want the same rows, and the tabs used to take them
     // separately; a third read for the count would have made the page's answer
     // to "how many keys are pinned" depend on which snapshot you asked.
-    let rows = variables::list_all(ctx).await;
+    let rows = variables::list_all(ctx).await?;
     let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
-    let upgrade_pins = rows
-        .as_deref()
-        .map_or(0, |rows| bulk_release_count(rows, offer_reset));
+    let upgrade_pins = bulk_release_count(&rows, offer_reset);
 
-    html! {
+    Ok(html! {
         div .mb-3 .flex .gap-1 {
             button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-var" {
                 (icons::plus()) " Add Variable"
@@ -67,10 +68,7 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
             @if active_tab == "all" {
                 (config_all_tab(&rows, offer_reset))
             } @else {
-                @match &rows {
-                    Ok(rows) => (config_by_block_tab(ctx, rows, offer_reset)),
-                    Err(e) => (variables_read_error(e)),
-                }
+                (config_by_block_tab(ctx, &rows, offer_reset))
             }
         }
 
@@ -115,14 +113,16 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Markup {
                 div #edit-var-modal {}
             }
         }
-    }
+    })
 }
 
 /// Full settings page for variables — used by mutation handlers that need to
-/// re-render the complete page after a create/update. Delegates to the
-/// canonical `settings_page` so both call paths share one composition.
-async fn variables_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    super::settings::settings_page(ctx, msg, "variables").await
+/// re-render the complete page after a create/update that landed (`done`).
+/// Delegates to the canonical settings page so both call paths share one
+/// composition; see [`super::settings::settings_page_after_write`] for what a
+/// failed re-read answers.
+async fn variables_page(ctx: &dyn Context, msg: &Message, done: &str) -> OutputStream {
+    super::settings::settings_page_after_write(ctx, msg, "variables", done).await
 }
 
 /// How a variable's value cell should render. SEC-060: the masking decision
@@ -594,97 +594,77 @@ fn declared_shared_keys() -> std::collections::HashSet<String> {
 ///
 /// The rows and `offer_reset` are the caller's — see [`settings_body`], which
 /// takes each exactly once for the whole page.
-fn config_all_tab(
-    settings: &Result<Vec<variables::VariableRow>, WaferError>,
-    offer_reset: bool,
-) -> Markup {
+fn config_all_tab(rows: &[variables::VariableRow], offer_reset: bool) -> Markup {
     let declared_shared = declared_shared_keys();
 
     html! {
-        @match settings {
-            Ok(rows) => {
-                @let table_rows: Vec<components::TableRow> = rows.iter().map(|row| {
-                    let key = row.key.as_str();
-                    let description = row.description.as_str();
-                    let warning = row.warning.as_str();
-                    // SEC-060: mask via the shared rule, not the `sensitive`
-                    // flag alone.
-                    let masked = ops::is_sensitive_key(key, i64::from(row.sensitive));
-                    components::TableRow::new(vec![
-                        html! { span .font-medium { (key) } },
-                        html! {
-                            @if masked {
-                                code { "********" }
-                            } @else {
-                                code { (row.value) }
-                            }
-                        },
-                        html! {
-                            @if !description.is_empty() {
-                                span .text-muted { (description) }
-                            }
-                            @if let Some(pin) = variables::pin_of(row) {
-                                div .mt-1 { (pin_badge(pin)) }
-                            }
-                            @if !warning.is_empty() {
-                                div .text-warning-strong .text-xs .mt-1 {
-                                    (ui::icons::triangle_alert()) (warning)
-                                }
-                            }
-                        },
-                        html! {
-                            div .flex .gap-1 {
-                                button .btn .btn--sm .btn--ghost
-                                    hx-get={"/b/admin/variables/" (key) "/edit"}
-                                    hx-target="#edit-var-modal"
-                                    hx-swap="innerHTML"
-                                    title="Edit"
-                                    aria-label=(format!("Edit {key}"))
-                                { (icons::edit()) }
-                                // Same reasoning as the delete control below:
-                                // the flat listing is where an operator sent
-                                // here by a boot WARN naming one key actually
-                                // looks for it, so it must offer what the By
-                                // Block tables offer.
-                                @if offer_reset
-                                    && variables::pin_of(row).is_some()
-                                    && key_can_be_seeded_from_env(key)
-                                {
-                                    (reset_to_environment_button(key))
-                                }
-                                // The flat listing offers the same control as
-                                // the Unowned table: this is where an operator
-                                // scanning for a legacy key actually looks, and
-                                // two tabs disagreeing about whether a row can
-                                // be removed is its own defect.
-                                @if key_is_deletable(key, &declared_shared) {
-                                    (delete_button(key))
-                                }
-                            }
-                        },
-                    ])
-                    .id(format!("var-row-{key}"))
-                }).collect();
+        @let table_rows: Vec<components::TableRow> = rows.iter().map(|row| {
+            let key = row.key.as_str();
+            let description = row.description.as_str();
+            let warning = row.warning.as_str();
+            // SEC-060: mask via the shared rule, not the `sensitive`
+            // flag alone.
+            let masked = ops::is_sensitive_key(key, i64::from(row.sensitive));
+            components::TableRow::new(vec![
+                html! { span .font-medium { (key) } },
+                html! {
+                    @if masked {
+                        code { "********" }
+                    } @else {
+                        code { (row.value) }
+                    }
+                },
+                html! {
+                    @if !description.is_empty() {
+                        span .text-muted { (description) }
+                    }
+                    @if let Some(pin) = variables::pin_of(row) {
+                        div .mt-1 { (pin_badge(pin)) }
+                    }
+                    @if !warning.is_empty() {
+                        div .text-warning-strong .text-xs .mt-1 {
+                            (ui::icons::triangle_alert()) (warning)
+                        }
+                    }
+                },
+                html! {
+                    div .flex .gap-1 {
+                        button .btn .btn--sm .btn--ghost
+                            hx-get={"/b/admin/variables/" (key) "/edit"}
+                            hx-target="#edit-var-modal"
+                            hx-swap="innerHTML"
+                            title="Edit"
+                            aria-label=(format!("Edit {key}"))
+                        { (icons::edit()) }
+                        // Same reasoning as the delete control below:
+                        // the flat listing is where an operator sent
+                        // here by a boot WARN naming one key actually
+                        // looks for it, so it must offer what the By
+                        // Block tables offer.
+                        @if offer_reset
+                            && variables::pin_of(row).is_some()
+                            && key_can_be_seeded_from_env(key)
+                        {
+                            (reset_to_environment_button(key))
+                        }
+                        // The flat listing offers the same control as
+                        // the Unowned table: this is where an operator
+                        // scanning for a legacy key actually looks, and
+                        // two tabs disagreeing about whether a row can
+                        // be removed is its own defect.
+                        @if key_is_deletable(key, &declared_shared) {
+                            (delete_button(key))
+                        }
+                    }
+                },
+            ])
+            .id(format!("var-row-{key}"))
+        }).collect();
 
-                (components::DataTable::new(&ALL_VAR_COLUMNS)
-                    .rows(table_rows)
-                    .empty(html! { p .text-center .text-muted { "No variables are set." } })
-                    .render())
-            }
-            Err(e) => (variables_read_error(e)),
-        }
-    }
-}
-
-/// What either tab shows in place of its table when the variables table
-/// cannot be listed.
-///
-/// The "By Block" tab cannot fall back to the declared vars and their
-/// defaults: a declared var reads as "at its default, not pinned" there, so a
-/// failed read would tell the operator every value they set is gone.
-fn variables_read_error(e: &WaferError) -> Markup {
-    html! {
-        div .login-error { "Failed to load variables: " (e.message) }
+        (components::DataTable::new(&ALL_VAR_COLUMNS)
+            .rows(table_rows)
+            .empty(html! { p .text-center .text-muted { "No variables are set." } })
+            .render())
     }
 }
 
@@ -692,7 +672,10 @@ fn variables_read_error(e: &WaferError) -> Markup {
 ///
 /// `all_vars` and `offer_reset` are the caller's — see [`settings_body`]. The
 /// rows arrive already read: a failed read never reaches this tab, because
-/// [`settings_body`] renders [`variables_read_error`] instead.
+/// [`settings_body`] answers it instead. It cannot fall back to the declared
+/// vars and their defaults: a declared var reads as "at its default, not
+/// pinned" here, so a failed read would tell the operator every value they
+/// set is gone.
 fn config_by_block_tab(
     ctx: &dyn Context,
     all_vars: &[variables::VariableRow],
@@ -890,7 +873,7 @@ pub async fn handle_create_variable(
     }
 
     // Re-render the variables page (htmx will swap #content)
-    variables_page(ctx, msg).await
+    variables_page(ctx, msg, "Variable created").await
 }
 
 /// `GET /b/admin/variables/{key}/edit` -- return modal edit form content.
@@ -1081,8 +1064,7 @@ pub async fn handle_update_variable(
     // reason `ops::stored_sensitive_flag`'s sibling read gives: this read names
     // its own table, so a `NotFound` really is a 500 — but a WRAP refusal is a
     // 403 and a quota a 429, and flattening those into "Internal server error"
-    // is the drift `tests/error_door.rs` exists to stop (it cannot catch this
-    // one; its own doc names the no-`NotFound`-arm blind spot).
+    // is the drift `tests/error_door.rs` exists to stop.
     let stored_flag = match variables::get_by_key(ctx, var_key).await {
         Ok(Some(row)) => i64::from(row.sensitive),
         Ok(None) => 0,
@@ -1113,7 +1095,7 @@ pub async fn handle_update_variable(
         return out;
     }
 
-    variables_page(ctx, msg).await
+    variables_page(ctx, msg, "Variable updated").await
 }
 
 /// `POST /b/admin/variables/{key}/reset-to-environment` — the Variables page's
@@ -1220,21 +1202,33 @@ mod tests {
     use super::*;
     use crate::test_support::{admin_msg, output_html, TestContext};
 
-    /// The "By Block" tab (the default) reports a failed read as the "All
-    /// Variables" tab does, instead of listing every declared var at its
-    /// default, unpinned — which tells the operator every value they set is
-    /// gone.
+    /// Both tabs answer a failed read with the error page, instead of the
+    /// "By Block" tab listing every declared var at its default, unpinned —
+    /// which tells the operator every value they set is gone.
     #[tokio::test]
-    async fn the_by_block_tab_reports_a_failed_read_instead_of_defaults() {
+    async fn a_failed_read_is_the_error_page_not_the_defaults() {
         let ctx = TestContext::with_admin().await.break_reads();
 
-        let html = variables_page_html(&ctx, "").await;
-
-        assert!(html.contains("Failed to load variables"), "{html}");
-        assert!(
-            !html.contains("WAFER_RUN_SHARED__APP_NAME"),
-            "a declared var rendered from its default: {html}"
-        );
+        for tab in ["", "all"] {
+            let mut msg = crate::blocks::admin::test_support::routed(admin_msg(
+                "retrieve",
+                "/b/admin/settings/variables",
+            ));
+            msg.set_meta("http.header.accept", "text/html");
+            if !tab.is_empty() {
+                msg.set_meta("req.query.tab", tab);
+            }
+            let parts = wafer_block::http_codec::collect_http_response(
+                crate::blocks::admin::pages::settings::settings_page(&ctx, &msg, "variables").await,
+            )
+            .await;
+            let html = String::from_utf8_lossy(&parts.body);
+            assert_eq!(parts.status, 500, "tab {tab:?}: {html}");
+            assert!(
+                !html.contains("WAFER_RUN_SHARED__APP_NAME"),
+                "tab {tab:?}: a declared var rendered from its default: {html}"
+            );
+        }
     }
 
     /// Serialize a rendered form the way a BROWSER would, so a test posts what
@@ -2488,6 +2482,7 @@ mod create_form_tests {
         let ctx = admin_ctx().await;
         let html = settings_body(&ctx, &admin_msg("retrieve", "/admin/settings"))
             .await
+            .expect("the variables read succeeds")
             .into_string();
         assert!(
             html.contains(r#"type="hidden" name="sensitive" value="0""#),
