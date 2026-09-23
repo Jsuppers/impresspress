@@ -279,14 +279,10 @@ pub async fn create_ticket(
     ))
 }
 
-pub async fn detail(ctx: &dyn Context, id: &str) -> Result<TicketDetail, ServiceError> {
-    let mut ticket = repo::get_ticket(ctx, id).await.map_err(ServiceError::Db)?;
-    let mut events = repo::list_events(ctx, id, 201)
-        .await
-        .map_err(ServiceError::Db)?;
-    let mut analyses = repo::list_analyses(ctx, id, 101)
-        .await
-        .map_err(ServiceError::Db)?;
+pub async fn detail(ctx: &dyn Context, id: &str) -> Result<TicketDetail, WaferError> {
+    let mut ticket = repo::get_ticket(ctx, id).await?;
+    let mut events = repo::list_events(ctx, id, 201).await?;
+    let mut analyses = repo::list_analyses(ctx, id, 101).await?;
     let events_truncated = events.len() > 200;
     let analyses_truncated = analyses.len() > 100;
     events.truncate(200);

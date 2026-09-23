@@ -7,7 +7,6 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::{config::SecurityReadiness, repo, service};
 use crate::{
     blocks::crud,
-    http::err_internal,
     ui::{self, components},
 };
 
@@ -52,7 +51,7 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let tickets =
         match repo::list_tickets(ctx, &filters, page_size.min(100) as i64, offset as i64).await {
             Ok(rows) => rows,
-            Err(error) => return err_internal("Could not load tickets", error),
+            Err(error) => return crud::db_error_page(msg, error, "Could not load tickets"),
         };
     let types = repo::list_types(ctx, false, 100, 0)
         .await
@@ -183,12 +182,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let id = msg.var("id");
     let detail = match service::detail(ctx, id).await {
         Ok(detail) => detail,
-        Err(service::ServiceError::Db(error)) => {
-            return crud::db_error(error, "Ticket not found", "Could not load ticket")
-        }
-        // `service::detail` reads only; the two domain variants are
-        // unreachable here, and an unreachable one is an internal fault.
-        Err(error) => return err_internal("Could not load ticket", error),
+        Err(error) => return crud::db_error(error, "Ticket not found", "Could not load ticket"),
     };
     let ticket = &detail.ticket;
     let report = &detail.untrusted_report;
@@ -394,7 +388,7 @@ pub async fn detail(ctx: &dyn Context, msg: &Message) -> OutputStream {
 pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let types = match repo::list_types(ctx, false, 100, 0).await {
         Ok(rows) => rows.records,
-        Err(error) => return err_internal("Could not load ticket types", error),
+        Err(error) => return crud::db_error_page(msg, error, "Could not load ticket types"),
     };
     let content = html! {
         (components::page_header(
@@ -668,5 +662,50 @@ mod denial_tests {
         let mut msg = admin_msg("retrieve", "/b/tickets/admin/tickets/any-id");
         endpoint_match::dispatch(&mut msg, crate::blocks::tickets::ROUTES);
         assert_eq!(output_http_status(detail(&ctx, &msg).await).await, 403);
+    }
+
+    /// The inbox and the ticket-types page each render from one list read. A
+    /// refused read is the styled 403 page, with none of the denial's own
+    /// text, through the block's own dispatch.
+    #[tokio::test]
+    async fn refused_list_pages_are_the_403_page() {
+        use wafer_block::ServiceOp;
+        use wafer_run::{Block, ErrorCode, InputStream, WaferError};
+
+        use crate::{blocks::tickets::TicketsBlock, test_support::FailingDbOpContext};
+
+        let ctx = TestContext::with_tickets().await;
+        let mut misses = Vec::new();
+        for (table, path) in [
+            (repo::TICKETS, "/b/tickets/admin/tickets"),
+            (repo::TYPES, "/b/tickets/admin/types"),
+        ] {
+            let failing = FailingDbOpContext::failing_with(
+                ctx.clone(),
+                ServiceOp::DATABASE_OPS
+                    .iter()
+                    .map(|op| (*op, table))
+                    .collect(),
+                WaferError::new(
+                    ErrorCode::PermissionDenied,
+                    "WRAP: impresspress/tickets holds no grant on this table",
+                ),
+            );
+            let mut msg = admin_msg("retrieve", path);
+            msg.set_meta("http.header.accept", "text/html");
+            let out = TicketsBlock::new()
+                .handle(&failing, msg, InputStream::empty())
+                .await;
+            let parts = wafer_block::http_codec::collect_http_response(out).await;
+            let html = String::from_utf8_lossy(&parts.body);
+            if parts.status != 403 || !html.contains("Go home") || html.contains("holds no grant") {
+                misses.push(format!("{path}: {} {html}", parts.status));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "expected the 403 page at every site:\n{}",
+            misses.join("\n")
+        );
     }
 }
