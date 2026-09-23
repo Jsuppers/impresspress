@@ -1355,7 +1355,7 @@
                               "type": "string"
                             },
                             "uploaded_at": {
-                              "description": "When the upload was reserved — the timestamp the object browser\nrenders as \"modified\", and the one `delete_stale_pending` compares.",
+                              "description": "When the upload was reserved — the timestamp the object browser\nrenders as \"modified\", and the one `list_stale_pending` compares.",
                               "type": "string"
                             },
                             "uploaded_by": {

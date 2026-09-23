@@ -13523,7 +13523,7 @@ export interface paths {
                                     updated_at: string;
                                     /**
                                      * @description When the upload was reserved — the timestamp the object browser
-                                     *     renders as "modified", and the one `delete_stale_pending` compares.
+                                     *     renders as "modified", and the one `list_stale_pending` compares.
                                      */
                                     uploaded_at: string;
                                     uploaded_by: string;
