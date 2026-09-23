@@ -1403,45 +1403,6 @@ pub(crate) async fn claim_for_checkout(
     .await
 }
 
-/// Atomic admin refund: `completed` -> `refunded` with audit fields. Returns
-/// rows affected (0 = not completed / already refunded).
-#[cfg(test)]
-pub(crate) async fn refund_atomic(
-    ctx: &dyn Context,
-    id: &str,
-    refunded_by: &str,
-    reason: &str,
-) -> Result<i64, WaferError> {
-    let purchase = get(ctx, id).await?;
-    let total = purchase.i64_field("total_cents");
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-    data.insert("status".into(), serde_json::json!(OrderStatus::Refunded));
-    data.insert("refunded_at".into(), serde_json::json!(&now));
-    data.insert("refunded_by".into(), serde_json::json!(refunded_by));
-    data.insert("refund_reason".into(), serde_json::json!(reason));
-    data.insert("refunded_total_cents".into(), serde_json::json!(total));
-    data.insert("updated_at".into(), serde_json::json!(&now));
-    db::update_by_filters_count(
-        ctx,
-        PURCHASES_TABLE,
-        vec![
-            Filter {
-                field: "id".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(id),
-            },
-            Filter {
-                field: "status".into(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(OrderStatus::Completed),
-            },
-        ],
-        data,
-    )
-    .await
-}
-
 /// Reconcile an authoritative cumulative refunded amount from a successful
 /// provider response or webhook. The expected-current filter makes retries
 /// idempotent and prevents a late smaller total from overwriting newer state.

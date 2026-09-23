@@ -107,10 +107,14 @@ const SQL_004_POSTGRES: &str = include_str!("004_user_roles_unique.postgres.sql"
 /// Order here is the apply order.
 pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("001_admin_schema", SQL_001_SQLITE),
-    ("002_variables_block_column", SQL_002_SQLITE),
+    (VARIABLES_BLOCK_COLUMN, SQL_002_SQLITE),
     ("003_block_settings_seed_hash", SQL_003_SQLITE),
     (USER_ROLES_UNIQUE, SQL_004_SQLITE),
 ];
+
+/// Basename of the `variables.block` column + backfill, named once so the
+/// migration list and the test that slices it cannot drift apart.
+pub(crate) const VARIABLES_BLOCK_COLUMN: &str = "002_variables_block_column";
 
 /// Basename of the grant-uniqueness repair, named once so the migration list
 /// and the test that slices it cannot drift apart.
@@ -303,5 +307,195 @@ mod user_roles_unique_tests {
             .is_err(),
             "the index is in place, so the grant cannot be repeated again"
         );
+    }
+}
+
+#[cfg(test)]
+mod variables_block_column_tests {
+    //! What `002_variables_block_column` does to a deployment whose
+    //! `variables` table already holds rows — the only database its backfill
+    //! `UPDATE` has anything to do on. Every other fixture applies the whole
+    //! list against an empty table, so a backfill that derived the wrong
+    //! prefix, or none at all, would pass there and first show up on a real
+    //! upgrade as every block-scoped variable grouped under no block.
+
+    use std::collections::HashMap;
+
+    use serde_json::json;
+    use wafer_block::db::ListOptions;
+    use wafer_core::clients::database as db;
+
+    use super::{SQLITE_MIGRATIONS, VARIABLES_BLOCK_COLUMN};
+    use crate::{migration_helper, platform_state::variables, test_support::TestContext};
+
+    const ADMIN: &str = "impresspress/admin";
+
+    /// The shipped migrations up to (`through: false`) or including
+    /// (`through: true`) 002, sliced out of the list by name so an unwired
+    /// 002 cannot pass as applied.
+    fn up_to_002(through: bool) -> Vec<&'static str> {
+        let at = SQLITE_MIGRATIONS
+            .iter()
+            .position(|(name, _)| *name == VARIABLES_BLOCK_COLUMN)
+            .expect("002 is wired into SQLITE_MIGRATIONS");
+        let end = if through { at + 1 } else { at };
+        SQLITE_MIGRATIONS[..end]
+            .iter()
+            .map(|(_, sql)| *sql)
+            .collect()
+    }
+
+    fn all() -> Vec<&'static str> {
+        SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect()
+    }
+
+    /// Insert a pre-002 `variables` row: every NOT NULL column 001 declares,
+    /// and no `block`, which 001 does not have.
+    async fn insert_var(ctx: &TestContext, key: &str) {
+        let mut data: HashMap<String, serde_json::Value> = HashMap::new();
+        data.insert("id".to_string(), json!(format!("v-{key}")));
+        data.insert("key".to_string(), json!(key));
+        data.insert("value".to_string(), json!("v"));
+        data.insert("name".to_string(), json!(""));
+        data.insert("description".to_string(), json!(""));
+        data.insert("warning".to_string(), json!(""));
+        data.insert("sensitive".to_string(), json!(0));
+        data.insert("updated_by".to_string(), json!(""));
+        data.insert("created_at".to_string(), json!("2026-05-16T00:00:00Z"));
+        data.insert("updated_at".to_string(), json!("2026-05-16T00:00:00Z"));
+        db::create(ctx, variables::TABLE, data)
+            .await
+            .unwrap_or_else(|e| panic!("create row {key}: {e}"));
+    }
+
+    async fn block_of(ctx: &TestContext, key: &str) -> Option<String> {
+        let rows = db::list(
+            ctx,
+            variables::TABLE,
+            &ListOptions {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list variables");
+        let row = rows
+            .records
+            .into_iter()
+            .find(|r| r.data.get("key").and_then(|v| v.as_str()) == Some(key))
+            .unwrap_or_else(|| panic!("row with key={key} not found"));
+        row.data
+            .get("block")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    /// The four key shapes the backfill has to tell apart.
+    const KEYS: [&str; 4] = [
+        "WAFER_RUN__AUTH__JWT_SECRET",
+        "WAFER_RUN__SQLITE__DB_PATH",
+        "WAFER_RUN_SHARED__SITE_TITLE",
+        "NO_DOUBLE_UNDERSCORE",
+    ];
+
+    async fn assert_backfilled(ctx: &TestContext) {
+        assert_eq!(
+            block_of(ctx, KEYS[0]).await.as_deref(),
+            Some("WAFER_RUN__AUTH")
+        );
+        assert_eq!(
+            block_of(ctx, KEYS[1]).await.as_deref(),
+            Some("WAFER_RUN__SQLITE")
+        );
+        // One `__` (the shared namespace) names no block.
+        assert_eq!(block_of(ctx, KEYS[2]).await, None);
+        // Neither does a key with no `__` at all.
+        assert_eq!(block_of(ctx, KEYS[3]).await, None);
+    }
+
+    #[tokio::test]
+    async fn migration_002_adds_block_column_and_index() {
+        let ctx = TestContext::new().await;
+        migration_helper::apply_migrations(&ctx, ADMIN, &all(), &[])
+            .await
+            .expect("apply migrations");
+
+        let cols = db::query_raw(
+            &ctx,
+            "PRAGMA table_info(impresspress__admin__variables)",
+            &[],
+        )
+        .await
+        .expect("pragma table_info");
+        let col_names: Vec<String> = cols
+            .iter()
+            .filter_map(|r| {
+                r.data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            col_names.contains(&"block".to_string()),
+            "expected `block` column in variables, got: {col_names:?}"
+        );
+
+        let idx = db::query_raw(
+            &ctx,
+            "SELECT name FROM sqlite_master WHERE type='index' \
+             AND name='impresspress__admin__variables_block_idx'",
+            &[],
+        )
+        .await
+        .expect("query sqlite_master for index");
+        assert_eq!(idx.len(), 1, "expected the block index to exist");
+    }
+
+    /// 001 alone, then rows, then the shipped list the way an operator
+    /// upgrading with `--run-migrations` applies it: the backfill in 002 is
+    /// what populates `block`, not anything the test runs itself.
+    #[tokio::test]
+    async fn migration_002_backfills_block_on_rows_written_before_it() {
+        let mut ctx = TestContext::new().await;
+        migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(false), &[])
+            .await
+            .expect("001 applies");
+        for key in KEYS {
+            insert_var(&ctx, key).await;
+        }
+
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+        migration_helper::apply_migrations(&ctx, ADMIN, &all(), &[])
+            .await
+            .expect("002 applies to a database holding variables");
+
+        assert_backfilled(&ctx).await;
+    }
+
+    /// The gate re-runs the whole concatenated list from 001 whenever its
+    /// hash changes — here, a deployment that stopped at 002 upgrading to the
+    /// full list. 002's `ADD COLUMN` then meets a column that already exists
+    /// and its backfill meets rows it already filled; both must pass through
+    /// without failing the batch or disturbing a derived value.
+    #[tokio::test]
+    async fn migration_002_survives_a_re_run_of_the_whole_list() {
+        let mut ctx = TestContext::new().await;
+        migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(false), &[])
+            .await
+            .expect("001 applies");
+        for key in KEYS {
+            insert_var(&ctx, key).await;
+        }
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+        migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(true), &[])
+            .await
+            .expect("001-002 apply");
+
+        migration_helper::apply_migrations(&ctx, ADMIN, &all(), &[])
+            .await
+            .expect("re-running 001-002 inside the full list succeeds");
+
+        assert_backfilled(&ctx).await;
     }
 }
