@@ -15,6 +15,10 @@ use crate::cli::{
 const RUNTIME_SITE_REL: &str = "data/storage/wafer-run/web/site";
 
 pub async fn build(repo_root: &Path, _release: bool) -> Result<()> {
+    // A malformed `impresspress.toml` fails the build here, before any work;
+    // only an absent file means "no overlays".
+    let cfg = config::find_and_load(repo_root)?;
+
     // 1. wafer build per block.
     blocks::build_all(repo_root).await?;
 
@@ -25,7 +29,7 @@ pub async fn build(repo_root: &Path, _release: bool) -> Result<()> {
     }
 
     // 3. Optional overlays from impresspress.toml.
-    if let Ok((cfg, root)) = config::find_and_load(repo_root) {
+    if let Some((cfg, root)) = cfg {
         let dst = root.join(RUNTIME_SITE_REL);
         overlays::apply_overlays(&cfg, &root, &dst)?;
     }

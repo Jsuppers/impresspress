@@ -108,7 +108,12 @@ use std::path::{Path, PathBuf};
 /// Walk up from `start` looking for `impresspress.toml`; parse and return
 /// `(config, repo_root)` where `repo_root` is the directory that contains
 /// the file.
-pub fn find_and_load(start: &Path) -> anyhow::Result<(Config, PathBuf)> {
+///
+/// `Ok(None)` means no `impresspress.toml` exists in `start` or any parent —
+/// the only outcome a caller may treat as "no config". A file that exists but
+/// cannot be read or parsed is an `Err`: falling back to defaults there would
+/// silently drop every setting the operator wrote.
+pub fn find_and_load(start: &Path) -> anyhow::Result<Option<(Config, PathBuf)>> {
     let start = start
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("canonicalize {start:?}: {e}"))?;
@@ -119,17 +124,21 @@ pub fn find_and_load(start: &Path) -> anyhow::Result<(Config, PathBuf)> {
             let text = std::fs::read_to_string(&candidate)
                 .map_err(|e| anyhow::anyhow!("read {candidate:?}: {e}"))?;
             let cfg = parse(&text).map_err(|e| anyhow::anyhow!("parse {candidate:?}: {e}"))?;
-            return Ok((cfg, cur.to_path_buf()));
+            return Ok(Some((cfg, cur.to_path_buf())));
         }
         match cur.parent() {
             Some(p) => cur = p,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "no impresspress.toml found in {start:?} or any parent directory"
-                ));
-            }
+            None => return Ok(None),
         }
     }
+}
+
+/// [`find_and_load`] for flows that cannot run without an `impresspress.toml`:
+/// a missing file is an error too.
+pub fn find_and_load_required(start: &Path) -> anyhow::Result<(Config, PathBuf)> {
+    find_and_load(start)?.ok_or_else(|| {
+        anyhow::anyhow!("no impresspress.toml found in {start:?} or any parent directory")
+    })
 }
 
 #[cfg(test)]
@@ -236,7 +245,7 @@ boot_redirect = "/"
         let nested = root.join("sub/dir");
         fs::create_dir_all(&nested).unwrap();
 
-        let (cfg, repo_root) = find_and_load(&nested).unwrap();
+        let (cfg, repo_root) = find_and_load(&nested).unwrap().unwrap();
         assert_eq!(cfg.app.name, "x");
         assert_eq!(
             repo_root.canonicalize().unwrap(),
@@ -247,9 +256,18 @@ boot_redirect = "/"
     #[test]
     fn find_config_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = find_and_load(tmp.path()).unwrap_err().to_string();
+        assert!(find_and_load(tmp.path()).unwrap().is_none());
+        let err = find_and_load_required(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("impresspress.toml"));
         assert!(err.contains("no"));
+    }
+
+    #[test]
+    fn find_config_malformed_is_an_error_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("impresspress.toml"), "[app\n").unwrap();
+        let err = find_and_load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("parse"), "{err}");
     }
 
     #[test]
