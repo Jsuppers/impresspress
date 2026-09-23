@@ -1063,19 +1063,24 @@ mod tests {
         let (mut ctx, thread_id, chat_calls) = chat_fixture().await;
         ctx.register_block("impresspress/llm", Arc::new(stub_block()));
 
-        for path in ["/b/llm/api/chat", "/b/llm/api/chat/stream"] {
+        let paths = ["/b/llm/api/chat", "/b/llm/api/chat/stream"];
+        let mut refused = Vec::new();
+        for path in paths {
             let out = ctx
                 .dispatch_with_input(
                     crate::test_support::auth_msg("create", path, "user-b"),
                     chat_body(&thread_id),
                 )
                 .await;
-            assert_eq!(
-                crate::test_support::output_http_status(out).await,
-                404,
-                "{path}: user-b must not be able to post into user-a's thread"
-            );
+            let status = crate::test_support::output_http_status(out).await;
+            if status != 404 {
+                refused.push(format!("{path}: {status}"));
+            }
         }
+        assert!(
+            refused.is_empty(),
+            "user-b must not be able to post into user-a's thread, expected 404 on: {refused:?}"
+        );
 
         assert_eq!(
             chat_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1098,6 +1103,26 @@ mod tests {
             entries.records.is_empty(),
             "user-a's thread gained turns it never wrote: {:?}",
             entries.records
+        );
+
+        // The same dispatch as the owner succeeds on both paths, so the 404s
+        // above are the owner check and not a route that failed to match.
+        let mut failed = Vec::new();
+        for path in paths {
+            let out = ctx
+                .dispatch_with_input(
+                    crate::test_support::auth_msg("create", path, "user-a"),
+                    chat_body(&thread_id),
+                )
+                .await;
+            let status = crate::test_support::output_http_status(out).await;
+            if status != 200 {
+                failed.push(format!("{path}: {status}"));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "the thread's owner must be able to chat on both paths, got: {failed:?}"
         );
     }
 

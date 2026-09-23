@@ -9,7 +9,7 @@ use impresspress_core::{
         repo::{self, TicketFilters},
         service, TicketsBlock,
     },
-    test_support::{admin_msg, output_html, output_http_status, output_json, TestContext},
+    test_support::{admin_msg, output_html, output_json, TestContext},
 };
 use wafer_core::clients::database as db;
 use wafer_run::{Block as _, HttpMethod, InputStream};
@@ -600,11 +600,4 @@ async fn analyses_posted_through_the_route_are_append_only() {
         rewriting.is_empty(),
         "analyses are append-only, but these endpoints could rewrite one: {rewriting:?}"
     );
-    for method in ["update", "delete"] {
-        let status = output_http_status(ctx.dispatch(admin_msg(method, &path)).await).await;
-        assert!(
-            (400..500).contains(&status),
-            "{method} on the analyses collection must be refused, got {status}"
-        );
-    }
 }

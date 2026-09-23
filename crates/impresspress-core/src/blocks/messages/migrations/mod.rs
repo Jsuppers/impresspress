@@ -94,14 +94,8 @@ mod tests {
         // entries. A dropped ALTER changes this count instead of being
         // masked by the header comment's prose.
         assert_eq!(count_alter_add_column(sql), 2);
-        // Backfill #1: contexts.owner_id from historical sender_id.
-        assert!(sql.contains("owner_id = sender_id"));
-        // Backfill #2: entries.owner_id from the parent context's
-        // owner_id, correlated on context_id. Deleting either backfill
-        // statement drops one of these substrings.
-        assert!(sql.contains("UPDATE impresspress__messages__entries"));
-        assert!(sql.contains("c.owner_id"));
-        assert!(sql.contains("context_id"));
+        // The two backfills are executed, not grepped, in
+        // `owner_id_backfill_tests`.
         assert!(sql.contains("idx_messages_contexts_owner_id"));
         assert!(sql.contains("idx_messages_entries_owner_id"));
     }
