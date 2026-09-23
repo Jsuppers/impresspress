@@ -317,22 +317,26 @@ mod variables_block_column_tests {
     //! `UPDATE` has anything to do on. Every other fixture applies the whole
     //! list against an empty table, so a backfill that derived the wrong
     //! prefix, or none at all, would pass there and first show up on a real
-    //! upgrade as every block-scoped variable grouped under no block.
+    //! upgrade as block-scoped variables grouped under no block.
+    //!
+    //! Rows are written and read back through `platform_state::variables`,
+    //! the module that owns the table, so what is asserted is the `block`
+    //! the config loader sees.
 
-    use std::collections::HashMap;
-
-    use serde_json::json;
-    use wafer_block::db::ListOptions;
     use wafer_core::clients::database as db;
 
     use super::{SQLITE_MIGRATIONS, VARIABLES_BLOCK_COLUMN};
-    use crate::{migration_helper, platform_state::variables, test_support::TestContext};
+    use crate::{
+        migration_helper,
+        platform_state::variables::{self, NewVariable},
+        test_support::TestContext,
+    };
 
     const ADMIN: &str = "impresspress/admin";
 
-    /// The shipped migrations up to (`through: false`) or including
-    /// (`through: true`) 002, sliced out of the list by name so an unwired
-    /// 002 cannot pass as applied.
+    /// The shipped migrations before 002 (`through: false`) or up to and
+    /// including it (`through: true`), sliced out of the list by name so an
+    /// unwired 002 cannot pass as applied.
     fn up_to_002(through: bool) -> Vec<&'static str> {
         let at = SQLITE_MIGRATIONS
             .iter()
@@ -349,68 +353,59 @@ mod variables_block_column_tests {
         SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect()
     }
 
-    /// Insert a pre-002 `variables` row: every NOT NULL column 001 declares,
-    /// and no `block`, which 001 does not have.
-    async fn insert_var(ctx: &TestContext, key: &str) {
-        let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-        data.insert("id".to_string(), json!(format!("v-{key}")));
-        data.insert("key".to_string(), json!(key));
-        data.insert("value".to_string(), json!("v"));
-        data.insert("name".to_string(), json!(""));
-        data.insert("description".to_string(), json!(""));
-        data.insert("warning".to_string(), json!(""));
-        data.insert("sensitive".to_string(), json!(0));
-        data.insert("updated_by".to_string(), json!(""));
-        data.insert("created_at".to_string(), json!("2026-05-16T00:00:00Z"));
-        data.insert("updated_at".to_string(), json!("2026-05-16T00:00:00Z"));
-        db::create(ctx, variables::TABLE, data)
-            .await
-            .unwrap_or_else(|e| panic!("create row {key}: {e}"));
-    }
-
-    async fn block_of(ctx: &TestContext, key: &str) -> Option<String> {
-        let rows = db::list(
-            ctx,
-            variables::TABLE,
-            &ListOptions {
-                limit: 100,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("list variables");
-        let row = rows
-            .records
-            .into_iter()
-            .find(|r| r.data.get("key").and_then(|v| v.as_str()) == Some(key))
-            .unwrap_or_else(|| panic!("row with key={key} not found"));
-        row.data
-            .get("block")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    }
-
-    /// The four key shapes the backfill has to tell apart.
-    const KEYS: [&str; 4] = [
-        "WAFER_RUN__AUTH__JWT_SECRET",
-        "WAFER_RUN__SQLITE__DB_PATH",
-        "WAFER_RUN_SHARED__SITE_TITLE",
-        "NO_DOUBLE_UNDERSCORE",
+    /// The key shapes the backfill has to tell apart, with the `block` each
+    /// must end up with: two block-scoped keys (`{ORG}__{BLOCK}__NAME`), one
+    /// with a single `__` (the shape of the `WAFER_RUN_SHARED__` namespace),
+    /// one with none, and two whose runs of underscores make the second
+    /// separator easy to misplace. Invented names, so that no declared key is
+    /// respelled here.
+    const CASES: [(&str, Option<&str>); 6] = [
+        ("ACME__WIDGETS__API_TOKEN", Some("ACME__WIDGETS")),
+        ("ACME__STORE__DB_PATH", Some("ACME__STORE")),
+        ("ACME_SHARED__SITE_TITLE", None),
+        ("NO_DOUBLE_UNDERSCORE", None),
+        ("ACME____EMPTY_BLOCK", Some("ACME__")),
+        ("ACME___ODD__NAME", Some("ACME___ODD")),
     ];
 
+    /// A row as a pre-002 build wrote it: no `block`, which 001 has no
+    /// column for.
+    async fn seed_pre_002(ctx: &TestContext) {
+        for (key, _) in CASES {
+            variables::insert(
+                ctx,
+                NewVariable {
+                    key: key.to_string(),
+                    value: "v".to_string(),
+                    name: String::new(),
+                    description: String::new(),
+                    warning: String::new(),
+                    sensitive: false,
+                    updated_by: String::new(),
+                    block: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed {key}: {e}"));
+        }
+    }
+
+    /// Every row carries the block its key names — and the same block the
+    /// Rust derivation gives a row seeded after the upgrade, which
+    /// `config_vars::key_block_prefix` promises is byte-for-byte this SQL.
     async fn assert_backfilled(ctx: &TestContext) {
-        assert_eq!(
-            block_of(ctx, KEYS[0]).await.as_deref(),
-            Some("WAFER_RUN__AUTH")
-        );
-        assert_eq!(
-            block_of(ctx, KEYS[1]).await.as_deref(),
-            Some("WAFER_RUN__SQLITE")
-        );
-        // One `__` (the shared namespace) names no block.
-        assert_eq!(block_of(ctx, KEYS[2]).await, None);
-        // Neither does a key with no `__` at all.
-        assert_eq!(block_of(ctx, KEYS[3]).await, None);
+        for (key, expected) in CASES {
+            let row = variables::get_by_key(ctx, key)
+                .await
+                .expect("read variable")
+                .unwrap_or_else(|| panic!("row {key} is gone"));
+            assert_eq!(row.block.as_deref(), expected, "block for {key}");
+            assert_eq!(
+                row.block,
+                variables::block_for_key(key),
+                "the backfill and block_for_key disagree on {key}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -461,9 +456,7 @@ mod variables_block_column_tests {
         migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(false), &[])
             .await
             .expect("001 applies");
-        for key in KEYS {
-            insert_var(&ctx, key).await;
-        }
+        seed_pre_002(&ctx).await;
 
         ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
         migration_helper::apply_migrations(&ctx, ADMIN, &all(), &[])
@@ -484,9 +477,7 @@ mod variables_block_column_tests {
         migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(false), &[])
             .await
             .expect("001 applies");
-        for key in KEYS {
-            insert_var(&ctx, key).await;
-        }
+        seed_pre_002(&ctx).await;
         ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
         migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(true), &[])
             .await
