@@ -72,7 +72,7 @@ async fn wrap_grants_are_read_through_the_database_service() {
     assert!(
         grants.iter().any(|g| g.grantee == "impresspress/files"
             && g.resource == "impresspress__files__objects"
-            && g.write),
+            && g.write == wafer_block::GrantWrite::Full),
         "a grant seeded through the database service must be installed on the runtime, got: {grants:?}"
     );
     assert!(

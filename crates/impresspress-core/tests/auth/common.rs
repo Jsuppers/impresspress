@@ -166,9 +166,18 @@ impl Context for AsAuthUi {
         &self,
         _resource: &str,
         _resource_type: wafer_run::ResourceType,
-        _is_write: bool,
+        _access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         Ok(())
+    }
+
+    fn resource_access_admitted(
+        &self,
+        _resource: &str,
+        _resource_type: wafer_run::ResourceType,
+        _access: wafer_block::ResourceAccess,
+    ) -> bool {
+        true
     }
 
     fn clone_arc(&self) -> Arc<dyn Context> {
@@ -211,9 +220,18 @@ impl Context for MigrationTestCtx {
         &self,
         _resource: &str,
         _resource_type: wafer_run::ResourceType,
-        _is_write: bool,
+        _access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         Ok(())
+    }
+
+    fn resource_access_admitted(
+        &self,
+        _resource: &str,
+        _resource_type: wafer_run::ResourceType,
+        _access: wafer_block::ResourceAccess,
+    ) -> bool {
+        true
     }
 
     fn clone_arc(&self) -> Arc<dyn Context> {

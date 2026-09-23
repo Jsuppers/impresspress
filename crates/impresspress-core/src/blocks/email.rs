@@ -881,7 +881,7 @@ mod tests {
             &self,
             _resource: &str,
             resource_type: wafer_run::ResourceType,
-            _is_write: bool,
+            _access: wafer_block::ResourceAccess,
         ) -> Result<(), wafer_run::WaferError> {
             if resource_type == wafer_run::ResourceType::Network {
                 Ok(())
@@ -891,6 +891,14 @@ mod tests {
                     "ConfigCtx grants network access only",
                 ))
             }
+        }
+        fn resource_access_admitted(
+            &self,
+            _resource: &str,
+            resource_type: wafer_run::ResourceType,
+            _access: wafer_block::ResourceAccess,
+        ) -> bool {
+            resource_type == wafer_run::ResourceType::Network
         }
         fn clone_arc(&self) -> Arc<dyn Context> {
             Arc::new(self.clone())

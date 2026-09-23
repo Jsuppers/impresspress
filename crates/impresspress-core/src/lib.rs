@@ -99,12 +99,12 @@ pub use isolate_cell::{IdentityCache, IsolateCell};
 pub use migration_helper::db_backend;
 pub use pipeline::handle_request;
 pub use prepared_plan::{
-    PreparedApplication, PreparedBlockImplementation, PreparedBlockRuntime, PreparedPlanError,
-    PreparedReleaseAssets, PreparedResourceGrant, PreparedResourceType, PreparedRoute,
-    PreparedRouteAccess, PreparedRuntimePlan, PreparedRuntimePlanSummary, PreparedRuntimeStructure,
-    WaferLockIdentity, PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR,
-    PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_RUNTIME_PLAN_SCHEMA_VERSION,
-    PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
-    RELEASE_ASSET_MANIFEST_SHA256_VAR, UNBOUND_CONFIG_GENERATION,
+    PreparedApplication, PreparedBlockImplementation, PreparedBlockRuntime, PreparedGrantWrite,
+    PreparedPlanError, PreparedReleaseAssets, PreparedResourceGrant, PreparedResourceType,
+    PreparedRoute, PreparedRouteAccess, PreparedRuntimePlan, PreparedRuntimePlanSummary,
+    PreparedRuntimeStructure, WaferLockIdentity, PREPARED_APPLICATION_BUILD_SHA256_VAR,
+    PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
+    PREPARED_RUNTIME_PLAN_SCHEMA_VERSION, PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR,
+    RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR, UNBOUND_CONFIG_GENERATION,
 };
 pub use routing::{ExtraRoute, RouteAccess};

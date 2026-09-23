@@ -746,7 +746,7 @@ impl DatabaseService for D1DatabaseService {
     // silent success that only surfaces later as a confusing "no such table" / "no
     // such column" from the next query. Instead each returns an explicit error so a
     // mistaken runtime schema mutation on D1 fails loudly and names the fix (edit the
-    // block's migration files). `schema_table_exists` is a read and stays live.
+    // block's migration files). `schema_table_exists` and `schema_columns` are reads and stay live.
 
     async fn ensure_schema_table(&self, table: &Table) -> Result<(), DatabaseError> {
         Err(schema_mutation_unsupported(
@@ -757,6 +757,10 @@ impl DatabaseService for D1DatabaseService {
 
     async fn schema_table_exists(&self, name: &str) -> Result<bool, DatabaseError> {
         DbExec::schema_table_exists(self, name).await
+    }
+
+    async fn schema_columns(&self, table: &str) -> Result<Vec<String>, DatabaseError> {
+        DbExec::schema_columns(self, table).await
     }
 
     async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {

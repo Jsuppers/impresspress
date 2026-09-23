@@ -17,7 +17,7 @@ use super::ImpresspressBuilder;
 use crate::{
     features::BlockSettings,
     prepared_plan::{
-        PreparedBlockImplementation, PreparedBlockRuntime, PreparedPlanError,
+        PreparedBlockImplementation, PreparedBlockRuntime, PreparedGrantWrite, PreparedPlanError,
         PreparedReleaseAssets, PreparedResourceGrant, PreparedResourceType, PreparedRoute,
         PreparedRouteAccess, PreparedRuntimePlan, PreparedRuntimeStructure, WaferLockIdentity,
     },
@@ -406,7 +406,11 @@ impl From<&wafer_run::ResourceGrant> for PreparedResourceGrant {
         Self {
             grantee: grant.grantee.clone(),
             resource: grant.resource.clone(),
-            write: grant.write,
+            write: match grant.write {
+                wafer_block::GrantWrite::None => PreparedGrantWrite::Read,
+                wafer_block::GrantWrite::Full => PreparedGrantWrite::ReadWrite,
+                wafer_block::GrantWrite::Append => PreparedGrantWrite::Append,
+            },
             resource_type: grant.resource_type.as_ref().map(|kind| match kind {
                 wafer_run::ResourceType::Db => PreparedResourceType::Db,
                 wafer_run::ResourceType::Config => PreparedResourceType::Config,
@@ -424,7 +428,11 @@ impl From<PreparedResourceGrant> for wafer_run::ResourceGrant {
         Self {
             grantee: grant.grantee,
             resource: grant.resource,
-            write: grant.write,
+            write: match grant.write {
+                PreparedGrantWrite::Read => wafer_block::GrantWrite::None,
+                PreparedGrantWrite::ReadWrite => wafer_block::GrantWrite::Full,
+                PreparedGrantWrite::Append => wafer_block::GrantWrite::Append,
+            },
             resource_type: grant.resource_type.map(|kind| match kind {
                 PreparedResourceType::Db => wafer_run::ResourceType::Db,
                 PreparedResourceType::Config => wafer_run::ResourceType::Config,

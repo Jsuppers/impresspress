@@ -170,10 +170,20 @@ impl wafer_run::context::Context for RefusingConfig {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.inner
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {

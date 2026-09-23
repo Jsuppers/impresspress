@@ -617,6 +617,10 @@ impl DatabaseService for ScopedDatabaseService {
         self.current()?.schema_table_exists(name).await
     }
 
+    async fn schema_columns(&self, table: &str) -> Result<Vec<String>, DatabaseError> {
+        self.current()?.schema_columns(table).await
+    }
+
     async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
         self.current()?.schema_drop_table(name).await
     }

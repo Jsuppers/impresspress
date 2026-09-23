@@ -803,7 +803,7 @@ mod tests {
         let site_grant = &grants[0];
         assert_eq!(site_grant.grantee, BLOCK_NAME);
         assert_eq!(site_grant.resource, "wafer-run/web/site/*");
-        assert!(site_grant.write);
+        assert_eq!(site_grant.write, wafer_block::GrantWrite::Full);
         // Typed to Storage: an untyped grant would also admit a database
         // collection or config key that happened to match the pattern.
         assert_eq!(
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(db_grants.len(), data_snapshot::TABLE_ALLOWLIST.len());
         for grant in db_grants {
             assert_eq!(grant.grantee, BLOCK_NAME);
-            assert!(grant.write);
+            assert_eq!(grant.write, wafer_block::GrantWrite::Full);
             assert_eq!(grant.resource_type, Some(wafer_run::ResourceType::Db));
             assert!(
                 !grant.resource.ends_with('*'),

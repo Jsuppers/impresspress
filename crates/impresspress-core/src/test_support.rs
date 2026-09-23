@@ -1275,6 +1275,7 @@ wafer_core::forward_database_service! {
             ensure_schema_table: forward,
             ensure_schema_tables: forward,
             schema_table_exists: forward,
+            schema_columns: forward,
             schema_drop_table: forward,
             schema_add_column: forward,
             set_strict_schema: forward,
@@ -1608,6 +1609,13 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
         self.inner.schema_table_exists(name).await
     }
 
+    async fn schema_columns(
+        &self,
+        table: &str,
+    ) -> Result<Vec<String>, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.schema_columns(table).await
+    }
+
     async fn schema_drop_table(
         &self,
         name: &str,
@@ -1889,6 +1897,13 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingWrite
         self.inner.schema_table_exists(name).await
     }
 
+    async fn schema_columns(
+        &self,
+        table: &str,
+    ) -> Result<Vec<String>, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.schema_columns(table).await
+    }
+
     async fn schema_drop_table(
         &self,
         name: &str,
@@ -1923,19 +1938,32 @@ impl Context for TestContext {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         if let Some(ref caller) = self.caller_id {
             wafer_block::wrap::check_access(
                 Some(caller.as_str()),
                 resource,
-                is_write,
+                access,
                 Some(&resource_type),
                 &self.wrap_grants,
                 &self.wrap_admin_block,
             )?;
         }
         Ok(())
+    }
+
+    /// The same decision as [`Self::check_resource_access`], without the
+    /// error — `RuntimeContext::resource_access_admitted` answers from the
+    /// same check the same way.
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.check_resource_access(resource, resource_type, access)
+            .is_ok()
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
@@ -1990,33 +2018,13 @@ impl Context for TestContext {
             }
         }
 
-        // Gate 3: WRAP (only when the test opted in via `with_wrap`).
-        // Mirrors `RuntimeContext::check_resource_access`, which production
-        // reaches from the service handler's `decode_and_authorize` — same
-        // `check_access` callsite shape, one frame earlier.
-        if let Some(ref caller) = self.caller_id {
-            let resource = msg.get_meta(wafer_block::meta::META_WRAP_RESOURCE);
-            if !resource.is_empty() {
-                let is_write = msg.get_meta(wafer_block::meta::META_WRAP_ACCESS) == "write";
-                let rt_str = msg.get_meta(wafer_block::meta::META_WRAP_RESOURCE_TYPE);
-                let rt = wafer_run::ResourceType::parse_stored(if rt_str.is_empty() {
-                    None
-                } else {
-                    Some(rt_str)
-                })
-                .unwrap_or_else(|e| panic!("test WRAP resource_type meta {rt_str:?}: {e}"));
-                if let Err(e) = wafer_block::wrap::check_access(
-                    Some(caller.as_str()),
-                    resource,
-                    is_write,
-                    rt.as_ref(),
-                    &self.wrap_grants,
-                    &self.wrap_admin_block,
-                ) {
-                    return OutputStream::error(e);
-                }
-            }
-        }
+        // WRAP is not a `call_block` gate. `RuntimeContext::dispatch_call`
+        // reads none of the advisory `wrap.*` metas a client stamps: each
+        // service handler authorizes the op it decoded, through
+        // `check_resource_access` on the context it runs on — here the callee
+        // sub-context below, which carries the same `caller_id` and grants.
+        // So the database handler, not this fixture, decides that a
+        // `database.create` needs `Append` while an `update` needs `Write`.
 
         // The callee runs on a sub-context carrying ITS OWN declared
         // `requires`, which is what `RuntimeContext::dispatch_call` builds
@@ -2186,10 +2194,20 @@ impl Context for FailingDbOpContext {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.inner
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
@@ -2325,10 +2343,20 @@ impl Context for RendezvousDbOpContext {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.inner
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
@@ -2434,10 +2462,20 @@ impl Context for FloatAggregateContext {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.inner
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
@@ -2567,10 +2605,20 @@ impl Context for EcholessWriteContext {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.inner
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
     }
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {

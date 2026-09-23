@@ -355,6 +355,10 @@ impl DatabaseService for KvCachedD1DatabaseService {
         self.inner.schema_table_exists(name).await
     }
 
+    async fn schema_columns(&self, table: &str) -> Result<Vec<String>, DatabaseError> {
+        self.inner.schema_columns(table).await
+    }
+
     async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
         self.inner.schema_drop_table(name).await
     }
@@ -1054,6 +1058,10 @@ mod tests {
         }
 
         async fn schema_table_exists(&self, _name: &str) -> Result<bool, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn schema_columns(&self, _table: &str) -> Result<Vec<String>, DatabaseError> {
             unreachable!()
         }
 

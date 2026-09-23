@@ -187,9 +187,20 @@ impl Context for DenyAllContext {
         &self,
         resource: &str,
         _resource_type: wafer_run::ResourceType,
-        _is_write: bool,
+        _access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         Err(self.deny(&format!("resource {resource:?}")))
+    }
+
+    /// Admits nothing, as [`Self::check_resource_access`] does. Not counted:
+    /// this is a probe, never the authorization itself.
+    fn resource_access_admitted(
+        &self,
+        _resource: &str,
+        _resource_type: wafer_run::ResourceType,
+        _access: wafer_block::ResourceAccess,
+    ) -> bool {
+        false
     }
 }
 
@@ -626,16 +637,26 @@ impl Context for BootContext {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         wafer_run::wrap::check_access(
             Some(BLOCK_NAME),
             resource,
-            is_write,
+            access,
             Some(&resource_type),
             self.wafer.wrap_grants(),
             self.wafer.wrap_admin_block(),
         )
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.check_resource_access(resource, resource_type, access)
+            .is_ok()
     }
 }
 

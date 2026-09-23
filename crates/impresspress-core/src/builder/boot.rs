@@ -223,7 +223,7 @@ pub async fn boot(
             let loaded = crate::platform_state::wrap_grants::load(db).await;
             if !loaded.is_empty() {
                 tracing::info!(count = loaded.len(), "registering database WRAP grants");
-                wafer.add_wrap_grants(loaded);
+                wafer.add_wrap_grants(loaded)?;
             }
         }
         GrantSource::PreInstalled(_because) => {}
@@ -775,7 +775,9 @@ mod tests {
 
         let order2 = Arc::new(Mutex::new(Vec::new()));
         let mut pre_installed = wafer_with_probes(&order2, None);
-        pre_installed.add_wrap_grants(expected.clone());
+        pre_installed
+            .add_wrap_grants(expected.clone())
+            .expect("the loaded grants are well-formed");
         let storage2 = storage_block();
         boot(
             &mut pre_installed,

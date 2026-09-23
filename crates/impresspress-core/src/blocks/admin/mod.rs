@@ -870,7 +870,13 @@ async fn handle_create_wrap_grant(
     let form = parse_form_body(&raw);
     let grantee = form.get("grantee").cloned().unwrap_or_default();
     let resource = form.get("resource").cloned().unwrap_or_default();
-    let write = crate::config_vars::form_bool(&form, "write");
+    // The form offers read-only and read-write; an append-only grant is
+    // declared in code (`ResourceGrant::append`).
+    let write = if crate::config_vars::form_bool(&form, "write") {
+        wafer_block::GrantWrite::Full
+    } else {
+        wafer_block::GrantWrite::None
+    };
     let resource_type = form.get("resource_type").cloned().unwrap_or_default();
     let description = form.get("description").cloned().unwrap_or_default();
 
@@ -1222,7 +1228,7 @@ mod wrap_grant_mutation_tests {
             wrap_grants::NewWrapGrant {
                 grantee: "impresspress/files".to_string(),
                 resource: "some_table".to_string(),
-                write: false,
+                write: wafer_block::GrantWrite::None,
                 resource_type: String::new(),
                 description: String::new(),
             },
@@ -1389,7 +1395,7 @@ mod grant_tests {
             .find(|g| g.grantee == AUTH_UI_BLOCK_ID && g.resource == table);
 
         assert!(
-            auth_ui_user_roles_grant.is_some_and(|g| g.write),
+            auth_ui_user_roles_grant.is_some_and(|g| g.write == wafer_block::GrantWrite::Full),
             "admin block must declare a read_write grant for {AUTH_UI_BLOCK_ID} on \
              {table} (login path) — found: {auth_ui_user_roles_grant:?}"
         );
@@ -1479,10 +1485,20 @@ mod test_support {
             &self,
             resource: &str,
             resource_type: wafer_run::ResourceType,
-            is_write: bool,
+            access: wafer_block::ResourceAccess,
         ) -> Result<(), wafer_run::WaferError> {
             self.inner
-                .check_resource_access(resource, resource_type, is_write)
+                .check_resource_access(resource, resource_type, access)
+        }
+
+        fn resource_access_admitted(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            access: wafer_block::ResourceAccess,
+        ) -> bool {
+            self.inner
+                .resource_access_admitted(resource, resource_type, access)
         }
 
         async fn call_block(
@@ -2217,7 +2233,7 @@ pub(crate) mod page_link_tests {
             wrap_grants::NewWrapGrant {
                 grantee: "impresspress/probe".to_string(),
                 resource: "impresspress__probe__things".to_string(),
-                write: false,
+                write: wafer_block::GrantWrite::None,
                 resource_type: String::new(),
                 description: String::new(),
             },

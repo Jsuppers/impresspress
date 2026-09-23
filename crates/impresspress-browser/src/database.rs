@@ -498,6 +498,7 @@ wafer_core::forward_database_service! {
             ensure_schema_table: custom,
             ensure_schema_tables: inherit,
             schema_table_exists: forward,
+            schema_columns: forward,
             schema_drop_table: custom,
             schema_add_column: custom,
             set_strict_schema: custom,

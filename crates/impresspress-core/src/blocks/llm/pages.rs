@@ -1167,6 +1167,16 @@ mod messages_boundary_tests {
                     "denied",
                 ))
             }
+            /// Admits nothing, as the fail-closed `check_resource_access` default
+            /// this context keeps does.
+            fn resource_access_admitted(
+                &self,
+                _resource: &str,
+                _resource_type: wafer_run::ResourceType,
+                _access: wafer_block::ResourceAccess,
+            ) -> bool {
+                false
+            }
             fn is_cancelled(&self) -> bool {
                 false
             }
@@ -1229,6 +1239,16 @@ mod outage_tests {
                 return OutputStream::error(WaferError::new(ErrorCode::Internal, "messages down"));
             }
             OutputStream::respond(br#"{}"#.to_vec())
+        }
+        /// Admits nothing, as the fail-closed `check_resource_access` default
+        /// this context keeps does.
+        fn resource_access_admitted(
+            &self,
+            _resource: &str,
+            _resource_type: wafer_run::ResourceType,
+            _access: wafer_block::ResourceAccess,
+        ) -> bool {
+            false
         }
         fn is_cancelled(&self) -> bool {
             false
