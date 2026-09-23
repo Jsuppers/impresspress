@@ -2436,9 +2436,9 @@ pub(crate) async fn deactivate_payment_link(
     }
     if stored.stripe_payment_link_id.is_empty() && stored.stripe_request.is_empty() {
         // The request is written before it is sent, so a row that records
-        // none has nothing at Stripe to take down. (A row written before the
-        // column existed is indistinguishable from one, and deactivates
-        // locally as it always did.)
+        // none has nothing at Stripe to take down. A row older than the
+        // `stripe_request` column reads the same way and deactivates
+        // locally.
         return repo::payment_links::deactivate_local(ctx, offer_id, link_id).await;
     }
     if !stripe_secret_operations_allowed(ctx).await {
