@@ -60,29 +60,44 @@ async fn fragment(ctx: &dyn wafer_run::context::Context, msg: Message, body: &st
         .await
 }
 
-/// The request ended in the 403 `crud::db_error_internal` gives a WRAP
-/// denial: `PermissionDenied` with the door's own "Access denied".
-async fn assert_wrap_denial(out: OutputStream, route: &str) {
+/// Records a miss unless the request ended in the 403
+/// `crud::db_error_internal` gives a WRAP denial: `PermissionDenied` with the
+/// door's own "Access denied". A test checks every site before it fails, so
+/// one run names every site that answers something else.
+async fn assert_wrap_denial(misses: &mut Vec<String>, out: OutputStream, route: &str) {
     match out.collect_buffered().await {
-        Err(TerminalNotResponse::Error(error)) => assert_eq!(
-            (error.code, error.message.as_str()),
-            (ErrorCode::PermissionDenied, "Access denied"),
-            "{route}: expected the database door's WRAP denial"
-        ),
-        Ok(_) => panic!("{route}: expected a WRAP denial, got a response"),
-        Err(_) => panic!("{route}: expected a WRAP denial, got another terminal"),
+        Err(TerminalNotResponse::Error(error))
+            if (error.code, error.message.as_str())
+                == (ErrorCode::PermissionDenied, "Access denied") => {}
+        Err(TerminalNotResponse::Error(error)) => {
+            misses.push(format!("{route}: {:?} {:?}", error.code, error.message))
+        }
+        Ok(_) => misses.push(format!("{route}: a response, not a WRAP denial")),
+        Err(_) => misses.push(format!("{route}: another terminal, not a WRAP denial")),
     }
 }
 
-/// The page answered the styled 403 a refused read gets.
-async fn assert_refused_page(ctx: &dyn wafer_run::context::Context, msg: Message) {
+/// Fails with every recorded miss.
+fn report(misses: Vec<String>) {
+    assert!(
+        misses.is_empty(),
+        "expected the database door's WRAP denial at every site:\n{}",
+        misses.join("\n")
+    );
+}
+
+/// Records a miss unless the page answered the styled 403 a refused read
+/// gets.
+async fn assert_refused_page(
+    misses: &mut Vec<String>,
+    ctx: &dyn wafer_run::context::Context,
+    msg: Message,
+) {
     let path = msg.path().to_string();
     let (status, html) = browser_request(ctx, msg, "").await;
-    assert_eq!(status, 403, "{path}: {html}");
-    assert!(
-        html.contains("Go home"),
-        "{path}: not the refusal page: {html}"
-    );
+    if status != 403 || !html.contains("Go home") {
+        misses.push(format!("{path}: {status} {html}"));
+    }
 }
 
 async fn fixture() -> TestContext {
@@ -111,6 +126,7 @@ async fn link(ctx: &TestContext, user: &str, provider: &str) {
 /// A page whose read was refused is the styled 403, not the 500 page.
 #[tokio::test]
 async fn page_read_denials_are_the_403_page() {
+    let mut misses = Vec::new();
     let ctx = fixture().await;
     for (table, msg) in [
         (TABLE, auth_msg("retrieve", "/b/userportal/", USER)),
@@ -133,8 +149,9 @@ async fn page_read_denials_are_the_403_page() {
         ),
         (TABLE, admin_msg("retrieve", "/b/userportal/admin/buttons")),
     ] {
-        assert_refused_page(&denied(&ctx, table), msg).await;
+        assert_refused_page(&mut misses, &denied(&ctx, table), msg).await;
     }
+    report(misses);
 }
 
 /// `inner`, with every call to the config service refused with `error`. The
@@ -211,6 +228,7 @@ async fn branding_settings_refusal_is_the_refusal_page() {
 
 #[tokio::test]
 async fn session_revoke_denials_are_403() {
+    let mut misses = Vec::new();
     let ctx = fixture().await;
     sessions::insert(
         &ctx,
@@ -234,17 +252,20 @@ async fn session_revoke_denials_are_403() {
         (denied(&ctx, sessions::TABLE).after_passing(1), "delete"),
     ] {
         assert_wrap_denial(
+            &mut misses,
             fragment(&failing, auth_msg("delete", path, USER), "").await,
             &format!("{path} ({step})"),
         )
         .await;
     }
+    report(misses);
 }
 
 // --- pages/security.rs -------------------------------------------------------
 
 #[tokio::test]
 async fn provider_unlink_denials_are_403() {
+    let mut misses = Vec::new();
     let ctx = fixture().await;
     // Two links, so the unlink needs no password check.
     link(&ctx, USER, "github").await;
@@ -268,21 +289,25 @@ async fn provider_unlink_denials_are_403() {
         ),
     ] {
         assert_wrap_denial(
+            &mut misses,
             fragment(&failing, auth_msg("delete", path, user), "").await,
             &format!("{path} ({step})"),
         )
         .await;
     }
+    report(misses);
 }
 
 // --- pages/admin_buttons.rs --------------------------------------------------
 
 #[tokio::test]
 async fn button_write_denials_are_403() {
+    let mut misses = Vec::new();
     let ctx = fixture().await;
     let form = "label=Files&path=%2Fb%2Fstorage%2F&icon=folder";
     let failing = denied(&ctx, TABLE);
     assert_wrap_denial(
+        &mut misses,
         fragment(
             &failing,
             admin_msg("create", "/b/userportal/admin/buttons"),
@@ -304,10 +329,12 @@ async fn button_write_denials_are_403() {
     .expect("seed a button");
     let path = format!("/b/userportal/admin/buttons/{}", record.id);
     assert_wrap_denial(
+        &mut misses,
         fragment(&failing, admin_msg("update", &path), form).await,
         &format!("PATCH {path}"),
     )
     .await;
+    report(misses);
 }
 
 /// The id is the caller's, so an update of a button that is not there is

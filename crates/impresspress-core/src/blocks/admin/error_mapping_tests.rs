@@ -68,29 +68,44 @@ async fn api(
         .await
 }
 
-/// The request ended in the 403 `crud::db_error_internal` gives a WRAP
-/// denial: `PermissionDenied` with the door's own "Access denied".
-async fn assert_wrap_denial(out: OutputStream, route: &str) {
+/// Records a miss unless the request ended in the 403
+/// `crud::db_error_internal` gives a WRAP denial: `PermissionDenied` with the
+/// door's own "Access denied". A test checks every site before it fails, so
+/// one run names every site that answers something else.
+async fn assert_wrap_denial(misses: &mut Vec<String>, out: OutputStream, route: &str) {
     match out.collect_buffered().await {
-        Err(TerminalNotResponse::Error(error)) => assert_eq!(
-            (error.code, error.message.as_str()),
-            (ErrorCode::PermissionDenied, "Access denied"),
-            "{route}: expected the database door's WRAP denial"
-        ),
-        Ok(_) => panic!("{route}: expected a WRAP denial, got a response"),
-        Err(_) => panic!("{route}: expected a WRAP denial, got another terminal"),
+        Err(TerminalNotResponse::Error(error))
+            if (error.code, error.message.as_str())
+                == (ErrorCode::PermissionDenied, "Access denied") => {}
+        Err(TerminalNotResponse::Error(error)) => {
+            misses.push(format!("{route}: {:?} {:?}", error.code, error.message))
+        }
+        Ok(_) => misses.push(format!("{route}: a response, not a WRAP denial")),
+        Err(_) => misses.push(format!("{route}: another terminal, not a WRAP denial")),
     }
 }
 
-/// The page answered the styled 403 a refused read gets.
-async fn assert_refused_page(ctx: &dyn wafer_run::context::Context, path: &str) {
+/// Fails with every recorded miss.
+fn report(misses: Vec<String>) {
+    assert!(
+        misses.is_empty(),
+        "expected the database door's WRAP denial at every site:\n{}",
+        misses.join("\n")
+    );
+}
+
+/// Records a miss unless the page answered the styled 403 a refused read
+/// gets.
+async fn assert_refused_page(
+    misses: &mut Vec<String>,
+    ctx: &dyn wafer_run::context::Context,
+    path: &str,
+) {
     let parts = browser_request(ctx, routed(admin_msg("retrieve", path))).await;
     let html = String::from_utf8_lossy(&parts.body);
-    assert_eq!(parts.status, 403, "{path}: {html}");
-    assert!(
-        html.contains("Go home"),
-        "{path}: not the refusal page: {html}"
-    );
+    if parts.status != 403 || !html.contains("Go home") {
+        misses.push(format!("{path}: {} {html}", parts.status));
+    }
 }
 
 /// An admin fixture with a user to act on, a role (`editor`) that user
@@ -123,6 +138,7 @@ async fn fixture() -> (TestContext, String) {
 
 #[tokio::test]
 async fn iam_reads_keep_a_wrap_denial() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     for (table, path) in [
         (ROLES_TABLE, "/b/admin/api/iam/roles"),
@@ -130,7 +146,7 @@ async fn iam_reads_keep_a_wrap_denial() {
         (user_roles::TABLE, "/b/admin/api/iam/user-roles"),
     ] {
         let failing = denied(&ctx, every_op_on(table));
-        assert_wrap_denial(api(&failing, "retrieve", path, "").await, path).await;
+        assert_wrap_denial(&mut misses, api(&failing, "retrieve", path, "").await, path).await;
     }
 
     // One user's grants rather than the capped list of everyone's.
@@ -139,12 +155,14 @@ async fn iam_reads_keep_a_wrap_denial() {
     msg.set_meta("http.header.accept", "application/json");
     msg.set_meta("req.query.user_id", TARGET);
     assert_wrap_denial(
+        &mut misses,
         AdminBlock::new()
             .handle(&failing, msg, InputStream::empty())
             .await,
         "/b/admin/api/iam/user-roles?user_id=u-target",
     )
     .await;
+    report(misses);
 }
 
 /// The plan's named case. `ops::create_role` already classified its insert
@@ -152,9 +170,11 @@ async fn iam_reads_keep_a_wrap_denial() {
 /// it guards the route, it does not prove the fix.
 #[tokio::test]
 async fn role_create_denial_is_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let failing = denied(&ctx, every_op_on(ROLES_TABLE));
     assert_wrap_denial(
+        &mut misses,
         api(
             &failing,
             "create",
@@ -165,6 +185,7 @@ async fn role_create_denial_is_403() {
         "POST /b/admin/api/iam/roles",
     )
     .await;
+    report(misses);
 }
 
 /// The grant write, and the session invalidation after it lands (a write to
@@ -172,6 +193,7 @@ async fn role_create_denial_is_403() {
 /// outage.
 #[tokio::test]
 async fn role_assign_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let created = api(
         &ctx,
@@ -184,6 +206,7 @@ async fn role_assign_denials_are_403() {
     for (table, step) in [(user_roles::TABLE, "grant"), (users::TABLE, "invalidation")] {
         let failing = denied(&ctx, every_op_on(table));
         assert_wrap_denial(
+            &mut misses,
             api(
                 &failing,
                 "create",
@@ -195,10 +218,12 @@ async fn role_assign_denials_are_403() {
         )
         .await;
     }
+    report(misses);
 }
 
 #[tokio::test]
 async fn role_remove_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, grant) = fixture().await;
     let path = format!("/b/admin/api/iam/user-roles/{grant}");
     // The grant lookup, the invalidation before the removal, and the one
@@ -212,11 +237,13 @@ async fn role_remove_denials_are_403() {
         ),
     ] {
         assert_wrap_denial(
+            &mut misses,
             api(&failing, "delete", &path, "").await,
             &format!("DELETE {path} ({step})"),
         )
         .await;
     }
+    report(misses);
 }
 
 // --- ops.rs ----------------------------------------------------------------
@@ -225,6 +252,7 @@ async fn role_remove_denials_are_403() {
 /// after the row changed; a denied invalidation is a 403.
 #[tokio::test]
 async fn user_lifecycle_invalidation_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let bump = vec![("database.increment_field_where", users::TABLE)];
     for (action, path, body) in [
@@ -237,14 +265,16 @@ async fn user_lifecycle_invalidation_denials_are_403() {
         ("delete", "/b/admin/api/users/u-target", ""),
     ] {
         let failing = denied(&ctx, bump.clone());
-        assert_wrap_denial(api(&failing, action, path, body).await, path).await;
+        assert_wrap_denial(&mut misses, api(&failing, action, path, body).await, path).await;
     }
+    report(misses);
 }
 
 /// Deleting a held role invalidates every holder before and after revoking
 /// the grants; either invalidation refused is a 403.
 #[tokio::test]
 async fn role_delete_invalidation_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let roles = output_json(api(&ctx, "retrieve", "/b/admin/api/iam/roles", "").await).await;
     let editor = roles["roles"]
@@ -264,15 +294,18 @@ async fn role_delete_invalidation_denials_are_403() {
         (denied(&ctx, bump.clone()).after_passing(1), "bump after"),
     ] {
         assert_wrap_denial(
+            &mut misses,
             api(&failing, "delete", &path, "").await,
             &format!("DELETE {path} ({step})"),
         )
         .await;
     }
+    report(misses);
 }
 
 #[tokio::test]
 async fn variable_release_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     output_json(
         api(
@@ -294,6 +327,7 @@ async fn variable_release_denials_are_403() {
         ),
     ] {
         assert_wrap_denial(
+            &mut misses,
             api(&failing, "create", path, "").await,
             &format!("{path} ({step})"),
         )
@@ -302,13 +336,15 @@ async fn variable_release_denials_are_403() {
 
     let failing = denied(&ctx, every_op_on(variables::TABLE));
     let path = "/b/admin/variables/reset-pinned-at-upgrade";
-    assert_wrap_denial(api(&failing, "create", path, "").await, path).await;
+    assert_wrap_denial(&mut misses, api(&failing, "create", path, "").await, path).await;
+    report(misses);
 }
 
 // --- logs.rs, database.rs, settings.rs, mod.rs ------------------------------
 
 #[tokio::test]
 async fn json_reads_keep_a_wrap_denial() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     for (ops, path) in [
         (every_op_on(AUDIT_LOGS_TABLE), "/b/admin/api/logs"),
@@ -322,15 +358,18 @@ async fn json_reads_keep_a_wrap_denial() {
         (every_op_on(variables::TABLE), "/b/admin/api/settings/all"),
     ] {
         let failing = denied(&ctx, ops);
-        assert_wrap_denial(api(&failing, "retrieve", path, "").await, path).await;
+        assert_wrap_denial(&mut misses, api(&failing, "retrieve", path, "").await, path).await;
     }
+    report(misses);
 }
 
 #[tokio::test]
 async fn wrap_grant_create_denial_is_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let failing = denied(&ctx, every_op_on(wrap_grants::TABLE));
     assert_wrap_denial(
+        &mut misses,
         api(
             &failing,
             "create",
@@ -341,12 +380,14 @@ async fn wrap_grant_create_denial_is_403() {
         "POST /b/admin/grants/rules",
     )
     .await;
+    report(misses);
 }
 
 // --- pages/blocks.rs, pages/users.rs, pages/variables.rs --------------------
 
 #[tokio::test]
 async fn block_setting_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     block_settings::set_enabled(&ctx, "impresspress/files", true)
         .await
@@ -361,6 +402,7 @@ async fn block_setting_denials_are_403() {
         ),
     ] {
         assert_wrap_denial(
+            &mut misses,
             api(&failing, "create", toggle, "").await,
             &format!("{toggle} ({step})"),
         )
@@ -369,11 +411,18 @@ async fn block_setting_denials_are_403() {
 
     let detail = "/b/admin/blocks/impresspress--files/detail";
     let failing = denied(&ctx, every_op_on(block_settings::TABLE));
-    assert_wrap_denial(api(&failing, "retrieve", detail, "").await, detail).await;
+    assert_wrap_denial(
+        &mut misses,
+        api(&failing, "retrieve", detail, "").await,
+        detail,
+    )
+    .await;
+    report(misses);
 }
 
 #[tokio::test]
 async fn api_key_revoke_denials_are_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let key = api_keys::insert(
         &ctx,
@@ -396,19 +445,23 @@ async fn api_key_revoke_denials_are_403() {
         ),
     ] {
         assert_wrap_denial(
+            &mut misses,
             api(&failing, "create", &path, "").await,
             &format!("{path} ({step})"),
         )
         .await;
     }
+    report(misses);
 }
 
 #[tokio::test]
 async fn variable_edit_form_denial_is_403() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     let failing = denied(&ctx, every_op_on(variables::TABLE));
     let path = "/b/admin/variables/MY_SETTING/edit";
-    assert_wrap_denial(api(&failing, "retrieve", path, "").await, path).await;
+    assert_wrap_denial(&mut misses, api(&failing, "retrieve", path, "").await, path).await;
+    report(misses);
 }
 
 // --- full pages ----------------------------------------------------------
@@ -417,6 +470,7 @@ async fn variable_edit_form_denial_is_403() {
 /// operator reading "Something went wrong" looks for an outage, not a grant.
 #[tokio::test]
 async fn page_read_denials_are_the_403_page() {
+    let mut misses = Vec::new();
     let (ctx, _) = fixture().await;
     for (ops, path) in [
         (every_op_on(STORAGE_ACCESS_LOGS_TABLE), "/b/admin/storage"),
@@ -427,6 +481,7 @@ async fn page_read_denials_are_the_403_page() {
             "/b/admin/settings/permissions",
         ),
     ] {
-        assert_refused_page(&denied(&ctx, ops), path).await;
+        assert_refused_page(&mut misses, &denied(&ctx, ops), path).await;
     }
+    report(misses);
 }
