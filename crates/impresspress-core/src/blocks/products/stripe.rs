@@ -2331,7 +2331,8 @@ pub(crate) async fn create_payment_link(
     // Stripe now holds a live link. If this write fails the row stays
     // `syncing`; a retry re-drives the same row with the same request, so
     // while Stripe retains the key it answers with this same link for the
-    // retry to record. A retry whose request changed in between (see
+    // retry to record — and a deactivation of the row reaches it the same
+    // way. A retry whose request changed in between (see
     // `payment_link_idempotency_key`) cannot reach it; the log line names the
     // link so it can be reconciled.
     match repo::payment_links::mark_synced(ctx, &pending.managed.id, stripe_id, url).await {
@@ -2406,11 +2407,13 @@ async fn deactivate_stripe_payment_link(
 /// Stripe refuses a reused key whose parameters differ, so the key covers
 /// every parameter sent — including the local row id in the metadata, which
 /// is itself derived from the configuration and its generation (see
-/// `repo::payment_links::create_pending`). One key therefore always carries
-/// one request. A retry of an unfinished row with nothing changed sends the
-/// same bytes under the same key, and while Stripe retains the key (at least
-/// 24 hours) it reaches the object the first attempt created, or replays that
-/// attempt's saved result. Anything that changes the request — the fee, the
+/// `repo::payment_links::pending_id`). One key therefore always carries one
+/// request. A retry of an unfinished row with nothing changed sends the same
+/// bytes under the same key, and while Stripe retains the key (at least 24
+/// hours) it reaches the object the first attempt created, or replays that
+/// attempt's saved result — which is also how
+/// `resolve_unrecorded_payment_link` learns a link id the row never
+/// recorded. Anything that changes the request — the fee, the
 /// automatic-tax setting, the product name, the platform country, a
 /// component's synced Price, the account, a new generation after a
 /// deactivation or a refusal — is a new key and a new Stripe object.
