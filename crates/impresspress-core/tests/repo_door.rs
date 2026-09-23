@@ -809,6 +809,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "pipeline.rs",
             "blocks/admin/mod.rs",
             "blocks/dev/data_snapshot.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
         ],
     ),
     (
