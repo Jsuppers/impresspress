@@ -1027,6 +1027,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/products/tests/repo_tests.rs",
             "blocks/products/tests/seller_governance_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
+            // seeds a storefront product and names the table to refuse one
+            // database op on it through `FailingDbOpContext`.
+            "blocks/products/tests/error_mapping_tests.rs",
             // names `products::TABLE` for the witness assertion that a
             // one-shot read of the seeded catalog stops at the ceiling — the
             // fact the exhaustive read exists to defeat.
@@ -1042,6 +1045,7 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         &[
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/error_mapping_tests.rs",
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/offer_pricing_tests.rs",
             "blocks/products/tests/stripe_tests.rs",
@@ -1155,6 +1159,7 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         &[
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
+            "blocks/products/tests/error_mapping_tests.rs",
             "blocks/products/tests/handler_tests.rs",
             "blocks/products/tests/page_link_tests.rs",
             "blocks/products/tests/provider_tests.rs",
