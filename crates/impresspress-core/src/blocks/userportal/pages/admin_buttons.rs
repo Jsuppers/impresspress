@@ -192,16 +192,18 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
 /// Called only after the mutation has been written, so a failed re-read must
 /// not render the empty table (which reads as "the change wiped every
 /// button"): the target becomes an error notice saying the change was
-/// `applied` and the list needs a reload.
+/// `applied`, why the list could not be loaded (classified by
+/// [`crud::db_error_notice`]), and that it needs a reload.
 async fn buttons_table_response(ctx: &dyn Context, applied: &str) -> OutputStream {
     match load_buttons(ctx).await {
         Ok(buttons) => ui::html_response(render_buttons_table(&buttons)),
         Err(e) => {
-            tracing::error!(error = %e, "userportal admin buttons: table re-read failed");
+            let reason = crud::db_error_notice(e, "userportal admin buttons: table re-read failed");
             ui::swap_error_response(
                 "buttons-table",
                 &format!(
-                    "{applied}, but the button list could not be loaded. Reload the page to see it."
+                    "{applied}, but the button list could not be loaded: {reason}. Reload the \
+                     page to see it."
                 ),
             )
         }
