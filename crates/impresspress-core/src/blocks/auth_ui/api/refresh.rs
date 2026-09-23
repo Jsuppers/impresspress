@@ -370,6 +370,46 @@ mod tests {
         );
     }
 
+    /// A rotation that happens inside the second its predecessor was minted
+    /// in still has to hand back a *different* token.
+    ///
+    /// Everything a refresh JWT carries is the same on both sides of one
+    /// rotation — same user, same family, same auth method, same issuer, and
+    /// `iat`/`exp` are whole seconds — so unless something in the claims
+    /// distinguishes them, the two tokens differ only in the order the
+    /// payload's `HashMap` happened to serialize its keys in. When that order
+    /// repeats, the successor hashes to the `token_hash` the row the rotation
+    /// has just revoked already holds: the unique index refuses the insert,
+    /// the refresh 500s, and because the presented token was revoked first the
+    /// family is left with no live generation at all. The user is signed out
+    /// by a refresh that should have been routine.
+    ///
+    /// [`PinnedMintCrypto`](crate::test_support::PinnedMintCrypto) is what
+    /// makes that certain rather than occasional; the rest of the path is the
+    /// real one.
+    #[tokio::test]
+    async fn a_rotation_inside_one_second_mints_a_distinct_token() {
+        let ctx = TestContext::with_auth_and_pinned_mint_crypto().await;
+        let first = fresh_refresh_token(&ctx).await;
+
+        let rotated = output_http_json(handle(&ctx, refresh_with(&first)).await).await;
+        let second = rotated["refresh_token"].as_str().unwrap_or_else(|| {
+            panic!("rotating inside the mint's own second must issue a successor, got {rotated}")
+        });
+        assert_ne!(
+            second, first,
+            "the successor must not be the predecessor, whose row the rotation just revoked"
+        );
+
+        // And the successor is usable: a token that merely looked new would
+        // read back the revoked predecessor's row and be refused as a replay.
+        let again = output_http_json(handle(&ctx, refresh_with(second)).await).await;
+        assert!(
+            again["refresh_token"].is_string(),
+            "the successor must refresh in its turn, got {again}"
+        );
+    }
+
     /// A live token whose user row could not be read is an error, not a
     /// revocation: `Ok(None)` and `Err` are different answers, and collapsing
     /// them told every client its session was over whenever the database
