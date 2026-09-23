@@ -25,9 +25,33 @@ use std::sync::{Arc, OnceLock};
 use wafer_core::interfaces::auth::service::{
     AuthError, AuthService, Role, TokenScope, UserId, UserProfile,
 };
-use wafer_run::{context::Context, Message};
+use wafer_run::{context::Context, ErrorCode, Message, WaferError};
 
 use super::repo::{pats, users};
+use crate::blocks::crud::{classify_db_error, DbFailure};
+
+/// A failed lower-level call under an auth check, as the [`AuthError`] the
+/// caller gets: [`AuthError::Backend`], carrying the failure's code.
+///
+/// The auth handler passes a `Backend` error to the calling block
+/// untouched, and the HTTP boundary writes its message into the response
+/// body — while a raw WRAP refusal names the grant and the table. So the
+/// error goes through the database-error classifier every block uses
+/// ([`classify_db_error`]): a refusal arrives as `PermissionDenied "Access
+/// denied"` or `ResourceExhausted` with its detail logged under `context`,
+/// and anything else is logged here and sent on as a generic `Internal`.
+fn backend_error(error: WaferError, context: &str) -> AuthError {
+    match classify_db_error(error, None, context) {
+        DbFailure::Refused(refusal) => AuthError::Backend(refusal),
+        DbFailure::Internal(fault) => {
+            tracing::error!(context = %context, error = %fault, "auth backend call failed");
+            AuthError::Backend(WaferError::new(
+                ErrorCode::Internal,
+                "Authentication is unavailable",
+            ))
+        }
+    }
+}
 
 /// Per-block state. Holds a lazy [`Context`] handle so service methods can
 /// dispatch messages to `wafer-run/database` etc.
@@ -329,7 +353,7 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
 async fn ensure_active(ctx: &dyn Context, user_id: &str) -> Result<(), AuthError> {
     let user = users::find_by_id(ctx, user_id)
         .await
-        .map_err(|e| AuthError::Internal(e.to_string()))?
+        .map_err(|e| backend_error(e, "auth: user lookup"))?
         .ok_or(AuthError::Unauthorized)?;
     if !user.is_active() {
         return Err(AuthError::Unauthorized);
@@ -373,7 +397,7 @@ impl AuthService for AuthServiceImpl {
         let cfg = super::config::AuthConfig::from_ctx(ctx).await;
         super::bootstrap::run(ctx, &cfg)
             .await
-            .map_err(|e| AuthError::Internal(e.to_string()))?;
+            .map_err(|e| backend_error(e, "auth init: bootstrap admin"))?;
         Ok(())
     }
 
@@ -402,7 +426,7 @@ impl AuthService for AuthServiceImpl {
             Creds::Pat(h) => {
                 let row = pats::find_by_token_hash(ctx, &h)
                     .await
-                    .map_err(|e| AuthError::Internal(e.to_string()))?
+                    .map_err(|e| backend_error(e, "auth: personal access token lookup"))?
                     .ok_or(AuthError::Unauthorized)?;
                 if let Some(exp) = row.expires_at.as_deref() {
                     if is_expired(exp) {
@@ -411,7 +435,7 @@ impl AuthService for AuthServiceImpl {
                 }
                 pats::touch_last_used(ctx, &h)
                     .await
-                    .map_err(|e| AuthError::Internal(e.to_string()))?;
+                    .map_err(|e| backend_error(e, "auth: personal access token touch"))?;
                 ensure_active(ctx, &row.user_id).await?;
                 Ok(UserId(row.user_id))
             }
@@ -430,7 +454,7 @@ impl AuthService for AuthServiceImpl {
         };
         let row = pats::find_by_token_hash(ctx, &h)
             .await
-            .map_err(|e| AuthError::Internal(e.to_string()))?
+            .map_err(|e| backend_error(e, "auth: personal access token lookup"))?
             .ok_or(AuthError::Unauthorized)?;
         if let Some(exp) = row.expires_at.as_deref() {
             if is_expired(exp) {
@@ -445,7 +469,7 @@ impl AuthService for AuthServiceImpl {
         }
         pats::touch_last_used(ctx, &h)
             .await
-            .map_err(|e| AuthError::Internal(e.to_string()))?;
+            .map_err(|e| backend_error(e, "auth: personal access token touch"))?;
         ensure_active(ctx, &row.user_id).await?;
         Ok(UserId(row.user_id))
     }
@@ -464,7 +488,7 @@ impl AuthService for AuthServiceImpl {
                 let h = hash_token(&bearer);
                 let valid = super::repo::bootstrap_tokens::is_valid(ctx, &h)
                     .await
-                    .map_err(|e| AuthError::Internal(e.to_string()))?;
+                    .map_err(|e| backend_error(e, "auth: bootstrap token lookup"))?;
                 if valid {
                     return Ok(UserId("bootstrap".to_string()));
                 }
@@ -480,7 +504,7 @@ impl AuthService for AuthServiceImpl {
         let has = match role {
             Role::Admin => crate::blocks::auth::helpers::get_user_roles(ctx, &uid.0)
                 .await
-                .map_err(|e| AuthError::Internal(e.to_string()))?
+                .map_err(|e| backend_error(e, "auth: role lookup"))?
                 .iter()
                 .any(|r| r == "admin"),
             Role::User => true, // any authenticated user
@@ -496,7 +520,7 @@ impl AuthService for AuthServiceImpl {
         let ctx = self.ctx()?;
         let row = users::find_by_id(ctx, &user.0)
             .await
-            .map_err(|e| AuthError::Internal(e.to_string()))?
+            .map_err(|e| backend_error(e, "auth: profile lookup"))?
             .ok_or(AuthError::NotFound)?;
         let role = match row.role.as_str() {
             "admin" => Role::Admin,
@@ -808,5 +832,64 @@ mod tests {
             ensure_active(&ctx, "does-not-exist").await,
             Err(AuthError::Unauthorized)
         ));
+    }
+
+    /// A database refusal under the auth service reaches a block that asked
+    /// `wafer-run/auth` who its caller is as a 403 whose body says "Access
+    /// denied" — not a 500, and not the refusal's own text, which names the
+    /// grant and the table.
+    ///
+    /// The credential is a personal access token, so the refused call is the
+    /// PAT lookup `require_user` makes itself. (An access JWT would not get
+    /// that far: `crypto::verify_access_token` reads the account's
+    /// `auth_version` first and rejects the token when that read fails.)
+    ///
+    /// The route is the shape every `auth@v1` consumer has: the typed
+    /// client's `require_user`, its error handed straight back as the
+    /// response, rendered by the HTTP boundary's `collect_http_response`.
+    #[tokio::test]
+    async fn a_refused_token_lookup_reaches_the_caller_route_as_access_denied() {
+        const REFUSAL: &str =
+            "WRAP: impresspress/probe may not read wafer_run__auth__personal_access_tokens";
+
+        let mut ctx = with_admin_and_jwt_secret().await;
+        AuthServiceImpl::new(BlockState::for_test(Arc::new(ctx.clone())))
+            .init(&ctx)
+            .await
+            .expect("auth init applies the auth migrations");
+
+        let refused = crate::test_support::FailingDbOpContext::failing_with(
+            ctx.clone(),
+            vec![("database.list", pats::TABLE)],
+            WaferError::new(ErrorCode::PermissionDenied, REFUSAL),
+        );
+        let service = AuthServiceImpl::new(BlockState::for_test(Arc::new(refused)));
+        ctx.register_block(
+            "wafer-run/auth",
+            Arc::new(wafer_core::service_blocks::auth::AuthBlock::new(Arc::new(
+                service,
+            ))),
+        );
+
+        let mut request = Message::new("retrieve");
+        request.set_meta("http.header.authorization", "Bearer wafer_pat_refused");
+        let out = match wafer_core::clients::auth::require_user(&ctx, &request).await {
+            Ok(id) => panic!("a refused token lookup must not authenticate {id}"),
+            Err(e) => wafer_run::OutputStream::error(e),
+        };
+        let response = wafer_block::http_codec::collect_http_response(out).await;
+        let body = String::from_utf8(response.body).expect("UTF-8 body");
+
+        assert_eq!(response.status, 403, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON error body");
+        assert_eq!(
+            json["message"],
+            serde_json::json!("Access denied"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("personal_access_tokens") && !body.contains("impresspress/probe"),
+            "the refusal's grant and table must not reach the body: {body}"
+        );
     }
 }
