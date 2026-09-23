@@ -597,6 +597,29 @@ image in Admin → Settings → Variables. It renders exactly as before.
 referenced them. `IMPRESSPRESS_ASSETS.logo` (the square mark) and
 `favicon.ico` are unchanged in name and now carry the new art.
 
+### Email: `WAFER_RUN_SHARED__SITE_URL` is gone, and mail is sent under your App Name
+
+**`WAFER_RUN_SHARED__SITE_URL` is no longer a setting.** Its only reader was a
+`welcome` email template that nothing ever sent, and it defaulted to the
+project's own marketing domain. Both are removed, along with the equally unsent
+`payment_failed` template: `email.send_template` now knows `verification` and
+`password_reset` only, and any other name is a 400 as an unknown template.
+
+**What to do.** Nothing is required. A deployment that booted an earlier release
+still holds a `WAFER_RUN_SHARED__SITE_URL` row in its variables table. It is
+harmless — nothing reads it — and it is listed on Admin → Settings → Variables
+like any other key no block declares, where you can delete it. Setting
+`WAFER_RUN_SHARED__SITE_URL` anywhere now has no effect: native boot no longer
+copies it from the environment into the variables table, and no code reads it
+on any target.
+
+**The default sender's display name is your App Name.** With
+`IMPRESSPRESS__EMAIL__MAILGUN_FROM` unset, mail used to go out as
+`Impresspress <noreply@{your Mailgun domain}>` whatever the deployment was
+called. It now carries `WAFER_RUN_SHARED__APP_NAME` — quoted, or RFC 2047
+encoded when it is not plain ASCII — so recipients see the name you configured.
+A `MAILGUN_FROM` you set yourself is sent unchanged, as before.
+
 ### Auth: OAuth sign-in now needs a *proven* address, and existing accounts have none
 
 **What changes.** An OAuth identity may only join an existing local account when

@@ -23,7 +23,7 @@ use impresspress::cli::{
 use impresspress_core::builder::{boot, BootHooks, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
 use wafer_core::interfaces::database::service::DatabaseService;
-use wafer_run::Wafer;
+use wafer_run::{InputStream, Message, Wafer};
 
 /// The reason native passes [`GrantSource::PreInstalled`]: `build_native_runtime`
 /// reads the admin-created rows out of the platform database and hands them to
@@ -497,6 +497,114 @@ async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
         None,
         "`filter_to_declared_keys` must keep an infrastructure key out of the batch"
     );
+}
+
+/// `WAFER_RUN_SHARED__SITE_URL` is no longer declared, but every deployment
+/// that booted an older release holds a row for it: `seed_defaults` wrote the
+/// declared default into the `variables` table on first boot. That leftover
+/// row must not stop a boot, must not break the admin Variables page, and must
+/// be removable by an operator — and an exported `SITE_URL` must stop reaching
+/// the table, since nothing declares it any more.
+#[tokio::test]
+async fn a_leftover_row_for_a_retired_var_boots_lists_and_deletes() {
+    const RETIRED: &str = "WAFER_RUN_SHARED__SITE_URL";
+    const OLD_DEFAULT: &str = "https://impresspress.org";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("retired_var.sqlite3");
+    let storage_root = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    // --- A deployment that booted before the var was retired. ---
+    let (mut wafer, storage_block, db) = build_runtime(&db_path, &storage_root).await;
+    boot(
+        &mut wafer,
+        &storage_block,
+        &NativeBootHooks,
+        NATIVE_GRANTS,
+        InitPolicy::Reported,
+    )
+    .await
+    .expect("first boot");
+    // The row exactly as an older `seed_defaults` wrote it.
+    assert!(
+        impresspress_core::platform_state::variables::seed_if_absent(
+            &db,
+            RETIRED,
+            OLD_DEFAULT,
+            "Site URL",
+            "Marketing site URL for docs and pricing links",
+            false,
+        )
+        .await
+        .expect("stage the leftover row"),
+        "the fresh boot must not have seeded the retired var itself"
+    );
+
+    // --- Upgrade boot, with the retired var still exported. ---
+    let environment = filter_to_declared_keys(HashMap::from([(
+        RETIRED.to_string(),
+        "https://env.example".to_string(),
+    )]));
+    let (mut wafer, storage_block, db) =
+        build_runtime_with_env(&db_path, &storage_root, &environment).await;
+    let report = boot(
+        &mut wafer,
+        &storage_block,
+        &NativeBootHooks,
+        NATIVE_GRANTS,
+        InitPolicy::Reported,
+    )
+    .await
+    .expect("a leftover row for a retired var must not fail the boot");
+    assert!(
+        report.ok,
+        "no step may fail over the leftover row: {report:?}"
+    );
+    assert_eq!(
+        stored(&db, RETIRED).await.as_deref(),
+        Some(OLD_DEFAULT),
+        "an undeclared key never reaches the table from the environment"
+    );
+
+    // --- The admin Variables page still renders, and lists the row. ---
+    let admin = |action: &str, resource: &str| {
+        let mut msg = Message::new("http.request");
+        msg.set_meta("req.action", action);
+        msg.set_meta("req.resource", resource);
+        msg.set_meta("http.header.accept", "text/html");
+        msg.set_meta("auth.user_id", "admin_1");
+        msg.set_meta("auth.user_roles", "admin");
+        msg
+    };
+    let out = wafer
+        .run_block(
+            "impresspress/admin",
+            admin("retrieve", "/b/admin/settings/variables"),
+            InputStream::empty(),
+        )
+        .await;
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    let html = String::from_utf8(parts.body).expect("UTF-8 body");
+    assert_eq!(parts.status, 200, "{html}");
+    assert!(html.contains(RETIRED), "the leftover row is listed: {html}");
+
+    // --- And an operator can delete it. ---
+    let out = wafer
+        .run_block(
+            "impresspress/admin",
+            admin("delete", &format!("/b/admin/api/settings/{RETIRED}")),
+            InputStream::empty(),
+        )
+        .await;
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    assert!(
+        (200..300).contains(&parts.status),
+        "deleting the leftover row: {} {}",
+        parts.status,
+        String::from_utf8_lossy(&parts.body)
+    );
+    assert_eq!(stored(&db, RETIRED).await, None);
 }
 
 /// The value stored in the variables table for `key`, if any.
