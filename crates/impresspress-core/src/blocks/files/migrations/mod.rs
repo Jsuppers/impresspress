@@ -43,6 +43,40 @@ const SQL_002_POSTGRES: &str = include_str!("002_bucket_name_unique.postgres.sql
 const SQL_003_SQLITE: &str = include_str!("003_legacy_share_token_expiry.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_003_POSTGRES: &str = include_str!("003_legacy_share_token_expiry.postgres.sql");
+// 004 gives each upload reservation of an object row its own token.
+//
+// `repo::objects::reserve_upload` takes over an existing row (a stored object
+// being replaced, or an orphaned reservation) with a write conditional on the
+// row being unchanged since it was read. That condition used to be the row's
+// `updated_at` — a timestamp, and the claim's own stamp is a timestamp too, so
+// a second upload that read the row before the first one's claim landed could
+// find the claim's stamp equal to the one it read (same millisecond, or two
+// isolates whose clocks disagree) and take the row as well. `claim_id` is a
+// fresh random value per reservation, so the condition is exact, and
+// `repo::objects::mark_complete` / `release_reservation` act only on the
+// reservation that is still theirs.
+//
+// Rows written before 004 have a NULL `claim_id`; the take-over condition
+// matches that NULL exactly as it matches a token. The column is nullable and
+// has no default for that reason: a default would give every old row the same
+// value.
+//
+// Re-running is harmless on every backend: `ADD COLUMN IF NOT EXISTS` on
+// PostgreSQL, and on SQLite/D1 the duplicate-column error `apply_if_blessed`
+// tolerates for an `ALTER TABLE … ADD COLUMN`. What shipping it re-runs — the
+// whole set, 001 onwards, over live rows — is pinned by `replay_tests` below.
+//
+// A native deployment that has not run it yet still uploads, as long as
+// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is off: the database service then adds
+// a column a write names but the table lacks (the lazy column-add), which
+// `uploads_work_before_migration_004_has_run` in `storage::objects` exercises.
+// Under strict schema there is no lazy add, so every reservation fails until
+// 004 runs. Cloudflare deploys set strict schema, but every
+// `impresspress deploy` runs the block migrations in its prepare funnel (the
+// command has no `--run-migrations` opt-out), so they get the column on deploy.
+const SQL_004_SQLITE: &str = include_str!("004_object_claim_id.sqlite.sql");
+#[cfg(any(feature = "postgres", test))]
+const SQL_004_POSTGRES: &str = include_str!("004_object_claim_id.postgres.sql");
 
 // The unused `cloud_quotas.reset_period_days` column.
 //
@@ -65,6 +99,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial_schema", SQL_001_SQLITE),
     ("002_bucket_name_unique", SQL_002_SQLITE),
     (LEGACY_SHARE_TOKEN_EXPIRY, SQL_003_SQLITE),
+    ("004_object_claim_id", SQL_004_SQLITE),
 ];
 
 /// Basename of the share-expiry repair, named once so the migration list and
@@ -79,7 +114,12 @@ pub(crate) const LEGACY_SHARE_TOKEN_EXPIRY: &str = "003_legacy_share_token_expir
 /// literals a postgres deployment really applies rather than a test-only copy
 /// of them.
 #[cfg(any(feature = "postgres", test))]
-const POSTGRES_MIGRATION_FILES: &[&str] = &[SQL_001_POSTGRES, SQL_002_POSTGRES, SQL_003_POSTGRES];
+const POSTGRES_MIGRATION_FILES: &[&str] = &[
+    SQL_001_POSTGRES,
+    SQL_002_POSTGRES,
+    SQL_003_POSTGRES,
+    SQL_004_POSTGRES,
+];
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`]. Empty
 /// when the `postgres` feature is off — e.g. Cloudflare/D1 never selects the
@@ -167,6 +207,133 @@ mod tests {
                 .await
                 .is_err(),
             "and the index is in place, so it cannot be made again",
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    //! What re-running this block's migrations does to a live deployment.
+    //!
+    //! `apply_if_blessed` hashes the JOINED text of every file, so shipping
+    //! any new migration — 004 included — re-runs 001 onwards on the next
+    //! `--run-migrations` boot, over whatever the tables hold. For auth that
+    //! re-run signs every user out (its 004 drops the refresh-token table);
+    //! nothing here may do the equivalent to share links, buckets or uploads.
+
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::SQLITE_MIGRATIONS;
+    use crate::{blocks::files::repo, migration_helper, test_support::TestContext};
+
+    /// Every row of every table the files block owns, each column as stored,
+    /// by table and id.
+    async fn every_row(
+        ctx: &TestContext,
+    ) -> Vec<(&'static str, String, HashMap<String, serde_json::Value>)> {
+        let tables = [
+            ("buckets", repo::buckets::raw_rows(ctx).await),
+            ("objects", repo::objects::raw_rows(ctx).await),
+            ("views", repo::views::raw_rows(ctx).await),
+            ("shares", repo::shares::raw_rows(ctx).await),
+            ("access_logs", repo::shares::raw_access_log_rows(ctx).await),
+            ("quotas", repo::quota::raw_rows(ctx).await),
+        ];
+        let mut rows = Vec::new();
+        for (table, records) in tables {
+            let mut records = records.unwrap_or_else(|e| panic!("read {table}: {e}"));
+            records.sort_by(|a, b| a.id.cmp(&b.id));
+            rows.extend(records.into_iter().map(|r| (table, r.id, r.data)));
+        }
+        rows
+    }
+
+    /// Replaying every files migration over a deployment's live rows changes
+    /// none of them: no share link gains, loses or moves an expiry, no bucket
+    /// or object row is deleted, and a reservation keeps its `claim_id`.
+    ///
+    /// A guard, not a regression test — it passes before 004 as after. It
+    /// exists because a re-run is what 004 triggers on every upgrading
+    /// deployment, and a statement added later that is not safe to replay
+    /// (a `DROP`, an unguarded `UPDATE`) has to fail here rather than there.
+    /// The replay is forced under a fresh migration-state key, as
+    /// `the_repair_is_idempotent` explains: an unchanged hash would skip it.
+    #[tokio::test]
+    async fn replaying_every_files_migration_leaves_live_rows_alone() {
+        let mut ctx = TestContext::with_files().await;
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+
+        repo::buckets::insert(&ctx, "photos", false, "alice")
+            .await
+            .expect("a bucket");
+        for (id, token, expires_at) in [
+            // A legacy link 003 already dated, and a current one.
+            (
+                "legacy",
+                "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoic2hhcmUifQ.sig",
+                "2027-04-20T10:00:00Z",
+            ),
+            (
+                "opaque",
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "2026-12-01T00:00:00Z",
+            ),
+        ] {
+            repo::shares::seed(
+                &ctx,
+                crate::util::json_map(json!({
+                    "id": id,
+                    "token": token,
+                    "bucket": "photos",
+                    "key": "a.png",
+                    "created_by": "alice",
+                    "expires_at": expires_at,
+                    "access_count": 3,
+                    "created_at": "2026-04-20T10:00:00Z",
+                })),
+            )
+            .await
+            .expect("a share");
+        }
+        let stored =
+            repo::objects::reserve_upload(&ctx, "photos", "a.png", 8, "image/png", "alice")
+                .await
+                .expect("reserve");
+        assert_eq!(
+            repo::objects::mark_complete(&ctx, &stored)
+                .await
+                .expect("a stored object"),
+            repo::objects::Completion::Completed
+        );
+        repo::objects::reserve_upload(&ctx, "photos", "b.png", 4, "image/png", "alice")
+            .await
+            .expect("an upload in flight");
+        repo::views::insert(&ctx, "photos", "a.png", "alice")
+            .await
+            .expect("a view");
+        repo::quota::upsert_for_user(
+            &ctx,
+            "alice",
+            crate::util::json_map(json!({
+                "max_storage_bytes": 5_000,
+            })),
+        )
+        .await
+        .expect("a quota override");
+        let before = every_row(&ctx).await;
+
+        let every_file: Vec<&str> = SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect();
+        migration_helper::apply_migrations(&ctx, "impresspress/files-replay", &every_file, &[])
+            .await
+            .expect("the whole set replays over live rows");
+
+        assert_eq!(every_row(&ctx).await, before);
+        assert!(
+            before.iter().any(|(table, _, row)| *table == "objects"
+                && row.get("claim_id").is_some_and(|c| c.is_string())),
+            "the replay was checked over rows that carry a claim"
         );
     }
 }
@@ -486,7 +653,11 @@ mod legacy_share_expiry_tests {
                 "the repair must leave a chosen expiry alone"
             );
         };
-        repair(&SQLITE_MIGRATIONS.last().expect("a repair is shipped").1);
-        repair(POSTGRES_MIGRATION_FILES.last().expect("its twin"));
+        let at = SQLITE_MIGRATIONS
+            .iter()
+            .position(|(name, _)| *name == LEGACY_SHARE_TOKEN_EXPIRY)
+            .expect("a repair is shipped");
+        repair(&SQLITE_MIGRATIONS[at].1);
+        repair(&POSTGRES_MIGRATION_FILES[at]);
     }
 }
