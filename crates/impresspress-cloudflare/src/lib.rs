@@ -133,18 +133,22 @@ thread_local! {
 
 /// One-time isolate initialization: selects [`RequestLogMode::Queued`]
 /// (audit rows drain into `ctx.wait_until` off the response path — see
-/// `run`). Consumers should call this from their worker's
-/// `#[event(start)]` handler; `run()` also invokes it behind a
-/// once-per-isolate guard, so isolates stay correct either way and repeat
-/// calls are no-ops.
+/// `run`) and [`DeferMode::Queued`] (work a handler defers until after its
+/// response drains into `ctx.wait_until` too — see `dispatch`; spawned any
+/// other way it would be cancelled with the response). Consumers should call
+/// this from their worker's `#[event(start)]` handler; `run()` also invokes
+/// it behind a once-per-isolate guard, so isolates stay correct either way
+/// and repeat calls are no-ops.
 ///
 /// [`RequestLogMode::Queued`]: impresspress_core::pipeline::RequestLogMode::Queued
+/// [`DeferMode::Queued`]: impresspress_core::deferred::DeferMode::Queued
 pub fn init_isolate() {
     ISOLATE_INITIALIZED.with(|done| {
         if !done.get() {
             impresspress_core::pipeline::set_request_log_mode(
                 impresspress_core::pipeline::RequestLogMode::Queued,
             );
+            impresspress_core::deferred::set_mode(impresspress_core::deferred::DeferMode::Queued);
             done.set(true);
         }
     });
@@ -352,6 +356,7 @@ where
         &request_config,
         register_blocks,
         register_post_build,
+        &|task| ctx.wait_until(task),
     )
     .await;
 
@@ -524,6 +529,10 @@ pub async fn run_scheduled_with_config<F, G>(
     // thread-local nothing empties, on an isolate that may serve fetches for
     // hours. Add the drain (through `ctx.wait_until`, exactly as `run` does)
     // in the same change that adds such a dispatch.
+    //
+    // The same holds for `impresspress_core::deferred`'s queue: only the
+    // auth-ui mail handlers defer, and the sweep reaches none of them. A
+    // task queued here would run on the next fetch's drain instead.
     let cron = event.cron();
     match run_scheduled_inner(
         &env,
@@ -691,12 +700,23 @@ type BoxedTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 
 /// Convert a worker request into a WAFER message (preserving the auth header)
 /// and dispatch it through the `"site-main"` flow.
+///
+/// Work the handlers deferred ([`impresspress_core::deferred`]) is handed to
+/// `defer` — `ctx.wait_until` — each task wrapped in this request's service
+/// scope: the bindings its database, crypto and network calls reach are
+/// request-scoped here, and outside a scope they are refused. It is handed
+/// over whether or not the dispatch succeeded, so a failed conversion does
+/// not drop a mail a handler already queued. A task another interleaved
+/// request queued may be drained here instead; it then runs on this
+/// request's bindings, which are the same deployment's.
 async fn dispatch(
     wafer: &wafer_run::Wafer,
     req: worker::Request,
     services: std::rc::Rc<request_services::RequestServices>,
+    defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>> {
-    request_services::scope(services, async move {
+    let deferred_services = std::rc::Rc::clone(&services);
+    let response = request_services::scope(services, async move {
         // 7. Convert request → message; preserve auth header in meta.
         let auth_header = req.headers().get("authorization")?;
         let (mut msg, input) = convert::worker_request_to_message(&req).await?;
@@ -709,7 +729,14 @@ async fn dispatch(
         let output = wafer.run("site-main", msg, input).await;
         Ok(convert::output_to_response(output).await?)
     })
-    .await
+    .await;
+    for task in impresspress_core::deferred::drain() {
+        defer(Box::pin(request_services::scope(
+            std::rc::Rc::clone(&deferred_services),
+            task,
+        )));
+    }
+    response
 }
 
 async fn run_inner<F, G>(
@@ -719,6 +746,7 @@ async fn run_inner<F, G>(
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
+    defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>>
 where
     F: FnOnce(ImpresspressBuilder) -> Result<ImpresspressBuilder, Box<dyn std::error::Error>>,
@@ -740,7 +768,7 @@ where
     .await?;
     let services =
         warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
-    let mut response = dispatch(&rt.wafer, req, services).await?;
+    let mut response = dispatch(&rt.wafer, req, services, defer).await?;
 
     // Cheap observability signal (2026-07-16 audit follow-up): one header
     // assembly from a value already computed by `get_or_build`. Gated to
