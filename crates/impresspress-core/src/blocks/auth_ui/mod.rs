@@ -397,6 +397,9 @@ async fn apply_rate_limit(
     apply_route_limit(limiter, ctx, msg, key, category, limit).await
 }
 
+/// Block config key: the Google OAuth client ID.
+pub(crate) const OAUTH_GOOGLE_CLIENT_ID_KEY: &str = "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID";
+
 /// The auth-ui block's own declared config vars (OAuth provider creds). Single
 /// source of truth for both `BlockInfo::config_keys` and the admin settings
 /// page (rendered via `ui::settings_form`, not a parallel tuple table).
@@ -406,9 +409,6 @@ async fn apply_rate_limit(
 /// invariant the runtime enforces (see `block_name_to_var_prefix`). The
 /// auth-identity vars JWT_SECRET / REQUIRE_VERIFICATION / ALLOWED_EMAIL_DOMAINS
 /// are `WAFER_RUN__AUTH__*` and declared in `auth::config` instead.
-/// Block config key: the Google OAuth client ID.
-pub(crate) const OAUTH_GOOGLE_CLIENT_ID_KEY: &str = "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID";
-
 pub(crate) fn config_vars() -> Vec<ConfigVar> {
     vec![
         ConfigVar::new(OAUTH_GOOGLE_CLIENT_ID_KEY, "Google OAuth client ID", "")
