@@ -11,8 +11,9 @@ use wafer_core::clients::database::Record;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
+    blocks::crud,
     http::redirect,
-    ui::{self, icons, sidebar::nav_icon, SiteConfig, UserInfo},
+    ui::{icons, sidebar::nav_icon, SiteConfig, UserInfo},
     util::RecordExt,
 };
 
@@ -30,13 +31,10 @@ pub async fn dashboard_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 
     // The app tiles are this page's one read. Rendering without them would
-    // look like "no apps configured", so a failed read is the 500 page.
+    // look like "no apps configured", so a failed read is an error page.
     let buttons = match load_buttons(ctx).await {
         Ok(buttons) => buttons,
-        Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "userportal dashboard: buttons read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "userportal dashboard: buttons read failed"),
     };
     let config = SiteConfig::load(ctx).await;
     let is_admin = UserInfo::from_message(msg).is_some_and(|u| u.is_admin());

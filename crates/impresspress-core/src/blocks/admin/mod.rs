@@ -1,5 +1,7 @@
 mod contracts;
 mod database;
+#[cfg(test)]
+mod error_mapping_tests;
 mod iam;
 pub(crate) mod logs;
 pub mod migrations;
@@ -28,7 +30,7 @@ use wafer_run::{
 use crate::{
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     features::BlockSettings,
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_not_found, ok_json},
     platform_state::{block_settings, request_logs, user_roles, variables, wrap_grants},
 };
 
@@ -893,7 +895,7 @@ async fn handle_create_wrap_grant(
     .await
     {
         Ok(record) => record,
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
 
     logs::audit_log(

@@ -11,11 +11,13 @@ use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::{sessions, tokens},
+    blocks::{
+        auth::repo::{sessions, tokens},
+        crud,
+    },
     crypto::META_AUTH_FAMILY,
-    http::{err_internal, redirect, ResponseBuilder},
+    http::{redirect, ResponseBuilder},
     ui::{
-        self,
         components::{badge, BadgeVariant},
         SiteConfig,
     },
@@ -27,15 +29,12 @@ pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    // An unreadable list is the 500 page, not "No active sessions.": this is
+    // An unreadable list is an error page, not "No active sessions.": this is
     // where a user looks for a device to sign out, and an empty list tells
     // them there is nothing to revoke.
     let rows = match sessions::list_for_user(ctx, &user_id).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "userportal sessions: list_for_user failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "userportal sessions: list_for_user failed"),
     };
 
     let current_family = current_session_family(msg);
@@ -126,7 +125,8 @@ fn render_table(rows: &[sessions::SessionRow], current_family: Option<&str>) -> 
 ///    refresh.
 /// 3. Delete the session row.
 ///
-/// Steps 2 and 3 propagate their errors as a 500. "Revoked" that silently did
+/// Steps 2 and 3 propagate their errors (a WRAP denial as 403, a quota as
+/// 429, anything else as 500). "Revoked" that silently did
 /// not revoke is the failure mode this whole change exists to remove, so a
 /// user must not be told a device is signed out when it is not. Returns 401 if
 /// anonymous, 400 if the bound `{family}` is missing.
@@ -153,14 +153,14 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 .status(200)
                 .body(Vec::new(), "text/html")
         }
-        Err(e) => return err_internal("Could not look up the session", e),
+        Err(e) => return crud::db_error_internal(e, "Could not look up the session"),
     }
 
     if let Err(e) = tokens::revoke_family(ctx, &family).await {
-        return err_internal("Could not revoke the session", e);
+        return crud::db_error_internal(e, "Could not revoke the session");
     }
     if let Err(e) = sessions::delete(ctx, &family).await {
-        return err_internal("Could not remove the session", e);
+        return crud::db_error_internal(e, "Could not remove the session");
     }
 
     // Empty 200 — htmx swaps the row out via outerHTML.

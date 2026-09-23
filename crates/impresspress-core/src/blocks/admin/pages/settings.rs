@@ -16,7 +16,7 @@
 //!   /b/admin/settings/variables    → variables::settings_body
 //!   /b/admin/settings/permissions  → permissions::settings_body
 
-use wafer_run::{context::Context, Message, OutputStream};
+use wafer_run::{context::Context, Message, OutputStream, WaferError};
 
 use super::{admin_page, crumb, email, network, permissions, variables};
 use crate::ui::{
@@ -27,7 +27,50 @@ use crate::ui::{
 /// Render the settings page for the given tab. `tab` is one of
 /// "email" / "network" / "variables" / "permissions"; unknown values
 /// fall back to "email".
+///
+/// Every tab body hands back a `Result`, and a failed read fails the whole
+/// page through `crud::db_error_page`. `network` and `permissions` used to
+/// swallow one into the empty table a healthy deployment with nothing
+/// configured renders — "no inbound requests", "no custom grants". `email` is
+/// a form, and a form filled from defaults because the stored values could
+/// not be read would write those defaults back on Save.
 pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> OutputStream {
+    match render(ctx, msg, tab).await {
+        Ok(page) => page,
+        Err(e) => {
+            crate::blocks::crud::db_error_page(msg, e, "admin settings page: tab read failed")
+        }
+    }
+}
+
+/// [`settings_page`] re-rendered by a handler whose write has landed
+/// (`done`), as the htmx swap its control makes. A failed read cannot be the
+/// error page here: htmx 2 swaps only a 2xx, so the pre-write page would stay
+/// on screen under no sign the write happened. It is a notice saying the
+/// write landed and why the page could not be reloaded, classified by
+/// `crud::db_error_notice`.
+pub(super) async fn settings_page_after_write(
+    ctx: &dyn Context,
+    msg: &Message,
+    tab: &str,
+    done: &str,
+) -> OutputStream {
+    match render(ctx, msg, tab).await {
+        Ok(page) => page,
+        Err(e) => {
+            let reason = crate::blocks::crud::db_error_notice(
+                e,
+                "admin settings page: re-read after a write failed",
+            );
+            crate::ui::swap_notice_response(&format!(
+                "{done}, but the settings could not be reloaded: {reason}. Reload the page to \
+                 see them."
+            ))
+        }
+    }
+}
+
+async fn render(ctx: &dyn Context, msg: &Message, tab: &str) -> Result<OutputStream, WaferError> {
     let active = match tab {
         "email" | "network" | "variables" | "permissions" => tab,
         _ => "email",
@@ -56,30 +99,15 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
         ),
     ];
 
-    // Three of the four tab bodies hand back a `Result`, and a failed read
-    // fails the whole page. `network` and `permissions` used to swallow one
-    // into the empty table a healthy deployment with nothing configured
-    // renders — "no inbound requests", "no custom grants". `email` is a form,
-    // and a form filled from defaults because the stored values could not be
-    // read would write those defaults back on Save. `variables` reports a
-    // failed read inside its own tab body instead (see
-    // `variables::settings_body`), because its create/update handlers
-    // re-render this page as an htmx swap, and htmx drops a 500's body.
     let body_markup = match active {
         "network" => network::settings_body(ctx, msg).await,
-        "variables" => Ok(variables::settings_body(ctx, msg).await),
+        "variables" => variables::settings_body(ctx, msg).await,
         "permissions" => permissions::settings_body(ctx, msg).await,
         // "email" and any unknown active (defensive — `active` is already
         // normalized above) render the email body.
         _ => email::settings_body(ctx, msg).await,
     };
-    let body_markup = match body_markup {
-        Ok(markup) => markup,
-        Err(e) => {
-            tracing::error!(error = %e, tab = %active, "admin settings page: tab read failed");
-            return crate::ui::server_error_response(msg);
-        }
-    };
+    let body_markup = body_markup?;
 
     let form_body = tabbed_page(
         tabs,
@@ -90,7 +118,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
         }],
     );
 
-    admin_page(
+    Ok(admin_page(
         ctx,
         msg,
         "Settings",
@@ -102,7 +130,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message, tab: &str) -> Outpu
         },
         form_body,
     )
-    .await
+    .await)
 }
 
 fn tab_title(active: &str) -> &'static str {

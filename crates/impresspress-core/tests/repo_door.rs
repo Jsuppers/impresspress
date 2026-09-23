@@ -766,6 +766,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // refresh (`database.update`) and its bulk read (`database.list`)
             // on this table, to prove neither stamps the seed hash gate.
             "blocks/admin/settings.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
         ],
     ),
     (
@@ -778,6 +782,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // (`FailingDbOpContext`) at it in the toggle handler's tests
             "blocks/admin/pages/blocks.rs",
             "blocks/dev/data_snapshot.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
         ],
     ),
     (
@@ -786,6 +794,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "cache_key.rs",
             "blocks/admin/mod.rs",
             "blocks/dev/data_snapshot.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
         ],
     ),
     (
@@ -797,6 +809,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "pipeline.rs",
             "blocks/admin/mod.rs",
             "blocks/dev/data_snapshot.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
         ],
     ),
     (
@@ -819,6 +835,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // test plants twin grants for the repair to collapse, and the
             // door's only writer (`assign`) refuses to make a twin.
             "blocks/admin/migrations/mod.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
         ],
     ),
     (
@@ -856,6 +876,13 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // the second one (`generate_tokens`' auth_version read) — so the
             // denial lands on the query under test.
             "blocks/auth_ui/tests/error_mapping_tests.rs",
+            // Fault injectors: each admin route's WRAP-denial test refuses
+            // the table its database site reads or writes, so the denial
+            // lands on the query under test.
+            "blocks/admin/error_mapping_tests.rs",
+            // Fault injectors: each user-portal route's WRAP-denial test
+            // refuses the table its database site reads or writes.
+            "blocks/userportal/error_mapping_tests.rs",
         ],
     ),
     // The auth doors B12 adds. Two categories, both already established
@@ -869,6 +896,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // `("database.delete_where_count", sessions::TABLE)` — logout's
             // "a failed session-row delete is not a successful logout" test
             "blocks/auth_ui/api/logout.rs",
+            // Fault injectors: each user-portal route's WRAP-denial test
+            // refuses the table its database site reads or writes.
+            "blocks/userportal/error_mapping_tests.rs",
         ],
     ),
     (
@@ -889,6 +919,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // The WRAP-denial tests of login's refresh-row insert, refresh's
             // token lookup and logout's revocation.
             "blocks/auth_ui/tests/error_mapping_tests.rs",
+            // Fault injectors: each user-portal route's WRAP-denial test
+            // refuses the table its database site reads or writes.
+            "blocks/userportal/error_mapping_tests.rs",
             // `("database.delete_where_count", tokens::TABLE)` — the sweep's
             // "one failing table is named and the others still run" test
             "blocks/auth/maintenance.rs",

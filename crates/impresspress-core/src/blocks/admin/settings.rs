@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_internal, ok_json, require_row},
+    http::{err_bad_request, ok_json, require_row},
     platform_state::{
         block_settings::{self, BlockSettingsPatch},
         variables::{self, NewVariable, VariablePatch},
@@ -45,7 +45,7 @@ pub(super) async fn handle_list_full(ctx: &dyn Context) -> OutputStream {
                 .collect();
             ok_json(&vars)
         }
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -77,7 +77,7 @@ pub(super) async fn handle_list(ctx: &dyn Context) -> OutputStream {
                 settings: by_key.into_values().collect(),
             })
         }
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 

@@ -614,6 +614,18 @@ pub fn swap_error_row_response(
     html_response_with_toast(markup, message, "error")
 }
 
+/// [`swap_error_response`] for a control that swaps its target's CONTENTS
+/// (`innerHTML`, htmx's default): the notice is the alert alone, with no id of
+/// its own, so the target stays the one element carrying its id.
+///
+/// Same status and toast as [`swap_error_response`], for the same reason.
+pub fn swap_notice_response(message: &str) -> wafer_run::OutputStream {
+    let markup = maud::html! {
+        div class="alert alert--error" role="alert" { (message) }
+    };
+    html_response_with_toast(markup, message, "error")
+}
+
 /// Respond with HTML + an HX-Trigger header for toast notifications.
 ///
 /// The trigger payload lands in an HTTP response header and is parsed by

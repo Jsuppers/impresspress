@@ -19,7 +19,7 @@ use crate::{
     // `audit_logs` table, reached under this block's own WRAP identity via
     // the grant `admin::AdminBlock` declares for it.
     blocks::{admin::logs::audit_log, crud},
-    http::{err_bad_request, err_internal, err_not_found},
+    http::{err_bad_request, err_not_found},
     ui::{self, components, icons, sidebar::nav_icon},
     util::{json_map, parse_form_body, stamp_created, stamp_updated, RecordExt},
 };
@@ -49,12 +49,15 @@ pub(crate) const ICON_OPTIONS: &[(&str, &str)] = &[
 
 pub async fn admin_buttons_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // "No buttons configured" is what an empty table renders; an unreadable
-    // one is the 500 page, or the admin would add back buttons that exist.
+    // one is an error page, or the admin would add back buttons that exist.
     let buttons = match load_buttons(ctx).await {
         Ok(buttons) => buttons,
         Err(e) => {
-            tracing::error!(error = %e, "userportal admin buttons page: buttons read failed");
-            return ui::server_error_response(msg);
+            return crud::db_error_page(
+                msg,
+                e,
+                "userportal admin buttons page: buttons read failed",
+            )
         }
     };
 
@@ -189,16 +192,18 @@ fn render_buttons_table(buttons: &[db::Record]) -> maud::Markup {
 /// Called only after the mutation has been written, so a failed re-read must
 /// not render the empty table (which reads as "the change wiped every
 /// button"): the target becomes an error notice saying the change was
-/// `applied` and the list needs a reload.
+/// `applied`, why the list could not be loaded (classified by
+/// [`crud::db_error_notice`]), and that it needs a reload.
 async fn buttons_table_response(ctx: &dyn Context, applied: &str) -> OutputStream {
     match load_buttons(ctx).await {
         Ok(buttons) => ui::html_response(render_buttons_table(&buttons)),
         Err(e) => {
-            tracing::error!(error = %e, "userportal admin buttons: table re-read failed");
+            let reason = crud::db_error_notice(e, "userportal admin buttons: table re-read failed");
             ui::swap_error_response(
                 "buttons-table",
                 &format!(
-                    "{applied}, but the button list could not be loaded. Reload the page to see it."
+                    "{applied}, but the button list could not be loaded: {reason}. Reload the \
+                     page to see it."
                 ),
             )
         }
@@ -250,7 +255,7 @@ pub async fn handle_create_button(
 
     let record = match db::create(ctx, TABLE, data).await {
         Ok(record) => record,
-        Err(e) => return err_internal("Failed to create button", e.message),
+        Err(e) => return crud::db_error_internal(e, "Failed to create button"),
     };
     audit_log(
         ctx,
@@ -370,7 +375,7 @@ pub async fn handle_update_button(
     stamp_updated(&mut data);
 
     if let Err(e) = db::update(ctx, TABLE, id, data).await {
-        return err_internal("Failed to update button", e.message);
+        return crud::db_error(e, "Button not found", "Failed to update button");
     }
     audit_log(
         ctx,

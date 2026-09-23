@@ -5,6 +5,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{admin_page, crumb};
 use crate::{
+    blocks::crud,
     features::BlockSettings,
     platform_state::block_settings,
     ui::{
@@ -76,8 +77,7 @@ pub async fn blocks_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let block_settings_rows = match block_settings::list_all(ctx).await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::error!(error = %e, "admin blocks page: block-settings read failed");
-            return crate::ui::server_error_response(msg);
+            return crud::db_error_page(msg, e, "admin blocks page: block-settings read failed")
         }
     };
 
@@ -273,7 +273,7 @@ pub async fn handle_toggle_feature(
     // flip the block off the back of an outage (audit finding #12).
     let rows = match block_settings::list_all(ctx).await {
         Ok(rows) => rows,
-        Err(e) => return crate::http::err_internal("Failed to read block setting", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to read block setting"),
     };
     let row = rows.iter().find(|r| r.block_name == block_name);
 
@@ -320,7 +320,7 @@ pub async fn handle_toggle_feature(
     // had happened and re-rendered the page showing the new (unpersisted)
     // state.
     if let Err(e) = block_settings::set_enabled(ctx, block_name, new_enabled).await {
-        return crate::http::err_internal("Failed to persist block setting", e);
+        return crud::db_error_internal(e, "Failed to persist block setting");
     }
 
     // Then the LIVE snapshot, in that order. `routing::route_to_block` gates
@@ -384,7 +384,7 @@ pub async fn handle_block_detail(ctx: &dyn Context, msg: &Message) -> OutputStre
     // Check block enabled state via shared helper (audit finding #12).
     let is_enabled = match block_settings::is_enabled(ctx, block_name).await {
         Ok(enabled) => enabled,
-        Err(e) => return crate::http::err_internal("Failed to read block setting", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to read block setting"),
     };
 
     let encoded = encode_block_name(block_name);

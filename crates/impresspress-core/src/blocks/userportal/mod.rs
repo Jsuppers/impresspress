@@ -20,6 +20,9 @@ pub(crate) mod migrations;
 // `nav_icon` resolver in lockstep.
 pub(crate) mod pages;
 
+#[cfg(test)]
+mod error_mapping_tests;
+
 const TABLE: &str = "impresspress__userportal__buttons";
 
 /// Handler for one row of [`ROUTES`].
@@ -485,8 +488,11 @@ async fn admin_settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     {
         Ok(form) => form,
         Err(e) => {
-            tracing::error!(error = %e, "userportal branding settings: current values read failed");
-            return ui::server_error_response(msg);
+            return crud::db_error_page(
+                msg,
+                e,
+                "userportal branding settings: current values read failed",
+            )
         }
     };
     let content = html! {

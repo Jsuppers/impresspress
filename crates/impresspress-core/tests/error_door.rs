@@ -39,7 +39,7 @@
 //! the allowlist sent it to.
 //!
 //! That last blind spot is closed for every block in `GATED_BLOCKS` — the
-//! whole of `auth`, `auth_ui` and `products`. Whether an
+//! whole of `admin`, `auth`, `auth_ui`, `products` and `userportal`. Whether an
 //! `err_internal(label, cause)` there wraps a database call is a reading job
 //! per site, so the second gate below does not guess: every `err_internal`
 //! tail left in a gated file is inventoried by its label, with the reason it
@@ -58,6 +58,11 @@
 //! the call. The inventory covers `err_internal(label, cause)` only; those two
 //! are counted per block in `CAUSE_DROPPED` instead, exactly, with the plan
 //! item that reads them, so a new one is at least an edit a reviewer sees.
+//!
+//! A failure printed into a page as its own text (`"Failed to load …: " (e)`)
+//! is a third shape that neither sees: it answers 200, and a WRAP denial's
+//! grant and table names reach the page. `ERROR_TEXT_RENDERED` counts it per
+//! block, exactly.
 //!
 //! `auth::repo::RepoError` used to be named here as a site the gate could
 //! not help: it was `NotFound | Db(String)`, so the wafer code was gone
@@ -325,7 +330,7 @@ fn the_walk_reaches_the_files_it_claims_to_scan() {
 /// [`evasions`]: a file under one of these that is not on the inventory may
 /// have no `err_internal` tail at all. Test code (`tests/` directories and
 /// `#[cfg(test)]` items) is not gated.
-const GATED_BLOCKS: &[&str] = &["auth", "auth_ui", "products"];
+const GATED_BLOCKS: &[&str] = &["admin", "auth", "auth_ui", "products", "userportal"];
 
 /// The walk the gated-file checks run over: every block source outside a
 /// `tests/` directory, floored like [`scan`].
@@ -375,8 +380,10 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// `refund_ledger_denial_is_403` and its siblings in
 /// `products/tests/provider_tests.rs`, one real route per products file in
 /// `products/tests/error_mapping_tests.rs`, one real route per auth handler
-/// family in `auth_ui/tests/error_mapping_tests.rs`, and the OAuth callback's
-/// `state_redemption_denial_is_403_not_500`.
+/// family in `auth_ui/tests/error_mapping_tests.rs`, the OAuth callback's
+/// `state_redemption_denial_is_403_not_500`, and the admin and user-portal
+/// routes in `admin/error_mapping_tests.rs` and
+/// `userportal/error_mapping_tests.rs`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
         "products/stripe.rs",
@@ -1462,7 +1469,6 @@ fn the_evasion_gate_catches_each_way_around() {
 /// `src/blocks/` is its own entry; `crud.rs` is the door and is not listed.
 /// `"unplanned"` is a block no plan item has scheduled yet.
 const NOT_YET_GATED: &[(&str, usize, &str)] = &[
-    ("admin", 9, "N20"),
     ("dev", 6, "N25"),
     ("fastembed.rs", 1, "unplanned"),
     ("files", 6, "N25"),
@@ -1471,7 +1477,6 @@ const NOT_YET_GATED: &[(&str, usize, &str)] = &[
     ("messages", 1, "unplanned"),
     ("signal", 1, "unplanned"),
     ("tickets", 1, "N25"),
-    ("userportal", 3, "N20"),
     ("vector", 1, "N21"),
 ];
 
@@ -1525,7 +1530,6 @@ const CAUSE_DROPPING: &[&str] = &["err_internal_no_cause", "server_error_respons
 /// `"read: …"` is a block whose every site was read and none drops a database
 /// error; `"unplanned"` is a block no plan item has scheduled yet.
 const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
-    ("admin", 4, "N20"),
     (
         "auth_ui",
         7,
@@ -1537,7 +1541,12 @@ const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
     ("llm", 3, "N21"),
     ("messages", 3, "unplanned"),
     ("products", 32, "unplanned"),
-    ("userportal", 8, "N20"),
+    (
+        "userportal",
+        1,
+        "read: the profile page's signed-in user with no users row — the read \
+         succeeded, so there is no cause to carry",
+    ),
     ("vector", 1, "N21"),
 ];
 
@@ -1573,5 +1582,158 @@ fn cause_dropped_is_the_whole_backlog() {
             "{block}: `{plan}` must name a plan item, say what reading it found, \
              or say `unplanned`"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where a failure's own text is printed into a page
+// ---------------------------------------------------------------------------
+
+/// The markup interpolations in `src` that print a failed call's own text:
+/// an `Err(e) => { … (e) … }` arm whose body interpolates `(e)` or
+/// `(e.message)` before it closes, and any `"…" (x.message)` — a maud string
+/// followed by an error's message.
+///
+/// That shape answers a failed read as a page: the status is 200, the empty
+/// table's place is taken by the failure, and a WRAP denial's own text (the
+/// grant and table names it refused) is shown to whoever loaded the page.
+/// Nothing classified it on the way, so no inventory of `err_internal` tails
+/// can see it either. A page answers a failed read through
+/// `crud::db_error_page`, and a fragment through `crud::db_error_notice`.
+fn error_text_renders(src: &str) -> usize {
+    let code = production_code(src).join("\n");
+    let bytes = code.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // Where each interpolation opens (its `(`), so a site both shapes match
+    // is counted once.
+    let mut sites = std::collections::BTreeSet::new();
+
+    // Shape 1: an `Err(name) => {` arm interpolating `(name)` or
+    // `(name.message)` before its first closing brace, opened after
+    // whitespace, a quote or a brace — an interpolation, not a call like
+    // `Err(e)` or `f(e)`.
+    for (at, _) in code.match_indices("Err(") {
+        if at > 0 && is_ident(bytes[at - 1]) {
+            continue;
+        }
+        let rest_at = at + 4;
+        let rest = &code[rest_at..];
+        let Some(close) = rest.find(')') else {
+            continue;
+        };
+        let name = rest[..close].trim();
+        if name.is_empty() || !name.bytes().all(is_ident) {
+            continue;
+        }
+        let after = &rest[close + 1..];
+        let after_at = rest_at + close + 1 + (after.len() - after.trim_start().len());
+        let Some(after) = after.trim_start().strip_prefix("=>") else {
+            continue;
+        };
+        let body_at = after_at + 2 + (after.len() - after.trim_start().len());
+        let Some(body) = after.trim_start().strip_prefix('{') else {
+            continue;
+        };
+        let body_at = body_at + 1;
+        let body = &body[..body.find('}').unwrap_or(body.len())];
+        for needle in [format!("({name})"), format!("({name}.message)")] {
+            for (hit, _) in body.match_indices(needle.as_str()) {
+                if hit > 0 && matches!(body.as_bytes()[hit - 1], b' ' | b'\n' | b'\t' | b'"' | b'{')
+                {
+                    sites.insert(body_at + hit);
+                }
+            }
+        }
+    }
+
+    // Shape 2: `"…" (x.message)` anywhere — outside an `Err` arm too, as in
+    // a helper handed the error.
+    for (at, _) in code.match_indices(".message)") {
+        let mut start = at;
+        while start > 0 && is_ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == at || start == 0 || bytes[start - 1] != b'(' {
+            continue;
+        }
+        if code[..start - 1].trim_end().ends_with('"') {
+            sites.insert(start - 1);
+        }
+    }
+    sites.len()
+}
+
+/// Every block that still prints a failure's own text into a page, how many
+/// times, and the plan item that reads it — exact both ways, like
+/// [`CAUSE_DROPPED`].
+const ERROR_TEXT_RENDERED: &[(&str, usize, &str)] = &[("products", 6, "unplanned")];
+
+#[test]
+fn error_text_rendered_is_the_whole_backlog() {
+    let mut sites: std::collections::BTreeMap<String, usize> = Default::default();
+    for file in gated_scan().collect() {
+        if file.rel == THE_DOOR {
+            continue;
+        }
+        let n = error_text_renders(&file.text);
+        if n > 0 {
+            *sites.entry(block_of(&file.rel).to_string()).or_default() += n;
+        }
+    }
+    let listed: std::collections::BTreeMap<String, usize> = ERROR_TEXT_RENDERED
+        .iter()
+        .map(|(block, n, _)| (block.to_string(), *n))
+        .collect();
+    assert_eq!(
+        sites, listed,
+        "ERROR_TEXT_RENDERED must state exactly how many times each block prints \
+         a failure's own text into markup (left: the tree, right: the list). A \
+         page answers a failed read through `crud::db_error_page`, a fragment \
+         through `crud::db_error_notice`."
+    );
+    for (block, _, plan) in ERROR_TEXT_RENDERED {
+        assert!(
+            plan.starts_with('N') || *plan == "unplanned",
+            "{block}: `{plan}` must name a plan item or say `unplanned`"
+        );
+    }
+}
+
+/// The scan can fail: each shape it exists for is found, and the shapes that
+/// merely look like it are not.
+#[test]
+fn the_error_text_scan_catches_the_shapes() {
+    for (src, n) in [
+        // The admin users page's roles tab, as it was.
+        (
+            "fn a() { html! { @match r { Ok(l) => { (l) } Err(e) => {\n div .login-error { \"Failed to load roles: \" (e.message) }\n } } } }\n",
+            1,
+        ),
+        // Display of the error itself.
+        (
+            "fn a() { html! { @match r { Err(e) => { div .login-error { \"Failed: \" (e) } } } } }\n",
+            1,
+        ),
+        // A helper handed the error.
+        (
+            "fn a(e: &WaferError) -> Markup { html! { div { \"Failed to load variables: \" (e.message) } } }\n",
+            1,
+        ),
+        // Two sites.
+        (
+            "fn a() { html! { Err(a) => { p { \"x\" (a) } } Err(b) => { p { \"y\" (b.message) } } } }\n",
+            2,
+        ),
+        // Not the shape: calls, a classified reason, a test.
+        ("fn a() { match r { Err(e) => { return Err(e) } } }\n", 0),
+        ("fn a() { match r { Err(e) => { return crud::db_error_internal(e, \"x\") } } }\n", 0),
+        ("fn a() { match r { Err(e) => { RoomError::Db(e.message) } } }\n", 0),
+        ("fn a() { html! { div { \"Failed: \" (reason) } } }\n", 0),
+        (
+            "#[cfg(test)]\nmod tests { fn t() { html! { Err(e) => { p { \"x\" (e) } } } } }\n",
+            0,
+        ),
+    ] {
+        assert_eq!(error_text_renders(src), n, "{src}");
     }
 }

@@ -14,7 +14,7 @@ use super::{
 use crate::{
     blocks::{auth::bump_auth_version, crud},
     db_read::{self, Bound},
-    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_not_found, ok_json},
     platform_state::user_roles::{self, Assigned},
     util::{json_map, RecordExt},
 };
@@ -42,7 +42,7 @@ pub(super) async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
         // while Postgres/D1 return the raw string, so the untyped response had
         // no single shape a schema could describe.
         Ok(result) => ok_json(&AdminRoleListResponse::from_record_list(&result)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -382,7 +382,7 @@ pub(super) async fn handle_list_permissions(ctx: &dyn Context) -> OutputStream {
                 page_size: total_count,
             })
         }
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -510,14 +510,14 @@ pub(super) async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> 
                 let total = if capped.truncated {
                     match user_roles::count_all(ctx).await {
                         Ok(total) => total,
-                        Err(e) => return err_internal("Database error", e),
+                        Err(e) => return crud::db_error_internal(e, "Database error"),
                     }
                 } else {
                     capped.rows.len() as i64
                 };
                 (capped.rows, total)
             }
-            Err(e) => return err_internal("Database error", e),
+            Err(e) => return crud::db_error_internal(e, "Database error"),
         }
     } else {
         match user_roles::list_for_user(ctx, &user_id).await {
@@ -525,7 +525,7 @@ pub(super) async fn handle_list_user_roles(ctx: &dyn Context, msg: &Message) -> 
                 let total = rows.len() as i64;
                 (rows, total)
             }
-            Err(e) => return err_internal("Database error", e),
+            Err(e) => return crud::db_error_internal(e, "Database error"),
         }
     };
     // Echoed in the `{id, data}` record envelope this endpoint has
@@ -595,7 +595,7 @@ pub(super) async fn handle_assign_role(
                     error = %e,
                     "role assigned but auth_version bump failed"
                 );
-                return err_internal("Role assigned but session invalidation failed", e);
+                return crud::db_error_internal(e, "Role assigned but session invalidation failed");
             }
             // Audit-log like every other admin mutation (this JSON path used to
             // write zero audit rows).
@@ -614,7 +614,7 @@ pub(super) async fn handle_assign_role(
                 data: row.to_data(),
             })
         }
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -640,7 +640,7 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
             return err_not_found("User-role assignment not found");
         }
         Err(e) => {
-            return err_internal("Database error", e);
+            return crud::db_error_internal(e, "Database error");
         }
     };
 
@@ -659,7 +659,7 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
             error = %e,
             "role not removed: auth_version bump failed"
         );
-        return err_internal("Role not removed: session invalidation failed", e);
+        return crud::db_error_internal(e, "Role not removed: session invalidation failed");
     }
 
     match user_roles::remove(ctx, id).await {
@@ -670,7 +670,7 @@ pub(super) async fn handle_remove_role(ctx: &dyn Context, msg: &Message) -> Outp
                     error = %e,
                     "role removed but auth_version bump failed"
                 );
-                return err_internal("Role removed but session invalidation failed", e);
+                return crud::db_error_internal(e, "Role removed but session invalidation failed");
             }
             audit_log(
                 ctx,

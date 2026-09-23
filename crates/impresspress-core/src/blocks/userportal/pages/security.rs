@@ -5,9 +5,12 @@ use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::{local_credentials, provider_links, users},
-    http::{err_internal, redirect, ResponseBuilder},
-    ui::{self, SiteConfig},
+    blocks::{
+        auth::repo::{local_credentials, provider_links, users},
+        crud,
+    },
+    http::{redirect, ResponseBuilder},
+    ui::SiteConfig,
 };
 
 /// The resend-verification button's behaviour, delegated.
@@ -50,7 +53,7 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    // Both reads fail closed to the 500 page. An unreadable link list would
+    // Both reads fail closed to an error page. An unreadable link list would
     // render "No external accounts linked" — hiding exactly the sign-in
     // routes this page exists to let a user audit — and an unreadable
     // verification flag would tell a verified user they are not, with a
@@ -58,15 +61,13 @@ pub async fn security_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let links = match provider_links::list_for_user(ctx, &user_id).await {
         Ok(links) => links,
         Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "userportal security: provider links read failed");
-            return ui::server_error_response(msg);
+            return crud::db_error_page(msg, e, "userportal security: provider links read failed")
         }
     };
     let email_verified = match users::is_email_verified(ctx, &user_id).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "userportal security: email_verified read failed");
-            return ui::server_error_response(msg);
+            return crud::db_error_page(msg, e, "userportal security: email_verified read failed")
         }
     };
     let user_email = msg.get_meta("auth.user_email").to_string();
@@ -214,7 +215,7 @@ pub async fn handle_unlink(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let links = match provider_links::list_for_user(ctx, &user_id).await {
         Ok(l) => l,
-        Err(e) => return err_internal("Could not read your linked accounts", e),
+        Err(e) => return crud::db_error_internal(e, "Could not read your linked accounts"),
     };
     let Some(target) = links.iter().find(|l| l.provider == provider) else {
         // Not linked to this caller — indistinguishable from someone else's
@@ -227,7 +228,7 @@ pub async fn handle_unlink(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if links.len() == 1 {
         let has_password = match local_credentials::has_password(ctx, &user_id).await {
             Ok(has) => has,
-            Err(e) => return err_internal("Could not check your sign-in methods", e),
+            Err(e) => return crud::db_error_internal(e, "Could not check your sign-in methods"),
         };
         if !has_password {
             return ResponseBuilder::new().status(200).body(
@@ -246,7 +247,7 @@ pub async fn handle_unlink(ctx: &dyn Context, msg: &Message) -> OutputStream {
     }
 
     if let Err(e) = provider_links::delete_for_user(ctx, &user_id, &provider).await {
-        return err_internal("Could not unlink that account", e);
+        return crud::db_error_internal(e, "Could not unlink that account");
     }
     ResponseBuilder::new()
         .status(200)

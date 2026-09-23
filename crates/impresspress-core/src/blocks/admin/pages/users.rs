@@ -11,8 +11,9 @@ use crate::{
             api_keys,
             users::{self, ActiveUserQuery, UserRow},
         },
+        crud,
     },
-    http::{err_internal, err_not_found, ResponseBuilder},
+    http::{err_not_found, ResponseBuilder},
     ui::{
         self,
         components::{self, badge, pagination, Badge, BadgeVariant},
@@ -61,16 +62,21 @@ pub async fn users_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         .map(|u| u.id.as_str())
         .unwrap_or("")
         .to_string();
+    // An unreadable table is an error page, never the empty state ("No
+    // roles", "No API keys") and never the failure's own text in the page.
+    let tab = match active_tab {
+        "users" => users_tab(ctx, msg, &current_uid).await,
+        "roles" => roles_tab(ctx)
+            .await
+            .map(|roles| html! { div #iam-content { (roles) } }),
+        _ => api_keys_tab(ctx).await,
+    };
+    let tab = match tab {
+        Ok(tab) => tab,
+        Err(e) => return crud::db_error_page(msg, e, "admin users page: tab read failed"),
+    };
     let tab_content = html! {
-        div #users-tab-content {
-            @if active_tab == "users" {
-                (users_tab(ctx, msg, &current_uid).await)
-            } @else if active_tab == "roles" {
-                div #iam-content { (roles_tab(ctx).await) }
-            } @else {
-                (api_keys_tab(ctx).await)
-            }
-        }
+        div #users-tab-content { (tab) }
     };
 
     let body = list_page(Some(tabs_markup), tab_content, None);
@@ -91,7 +97,12 @@ pub async fn users_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 /// Users tab content (table + search + pagination).
-async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> Markup {
+/// `Err` when a read failed; the caller answers it, never an empty table.
+async fn users_tab(
+    ctx: &dyn Context,
+    msg: &Message,
+    current_user_id: &str,
+) -> Result<Markup, WaferError> {
     let (page, page_size, _) = msg.pagination_params(20);
     let search = msg.query("search").to_string();
 
@@ -100,7 +111,7 @@ async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> M
     // list endpoint. `total_count` is now the full matched count across all
     // pages, so the footer below paginates a search correctly instead of
     // reporting the in-page count as the total.
-    let result = users::list_active_page(
+    let list = users::list_active_page(
         ctx,
         &ActiveUserQuery {
             page: page as i64,
@@ -108,31 +119,18 @@ async fn users_tab(ctx: &dyn Context, msg: &Message, current_user_id: &str) -> M
             search: (!search.is_empty()).then(|| search.clone()),
         },
     )
-    .await;
+    .await?;
+    let table = users_table(&list.rows, ctx, current_user_id).await?;
 
-    html! {
+    Ok(html! {
         div .filter-bar {
             (components::search_input_with_value("search", "Search by email or user ID...", "/b/admin/users", "#content", &search))
         }
 
-        @match &result {
-            Ok(list) => {
-                @match users_table(&list.rows, ctx, current_user_id).await {
-                    Ok(table) => {
-                        (table)
+        (table)
 
-                        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
-                    }
-                    Err(e) => {
-                        div .login-error { "Failed to load the users' roles: " (e) }
-                    }
-                }
-            }
-            Err(e) => {
-                div .login-error { "Failed to load users: " (e) }
-            }
-        }
-    }
+        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
+    })
 }
 
 /// Render the users table body. Async because it enriches each user with roles.
@@ -259,11 +257,12 @@ fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> com
 /// [`USER_COLUMNS`], so the row htmx swaps in carries the same classes and the
 /// same `data-label` cells as the row it replaces.
 ///
-/// `None` when the row cannot be re-read: the user read or the roles read
-/// failed, or the user is gone. The caller swaps in an error row instead —
+/// `Err` with the reason when the row cannot be re-read: the user read or the
+/// roles read failed (classified by [`crud::db_error_notice`]), or the user
+/// is gone. The caller swaps in an error row instead —
 /// an empty body would delete the row from the table under a success toast,
 /// and a row built from a failed roles read would show the user holding none.
-async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Option<Markup> {
+async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Result<Markup, &'static str> {
     let record = match users::find_by_id(ctx, user_id).await {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -271,24 +270,23 @@ async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Option<Markup> {
                 user_id,
                 "admin users: row re-read found no user after a mutation"
             );
-            return None;
+            return Err("something went wrong");
         }
-        Err(e) => {
-            tracing::error!(user_id, error = %e, "admin users: row re-read failed");
-            return None;
-        }
+        Err(e) => return Err(crud::db_error_notice(e, "admin users: row re-read failed")),
     };
 
     // Single-user lookup via the shared roles helper (the `[one]` case).
     let roles = match ops::fetch_roles(ctx, &[user_id]).await {
         Ok(mut roles) => roles.remove(user_id).unwrap_or_default(),
         Err(e) => {
-            tracing::error!(user_id, error = %e, "admin users: roles re-read failed");
-            return None;
+            return Err(crud::db_error_notice(
+                e,
+                "admin users: roles re-read failed",
+            ))
         }
     };
 
-    Some(single_user_row(&record, &roles, "").render(&USER_COLUMNS, None))
+    Ok(single_user_row(&record, &roles, "").render(&USER_COLUMNS, None))
 }
 
 /// The answer to an Enable/Disable that landed: the re-rendered row under a
@@ -296,11 +294,13 @@ async fn user_row_fragment(ctx: &dyn Context, user_id: &str) -> Option<Markup> {
 /// place saying the change was made.
 async fn user_row_response(ctx: &dyn Context, user_id: &str, done: &str) -> OutputStream {
     match user_row_fragment(ctx, user_id).await {
-        Some(row) => ui::html_response_with_toast(row, done, "success"),
-        None => ui::swap_error_row_response(
+        Ok(row) => ui::html_response_with_toast(row, done, "success"),
+        Err(reason) => ui::swap_error_row_response(
             &format!("user-row-{user_id}"),
             USER_COLUMNS.len(),
-            &format!("{done}, but the row could not be reloaded. Reload the page to see it."),
+            &format!(
+                "{done}, but the row could not be reloaded: {reason}. Reload the page to see it."
+            ),
         ),
     }
 }
@@ -358,7 +358,10 @@ pub async fn handle_create_role(
     }
 
     // Return the updated roles tab + close modal + toast
-    let content = roles_tab(ctx).await;
+    let content = match roles_tab(ctx).await {
+        Ok(content) => content,
+        Err(e) => return reread_failed("Role created", "the role list", e),
+    };
     let trigger = r#"{"showToast":{"message":"Role created","type":"success"},"closeModal":{"id":"create-role"}}"#;
     ResponseBuilder::new()
         .set_header("HX-Trigger", trigger)
@@ -378,7 +381,10 @@ pub async fn handle_delete_role(ctx: &dyn Context, msg: &Message) -> OutputStrea
         Ok(deleted) => deleted,
         Err(out) => return out,
     };
-    let content = roles_tab(ctx).await;
+    let content = match roles_tab(ctx).await {
+        Ok(content) => content,
+        Err(e) => return reread_failed("Role deleted", "the role list", e),
+    };
     match late_pass_warning(&deleted) {
         None => ui::html_response_with_toast(content, "Role deleted", "success"),
         Some(warning) => ui::html_response_with_toast(content, &warning, "warning"),
@@ -436,10 +442,10 @@ pub async fn handle_revoke_api_key(ctx: &dyn Context, msg: &Message) -> OutputSt
     match api_keys::find_by_id(ctx, key_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return err_not_found("API key not found"),
-        Err(e) => return err_internal("Could not load the API key", e),
+        Err(e) => return crud::db_error_internal(e, "Could not load the API key"),
     }
     if let Err(e) = api_keys::revoke(ctx, key_id).await {
-        return err_internal("Could not revoke the API key", e);
+        return crud::db_error_internal(e, "Could not revoke the API key");
     }
     audit_log(
         ctx,
@@ -449,10 +455,26 @@ pub async fn handle_revoke_api_key(ctx: &dyn Context, msg: &Message) -> OutputSt
         msg.remote_addr(),
     )
     .await;
-    ui::html_response_with_toast(api_keys_tab(ctx).await, "API key revoked", "success")
+    match api_keys_tab(ctx).await {
+        Ok(tab) => ui::html_response_with_toast(tab, "API key revoked", "success"),
+        Err(e) => reread_failed("API key revoked", "the key list", e),
+    }
 }
 
-async fn roles_tab(ctx: &dyn Context) -> Markup {
+/// The answer to a write that landed when the tab its control swaps
+/// (`innerHTML`) could not be re-read: an error notice in the tab under an
+/// error toast, both saying the write was `done`. The reason is classified by
+/// [`crud::db_error_notice`], so a WRAP denial reads as one and its own text
+/// stays in the log.
+fn reread_failed(done: &str, what: &str, error: WaferError) -> OutputStream {
+    let reason = crud::db_error_notice(error, "admin users page: re-read after a write failed");
+    ui::swap_notice_response(&format!(
+        "{done}, but {what} could not be reloaded: {reason}. Reload the page to see it."
+    ))
+}
+
+/// `Err` when the read failed; the caller answers it, never an empty table.
+async fn roles_tab(ctx: &dyn Context) -> Result<Markup, WaferError> {
     let opts = ListOptions {
         sort: vec![SortField {
             field: "name".into(),
@@ -461,9 +483,9 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
         limit: 100,
         ..Default::default()
     };
-    let result = db::list(ctx, ROLES_TABLE, &opts).await;
+    let list = db::list(ctx, ROLES_TABLE, &opts).await?;
 
-    html! {
+    Ok(html! {
         div .flex .items-center .justify-between .mb-4 {
             h3 .font-semibold { "Roles" }
             button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-role" {
@@ -471,44 +493,37 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
             }
         }
 
-        @match &result {
-            Ok(list) => {
-                @let rows: Vec<Vec<Markup>> = list.records.iter().map(|record| {
-                    let name = record.str_field("name");
-                    let is_system = record.bool_field("is_system");
-                    vec![
-                        html! { span .font-medium { (name) } },
-                        html! { span .text-muted { (record.str_field("description")) } },
-                        html! {
-                            @if is_system {
-                                (badge(BadgeVariant::Info, "System"))
-                            } @else {
-                                (badge(BadgeVariant::Primary, "Custom"))
-                            }
-                        },
-                        html! {
-                            @if !is_system {
-                                button .btn .btn--sm .btn--danger
-                                    hx-delete={"/b/admin/iam/roles/" (record.id)}
-                                    hx-target="#iam-content"
-                                    hx-confirm={"Delete role \"" (name) "\"? Everyone it is assigned to loses it."}
-                                { (icons::trash()) }
-                            }
-                        },
-                    ]
-                }).collect();
+        @let rows: Vec<Vec<Markup>> = list.records.iter().map(|record| {
+            let name = record.str_field("name");
+            let is_system = record.bool_field("is_system");
+            vec![
+                html! { span .font-medium { (name) } },
+                html! { span .text-muted { (record.str_field("description")) } },
+                html! {
+                    @if is_system {
+                        (badge(BadgeVariant::Info, "System"))
+                    } @else {
+                        (badge(BadgeVariant::Primary, "Custom"))
+                    }
+                },
+                html! {
+                    @if !is_system {
+                        button .btn .btn--sm .btn--danger
+                            hx-delete={"/b/admin/iam/roles/" (record.id)}
+                            hx-target="#iam-content"
+                            hx-confirm={"Delete role \"" (name) "\"? Everyone it is assigned to loses it."}
+                        { (icons::trash()) }
+                    }
+                },
+            ]
+        }).collect();
 
-                (components::data_table::<fn(usize) -> Option<String>>(
-                    &ROLE_COLUMNS,
-                    rows,
-                    None,
-                    html! { p .text-center .text-muted { "No roles" } },
-                ))
-            }
-            Err(e) => {
-                div .login-error { "Failed to load roles: " (e.message) }
-            }
-        }
+        (components::data_table::<fn(usize) -> Option<String>>(
+            &ROLE_COLUMNS,
+            rows,
+            None,
+            html! { p .text-center .text-muted { "No roles" } },
+        ))
 
         // Create role modal
         (components::modal("create-role", "Create Role", html! {
@@ -527,16 +542,17 @@ async fn roles_tab(ctx: &dyn Context) -> Markup {
                 }
             }
         }))
-    }
+    })
 }
 
-async fn api_keys_tab(ctx: &dyn Context) -> Markup {
+/// `Err` when the read failed; the caller answers it, never an empty table.
+async fn api_keys_tab(ctx: &dyn Context) -> Result<Markup, WaferError> {
     // Every key in the deployment, newest first — this tab is the operator's
     // view, not one account's (`api_keys::list_for_user` is what the
     // userportal and the auth-ui CRUD endpoints use).
-    let result = api_keys::list_recent(ctx, 100).await;
+    let list = api_keys::list_recent(ctx, 100).await?;
 
-    html! {
+    Ok(html! {
         div .flex .items-center .justify-between .mb-4 {
             h3 .font-semibold { "API Keys" }
             button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="create-api-key" {
@@ -544,50 +560,43 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
             }
         }
 
-        @match &result {
-            Ok(list) => {
-                @let rows: Vec<Vec<Markup>> = list.iter().map(|record| {
-                    let user_id = record.user_id.as_str();
-                    let created = record.created_at.as_str();
-                    let revoked = record.revoked_at.as_deref().unwrap_or("");
-                    vec![
-                        html! { code { (record.key_prefix) "..." } },
-                        html! { (record.name) },
-                        html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
-                        html! { span .text-muted { (created.get(..10).unwrap_or(created)) } },
-                        html! {
-                            @if revoked.is_empty() {
-                                (components::status_badge("active"))
-                            } @else {
-                                (components::status_badge("disabled"))
-                            }
-                        },
-                        html! {
-                            @if revoked.is_empty() {
-                                // This block's own route, answered with
-                                // this tab re-rendered: see
-                                // `handle_revoke_api_key`.
-                                button .btn .btn--sm .btn--secondary
-                                    hx-post={"/b/admin/api-keys/" (record.id) "/revoke"}
-                                    hx-target="#users-tab-content"
-                                    hx-confirm="Revoke this API key?"
-                                { "Revoke" }
-                            }
-                        },
-                    ]
-                }).collect();
+        @let rows: Vec<Vec<Markup>> = list.iter().map(|record| {
+            let user_id = record.user_id.as_str();
+            let created = record.created_at.as_str();
+            let revoked = record.revoked_at.as_deref().unwrap_or("");
+            vec![
+                html! { code { (record.key_prefix) "..." } },
+                html! { (record.name) },
+                html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
+                html! { span .text-muted { (created.get(..10).unwrap_or(created)) } },
+                html! {
+                    @if revoked.is_empty() {
+                        (components::status_badge("active"))
+                    } @else {
+                        (components::status_badge("disabled"))
+                    }
+                },
+                html! {
+                    @if revoked.is_empty() {
+                        // This block's own route, answered with
+                        // this tab re-rendered: see
+                        // `handle_revoke_api_key`.
+                        button .btn .btn--sm .btn--secondary
+                            hx-post={"/b/admin/api-keys/" (record.id) "/revoke"}
+                            hx-target="#users-tab-content"
+                            hx-confirm="Revoke this API key?"
+                        { "Revoke" }
+                    }
+                },
+            ]
+        }).collect();
 
-                (components::data_table::<fn(usize) -> Option<String>>(
-                    &API_KEY_COLUMNS,
-                    rows,
-                    None,
-                    html! { p .text-center .text-muted { "No API keys" } },
-                ))
-            }
-            Err(e) => {
-                div .login-error { "Failed to load API keys: " (e) }
-            }
-        }
+        (components::data_table::<fn(usize) -> Option<String>>(
+            &API_KEY_COLUMNS,
+            rows,
+            None,
+            html! { p .text-center .text-muted { "No API keys" } },
+        ))
 
         // Create API key modal
         (components::modal("create-api-key", "Create API Key", html! {
@@ -602,7 +611,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Markup {
                 }
             }
         }))
-    }
+    })
 }
 
 /// The roles and API-key tables' columns. Declared once each so the
