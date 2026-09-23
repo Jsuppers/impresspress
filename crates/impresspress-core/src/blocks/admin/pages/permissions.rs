@@ -1,4 +1,5 @@
 use maud::{html, Markup};
+use wafer_block::GrantWrite;
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
@@ -68,6 +69,24 @@ pub async fn permissions_page(ctx: &dyn Context, msg: &Message) -> OutputStream 
     super::settings::settings_page(ctx, msg, "permissions").await
 }
 
+/// The access a grant confers, as the grant tables badge it.
+fn access_badge(write: GrantWrite) -> Markup {
+    match write {
+        GrantWrite::Full => badge(BadgeVariant::Danger, "read + write"),
+        GrantWrite::Append => badge(BadgeVariant::Warning, "append only"),
+        GrantWrite::None => badge(BadgeVariant::Success, "read only"),
+    }
+}
+
+/// The access a grant confers, as the permissions summary words it.
+fn access_verb(write: GrantWrite) -> &'static str {
+    match write {
+        GrantWrite::Full => "can read and write",
+        GrantWrite::Append => "can only add rows to",
+        GrantWrite::None => "can read",
+    }
+}
+
 pub async fn grants_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     permissions_page(ctx, msg).await
 }
@@ -103,11 +122,7 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                         },
                         html! { code .text-xs { (grant.resource) } },
                         html! {
-                            @if grant.write {
-                                (badge(BadgeVariant::Danger, "read + write"))
-                            } @else {
-                                (badge(BadgeVariant::Success, "read only"))
-                            }
+                            (access_badge(grant.write))
                         },
                     ])
                 }).collect();
@@ -174,11 +189,7 @@ pub(crate) async fn grants_custom_tab(
                             },
                             html! { code .text-xs { (grant.resource) } },
                             html! {
-                                @if grant.write {
-                                    (badge(BadgeVariant::Danger, "read + write"))
-                                } @else {
-                                    (badge(BadgeVariant::Success, "read only"))
-                                }
+                                (access_badge(grant.write))
                             },
                             html! { span .text-13 { (grant.description) } },
                             html! {
@@ -437,11 +448,7 @@ async fn permissions_all_tab(
             } else {
                 grant.grantee.clone()
             };
-            let verb = if grant.write {
-                "can read and write"
-            } else {
-                "can read"
-            };
+            let verb = access_verb(grant.write);
             let sentence = format!("{} {} {}' {}", grantee, verb, block.name, grant.resource);
             all_rows.push(PermRow {
                 type_label,
@@ -460,7 +467,6 @@ async fn permissions_all_tab(
     for grant in &custom_grants {
         let grantee = grant.grantee.as_str();
         let resource = grant.resource.as_str();
-        let write = grant.write;
         let rt = grant.resource_type.as_str();
         let type_label = if rt.is_empty() {
             "DB/Config"
@@ -472,11 +478,7 @@ async fn permissions_all_tab(
         } else {
             grantee
         };
-        let verb = if write {
-            "can read and write"
-        } else {
-            "can read"
-        };
+        let verb = access_verb(grant.write);
         let sentence = format!("{grantee_display} {verb} {resource}");
         all_rows.push(PermRow {
             type_label: type_label.to_string(),

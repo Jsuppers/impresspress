@@ -33,6 +33,16 @@ impl Context for PanicCtx {
     ) -> OutputStream {
         panic!("call_block must not be invoked on a parse-error path");
     }
+    /// Admits nothing, as the fail-closed `check_resource_access` default
+    /// this context keeps does.
+    fn resource_access_admitted(
+        &self,
+        _resource: &str,
+        _resource_type: wafer_run::ResourceType,
+        _access: wafer_block::ResourceAccess,
+    ) -> bool {
+        false
+    }
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -134,6 +144,16 @@ impl Context for RecordingCtx {
         });
         OutputStream::respond(scripted.unwrap_or_else(|| br#"{"id":"entry-1"}"#.to_vec()))
     }
+    /// Admits nothing, as the fail-closed `check_resource_access` default
+    /// this context keeps does.
+    fn resource_access_admitted(
+        &self,
+        _resource: &str,
+        _resource_type: wafer_run::ResourceType,
+        _access: wafer_block::ResourceAccess,
+    ) -> bool {
+        false
+    }
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -196,10 +216,20 @@ impl Context for MessagesWriteFails {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.inner
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
     }
     fn is_cancelled(&self) -> bool {
         self.inner.is_cancelled()

@@ -400,10 +400,19 @@ impl Context for MessagesRefused {
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
-        is_write: bool,
+        access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
         self.0
-            .check_resource_access(resource, resource_type, is_write)
+            .check_resource_access(resource, resource_type, access)
+    }
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.0
+            .resource_access_admitted(resource, resource_type, access)
     }
     fn is_cancelled(&self) -> bool {
         self.0.is_cancelled()
@@ -450,6 +459,16 @@ async fn refused_page_reads_are_the_403_page() {
                 return OutputStream::error(wrap_denial());
             }
             self.0.call_block(name, msg, input).await
+        }
+        /// Admits nothing, as the fail-closed `check_resource_access` default
+        /// this context keeps does.
+        fn resource_access_admitted(
+            &self,
+            _resource: &str,
+            _resource_type: wafer_run::ResourceType,
+            _access: wafer_block::ResourceAccess,
+        ) -> bool {
+            false
         }
         fn is_cancelled(&self) -> bool {
             self.0.is_cancelled()
@@ -515,6 +534,16 @@ impl Context for ThreadListUnreadable {
             return OutputStream::respond(br#"{"total_count":0}"#.to_vec());
         }
         self.0.call_block(name, msg, input).await
+    }
+    /// Admits nothing, as the fail-closed `check_resource_access` default
+    /// this context keeps does.
+    fn resource_access_admitted(
+        &self,
+        _resource: &str,
+        _resource_type: wafer_run::ResourceType,
+        _access: wafer_block::ResourceAccess,
+    ) -> bool {
+        false
     }
     fn is_cancelled(&self) -> bool {
         self.0.is_cancelled()

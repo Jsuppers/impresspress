@@ -557,7 +557,7 @@ impl ImpresspressBuilder {
         let mut external_grants = self.wrap_grants;
         external_grants.extend(self.deployment_wrap_grants);
         if !external_grants.is_empty() {
-            wafer.add_wrap_grants(external_grants);
+            wafer.add_wrap_grants(external_grants)?;
         }
 
         // 13. The synchronous `ctx.config_get` surface, from the same

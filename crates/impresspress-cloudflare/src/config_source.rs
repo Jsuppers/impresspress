@@ -513,6 +513,9 @@ mod tests {
         async fn schema_table_exists(&self, _n: &str) -> Result<bool, DatabaseError> {
             unreachable!()
         }
+        async fn schema_columns(&self, _table: &str) -> Result<Vec<String>, DatabaseError> {
+            unreachable!()
+        }
         async fn schema_drop_table(&self, _n: &str) -> Result<(), DatabaseError> {
             unreachable!()
         }

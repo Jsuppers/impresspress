@@ -314,9 +314,70 @@ pub struct PreparedResourceGrant {
     pub grantee: String,
     pub resource: String,
     #[serde(default)]
-    pub write: bool,
+    pub write: PreparedGrantWrite,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<PreparedResourceType>,
+}
+
+/// What a [`PreparedResourceGrant`] lets its grantee do.
+///
+/// Encoded as `false` / `true` / `"append"` — the same spelling as
+/// `wafer_block::types::GrantWrite` — so every plan exported before append
+/// grants existed still imports unchanged, and a build that predates them
+/// refuses a plan carrying `"append"` rather than reading it as read-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PreparedGrantWrite {
+    /// Read-only (`false`).
+    #[default]
+    Read,
+    /// Read-write (`true`).
+    ReadWrite,
+    /// Append-only on a database collection (`"append"`).
+    Append,
+}
+
+const PREPARED_GRANT_WRITE_APPEND: &str = "append";
+
+impl Serialize for PreparedGrantWrite {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Read => serializer.serialize_bool(false),
+            Self::ReadWrite => serializer.serialize_bool(true),
+            Self::Append => serializer.serialize_str(PREPARED_GRANT_WRITE_APPEND),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PreparedGrantWrite {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = PreparedGrantWrite;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a boolean or the string `{PREPARED_GRANT_WRITE_APPEND}`")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<PreparedGrantWrite, E> {
+                Ok(if v {
+                    PreparedGrantWrite::ReadWrite
+                } else {
+                    PreparedGrantWrite::Read
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PreparedGrantWrite, E> {
+                if v == PREPARED_GRANT_WRITE_APPEND {
+                    Ok(PreparedGrantWrite::Append)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// One route in matching order. Route order is semantic and is not sorted.

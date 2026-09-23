@@ -442,6 +442,10 @@ mod boot_hook_tests {
             Ok(true)
         }
 
+        async fn schema_columns(&self, _table: &str) -> Result<Vec<String>, DatabaseError> {
+            Ok(Vec::new())
+        }
+
         async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
             self.note(format!("schema_drop_table {name}"));
             Ok(())

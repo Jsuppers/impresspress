@@ -598,38 +598,29 @@ crate::impresspress_feature_block! {
                 // where this list is the set of admin surfaces that happen
                 // not to live in the admin block.
                 //
-                // What these grants actually confer, stated plainly because
-                // it is more than appending a row. WRAP carries ONE write
-                // bit: `wrap::grant_allows` refuses a write only when
-                // `!grant.write`, and every mutating database op —
-                // `database.create`, `.update`, `.delete` alike — authorizes
-                // as `(collection, ResourceType::Db, true)`
-                // (`wafer-core`'s `interfaces/database/handler.rs`). So each
-                // grantee can rewrite and DELETE audit rows, not only add
-                // them, and `read_write` has no read-less form to narrow it
-                // to. The grant is also block-scoped, not route-scoped: it
-                // covers every code path in that block, not just the
-                // settings-save and portal-button handlers that need it.
-                // Tightening this needs an append-only channel in wafer-run,
-                // not a different grant here.
+                // Append-only: each grantee may insert audit rows and do
+                // nothing else to the table — not read, update, delete,
+                // upsert, reshape it, or pick a row's `id`, `created_at` or
+                // `updated_at` (the database assigns those, so an entry
+                // cannot be forged over another or back-dated). The
+                // database handler classifies every op
+                // (`wafer_block::wrap::DATABASE_OP_ACCESS`) and admits only
+                // `database.create` / `create_many` / a batch of `Create`s
+                // under an append grant. Their only access is
+                // `logs::audit_log` → `db::create`. The grant is still
+                // block-scoped, not route-scoped: it covers every code path
+                // in that block, not just the settings-save and portal-button
+                // handlers that need it.
                 //
-                // `.typed(Db)` because an UNtyped grant is a wildcard across
-                // every resource type (`grant_allows` skips the type check
-                // when `grant.resource_type` is `None`), which would let this
-                // table name authorize a Config, Storage, Crypto, Network or
-                // Vector access too. Nothing reaches those under this name
-                // today; the type is declared so nothing can.
-                wafer_run::ResourceGrant::read_write("impresspress/userportal", AUDIT_LOGS_TABLE)
-                    .typed(wafer_run::ResourceType::Db),
-                wafer_run::ResourceGrant::read_write("impresspress/products", AUDIT_LOGS_TABLE)
-                    .typed(wafer_run::ResourceType::Db),
-                wafer_run::ResourceGrant::read_write("impresspress/legalpages", AUDIT_LOGS_TABLE)
-                    .typed(wafer_run::ResourceType::Db),
-                wafer_run::ResourceGrant::read_write(
+                // `ResourceGrant::append` is typed `Db` by construction — an
+                // append grant of any other type is refused at registration.
+                wafer_run::ResourceGrant::append("impresspress/userportal", AUDIT_LOGS_TABLE),
+                wafer_run::ResourceGrant::append("impresspress/products", AUDIT_LOGS_TABLE),
+                wafer_run::ResourceGrant::append("impresspress/legalpages", AUDIT_LOGS_TABLE),
+                wafer_run::ResourceGrant::append(
                     super::auth_ui::AUTH_UI_BLOCK_ID,
                     AUDIT_LOGS_TABLE,
-                )
-                .typed(wafer_run::ResourceType::Db),
+                ),
                 // Default: allow all blocks to make outbound network requests.
                 // Remove this grant via the admin UI to restrict network access.
                 wafer_run::ResourceGrant::read("*", "*")
@@ -870,7 +861,13 @@ async fn handle_create_wrap_grant(
     let form = parse_form_body(&raw);
     let grantee = form.get("grantee").cloned().unwrap_or_default();
     let resource = form.get("resource").cloned().unwrap_or_default();
-    let write = crate::config_vars::form_bool(&form, "write");
+    // The form offers read-only and read-write; an append-only grant is
+    // declared in code (`ResourceGrant::append`).
+    let write = if crate::config_vars::form_bool(&form, "write") {
+        wafer_block::GrantWrite::Full
+    } else {
+        wafer_block::GrantWrite::None
+    };
     let resource_type = form.get("resource_type").cloned().unwrap_or_default();
     let description = form.get("description").cloned().unwrap_or_default();
 
@@ -1222,7 +1219,7 @@ mod wrap_grant_mutation_tests {
             wrap_grants::NewWrapGrant {
                 grantee: "impresspress/files".to_string(),
                 resource: "some_table".to_string(),
-                write: false,
+                write: wafer_block::GrantWrite::None,
                 resource_type: String::new(),
                 description: String::new(),
             },
@@ -1389,7 +1386,7 @@ mod grant_tests {
             .find(|g| g.grantee == AUTH_UI_BLOCK_ID && g.resource == table);
 
         assert!(
-            auth_ui_user_roles_grant.is_some_and(|g| g.write),
+            auth_ui_user_roles_grant.is_some_and(|g| g.write == wafer_block::GrantWrite::Full),
             "admin block must declare a read_write grant for {AUTH_UI_BLOCK_ID} on \
              {table} (login path) — found: {auth_ui_user_roles_grant:?}"
         );
@@ -1479,10 +1476,20 @@ mod test_support {
             &self,
             resource: &str,
             resource_type: wafer_run::ResourceType,
-            is_write: bool,
+            access: wafer_block::ResourceAccess,
         ) -> Result<(), wafer_run::WaferError> {
             self.inner
-                .check_resource_access(resource, resource_type, is_write)
+                .check_resource_access(resource, resource_type, access)
+        }
+
+        fn resource_access_admitted(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            access: wafer_block::ResourceAccess,
+        ) -> bool {
+            self.inner
+                .resource_access_admitted(resource, resource_type, access)
         }
 
         async fn call_block(
@@ -2217,7 +2224,7 @@ pub(crate) mod page_link_tests {
             wrap_grants::NewWrapGrant {
                 grantee: "impresspress/probe".to_string(),
                 resource: "impresspress__probe__things".to_string(),
-                write: false,
+                write: wafer_block::GrantWrite::None,
                 resource_type: String::new(),
                 description: String::new(),
             },

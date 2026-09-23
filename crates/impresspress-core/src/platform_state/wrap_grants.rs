@@ -14,7 +14,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{json, Value};
-use wafer_block::db::ListOptions;
+use wafer_block::{db::ListOptions, GrantWrite};
 use wafer_core::{clients::database as db, interfaces::database::service::DatabaseService};
 use wafer_run::{context::Context, ErrorCode, ResourceGrant, ResourceType, WaferError};
 
@@ -33,8 +33,9 @@ pub struct WrapGrantRow {
     pub grantee: String,
     /// The table, storage path or other resource pattern being granted.
     pub resource: String,
-    /// Stored as the integer column `write` (migration 001).
-    pub write: bool,
+    /// Stored in the integer column `write` (migration 001) as
+    /// [`WRITE_READ`], [`WRITE_READ_WRITE`] or [`WRITE_APPEND`].
+    pub write: GrantWrite,
     /// The stored wire value of the grant's [`ResourceType`] (its lowercase
     /// `Display` form: `db`, `config`, …); empty is the all-types wildcard.
     pub resource_type: String,
@@ -47,8 +48,8 @@ impl WrapGrantRow {
     /// Decode one row. `grantee`, `resource` and `write` are required (all
     /// `NOT NULL`); a row without them is not a grant and is refused rather
     /// than defaulted, so a malformed row can never widen access. `write`
-    /// accepts the integer SQLite stores, the bool Postgres returns and the
-    /// strings `"1"`/`"true"`; anything else reads as read-only.
+    /// is decoded by [`decode_write`]; a value it does not recognise refuses
+    /// the row too.
     pub fn from_record(id: &str, data: &HashMap<String, Value>) -> Result<Self, String> {
         let grantee = data
             .opt_str_field("grantee")
@@ -56,14 +57,16 @@ impl WrapGrantRow {
         let resource = data
             .opt_str_field("resource")
             .ok_or_else(|| format!("{TABLE} row `{id}` has no resource"))?;
-        if data.get("write").is_none() {
+        let Some(write) = data.get("write") else {
             return Err(format!("{TABLE} row `{id}` has no write column"));
-        }
+        };
+        let write = decode_write(write)
+            .ok_or_else(|| format!("{TABLE} row `{id}` has an unrecognised write value {write}"))?;
         Ok(Self {
             id: id.to_string(),
             grantee,
             resource,
-            write: data.bool_field("write"),
+            write,
             resource_type: data.str_field("resource_type").to_string(),
             description: data.str_field("description").to_string(),
             created_at: data.str_field("created_at").to_string(),
@@ -77,7 +80,7 @@ impl WrapGrantRow {
         data.insert("id".to_string(), json!(self.id));
         data.insert("grantee".to_string(), json!(self.grantee));
         data.insert("resource".to_string(), json!(self.resource));
-        data.insert("write".to_string(), json!(i64::from(self.write)));
+        data.insert("write".to_string(), json!(encode_write(self.write)));
         data.insert("resource_type".to_string(), json!(self.resource_type));
         data.insert("description".to_string(), json!(self.description));
         data.insert("created_at".to_string(), json!(self.created_at));
@@ -88,16 +91,61 @@ impl WrapGrantRow {
     /// The runtime grant this row declares. An empty `resource_type` is the
     /// intentional all-types wildcard; a non-empty unrecognized value is a
     /// typo'd grant and is an error (fail-closed) rather than widened to the
-    /// wildcard.
+    /// wildcard. So is a grant the runtime would refuse to install
+    /// ([`ResourceGrant::check_shape`]: an append grant not typed `db`) —
+    /// `Wafer::add_wrap_grants` rejects the whole set it is handed when one
+    /// grant fails that check, so one bad row must not reach it.
     pub fn into_resource_grant(self) -> Result<ResourceGrant, String> {
         let resource_type = ResourceType::parse_stored(Some(&self.resource_type))
             .map_err(|e| format!("{TABLE} row `{}`: {e}", self.id))?;
-        Ok(ResourceGrant {
+        let grant = ResourceGrant {
             grantee: self.grantee,
             resource: self.resource,
             write: self.write,
             resource_type,
-        })
+        };
+        grant
+            .check_shape()
+            .map_err(|e| format!("{TABLE} row `{}`: {e}", self.id))?;
+        Ok(grant)
+    }
+}
+
+/// `write` column value of a read-only grant.
+pub const WRITE_READ: i64 = 0;
+/// `write` column value of a read-write grant.
+pub const WRITE_READ_WRITE: i64 = 1;
+/// `write` column value of an append-only grant.
+pub const WRITE_APPEND: i64 = 2;
+
+fn encode_write(write: GrantWrite) -> i64 {
+    match write {
+        GrantWrite::None => WRITE_READ,
+        GrantWrite::Full => WRITE_READ_WRITE,
+        GrantWrite::Append => WRITE_APPEND,
+    }
+}
+
+/// The stored `write` value as a [`GrantWrite`]: the integer SQLite and
+/// Postgres store, a bool, or either spelled as a string by a hand-built
+/// fixture. `None` for anything else — the caller refuses the row rather
+/// than guess which access it meant.
+fn decode_write(value: &Value) -> Option<GrantWrite> {
+    let code = match value {
+        Value::Number(n) => n.as_i64()?,
+        Value::Bool(b) => i64::from(*b),
+        Value::String(s) => match s.as_str() {
+            "true" => WRITE_READ_WRITE,
+            "false" => WRITE_READ,
+            other => other.parse().ok()?,
+        },
+        _ => return None,
+    };
+    match code {
+        WRITE_READ => Some(GrantWrite::None),
+        WRITE_READ_WRITE => Some(GrantWrite::Full),
+        WRITE_APPEND => Some(GrantWrite::Append),
+        _ => None,
     }
 }
 
@@ -106,7 +154,7 @@ impl WrapGrantRow {
 pub struct NewWrapGrant {
     pub grantee: String,
     pub resource: String,
-    pub write: bool,
+    pub write: GrantWrite,
     pub resource_type: String,
     pub description: String,
 }
@@ -205,7 +253,7 @@ pub(crate) async fn seed_fixture_grant(db: &Arc<dyn DatabaseService>) {
     let row = NewWrapGrant {
         grantee: "impresspress/files".to_string(),
         resource: FIXTURE_RESOURCE.to_string(),
-        write: true,
+        write: GrantWrite::Full,
         resource_type: "db".to_string(),
         description: String::new(),
     }
@@ -259,14 +307,14 @@ mod tests {
         NewWrapGrant {
             grantee: "impresspress/files".to_string(),
             resource: "impresspress__foo__bar".to_string(),
-            write: true,
+            write: GrantWrite::Full,
             resource_type: resource_type.to_string(),
             description: "probe".to_string(),
         }
     }
 
     /// The codec: every column `create` writes comes back through `list`
-    /// unchanged, `write` as a bool from the integer column.
+    /// unchanged, `write` as a [`GrantWrite`] from the integer column.
     #[tokio::test]
     async fn create_and_list_round_trip_every_column() {
         let ctx = TestContext::with_admin().await;
@@ -274,7 +322,7 @@ mod tests {
         assert!(created.id.starts_with("wg_"), "{}", created.id);
         assert_eq!(created.grantee, "impresspress/files");
         assert_eq!(created.resource, "impresspress__foo__bar");
-        assert!(created.write);
+        assert_eq!(created.write, GrantWrite::Full);
         assert_eq!(created.resource_type, "db");
         assert_eq!(created.description, "probe");
         assert!(!created.created_at.is_empty());
@@ -291,8 +339,56 @@ mod tests {
             .expect("a stored `db` type parses");
         assert_eq!(grant.grantee, "impresspress/files");
         assert_eq!(grant.resource, "impresspress__foo__bar");
-        assert!(grant.write);
+        assert_eq!(grant.write, GrantWrite::Full);
         assert_eq!(grant.resource_type, Some(ResourceType::Db));
+    }
+
+    /// An append-only grant survives the table and becomes an append-only
+    /// runtime grant — the column is an integer, not a bool, so it cannot
+    /// collapse into read-only or read-write on the way through.
+    #[tokio::test]
+    async fn an_append_grant_round_trips_through_the_table() {
+        let ctx = TestContext::with_admin().await;
+        let created = create(
+            &ctx,
+            NewWrapGrant {
+                write: GrantWrite::Append,
+                ..new_grant("db")
+            },
+        )
+        .await
+        .expect("create");
+        assert_eq!(created.to_data()["write"], serde_json::json!(WRITE_APPEND));
+        let rows = list(&ctx).await.expect("list");
+        assert_eq!(rows[0].write, GrantWrite::Append);
+        let grant = rows[0]
+            .clone()
+            .into_resource_grant()
+            .expect("a db append grant");
+        assert_eq!(grant.write, GrantWrite::Append);
+    }
+
+    /// An append grant not typed `db` is one the runtime refuses to install,
+    /// and `Wafer::add_wrap_grants` refuses the WHOLE set it is handed when
+    /// one fails — so the row is refused here, where [`load`] drops it alone.
+    #[tokio::test]
+    async fn an_append_grant_not_typed_db_is_refused_as_a_row() {
+        let ctx = TestContext::with_admin().await;
+        for resource_type in ["", "storage"] {
+            let created = create(
+                &ctx,
+                NewWrapGrant {
+                    write: GrantWrite::Append,
+                    ..new_grant(resource_type)
+                },
+            )
+            .await
+            .expect("create");
+            let err = created
+                .into_resource_grant()
+                .expect_err("append grant not typed db");
+            assert!(err.contains("append"), "{err}");
+        }
     }
 
     /// An empty `resource_type` is the intentional all-types wildcard; a
@@ -335,15 +431,20 @@ mod tests {
         assert!(list(&failing).await.is_err());
     }
 
-    /// `write` arrives as an integer from SQLite, a bool from Postgres and a
-    /// string from a hand-built fixture; a row without it is not a grant.
+    /// `write` arrives as an integer from the database, or as a bool or a
+    /// string from a hand-built fixture; a row without it, or with a value
+    /// that names no access, is not a grant.
     #[test]
     fn write_decodes_from_every_backend_shape_and_is_required() {
         for (shape, want) in [
-            (serde_json::json!(1), true),
-            (serde_json::json!(0), false),
-            (serde_json::json!(true), true),
-            (serde_json::json!("1"), true),
+            (serde_json::json!(1), GrantWrite::Full),
+            (serde_json::json!(0), GrantWrite::None),
+            (serde_json::json!(2), GrantWrite::Append),
+            (serde_json::json!(true), GrantWrite::Full),
+            (serde_json::json!(false), GrantWrite::None),
+            (serde_json::json!("1"), GrantWrite::Full),
+            (serde_json::json!("2"), GrantWrite::Append),
+            (serde_json::json!("true"), GrantWrite::Full),
         ] {
             let mut data = HashMap::new();
             data.insert("grantee".to_string(), serde_json::json!("a/b"));
@@ -364,6 +465,22 @@ mod tests {
             data.remove(missing);
             let err = WrapGrantRow::from_record("wg_1", &data).expect_err(missing);
             assert!(err.contains(missing) && err.contains("wg_1"), "{err}");
+        }
+        for unknown in [
+            serde_json::json!(3),
+            serde_json::json!(-1),
+            serde_json::json!("append"),
+            serde_json::json!(null),
+        ] {
+            let mut data = HashMap::new();
+            data.insert("grantee".to_string(), serde_json::json!("a/b"));
+            data.insert("resource".to_string(), serde_json::json!("a__b__c"));
+            data.insert("write".to_string(), unknown.clone());
+            let err = WrapGrantRow::from_record("wg_1", &data).expect_err("unknown write");
+            assert!(
+                err.contains("write") && err.contains("wg_1"),
+                "{unknown}: {err}"
+            );
         }
     }
 }
@@ -392,7 +509,7 @@ mod boot_tests {
         db: &Arc<dyn DatabaseService>,
         grantee: &str,
         resource: &str,
-        write: bool,
+        write: GrantWrite,
         resource_type: &str,
     ) {
         let row = NewWrapGrant {
@@ -428,11 +545,11 @@ mod boot_tests {
             &db,
             "impresspress/files",
             "impresspress__files__objects",
-            true,
+            GrantWrite::Full,
             "db",
         )
         .await;
-        seed(&db, "wafer-run/auth", "bucket/x", false, "").await;
+        seed(&db, "wafer-run/auth", "bucket/x", GrantWrite::None, "").await;
 
         let grants = load(&db).await;
         assert_eq!(grants.len(), 2);
@@ -440,13 +557,13 @@ mod boot_tests {
             .iter()
             .find(|g| g.grantee == "impresspress/files")
             .unwrap();
-        assert!(g1.write);
+        assert_eq!(g1.write, GrantWrite::Full);
         assert_eq!(g1.resource_type, Some(wafer_run::ResourceType::Db));
         let g2 = grants
             .iter()
             .find(|g| g.grantee == "wafer-run/auth")
             .unwrap();
-        assert!(!g2.write);
+        assert_eq!(g2.write, GrantWrite::None);
         assert_eq!(g2.resource_type, None);
 
         // Unrecognized resource_type → the ROW is dropped (fail-closed),
@@ -455,16 +572,34 @@ mod boot_tests {
             &db,
             "impresspress/products",
             "impresspress__products__items",
-            true,
+            GrantWrite::Full,
             "databsae",
         )
         .await;
         // Empty-string resource_type → kept as an intentional wildcard.
-        seed(&db, "impresspress/files", "bucket/y", false, "").await;
+        seed(&db, "impresspress/files", "bucket/y", GrantWrite::None, "").await;
+        // An append grant not typed `db` → the ROW is dropped, so the rest of
+        // the set still reaches `Wafer::add_wrap_grants`, which would refuse
+        // all of it over this one.
+        seed(
+            &db,
+            "impresspress/legalpages",
+            "impresspress__legalpages__docs",
+            GrantWrite::Append,
+            "",
+        )
+        .await;
 
         let grants = load(&db).await;
-        assert_eq!(grants.len(), 3, "typo'd resource_type row must be dropped");
+        assert_eq!(
+            grants.len(),
+            3,
+            "typo'd resource_type and untyped append rows must be dropped"
+        );
         assert!(grants.iter().all(|g| g.grantee != "impresspress/products"));
+        assert!(grants
+            .iter()
+            .all(|g| g.grantee != "impresspress/legalpages"));
         let g4 = grants
             .iter()
             .find(|g| g.resource == "bucket/y")
@@ -485,6 +620,10 @@ mod boot_tests {
             Err(DatabaseError::Internal(
                 "simulated wrap_grants existence-check failure".into(),
             ))
+        }
+
+        async fn schema_columns(&self, _table: &str) -> Result<Vec<String>, DatabaseError> {
+            unreachable!()
         }
 
         async fn get(&self, _collection: &str, _id: &str) -> Result<Record, DatabaseError> {

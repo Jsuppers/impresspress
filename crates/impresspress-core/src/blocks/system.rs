@@ -109,6 +109,16 @@ mod tests {
         ) -> OutputStream {
             panic!("call_block not used");
         }
+        /// Admits nothing, as the fail-closed `check_resource_access` default
+        /// this context keeps does.
+        fn resource_access_admitted(
+            &self,
+            _resource: &str,
+            _resource_type: wafer_run::ResourceType,
+            _access: wafer_block::ResourceAccess,
+        ) -> bool {
+            false
+        }
         fn is_cancelled(&self) -> bool {
             false
         }

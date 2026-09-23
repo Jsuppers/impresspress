@@ -61,7 +61,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use wafer_block::{codec, wire::config as wire, ServiceOp};
+use wafer_block::{codec, wire::config as wire, ResourceAccess, ServiceOp};
 use wafer_core::interfaces::{config::service::ConfigService, database::service::DatabaseService};
 use wafer_run::{
     context::Context, Block, BlockInfo, ErrorCode, InputStream, Message, OutputStream,
@@ -352,7 +352,9 @@ impl VariablesConfigBlock {
         };
         let mut values = HashMap::with_capacity(req.keys.len());
         for key in req.keys {
-            if let Err(e) = ctx.check_resource_access(&key, ResourceType::Config, false) {
+            if let Err(e) =
+                ctx.check_resource_access(&key, ResourceType::Config, ResourceAccess::Read)
+            {
                 return OutputStream::error(e);
             }
             match self.resolve(&key).await {
@@ -599,7 +601,9 @@ impl Block for VariablesConfigBlock {
                     Ok(key) => key,
                     Err(out) => return out,
                 };
-                if let Err(e) = ctx.check_resource_access(&key, ResourceType::Config, false) {
+                if let Err(e) =
+                    ctx.check_resource_access(&key, ResourceType::Config, ResourceAccess::Read)
+                {
                     return OutputStream::error(e);
                 }
 
@@ -645,7 +649,9 @@ impl Block for VariablesConfigBlock {
                         ))
                     }
                 };
-                if let Err(e) = ctx.check_resource_access(&req.key, ResourceType::Config, true) {
+                if let Err(e) =
+                    ctx.check_resource_access(&req.key, ResourceType::Config, ResourceAccess::Write)
+                {
                     return OutputStream::error(e);
                 }
                 // A runtime-owned key is never served from the table, so

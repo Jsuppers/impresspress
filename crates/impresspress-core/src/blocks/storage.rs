@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use wafer_block::{codec, stream::StreamEvent, wire::storage as wire, ServiceOp};
+use wafer_block::{codec, stream::StreamEvent, wire::storage as wire, ResourceAccess, ServiceOp};
 use wafer_core::{clients::database as db, interfaces::storage::service::StorageService};
 use wafer_run::{
     context::Context, Block, BlockInfo, ErrorCode, InputStream, LifecycleEvent, Message,
@@ -388,7 +388,11 @@ impl Block for ImpresspressStorageBlock {
         // resource is the caller's own namespace to it and is admitted for
         // any attributable caller without looking at a grant.
         if resolved.cross_block {
-            let is_write = access == "write";
+            let access = if access == "write" {
+                ResourceAccess::Write
+            } else {
+                ResourceAccess::Read
+            };
             let grants = self
                 .wrap_grants
                 .read()
@@ -397,7 +401,7 @@ impl Block for ImpresspressStorageBlock {
             if let Err(e) = wafer_run::wrap::check_access(
                 Some(&caller),
                 &format!("@{}", resolved.wrap_resource),
-                is_write,
+                access,
                 Some(&ResourceType::Storage),
                 &grants,
                 &self.wrap_admin_block,

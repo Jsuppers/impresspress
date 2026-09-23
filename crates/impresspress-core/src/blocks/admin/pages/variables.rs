@@ -719,8 +719,10 @@ fn config_by_block_tab(
     // below used to walk `blocks × grants × config_keys` looking for matches —
     // a cubic loop for every page render. We build a single map up front so
     // the inner template just does an O(1) lookup per config key.
-    let mut grants_by_resource: std::collections::HashMap<String, Vec<(&str, bool)>> =
-        std::collections::HashMap::new();
+    let mut grants_by_resource: std::collections::HashMap<
+        String,
+        Vec<(&str, wafer_block::GrantWrite)>,
+    > = std::collections::HashMap::new();
     for grant_block in blocks {
         for grant in &grant_block.grants {
             grants_by_resource
@@ -773,7 +775,11 @@ fn config_by_block_tab(
                                             @if *grantee != block.name {
                                                 (Badge::new(BadgeVariant::Secondary).classes("mr-1 text-11").render(html! {
                                                     (grantee) ": "
-                                                    @if *write { "read+write" } @else { "read" }
+                                                    (match write {
+                                                        wafer_block::GrantWrite::Full => "read+write",
+                                                        wafer_block::GrantWrite::Append => "append",
+                                                        wafer_block::GrantWrite::None => "read",
+                                                    })
                                                 }))
                                             }
                                         }

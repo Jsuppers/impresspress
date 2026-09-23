@@ -1019,6 +1019,10 @@ mod operational_error_tests {
             Ok(true)
         }
 
+        async fn schema_columns(&self, _table: &str) -> Result<Vec<String>, DatabaseError> {
+            unreachable!()
+        }
+
         async fn schema_drop_table(&self, _name: &str) -> Result<(), DatabaseError> {
             unreachable!()
         }
