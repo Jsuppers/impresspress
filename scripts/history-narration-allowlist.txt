@@ -23,7 +23,6 @@
 1	crates/impresspress-core/src/blocks/auth/mod.rs
 1	crates/impresspress-core/src/blocks/auth/service.rs
 1	crates/impresspress-core/src/blocks/auth_ui/api/api_keys.rs
-1	crates/impresspress-core/src/blocks/auth_ui/api/signup.rs
 1	crates/impresspress-core/src/blocks/auth_ui/mod.rs
 1	crates/impresspress-core/src/blocks/auth_ui/oauth/callback.rs
 1	crates/impresspress-core/src/blocks/auth_ui/oauth/mod.rs
