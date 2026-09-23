@@ -179,7 +179,8 @@ fn newest_first() -> Vec<SortField> {
     }]
 }
 
-pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, WaferError> {
+/// The row [`insert`] writes for `new`, keyed by the id it mints.
+fn new_row(new: NewUser) -> (String, HashMap<String, Value>) {
     let id = Uuid::now_v7().to_string();
     let now = now_iso();
     let mut data: HashMap<String, Value> = HashMap::new();
@@ -197,11 +198,67 @@ pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, WaferErr
     }
     data.insert("created_at".into(), json!(now));
     data.insert("updated_at".into(), json!(now));
+    (id, data)
+}
 
+/// Insert an account row alone. An account created for someone to sign in
+/// to needs a way in, written with it: [`insert_with_password`] for a
+/// password account, [`insert_with_ops`] for anything else.
+pub async fn insert(ctx: &dyn Context, new: NewUser) -> Result<UserRow, WaferError> {
+    let (_, data) = new_row(new);
     let rec = db::create(ctx, TABLE, data)
         .await
         .map_err(|e| db_failed("insert", e))?;
     row_from_map(&rec.data)
+}
+
+/// Insert an account row and the rows `companions` builds for its id, as one
+/// atomic write: every row lands, or — when any of them fails — none does.
+///
+/// Two separate writes leave an account without a way in whenever the
+/// second one fails, and the address is then taken: every retry is told it
+/// is already registered. `companions` gets the minted id so its rows can
+/// point at the account they belong to.
+///
+/// A taken address fails the whole write with `AlreadyExists` (the
+/// `users.email` UNIQUE constraint), and nothing is written.
+pub async fn insert_with_ops(
+    ctx: &dyn Context,
+    new: NewUser,
+    companions: impl FnOnce(&str) -> Vec<wire::BatchWrite>,
+) -> Result<UserRow, WaferError> {
+    let (id, data) = new_row(new);
+    let mut ops = vec![wire::BatchWrite::Create {
+        collection: TABLE.to_string(),
+        data,
+    }];
+    ops.extend(companions(&id));
+    let results = db::batch(ctx, ops)
+        .await
+        .map_err(|e| db_failed("insert with companion rows", e))?;
+    match results.into_iter().next() {
+        Some(wire::BatchWriteResult::Created(rec)) => row_from_map(&rec.data),
+        other => Err(internal_error(format!(
+            "account insert answered {other:?}, not the created row"
+        ))),
+    }
+}
+
+/// Insert a password account — the account row and its
+/// `local_credentials` row — as one atomic write. See [`insert_with_ops`].
+pub async fn insert_with_password(
+    ctx: &dyn Context,
+    new: NewUser,
+    password_hash: &str,
+) -> Result<UserRow, WaferError> {
+    insert_with_ops(ctx, new, |id| {
+        vec![super::local_credentials::create_op(
+            id,
+            password_hash,
+            false,
+        )]
+    })
+    .await
 }
 
 pub async fn find_by_email(ctx: &dyn Context, email: &str) -> Result<Option<UserRow>, WaferError> {
@@ -299,8 +356,9 @@ pub async fn find_by_verification_token(
 /// proof, and clear their `verification_token` in the same write. Stamps
 /// `updated_at` with [`super::now_iso`].
 ///
-/// The ONLY writer of `email_verified_by`. Call it from a caller that has just
-/// watched the proof happen — `auth_ui::api::verify` redeeming a mailed token
+/// With [`record_email_proof_op`], its batch form, the ONLY writer of
+/// `email_verified_by`. Call either from a caller that has just watched the
+/// proof happen — `auth_ui::api::verify` redeeming a mailed token
 /// (`proof::EMAIL_TOKEN`), or `auth_ui::oauth::callback` receiving a verified
 /// address from a provider that asserts one (`proof::oauth`). Setting the
 /// policy flag alone is [`set_email_verified`], which deliberately cannot
@@ -310,15 +368,30 @@ pub async fn record_email_proof(
     user_id: &str,
     proof: &str,
 ) -> Result<(), WaferError> {
-    let mut data = std::collections::HashMap::new();
+    db::update(ctx, TABLE, user_id, email_proof_data(proof))
+        .await
+        .map_err(|e| db_failed(&format!("record email proof for {user_id}"), e))?;
+    Ok(())
+}
+
+/// [`record_email_proof`] as one write of a batch: for the OAuth sign-up
+/// whose provider asserted the address, so the proof lands with the account
+/// it is about.
+pub fn record_email_proof_op(user_id: &str, proof: &str) -> wire::BatchWrite {
+    wire::BatchWrite::Update {
+        collection: TABLE.to_string(),
+        id: user_id.to_string(),
+        data: email_proof_data(proof),
+    }
+}
+
+fn email_proof_data(proof: &str) -> HashMap<String, Value> {
+    let mut data = HashMap::new();
     data.insert("email_verified".to_string(), json!(true));
     data.insert("email_verified_by".to_string(), json!(proof));
     data.insert("verification_token".to_string(), json!(""));
     data.insert("updated_at".to_string(), json!(now_iso()));
-    db::update(ctx, TABLE, user_id, data)
-        .await
-        .map_err(|e| db_failed(&format!("record email proof for {user_id}"), e))?;
-    Ok(())
+    data
 }
 
 /// The values [`record_email_proof`] writes. A proof names the act that

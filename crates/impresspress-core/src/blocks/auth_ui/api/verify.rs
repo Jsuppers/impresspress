@@ -111,7 +111,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
 }
 
 pub async fn handle_resend(
-    limiter: &UserRateLimiter,
+    limiter: &std::sync::Arc<UserRateLimiter>,
     ctx: &dyn Context,
     msg: &Message,
     input: InputStream,
@@ -166,26 +166,31 @@ pub async fn handle_resend(
     // Mint, persist and mail a fresh link — the shared path, which owns both
     // the 60-second resend cooldown and the outbound-mail budget. Inside the
     // cooldown nothing is minted and nothing is said.
-    match super::send_verification_email(limiter, ctx, msg, &user.id, &email_lower).await {
-        Ok(super::VerificationMail::Sent | super::VerificationMail::WithinCooldown) => {}
-        // Same constraint as forgot-password: `constant()` is the answer for
-        // every account state, so the failure is recorded here rather than
-        // in the body.
-        Ok(super::VerificationMail::NotSent(failure)) => {
-            super::log_email_not_sent("resend-verification", &user.id, &failure);
+    //
+    // After the response, like forgot-password: every step of it is work an
+    // unregistered (or already proven) address never causes, so done inline
+    // it made `constant()` arrive later for exactly the addresses it exists
+    // to hide. Deferred, every path costs the handler one lookup.
+    let mail = super::LaterMail::capture(limiter, ctx, msg);
+    crate::deferred::defer(async move {
+        match mail.send_verification(&user.id, &email_lower).await {
+            Ok(super::VerificationMail::Sent | super::VerificationMail::WithinCooldown) => {}
+            Ok(super::VerificationMail::NotSent(failure)) => {
+                super::log_email_not_sent("resend-verification", &user.id, &failure);
+            }
+            // There is no reply left to carry it, and one could not anyway:
+            // a mint that fails only for a registered, unproven address
+            // would be the oracle `constant()` closes. Logged with its code.
+            Err(e) => {
+                tracing::error!(
+                    code = ?e.code,
+                    error = %e,
+                    user_id = %user.id,
+                    "resend-verification: minting the verification token failed"
+                );
+            }
         }
-        // A mint that could not be read, drawn or stored is reachable only
-        // for a registered, unproven address, so a 403 or 500 here would be
-        // the oracle `constant()` closes. Logged with its code instead.
-        Err(e) => {
-            tracing::error!(
-                code = ?e.code,
-                error = %e,
-                user_id = %user.id,
-                "resend-verification: minting the verification token failed"
-            );
-        }
-    }
+    });
 
     constant()
 }
@@ -435,10 +440,13 @@ mod resend_tests {
             .expect("set token");
 
         let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
         let _ = handle_resend(&limiter, &ctx, &msg, body("cooling@example.com"))
             .await
             .collect_buffered()
             .await;
+        // The cooldown is judged by the deferred send; run it.
+        assert_eq!(crate::blocks::auth_ui::api::run_deferred().await, 1);
 
         assert_eq!(
             users::last_verification_sent(&ctx, &id)
@@ -499,10 +507,16 @@ mod resend_tests {
         );
 
         let (limiter, request) = crate::blocks::auth_ui::api::test_mail_request();
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
         let _ = handle_resend(&limiter, &ctx, &request, body("flagged@example.com"))
             .await
             .collect_buffered()
             .await;
+        assert_eq!(
+            crate::blocks::auth_ui::api::run_deferred().await,
+            1,
+            "the link is minted after the response"
+        );
 
         assert!(
             !users::last_verification_sent(&ctx, &user.id)
@@ -590,6 +604,52 @@ mod resend_tests {
         assert_eq!(
             registered, unregistered,
             "a failed token draw must not be visible to the caller"
+        );
+    }
+
+    /// Every account state answers the same body (pinned above); this pins
+    /// that every state also costs the handler the same work before
+    /// answering — one lookup — so the body does not arrive later for an
+    /// unproven account either. Minting, storing and mailing its link run
+    /// after the response.
+    #[tokio::test]
+    async fn an_unproven_account_costs_the_handler_the_same_work_as_an_unknown_address() {
+        use super::super::{run_deferred, CallLog};
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let id = seed(&ctx, "unproven@example.com", false).await;
+        let ctx = CallLog::new(ctx);
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+
+        let unknown =
+            output_json(handle_resend(&limiter, &ctx, &msg, body("nobody@example.com")).await)
+                .await;
+        let unknown_calls = ctx.take();
+        assert_eq!(run_deferred().await, 0);
+
+        let unproven =
+            output_json(handle_resend(&limiter, &ctx, &msg, body("unproven@example.com")).await)
+                .await;
+        let unproven_calls = ctx.take();
+
+        assert_eq!(unproven, unknown);
+        assert_eq!(
+            unproven_calls, unknown_calls,
+            "an unproven account must cost the handler exactly what an unknown address does"
+        );
+
+        assert_eq!(
+            run_deferred().await,
+            1,
+            "the link is minted after the response"
+        );
+        assert!(
+            !users::last_verification_sent(&ctx, &id)
+                .await
+                .expect("read cooldown")
+                .is_empty(),
+            "the deferred task minted and stored the link"
         );
     }
 }

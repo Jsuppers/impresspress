@@ -8,7 +8,10 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use wafer_block::db::{Filter, FilterOp};
+use wafer_block::{
+    db::{Filter, FilterOp},
+    wire::database::BatchWrite,
+};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, WaferError};
 
@@ -36,25 +39,37 @@ fn row_from_map(m: &HashMap<String, Value>) -> Result<LocalCredentialRow, WaferE
 
 /// Insert a local-credentials row for `user_id`. Fails if a row already
 /// exists for that user (PK collision).
+///
+/// For an account that already exists. A new account gets its row in the
+/// same write as the account (`users::insert_with_password`).
 pub async fn insert(
     ctx: &dyn Context,
     user_id: &str,
     password_hash: &str,
     must_reset: bool,
 ) -> Result<(), WaferError> {
-    let id = uuid::Uuid::now_v7().to_string();
-    let now = now_iso();
-    let mut data: HashMap<String, Value> = HashMap::new();
-    data.insert("id".into(), json!(id));
-    data.insert("user_id".into(), json!(user_id));
-    data.insert("password_hash".into(), json!(password_hash));
-    data.insert("must_reset".into(), json!(must_reset));
-    data.insert("created_at".into(), json!(now));
-
-    db::create(ctx, TABLE, data)
+    db::create(ctx, TABLE, new_row(user_id, password_hash, must_reset))
         .await
         .map_err(|e| db_failed("local_credentials insert", e))?;
     Ok(())
+}
+
+/// [`insert`] as one write of a batch.
+pub fn create_op(user_id: &str, password_hash: &str, must_reset: bool) -> BatchWrite {
+    BatchWrite::Create {
+        collection: TABLE.to_string(),
+        data: new_row(user_id, password_hash, must_reset),
+    }
+}
+
+fn new_row(user_id: &str, password_hash: &str, must_reset: bool) -> HashMap<String, Value> {
+    let mut data: HashMap<String, Value> = HashMap::new();
+    data.insert("id".into(), json!(uuid::Uuid::now_v7().to_string()));
+    data.insert("user_id".into(), json!(user_id));
+    data.insert("password_hash".into(), json!(password_hash));
+    data.insert("must_reset".into(), json!(must_reset));
+    data.insert("created_at".into(), json!(now_iso()));
+    data
 }
 
 /// Update the `password_hash` for `user_id`.

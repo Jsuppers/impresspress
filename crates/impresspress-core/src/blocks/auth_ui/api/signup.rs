@@ -1,7 +1,9 @@
 //! POST /b/auth/api/signup — relocated from auth/login.rs in Task 5.
 
+use std::sync::Arc;
+
 use wafer_core::clients::{config, crypto};
-use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
+use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
     blocks::{
@@ -9,7 +11,7 @@ use crate::{
             helpers::{
                 email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
             },
-            repo::{local_credentials, users},
+            repo::users,
         },
         auth_ui::{
             contracts::{
@@ -25,14 +27,6 @@ use crate::{
     http::{err_bad_request, err_internal, ResponseBuilder},
     util::{hex_encode, sha256_hex},
 };
-
-/// Returns `Ok(true)` when a user with `email_lower` already exists, `Ok(false)`
-/// when not. Any DB failure other than NOT_FOUND propagates — see [SEC-035]
-/// note below; collapsing a WRAP denial or connection blip to "email is free"
-/// would let a duplicate insert race in past the unique-email constraint.
-async fn user_exists(ctx: &dyn Context, email_lower: &str) -> Result<bool, WaferError> {
-    Ok(users::find_by_email(ctx, email_lower).await?.is_some())
-}
 
 /// The no-auto-login signup response. Under `REQUIRE_VERIFICATION` a fresh
 /// signup and an already-registered address both answer exactly this, byte
@@ -55,7 +49,7 @@ fn pending_verification(email: String) -> SignupResponse {
 }
 
 pub async fn handle(
-    limiter: &UserRateLimiter,
+    limiter: &Arc<UserRateLimiter>,
     ctx: &dyn Context,
     msg: &Message,
     input: InputStream,
@@ -105,43 +99,22 @@ pub async fn handle(
         }
     }
 
-    // [SEC-035] If the email is already registered, do NOT confirm that to
-    // the caller — answer the reply a fresh signup under REQUIRE_VERIFICATION
-    // produces (see `pending_verification` for when that hides the address's
-    // state and when it cannot). The signup endpoint is otherwise a free
-    // email-enumeration oracle for password-reset / phishing campaigns.
-    // What matches is the response, not the time it takes: a fresh signup
-    // also hashes the password, inserts two rows and sends mail, and this
-    // branch does none of that.
-    //
-    // Follow-up: send a "someone tried to sign up with your email" notice
-    // to the existing account. Not included in this PR — needs the email
-    // block's templating to grow a new template, which is out of scope.
-    //
-    // Use the typed `users::find_by_email` path (NOT_FOUND → Ok(None));
-    // any other Err is a real backend failure (WRAP denial, DB outage)
-    // that we must surface, not collapse to "email is free".
-    let email_already_taken = match user_exists(ctx, &email_lower).await {
-        Ok(t) => t,
-        Err(e) => return crud::db_error_internal(e, "User lookup failed"),
-    };
-    if email_already_taken {
-        return ResponseBuilder::new()
-            .status(201)
-            .json(&pending_verification(email_lower));
-    }
-
-    // Hash password
+    // Everything up to and including the account write runs whether or not
+    // the address is taken, because what a caller measures is not only the
+    // reply ([SEC-035], see `pending_verification`) but how long it took.
+    // A registered address answered before the ~100 ms password hash was an
+    // enumeration oracle with the same body: fast meant "has an account".
+    // So the hash, the token draw and the write happen on both paths, the
+    // write is what finds out the address is taken, and the mail — the one
+    // slow step only a new account has — goes out after the response.
     let password_hash = match crypto::hash(ctx, &body.password).await {
         Ok(h) => h,
         Err(e) => return err_internal("Failed to hash password", e),
     };
 
-    // Check if email verification is required
     let require_verification =
         crate::config_vars::get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false).await;
 
-    // Generate verification token if needed
     let verification_token = if require_verification {
         match crypto::random_bytes(ctx, 32).await {
             Ok(bytes) => hex_encode(&bytes),
@@ -155,16 +128,19 @@ pub async fn handle(
     // admin email (re-uses the same key as bootstrap for consistency).
     let role = initial_role_for(ctx, &email_lower).await;
 
-    // Insert via typed repo — no password_hash on the users row (those live
-    // in `local_credentials`), and no `user_roles` row: the initial role is
-    // the inline `users.role` column `NewUser.role` writes, which is what
-    // `helpers::get_user_roles` reads first.
+    // The account row and its `local_credentials` row in one atomic write —
+    // as two, a failure between them left an account with no password whose
+    // address answered "already registered" to every retry. No `user_roles`
+    // row: the initial role is the inline `users.role` column `NewUser.role`
+    // writes, which is what `helpers::get_user_roles` reads first. The
+    // verification state rides on the insert too.
     //
-    // The verification state rides on the insert. It used to be a second
-    // `UPDATE` against the row this call had just created, which meant a
-    // signup could leave a user verified-by-default if that write failed
-    // (it was only warned about).
-    let user = match users::insert(
+    // A taken address fails the write with `AlreadyExists` (`users.email` is
+    // UNIQUE) and writes nothing; that is the registered answer. Any other
+    // failure is a real backend fault on a new address and is reported as
+    // one — it is not the enumeration oracle, because a registered address
+    // never reaches it.
+    let user = match users::insert_with_password(
         ctx,
         users::NewUser {
             email: email_lower.clone(),
@@ -177,42 +153,42 @@ pub async fn handle(
             verification_token_hash: (!verification_token.is_empty())
                 .then(|| sha256_hex(verification_token.as_bytes())),
         },
+        &password_hash,
     )
     .await
     {
         Ok(u) => u,
-        Err(e) => return crud::db_error_internal(e, "Failed to create user"),
+        Err(e) if e.code == wafer_run::ErrorCode::AlreadyExists => {
+            // Follow-up: send a "someone tried to sign up with your email"
+            // notice to the existing account — after the response, like the
+            // verification mail below. Needs the email block's templating to
+            // grow a new template.
+            return ResponseBuilder::new()
+                .status(201)
+                .json(&pending_verification(email_lower));
+        }
+        Err(e) => return crud::db_error_internal(e, "Failed to create account"),
     };
-
-    if let Err(e) = local_credentials::insert(ctx, &user.id, &password_hash, false).await {
-        return crud::db_error_internal(e, "Failed to store credentials");
-    }
 
     let roles = vec![role.to_string()];
 
-    // Send verification email if required
     if require_verification {
-        if let Err(failure) = super::send_template_email(
-            limiter,
-            ctx,
-            msg,
-            "verification",
-            &email_lower,
-            &verification_token,
-        )
-        .await
-        {
-            // The response below cannot carry this. It is the same body the
-            // "[SEC-035] email already registered" branch above answers, and
-            // a body that varied with whether mail actually went out would
-            // hand an anonymous caller the enumeration oracle that branch
-            // exists to close.
-            //
-            // The account exists and the resend endpoint can mint a fresh
-            // token, so the recoverable half is already in the user's hands;
-            // the part that was missing is this line.
-            super::log_email_not_sent("signup", &user.id, &failure);
-        }
+        // After the response: see above. The body cannot carry a send
+        // failure anyway — it is the same body the registered branch
+        // answers, and one that varied with whether mail went out would be
+        // the oracle that branch closes. The account exists and the resend
+        // endpoint can mint a fresh token, so the log line is what was
+        // missing when mail fails.
+        let mail = super::LaterMail::capture(limiter, ctx, msg);
+        let (to, user_id) = (email_lower.clone(), user.id.clone());
+        crate::deferred::defer(async move {
+            if let Err(failure) = mail
+                .send_template("verification", &to, &verification_token)
+                .await
+            {
+                super::log_email_not_sent("signup", &user_id, &failure);
+            }
+        });
         // Do NOT issue tokens before email is verified
         return ResponseBuilder::new()
             .status(201)
@@ -485,5 +461,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The account row and its password are one write. As two, a failure
+    /// between them kept the account — with no password — and the address
+    /// then answered "already registered" to every retry, so its owner could
+    /// neither sign up nor sign in.
+    #[tokio::test]
+    async fn a_failure_writing_the_password_leaves_no_account_and_the_retry_succeeds() {
+        use crate::blocks::auth::repo::{
+            local_credentials,
+            test_faults::{drop_trigger, fail_inserts_into},
+        };
+
+        let ctx = ctx_with_crypto().await;
+        let trigger = fail_inserts_into(&ctx, local_credentials::TABLE).await;
+
+        let failed = signup_on_the_wire(&ctx, "halfway@example.com", "correct-horse-battery").await;
+        assert_eq!(
+            failed.status, 500,
+            "a new address whose write failed is told so"
+        );
+        assert!(
+            users::find_by_email(&ctx, "halfway@example.com")
+                .await
+                .expect("user lookup ok")
+                .is_none(),
+            "the account row must not outlive its failed password write"
+        );
+
+        drop_trigger(&ctx, &trigger).await;
+        let retry = signup(&ctx, "halfway@example.com", "correct-horse-battery").await;
+        assert!(
+            retry["access_token"].is_string(),
+            "the retry must create the account and sign it in, not be told the \
+             address is already registered: {retry}"
+        );
+    }
+
+    /// [SEC-035] Under REQUIRE_VERIFICATION the reply for a registered
+    /// address is the fresh-signup reply byte for byte (pinned above). This
+    /// pins the other half: the handler does the same work for both before
+    /// answering — the same block calls, in the same order, the password
+    /// hash included — so the reply does not arrive measurably sooner for a
+    /// registered address either. The one step only a new account has, the
+    /// verification mail, runs after the response.
+    #[tokio::test]
+    async fn a_registered_address_costs_signup_the_same_work_as_a_new_one() {
+        use super::super::{run_deferred, CallLog};
+
+        let mut ctx = ctx_with_crypto().await;
+        ctx.set_config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true");
+        let ctx = CallLog::new(ctx);
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+
+        async fn attempt(ctx: &CallLog, email: &str) -> u16 {
+            let body = serde_json::json!({"email": email, "password": "correct-horse-battery"})
+                .to_string();
+            let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+            crate::test_support::output_status(
+                handle(
+                    &limiter,
+                    ctx,
+                    &msg,
+                    InputStream::from_bytes(body.into_bytes()),
+                )
+                .await,
+            )
+            .await
+        }
+
+        assert_eq!(attempt(&ctx, "someone@example.com").await, 201);
+        let fresh = ctx.take();
+        assert_eq!(
+            run_deferred().await,
+            1,
+            "a new account's verification mail goes out after the response"
+        );
+        let deferred = ctx.take();
+
+        assert_eq!(attempt(&ctx, "someone@example.com").await, 201);
+        let registered = ctx.take();
+        assert_eq!(
+            run_deferred().await,
+            0,
+            "a registered address has no mail to send"
+        );
+
+        assert_eq!(
+            fresh, registered,
+            "a registered address must cost the handler exactly what a new one does"
+        );
+        assert_eq!(
+            fresh
+                .iter()
+                .filter(|call| call.as_str() == "wafer-run/crypto crypto.hash")
+                .count(),
+            1,
+            "both paths hash the password: {fresh:?}"
+        );
+        assert!(
+            !fresh
+                .iter()
+                .any(|call| call.starts_with("impresspress/email")),
+            "no mail is sent before the response: {fresh:?}"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|call| call == "impresspress/email email.send_template"),
+            "the deferred task is the verification mail: {deferred:?}"
+        );
     }
 }

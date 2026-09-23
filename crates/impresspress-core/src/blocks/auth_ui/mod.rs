@@ -468,7 +468,7 @@ crate::impresspress_feature_block! {
     /// (`impresspress/auth-ui`). The auth *service* primitive lives in the
     /// framework `wafer-run/auth` block.
     pub struct AuthUiBlock;
-    fields: { limiter: UserRateLimiter },
+    fields: { limiter: std::sync::Arc<UserRateLimiter> },
     name: "impresspress/auth-ui",
     info: |_this| {
         BlockInfo::new(
@@ -897,6 +897,9 @@ mod outbound_mail_wiring_tests {
 
         let budget = crate::blocks::rate_limit::RateLimit::AUTH_EMAIL.max_requests as usize;
         let mut bodies = Vec::new();
+        // The send runs after each response; run it, as the platform would,
+        // before the next request.
+        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
         for _ in 0..budget + 1 {
             let mut msg = anon_msg("create", "/b/auth/api/forgot-password");
             msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.9");
@@ -909,6 +912,7 @@ mod outbound_mail_wiring_tests {
                 )
                 .await,
             );
+            api::run_deferred().await;
         }
 
         assert_eq!(

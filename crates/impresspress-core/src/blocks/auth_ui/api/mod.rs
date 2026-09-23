@@ -126,10 +126,95 @@ fn classify_email_error(terminal: &wafer_run::TerminalNotResponse) -> EmailNotSe
 /// file silently stop sending mail. A test that IS about the outbound budget
 /// builds its own limiter and holds on to it across calls.
 #[cfg(test)]
-pub(crate) fn test_mail_request() -> (UserRateLimiter, Message) {
+pub(crate) fn test_mail_request() -> (std::sync::Arc<UserRateLimiter>, Message) {
     let mut msg = Message::new("http.request");
     msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.7");
-    (UserRateLimiter::new(), msg)
+    (std::sync::Arc::new(UserRateLimiter::new()), msg)
+}
+
+/// A context that records every block call made through it — `"{block}
+/// {message kind}"`, in order — and forwards it unchanged. Its `clone_arc`
+/// shares the record, so calls a deferred task makes land in it too.
+///
+/// It is how a test states that two paths through a handler do the same
+/// work: the same calls, in the same order, before the response.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CallLog {
+    inner: crate::test_support::TestContext,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl CallLog {
+    pub(crate) fn new(inner: crate::test_support::TestContext) -> Self {
+        Self {
+            inner,
+            calls: std::sync::Arc::default(),
+        }
+    }
+
+    /// The calls recorded since the last `take`, clearing the record.
+    pub(crate) fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.calls.lock().expect("call log"))
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Context for CallLog {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        is_write: bool,
+    ) -> Result<(), wafer_run::WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, is_write)
+    }
+
+    async fn call_block(
+        &self,
+        name: &str,
+        msg: Message,
+        input: InputStream,
+    ) -> wafer_run::OutputStream {
+        self.calls
+            .lock()
+            .expect("call log")
+            .push(format!("{name} {}", msg.kind));
+        self.inner.call_block(name, msg, input).await
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> std::sync::Arc<dyn Context> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+/// Run the work the handler under test deferred ([`crate::deferred`]), as
+/// the platform would after the response. The test must have selected
+/// [`crate::deferred::DeferMode::Queued`] before calling the handler;
+/// answers how many tasks ran.
+#[cfg(test)]
+pub(crate) async fn run_deferred() -> usize {
+    let tasks = crate::deferred::drain();
+    let n = tasks.len();
+    for task in tasks {
+        task.await;
+    }
+    n
 }
 
 /// Record an outcome from [`send_template_email`] against the flow that
@@ -142,6 +227,62 @@ pub(crate) fn log_email_not_sent(flow: &str, user_id: &str, failure: &EmailNotSe
         tracing::error!(flow, user_id, %failure, "transactional email was not sent");
     } else {
         tracing::warn!(flow, user_id, %failure, "transactional email was not sent");
+    }
+}
+
+/// Mail sent after the response, off the request path ([`crate::deferred`]).
+///
+/// The public auth endpoints answer a registered address and an unknown one
+/// with the same body; if only the registered path also drew a token, wrote
+/// it and called the email block before answering, the same body would come
+/// back measurably later for it. Those steps run here instead, once the
+/// handler has answered, so both paths cost the handler the same.
+///
+/// Owns what the send needs from the request — the block's limiter, the
+/// context and the request message (for the client address the outbound
+/// budget is keyed on) — because the handler's borrows end with the
+/// response. A failure here has no response left to change, so every task
+/// records its own with [`log_email_not_sent`] or a log line of its own.
+pub(crate) struct LaterMail {
+    limiter: std::sync::Arc<UserRateLimiter>,
+    ctx: std::sync::Arc<dyn Context>,
+    msg: Message,
+}
+
+impl LaterMail {
+    pub(crate) fn capture(
+        limiter: &std::sync::Arc<UserRateLimiter>,
+        ctx: &dyn Context,
+        msg: &Message,
+    ) -> Self {
+        Self {
+            limiter: std::sync::Arc::clone(limiter),
+            ctx: ctx.clone_arc(),
+            msg: msg.clone(),
+        }
+    }
+
+    pub(crate) fn ctx(&self) -> &dyn Context {
+        &*self.ctx
+    }
+
+    /// [`send_template_email`] with the captured request.
+    pub(crate) async fn send_template(
+        &self,
+        template: &str,
+        to: &str,
+        token: &str,
+    ) -> Result<(), EmailNotSent> {
+        send_template_email(&self.limiter, &*self.ctx, &self.msg, template, to, token).await
+    }
+
+    /// [`send_verification_email`] with the captured request.
+    pub(crate) async fn send_verification(
+        &self,
+        user_id: &str,
+        email: &str,
+    ) -> Result<VerificationMail, wafer_run::WaferError> {
+        send_verification_email(&self.limiter, &*self.ctx, &self.msg, user_id, email).await
     }
 }
 
