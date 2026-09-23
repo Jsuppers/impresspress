@@ -76,7 +76,7 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Markup {
     let (page, page_size, _) = msg.pagination_params(50);
     let search = msg.query("search").to_string();
 
-    let result = request_logs::paginated(ctx, page as i64, page_size as i64, &search).await;
+    let result = request_logs::paginated(ctx, page as i64, page_size as i64, &search, false).await;
 
     html! {
         div .filter-bar {

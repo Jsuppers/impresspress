@@ -2859,7 +2859,7 @@ mod streaming_audit_tests {
     }
 
     async fn request_log_count(ctx: &TestContext) -> i64 {
-        request_logs::paginated(ctx, 1, 20, "")
+        request_logs::paginated(ctx, 1, 20, "", false)
             .await
             .expect("count request_logs")
             .total_count
@@ -2965,7 +2965,7 @@ mod secret_path_redaction_tests {
     /// The `(path, status_code)` of every audit row, so a test can pin the
     /// status its reasoning depends on instead of asserting it in a comment.
     async fn logged_rows(ctx: &TestContext) -> Vec<(String, i64)> {
-        request_logs::paginated(ctx, 1, 50, "")
+        request_logs::paginated(ctx, 1, 50, "", false)
             .await
             .expect("list request_logs")
             .rows
@@ -3317,7 +3317,7 @@ mod request_log_policy_tests {
     /// `(path, status_code)` of every row written, sorted so a test states
     /// which rows exist without also pinning `paginated`'s newest-first order.
     async fn logged(ctx: &TestContext) -> Vec<(String, i64)> {
-        let mut rows: Vec<(String, i64)> = request_logs::paginated(ctx, 1, 1000, "")
+        let mut rows: Vec<(String, i64)> = request_logs::paginated(ctx, 1, 1000, "", false)
             .await
             .expect("list request_logs")
             .rows
@@ -3388,7 +3388,7 @@ mod request_log_policy_tests {
         reset_request_log_budget_for_test();
         drive(&ctx, MOVED_ROUTE).await;
 
-        let rows = request_logs::paginated(&ctx, 1, 10, "")
+        let rows = request_logs::paginated(&ctx, 1, 10, "", false)
             .await
             .expect("list request_logs")
             .rows;
@@ -3405,7 +3405,7 @@ mod request_log_policy_tests {
     async fn sole_row_and_dashboard_errors(
         ctx: &TestContext,
     ) -> (request_logs::RequestLogRow, i64, i64) {
-        let rows = request_logs::paginated(ctx, 1, 10, "")
+        let rows = request_logs::paginated(ctx, 1, 10, "", false)
             .await
             .expect("list request_logs")
             .rows;
@@ -3867,7 +3867,7 @@ mod oversized_body_tests {
         let ctx = TestContext::with_admin().await;
         let _ = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
 
-        let rows = request_logs::paginated(&ctx, 1, 20, "")
+        let rows = request_logs::paginated(&ctx, 1, 20, "", false)
             .await
             .expect("read request_logs")
             .rows;
