@@ -187,12 +187,12 @@ pub async fn handle_direct_access(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     use serde_json::json;
 
     use super::{
-        super::test_support::{routed, seed_legacy_object, share_ctx},
+        super::test_support::{routed, seed_legacy_object, share_ctx, share_ctx_over, upload_msg},
         *,
     };
     use crate::{
@@ -523,6 +523,42 @@ mod tests {
         assert!(
             output_is_error(direct_access(&failing, OPAQUE_TOKEN).await, "Internal").await,
             "an unrecordable access must refuse the download, not serve past the cap"
+        );
+    }
+
+    /// A share link serves the object the key holds NOW: its bytes are
+    /// resolved through the object's row, so after a replacement the link
+    /// serves the replacement — never the blob the replacement superseded,
+    /// which is deleted.
+    #[tokio::test]
+    async fn a_share_link_serves_the_bytes_the_objects_row_names() {
+        let storage = Arc::new(crate::test_support::InMemoryStorageService::new());
+        let ctx = share_ctx_over("photos", "alice", storage.clone()).await;
+        seed_legacy_object(&ctx, "photos", "a.png", b"first", "image/png", "alice").await;
+        seed_share(&ctx, &[]).await;
+        assert_eq!(
+            served_bytes(direct_access(&ctx, OPAQUE_TOKEN).await).await,
+            b"first"
+        );
+
+        let replaced = crate::blocks::files::storage::handle_upload_object(
+            &ctx,
+            &upload_msg("photos", "a.png", "image/png", "alice"),
+            wafer_run::InputStream::from_bytes(b"second".to_vec()),
+        )
+        .await;
+        assert_eq!(crate::test_support::output_http_status(replaced).await, 200);
+
+        assert_eq!(
+            served_bytes(direct_access(&ctx, OPAQUE_TOKEN).await).await,
+            b"second",
+            "the link serves the object's current bytes"
+        );
+        assert!(
+            wafer_core::clients::storage::get(&ctx, "photos", "a.png")
+                .await
+                .is_err(),
+            "the superseded blob at the object key is deleted"
         );
     }
 }

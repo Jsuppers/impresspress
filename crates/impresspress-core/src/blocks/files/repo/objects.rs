@@ -1111,6 +1111,19 @@ mod tests {
         assert!(err.message.contains("half"), "{}", err.message);
     }
 
+    /// A claim's blob key keeps the object's directory and file name and puts
+    /// the claim in front of the name, so it splits back into one
+    /// `(key, claim)` pair and keeps the extension a content type is guessed
+    /// from.
+    #[test]
+    fn a_claims_blob_key_prefixes_the_file_name_with_the_claim() {
+        assert_eq!(claim_blob_key("a.png", "c1"), "c1~a.png");
+        assert_eq!(
+            claim_blob_key("docs/2026/report.pdf", "c1"),
+            "docs/2026/c1~report.pdf"
+        );
+    }
+
     /// A take-over is conditional on the claim the row was read with, not on
     /// a timestamp.
     ///

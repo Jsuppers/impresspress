@@ -122,15 +122,18 @@ mod test_helpers {
             self.refused.lock().unwrap().insert(op);
         }
 
-        /// Every blob key stored in `folder`, sorted — what a test asserts
-        /// to show that an upload left nothing behind, or exactly one blob.
-        pub(super) fn blob_keys(&self, folder: &str) -> Vec<String> {
+        /// Every blob key stored in the files block's `bucket`, sorted — what
+        /// a test asserts to show that an upload left nothing behind, or
+        /// exactly one blob. The storage shim namespaces the folder under the
+        /// calling block, so that is the folder this double sees.
+        pub(super) fn blob_keys(&self, bucket: &str) -> Vec<String> {
+            let folder = format!("{}/{bucket}", crate::blocks::files::FilesBlock::BLOCK_NAME);
             let mut keys: Vec<String> = self
                 .objects
                 .lock()
                 .unwrap()
                 .keys()
-                .filter(|(f, _)| f == folder)
+                .filter(|(f, _)| *f == folder)
                 .map(|(_, key)| key.clone())
                 .collect();
             keys.sort();
@@ -306,6 +309,27 @@ mod test_helpers {
         crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &sql, &[])
             .await
             .expect("001-003 apply");
+        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+    }
+
+    /// [`ctx_with_storage_handle`] on a database with every files migration
+    /// but `005_object_blob_key` — a deployment that took this code without
+    /// `--run-migrations`, so its objects table has no `blob_key` column.
+    pub(super) async fn ctx_with_storage_before_005() -> (TestContext, Arc<MemStorage>) {
+        let ctx = TestContext::with_auth().await;
+        let sql: Vec<&str> = crate::blocks::files::migrations::SQLITE_MIGRATIONS
+            .iter()
+            .filter(|(basename, _)| *basename != "005_object_blob_key")
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert_eq!(
+            sql.len() + 1,
+            crate::blocks::files::migrations::SQLITE_MIGRATIONS.len(),
+            "005 is still shipped, under this name"
+        );
+        crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &sql, &[])
+            .await
+            .expect("001-004 apply");
         with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
     }
 

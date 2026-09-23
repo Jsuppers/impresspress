@@ -282,8 +282,8 @@ mod replay_tests {
     /// none of them: no share link gains, loses or moves an expiry, no bucket
     /// or object row is deleted, and a reservation keeps its `claim_id`.
     ///
-    /// A guard, not a regression test — it passes before 004 as after. It
-    /// exists because a re-run is what 004 triggers on every upgrading
+    /// A guard, not a regression test — it passes before 004 and 005 as
+    /// after. It exists because a re-run is what each of them triggers on every upgrading
     /// deployment, and a statement added later that is not safe to replay
     /// (a `DROP`, an unguarded `UPDATE`) has to fail here rather than there.
     /// The replay is forced under a fresh migration-state key, as
@@ -362,6 +362,11 @@ mod replay_tests {
             before.iter().any(|(table, _, row)| *table == "objects"
                 && row.get("claim_id").is_some_and(|c| c.is_string())),
             "the replay was checked over rows that carry a claim"
+        );
+        assert!(
+            before.iter().any(|(table, _, row)| *table == "objects"
+                && row.get("blob_key").is_some_and(|c| c.is_string())),
+            "the replay was checked over rows that name their blob"
         );
     }
 }
