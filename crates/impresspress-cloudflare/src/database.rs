@@ -8,6 +8,25 @@
 //! `wafer-block-postgres`. The `DatabaseService` impl forwards each method into
 //! the matching `DbExec` default.
 //!
+//! ## Atomic multi-statement writes
+//!
+//! `create_many`, `batch` and the guarded writes all reach D1 through one
+//! primitive, [`DbExec::run_transaction`], which this adapter implements with
+//! D1's native `db.batch()`: the statements run in order inside one implicit
+//! transaction and a failing statement rolls every earlier one back. The
+//! database handler caps one call at
+//! [`MAX_BATCH_WRITES`](wafer_block::wire::database::MAX_BATCH_WRITES)
+//! statements, which wafer sizes to the Workers Paid per-invocation D1 query
+//! limit (1000) counting each statement as a query; the Free plan allows 50,
+//! so a Free-plan deploy has to keep its calls smaller than the cap.
+//!
+//! ## A taken key
+//!
+//! D1 reports a failed statement only as text, so every error is classified by
+//! [`impresspress_core::sqlite_text_error::statement_error`]: a primary- or
+//! unique-key violation is [`DatabaseError::AlreadyExists`], as the native
+//! backends report it from the driver's code, and anything else `Internal`.
+//!
 //! ## Lazy column-add
 //!
 //! Tables themselves must exist before any `create()` — every block ships
@@ -73,12 +92,11 @@ use impresspress_core::IdentityCache;
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
-    exec::{BatchOp, BatchResult, DbExec},
-    mint_record_id,
+    exec::{BatchOp, BatchResult, DbExec, TxOp, TxResult},
     schema_cache::SchemaCache,
     service::{
-        AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table,
-        UpsertSpec,
+        AggregateSpec, CapGuard, Column, DatabaseError, DatabaseService, GuardedInsert,
+        GuardedUpdate, Record, RecordList, Table, UpsertSpec, WriteOp, WriteOutcome,
     },
 };
 use wafer_sql_utils::{introspect, Backend};
@@ -201,122 +219,6 @@ impl D1DatabaseService {
         let js_params: Vec<JsValue> = params.iter().map(json_value_to_js).collect();
         self.db.prepare(sql).bind(&js_params).map_err(db_err)
     }
-
-    /// Batch-insert `rows` into `collection` via D1's native `batch()` API —
-    /// one D1 round trip for the whole set instead of one `create()` (one
-    /// prepare+run each) per row. Used by the Cloudflare audit-log drain
-    /// (`lib.rs::run`'s post-dispatch `waitUntil`), which previously issued
-    /// one `create()` per queued `request_logs` row — see "Batch audit-log
-    /// persistence".
-    ///
-    /// Every row must resolve to the identical column set after stamping
-    /// (audit-log rows always do — `pipeline.rs` builds them from the same
-    /// fixed field list) since this method plans one INSERT *shape* for the
-    /// whole batch rather than re-planning per row; a row with a different
-    /// column set is rejected rather than silently producing a
-    /// short/misaligned INSERT.
-    ///
-    /// Mirrors `DbExec::create`'s per-row policy — mints the `id` with
-    /// wafer's [`mint_record_id`] (a UUIDv7, so a batch's ids sort in the
-    /// order its rows were queued and a `created_at` tie lists them in that
-    /// order) when absent (D1 never overrides `table_autogenerates_id`, so
-    /// ids are always supplied by the caller or minted here) and stamps
-    /// `created_at`/`updated_at` when absent (see [`prepare_batch_rows`]) —
-    /// but adds missing columns only ONCE for
-    /// the whole batch (via the first row, which is representative since
-    /// every row shares the same shape) rather than per row: the audit-log
-    /// table's schema is migration-owned, so this is a safety net, not the
-    /// steady-state path.
-    pub async fn create_many(
-        &self,
-        collection: &str,
-        rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
-    ) -> Result<i64, DatabaseError> {
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let table = wafer_sql_utils::ident::sanitize_ident(collection);
-
-        let prepared = prepare_batch_rows(rows)?;
-
-        // Lazy column-add once (request_logs' schema is migration-owned;
-        // this is a safety net, not the steady-state path) — every row has
-        // the same shape, so the first is representative.
-        if let Some(first) = prepared.first() {
-            let sample: std::collections::HashMap<String, serde_json::Value> =
-                first.iter().cloned().collect();
-            DbExec::ensure_data_columns(self, &table, &sample).await?;
-        }
-
-        let mut statements = Vec::with_capacity(prepared.len());
-        for pairs in &prepared {
-            // D1 is always SQLite — same dialect `DbExec::BACKEND` declares
-            // for this backend below.
-            let stmt = wafer_sql_utils::query::build_insert(&table, pairs, Backend::Sqlite);
-            statements.push(self.prepare_bind(
-                &stmt.sql,
-                &wafer_sql_utils::value::sea_values_to_json(stmt.values),
-            )?);
-        }
-
-        let results = self.db.batch(statements).await.map_err(db_err)?;
-        for r in &results {
-            if !r.success() {
-                return Err(DatabaseError::Internal(format!(
-                    "batch insert into {collection}: {}",
-                    r.error().unwrap_or_else(|| "unknown error".to_string())
-                )));
-            }
-        }
-        Ok(results.len() as i64)
-    }
-}
-
-/// Stamp and shape the rows of one [`D1DatabaseService::create_many`] batch:
-/// mint a missing `id` with [`mint_record_id`], stamp a missing
-/// `created_at`/`updated_at`, and turn each row into sanitized, column-sorted
-/// `(column, value)` pairs. Every row must end up with the same column set,
-/// because the batch runs one INSERT shape; a row that differs is an error.
-///
-/// Ids are minted in row order, so the batch's keys ascend in the order its
-/// rows were queued.
-fn prepare_batch_rows(
-    rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
-) -> Result<Vec<Vec<(String, serde_json::Value)>>, DatabaseError> {
-    let mut prepared: Vec<Vec<(String, serde_json::Value)>> = Vec::with_capacity(rows.len());
-    let mut shape: Option<Vec<String>> = None;
-    for mut data in rows {
-        if !data.contains_key("id") {
-            data.insert(
-                "id".to_string(),
-                serde_json::Value::String(mint_record_id()),
-            );
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        data.entry("created_at".to_string())
-            .or_insert_with(|| serde_json::Value::String(now.clone()));
-        data.entry("updated_at".to_string())
-            .or_insert_with(|| serde_json::Value::String(now));
-
-        let mut pairs: Vec<(String, serde_json::Value)> = data
-            .into_iter()
-            .map(|(k, v)| (wafer_sql_utils::ident::sanitize_ident(&k), v))
-            .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let cols: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        match &shape {
-            None => shape = Some(cols),
-            Some(expected) if expected == &cols => {}
-            Some(_) => {
-                return Err(DatabaseError::Internal(
-                    "create_many requires every row to share the same column set".into(),
-                ));
-            }
-        }
-        prepared.push(pairs);
-    }
-    Ok(prepared)
 }
 
 // SAFETY: `D1DatabaseService` holds a `D1Database` handle scoped to a single
@@ -454,15 +356,7 @@ impl DbExec for D1DatabaseService {
             .run()
             .await
             .map_err(db_err)?;
-        // worker-rs 0.7 exposes D1Result::meta().changes (Option<usize>) for
-        // mutations — surface a real rows_affected so the shared defaults can
-        // map 0-rows to NotFound on update/delete-by-id.
-        let changes = result
-            .meta()
-            .map_err(db_err)?
-            .and_then(|m| m.changes)
-            .unwrap_or(0);
-        Ok(changes as i64)
+        changes(&result)
     }
 
     /// Delegates to [`run_fetch`](Self::run_fetch): a D1 binding is one
@@ -526,7 +420,8 @@ impl DbExec for D1DatabaseService {
     /// statement primitive — on D1 that is N separate network round-trips.
     /// This override prepares every op's `(sql, params)` uniformly (the same
     /// `prepare_bind` the primitives use, so binding is byte-identical) and
-    /// submits them as a single `db.batch()`, exactly like [`create_many`].
+    /// submits them as a single `db.batch()`, exactly like
+    /// [`run_transaction`](DbExec::run_transaction).
     /// D1 returns one [`D1Result`] per statement **in submission order**
     /// (worker-rs `D1Database::batch` documents this), so each result is
     /// decoded positionally into the [`BatchResult`] variant its op names,
@@ -592,16 +487,9 @@ impl DbExec for D1DatabaseService {
         for (op, result) in ops.iter().zip(results.iter()) {
             // A transactional batch rejects (the `Err` above) on any statement
             // failure, so a non-success result here is unexpected; guard it
-            // like `create_many` and surface D1's own error text rather than
-            // decode a failed statement.
-            if !result.success() {
-                return Err(DatabaseError::Internal(format!(
-                    "D1 batch statement failed: {}",
-                    result
-                        .error()
-                        .unwrap_or_else(|| "unknown error".to_string())
-                )));
-            }
+            // and surface D1's own error text rather than decode a failed
+            // statement.
+            check_statement_succeeded(result)?;
             let decoded = match op {
                 BatchOp::Rows { .. } => {
                     let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
@@ -612,15 +500,8 @@ impl DbExec for D1DatabaseService {
                     let row = rows.into_iter().next().ok_or(DatabaseError::NotFound)?;
                     BatchResult::FetchOne(record_from_json_row(row))
                 }
-                BatchOp::Execute { .. } => {
-                    // Same source as `run_execute`: D1Result meta's `changes`.
-                    let changes = result
-                        .meta()
-                        .map_err(db_err)?
-                        .and_then(|m| m.changes)
-                        .unwrap_or(0);
-                    BatchResult::Execute(changes as i64)
-                }
+                // Same source as `run_execute`: D1Result meta's `changes`.
+                BatchOp::Execute { .. } => BatchResult::Execute(changes(result)?),
                 BatchOp::ScalarI64 { .. } => {
                     let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
                     BatchResult::ScalarI64(scalar_i64(rows.into_iter().next()))
@@ -633,6 +514,49 @@ impl DbExec for D1DatabaseService {
             out.push(decoded);
         }
         Ok(out)
+    }
+
+    /// Run `ops` as ONE native D1 `db.batch()`, which is what makes it a
+    /// transaction: D1 runs a batch's statements in order inside one implicit
+    /// transaction, and a failing statement rolls back every statement before
+    /// it and rejects the whole call (the outer `Err`, classified by
+    /// [`db_err`] so a taken key is `AlreadyExists`).
+    ///
+    /// Decoded positionally, as [`run_batch`](DbExec::run_batch) is: a
+    /// [`TxOp::Execute`] yields `meta().changes`, as
+    /// [`run_execute`](DbExec::run_execute) does, and a [`TxOp::Returning`]
+    /// its `RETURNING` rows through [`record_from_json_row`], as
+    /// [`run_execute_returning`](DbExec::run_execute_returning) does.
+    async fn run_transaction(&self, ops: &[TxOp<'_>]) -> Result<Vec<TxResult>, DatabaseError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statements = Vec::with_capacity(ops.len());
+        for op in ops {
+            let (sql, params) = op.sql_params();
+            statements.push(self.prepare_bind(sql, params)?);
+        }
+        let results = self.db.batch(statements).await.map_err(db_err)?;
+        if results.len() != ops.len() {
+            return Err(DatabaseError::Internal(format!(
+                "D1 batch returned {} results for {} statements",
+                results.len(),
+                ops.len()
+            )));
+        }
+        ops.iter()
+            .zip(results.iter())
+            .map(|(op, result)| {
+                check_statement_succeeded(result)?;
+                Ok(match op {
+                    TxOp::Execute { .. } => TxResult::Execute(changes(result)?),
+                    TxOp::Returning { .. } => {
+                        let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
+                        TxResult::Returning(rows.into_iter().map(record_from_json_row).collect())
+                    }
+                })
+            })
+            .collect()
     }
 }
 
@@ -769,6 +693,37 @@ impl DatabaseService for D1DatabaseService {
         DbExec::update_where_count(self, collection, filters, data).await
     }
 
+    async fn create_many(
+        &self,
+        collection: &str,
+        rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, DatabaseError> {
+        DbExec::create_many(self, collection, rows).await
+    }
+
+    async fn batch(&self, ops: Vec<WriteOp>) -> Result<Vec<WriteOutcome>, DatabaseError> {
+        DbExec::batch(self, ops).await
+    }
+
+    async fn insert_guarded(
+        &self,
+        collection: &str,
+        data: std::collections::HashMap<String, serde_json::Value>,
+        guards: &[CapGuard],
+    ) -> Result<GuardedInsert, DatabaseError> {
+        DbExec::insert_guarded(self, collection, data, guards).await
+    }
+
+    async fn update_guarded(
+        &self,
+        collection: &str,
+        filters: &[Filter],
+        data: std::collections::HashMap<String, serde_json::Value>,
+        guards: &[CapGuard],
+    ) -> Result<GuardedUpdate, DatabaseError> {
+        DbExec::update_guarded(self, collection, filters, data, guards).await
+    }
+
     // --- Schema management: D1 schema is migration-owned ---
     //
     // D1's schema is established *exclusively* by each block's `migrations/*.sql`,
@@ -842,9 +797,60 @@ fn json_value_to_js(val: &serde_json::Value) -> JsValue {
     }
 }
 
-/// Convert any Display error into a DatabaseError::Internal.
-fn db_err(e: impl std::fmt::Display) -> DatabaseError {
-    DatabaseError::Internal(e.to_string())
+/// A D1 failure as a [`DatabaseError`]. D1 hands back text only, so a taken
+/// key is recognised by it — see
+/// [`impresspress_core::sqlite_text_error::statement_error`] — and that text
+/// is [`d1_error_text`].
+fn db_err(e: worker::Error) -> DatabaseError {
+    impresspress_core::sqlite_text_error::statement_error(d1_error_text(&e))
+}
+
+/// The whole text of a failed D1 call.
+///
+/// worker-rs wraps a rejection whose message starts with `D1` as
+/// [`worker::Error::D1`], and that variant's `Display` prints only the JS
+/// error's `cause` — which is `undefined` when D1 attached none, dropping the
+/// message (`D1_ERROR: UNIQUE constraint failed: …`) the classifier reads.
+/// So a D1 error is spelled here as its message followed by its cause; every
+/// other variant's `Display` already carries its text.
+fn d1_error_text(e: &worker::Error) -> String {
+    match e {
+        worker::Error::D1(d1) => {
+            let error: &js_sys::Error = d1.as_ref();
+            format!("{}: {}", String::from(error.message()), d1.cause())
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The affected-row count of one statement's result. worker-rs exposes
+/// `D1Result::meta().changes` (`Option<usize>`) for mutations; it is a real
+/// count, so the shared defaults can map 0 rows to `NotFound` on an
+/// update/delete by id.
+fn changes(result: &D1Result) -> Result<i64, DatabaseError> {
+    let changes = result
+        .meta()
+        .map_err(db_err)?
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    Ok(changes as i64)
+}
+
+/// `Err` carrying D1's own text when one statement of a batch reports
+/// failure. A batch rejects outright when a statement fails, so this is the
+/// guard against a result that says otherwise, not the usual failure path.
+fn check_statement_succeeded(result: &D1Result) -> Result<(), DatabaseError> {
+    if result.success() {
+        return Ok(());
+    }
+    Err(impresspress_core::sqlite_text_error::statement_error(
+        format!(
+            "D1 batch statement failed: {}",
+            result
+                .error()
+                .unwrap_or_else(|| "unknown error".to_string())
+        ),
+    ))
 }
 
 /// The explicit "runtime schema mutation unsupported on D1" error shared by the
@@ -949,45 +955,6 @@ mod tests {
         assert_eq!(scalar_i64(None), 0);
         assert_eq!(scalar_f64(Some(serde_json::json!({"total": 2.5}))), 2.5);
         assert_eq!(scalar_f64(None), 0.0);
-    }
-
-    /// A batch's minted ids are UUIDv7 and ascend in row order, so request-log
-    /// rows drained together — which share a `created_at` to the millisecond —
-    /// list newest-first in the reverse of the order they were queued once a
-    /// sorted `list` breaks the tie on `id`. A UUIDv4 would order them at random.
-    #[wasm_bindgen_test]
-    fn a_batch_mints_v7_ids_in_row_order() {
-        let rows: Vec<std::collections::HashMap<String, serde_json::Value>> = (0..64)
-            .map(|n| {
-                std::collections::HashMap::from([
-                    ("path".to_string(), serde_json::json!(format!("/r/{n}"))),
-                    (
-                        "created_at".to_string(),
-                        serde_json::json!("2026-09-23T00:00:00.000+00:00"),
-                    ),
-                ])
-            })
-            .collect();
-        let prepared = prepare_batch_rows(rows).expect("one shape");
-        let ids: Vec<String> = prepared
-            .iter()
-            .map(|pairs| {
-                let (_, id) = pairs.iter().find(|(k, _)| k == "id").expect("minted id");
-                id.as_str().expect("string id").to_string()
-            })
-            .collect();
-        for id in &ids {
-            let parsed = uuid::Uuid::parse_str(id).expect("a UUID");
-            assert_eq!(parsed.get_version_num(), 7, "{id} is not a UUIDv7");
-        }
-        for pair in ids.windows(2) {
-            assert!(
-                pair[0] < pair[1],
-                "{} then {} is out of row order",
-                pair[0],
-                pair[1]
-            );
-        }
     }
 
     /// A `D1Database` that is never queried.
@@ -1233,5 +1200,248 @@ mod tests {
 
         DatabaseService::set_strict_schema(&svc, false);
         assert!(!DbExec::strict_schema(&svc));
+    }
+
+    /// What a [`batching_d1`] double's `batch()` does with what it is handed.
+    enum BatchAnswer {
+        /// Resolve with one successful result per statement: `changes: 1`, and
+        /// a `RETURNING` statement's row echoed back as `{"id": "row-<n>"}`.
+        Succeed,
+        /// Reject the way D1 rejects a batch whose statement failed: an
+        /// `Error` whose message starts with `D1_` and whose `cause` carries
+        /// SQLite's text — or, with `None`, no cause at all.
+        Reject {
+            message: &'static str,
+            cause: Option<&'static str>,
+        },
+    }
+
+    /// A `D1Database` double for the batch path: `prepare(sql)` → a statement
+    /// that remembers its SQL, `bind(...)` → the same statement, and
+    /// `batch(statements)` → [`BatchAnswer`]. `batches` records the SQL of
+    /// every statement of every `batch()` call, so a test can tell one
+    /// round trip of N statements from N round trips.
+    fn batching_d1(
+        answer: BatchAnswer,
+        batches: Rc<std::cell::RefCell<Vec<Vec<String>>>>,
+    ) -> D1Database {
+        use wasm_bindgen::{closure::Closure, JsCast};
+
+        let db = js_sys::Object::new();
+        let prepare = Closure::<dyn Fn(JsValue) -> JsValue>::new(move |sql: JsValue| {
+            let statement = js_sys::Object::new();
+            js_sys::Reflect::set(&statement, &JsValue::from_str("sql"), &sql).expect("set sql");
+            let this = statement.clone();
+            let bind = Closure::<dyn Fn() -> JsValue>::new(move || JsValue::from(this.clone()));
+            js_sys::Reflect::set(
+                &statement,
+                &JsValue::from_str("bind"),
+                bind.as_ref().unchecked_ref(),
+            )
+            .expect("set bind");
+            bind.forget();
+            JsValue::from(statement)
+        });
+        js_sys::Reflect::set(
+            &db,
+            &JsValue::from_str("prepare"),
+            prepare.as_ref().unchecked_ref(),
+        )
+        .expect("set prepare");
+        prepare.forget();
+
+        let batch = Closure::<dyn Fn(js_sys::Array) -> js_sys::Promise>::new(
+            move |statements: js_sys::Array| {
+                let sqls: Vec<String> = statements
+                    .iter()
+                    .map(|statement| {
+                        js_sys::Reflect::get(&statement, &JsValue::from_str("sql"))
+                            .expect("sql")
+                            .as_string()
+                            .expect("sql is text")
+                    })
+                    .collect();
+                batches.borrow_mut().push(sqls.clone());
+                match answer {
+                    BatchAnswer::Succeed => {
+                        let results = js_sys::Array::new();
+                        for (n, sql) in sqls.iter().enumerate() {
+                            let result = js_sys::Object::new();
+                            let set = |key: &str, value: &JsValue| {
+                                js_sys::Reflect::set(&result, &JsValue::from_str(key), value)
+                                    .expect("set result field");
+                            };
+                            set("success", &JsValue::TRUE);
+                            let meta = js_sys::Object::new();
+                            js_sys::Reflect::set(
+                                &meta,
+                                &JsValue::from_str("changes"),
+                                &JsValue::from(1),
+                            )
+                            .expect("set changes");
+                            set("meta", &meta);
+                            let rows = js_sys::Array::new();
+                            if sql.contains("RETURNING") {
+                                let row = js_sys::Object::new();
+                                js_sys::Reflect::set(
+                                    &row,
+                                    &JsValue::from_str("id"),
+                                    &JsValue::from_str(&format!("row-{n}")),
+                                )
+                                .expect("set id");
+                                rows.push(&row);
+                            }
+                            set("results", &rows);
+                            results.push(&result);
+                        }
+                        js_sys::Promise::resolve(&JsValue::from(results))
+                    }
+                    BatchAnswer::Reject { message, cause } => {
+                        let error = js_sys::Error::new(message);
+                        if let Some(cause) = cause {
+                            error.set_cause(&js_sys::Error::new(cause));
+                        }
+                        js_sys::Promise::reject(&JsValue::from(error))
+                    }
+                }
+            },
+        );
+        js_sys::Reflect::set(
+            &db,
+            &JsValue::from_str("batch"),
+            batch.as_ref().unchecked_ref(),
+        )
+        .expect("set batch");
+        batch.forget();
+
+        JsValue::from(db).unchecked_into::<D1Database>()
+    }
+
+    fn rows(n: usize) -> Vec<std::collections::HashMap<String, serde_json::Value>> {
+        (0..n)
+            .map(|i| {
+                std::collections::HashMap::from([(
+                    "path".to_string(),
+                    serde_json::json!(format!("/r/{i}")),
+                )])
+            })
+            .collect()
+    }
+
+    /// **`create_many` is one D1 round trip.** The rows reach D1 as ONE
+    /// `batch()` of one INSERT each — the call D1 runs as a single implicit
+    /// transaction — rather than a `run()` per row. Strict schema is on, as in
+    /// production, so no introspection statement joins the batch.
+    #[wasm_bindgen_test]
+    async fn create_many_is_one_batch_of_one_insert_per_row() {
+        forget_isolate_schema();
+        let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let svc = D1DatabaseService::new(
+            batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
+            true,
+            "DB",
+        );
+
+        let inserted = DatabaseService::create_many(&svc, "request_logs", rows(40))
+            .await
+            .expect("inserted");
+
+        assert_eq!(inserted, 40);
+        let batches = batches.borrow();
+        assert_eq!(batches.len(), 1, "one round trip, not one per row");
+        assert_eq!(batches[0].len(), 40);
+        assert!(batches[0].iter().all(|sql| sql.starts_with("INSERT INTO")));
+    }
+
+    /// `run_transaction` decodes each statement's result in its own position:
+    /// an `Execute` is its `changes`, a `Returning` its rows.
+    #[wasm_bindgen_test]
+    async fn run_transaction_decodes_each_result_as_its_op_asked() {
+        forget_isolate_schema();
+        let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let svc = D1DatabaseService::new(
+            batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
+            true,
+            "DB",
+        );
+        let results = DbExec::run_transaction(
+            &svc,
+            &[
+                TxOp::Execute {
+                    sql: "UPDATE t SET a = 1",
+                    params: &[],
+                },
+                TxOp::Returning {
+                    sql: "INSERT INTO t (a) VALUES (2) RETURNING *",
+                    params: &[],
+                },
+            ],
+        )
+        .await
+        .expect("committed");
+
+        assert!(matches!(results[0], TxResult::Execute(1)), "{results:?}");
+        match &results[1] {
+            TxResult::Returning(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "row-1");
+            }
+            other => panic!("expected the RETURNING rows, got {other:?}"),
+        }
+        assert_eq!(batches.borrow().len(), 1);
+    }
+
+    /// **A taken key is `AlreadyExists`, not a fault.** D1 has no error code
+    /// to read, only the text of the rejection; the database handler turns
+    /// `AlreadyExists` into a 409, `Internal` into a 500. Covered both with
+    /// and without the `cause` D1 normally attaches, because worker-rs's
+    /// `Display` for a D1 error prints only the cause.
+    #[wasm_bindgen_test]
+    async fn a_batch_refused_for_a_taken_key_is_already_exists() {
+        for cause in [
+            Some("UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT"),
+            None,
+        ] {
+            forget_isolate_schema();
+            let svc = D1DatabaseService::new(
+                batching_d1(
+                    BatchAnswer::Reject {
+                        message: "D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT",
+                        cause,
+                    },
+                    Rc::new(std::cell::RefCell::new(Vec::new())),
+                ),
+                true,
+                "DB",
+            );
+            let err = DatabaseService::create_many(&svc, "t", rows(2))
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(err, DatabaseError::AlreadyExists(_)),
+                "cause {cause:?}: {err:?}"
+            );
+        }
+    }
+
+    /// Any other refusal stays a fault.
+    #[wasm_bindgen_test]
+    async fn a_batch_refused_for_anything_else_is_internal() {
+        forget_isolate_schema();
+        let svc = D1DatabaseService::new(
+            batching_d1(
+                BatchAnswer::Reject {
+                    message: "D1_ERROR: NOT NULL constraint failed: t.path: SQLITE_CONSTRAINT",
+                    cause: Some("NOT NULL constraint failed: t.path: SQLITE_CONSTRAINT"),
+                },
+                Rc::new(std::cell::RefCell::new(Vec::new())),
+            ),
+            true,
+            "DB",
+        );
+        let err = DatabaseService::create_many(&svc, "t", rows(2))
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, DatabaseError::Internal(_)), "{err:?}");
     }
 }

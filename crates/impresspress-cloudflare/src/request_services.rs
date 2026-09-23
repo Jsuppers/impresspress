@@ -43,8 +43,8 @@ use wafer_core::interfaces::{
     config::service::ConfigService,
     crypto::service::{CryptoError, CryptoService},
     database::service::{
-        AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table,
-        UpsertSpec,
+        AggregateSpec, CapGuard, Column, DatabaseError, DatabaseService, GuardedInsert,
+        GuardedUpdate, Record, RecordList, Table, UpsertSpec, WriteOp, WriteOutcome,
     },
     logger::service::{Field, LoggerService},
     network::service::{
@@ -560,6 +560,41 @@ impl DatabaseService for ScopedDatabaseService {
 
     async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
         self.current()?.upsert(collection, spec).await
+    }
+
+    async fn create_many(
+        &self,
+        collection: &str,
+        rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, DatabaseError> {
+        self.current()?.create_many(collection, rows).await
+    }
+
+    async fn batch(&self, ops: Vec<WriteOp>) -> Result<Vec<WriteOutcome>, DatabaseError> {
+        self.current()?.batch(ops).await
+    }
+
+    async fn insert_guarded(
+        &self,
+        collection: &str,
+        data: HashMap<String, serde_json::Value>,
+        guards: &[CapGuard],
+    ) -> Result<GuardedInsert, DatabaseError> {
+        self.current()?
+            .insert_guarded(collection, data, guards)
+            .await
+    }
+
+    async fn update_guarded(
+        &self,
+        collection: &str,
+        filters: &[Filter],
+        data: HashMap<String, serde_json::Value>,
+        guards: &[CapGuard],
+    ) -> Result<GuardedUpdate, DatabaseError> {
+        self.current()?
+            .update_guarded(collection, filters, data, guards)
+            .await
     }
 
     async fn aggregate(

@@ -36,11 +36,13 @@ pub fn make_d1_database_service(
     )?)
 }
 
-/// Concrete-typed variant of [`make_d1_database_service`]. Used internally
-/// where a caller needs D1-specific capabilities beyond the
-/// `DatabaseService` trait object — e.g. the audit-log batch-insert path in
-/// `run()`, which needs D1's native `batch()` API via
-/// [`database::D1DatabaseService::create_many`].
+/// Concrete-typed variant of [`make_d1_database_service`], for the internal
+/// callers that already hold the request's environment capture: the
+/// audit-log drain in `run()` (one `DatabaseService::create_many` per table,
+/// which reaches D1's native `batch()` through
+/// [`DbExec::run_transaction`](wafer_core::interfaces::database::exec::DbExec::run_transaction))
+/// and [`make_kv_cached_database_service_with_backend`], which hands the
+/// concrete handle back beside the decorated one.
 ///
 /// `environment` is a parameter rather than a capture of its own for the same
 /// reason [`build_runtime`](crate::runtime_build::build_runtime) takes one:

@@ -1398,6 +1398,55 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
         self.inner.upsert(collection, spec).await
     }
 
+    // The multi-write and guarded ops are writes: delegated, like `create`.
+    // A guarded write's guard check reads the table inside the write's own
+    // transaction, which no real backend can fail separately from the write.
+
+    async fn create_many(
+        &self,
+        collection: &str,
+        rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.create_many(collection, rows).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+    ) -> Result<
+        Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner.batch(ops).await
+    }
+
+    async fn insert_guarded(
+        &self,
+        collection: &str,
+        data: HashMap<String, serde_json::Value>,
+        guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedInsert,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner.insert_guarded(collection, data, guards).await
+    }
+
+    async fn update_guarded(
+        &self,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+        data: HashMap<String, serde_json::Value>,
+        guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedUpdate,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner
+            .update_guarded(collection, filters, data, guards)
+            .await
+    }
+
     async fn aggregate(
         &self,
         _collection: &str,
@@ -1633,6 +1682,49 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingWrite
         _collection: &str,
         _spec: wafer_core::interfaces::database::service::UpsertSpec,
     ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn create_many(
+        &self,
+        _collection: &str,
+        _rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn batch(
+        &self,
+        _ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+    ) -> Result<
+        Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        Err(simulated_write_failure())
+    }
+
+    async fn insert_guarded(
+        &self,
+        _collection: &str,
+        _data: HashMap<String, serde_json::Value>,
+        _guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedInsert,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        Err(simulated_write_failure())
+    }
+
+    async fn update_guarded(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+        _data: HashMap<String, serde_json::Value>,
+        _guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedUpdate,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
         Err(simulated_write_failure())
     }
 

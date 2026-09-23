@@ -57,6 +57,20 @@
 //! database: `vector::service` writes the same sql.js file through the same
 //! bridge and goes through the same helper. There is one durability contract
 //! for the crate, not one per service.
+//!
+//! The multi-write operations — `create_many`, `batch` and the guarded writes —
+//! are one logical mutation each, so a `create_many` of a thousand rows is one
+//! flush, not a thousand. They reach sql.js through
+//! [`DbExec::run_transaction`], which this backend runs between `BEGIN` and
+//! `COMMIT` (see [`in_transaction`]).
+//!
+//! ## A taken key
+//!
+//! sql.js reports a failed statement as a JS exception carrying SQLite's
+//! message and no code, so the primitives classify that text with
+//! [`impresspress_core::sqlite_text_error::statement_error`]: a primary- or
+//! unique-key violation is [`DatabaseError::AlreadyExists`], as on the native
+//! backends, and anything else `Internal`.
 
 use std::{
     collections::HashMap,
@@ -72,9 +86,12 @@ use std::{
 use wafer_block::db::Filter;
 use wafer_core::interfaces::database::{
     codec::{record_from_json_row, scalar_f64, scalar_i64},
-    exec::DbExec,
+    exec::{DbExec, TxOp, TxResult},
     schema_cache::SchemaCache,
-    service::{Column, DatabaseError, DatabaseService, Record, Table, UpsertSpec},
+    service::{
+        CapGuard, Column, DatabaseError, DatabaseService, GuardedInsert, GuardedUpdate, Record,
+        Table, UpsertSpec, WriteOp, WriteOutcome,
+    },
 };
 use wafer_sql_utils::{introspect, Backend};
 
@@ -223,8 +240,7 @@ impl BrowserDatabaseService {
         params: &[serde_json::Value],
     ) -> Result<Vec<serde_json::Value>, DatabaseError> {
         let params_js = db_codec::params_to_js(params).map_err(DatabaseError::Internal)?;
-        let value = bridge::db_query_raw(sql, params_js)
-            .map_err(|e| DatabaseError::Internal(format!("sql exec: {e:?}")))?;
+        let value = bridge::db_query_raw(sql, params_js).map_err(|e| statement_failed(&e))?;
         db_codec::rows_from_js(value).map_err(DatabaseError::Internal)
     }
 
@@ -304,8 +320,8 @@ impl DbExec for BrowserDatabaseService {
         params: &[serde_json::Value],
     ) -> Result<i64, DatabaseError> {
         let params_js = db_codec::params_to_js(params).map_err(DatabaseError::Internal)?;
-        let rows_modified = bridge::db_exec_raw(sql, params_js)
-            .map_err(|e| DatabaseError::Internal(format!("sql exec: {e:?}")))?;
+        let rows_modified =
+            bridge::db_exec_raw(sql, params_js).map_err(|e| statement_failed(&e))?;
         // NOTE: deliberately no `bridge::dbFlush()` here — flushing is
         // coalesced at the `DatabaseService` method boundary via
         // `with_flush`. See the module doc comment.
@@ -354,13 +370,90 @@ impl DbExec for BrowserDatabaseService {
         let (sql, params) = introspect::build_table_exists(table, Backend::Sqlite);
         Ok(self.run_scalar_i64(&sql, &params).await? > 0)
     }
+
+    /// `ops` between `BEGIN` and `COMMIT` on the one sql.js database, rolled
+    /// back on the first failure — see [`in_transaction`]. Like every other
+    /// primitive here it does not flush; the `DatabaseService` method that
+    /// called it does, once.
+    async fn run_transaction(&self, ops: &[TxOp<'_>]) -> Result<Vec<TxResult>, DatabaseError> {
+        in_transaction(ops, |op| match *op {
+            TxOp::Execute { sql, params } => {
+                let params_js = db_codec::params_to_js(params).map_err(DatabaseError::Internal)?;
+                let rows = bridge::db_exec_raw(sql, params_js).map_err(|e| statement_failed(&e))?;
+                Ok(TxResult::Execute(rows as i64))
+            }
+            TxOp::Returning { sql, params } => Ok(TxResult::Returning(
+                self.query_json_rows(sql, params)?
+                    .into_iter()
+                    .map(record_from_json_row)
+                    .collect(),
+            )),
+        })
+    }
+}
+
+/// A statement sql.js refused, as a [`DatabaseError`]: its text classified by
+/// [`impresspress_core::sqlite_text_error::statement_error`], so a taken key is
+/// `AlreadyExists`.
+fn statement_failed(e: &wasm_bindgen::JsValue) -> DatabaseError {
+    impresspress_core::sqlite_text_error::statement_error(format!("sql exec: {e:?}"))
+}
+
+/// Run `ops` through `run` as one transaction: `BEGIN`, every op in order,
+/// `COMMIT` — and on the first failure `ROLLBACK` and that failure, so either
+/// every op is applied or none is.
+///
+/// `run` is synchronous, and that is what makes this a transaction on a
+/// database other code shares: every bridge call is synchronous, so nothing
+/// between `BEGIN` and `COMMIT` yields to the executor, and no other task's
+/// statement can land inside it. It is a parameter so the framing can be
+/// tested without sql.js (`transaction_framing`).
+///
+/// A failed `ROLLBACK` is logged, not returned: the caller is owed the
+/// statement's own failure. A connection left inside a transaction refuses
+/// the next `BEGIN` ("cannot start a transaction within a transaction"), so
+/// the log is what names the cause when that happens.
+fn in_transaction(
+    ops: &[TxOp<'_>],
+    mut run: impl FnMut(&TxOp<'_>) -> Result<TxResult, DatabaseError>,
+) -> Result<Vec<TxResult>, DatabaseError> {
+    const BEGIN: TxOp<'static> = TxOp::Execute {
+        sql: "BEGIN",
+        params: &[],
+    };
+    const COMMIT: TxOp<'static> = TxOp::Execute {
+        sql: "COMMIT",
+        params: &[],
+    };
+    const ROLLBACK: TxOp<'static> = TxOp::Execute {
+        sql: "ROLLBACK",
+        params: &[],
+    };
+
+    run(&BEGIN)?;
+    let mut results = Vec::with_capacity(ops.len());
+    let outcome = ops.iter().try_for_each(|op| {
+        results.push(run(op)?);
+        Ok(())
+    });
+    let outcome = outcome.and_then(|()| run(&COMMIT).map(|_| ()));
+    if let Err(failure) = outcome {
+        if let Err(rollback) = run(&ROLLBACK) {
+            tracing::error!(
+                error = %rollback,
+                "ROLLBACK after a failed transaction failed; sql.js may still be inside it"
+            );
+        }
+        return Err(failure);
+    }
+    Ok(results)
 }
 
 // ─── DatabaseService — an explicit ledger over the shared DbExec defaults ─────
 //
 // Written with `forward_database_service!` rather than by hand. The macro's
 // `ops { … }` block names EVERY operation on the trait and refuses to expand
-// if one is missing, so the twenty-three lines below are a ledger of what this
+// if one is missing, so the twenty-seven lines below are a ledger of what this
 // backend does with each: `forward` = the shared `DbExec` default, `custom` =
 // written here, `inherit` = deliberately the `DatabaseService` trait default.
 // Eight of those trait defaults are not pass-throughs (`take_where` is a
@@ -384,6 +477,7 @@ wafer_core::forward_database_service! {
             get: forward,
             list: forward,
             create: custom,
+            create_many: custom,
             update: custom,
             delete: custom,
             count: forward,
@@ -398,6 +492,9 @@ wafer_core::forward_database_service! {
             increment_field_where: custom,
             upsert: custom,
             aggregate: forward,
+            batch: custom,
+            insert_guarded: custom,
+            update_guarded: custom,
             ensure_schema_table: custom,
             ensure_schema_tables: inherit,
             schema_table_exists: forward,
@@ -500,6 +597,44 @@ wafer_core::forward_database_service! {
         async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
             self.with_flush(DbExec::upsert(self, collection, spec))
                 .await
+        }
+
+        /// One transaction, one flush, however many rows.
+        async fn create_many(
+            &self,
+            collection: &str,
+            rows: Vec<HashMap<String, serde_json::Value>>,
+        ) -> Result<i64, DatabaseError> {
+            self.with_flush(DbExec::create_many(self, collection, rows))
+                .await
+        }
+
+        /// One transaction, one flush, however many ops.
+        async fn batch(&self, ops: Vec<WriteOp>) -> Result<Vec<WriteOutcome>, DatabaseError> {
+            self.with_flush(DbExec::batch(self, ops)).await
+        }
+
+        async fn insert_guarded(
+            &self,
+            collection: &str,
+            data: HashMap<String, serde_json::Value>,
+            guards: &[CapGuard],
+        ) -> Result<GuardedInsert, DatabaseError> {
+            self.with_flush(DbExec::insert_guarded(self, collection, data, guards))
+                .await
+        }
+
+        async fn update_guarded(
+            &self,
+            collection: &str,
+            filters: &[Filter],
+            data: HashMap<String, serde_json::Value>,
+            guards: &[CapGuard],
+        ) -> Result<GuardedUpdate, DatabaseError> {
+            self.with_flush(DbExec::update_guarded(
+                self, collection, filters, data, guards,
+            ))
+            .await
         }
 
         /// The DDL sequence itself is [`DbExec::ensure_schema_table`] — the
@@ -982,5 +1117,101 @@ mod flush_precedence {
             Err(VectorError::Internal("quota".into())),
         );
         assert!(matches!(both_failed, Err(VectorError::IndexNotFound(_))));
+    }
+}
+
+/// The `BEGIN`/`COMMIT`/`ROLLBACK` framing of [`in_transaction`], driven
+/// through a recording statement runner instead of sql.js (which does not
+/// exist under `wasm-pack test --node`).
+#[cfg(all(test, target_arch = "wasm32"))]
+mod transaction_framing {
+    use std::cell::RefCell;
+
+    use wafer_core::interfaces::database::{
+        exec::{TxOp, TxResult},
+        service::DatabaseError,
+    };
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::in_transaction;
+
+    /// Three inserts, the second of which may fail the way sql.js reports a
+    /// taken key.
+    fn inserts() -> [TxOp<'static>; 3] {
+        [
+            TxOp::Execute {
+                sql: "INSERT INTO t (id) VALUES ('a')",
+                params: &[],
+            },
+            TxOp::Execute {
+                sql: "INSERT INTO t (id) VALUES ('b')",
+                params: &[],
+            },
+            TxOp::Execute {
+                sql: "INSERT INTO t (id) VALUES ('c')",
+                params: &[],
+            },
+        ]
+    }
+
+    /// Every statement the runner saw, in order, failing the one whose SQL
+    /// contains `fail_on`.
+    fn run_recording(
+        ops: &[TxOp<'_>],
+        fail_on: Option<&str>,
+    ) -> (Result<Vec<TxResult>, DatabaseError>, Vec<String>) {
+        let seen = RefCell::new(Vec::new());
+        let out = in_transaction(ops, |op| {
+            let (sql, _) = op.sql_params();
+            seen.borrow_mut().push(sql.to_string());
+            match fail_on {
+                Some(needle) if sql.contains(needle) => {
+                    Err(impresspress_core::sqlite_text_error::statement_error(
+                        "sql exec: JsValue(Error: UNIQUE constraint failed: t.id)".into(),
+                    ))
+                }
+                _ => Ok(TxResult::Execute(1)),
+            }
+        });
+        (out, seen.into_inner())
+    }
+
+    #[wasm_bindgen_test]
+    fn every_statement_runs_between_begin_and_commit() {
+        let (out, seen) = run_recording(&inserts(), None);
+        assert_eq!(out.expect("committed").len(), 3);
+        assert_eq!(seen.first().map(String::as_str), Some("BEGIN"));
+        assert_eq!(seen.last().map(String::as_str), Some("COMMIT"));
+        assert_eq!(seen.len(), 5, "{seen:?}");
+    }
+
+    /// **The all-or-nothing half.** A failing statement rolls back the ones
+    /// before it and is never followed by a `COMMIT` — without the rollback,
+    /// the first insert would stay applied and the next flush would persist
+    /// it. The failure reaches the caller as the taken key it was.
+    #[wasm_bindgen_test]
+    fn a_failing_statement_rolls_back_and_nothing_after_it_runs() {
+        let (out, seen) = run_recording(&inserts(), Some("'b'"));
+        assert!(
+            matches!(out, Err(DatabaseError::AlreadyExists(_))),
+            "{out:?}"
+        );
+        assert_eq!(
+            seen,
+            [
+                "BEGIN",
+                "INSERT INTO t (id) VALUES ('a')",
+                "INSERT INTO t (id) VALUES ('b')",
+                "ROLLBACK",
+            ],
+        );
+    }
+
+    /// A `COMMIT` that fails is a failed transaction too.
+    #[wasm_bindgen_test]
+    fn a_failed_commit_rolls_back() {
+        let (out, seen) = run_recording(&inserts(), Some("COMMIT"));
+        assert!(out.is_err());
+        assert_eq!(seen.last().map(String::as_str), Some("ROLLBACK"));
     }
 }
