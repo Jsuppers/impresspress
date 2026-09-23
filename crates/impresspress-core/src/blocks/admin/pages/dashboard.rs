@@ -292,7 +292,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
         section .card {
             header .card__head {
                 h2 .card__title { "Recent Errors" }
-                a .btn .btn--ghost .btn--sm .card__actions href="/b/admin/logs?status=ERROR" { "View all" }
+                a .btn .btn--ghost .btn--sm .card__actions href="/b/admin/logs?errors=1" { "View all" }
             }
             div .card__body {
                 @if let Some(recent_errors) = &recent_errors {
@@ -349,9 +349,9 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
             "Last 30 days",
             series,
             "var(--accent-danger)",
-            "/b/admin/logs?status=ERROR",
+            "/b/admin/logs?errors=1",
         ),
-        None => chart_unavailable_card("Errors", "Last 30 days", "/b/admin/logs?status=ERROR"),
+        None => chart_unavailable_card("Errors", "Last 30 days", "/b/admin/logs?errors=1"),
     };
 
     let charts_section = html! {
