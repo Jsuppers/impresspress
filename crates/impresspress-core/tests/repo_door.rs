@@ -958,6 +958,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // `("database.delete_where", buckets::TABLE)` — the bucket-delete
             // handler's two compensating-failure tests
             "blocks/files/storage/buckets.rs",
+            // category 2: `files/error_mapping_tests.rs` aims each WRAP
+            // denial at the one read or write its route site makes
+            "blocks/files/error_mapping_tests.rs",
         ],
     ),
     (
@@ -981,6 +984,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // "bucket found, listing failed" shape: the ownership check reads
             // the buckets table and must still land.
             "blocks/files/pages_user/objects.rs",
+            // category 2: `files/error_mapping_tests.rs` aims each WRAP
+            // denial at the one read or write its route site makes
+            "blocks/files/error_mapping_tests.rs",
         ],
     ),
     (
@@ -1002,6 +1008,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // that failed must not read as a revoked link, and an access
             // the counter could not record must not be served
             "blocks/files/share.rs",
+            // category 2: `files/error_mapping_tests.rs` aims each WRAP
+            // denial at the one read or write its route site makes
+            "blocks/files/error_mapping_tests.rs",
         ],
     ),
     (
@@ -1014,7 +1023,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         // `blocks/admin/pages/blocks.rs` is listed above.
         &["blocks/legalpages/mod.rs"],
     ),
-    ("share_access_logs", &["blocks/files/mod.rs"]),
+    (
+        "share_access_logs",
+        &[
+            "blocks/files/mod.rs",
+            // category 2: `files/error_mapping_tests.rs` aims each WRAP
+            // denial at the one read or write its route site makes
+            "blocks/files/error_mapping_tests.rs",
+        ],
+    ),
     (
         "quota",
         &[
@@ -1022,9 +1039,20 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // `("database.list", quota::TABLE)` — the upload's fail-closed
             // test for the quota override lookup
             "blocks/files/storage/objects.rs",
+            // category 2: `files/error_mapping_tests.rs` aims each WRAP
+            // denial at the one read or write its route site makes
+            "blocks/files/error_mapping_tests.rs",
         ],
     ),
-    ("views", &["blocks/files/mod.rs"]),
+    (
+        "views",
+        &[
+            "blocks/files/mod.rs",
+            // category 2: `files/error_mapping_tests.rs` aims each WRAP
+            // denial at the one read or write its route site makes
+            "blocks/files/error_mapping_tests.rs",
+        ],
+    ),
     // The products doors. Four categories:
     //
     // 1. `blocks/products/mod.rs` — `BlockInfo::collections(..)` plus the

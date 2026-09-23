@@ -320,12 +320,7 @@ async fn refused_page_reads_are_the_403_page() {
         (repo::shares::TABLE, "/b/cloudstorage/"),
         (repo::quota::TABLE, "/b/cloudstorage/"),
     ] {
-        expect_refused_page(
-            &mut misses,
-            &denied(&ctx, table),
-            user("retrieve", path),
-        )
-        .await;
+        expect_refused_page(&mut misses, &denied(&ctx, table), user("retrieve", path)).await;
     }
     report(misses);
 }

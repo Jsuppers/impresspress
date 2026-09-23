@@ -146,7 +146,11 @@ async fn refused_workspace_storage_is_403_on_every_file_route() {
         )
     };
 
-    let sites: Vec<(FailingStorageOpContext, (&str, &str, serde_json::Value), &str)> = vec![
+    let sites: Vec<(
+        FailingStorageOpContext,
+        (&str, &str, serde_json::Value),
+        &str,
+    )> = vec![
         (
             get(),
             ("retrieve", "/b/dev/api/files", serde_json::Value::Null),
@@ -156,7 +160,11 @@ async fn refused_workspace_storage_is_403_on_every_file_route() {
         (get().after_passing(1), read(), "read (the blob read)"),
         (get(), write_new(), "write (the manifest load)"),
         (put(), write_new(), "write (the blob write)"),
-        (put().after_passing(1), write_new(), "write (the manifest save)"),
+        (
+            put().after_passing(1),
+            write_new(),
+            "write (the manifest save)",
+        ),
         (get(), delete(), "delete (the manifest load)"),
         (put(), delete(), "delete (the manifest save)"),
     ];

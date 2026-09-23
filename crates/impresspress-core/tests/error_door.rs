@@ -714,7 +714,8 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
             Tail {
                 label: "dev export shell",
                 count: 1,
-                why: "provider: `ShellSource` answers the host's static shell as a `String` error, \
+                why:
+                    "provider: `ShellSource` answers the host's static shell as a `String` error, \
                       a type with no database code",
             },
         ],
@@ -972,9 +973,15 @@ fn gated_files_tail_only_inventoried_non_database_failures() {
         );
         for tail in *inventory {
             assert!(
-                ["Stripe: ", "provider: ", "crypto: ", "invariant: ", "classified: "]
-                    .iter()
-                    .any(|reason| tail.why.starts_with(reason)),
+                [
+                    "Stripe: ",
+                    "provider: ",
+                    "crypto: ",
+                    "invariant: ",
+                    "classified: "
+                ]
+                .iter()
+                .any(|reason| tail.why.starts_with(reason)),
                 "{rel}: `{}` must say which non-database cause it is",
                 tail.label
             );
@@ -1833,8 +1840,8 @@ fn error_text_renders(src: &str) -> usize {
         let mut held = vec![Vec::new(); trees.len()];
         for at in 0..trees.len() {
             if is_ident(trees.get(at), "fn") {
-                let Some(params) = (at + 1..trees.len())
-                    .find(|&i| is_group(trees.get(i), Delimiter::Parenthesis))
+                let Some(params) =
+                    (at + 1..trees.len()).find(|&i| is_group(trees.get(i), Delimiter::Parenthesis))
                 else {
                     continue;
                 };
