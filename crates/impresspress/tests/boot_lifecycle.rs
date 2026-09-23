@@ -370,6 +370,61 @@ async fn a_prepared_plans_grants_reach_the_sealed_runtime() {
     );
 }
 
+/// A deployment grant the runtime refuses to install fails the build, loudly.
+/// `Wafer::add_wrap_grants` rejects the whole set when one grant fails
+/// `ResourceGrant::check_shape` and installs none of it, so a build that
+/// carried on would seal a runtime missing every deployment grant.
+#[tokio::test]
+async fn a_malformed_deployment_grant_fails_the_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("malformed_grant_test.sqlite3");
+    let storage_root = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    let infra = infra_for(&db_path, &storage_root);
+    let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
+        .await
+        .expect("construct sqlite database service");
+    let storage = impresspress_native::make_storage_service("local", &infra.storage_root)
+        .await
+        .expect("construct local storage service");
+    let (builder, ()) = impresspress_core::builder::RuntimeConfig::new().install(
+        impresspress_core::builder::ImpresspressBuilder::new()
+            .database(database)
+            .storage(storage),
+        |map| {
+            (
+                impresspress_core::builder::fill_config_service(
+                    Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+                    map,
+                ),
+                (),
+            )
+        },
+    );
+    let builder = builder
+        .crypto(
+            impresspress_native::make_jwt_crypto_service(
+                "malformed-grant-test-jwt-secret-value".to_string(),
+            )
+            .expect("jwt crypto service"),
+        )
+        .network(impresspress_native::make_fetch_network_service().expect("network service"))
+        .logger(impresspress_native::make_tracing_logger())
+        // An append-only grant is a database-collection grant; typed
+        // Storage it is one the runtime will not install.
+        .wrap_grants(vec![
+            wafer_run::ResourceGrant::read("impresspress/files", "impresspress__admin__variables"),
+            wafer_run::ResourceGrant::append("impresspress/files", "impresspress/admin/exports")
+                .typed(wafer_run::ResourceType::Storage),
+        ]);
+
+    let Err(error) = builder.build() else {
+        panic!("a build carrying a malformed deployment grant must fail");
+    };
+    assert!(error.to_string().contains("append"), "{error}");
+}
+
 /// Native fills both config surfaces from one `RuntimeConfig`, so anything the
 /// async `ConfigService` carries is readable synchronously through
 /// `ctx.config_get` as well. Before `RuntimeConfig` these were two literals in
