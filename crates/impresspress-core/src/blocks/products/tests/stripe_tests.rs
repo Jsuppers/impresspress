@@ -5039,6 +5039,9 @@ struct IdempotentPaymentLinkStripe {
     in_flight: Arc<Mutex<std::collections::HashSet<IdempotencyScope>>>,
     links_created: Arc<Mutex<Vec<String>>>,
     rate_limited: Arc<Mutex<usize>>,
+    /// Answer this many `POST /v1/payment_links/{id}` deactivations with a
+    /// 500 before letting one through.
+    deactivations_failed: Arc<Mutex<usize>>,
     fresh_outcomes: Arc<Mutex<VecDeque<FreshOutcome>>>,
     held: Arc<HeldExecution>,
 }
@@ -5057,6 +5060,16 @@ impl NetworkService for IdempotentPaymentLinkStripe {
         self.requests.lock().unwrap().push(request.clone());
         if !request.url.ends_with("/v1/payment_links") {
             let id = request.url.rsplit('/').next().unwrap_or("").to_string();
+            {
+                let mut remaining = self.deactivations_failed.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(stripe_response(
+                        500,
+                        &serde_json::json!({"error": {"type": "api_error"}}),
+                    ));
+                }
+            }
             return Ok(stripe_response(
                 200,
                 &serde_json::json!({"id": id, "active": false}),
@@ -5372,6 +5385,19 @@ fn stripe_calls(stripe: &IdempotentPaymentLinkStripe) -> Vec<(String, String)> {
         .collect()
 }
 
+/// How many times Stripe was told to take `stripe_payment_link_id` down.
+/// Sending the request is not the same as Stripe accepting it, so a test
+/// about retries counts these rather than asking whether one was ever sent.
+fn deactivations_of(stripe: &IdempotentPaymentLinkStripe, stripe_payment_link_id: &str) -> usize {
+    stripe_calls(stripe)
+        .iter()
+        .filter(|(url, body)| {
+            url.ends_with(&format!("/v1/payment_links/{stripe_payment_link_id}"))
+                && body.contains("active=false")
+        })
+        .count()
+}
+
 /// `true` when Stripe was told to take `stripe_payment_link_id` down.
 fn was_deactivated_at_stripe(calls: &[(String, String)], stripe_payment_link_id: &str) -> bool {
     calls.iter().any(|(url, body)| {
@@ -5397,6 +5423,73 @@ async fn deactivate_link_over_the_wire(
     );
     msg.set_meta("auth.user_roles", "admin");
     dispatch_routed(ctx, msg, input).await
+}
+
+/// Backdate a row's recorded Stripe request by `hours`, putting it outside
+/// Stripe's idempotency-key retention.
+async fn age_payment_link_request(
+    ctx: &crate::test_support::TestContext,
+    link_id: &str,
+    hours: i64,
+) {
+    db::update(
+        ctx,
+        repo::payment_links::TABLE,
+        link_id,
+        HashMap::from([(
+            "stripe_request_at".to_string(),
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()),
+        )]),
+    )
+    .await
+    .unwrap();
+}
+
+/// Seed an active row whose Stripe request went out too long ago to be
+/// re-sent: the shape a crashed synchronization leaves behind.
+async fn seed_unresolvable_payment_link(
+    ctx: &crate::test_support::TestContext,
+    offer_id: &str,
+    stripe_account_id: &str,
+) -> String {
+    let link_id = format!("link_stuck_{offer_id}");
+    seed(
+        ctx,
+        repo::payment_links::TABLE,
+        &link_id,
+        HashMap::from([
+            ("offer_id".to_string(), serde_json::json!(offer_id)),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!(stripe_account_id),
+            ),
+            ("active".to_string(), serde_json::json!(true)),
+            ("sync_status".to_string(), serde_json::json!("syncing")),
+            (
+                "stripe_request".to_string(),
+                serde_json::json!("[[\"metadata[impresspress_payment_link_id]\",\"x\"]]"),
+            ),
+        ]),
+    )
+    .await;
+    age_payment_link_request(ctx, &link_id, 25).await;
+    link_id
+}
+
+/// The queued takedown of one Payment Link row. Panics when none was
+/// enqueued, which is the failure this whole area is about.
+async fn takedown_operation(ctx: &crate::test_support::TestContext, link_id: &str) -> db::Record {
+    repo::provider_operations::list(ctx, None, 1, 50)
+        .await
+        .expect("list provider operations")
+        .records
+        .into_iter()
+        .find(|operation| {
+            operation.str_field("operation_type")
+                == repo::provider_operations::PAYMENT_LINK_DEACTIVATE
+                && operation.str_field("aggregate_id") == link_id
+        })
+        .unwrap_or_else(|| panic!("no takedown operation was enqueued for {link_id}"))
 }
 
 /// A row whose attempt never recorded a link id can still have a live,
@@ -5432,58 +5525,205 @@ async fn deactivating_a_row_with_no_recorded_link_takes_the_link_down_at_stripe(
 }
 
 /// Past Stripe's idempotency-key retention the saved result is gone, so
-/// re-sending the attempt's request would create a second live link instead
-/// of naming the first. The deactivation refuses, and names the row.
+/// re-sending the request would create a second live link rather than name
+/// the first. The row still retires — blocking on it would let one stuck link
+/// block an offer archival or a seller suspension — and the takedown
+/// dead-letters with what an operator has to do instead.
 #[tokio::test]
-async fn deactivating_a_row_whose_request_stripe_has_forgotten_is_refused() {
+async fn deactivating_a_row_whose_request_stripe_has_forgotten_dead_letters_the_takedown() {
     let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
     let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
     let (product, offer_id, link_id) =
         a_live_link_no_row_records(&ctx, "product_link_forgotten", &stripe).await;
-    db::update(
-        &ctx,
-        repo::payment_links::TABLE,
-        &link_id,
-        HashMap::from([(
-            "stripe_request_at".to_string(),
-            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339()),
-        )]),
-    )
-    .await
-    .unwrap();
+    age_payment_link_request(&ctx, &link_id, 25).await;
     let calls_before = stripe_calls(&stripe).len();
 
-    let refusal = deactivate_link_over_the_wire(&ctx, &product.id, &offer_id, &link_id).await;
-    let Err(wafer_run::streams::output::TerminalNotResponse::Error(error)) =
-        refusal.collect_buffered().await
-    else {
-        panic!("a request Stripe has forgotten must be refused, not deactivated locally");
-    };
-    // `domain_error` maps a domain `Aborted` onto the wire's 409.
-    assert_eq!(error.code, ErrorCode::AlreadyExists, "{error:?}");
-    assert!(
-        error.message.contains(&link_id),
-        "the refusal must name the row an operator has to reconcile: {}",
-        error.message
+    let deactivated =
+        output_to_json(deactivate_link_over_the_wire(&ctx, &product.id, &offer_id, &link_id).await)
+            .await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the row must retire even though its link cannot be named: {deactivated}"
     );
     assert_eq!(
         stripe_calls(&stripe).len(),
         calls_before,
-        "a refusal must not send anything to Stripe"
+        "re-sending a forgotten request would mint a second live link"
+    );
+
+    let operation = takedown_operation(&ctx, &link_id).await;
+    assert_eq!(
+        operation.str_field("status"),
+        "dead_letter",
+        "no retry can do better, so the operation must not stay due: {:?}",
+        operation.data
+    );
+    let last_error = operation.str_field("last_error");
+    assert!(
+        last_error.contains(&format!("metadata[impresspress_payment_link_id]={link_id}")),
+        "the operator needs the handle the link actually carries: {last_error}"
+    );
+}
+
+/// A takedown that fails at Stripe must stay retryable, and the link it could
+/// not take down must be named by the row — otherwise the compensating call
+/// is one shot and its failure leaves exactly the live, unnamed link this all
+/// exists to prevent.
+#[tokio::test]
+async fn a_takedown_that_fails_at_stripe_is_retried_from_the_recorded_link_id() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    // The one deactivation this create compensates with fails.
+    *stripe.deactivations_failed.lock().unwrap() = 1;
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_takedown_retry").await;
+
+    stripe
+        .held
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let create = stripe::create_payment_link(&ctx, &product, &offer_id, &request);
+    let retire = async {
+        stripe.held.started.notified().await;
+        let rows = repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap();
+        repo::payment_links::deactivate_local(&ctx, &offer_id, &rows[0].id)
+            .await
+            .expect("retire the row mid-flight");
+        stripe.held.release.notify_one();
+        rows[0].id.clone()
+    };
+    let (created, link_id) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(create, retire)
+    })
+    .await
+    .expect("the create must reach Stripe");
+    created.expect_err("a create whose row was retired cannot report success");
+
+    // The compensating deactivation failed, so the link is still live at
+    // Stripe — but the row names it and the operation is due.
+    let stored = repo::payment_links::get_for_offer(&ctx, &offer_id, &link_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.stripe_payment_link_id, "plink_minted_1",
+        "the retired row must record the link minted for it"
+    );
+    assert!(!stored.managed.active);
+    let operation = takedown_operation(&ctx, &link_id).await;
+    assert_eq!(
+        operation.str_field("status"),
+        "pending",
+        "a failed takedown must stay due: {:?}",
+        operation.data
+    );
+    assert_eq!(
+        deactivations_of(&stripe, "plink_minted_1"),
+        1,
+        "one attempt was made, and Stripe refused it"
+    );
+
+    // The worker that owns the queue finishes it.
+    let result = super::super::stripe_provider::reconcile_provider_operations(&ctx, 25)
+        .await
+        .expect("reconcile the queue");
+    assert_eq!(result.succeeded, 1, "{result:?}");
+    assert_eq!(
+        deactivations_of(&stripe, "plink_minted_1"),
+        2,
+        "the retry must send the takedown again: {:?}",
+        stripe_calls(&stripe)
+    );
+    assert_eq!(
+        takedown_operation(&ctx, &link_id).await.str_field("status"),
+        "succeeded"
+    );
+}
+
+/// Suspending a seller is a fraud control: it must not be stoppable by one
+/// Payment Link row whose Stripe link nothing can name any more.
+#[tokio::test]
+async fn seller_suspension_is_not_blocked_by_a_payment_link_that_cannot_be_resolved() {
+    let mut ctx = ctx_with(&[
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            "sk_test_stuck_link",
+        ),
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+    ])
+    .await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_stuck_link_account",
+        HashMap::from([
+            (
+                "user_id".to_string(),
+                serde_json::json!("seller_stuck_link"),
+            ),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stuck_link"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("fee_basis_points".to_string(), serde_json::json!(200)),
+        ]),
+    )
+    .await;
+    let product_id = "seller_stuck_link_product";
+    let offer_id = seed_active_offer(&ctx, product_id, "seller_stuck_link").await;
+    // A row whose attempt went out but never came back, long enough ago that
+    // Stripe has forgotten its idempotency key.
+    let link_id = seed_unresolvable_payment_link(&ctx, &offer_id, "acct_stuck_link").await;
+
+    let (msg, input) = admin_create_msg(
+        "/b/products/api/admin/sellers/seller_stuck_link_account/suspend",
+        serde_json::json!({}),
+    );
+    let suspended = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(
+        suspended["status"],
+        serde_json::json!("suspended"),
+        "the fraud control must complete: {suspended}"
+    );
+    assert_eq!(
+        db::get(&ctx, repo::products::TABLE, product_id)
+            .await
+            .unwrap()
+            .str_field("status"),
+        "archived",
+        "suspension must reach the product rows"
     );
     assert!(
-        repo::payment_links::get_for_offer(&ctx, &offer_id, &link_id)
+        !repo::payment_links::get(&ctx, &link_id)
             .await
             .unwrap()
             .managed
             .active,
-        "the row stays active so it and its link can still be reconciled"
+        "the stuck link's row must still retire"
+    );
+    assert_eq!(
+        takedown_operation(&ctx, &link_id).await.str_field("status"),
+        "dead_letter",
+        "and what an operator must finish by hand must be queued for them"
+    );
+    assert!(
+        stripe.requests.lock().unwrap().is_empty(),
+        "a forgotten request must not be re-sent"
     );
 }
 
 /// A row no request has ever been sent for has nothing at Stripe, and
-/// deactivates locally. (A guard: rows written before the request column
-/// existed look exactly like this, and must keep deactivating.)
+/// deactivates locally. (A guard: it passes before the re-send path exists
+/// too. The row here stores an empty JSON list; the shapes a row written
+/// before the column existed has are covered by
+/// `a_row_from_before_the_request_column_deactivates_locally`.)
 #[tokio::test]
 async fn deactivating_a_row_with_no_stripe_request_stays_local() {
     let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
@@ -5517,6 +5757,70 @@ async fn deactivating_a_row_with_no_stripe_request_stays_local() {
     assert!(
         stripe.requests.lock().unwrap().is_empty(),
         "a row with no request in flight must not reach Stripe"
+    );
+}
+
+/// The real shape of a row written before the `stripe_request` column: the
+/// migration's `DEFAULT ''` leaves it empty rather than an empty JSON list,
+/// and a row the database layer never gave the column at all reads the same.
+/// Both must hydrate as "no request in flight" — reading either as JSON would
+/// fail the row closed and make it undeactivatable.
+#[tokio::test]
+async fn a_row_from_before_the_request_column_deactivates_locally() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let product_id = "product_link_pre_migration";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+
+    // Seeded without the column: the database layer supplies the same
+    // default the migration gives an existing row.
+    let absent = "link_pre_migration_absent";
+    seed(
+        &ctx,
+        repo::payment_links::TABLE,
+        absent,
+        HashMap::from([
+            ("offer_id".to_string(), serde_json::json!(&offer_id)),
+            ("active".to_string(), serde_json::json!(true)),
+            ("sync_status".to_string(), serde_json::json!("syncing")),
+        ]),
+    )
+    .await;
+    // And the explicit empty string the `ALTER TABLE ... DEFAULT ''` writes.
+    let empty = "link_pre_migration_empty";
+    seed(
+        &ctx,
+        repo::payment_links::TABLE,
+        empty,
+        HashMap::from([
+            ("offer_id".to_string(), serde_json::json!(&offer_id)),
+            ("active".to_string(), serde_json::json!(true)),
+            ("sync_status".to_string(), serde_json::json!("syncing")),
+            ("stripe_request".to_string(), serde_json::json!("")),
+            ("stripe_request_at".to_string(), serde_json::json!("")),
+        ]),
+    )
+    .await;
+
+    for link_id in [absent, empty] {
+        let stored = repo::payment_links::get(&ctx, link_id).await.unwrap();
+        assert!(
+            stored.stripe_request.is_empty() && stored.stripe_request_at.is_empty(),
+            "{link_id} must read as no request in flight: {stored:?}"
+        );
+        let deactivated = output_to_json(
+            deactivate_link_over_the_wire(&ctx, product_id, &offer_id, link_id).await,
+        )
+        .await;
+        assert_eq!(
+            deactivated["active"],
+            serde_json::json!(false),
+            "{link_id}: {deactivated}"
+        );
+    }
+    assert!(
+        stripe.requests.lock().unwrap().is_empty(),
+        "neither shape has anything at Stripe to take down"
     );
 }
 
@@ -5571,9 +5875,18 @@ async fn a_link_minted_for_a_row_retired_mid_flight_is_deactivated_at_stripe() {
         .await
         .unwrap();
     assert!(!stored.managed.active);
+    assert_eq!(
+        stored.stripe_payment_link_id, "plink_minted_1",
+        "the retired row must name the link so the takedown is retryable"
+    );
     assert!(
-        stored.stripe_payment_link_id.is_empty() && stored.managed.url.is_empty(),
-        "a retired row must not be given the link it no longer owns"
+        stored.managed.url.is_empty() && stored.managed.sync_status != "synced",
+        "naming the link must not make a retired row sellable again: {stored:?}"
+    );
+    assert_eq!(
+        takedown_operation(&ctx, &link_id).await.str_field("status"),
+        "succeeded",
+        "the takedown settled inline, so nothing is left due"
     );
 }
 

@@ -660,7 +660,10 @@ pub(crate) async fn retrieve_refund(
     decode_refund_response(&value, params, Some(refund_id), client.livemode)
 }
 
-enum RefundReconcileOutcome {
+/// What one run of a claimed provider operation achieved, whatever kind it
+/// is: completed, worth another attempt, or finished in a state only an
+/// operator can move.
+enum OperationOutcome {
     Succeeded(String),
     Retry(String),
     Terminal(String, String),
@@ -669,7 +672,7 @@ enum RefundReconcileOutcome {
 async fn reconcile_refund_operation(
     ctx: &dyn Context,
     operation: &wafer_core::clients::database::Record,
-) -> Result<RefundReconcileOutcome, WaferError> {
+) -> Result<OperationOutcome, WaferError> {
     let refund = wafer_core::clients::database::get(
         ctx,
         repo::refunds::TABLE,
@@ -677,7 +680,7 @@ async fn reconcile_refund_operation(
     )
     .await?;
     if repo::refunds::status_of(&refund)? == RefundStatus::Succeeded {
-        return Ok(RefundReconcileOutcome::Succeeded(
+        return Ok(OperationOutcome::Succeeded(
             refund.json_text_field("response_json"),
         ));
     }
@@ -751,7 +754,7 @@ async fn reconcile_refund_operation(
             )
             .await?;
             ledger = repo::refunds::mark_succeeded(ctx, &ledger.id).await?;
-            Ok(RefundReconcileOutcome::Succeeded(
+            Ok(OperationOutcome::Succeeded(
                 ledger.json_text_field("response_json"),
             ))
         }
@@ -762,12 +765,12 @@ async fn reconcile_refund_operation(
                 "Stripe reports that the refund is terminal and was not completed",
             )
             .await?;
-            Ok(RefundReconcileOutcome::Terminal(
+            Ok(OperationOutcome::Terminal(
                 "Stripe refund failed or was canceled".to_string(),
                 response_json,
             ))
         }
-        _ => Ok(RefundReconcileOutcome::Retry(format!(
+        _ => Ok(OperationOutcome::Retry(format!(
             "Stripe refund remains {}",
             provider.status
         ))),
@@ -816,6 +819,24 @@ pub(crate) async fn reconcile_provider_operations(
     Ok(result)
 }
 
+/// Take down the Payment Link of the row this operation names. The row id is
+/// the aggregate, so a takedown queued by a deactivation, by an archived
+/// offer or by a create whose row was retired mid-flight is the same
+/// operation under the same Stripe idempotency key.
+async fn take_down_payment_link_operation(
+    ctx: &dyn Context,
+    operation: &wafer_core::clients::database::Record,
+) -> Result<OperationOutcome, WaferError> {
+    match super::stripe::take_down_payment_link(ctx, operation.str_field("aggregate_id")).await? {
+        super::stripe::PaymentLinkTakedown::Settled => {
+            Ok(OperationOutcome::Succeeded("{}".to_string()))
+        }
+        super::stripe::PaymentLinkTakedown::Unresolvable(reason) => {
+            Ok(OperationOutcome::Terminal(reason, "{}".to_string()))
+        }
+    }
+}
+
 /// Where [`record_operation_outcome`] left one claimed operation.
 enum Recorded {
     Succeeded,
@@ -834,13 +855,16 @@ async fn record_operation_outcome(
         repo::provider_operations::REFUND_RECONCILE => {
             reconcile_refund_operation(ctx, &claim.record).await
         }
-        other => Ok(RefundReconcileOutcome::Terminal(
+        repo::provider_operations::PAYMENT_LINK_DEACTIVATE => {
+            take_down_payment_link_operation(ctx, &claim.record).await
+        }
+        other => Ok(OperationOutcome::Terminal(
             format!("unsupported provider operation type: {other}"),
             "{}".to_string(),
         )),
     };
     match outcome {
-        Ok(RefundReconcileOutcome::Succeeded(response_json)) => {
+        Ok(OperationOutcome::Succeeded(response_json)) => {
             repo::provider_operations::mark_completed(
                 ctx,
                 &claim.record.id,
@@ -850,7 +874,7 @@ async fn record_operation_outcome(
             .await?;
             Ok(Recorded::Succeeded)
         }
-        Ok(RefundReconcileOutcome::Terminal(message, response_json)) => {
+        Ok(OperationOutcome::Terminal(message, response_json)) => {
             repo::provider_operations::resolve_unleased(
                 ctx,
                 &claim.record.id,
@@ -861,7 +885,7 @@ async fn record_operation_outcome(
             .await?;
             Ok(Recorded::DeadLettered)
         }
-        Ok(RefundReconcileOutcome::Retry(message)) | Err(WaferError { message, .. }) => {
+        Ok(OperationOutcome::Retry(message)) | Err(WaferError { message, .. }) => {
             match repo::provider_operations::mark_retry(
                 ctx,
                 &claim.record.id,

@@ -458,6 +458,45 @@ pub(crate) async fn mark_rejected(
     .await
 }
 
+/// One row by id, without the offer scoping [`get_for_offer`] applies. For
+/// the callers that already hold the row id as their subject — the durable
+/// takedown operation, which is keyed on it.
+pub(crate) async fn get(ctx: &dyn Context, link_id: &str) -> Result<StoredPaymentLink, WaferError> {
+    hydrate(db::get(ctx, TABLE, link_id).await?)
+}
+
+/// Record the Stripe link a row turned out to own, whatever state the row is
+/// in.
+///
+/// Unlike [`mark_synced`] this does not make the row `synced` and does not
+/// require it to be active: its subject is a link that exists at Stripe and
+/// that nothing local names, including one minted for a row that was retired
+/// while Stripe was creating it. Writing the id is what makes taking that
+/// link down a retryable operation instead of a one-shot attempt.
+pub(crate) async fn record_stripe_link(
+    ctx: &dyn Context,
+    link_id: &str,
+    stripe_payment_link_id: &str,
+) -> Result<(), WaferError> {
+    db::update(
+        ctx,
+        TABLE,
+        link_id,
+        HashMap::from([
+            (
+                "stripe_payment_link_id".to_string(),
+                Value::String(stripe_payment_link_id.to_string()),
+            ),
+            (
+                "updated_at".to_string(),
+                Value::String(chrono::Utc::now().to_rfc3339()),
+            ),
+        ]),
+    )
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn get_for_offer(
     ctx: &dyn Context,
     offer_id: &str,
