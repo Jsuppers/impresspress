@@ -187,12 +187,14 @@ pub async fn insert(ctx: &dyn Context, row: &NewRequestLog<'_>) -> Result<(), Wa
 }
 
 /// Page `page` of `page_size` rows, newest first, optionally narrowed to
-/// paths containing `path_search`. The admin logs page.
+/// paths containing `path_search` and, when `errors_only`, to error rows
+/// ([`is_error_status`]). The admin logs page.
 pub async fn paginated(
     ctx: &dyn Context,
     page: i64,
     page_size: i64,
     path_search: &str,
+    errors_only: bool,
 ) -> Result<Page<RequestLogRow>, WaferError> {
     let mut filters = Vec::new();
     if !path_search.is_empty() {
@@ -201,6 +203,9 @@ pub async fn paginated(
             operator: FilterOp::Like,
             value: json!(format!("%{path_search}%")),
         });
+    }
+    if errors_only {
+        filters.push(is_error());
     }
     let list = db::paginated_list(ctx, TABLE, page, page_size, filters, newest_first()).await?;
     Ok(Page {
@@ -472,6 +477,21 @@ mod tests {
             .unwrap_or_else(|e| panic!("seed request_log {id}: {e}"));
     }
 
+    /// Seed a row whose stored `status` label is the caller's rather than the
+    /// one [`status_label`] derives — the shape a writer from before the
+    /// label was derived left behind, and the only way to tell a
+    /// code-reading filter from a label-reading one.
+    async fn seed_labelled(ctx: &TestContext, id: &str, code: i64, label: &str, at: &str) {
+        let mut data = probe(code, 10).to_data();
+        data.insert("id".to_string(), serde_json::json!(id));
+        data.insert("status".to_string(), serde_json::json!(label));
+        data.insert("created_at".to_string(), serde_json::json!(at));
+        data.insert("updated_at".to_string(), serde_json::json!(at));
+        db::create(ctx, TABLE, data)
+            .await
+            .unwrap_or_else(|e| panic!("seed request_log {id}: {e}"));
+    }
+
     /// The codec: every column `insert` writes comes back through
     /// `paginated`, integers as integers and strings as strings.
     #[tokio::test]
@@ -479,7 +499,7 @@ mod tests {
         let ctx = TestContext::with_admin().await;
         insert(&ctx, &probe(500, 42)).await.expect("insert");
 
-        let page = paginated(&ctx, 1, 20, "").await.expect("paginated");
+        let page = paginated(&ctx, 1, 20, "", false).await.expect("paginated");
         assert_eq!(page.total_count, 1);
         assert_eq!((page.page, page.page_size), (1, 20));
         let row = &page.rows[0];
@@ -519,14 +539,71 @@ mod tests {
         other.path = "/other";
         seed_at(&ctx, "r3", other, "2026-01-03T00:00:00Z").await;
 
-        let page = paginated(&ctx, 1, 1, "").await.expect("page 1");
+        let page = paginated(&ctx, 1, 1, "", false).await.expect("page 1");
         assert_eq!(page.total_count, 3);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, "r3", "newest first");
 
-        let probes = paginated(&ctx, 1, 20, "prob").await.expect("filtered");
+        let probes = paginated(&ctx, 1, 20, "prob", false)
+            .await
+            .expect("filtered");
         assert_eq!(probes.total_count, 2);
         assert!(probes.rows.iter().all(|r| r.path == "/probe"));
+    }
+
+    /// `errors_only` narrows the list to error rows by their `status_code`,
+    /// composes with the path search, and counts the narrowed set.
+    #[tokio::test]
+    async fn paginated_errors_only_selects_by_code_not_by_the_stored_label() {
+        let ctx = TestContext::with_admin().await;
+        seed_labelled(&ctx, "served_200", 200, "OK", "2026-01-01T00:00:00Z").await;
+        seed_labelled(
+            &ctx,
+            "served_404_labelled_ok",
+            404,
+            "OK",
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        seed_labelled(
+            &ctx,
+            "served_302_labelled_error",
+            302,
+            "ERROR",
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+
+        let all = paginated(&ctx, 1, 20, "", false).await.expect("all rows");
+        assert_eq!(all.total_count, 3);
+
+        let errors = paginated(&ctx, 1, 20, "", true).await.expect("error rows");
+        assert_eq!(
+            errors
+                .rows
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["served_404_labelled_ok"],
+            "only the row whose code is >= 400, whatever its label says",
+        );
+        assert_eq!(errors.total_count, 1, "the count is of the narrowed set");
+
+        // The two filters compose: same rows, narrowed by path as well.
+        assert_eq!(
+            paginated(&ctx, 1, 20, "prob", true)
+                .await
+                .expect("error rows on /probe")
+                .total_count,
+            1
+        );
+        assert_eq!(
+            paginated(&ctx, 1, 20, "nope", true)
+                .await
+                .expect("error rows on a path that matches nothing")
+                .total_count,
+            0
+        );
     }
 
     #[tokio::test]
@@ -665,25 +742,11 @@ mod tests {
         let at = format!("{}T12:00:00", today.format("%Y-%m-%d"));
         let today_start = format!("{}T00:00:00", today.format("%Y-%m-%d"));
 
-        let seed_labelled = |id: &'static str, code: i64, label: &'static str| {
-            let ctx = &ctx;
-            let at = at.clone();
-            async move {
-                let mut data = probe(code, 10).to_data();
-                data.insert("id".to_string(), serde_json::json!(id));
-                data.insert("status".to_string(), serde_json::json!(label));
-                data.insert("created_at".to_string(), serde_json::json!(at));
-                data.insert("updated_at".to_string(), serde_json::json!(at));
-                db::create(ctx, TABLE, data)
-                    .await
-                    .unwrap_or_else(|e| panic!("seed request_log {id}: {e}"));
-            }
-        };
         // Two errors stored as OK and one non-error stored as ERROR, so a
         // label-reading count (1) cannot coincide with the code-reading one.
-        seed_labelled("served_500_labelled_ok", 500, "OK").await;
-        seed_labelled("served_404_labelled_ok", 404, "OK").await;
-        seed_labelled("served_302_labelled_error", 302, "ERROR").await;
+        seed_labelled(&ctx, "served_500_labelled_ok", 500, "OK", &at).await;
+        seed_labelled(&ctx, "served_404_labelled_ok", 404, "OK", &at).await;
+        seed_labelled(&ctx, "served_302_labelled_error", 302, "ERROR", &at).await;
 
         let counts = today_counts(&ctx, &today_start)
             .await

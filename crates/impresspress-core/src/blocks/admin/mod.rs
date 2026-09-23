@@ -2317,6 +2317,7 @@ pub(crate) mod page_link_tests {
         ("retrieve", "/b/admin/database", &[]),
         ("retrieve", "/b/admin/database", &[("tab", "sql")]),
         ("retrieve", "/b/admin/logs", &[]),
+        ("retrieve", "/b/admin/logs", &[("errors", "1")]),
         ("retrieve", "/b/admin/logs", &[("tab", "audit")]),
         ("retrieve", "/b/admin/settings/email", &[]),
         ("retrieve", "/b/admin/settings/network", &[]),
