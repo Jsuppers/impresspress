@@ -1332,7 +1332,7 @@ mod api_key_lifecycle_tests {
     use crate::{test_support::TestContext, util::sha256_hex};
 
     async fn seed_user_and_key(ctx: &TestContext, raw_key: &str) -> String {
-        let user_id = seed_user(ctx).await;
+        let user_id = seed_user(ctx, raw_key).await;
         api_keys::insert(
             ctx,
             api_keys::NewApiKey {
@@ -1348,11 +1348,13 @@ mod api_key_lifecycle_tests {
         user_id
     }
 
-    async fn seed_user(ctx: &TestContext) -> String {
+    /// One user per key, because the tests that seed two keys would otherwise
+    /// collide on the unique email.
+    async fn seed_user(ctx: &TestContext, tag: &str) -> String {
         users::insert(
             ctx,
             users::NewUser {
-                email: "key@e.co".into(),
+                email: format!("{tag}@e.co"),
                 display_name: "Key".into(),
                 avatar_url: None,
                 role: "user".into(),
@@ -1365,13 +1367,40 @@ mod api_key_lifecycle_tests {
         .id
     }
 
+    /// A context whose auth block really can read `user_roles`, so a key that
+    /// should authenticate does. Without the grant `get_user_roles` fails and
+    /// `authenticate_api_key` stamps no meta — which is what a rejected key
+    /// looks like too, so an expiry test on this fixture would pass whatever
+    /// the expiry check decided.
+    ///
+    /// The grant is sourced from the real `impresspress/admin` `BlockInfo`
+    /// (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)`) so the
+    /// fixture cannot drift from production.
+    async fn ctx_that_can_read_roles() -> TestContext {
+        use wafer_run::Block;
+
+        use crate::blocks::admin::AdminBlock;
+
+        let grants = AdminBlock::new().info().grants;
+        TestContext::with_auth().await.with_wrap(
+            "wafer-run/auth",
+            Vec::new(),
+            grants,
+            "impresspress/admin",
+        )
+    }
+
     /// Write an `api_keys` row with `expires_at` exactly as given, bypassing
     /// `NewApiKey`'s typed expiry. Test-fixture setup: this is the shape of
     /// row a deployment already holds, minted when the endpoint stored the
     /// caller's string as it stood, and nothing in the crate can write one
     /// any more.
-    async fn seed_key_with_stored_expiry(ctx: &TestContext, raw_key: &str, expires_at: &str) {
-        let user_id = seed_user(ctx).await;
+    async fn seed_key_with_stored_expiry(
+        ctx: &TestContext,
+        raw_key: &str,
+        expires_at: &str,
+    ) -> String {
+        let user_id = seed_user(ctx, raw_key).await;
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();
         data.insert("user_id".into(), json!(user_id));
         data.insert("name".into(), json!("legacy-key"));
@@ -1382,6 +1411,15 @@ mod api_key_lifecycle_tests {
         wafer_core::clients::database::create(ctx, api_keys::TABLE, data)
             .await
             .expect("seed a legacy api-key row");
+        user_id
+    }
+
+    /// The user id `authenticate_api_key` stamps for `raw_key`, or `""` when
+    /// it refused the key.
+    async fn authenticated_as(ctx: &TestContext, raw_key: &str) -> String {
+        let mut msg = Message::new("http");
+        authenticate_api_key(ctx, raw_key, &mut msg).await;
+        msg.get_meta(META_AUTH_USER_ID).to_string()
     }
 
     /// `…T20:00:00+09:00` is 11:00 UTC. Compared as text against the clock's
@@ -1391,25 +1429,30 @@ mod api_key_lifecycle_tests {
     /// one the clock reads — the divergence is forced, not sampled.
     #[tokio::test]
     async fn a_stored_offset_expiry_is_read_as_the_instant_it_names() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = ctx_that_can_read_roles().await;
         let offset = chrono::FixedOffset::east_opt(9 * 3600).expect("+09:00");
         let expired_an_hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1))
             .with_timezone(&offset)
             .to_rfc3339();
-        seed_key_with_stored_expiry(&ctx, "raw-offset-key", &expired_an_hour_ago).await;
-
-        let mut msg = Message::new("http");
-        authenticate_api_key(&ctx, "raw-offset-key", &mut msg).await;
+        let live_in_a_month = (chrono::Utc::now() + chrono::Duration::days(30))
+            .with_timezone(&offset)
+            .to_rfc3339();
+        seed_key_with_stored_expiry(&ctx, "raw-offset-dead", &expired_an_hour_ago).await;
+        let live_owner =
+            seed_key_with_stored_expiry(&ctx, "raw-offset-live", &live_in_a_month).await;
 
         assert_eq!(
-            msg.get_meta(META_AUTH_USER_ID),
+            authenticated_as(&ctx, "raw-offset-dead").await,
             "",
             "{expired_an_hour_ago} named an instant an hour ago"
+        );
+        // The control: the same offset spelling, still in the future, is
+        // honoured — so the assertion above is the expiry check answering,
+        // not the fixture refusing every key.
+        assert_eq!(
+            authenticated_as(&ctx, "raw-offset-live").await,
+            live_owner,
+            "{live_in_a_month} is a month out"
         );
     }
 
@@ -1418,39 +1461,22 @@ mod api_key_lifecycle_tests {
     /// it the one property a key must not have.
     #[tokio::test]
     async fn a_stored_expiry_that_is_not_a_timestamp_does_not_authenticate() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = ctx_that_can_read_roles().await;
         seed_key_with_stored_expiry(&ctx, "raw-never-key", "never").await;
+        let owner =
+            seed_key_with_stored_expiry(&ctx, "raw-readable-key", "2099-01-01T00:00:00Z").await;
 
-        let mut msg = Message::new("http");
-        authenticate_api_key(&ctx, "raw-never-key", &mut msg).await;
-
-        assert_eq!(msg.get_meta(META_AUTH_USER_ID), "");
+        assert_eq!(authenticated_as(&ctx, "raw-never-key").await, "");
+        // The control: a readable expiry far out still authenticates.
+        assert_eq!(authenticated_as(&ctx, "raw-readable-key").await, owner);
     }
 
     #[tokio::test]
     async fn active_user_key_authenticates() {
-        // SB-3: `get_user_roles` now surfaces (rather than swallows) a
-        // denied read of the admin-owned user_roles::TABLE, so this WRAP
-        // fixture must carry the real grant admin declares for the auth
-        // block (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)`
-        // in `blocks/admin/mod.rs`) — sourced from the real block so the
-        // fixture can't drift from production.
-        use wafer_run::Block;
-
-        use crate::blocks::admin::AdminBlock;
-
-        let grants = AdminBlock::new().info().grants;
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            grants,
-            "impresspress/admin",
-        );
+        // SB-3: `get_user_roles` surfaces (rather than swallows) a denied read
+        // of the admin-owned user_roles::TABLE, which is why this fixture
+        // carries the real grant — see `ctx_that_can_read_roles`.
+        let ctx = ctx_that_can_read_roles().await;
         let uid = seed_user_and_key(&ctx, "raw-active-key").await;
 
         let mut msg = Message::new("http");
