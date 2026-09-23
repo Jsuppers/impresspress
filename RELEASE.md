@@ -295,7 +295,7 @@ links now get the configured maximum instead. Existing links are unchanged
 by this — what bounds them is the repair above, which reproduces the
 lifetime their token already had.
 
-### Files: the file-count quota is per bucket, and `reset_period_days` is gone
+### Files: the file-count quota is per bucket, both caps are exact, and `reset_period_days` is gone
 
 **The file-count cap is per bucket, as its name says.** `max_files_per_bucket`
 (default `10000`, shown as "Max Files/Bucket" on the storage admin's Quotas tab)
@@ -303,9 +303,20 @@ used to be checked against a user's files summed over **all** their buckets,
 so filling one bucket blocked uploads everywhere. It is now checked against
 the files that user holds in the bucket being uploaded to. This **loosens**
 enforcement: a user with several buckets can now store up to
-`max_files_per_bucket` files in each. If you relied on it as a total cap,
-lower `max_storage_bytes` instead — that cap is still over everything a user
-stores. No migration is involved.
+`max_files_per_bucket` files in each. Nothing caps how many files a user holds
+across buckets: `max_storage_bytes` is still over everything a user stores,
+but it counts bytes, not files, so it bounds that total only by size. No
+migration is involved.
+
+**Both caps are exact.** An upload is held to `max_storage_bytes` and
+`max_files_per_bucket` by the write that reserves it, as one atomic step, so
+uploads running at the same time can no longer each pass against the same
+usage and together exceed a cap. A refused upload answers as before: a 400
+with `Storage quota exceeded` or `File count limit reached for this bucket
+(max N)`. One case still leaves a user over `max_storage_bytes`: an admin's
+upload replaces one of their objects, they use the room that frees, and the
+admin's upload then fails — their object is put back, and their next upload
+is refused until they are under the cap again.
 
 **`reset_period_days` is removed — a breaking change for API clients.** It
 was stored and published, but nothing ever enforced a reset period. It is no

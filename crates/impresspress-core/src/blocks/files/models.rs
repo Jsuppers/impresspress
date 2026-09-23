@@ -29,9 +29,9 @@ impl QuotaConfig {
     pub const DEFAULT_MAX_FILE_SIZE_BYTES: i64 = 104_857_600;
     /// Default cap on the objects one user holds in one bucket: 10,000.
     ///
-    /// Enforced per `(uploader, bucket)` by
-    /// [`super::quota::check_quota`], counting `pending` rows as well as
-    /// completed ones; the user's total across buckets is not capped.
+    /// Enforced per `(uploader, bucket)` by the upload's reservation
+    /// ([`super::repo::objects::reserve_upload`]), counting `pending` rows as
+    /// well as completed ones; the user's total across buckets is not capped.
     pub const DEFAULT_MAX_FILES_PER_BUCKET: i64 = 10_000;
 }
 

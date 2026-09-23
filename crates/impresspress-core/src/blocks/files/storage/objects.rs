@@ -215,20 +215,18 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         return err_forbidden("Access denied to this bucket");
     }
 
-    // Best-effort sweep before quota check: orphan `pending` rows (see
+    // Best-effort sweep before the reservation: orphan `pending` rows (see
     // `sweep_stale_pending`) would otherwise inflate this user's quota usage
     // and lock them out.
     crate::blocks::files::quota::sweep_stale_pending(ctx, msg.user_id()).await;
 
-    // Read the upload body under the user's quota. Two bounds:
-    //   - per-file `max_file_size_bytes` (cheap to check on the running
-    //     total; abort as soon as the collected total exceeds it)
-    //   - total `max_storage_bytes` (depends on current usage; checked once
-    //     after we know the body's full size)
-    // The per-chunk check uses the user's *file-size* cap as a hard ceiling
-    // since that's the smaller of the two. For multipart bodies the cap
+    // Read the upload body under the user's per-file cap,
+    // `max_file_size_bytes`, aborting as soon as the collected total exceeds
+    // it — the one place that cap is enforced. For multipart bodies the cap
     // applies to the envelope — a slight over-estimate (the extracted file
-    // is always smaller than its envelope), never an under-estimate.
+    // is always smaller than its envelope), never an under-estimate. The
+    // caps on what the user stores in total, `max_storage_bytes` and
+    // `max_files_per_bucket`, are enforced by the reservation's write below.
     //
     // This is not a streaming upload and it is not a defence against a
     // multi-GB body: the transport has already read the whole request body
@@ -291,42 +289,14 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         (body_bytes, query_key, content_type)
     };
 
-    // An upload to a key that already holds an object REPLACES it — `(bucket,
-    // key)` is one object, and completing the upload points its row at the
-    // new bytes — so the quota it has to fit is the difference, not the whole file, and only when
-    // the bytes it displaces are already counted against this same user.
-    // (Admins can upload into a bucket they do not own; those bytes belong to
-    // whoever uploaded them.)
-    let existing = match repo::objects::find_by_bucket_key(ctx, bucket, &key).await {
-        Ok(row) => row,
-        // Fail closed: admitting the upload against "nothing is stored here"
-        // would charge the full size to a quota it may not fit, or skip the
-        // per-bucket file count for a replacement that is not one.
-        Err(e) => return crud::db_error_internal(e, "Object lookup failed"),
-    };
-    let replaces_own_bytes = existing
-        .as_ref()
-        .filter(|row| row.uploaded_by == msg.user_id())
-        .map(|row| row.size);
-
-    if let Err(r) = crate::blocks::files::quota::check_quota(
-        ctx,
-        msg.user_id(),
-        bucket,
-        content.len() as i64,
-        replaces_own_bytes,
-    )
-    .await
-    {
-        return r;
-    }
-
-    // Claim the key BEFORE uploading so a quota check that runs after this
-    // insert counts the in-flight size. That narrows the race between
-    // check_quota and the upload; it does not close it (see `check_quota`).
-    // `(bucket, key)` is UNIQUE: a re-upload takes over the
-    // key's one row, and an upload that finds another upload of the key still
-    // in flight is refused (see `reserve_upload`).
+    // Claim the key BEFORE uploading, within the user's caps: the
+    // reservation's write is refused when it would take them past
+    // `max_storage_bytes` or `max_files_per_bucket`, as one atomic step, so
+    // concurrent uploads cannot all be admitted against the same usage. A
+    // re-upload of a key takes over its one row (`(bucket, key)` is UNIQUE)
+    // and is charged the difference when that row is the user's own; an
+    // upload that finds another upload of the key still in flight is refused
+    // (see `reserve_upload`).
     let reservation = match repo::objects::reserve_upload(
         ctx,
         bucket,
@@ -334,10 +304,18 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         content.len(),
         &content_type,
         msg.user_id(),
+        &quota,
     )
     .await
     {
         Ok(reservation) => reservation,
+        Err(ReserveError::OverStorageQuota) => return err_bad_request("Storage quota exceeded"),
+        Err(ReserveError::OverFileCount) => {
+            return err_bad_request(&format!(
+                "File count limit reached for this bucket (max {})",
+                quota.max_files_per_bucket
+            ))
+        }
         // Another upload of the key holds it (see `reserve_upload`): a
         // conflict the client resolves by retrying once that upload settles,
         // not a fault. The messages are this handler's own, so no backend
@@ -1252,10 +1230,10 @@ mod integration_tests {
     /// bytes until both are through the reservation
     /// ([`WriteHeldUntilBothReserved`]).
     ///
-    /// Each upload reads the row twice — once for the quota (a replacement is
-    /// charged the difference) and once to reserve it — so each racer lets
-    /// its own first read through ([`RendezvousDbOpContext::passing_first`])
-    /// and is held on the second. Names `repo::objects::TABLE` only to aim
+    /// Each upload lists the table twice — the pending sweep
+    /// (`quota::sweep_stale_pending`), then the reservation's read of the
+    /// key's row — so each racer lets its own first list through
+    /// ([`RendezvousDbOpContext::passing_first`]) and is held on the second. Names `repo::objects::TABLE` only to aim
     /// the rendezvous. Answers each racer's HTTP status, in `uploads` order.
     async fn race_two_uploads(
         ctx: &TestContext,
@@ -1390,10 +1368,17 @@ mod integration_tests {
     async fn an_upload_of_a_key_another_upload_holds_is_refused() {
         let (ctx, storage) = ctx_with_storage_handle().await;
         seed_bucket(&ctx, "assets", "alice").await;
-        let held =
-            repo::objects::reserve_upload(&ctx, "assets", "same.txt", 7, "text/plain", "bob")
-                .await
-                .expect("bob's upload claims the key");
+        let held = repo::objects::reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            7,
+            "text/plain",
+            "bob",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("bob's upload claims the key");
 
         let out = handle_upload_object(
             &ctx,
@@ -1491,8 +1476,8 @@ mod integration_tests {
 
     /// A context on which another upload of the key claims it just before
     /// this upload's reservation insert, and gives it up again just after:
-    /// the insert affects nothing, and the row that caused that is gone by
-    /// the time it is read back.
+    /// the insert is refused as a taken key, and the row that caused that is
+    /// gone by the time it is read back.
     #[derive(Clone)]
     struct ChurnedKeyContext {
         inner: TestContext,
@@ -1523,7 +1508,7 @@ mod integration_tests {
         }
 
         async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
-            if !(name == "wafer-run/database" && msg.action() == "database.upsert") {
+            if !(name == "wafer-run/database" && msg.action() == "database.insert_guarded") {
                 return self.inner.call_block(name, msg, input).await;
             }
             repo::objects::seed(
@@ -1538,15 +1523,19 @@ mod integration_tests {
             .await
             .expect("the rival upload claims the key");
             let out = self.inner.call_block(name, msg, input).await;
-            // Settled before the rival lets go, so the insert sees its row.
-            let answered = out
-                .collect_buffered()
-                .await
-                .unwrap_or_else(|_| panic!("the reservation insert must answer"));
+            // Settled before the rival lets go, so the insert sees its row —
+            // and is refused by the unique index, which is an error answer.
+            let answered = out.collect_buffered().await;
             repo::objects::delete_by_bucket_key(&self.inner, self.bucket, self.key)
                 .await
                 .expect("the rival upload releases the key");
-            OutputStream::respond_with_meta(answered.body, answered.meta)
+            match answered {
+                Ok(answered) => OutputStream::respond_with_meta(answered.body, answered.meta),
+                Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => {
+                    OutputStream::error(e)
+                }
+                Err(_) => panic!("the reservation insert must answer"),
+            }
         }
 
         fn is_cancelled(&self) -> bool {
@@ -1771,6 +1760,57 @@ mod integration_tests {
         );
     }
 
+    /// A user already over the per-bucket cap — an admin lowered it below
+    /// what they hold — can still overwrite their own file: the overwrite adds
+    /// no file, so the count guard is not set on it. A new file in that
+    /// bucket is still refused.
+    #[tokio::test]
+    async fn a_user_over_the_bucket_cap_can_still_replace_their_own_file() {
+        let (ctx, storage) = alice_capped_at_files_per_bucket_with_storage(2).await;
+        for key in ["one.txt", "two.txt", "three.txt"] {
+            repo::objects::seed(
+                &ctx,
+                crate::util::json_map(serde_json::json!({
+                    "bucket": "a",
+                    "key": key,
+                    "size": 5,
+                    "content_type": "text/plain",
+                    "status": ObjectStatus::Complete,
+                    "uploaded_by": "alice",
+                    "uploaded_at": "2026-09-01T00:00:00+00:00",
+                })),
+            )
+            .await
+            .expect("seed one of alice's files");
+        }
+
+        let replace = alice_uploads(&ctx, "a", "one.txt").await;
+        assert_eq!(
+            output_json(replace).await["uploaded"],
+            serde_json::json!(true),
+            "replacing her own file adds none, over the cap or not",
+        );
+        assert_eq!(
+            repo::objects::count_for_uploader_in_bucket(&ctx, "alice", "a")
+                .await
+                .expect("count"),
+            3,
+        );
+
+        let new_file = alice_uploads(&ctx, "a", "four.txt").await;
+        assert!(
+            output_is_error(new_file, "InvalidArgument").await,
+            "a new file in a bucket over its cap is still refused",
+        );
+        assert!(
+            !storage
+                .blob_keys("a")
+                .iter()
+                .any(|blob| blob.ends_with("four.txt")),
+            "nothing may be stored for a refused upload"
+        );
+    }
+
     /// An upload still in flight counts against the bucket's cap, as its bytes
     /// count against the storage cap: an upload whose check runs after
     /// another upload's reservation has landed sees that reservation and is
@@ -1780,9 +1820,17 @@ mod integration_tests {
     #[tokio::test]
     async fn an_upload_in_flight_counts_against_the_bucket_cap() {
         let ctx = alice_capped_at_files_per_bucket(1).await;
-        repo::objects::reserve_upload(&ctx, "a", "in-flight.txt", 5, "text/plain", "alice")
-            .await
-            .expect("reserve");
+        repo::objects::reserve_upload(
+            &ctx,
+            "a",
+            "in-flight.txt",
+            5,
+            "text/plain",
+            "alice",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("reserve");
 
         let out = alice_uploads(&ctx, "a", "next.txt").await;
         assert!(
@@ -1791,18 +1839,52 @@ mod integration_tests {
         );
     }
 
-    /// The per-bucket cap is NOT enforced atomically, and this pins that.
-    /// Two uploads of different keys into a bucket one short of its cap are
-    /// held until both have counted the bucket, so both see one file and
-    /// both are admitted: the bucket ends one over its cap. The count and the
-    /// reservation insert are separate calls, and a reservation is exclusive
-    /// per key, not per bucket. Tracked in `NICE_TO_HAVE.md` ("Files quota
-    /// caps are not enforced atomically"); when that lands, this test should
-    /// flip to one 200 and one refusal.
-    #[tokio::test]
-    async fn racing_uploads_of_different_keys_can_overshoot_the_bucket_cap() {
+    /// Run `uploads` (bucket, key, uploader, bytes) through the real handler
+    /// at once, each held at the reservation's guarded write `op` until every
+    /// one has reached it, so every racer has done everything the upload does
+    /// before its write when the writes land. Answers each racer's HTTP
+    /// status, in `uploads` order.
+    async fn race_guarded_writes(
+        ctx: &TestContext,
+        op: &'static str,
+        uploads: Vec<(&'static str, &'static str, &'static str, Vec<u8>)>,
+    ) -> Vec<u16> {
         use crate::test_support::{output_http_status, RendezvousDbOpContext};
 
+        let gated =
+            RendezvousDbOpContext::new(ctx.clone(), op, repo::objects::TABLE, uploads.len());
+        let racers: Vec<_> = uploads
+            .into_iter()
+            .map(|(bucket, key, uploader, bytes)| {
+                let racer = gated.clone();
+                tokio::spawn(async move {
+                    let out = handle_upload_object(
+                        &racer,
+                        &upload_msg_from(bucket, key, "text/plain", uploader),
+                        InputStream::from_bytes(bytes),
+                    )
+                    .await;
+                    output_http_status(out).await
+                })
+            })
+            .collect();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::try_join_all(racers),
+        )
+        .await
+        .expect("every upload must reach the rendezvous and finish")
+        .expect("upload task panicked")
+    }
+
+    /// The per-bucket cap is exact under concurrency. Two uploads of
+    /// different keys into a bucket one short of its cap are held until both
+    /// are at their reservation insert, so neither has written when the
+    /// other decides: the cap is checked by the insert itself, and exactly
+    /// one of them is admitted. A count read before a separate insert would
+    /// show both one file and admit both, leaving the bucket one over.
+    #[tokio::test]
+    async fn racing_uploads_of_different_keys_cannot_overshoot_the_bucket_cap() {
         let ctx = alice_capped_at_files_per_bucket(2).await;
         let first = alice_uploads(&ctx, "a", "one.txt").await;
         assert_eq!(
@@ -1810,34 +1892,204 @@ mod integration_tests {
             serde_json::json!(true)
         );
 
-        // Each upload makes exactly one `count` on the objects table: the
-        // per-bucket file count in `check_quota`.
-        let gated =
-            RendezvousDbOpContext::new(ctx.clone(), "database.count", repo::objects::TABLE, 2);
-        let racers: Vec<_> = ["two.txt", "three.txt"]
-            .into_iter()
-            .map(|key| {
-                let racer = gated.clone();
-                tokio::spawn(async move {
-                    output_http_status(alice_uploads_as(&racer, "a", key).await).await
-                })
-            })
-            .collect();
-        let statuses = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            futures::future::try_join_all(racers),
+        let mut statuses = race_guarded_writes(
+            &ctx,
+            "database.insert_guarded",
+            vec![
+                ("a", "two.txt", "alice", b"hello".to_vec()),
+                ("a", "three.txt", "alice", b"hello".to_vec()),
+            ],
         )
-        .await
-        .expect("both uploads must reach the rendezvous and finish")
-        .expect("upload task panicked");
+        .await;
+        statuses.sort_unstable();
 
-        assert_eq!(statuses, vec![200, 200], "both racers pass the check");
+        assert_eq!(
+            statuses,
+            vec![200, 400],
+            "one racer fits under the cap, the other is refused"
+        );
         assert_eq!(
             repo::objects::count_for_uploader_in_bucket(&ctx, "alice", "a")
                 .await
                 .expect("count"),
+            2,
+            "the bucket ends at its cap of two",
+        );
+    }
+
+    /// The storage cap is exact for take-overs too, where the row's size AND
+    /// its uploader change. An admin replaces two of alice's 3-byte objects
+    /// with 6 bytes each at once, against an admin cap of 10 bytes: each
+    /// replacement fits alone, both together do not. Each take-over leaves
+    /// the row it replaces out of the cap — it was alice's, and is now the
+    /// admin's at the new size — and exactly one is admitted. Usage read
+    /// before a separate take-over would admit both, leaving the admin at 12.
+    #[tokio::test]
+    async fn racing_take_overs_cannot_overshoot_the_new_uploaders_storage_cap() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        repo::quota::seed(
+            &ctx,
+            crate::util::json_map(serde_json::json!({
+                "user_id": "admin_1",
+                "max_storage_bytes": 10,
+            })),
+        )
+        .await
+        .expect("seed quota");
+        for key in ["x.txt", "y.txt"] {
+            let out = handle_upload_object(
+                &ctx,
+                &upload_msg("assets", key, "text/plain"),
+                InputStream::from_bytes(b"abc".to_vec()),
+            )
+            .await;
+            assert_eq!(output_json(out).await["uploaded"], serde_json::json!(true));
+        }
+
+        let statuses = race_guarded_writes(
+            &ctx,
+            "database.update_guarded",
+            vec![
+                ("assets", "x.txt", "admin_1", b"xxxxxx".to_vec()),
+                ("assets", "y.txt", "admin_1", b"yyyyyy".to_vec()),
+            ],
+        )
+        .await;
+        let mut sorted = statuses.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![200, 400],
+            "one take-over fits the admin's cap, the other is refused"
+        );
+
+        let usage = |user: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                crate::blocks::files::quota::get_used_bytes(&ctx, user)
+                    .await
+                    .expect("usage")
+            }
+        };
+        assert_eq!(
+            usage("admin_1").await,
+            6,
+            "the admin is charged one replacement"
+        );
+        assert_eq!(
+            usage("alice").await,
             3,
-            "the bucket ends one file over its cap of two",
+            "alice keeps the object that was not taken over"
+        );
+        let refused = if statuses[0] == 400 { "x.txt" } else { "y.txt" };
+        let row = repo::objects::find_by_bucket_key(&ctx, "assets", refused)
+            .await
+            .expect("read")
+            .expect("the refused key keeps its row");
+        assert_eq!(
+            (row.uploaded_by.as_str(), row.size, row.status),
+            ("alice", 3, ObjectStatus::Complete),
+            "a refused take-over leaves the row as it was",
+        );
+    }
+
+    /// A user's override of `max_storage_bytes` is what the upload is held
+    /// to: a file that fits the 1 GiB default but not the override is
+    /// refused with the storage message, and nothing is stored or reserved.
+    #[tokio::test]
+    async fn an_upload_past_the_storage_cap_is_refused() {
+        let (ctx, storage) = ctx_with_storage_handle().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        repo::quota::seed(
+            &ctx,
+            crate::util::json_map(serde_json::json!({
+                "user_id": "alice",
+                "max_storage_bytes": 8,
+            })),
+        )
+        .await
+        .expect("seed quota");
+
+        let fits = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "a.txt", "text/plain"),
+            InputStream::from_bytes(vec![b'a'; 5]),
+        )
+        .await;
+        assert_eq!(output_json(fits).await["uploaded"], serde_json::json!(true));
+
+        let over = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "b.txt", "text/plain"),
+            InputStream::from_bytes(vec![b'b'; 4]),
+        )
+        .await;
+        match over.collect_buffered().await {
+            Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => assert_eq!(
+                (format!("{:?}", e.code), e.message.as_str()),
+                ("InvalidArgument".to_string(), "Storage quota exceeded"),
+            ),
+            other => panic!("5 + 4 bytes is over a cap of 8: {other:?}"),
+        }
+        assert_eq!(
+            repo::objects::list_all(&ctx).await.expect("rows").len(),
+            1,
+            "a refused upload reserves nothing",
+        );
+        assert!(
+            !storage
+                .blob_keys("assets")
+                .iter()
+                .any(|blob| blob.ends_with("b.txt")),
+            "nothing may be stored for a refused upload"
+        );
+    }
+
+    /// An outage on the quota override lookup refuses the upload with an
+    /// internal error rather than admitting it under the defaults, which
+    /// would silently lift an admin-lowered cap.
+    #[tokio::test]
+    async fn an_upload_fails_closed_when_the_quota_lookup_errors() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let failing = crate::test_support::FailingDbOpContext::new(
+            ctx,
+            vec![("database.list", repo::quota::TABLE)],
+        );
+
+        let out = alice_uploads_as(&failing, "assets", "a.txt").await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "the outage must surface as an error, not as a quota verdict"
+        );
+    }
+
+    /// The usage the caps are measured against is read by the reservation's
+    /// write, so an outage there refuses the upload with an internal error —
+    /// never admits it as if the user stored nothing.
+    #[tokio::test]
+    async fn an_upload_fails_closed_when_the_guarded_reservation_errors() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let failing = crate::test_support::FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.insert_guarded", repo::objects::TABLE)],
+        );
+
+        let out = alice_uploads_as(&failing, "assets", "a.txt").await;
+
+        assert!(
+            output_is_error(out, "Internal").await,
+            "the outage must surface as an error, not as a quota verdict"
+        );
+        assert!(
+            repo::objects::list_all(&ctx)
+                .await
+                .expect("rows")
+                .is_empty(),
+            "nothing is reserved"
         );
     }
 
@@ -2105,6 +2357,7 @@ mod integration_tests {
                             9,
                             "text/csv",
                             "bob",
+                            &crate::blocks::files::models::QuotaConfig::effective_default(),
                         )
                         .await
                         .expect("bob takes the orphan over");
@@ -2120,6 +2373,7 @@ mod integration_tests {
                             9,
                             "text/csv",
                             "bob",
+                            &crate::blocks::files::models::QuotaConfig::effective_default(),
                         )
                         .await
                         .expect("bob claims the vacant key");
@@ -2558,10 +2812,17 @@ mod integration_tests {
         let (ctx, storage) = ctx_with_storage_handle().await;
         seed_bucket(&ctx, "assets", "alice").await;
         seed_legacy_object(&ctx, "assets", "doc.txt", b"stored", "text/plain", "alice").await;
-        let in_flight =
-            repo::objects::reserve_upload(&ctx, "assets", "doc.txt", 8, "text/plain", "alice")
-                .await
-                .expect("a replacement claims the key");
+        let in_flight = repo::objects::reserve_upload(
+            &ctx,
+            "assets",
+            "doc.txt",
+            8,
+            "text/plain",
+            "alice",
+            &crate::blocks::files::models::QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("a replacement claims the key");
         store::put(
             &ctx,
             "assets",

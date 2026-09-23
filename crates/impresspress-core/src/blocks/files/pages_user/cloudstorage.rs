@@ -145,7 +145,8 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
             return crate::ui::server_error_response(msg);
         }
     };
-    // Same quota source as upload enforcement (`quota::check_quota`), so
+    // Same quota source as upload enforcement (`repo::objects::reserve_upload`
+    // sums the same rows, and caps them at the same `max_storage_bytes`), so
     // the card can never disagree with what the API enforces.
     let used_bytes = crate::blocks::files::quota::get_used_bytes(ctx, &user_id).await;
     let limit = crate::blocks::files::quota::get_user_quota(ctx, &user_id).await;
