@@ -2446,8 +2446,8 @@ fn real_crypto_service() -> wafer_block_crypto::service::Argon2JwtCryptoService 
 /// A JWT payload is `serde_json` over a `HashMap`, so its keys come out in
 /// that map's iteration order, which `RandomState` randomizes per map. Two
 /// mints of an identical claim set therefore produce byte-identical tokens
-/// only when the two maps happen to agree, measured at about once in fifty
-/// thousand for a payload of eight claims. `iat`/`exp` are whole seconds, so
+/// only when the two maps happen to agree, measured at about once in forty
+/// thousand for the refresh token's payload of nine claims. `iat`/`exp` are whole seconds, so
 /// a second mint also has to land inside the first one's second.
 ///
 /// Neither is a property a handler may rely on: the first is a coin the

@@ -708,6 +708,47 @@ survive. What does not is the session/device list at **Account → Sessions**:
 migration 012 in the same set drops and recreates it, and it refills as each
 device next refreshes its tokens.
 
+### Auth: the OAuth start is rate-limited per IP, in a bucket of its own
+
+**What changes.** `GET /b/auth/oauth/login` writes a PKCE state row on every
+request, and it used to spend no rate-limit bucket at all. It now spends its own
+IP-keyed bucket, `oauth_start`: **30 starts per 60 seconds per client address**
+by default. It does not share the `auth` bucket that login, signup and the
+password-reset endpoints spend, so a burst of OAuth starts cannot lock anyone
+out of a password login, and loosening the one does not loosen the other.
+
+**Who has to act.** A deployment that raised or disabled
+`WAFER_RUN_SHARED__RATE_LIMIT_AUTH` — typically because many users share one
+egress address (an office NAT, a campus, a proxy that does not forward the
+client IP) — gets none of that headroom on the OAuth start: it is capped at the
+30/60 default from the first request after the deploy, and users behind that
+address see `429` on the provider buttons. Set the bucket by its own key:
+
+```
+WAFER_RUN_SHARED__RATE_LIMIT_OAUTH_START=300/60   # requests/seconds; 0 disables
+```
+
+Like every `WAFER_RUN_SHARED__RATE_LIMIT_*` category it is set by key — process
+environment or the `variables` table — and no `ConfigVar` declares it, so it
+does not appear as a field on any admin settings page. No migration is involved.
+
+### Auth: a refused database call is a 403, not a 500
+
+**What changes.** When WRAP refused one of the auth routes' database calls — a
+deployment missing the grant a table needs, or a row guard — the route answered
+`500 Internal server error (ref: …)`, the same as an outage. It now answers
+`403` (`Access denied`), and a quota the service enforces answers `429`, as every
+other block already did. The auth settings and organizations pages answer the
+same statuses as a styled page. A genuine fault is still the `500` with a
+correlation id.
+
+**Who has to act.** Only an alert or a client that treats a `5xx` from
+`/b/auth/*` as the one sign of a misconfigured deployment: a missing grant now
+shows up as `403`, and the server log line reads `database access denied`. A
+signed-in client that sees `403` from `/b/auth/api/refresh` or `/b/auth/api/me`
+should not treat it as a sign-out — the credential is intact; the deployment
+refused the read. No migration is involved.
+
 ### LLM: a provider can name its token-budget field (migration 002)
 
 **What changes.** Which field carries the output-token budget in a chat request

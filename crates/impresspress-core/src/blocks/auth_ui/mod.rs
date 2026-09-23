@@ -26,6 +26,8 @@ pub mod contracts;
 pub mod oauth;
 pub mod pages;
 pub mod redirect;
+#[cfg(test)]
+mod tests;
 
 use wafer_run::{
     context::Context, BlockInfo, ConfigVar, HttpMethod, InputType, InstanceMode, Message,

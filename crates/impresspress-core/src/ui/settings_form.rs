@@ -84,9 +84,9 @@ impl<'a> SettingsSection<'a> {
 ///
 /// `get_many` also refuses the whole batch when WRAP denies the caller ONE of
 /// the keys, where `config::get_default` swallowed the denial into that key's
-/// default. So a page that renders a var its block may not read is now a 500
-/// rather than a field showing the default: the page has no value to show and
-/// its Save would have written the default over the stored one.
+/// default. So a page that renders a var its block may not read is an error
+/// page rather than a field showing the default: the page has no value to
+/// show and its Save would have written the default over the stored one.
 async fn current_values<'v>(
     ctx: &dyn Context,
     vars: impl IntoIterator<Item = &'v ConfigVar>,
@@ -339,8 +339,10 @@ pub async fn render_sections(
 /// JSON to `post_url`, with one titled section per [`SettingsSection`], a
 /// "Save Settings" button, and the shared submit snippet. Current values are
 /// loaded from the config block internally; `Err` when they could not be read,
-/// and the caller answers [`crate::ui::server_error_response`] instead of a
-/// form (see [`render_sections`]).
+/// and the caller answers an error page instead of a form (see
+/// [`render_sections`]) — [`crate::blocks::crud::db_error_page`], which keeps
+/// a WRAP denial's 403 where [`crate::ui::server_error_response`] would make
+/// it a 500.
 ///
 /// `extra` is appended after the last section and before the submit button —
 /// used by blocks that want an extra panel inside the form (e.g. legalpages'

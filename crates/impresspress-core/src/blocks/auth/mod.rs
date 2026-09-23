@@ -1124,8 +1124,6 @@ pub(crate) mod helpers {
 
     #[cfg(test)]
     mod generate_tokens_auth_version_tests {
-        use wafer_block_crypto::service::Argon2JwtCryptoService;
-
         use super::*;
         use crate::test_support::TestContext;
 
@@ -1134,17 +1132,7 @@ pub(crate) mod helpers {
         /// `crypto::random_bytes` calls (and `crypto::verify` in these tests)
         /// have somewhere to dispatch to.
         async fn ctx_with_crypto() -> TestContext {
-            let mut ctx = TestContext::with_auth().await;
-            let svc = std::sync::Arc::new(
-                Argon2JwtCryptoService::new(
-                    "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-                )
-                .expect("test secret is long enough"),
-            );
-            let crypto_block: std::sync::Arc<dyn wafer_run::Block> =
-                std::sync::Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
-            ctx.register_block("wafer-run/crypto", crypto_block);
-            ctx
+            TestContext::with_auth_and_crypto().await
         }
 
         async fn seed_user(ctx: &TestContext) -> String {
@@ -1200,6 +1188,50 @@ pub(crate) mod helpers {
             assert_eq!(
                 refresh.get("family").and_then(|v| v.as_str()),
                 Some(family.as_str())
+            );
+        }
+
+        /// The refresh token carries its own `jti`, not the access token's.
+        /// Its nonce is what makes a rotation's output differ from the mint
+        /// before it (see `generate_tokens`); a refresh token that reused the
+        /// access token's id would still differ per mint, so this pins the
+        /// two ids as separate draws rather than one value stamped twice.
+        #[tokio::test]
+        async fn minted_refresh_token_carries_a_jti_of_its_own() {
+            let ctx = ctx_with_crypto().await;
+            let uid = seed_user(&ctx).await;
+
+            let Ok((access_token, refresh_token, _family)) = generate_tokens(
+                &ctx,
+                &uid,
+                "mint@example.com",
+                &["user".to_string()],
+                "password",
+                None,
+            )
+            .await
+            else {
+                panic!("mint tokens failed")
+            };
+
+            let jti = |claims: &HashMap<String, serde_json::Value>| {
+                claims
+                    .get("jti")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            };
+            let access = crypto::verify(&ctx, &access_token)
+                .await
+                .expect("verify access token");
+            let refresh = crypto::verify(&ctx, &refresh_token)
+                .await
+                .expect("verify refresh token");
+            let refresh_jti = jti(&refresh).expect("the refresh token carries a jti");
+            assert_eq!(refresh_jti.len(), 32, "a 16-byte nonce, hex: {refresh_jti}");
+            assert_ne!(
+                Some(refresh_jti),
+                jti(&access),
+                "the refresh token's jti must be its own draw, not the access token's"
             );
         }
 

@@ -1312,6 +1312,33 @@ mod security_regression_tests {
             .collect()
     }
 
+    /// The single-use state redemption is the callback's first database
+    /// call. A WRAP denial there is the deployment's missing grant — a 403 —
+    /// not the 500 an outage is, and it is refused before the flow reaches
+    /// the provider. Driven through the block's own route table.
+    #[tokio::test]
+    async fn state_redemption_denial_is_403_not_500() {
+        use crate::test_support::FailingDbOpContext;
+
+        let ctx = OauthFlow::google("denied@example.com").ctx().await;
+        let mut msg = crate::test_support::anon_msg("retrieve", "/b/auth/oauth/callback");
+        for entry in callback_msg(&ctx).await.meta {
+            msg.set_meta(&entry.key, &entry.value);
+        }
+        let ctx = FailingDbOpContext::failing_with(
+            ctx,
+            vec![("database.take_where", oauth_pkce::TABLE)],
+            wafer_run::WaferError::new(
+                wafer_run::ErrorCode::PermissionDenied,
+                "WRAP: no grant on the PKCE state table",
+            ),
+        );
+        let out = crate::blocks::auth_ui::AuthUiBlock::default()
+            .handle(&ctx, msg, InputStream::empty())
+            .await;
+        assert_eq!(crate::test_support::output_http_status(out).await, 403);
+    }
+
     // ---------------------------------------------------------------
     // Local-account fixtures — through the real handlers
     // ---------------------------------------------------------------

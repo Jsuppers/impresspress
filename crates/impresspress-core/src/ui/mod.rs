@@ -514,6 +514,11 @@ pub fn not_found_response(msg: &wafer_run::Message) -> wafer_run::OutputStream {
 /// field reads as "you have none" / "your name is empty", and a form built
 /// that way writes the blank back on submit. An htmx swap uses
 /// [`swap_error_response`] instead, since htmx drops a 5xx body.
+///
+/// It takes no cause, so it cannot tell a WRAP denial from an outage. A read
+/// that failed with a service error goes through
+/// [`crate::blocks::crud::db_error_page`], which answers this only for an
+/// internal fault and [`refused_response`] for a denial or a quota.
 pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStream {
     let accept = msg.get_meta("http.header.accept");
     if accept.contains("text/html") && !accept.contains("application/json") {

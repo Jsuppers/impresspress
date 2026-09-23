@@ -579,3 +579,19 @@ async fn portal_home_count_denial_is_403_not_500() {
     let (msg, input) = get_msg("/b/products", "buyer_1");
     assert_wrap_denial(dispatch(&ctx, msg, input).await).await;
 }
+
+/// The settings page renders every value through the config service, which
+/// WRAP guards like the database. A deployment that never granted the block
+/// its own settings gets the 403 page — not a 500, and not a form of
+/// defaults whose Save would overwrite the stored values.
+#[tokio::test]
+async fn settings_page_config_denial_is_the_403_page_not_a_500() {
+    let ctx = denied().await;
+    let (mut msg, input) = admin_get_msg("/b/products/admin/settings");
+    msg.set_meta("http.header.accept", "text/html");
+    let parts =
+        wafer_block::http_codec::collect_http_response(dispatch(&ctx, msg, input).await).await;
+    let html = String::from_utf8_lossy(&parts.body);
+    assert_eq!(parts.status, 403, "{html}");
+    assert!(!html.contains("settings-form"), "{html}");
+}
