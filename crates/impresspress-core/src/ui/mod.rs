@@ -514,6 +514,11 @@ pub fn not_found_response(msg: &wafer_run::Message) -> wafer_run::OutputStream {
 /// field reads as "you have none" / "your name is empty", and a form built
 /// that way writes the blank back on submit. An htmx swap uses
 /// [`swap_error_response`] instead, since htmx drops a 5xx body.
+///
+/// It takes no cause, so it cannot tell a WRAP denial from an outage. A read
+/// that failed with a service error goes through
+/// [`crate::blocks::crud::db_error_page`], which answers this only for an
+/// internal fault and [`refused_response`] for a denial or a quota.
 pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStream {
     let accept = msg.get_meta("http.header.accept");
     if accept.contains("text/html") && !accept.contains("application/json") {
@@ -527,6 +532,38 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
         )
     } else {
         crate::http::err_internal_no_cause("internal server error")
+    }
+}
+
+/// A refusal a page's read met, as [`crate::blocks::crud::db_error_page`]
+/// classified it: the 403 a WRAP denial becomes and the 429 a quota keeps, as
+/// a styled page for a browser and as the refusal itself for an API caller.
+pub fn refused_response(
+    msg: &wafer_run::Message,
+    error: wafer_run::WaferError,
+) -> wafer_run::OutputStream {
+    let accept = msg.get_meta("http.header.accept");
+    if !accept.contains("text/html") || accept.contains("application/json") {
+        return wafer_run::OutputStream::error(error);
+    }
+    match error.code {
+        wafer_run::ErrorCode::PermissionDenied => status_response(
+            403,
+            "Forbidden",
+            "403",
+            "Forbidden",
+            "You don't have access to this page.",
+            ("Go home", "/"),
+        ),
+        wafer_run::ErrorCode::ResourceExhausted => status_response(
+            429,
+            "Too many requests",
+            "429",
+            "Too many requests",
+            "This page is over its usage limit right now. Please try again later.",
+            ("Go home", "/"),
+        ),
+        _ => wafer_run::OutputStream::error(error),
     }
 }
 

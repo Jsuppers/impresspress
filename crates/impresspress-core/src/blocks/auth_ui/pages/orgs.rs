@@ -6,7 +6,7 @@ use maud::{html, Markup};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::auth::repo::orgs,
+    blocks::{auth::repo::orgs, crud},
     http::redirect,
     ui::{self, SiteConfig},
 };
@@ -18,14 +18,11 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    // A failed read is a 500, never the "no claimed organizations" copy: that
-    // would tell a user who owns orgs that they own none.
+    // A failed read is an error page, never the "no claimed organizations"
+    // copy: that would tell a user who owns orgs that they own none.
     let orgs_list = match orgs::list_for_user(ctx, &user_id).await {
         Ok(list) => list,
-        Err(e) => {
-            tracing::error!(error = %e, "orgs page: list_for_user failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "orgs page: list_for_user failed"),
     };
     let body = html! {
         p .text-muted .m-0 .mb-4 .text-sm {

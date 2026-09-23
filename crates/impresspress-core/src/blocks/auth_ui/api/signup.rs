@@ -1,7 +1,7 @@
 //! POST /b/auth/api/signup — relocated from auth/login.rs in Task 5.
 
 use wafer_core::clients::{config, crypto};
-use wafer_run::{context::Context, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::{
@@ -15,6 +15,7 @@ use crate::{
             contracts::{SignupRequest, SignupResponse, SignupUser, TokenType},
             redirect::{default_post_login_redirect, is_safe_local_redirect},
         },
+        crud,
         errors::{error_response, ErrorCode},
         rate_limit::UserRateLimiter,
     },
@@ -26,11 +27,8 @@ use crate::{
 /// when not. Any DB failure other than NOT_FOUND propagates — see [SEC-035]
 /// note below; collapsing a WRAP denial or connection blip to "email is free"
 /// would let a duplicate insert race in past the unique-email constraint.
-async fn user_exists(ctx: &dyn Context, email_lower: &str) -> Result<bool, String> {
-    match users::find_by_email(ctx, email_lower).await {
-        Ok(opt) => Ok(opt.is_some()),
-        Err(e) => Err(format!("{e}")),
-    }
+async fn user_exists(ctx: &dyn Context, email_lower: &str) -> Result<bool, WaferError> {
+    Ok(users::find_by_email(ctx, email_lower).await?.is_some())
 }
 
 /// The no-auto-login signup response. Under `REQUIRE_VERIFICATION` a fresh
@@ -132,7 +130,7 @@ pub async fn handle(
     // that we must surface, not collapse to "email is free".
     let email_already_taken = match user_exists(ctx, &email_lower).await {
         Ok(t) => t,
-        Err(e) => return err_internal("User lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "User lookup failed"),
     };
     if email_already_taken {
         return ResponseBuilder::new()
@@ -190,11 +188,11 @@ pub async fn handle(
     .await
     {
         Ok(u) => u,
-        Err(e) => return err_internal("Failed to create user", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to create user"),
     };
 
     if let Err(e) = local_credentials::insert(ctx, &user.id, &password_hash, false).await {
-        return err_internal("Failed to store credentials", e);
+        return crud::db_error_internal(e, "Failed to store credentials");
     }
 
     let roles = vec![role.to_string()];

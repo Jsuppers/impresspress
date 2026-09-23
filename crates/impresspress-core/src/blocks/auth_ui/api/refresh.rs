@@ -24,9 +24,10 @@ use crate::{
             repo::{tokens, users},
         },
         auth_ui::contracts::{RefreshRequest, RefreshResponse, TokenType},
+        crud,
         errors::{error_response, ErrorCode},
     },
-    http::{err_bad_request, err_internal, ResponseBuilder},
+    http::{err_bad_request, ResponseBuilder},
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
@@ -83,7 +84,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         // is a statement about the credential, and making it for this
         // deployment's own outage ends a session a working database would
         // have kept — the same rule the account-state read below follows.
-        Err(e) => return err_internal("Refresh could not look the token up", e),
+        Err(e) => return crud::db_error_internal(e, "Refresh could not look the token up"),
     };
 
     if row.revoked {
@@ -104,7 +105,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         // `packages/impresspress-js` raises the 401 as an `ImpresspressError`
         // the app has to handle — while the real cause is visible only in
         // this deployment's own logs.
-        Err(e) => return err_internal("Refresh could not load the account", e),
+        Err(e) => return crud::db_error_internal(e, "Refresh could not load the account"),
     };
 
     if !user.is_active() {
@@ -123,7 +124,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // (SB-3).
     let roles = match ensure_admin_role(ctx, &user_id, &email).await {
         Ok(r) => r,
-        Err(e) => return err_internal("Failed to resolve user roles", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
 
     // Preserve the original auth method across refresh — a token issued
@@ -149,7 +150,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         // not run leaves the presented token live, so issuing anyway would
         // put a second live generation in the family — refuse, and say it was
         // this deployment that failed.
-        Err(e) => return err_internal("Refresh could not rotate the token", e),
+        Err(e) => return crud::db_error_internal(e, "Refresh could not rotate the token"),
     }
 
     // Re-issue within the *preserved* family (SEC-039): passing
@@ -238,7 +239,9 @@ async fn refuse_not_live(
         NotLive::RevokedAtRead => {
             let family_live = match tokens::family_has_live_row(ctx, &row.family).await {
                 Ok(live) => live,
-                Err(e) => return err_internal("Refresh could not check the token family", e),
+                Err(e) => {
+                    return crud::db_error_internal(e, "Refresh could not check the token family")
+                }
             };
             if family_live {
                 tracing::warn!(
@@ -248,7 +251,7 @@ async fn refuse_not_live(
                     "refresh: token reuse detected; revoking entire family"
                 );
                 if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
-                    return err_internal("Refresh could not revoke the token family", e);
+                    return crud::db_error_internal(e, "Refresh could not revoke the token family");
                 }
             }
         }

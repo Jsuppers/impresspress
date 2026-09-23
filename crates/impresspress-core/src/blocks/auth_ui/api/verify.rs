@@ -5,8 +5,10 @@ use maud::html;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse, rate_limit::UserRateLimiter},
-    http::{err_bad_request, err_internal, ok_json},
+    blocks::{
+        auth::repo::users, auth_ui::contracts::MessageResponse, crud, rate_limit::UserRateLimiter,
+    },
+    http::{err_bad_request, ok_json},
     ui,
     ui::{components::auth_panel, icons, templates::auth_split},
     util::sha256_hex,
@@ -68,7 +70,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         // ("request a new one") sends the holder of a good token to
         // `resend-verification`, which reads the same table and replaces the
         // token they were holding.
-        Err(e) => return err_internal("Could not check the verification token", e),
+        Err(e) => return crud::db_error_internal(e, "Could not check the verification token"),
     };
 
     // `email_is_proven`, not `email_verified`. The flag is policy —
@@ -94,7 +96,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     // this link received it at the address, which is the only evidence of
     // mailbox control this app ever collects itself.
     if let Err(e) = users::record_email_proof(ctx, &user.id, users::proof::EMAIL_TOKEN).await {
-        return err_internal("Failed to verify email", e.to_string());
+        return crud::db_error_internal(e, "Failed to verify email");
     }
 
     html_respond(
@@ -172,7 +174,7 @@ pub async fn handle_resend(
         Ok(super::VerificationMail::NotSent(failure)) => {
             super::log_email_not_sent("resend-verification", &user.id, &failure);
         }
-        Err(e) => return err_internal("Failed to mint the verification token", e),
+        Err(e) => return crud::db_error_internal(e, "Failed to mint the verification token"),
     }
 
     constant()

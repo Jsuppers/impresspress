@@ -851,6 +851,11 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // test is the flag read. `break_reads` fails the link list first;
             // only `FailingDbOpContext` aimed at this table reaches it.
             "blocks/userportal/pages/security.rs",
+            // Fault injectors: each auth route's WRAP-denial test refuses the
+            // one `(action, table)` its site calls — the first users read, or
+            // the second one (`generate_tokens`' auth_version read) — so the
+            // denial lands on the query under test.
+            "blocks/auth_ui/tests/error_mapping_tests.rs",
         ],
     ),
     // The auth doors B12 adds. Two categories, both already established
@@ -881,6 +886,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             "blocks/auth_ui/api/reset_password.rs",
             "blocks/auth_ui/api/refresh.rs",
             "blocks/userportal/pages/sessions.rs",
+            // The WRAP-denial tests of login's refresh-row insert, refresh's
+            // token lookup and logout's revocation.
+            "blocks/auth_ui/tests/error_mapping_tests.rs",
             // `("database.delete_where_count", tokens::TABLE)` — the sweep's
             // "one failing table is named and the others still run" test
             "blocks/auth/maintenance.rs",

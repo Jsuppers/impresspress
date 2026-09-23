@@ -4,7 +4,9 @@ use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::{auth::repo::users, auth_ui::contracts::MessageResponse, rate_limit::UserRateLimiter},
+    blocks::{
+        auth::repo::users, auth_ui::contracts::MessageResponse, crud, rate_limit::UserRateLimiter,
+    },
     http::{err_bad_request, err_internal, ok_json},
     util::{hex_encode, sha256_hex},
 };
@@ -62,7 +64,7 @@ pub async fn handle(
 
     let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
     if let Err(e) = users::set_reset_token(ctx, &user.id, &reset_token_hash, &expires).await {
-        return err_internal("Failed to store reset token", e.to_string());
+        return crud::db_error_internal(e, "Failed to store reset token");
     }
 
     // Send the raw token in the email; the hash lives only in the DB.

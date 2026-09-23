@@ -39,22 +39,25 @@
 //! the allowlist sent it to.
 //!
 //! That last blind spot is closed for every block in `GATED_BLOCKS` — the
-//! whole `products` block today. Whether an `err_internal(label, cause)` there
-//! wraps a database call is a reading job per site, so the second gate below
-//! does not guess: every `err_internal` tail left in a gated file is
-//! inventoried by its label, with the reason it is not a database failure, and
-//! a tail that is not on the inventory fails. A third gate stops the inventory
-//! being walked around: in a gated file `err_internal` may only be called by
-//! name, never renamed, stored, wrapped in a macro, or wrapped in a function
-//! that forwards its caller's error. Everywhere else the blind spot stands —
-//! an empty `STILL_HAND_MAPPED` means no file writes the *shape*, not that
-//! every refusal is classified — and `NOT_YET_GATED` lists where it stands.
+//! whole of `auth`, `auth_ui` and `products`. Whether an
+//! `err_internal(label, cause)` there wraps a database call is a reading job
+//! per site, so the second gate below does not guess: every `err_internal`
+//! tail left in a gated file is inventoried by its label, with the reason it
+//! is not a database failure, and a tail that is not on the inventory fails.
+//! A third gate stops the inventory being walked around: in a gated file
+//! `err_internal` may only be called by name, never renamed, stored, wrapped
+//! in a macro, or wrapped in a function, trait default method or bound
+//! closure that forwards its caller's error. Everywhere else the blind spot
+//! stands — an empty `STILL_HAND_MAPPED` means no file writes the *shape*,
+//! not that every refusal is classified — and `NOT_YET_GATED` lists where it
+//! stands.
 //!
 //! What the inventory does NOT see, in a gated file or anywhere: a database
-//! failure answered through `err_internal_no_cause` (the cause, and its code,
-//! is dropped before the call), or through a response helper other than
-//! `err_internal` (`ui::server_error_response`). The gate covers
-//! `err_internal(label, cause)` only.
+//! failure answered through `err_internal_no_cause` or
+//! `ui::server_error_response`, which take no cause — its code is gone before
+//! the call. The inventory covers `err_internal(label, cause)` only; those two
+//! are counted per block in `CAUSE_DROPPED` instead, exactly, with the plan
+//! item that reads them, so a new one is at least an edit a reviewer sees.
 //!
 //! `auth::repo::RepoError` used to be named here as a site the gate could
 //! not help: it was `NotFound | Db(String)`, so the wafer code was gone
@@ -62,7 +65,7 @@
 //! sites classify like every other one now.
 
 use impresspress_core::test_support::source_scan::{
-    code_before_comment, strip_line_comments, strip_test_modules, SourceWalk,
+    strip_line_comments, strip_test_modules, SourceWalk,
 };
 
 /// Files still carrying the shape. **Empty**, and the history of how it got
@@ -322,7 +325,7 @@ fn the_walk_reaches_the_files_it_claims_to_scan() {
 /// [`evasions`]: a file under one of these that is not on the inventory may
 /// have no `err_internal` tail at all. Test code (`tests/` directories and
 /// `#[cfg(test)]` items) is not gated.
-const GATED_BLOCKS: &[&str] = &["products"];
+const GATED_BLOCKS: &[&str] = &["auth", "auth_ui", "products"];
 
 /// The walk the gated-file checks run over: every block source outside a
 /// `tests/` directory, floored like [`scan`].
@@ -345,12 +348,17 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// that is not listed here has an empty inventory.
 ///
 /// A database failure in these files goes through `crud::db_error_internal`
-/// (or `crud::db_error` where a `NotFound` is the caller's row), so a WRAP
-/// denial is 403 and a quota is 429. What is left here is one of two things:
+/// (or `crud::db_error` where a `NotFound` is the caller's row, or
+/// `crud::db_error_page` for a full page), so a WRAP denial is 403 and a quota
+/// is 429. What is left here is one of four things:
 ///
 /// - **Stripe**: the cause is a Stripe API call. `stripe_client::classify`
 ///   gives it `Internal` or `FailedPrecondition`, never a WRAP code, and a
 ///   Stripe 429 is Stripe's rate limit, not the database's.
+/// - **Provider**: the cause is an OAuth provider's token or userinfo
+///   endpoint — the request, or the body it answered.
+/// - **Crypto**: the cause is the `wafer-run/crypto` service hashing a
+///   password or drawing random bytes, which reads no table.
 /// - **Invariant**: the cause is this process, not a service — a row outside
 ///   its contract, a setting outside its range (`config::get_default` answers
 ///   the default, never a database error), a serialization or the OS RNG.
@@ -365,8 +373,10 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// `webhook_database_denial_is_403_and_the_delivery_is_retried` and its
 /// siblings in `products/tests/stripe_tests.rs`,
 /// `refund_ledger_denial_is_403` and its siblings in
-/// `products/tests/provider_tests.rs`, and one real route per products file in
-/// `products/tests/error_mapping_tests.rs`.
+/// `products/tests/provider_tests.rs`, one real route per products file in
+/// `products/tests/error_mapping_tests.rs`, one real route per auth handler
+/// family in `auth_ui/tests/error_mapping_tests.rs`, and the OAuth callback's
+/// `state_redemption_denial_is_403_not_500`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
         "products/stripe.rs",
@@ -527,11 +537,94 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
             why: "invariant: an undecodable provider operation row",
         }],
     ),
+    (
+        "auth_ui/api/signup.rs",
+        &[
+            Tail {
+                label: "Failed to hash password",
+                count: 1,
+                why: "crypto: hashing the new password",
+            },
+            Tail {
+                label: "Failed to generate verification token",
+                count: 1,
+                why: "crypto: drawing the verification token",
+            },
+        ],
+    ),
+    (
+        "auth_ui/api/api_keys.rs",
+        &[Tail {
+            label: "Failed to generate key",
+            count: 1,
+            why: "crypto: drawing the key's random bytes",
+        }],
+    ),
+    (
+        "auth_ui/api/change_password.rs",
+        &[Tail {
+            label: "Hash failed",
+            count: 1,
+            why: "crypto: hashing the new password",
+        }],
+    ),
+    (
+        "auth_ui/api/reset_password.rs",
+        &[Tail {
+            label: "Hash failed",
+            count: 1,
+            why: "crypto: hashing the new password",
+        }],
+    ),
+    (
+        "auth_ui/api/forgot_password.rs",
+        &[Tail {
+            label: "Token generation failed",
+            count: 1,
+            why: "crypto: drawing the reset token",
+        }],
+    ),
+    (
+        "auth_ui/oauth/start.rs",
+        &[
+            Tail {
+                label: "Failed to generate PKCE verifier",
+                count: 1,
+                why: "invariant: the OS random source",
+            },
+            Tail {
+                label: "Failed to generate state",
+                count: 1,
+                why: "invariant: the OS random source",
+            },
+        ],
+    ),
+    (
+        "auth_ui/oauth/callback.rs",
+        &[
+            Tail {
+                label: "Token exchange failed",
+                count: 1,
+                why: "provider: the token endpoint request",
+            },
+            Tail {
+                label: "User info request failed",
+                count: 1,
+                why: "provider: the userinfo endpoint request",
+            },
+            Tail {
+                label: "Failed to parse OAuth user info",
+                count: 1,
+                why: "provider: an undecodable userinfo body",
+            },
+        ],
+    ),
 ];
 
 /// One inventoried tail: its label as [`err_internal_labels`] reads it, how
 /// many times the file uses it, and why it is not a database failure —
-/// `"Stripe: …"` or `"invariant: …"`, the only two reasons there are.
+/// `"Stripe: …"`, `"provider: …"`, `"crypto: …"` or `"invariant: …"`, the
+/// only reasons there are.
 struct Tail {
     label: &'static str,
     count: usize,
@@ -541,73 +634,184 @@ struct Tail {
 /// A label whose use disagrees with its inventory: `(label, used, listed)`.
 type Miscount = (String, usize, usize);
 
-/// The first argument of every `err_internal(` call in `src`'s production
+/// The first argument of every `err_internal` call in `src`'s production
 /// code: a string literal without its quotes, any other expression as
-/// written, with its whitespace collapsed.
-///
-/// A call is `err_internal(` not preceded by an identifier character, so
-/// `err_internal_no_cause(` and `crud::db_error_internal(` are not calls of
-/// it. Comments are cut at `//` first: a call named in prose is not a call.
+/// [`render`] spells it.
 fn err_internal_labels(src: &str) -> Vec<String> {
-    const CALL: &str = "err_internal(";
-    let code = strip_test_modules(src)
-        .lines()
-        .map(code_before_comment)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut labels = Vec::new();
-    let mut from = 0;
-    while let Some(offset) = code[from..].find(CALL) {
-        let start = from + offset;
-        from = start + CALL.len();
-        let preceded_by_ident = code[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if preceded_by_ident {
-            continue;
-        }
-        labels.push(first_argument(&code[from..]));
-    }
-    labels
+    call_arguments(src, "err_internal")
 }
 
-/// The text of a call's first argument, up to the first comma outside any
-/// bracket or string.
-fn first_argument(args: &str) -> String {
-    let args = args.trim_start();
-    if let Some(literal) = args.strip_prefix('"') {
-        let mut escaped = false;
-        for (i, c) in literal.char_indices() {
-            match c {
-                '\\' if !escaped => escaped = true,
-                '"' if !escaped => return literal[..i].to_string(),
-                _ => escaped = false,
-            }
-        }
-        panic!("unterminated string literal in an err_internal call");
+/// The first argument of every call of the free function `name` in `src`'s
+/// production code, in source order.
+///
+/// Read from the token stream, not the text. A call is the identifier `name`,
+/// then an optional turbofish (`err_internal::<WaferError>`), then a
+/// parenthesized argument list; `err_internal_no_cause` and
+/// `crud::db_error_internal` are different identifiers, a comment is not a
+/// token, and a string that mentions the name is one literal. Calls inside a
+/// macro invocation (`fail_webhook!(err_internal(..))`, a `vec![..]`) are in
+/// its tokens and count like any other. `#[cfg(test)]` items and statements
+/// are dropped by [`production_tokens`] first.
+fn call_arguments(src: &str, name: &str) -> Vec<String> {
+    use proc_macro2::{Delimiter, TokenStream, TokenTree};
+
+    fn is_punct(tree: Option<&TokenTree>, ch: char) -> bool {
+        matches!(tree, Some(TokenTree::Punct(p)) if p.as_char() == ch)
     }
-    let (mut depth, mut in_string, mut escaped) = (0_i32, false, false);
-    for (i, c) in args.char_indices() {
-        if in_string {
-            match c {
-                '\\' if !escaped => escaped = true,
-                '"' if !escaped => in_string = false,
-                _ => escaped = false,
+
+    fn scan(stream: TokenStream, name: &str, found: &mut Vec<String>) {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        for (i, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Group(group) => scan(group.stream(), name, found),
+                TokenTree::Ident(ident) if ident == name => {
+                    // A definition, not a call.
+                    if i > 0 && matches!(&trees[i - 1], TokenTree::Ident(kw) if kw == "fn") {
+                        continue;
+                    }
+                    let mut next = i + 1;
+                    if is_punct(trees.get(next), ':')
+                        && is_punct(trees.get(next + 1), ':')
+                        && is_punct(trees.get(next + 2), '<')
+                    {
+                        next += 3;
+                        let mut depth = 1;
+                        while depth > 0 && next < trees.len() {
+                            match &trees[next] {
+                                TokenTree::Punct(p) if p.as_char() == '<' => depth += 1,
+                                // `->` inside the turbofish is an arrow, not a close.
+                                TokenTree::Punct(p)
+                                    if p.as_char() == '>'
+                                        && !is_punct(trees.get(next - 1), '-') =>
+                                {
+                                    depth -= 1
+                                }
+                                _ => {}
+                            }
+                            next += 1;
+                        }
+                    }
+                    if let Some(TokenTree::Group(args)) = trees.get(next) {
+                        if args.delimiter() == Delimiter::Parenthesis {
+                            found.push(first_argument(args.stream()));
+                        }
+                    }
+                }
+                _ => {}
             }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' if depth > 0 => depth -= 1,
-            ',' | ')' if depth == 0 => {
-                return args[..i].split_whitespace().collect::<Vec<_>>().join(" ");
-            }
-            _ => {}
         }
     }
-    panic!("unterminated err_internal call");
+
+    let mut found = Vec::new();
+    scan(production_tokens(src), name, &mut found);
+    found
+}
+
+/// `src`'s tokens with every `#[cfg(test)]` item and statement removed, at
+/// any depth.
+///
+/// Where the test item ends is decided by syn's own item and statement
+/// parsers, not by a brace count: a `#[cfg(test)]` on an early
+/// `mod test_support;`, a `use`, a fixture `fn` or a `let` drops exactly that
+/// one thing, and the production code after it is still scanned. Comments are
+/// not tokens, and doc comments become string literals, so neither can
+/// contribute a call.
+fn production_tokens(src: &str) -> proc_macro2::TokenStream {
+    use proc_macro2::{Group, TokenStream, TokenTree};
+    use syn::parse::{ParseStream, Parser};
+
+    fn is_cfg_test(attr: &syn::Attribute) -> bool {
+        attr.path().is_ident("cfg")
+            && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string() == "test")
+    }
+
+    fn strip(input: ParseStream) -> syn::Result<TokenStream> {
+        let mut out = TokenStream::new();
+        while !input.is_empty() {
+            if input.peek(syn::Token![#]) && !input.peek2(syn::Token![!]) {
+                let is_test = input
+                    .fork()
+                    .call(syn::Attribute::parse_outer)
+                    .is_ok_and(|attrs| attrs.iter().any(is_cfg_test));
+                if is_test {
+                    if input.fork().parse::<syn::Item>().is_ok() {
+                        input.parse::<syn::Item>()?;
+                        continue;
+                    }
+                    if input.fork().parse::<syn::Stmt>().is_ok() {
+                        input.parse::<syn::Stmt>()?;
+                        continue;
+                    }
+                }
+            }
+            match input.parse::<TokenTree>()? {
+                TokenTree::Group(group) => {
+                    let mut kept = Group::new(group.delimiter(), strip.parse2(group.stream())?);
+                    kept.set_span(group.span());
+                    out.extend([TokenTree::Group(kept)]);
+                }
+                other => out.extend([other]),
+            }
+        }
+        Ok(out)
+    }
+
+    let tokens: TokenStream = src
+        .parse()
+        .unwrap_or_else(|error| panic!("untokenizable source: {error}"));
+    strip
+        .parse2(tokens)
+        .unwrap_or_else(|error| panic!("unparseable source: {error}"))
+}
+
+/// A call's first argument: the tokens before the first top-level comma. A
+/// lone string literal is its contents, without the quotes; anything else is
+/// [`render`]ed.
+fn first_argument(args: proc_macro2::TokenStream) -> String {
+    use proc_macro2::TokenTree;
+
+    let first: Vec<TokenTree> = args
+        .into_iter()
+        .take_while(|tree| !matches!(tree, TokenTree::Punct(p) if p.as_char() == ','))
+        .collect();
+    if let [TokenTree::Literal(literal)] = first.as_slice() {
+        let text = literal.to_string();
+        if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            return inner.to_string();
+        }
+    }
+    render(first)
+}
+
+/// Tokens as text, spaced only where two words would otherwise run together:
+/// `&format!("{entity} row is outside the contract")` renders as written.
+fn render(trees: impl IntoIterator<Item = proc_macro2::TokenTree>) -> String {
+    use proc_macro2::{Delimiter, TokenTree};
+
+    let mut out = String::new();
+    let mut last_was_word = false;
+    for tree in trees {
+        let is_word = matches!(tree, TokenTree::Ident(_) | TokenTree::Literal(_));
+        if is_word && last_was_word {
+            out.push(' ');
+        }
+        match tree {
+            TokenTree::Group(group) => {
+                let (open, close) = match group.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::None => ("", ""),
+                };
+                out.push_str(open);
+                out.push_str(&render(group.stream()));
+                out.push_str(close);
+            }
+            other => out.push_str(&other.to_string()),
+        }
+        last_was_word = is_word;
+    }
+    out
 }
 
 /// `src` against its inventory: the labels used more often than listed (new
@@ -659,8 +863,10 @@ fn gated_files_tail_only_inventoried_non_database_failures() {
         );
         for tail in *inventory {
             assert!(
-                tail.why.starts_with("Stripe: ") || tail.why.starts_with("invariant: "),
-                "{rel}: `{}` must say whether it is a Stripe call or an invariant",
+                ["Stripe: ", "provider: ", "crypto: ", "invariant: "]
+                    .iter()
+                    .any(|reason| tail.why.starts_with(reason)),
+                "{rel}: `{}` must say which non-database cause it is",
                 tail.label
             );
         }
@@ -682,8 +888,8 @@ fn gated_files_tail_only_inventoried_non_database_failures() {
              If the cause is a database call, use \
              `crud::db_error_internal(error, \"<label>\")` so a WRAP denial \
              stays a 403 and a quota a 429. If it genuinely is not — a Stripe \
-             call, or a fault of this process — list it in INVENTORIED_TAILS \
-             with that reason."
+             or OAuth provider call, the crypto service, or a fault of this \
+             process — list it in INVENTORIED_TAILS with that reason."
         );
         assert!(
             stale.is_empty(),
@@ -746,6 +952,23 @@ fn the_inventory_gate_catches_a_planted_tail() {
         vec![("Stripe API error".to_string(), 0, 1)]
     );
 
+    // A turbofish on the callee is still the call, and so is a call inside a
+    // macro invocation's tokens.
+    assert_eq!(
+        err_internal_labels(
+            "fn a() { err_internal::<WaferError>(\"turbofish\", e); fail!(err_internal(\"in a macro\", e)); }\n"
+        ),
+        vec!["turbofish".to_string(), "in a macro".to_string()]
+    );
+    // A `#[cfg(test)]` early in a file drops that one item: the call after it
+    // is still production code.
+    assert_eq!(
+        err_internal_labels(
+            "#[cfg(test)]\nmod test_support;\n#[cfg(test)]\nuse a::b;\nfn a() { err_internal(\"after\", e); }\n"
+        ),
+        vec!["after".to_string()]
+    );
+
     // Neither prose, a test, nor a different function is a tail.
     let not_tails = "// err_internal(\"prose\", e)\n\
          fn a() { err_internal_no_cause(\"x\"); crud::db_error_internal(e, \"y\"); }\n\
@@ -766,8 +989,9 @@ enum Evasion {
     AsValue,
     /// A `macro_rules!` with this name whose body mentions `err_internal`.
     Macro(String),
-    /// A function or `let`-bound closure with this name that passes its
-    /// caller's error to `err_internal`.
+    /// A function, trait default method, or closure bound by `let`, `const`
+    /// or `static`, with this name, that passes its caller's error to
+    /// `err_internal`.
     Wrapper(String),
 }
 
@@ -798,8 +1022,9 @@ const LISTED_WRAPPERS: &[(&str, &str, &str)] = &[(
 ///   `.map_err(err_internal)`-style passing — for the same reason;
 /// - **a `macro_rules!`** whose expansion calls it: the inventory counts the
 ///   one call in the macro body however many sites expand it;
-/// - **a wrapper**: a function (or a `let`-bound closure) whose `err_internal`
-///   cause comes from its caller. The inventory counts the one call in the
+/// - **a wrapper**: a function, a trait's default method, or a closure bound
+///   by `let` (typed or not), `const` or `static`, whose `err_internal` cause
+///   comes from its caller. The inventory counts the one call in the
 ///   wrapper, and every call site of the wrapper — each of which can pass a
 ///   database error — is invisible. A cause comes from the caller when it
 ///   names a parameter of the closure, or a parameter of the function whose
@@ -1010,6 +1235,18 @@ fn evasions(src: &str) -> Vec<Evasion> {
                 self.0.push(Evasion::Wrapper(name));
             }
         }
+
+        /// `expr`, bound to `name`, when it is a closure that forwards one of
+        /// its own parameters to `err_internal`.
+        fn closure(&mut self, name: String, expr: &syn::Expr) {
+            if let syn::Expr::Closure(closure) = expr {
+                let sources = closure.inputs.iter().flat_map(binds).collect();
+                let body = Body::Expr(&closure.body);
+                if forwarded(body, &tainted(body, sources)) > 0 {
+                    self.0.push(Evasion::Wrapper(name));
+                }
+            }
+        }
     }
 
     impl<'ast> Visit<'ast> for Finder {
@@ -1040,17 +1277,43 @@ fn evasions(src: &str) -> Vec<Evasion> {
                 syn::visit::visit_impl_item_fn(self, item);
             }
         }
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            if is_cfg_test(&item.attrs) {
+                return;
+            }
+            // A default method is a wrapper every implementor inherits.
+            if let Some(body) = &item.default {
+                self.function(item.sig.ident.to_string(), &item.sig, body);
+            }
+            syn::visit::visit_trait_item_fn(self, item);
+        }
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if !is_cfg_test(&item.attrs) {
+                syn::visit::visit_item_trait(self, item);
+            }
+        }
         fn visit_local(&mut self, local: &'ast syn::Local) {
-            if let (Some(init), syn::Pat::Ident(name)) = (&local.init, &local.pat) {
-                if let syn::Expr::Closure(closure) = &*init.expr {
-                    let sources = closure.inputs.iter().flat_map(binds).collect();
-                    let body = Body::Expr(&closure.body);
-                    if forwarded(body, &tainted(body, sources)) > 0 {
-                        self.0.push(Evasion::Wrapper(name.ident.to_string()));
-                    }
-                }
+            // `let fail = |e| …` and `let fail: fn(_) -> _ = |e| …` alike.
+            let name = match &local.pat {
+                syn::Pat::Type(typed) => &*typed.pat,
+                pat => pat,
+            };
+            if let (Some(init), syn::Pat::Ident(name)) = (&local.init, name) {
+                self.closure(name.ident.to_string(), &init.expr);
             }
             syn::visit::visit_local(self, local);
+        }
+        fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+            if !is_cfg_test(&item.attrs) {
+                self.closure(item.ident.to_string(), &item.expr);
+                syn::visit::visit_item_const(self, item);
+            }
+        }
+        fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+            if !is_cfg_test(&item.attrs) {
+                self.closure(item.ident.to_string(), &item.expr);
+                syn::visit::visit_item_static(self, item);
+            }
         }
         fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
             if rename.ident == NAME {
@@ -1153,6 +1416,14 @@ fn the_evasion_gate_catches_each_way_around() {
              result.map_err(|e| err_internal(\"x\", e))\n}\n",
         "impl S { fn fail(&self, error: WaferError) -> OutputStream { err_internal(\"x\", error) } }\n",
         "fn f() { let fail = |e| err_internal(\"x\", e); }\n",
+        // A type annotation on the binding does not hide the closure.
+        "fn f() { let fail: fn(WaferError) -> OutputStream = |e| err_internal(\"x\", e); }\n",
+        "const FAIL: fn(WaferError) -> OutputStream = |e| err_internal(\"x\", e);\n",
+        "static FAIL: fn(WaferError) -> OutputStream = |e| err_internal(\"x\", e);\n",
+        // Nor does a trait: every implementor inherits the default body.
+        "trait Fail { fn fail(&self, error: WaferError) -> OutputStream { err_internal(\"x\", error) } }\n",
+        // Nor a turbofish on the callee.
+        "fn fail(error: WaferError) -> OutputStream { err_internal::<WaferError>(\"x\", error) }\n",
     ];
     for src in caught {
         assert_eq!(evasions(src).len(), 1, "not caught: {src}");
@@ -1187,29 +1458,29 @@ fn the_evasion_gate_catches_each_way_around() {
 // ---------------------------------------------------------------------------
 
 /// Every block outside [`GATED_BLOCKS`] that still calls
-/// `err_internal(label, cause)`, with how many of its files do. Nothing there
-/// is read per site: any of those calls may be a database failure answering
-/// 500 where a WRAP denial should be a 403 and a quota a 429.
+/// `err_internal(label, cause)`: how many of its files do, and the review
+/// plan item that gates it. Nothing there is read per site: any of those
+/// calls may be a database failure answering 500 where a WRAP denial should
+/// be a 403 and a quota a 429.
 ///
 /// A block leaves this list by joining `GATED_BLOCKS`, its tails inventoried.
 /// The counts are exact both ways, so converting a file lowers its block's
 /// count here and a new file with a tail raises it — either way this list is
 /// edited, and the backlog it states stays true. A top-level file under
 /// `src/blocks/` is its own entry; `crud.rs` is the door and is not listed.
-const NOT_YET_GATED: &[(&str, usize)] = &[
-    ("admin", 9),
-    ("auth", 1),
-    ("auth_ui", 13),
-    ("dev", 6),
-    ("fastembed.rs", 1),
-    ("files", 6),
-    ("legalpages", 1),
-    ("llm", 5),
-    ("messages", 1),
-    ("signal", 1),
-    ("tickets", 1),
-    ("userportal", 3),
-    ("vector", 1),
+/// `"unplanned"` is a block no plan item has scheduled yet.
+const NOT_YET_GATED: &[(&str, usize, &str)] = &[
+    ("admin", 9, "N20"),
+    ("dev", 6, "N25"),
+    ("fastembed.rs", 1, "unplanned"),
+    ("files", 6, "N25"),
+    ("legalpages", 1, "unplanned"),
+    ("llm", 5, "N21"),
+    ("messages", 1, "unplanned"),
+    ("signal", 1, "unplanned"),
+    ("tickets", 1, "N25"),
+    ("userportal", 3, "N20"),
+    ("vector", 1, "N21"),
 ];
 
 /// The block a `src/blocks`-relative path belongs to: its first component.
@@ -1232,7 +1503,7 @@ fn not_yet_gated_is_the_whole_backlog() {
     }
     let listed: std::collections::BTreeMap<String, usize> = NOT_YET_GATED
         .iter()
-        .map(|(block, files)| (block.to_string(), *files))
+        .map(|(block, files, _)| (block.to_string(), *files))
         .collect();
     assert_eq!(
         files_with_tails, listed,
@@ -1240,4 +1511,75 @@ fn not_yet_gated_is_the_whole_backlog() {
          `err_internal(label, cause)`, and in how many files (left: the tree, \
          right: the list)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Where the cause is dropped before anything could classify it
+// ---------------------------------------------------------------------------
+
+/// The helpers that answer a 500 without taking a cause:
+/// `err_internal_no_cause(label)` and `ui::server_error_response(msg)`. A
+/// database failure answered through either has lost its code before the
+/// call, so no inventory of `err_internal` tails can see it — in a gated block
+/// or anywhere else. A full page whose read failed answers through
+/// `crud::db_error_page` instead, which classifies first.
+const CAUSE_DROPPING: &[&str] = &["err_internal_no_cause", "server_error_response"];
+
+/// Every block's [`CAUSE_DROPPING`] call sites, with the plan item that reads
+/// them or what reading them found. The counts are exact both ways, like
+/// [`NOT_YET_GATED`]: a new site raises its block's count here, and the edit
+/// is where its reviewer asks whether the cause was a database call.
+///
+/// `"read: …"` is a block whose every site was read and none drops a database
+/// error; `"unplanned"` is a block no plan item has scheduled yet.
+const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
+    ("admin", 4, "N20"),
+    (
+        "auth_ui",
+        7,
+        "read: OAuth provider responses, OAuth configuration, and the \
+         admin row bootstrap has just inserted — none carries a cause",
+    ),
+    ("files", 11, "N25"),
+    ("legalpages", 1, "unplanned"),
+    ("llm", 3, "N21"),
+    ("messages", 3, "unplanned"),
+    ("products", 32, "unplanned"),
+    ("userportal", 8, "N20"),
+    ("vector", 1, "N21"),
+];
+
+#[test]
+fn cause_dropped_is_the_whole_backlog() {
+    let mut sites: std::collections::BTreeMap<String, usize> = Default::default();
+    for file in gated_scan().collect() {
+        if file.rel == THE_DOOR {
+            continue;
+        }
+        let n: usize = CAUSE_DROPPING
+            .iter()
+            .map(|name| call_arguments(&file.text, name).len())
+            .sum();
+        if n > 0 {
+            *sites.entry(block_of(&file.rel).to_string()).or_default() += n;
+        }
+    }
+    let listed: std::collections::BTreeMap<String, usize> = CAUSE_DROPPED
+        .iter()
+        .map(|(block, n, _)| (block.to_string(), *n))
+        .collect();
+    assert_eq!(
+        sites, listed,
+        "CAUSE_DROPPED must state exactly how many `err_internal_no_cause` / \
+         `ui::server_error_response` calls each block makes (left: the tree, \
+         right: the list). A database failure belongs in \
+         `crud::db_error_internal`, or `crud::db_error_page` for a full page."
+    );
+    for (block, _, plan) in CAUSE_DROPPED.iter().chain(NOT_YET_GATED) {
+        assert!(
+            plan.starts_with('N') || plan.starts_with("read: ") || *plan == "unplanned",
+            "{block}: `{plan}` must name a plan item, say what reading it found, \
+             or say `unplanned`"
+        );
+    }
 }

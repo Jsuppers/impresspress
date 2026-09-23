@@ -84,7 +84,7 @@ pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 "page_size": total_count,
             }))
         }
-        Err(e) => err_internal("Database error", e.to_string()),
+        Err(e) => crud::db_error_internal(e, "Could not list the API keys"),
     }
 }
 
@@ -192,7 +192,7 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
                 }))
             }
         }
-        Err(e) => err_internal("Database error", e.to_string()),
+        Err(e) => crud::db_error_internal(e, "Could not create the API key"),
     }
 }
 
@@ -211,7 +211,7 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let key = match api_keys::find_by_id(ctx, id).await {
         Ok(Some(key)) => key,
         Ok(None) => return err_not_found("API key not found"),
-        Err(e) => return err_internal("Could not load the API key", e),
+        Err(e) => return crud::db_error_internal(e, "Could not load the API key"),
     };
     if key.user_id != user_id && !crate::util::is_admin(msg) {
         return err_forbidden("Cannot revoke another user's API key");
@@ -219,7 +219,7 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     match api_keys::revoke(ctx, id).await {
         Ok(_) => ok_json(&serde_json::json!({"message": "API key revoked"})),
-        Err(e) => err_internal("Database error", e.to_string()),
+        Err(e) => crud::db_error(e, "API key not found", "Could not revoke the API key"),
     }
 }
 
@@ -237,7 +237,7 @@ pub async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let key = match api_keys::find_by_id(ctx, id).await {
         Ok(Some(key)) => key,
         Ok(None) => return err_not_found("API key not found"),
-        Err(e) => return err_internal("Could not load the API key", e),
+        Err(e) => return crud::db_error_internal(e, "Could not load the API key"),
     };
     if key.user_id != user_id && !crate::util::is_admin(msg) {
         return err_forbidden("Cannot delete another user's API key");
@@ -245,7 +245,7 @@ pub async fn handle_delete(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     match api_keys::delete(ctx, id).await {
         Ok(_) => ok_json(&serde_json::json!({"deleted": true})),
-        Err(e) => err_internal("Database error", e.to_string()),
+        Err(e) => crud::db_error(e, "API key not found", "Could not delete the API key"),
     }
 }
 

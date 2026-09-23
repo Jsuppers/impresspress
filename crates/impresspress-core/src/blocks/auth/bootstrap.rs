@@ -15,7 +15,7 @@
 //! bootstrap is a first-run mechanism only, never a "re-seed" trigger.
 
 use wafer_core::clients::crypto;
-use wafer_run::{context::Context, ErrorCode, WaferError};
+use wafer_run::{context::Context, WaferError};
 
 use super::{
     config::AuthConfig,
@@ -26,7 +26,7 @@ use super::{
 /// Run the bootstrap step. Idempotent: returns `Ok(())` without side-effects
 /// when the `users` table is already populated.
 pub async fn run(ctx: &dyn Context, cfg: &AuthConfig) -> Result<(), WaferError> {
-    let user_count = users::count(ctx).await.map_err(internal)?;
+    let user_count = users::count(ctx).await.map_err(bootstrap_failed)?;
     if user_count > 0 {
         tracing::debug!("auth: bootstrap skipped, users table already has {user_count} row(s)");
         return Ok(());
@@ -84,10 +84,10 @@ pub(crate) async fn bootstrap_with_email_password(
         },
     )
     .await
-    .map_err(internal)?;
+    .map_err(bootstrap_failed)?;
     local_credentials::insert(ctx, &user.id, &hash, false)
         .await
-        .map_err(internal)?;
+        .map_err(bootstrap_failed)?;
     Ok(())
 }
 
@@ -96,10 +96,12 @@ async fn bootstrap_with_token(ctx: &dyn Context, token: &str) -> Result<(), Wafe
     let expires_iso = expires.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     bootstrap_tokens::insert(ctx, hash_token(token), &expires_iso)
         .await
-        .map_err(internal)?;
+        .map_err(bootstrap_failed)?;
     Ok(())
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> WaferError {
-    WaferError::new(ErrorCode::Internal, format!("auth bootstrap: {e}"))
+/// `error` prefixed with this step, keeping its code: a WRAP denial on the
+/// redemption route (`auth_ui::api::bootstrap`) is a 403 there, not a 500.
+fn bootstrap_failed(error: WaferError) -> WaferError {
+    super::repo::db_failed("auth bootstrap", error)
 }

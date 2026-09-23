@@ -5,7 +5,7 @@ use maud::html;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
-    blocks::auth::config as auth_config,
+    blocks::{auth::config as auth_config, crud},
     config_vars,
     ui::{
         self, components, icons,
@@ -69,8 +69,7 @@ pub async fn handle_get(ctx: &dyn Context, msg: &Message) -> OutputStream {
         {
             Ok(form) => form,
             Err(e) => {
-                tracing::error!(error = %e, "auth settings: current values read failed");
-                return ui::server_error_response(msg);
+                return crud::db_error_page(msg, e, "auth settings: current values read failed")
             }
         };
     let content = html! {

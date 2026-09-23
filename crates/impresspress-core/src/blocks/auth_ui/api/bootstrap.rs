@@ -23,11 +23,11 @@ use crate::{
             service::hash_token,
         },
         auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        crud,
         errors::error_response,
     },
     http::{
-        err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_unauthorized,
-        ResponseBuilder,
+        err_bad_request, err_forbidden, err_internal_no_cause, err_unauthorized, ResponseBuilder,
     },
     util::parse_form_body,
 };
@@ -81,7 +81,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     match bootstrap_tokens::take_valid_by_hash(ctx, &token_hash).await {
         Ok(true) => {}
         Ok(false) => return err_unauthorized("invalid or expired bootstrap token"),
-        Err(e) => return err_internal("bootstrap_tokens lookup", e),
+        Err(e) => return crud::db_error_internal(e, "bootstrap_tokens lookup"),
     }
 
     // 2. Create the admin user via the same code path bootstrap-on-init uses.
@@ -91,7 +91,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     //    here just means the caller needs a fresh token from an operator —
     //    it can't reopen the single-use race.
     if let Err(e) = bootstrap::bootstrap_with_email_password(ctx, &email, &password).await {
-        return err_internal("create admin", e);
+        return crud::db_error_internal(e, "create admin");
     }
 
     // 4. Look up the just-created user so we have its id for session minting.
@@ -102,7 +102,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
                 "bootstrap created admin but find_by_email returned no row",
             )
         }
-        Err(e) => return err_internal("users::find_by_email after bootstrap", e),
+        Err(e) => return crud::db_error_internal(e, "users::find_by_email after bootstrap"),
     };
 
     // 5. Mint a session — same shared token-issuance tail as login/signup.
