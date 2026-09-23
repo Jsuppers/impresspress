@@ -2251,6 +2251,102 @@ impl Context for FailingDbOpContext {
     }
 }
 
+/// [`FailingDbOpContext`] for `"wafer-run/storage"`: wraps a [`TestContext`]
+/// and answers `error` to every storage call whose op ([`Message::action`],
+/// e.g. `"storage.put"` — see `wafer_block::common::ServiceOp`) is one of
+/// `failing`, while every other call passes through untouched.
+///
+/// Matched on the op alone: a storage request names a folder the storage
+/// block rewrites into the caller's namespace, so the op is what a test can
+/// aim at. A handler that makes the same op twice (a manifest read, then a
+/// blob read) is isolated with [`Self::after_passing`].
+#[derive(Clone)]
+pub struct FailingStorageOpContext {
+    inner: TestContext,
+    failing: Vec<&'static str>,
+    error: WaferError,
+    /// Matching calls still to let through; shared across clones, as in
+    /// [`FailingDbOpContext`].
+    passes_before_failing: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailingStorageOpContext {
+    /// Wrap `inner`, answering `error` to every storage call whose op is in
+    /// `failing`.
+    pub fn failing_with(inner: TestContext, failing: Vec<&'static str>, error: WaferError) -> Self {
+        Self {
+            inner,
+            failing,
+            error,
+            passes_before_failing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Let the first `n` matching calls through and fail from the `n + 1`th.
+    pub fn after_passing(self, n: usize) -> Self {
+        self.passes_before_failing
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl Context for FailingStorageOpContext {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
+    }
+
+    async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+        use std::sync::atomic::Ordering;
+        if name == "wafer-run/storage"
+            && self.failing.contains(&msg.action())
+            && self
+                .passes_before_failing
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_err()
+        {
+            return OutputStream::error(self.error.clone());
+        }
+        self.inner.call_block(name, msg, input).await
+    }
+
+    fn caller_id(&self) -> Option<&str> {
+        self.inner.caller_id()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
 /// Test double that wraps a [`TestContext`] and holds the first `n` calls
 /// matching `(op, collection)` open until all `n` of them have arrived,
 /// releasing them together.
