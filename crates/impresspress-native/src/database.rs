@@ -104,9 +104,10 @@ pub async fn make_postgres_database_service(url: &str) -> Result<Arc<dyn Databas
 /// Anything this cannot split with certainty is described as an unparseable
 /// URL rather than echoed: a password holding an unescaped `/`, `?`, `#` or
 /// `@` moves the delimiters, so an `@` anywhere past the authority means the
-/// user info may not end where the parse thinks it does.
-#[cfg(any(feature = "postgres", test))]
-fn postgres_target(url: &str) -> String {
+/// user info may not end where the parse thinks it does. An authority with a
+/// `:` but no `@` is refused too: `user:secret` (the `@host` forgotten) and
+/// `host:port` cannot be told apart when the secret is numeric.
+pub(crate) fn postgres_target(url: &str) -> String {
     const UNPARSEABLE: &str = "<unparseable URL, not shown>";
     let Some((_scheme, rest)) = url.split_once("://") else {
         return UNPARSEABLE.to_string();
@@ -116,7 +117,11 @@ fn postgres_target(url: &str) -> String {
     if tail.contains('@') {
         return UNPARSEABLE.to_string();
     }
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None if authority.contains(':') => return UNPARSEABLE.to_string(),
+        None => authority,
+    };
     let database = tail
         .strip_prefix('/')
         .map_or("", |p| p.split(['?', '#']).next().unwrap_or(""));
@@ -141,6 +146,16 @@ mod tests {
             "db.internal/prod"
         );
         assert_eq!(postgres_target("postgres://app@[::1]:5432"), "[::1]:5432/");
+        // No user info: a bare host is shown; a `host:port` is refused, the
+        // price of never echoing `user:secret` with its `@host` forgotten.
+        assert_eq!(
+            postgres_target("postgres://db.internal/prod"),
+            "db.internal/prod"
+        );
+        assert_eq!(
+            postgres_target("postgres://db.internal:5432/prod"),
+            "<unparseable URL, not shown>"
+        );
     }
 
     #[test]
@@ -152,6 +167,8 @@ mod tests {
             "postgres://app:hun@ter2@db/prod",
             "host=db password=hunter2",
             "postgres://",
+            "postgres://app:hunter2",
+            "postgres://app:hunter2/prod",
         ] {
             let shown = postgres_target(url);
             assert!(

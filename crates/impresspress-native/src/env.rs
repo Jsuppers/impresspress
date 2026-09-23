@@ -101,7 +101,9 @@ mod tests {
 }
 
 /// Infrastructure config read from `IMPRESSPRESS_*` env vars.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written: `db_url` carries the database password, so it is
+/// shown only as [`crate::database::postgres_target`] describes it.
 pub struct InfraConfig {
     pub listen: String,
     pub db_type: String,
@@ -121,6 +123,42 @@ impl InfraConfig {
             storage_type: env_or("IMPRESSPRESS_STORAGE_TYPE", "local"),
             storage_root: env_or("IMPRESSPRESS_STORAGE_ROOT", "data/storage"),
         }
+    }
+}
+
+impl std::fmt::Debug for InfraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfraConfig")
+            .field("listen", &self.listen)
+            .field("db_type", &self.db_type)
+            .field("db_path", &self.db_path)
+            .field(
+                "db_url",
+                &self.db_url.as_deref().map(crate::database::postgres_target),
+            )
+            .field("storage_type", &self.storage_type)
+            .field("storage_root", &self.storage_root)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod infra_config_tests {
+    use super::InfraConfig;
+
+    #[test]
+    fn debug_never_shows_the_db_password() {
+        let infra = InfraConfig {
+            listen: "0.0.0.0:8090".into(),
+            db_type: "postgres".into(),
+            db_path: "data/impresspress.db".into(),
+            db_url: Some("postgres://app:hunter2@db.internal:5432/prod".into()),
+            storage_type: "local".into(),
+            storage_root: "data/storage".into(),
+        };
+        let shown = format!("{infra:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("db.internal:5432/prod"), "{shown}");
     }
 }
 

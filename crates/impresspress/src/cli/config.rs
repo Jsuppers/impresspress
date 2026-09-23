@@ -110,9 +110,10 @@ use std::path::{Path, PathBuf};
 /// the file.
 ///
 /// `Ok(None)` means no `impresspress.toml` exists in `start` or any parent —
-/// the only outcome a caller may treat as "no config". A file that exists but
-/// cannot be read or parsed is an `Err`: falling back to defaults there would
-/// silently drop every setting the operator wrote.
+/// the only outcome a caller may treat as "no config". An entry that exists
+/// but cannot be read or parsed (a dangling symlink included) is an `Err`:
+/// falling back to defaults, or to a parent's file, would silently drop every
+/// setting the operator wrote.
 pub fn find_and_load(start: &Path) -> anyhow::Result<Option<(Config, PathBuf)>> {
     let start = start
         .canonicalize()
@@ -120,11 +121,19 @@ pub fn find_and_load(start: &Path) -> anyhow::Result<Option<(Config, PathBuf)>> 
     let mut cur: &Path = &start;
     loop {
         let candidate = cur.join("impresspress.toml");
-        if candidate.is_file() {
-            let text = std::fs::read_to_string(&candidate)
-                .map_err(|e| anyhow::anyhow!("read {candidate:?}: {e}"))?;
-            let cfg = parse(&text).map_err(|e| anyhow::anyhow!("parse {candidate:?}: {e}"))?;
-            return Ok(Some((cfg, cur.to_path_buf())));
+        // `symlink_metadata`, not `is_file`: only "no entry at this path"
+        // moves the search up. A dangling symlink, a directory or an I/O
+        // error is this directory's config failing to load, and must not
+        // hand the build to a parent directory's `impresspress.toml`.
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                let text = std::fs::read_to_string(&candidate)
+                    .map_err(|e| anyhow::anyhow!("read {candidate:?}: {e}"))?;
+                let cfg = parse(&text).map_err(|e| anyhow::anyhow!("parse {candidate:?}: {e}"))?;
+                return Ok(Some((cfg, cur.to_path_buf())));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::anyhow!("stat {candidate:?}: {e}")),
         }
         match cur.parent() {
             Some(p) => cur = p,
@@ -260,6 +269,27 @@ boot_redirect = "/"
         let err = find_and_load_required(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("impresspress.toml"));
         assert!(err.contains("no"));
+    }
+
+    /// A dangling `impresspress.toml` symlink is this directory's config
+    /// failing to load, not an absent file: the search must not walk up and
+    /// pick the parent's valid config instead.
+    #[cfg(unix)]
+    #[test]
+    fn find_config_dangling_symlink_is_an_error_not_a_walk_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("impresspress.toml"),
+            "[app]\nname = \"parent\"\ntitle = \"P\"\nboot_redirect = \"/\"\n",
+        )
+        .unwrap();
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::os::unix::fs::symlink(child.join("missing.toml"), child.join("impresspress.toml"))
+            .unwrap();
+
+        let err = find_and_load(&child).unwrap_err().to_string();
+        assert!(err.contains("impresspress.toml"), "{err}");
     }
 
     #[test]
