@@ -608,6 +608,76 @@ mod tests {
         );
     }
 
+    /// An append-only grant crosses the plan as `"append"` and comes back
+    /// append-only — never widened to read-write or narrowed to read-only —
+    /// while the boolean spelling every earlier plan used still imports.
+    #[test]
+    fn an_append_grant_round_trips_through_the_plan() {
+        let source = ImpresspressBuilder::new();
+        let exporter = source.prepared_plan_exporter().unwrap();
+        exporter
+            .publish_wrap_grants(&[wafer_run::ResourceGrant::append(
+                "example/app",
+                "impresspress__products__events",
+            )])
+            .unwrap();
+        let lock = WaferLockIdentity::absent();
+        let plan = exporter
+            .prepare_runtime_plan(
+                "example",
+                hash('b'),
+                lock.clone(),
+                PreparedReleaseAssets::absent(),
+            )
+            .unwrap();
+        let exported = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            exported["structure"]["deployment_wrap_grants"][0]["write"],
+            serde_json::json!("append")
+        );
+
+        let reimported = PreparedRuntimePlan::from_json(&plan.to_json_pretty().unwrap()).unwrap();
+        let applied = ImpresspressBuilder::new()
+            .apply_prepared_plan(
+                &reimported,
+                "example",
+                &hash('b'),
+                &lock,
+                &PreparedReleaseAssets::absent(),
+            )
+            .unwrap();
+        assert_eq!(
+            applied.deployment_wrap_grants[0].write,
+            wafer_block::GrantWrite::Append
+        );
+        assert_eq!(
+            applied.deployment_wrap_grants[0].resource_type,
+            Some(wafer_run::ResourceType::Db)
+        );
+
+        for (spelling, want) in [
+            (serde_json::json!(false), PreparedGrantWrite::Read),
+            (serde_json::json!(true), PreparedGrantWrite::ReadWrite),
+            (serde_json::json!("append"), PreparedGrantWrite::Append),
+        ] {
+            let grant: PreparedResourceGrant = serde_json::from_value(serde_json::json!({
+                "grantee": "example/app",
+                "resource": "impresspress__products__events",
+                "write": spelling,
+            }))
+            .unwrap();
+            assert_eq!(grant.write, want);
+        }
+        assert!(
+            serde_json::from_value::<PreparedResourceGrant>(serde_json::json!({
+                "grantee": "example/app",
+                "resource": "impresspress__products__events",
+                "write": "full",
+            }))
+            .is_err()
+        );
+    }
+
     #[test]
     fn final_block_config_is_exported_applied_and_parity_checked() {
         let config = serde_json::json!({
