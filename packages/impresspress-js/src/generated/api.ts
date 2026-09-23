@@ -1017,28 +1017,36 @@ export interface paths {
                     };
                     content: {
                         "application/json": {
-                            access_token?: string;
-                            default_redirect?: string;
-                            email_verified: boolean;
-                            /** Format: uint64 */
-                            expires_in?: number;
-                            /** @description Present when verification is required or the email is already registered */
-                            message?: string;
-                            refresh_token?: string;
+                            access_token: string;
+                            /** @description Role-aware post-login redirect path */
+                            default_redirect: string;
+                            /** @constant */
+                            email_verified: true;
+                            /**
+                             * Format: uint64
+                             * @description Access token lifetime in seconds
+                             */
+                            expires_in: number;
+                            refresh_token: string;
                             /**
                              * @description The only `token_type` this API issues.
                              * @enum {string}
                              */
-                            token_type?: "Bearer";
-                            /**
-                             * @description The new account. `id`, `roles` and `name` are present only on the
-                             *     auto-login path; the verification-required reply carries `email` alone.
-                             */
+                            token_type: "Bearer";
+                            /** @description The caller's identity, as returned by a successful authentication. */
                             user: {
                                 email: string;
-                                id?: string;
-                                name?: string;
-                                roles?: string[];
+                                id: string;
+                                name: string;
+                                roles: string[];
+                            };
+                        } | {
+                            /** @constant */
+                            email_verified: false;
+                            message: string;
+                            /** @description The address a signup awaiting verification was made for. */
+                            user: {
+                                email: string;
                             };
                         };
                     };

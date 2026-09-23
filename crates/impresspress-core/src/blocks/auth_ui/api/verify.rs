@@ -149,7 +149,7 @@ pub async fn handle_resend(
         Ok(Some(user)) => user,
         Ok(None) => return constant(),
         Err(e) => {
-            tracing::error!(error = %e, "resend-verification: user lookup failed");
+            tracing::error!(code = ?e.code, error = %e, "resend-verification: user lookup failed");
             return constant();
         }
     };
@@ -174,7 +174,17 @@ pub async fn handle_resend(
         Ok(super::VerificationMail::NotSent(failure)) => {
             super::log_email_not_sent("resend-verification", &user.id, &failure);
         }
-        Err(e) => return crud::db_error_internal(e, "Failed to mint the verification token"),
+        // A mint that could not be read, drawn or stored is reachable only
+        // for a registered, unproven address, so a 403 or 500 here would be
+        // the oracle `constant()` closes. Logged with its code instead.
+        Err(e) => {
+            tracing::error!(
+                code = ?e.code,
+                error = %e,
+                user_id = %user.id,
+                "resend-verification: minting the verification token failed"
+            );
+        }
     }
 
     constant()
@@ -543,6 +553,43 @@ mod resend_tests {
             proven.email_verified_by.as_deref(),
             Some(users::proof::EMAIL_TOKEN),
             "redeeming the link is what records the proof"
+        );
+    }
+
+    /// Everything the HTTP boundary sends for one resend request.
+    async fn resend_on_the_wire(
+        ctx: &dyn Context,
+        email: &str,
+    ) -> (u16, Vec<(String, String)>, String) {
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let parts = wafer_block::http_codec::collect_http_response(
+            handle_resend(&limiter, ctx, &msg, body(email)).await,
+        )
+        .await;
+        (
+            parts.status,
+            parts.headers,
+            String::from_utf8_lossy(&parts.body).into_owned(),
+        )
+    }
+
+    /// The token draw needs the crypto block; a deployment without it must
+    /// still answer a registered, unproven address like any other.
+    #[tokio::test]
+    async fn a_failed_verification_token_draw_answers_what_an_unregistered_address_does() {
+        let ctx = TestContext::with_auth().await;
+        seed(&ctx, "unproven@example.com", false).await;
+
+        let unregistered = resend_on_the_wire(&ctx, "nobody@example.com").await;
+        let registered = resend_on_the_wire(&ctx, "unproven@example.com").await;
+
+        assert_eq!(
+            unregistered.0, 200,
+            "the unregistered answer is the constant 200"
+        );
+        assert_eq!(
+            registered, unregistered,
+            "a failed token draw must not be visible to the caller"
         );
     }
 }

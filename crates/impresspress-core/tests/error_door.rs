@@ -577,14 +577,6 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
         }],
     ),
     (
-        "auth_ui/api/forgot_password.rs",
-        &[Tail {
-            label: "Token generation failed",
-            count: 1,
-            why: "crypto: drawing the reset token",
-        }],
-    ),
-    (
         "auth_ui/oauth/start.rs",
         &[
             Tail {

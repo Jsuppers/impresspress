@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import type { paths } from "../src/generated/api";
-import type { AuthSessionUser, AuthTokens, SignUpResult } from "../src/services/auth.service";
+import type {
+  AuthSessionUser,
+  AuthTokens,
+  SignUpReply,
+  SignUpResult,
+} from "../src/services/auth.service";
 import type { Extension, ShareRecord } from "../src/services/extensions.service";
 import type { CloudStorageExtension } from "../src/services/extensions.service";
 import type {
@@ -57,6 +62,10 @@ type _SignupUserFits = ServerFits<
   SignUpResult["user"],
   Json200<"/b/auth/api/signup", "post">["user"]
 >;
+// The whole reply, not just `user`: `SignUpReply` is a union discriminated on
+// `email_verified`, and the server's body fits it only if the server's type
+// is that union too, with the flag fixed per branch.
+type _SignupReplyFits = ServerFits<SignUpReply, Json200<"/b/auth/api/signup", "post">>;
 type _RefreshFits = ServerFits<AuthTokens, Json200<"/b/auth/api/refresh", "post">>;
 
 // ── admin / iam ───────────────────────────────────────────────────────────
@@ -110,6 +119,7 @@ describe("the SDK's exported types accept what the server publishes", () => {
       | _MeUserFits
       | _LoginUserFits
       | _SignupUserFits
+      | _SignupReplyFits
       | _RefreshFits
       | _ExtensionFits
       | _RoleListFits

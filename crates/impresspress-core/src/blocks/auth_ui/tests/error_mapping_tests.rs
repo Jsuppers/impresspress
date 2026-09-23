@@ -11,6 +11,10 @@
 //! `FailingDbOpContext` that refuses exactly the `(action, table)` the site
 //! under test calls, so every earlier step of the route runs for real. The
 //! `Internal` pairs pin that an outage is still the 500 it always was.
+//!
+//! The exception is forgot-password and resend-verification (end of file):
+//! public endpoints with one constant body, where any refusal a registered
+//! address alone can reach must answer that body, not a 403 or 500.
 
 use serde_json::json;
 use wafer_run::{context::Context, Block, ErrorCode, InputStream, Message, WaferError};
@@ -399,4 +403,111 @@ async fn settings_page_config_denial_is_the_403_page_not_a_500() {
     let html = String::from_utf8_lossy(&parts.body);
     assert_eq!(parts.status, 403, "{html}");
     assert!(!html.contains("settings-form"), "{html}");
+}
+
+// --- api/forgot_password.rs + api/verify.rs (resend) ------------------------
+//
+// These two are the exception to this file's rule. Both endpoints answer one
+// constant body for every account state, and the write that fails here is
+// reachable only by a registered address, so a 403 or 500 would tell an
+// anonymous caller which addresses have accounts. They must answer, whole
+// response, what an unregistered address gets, and log the code instead.
+
+/// Everything the HTTP boundary sends for one public request to `path`.
+async fn wire(ctx: &dyn Context, path: &str, email: &str) -> (u16, Vec<(String, String)>, String) {
+    let parts = wafer_block::http_codec::collect_http_response(
+        AuthUiBlock::default()
+            .handle(
+                ctx,
+                from_client(anon_msg("create", path)),
+                InputStream::from_bytes(
+                    serde_json::to_vec(&json!({ "email": email })).expect("serialize body"),
+                ),
+            )
+            .await,
+    )
+    .await;
+    (
+        parts.status,
+        parts.headers,
+        String::from_utf8_lossy(&parts.body).into_owned(),
+    )
+}
+
+/// A WRAP denial and an outage, the two refusals a write can meet.
+fn write_refusals() -> [WaferError; 2] {
+    [
+        wrap_denial(),
+        WaferError::new(ErrorCode::Internal, "simulated database outage"),
+    ]
+}
+
+async fn seed_user(ctx: &TestContext, email: &str) {
+    users::insert(
+        ctx,
+        users::NewUser {
+            email: email.into(),
+            display_name: "U".into(),
+            avatar_url: None,
+            role: "user".into(),
+            email_verified: false,
+            verification_token_hash: None,
+        },
+    )
+    .await
+    .expect("insert user");
+}
+
+#[tokio::test]
+async fn forgot_password_reset_token_store_failure_answers_like_an_unregistered_address() {
+    for error in write_refusals() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        seed_user(&ctx, "known@example.com").await;
+        let failing = FailingDbOpContext::failing_with(
+            ctx,
+            vec![("database.update", users::TABLE)],
+            error.clone(),
+        );
+
+        let path = "/b/auth/api/forgot-password";
+        let unregistered = wire(&failing, path, "nobody@example.com").await;
+        let registered = wire(&failing, path, "known@example.com").await;
+
+        assert_eq!(
+            unregistered.0, 200,
+            "the unregistered answer is the constant 200"
+        );
+        assert_eq!(
+            registered, unregistered,
+            "a {:?} storing the reset token must not be visible to the caller",
+            error.code
+        );
+    }
+}
+
+#[tokio::test]
+async fn resend_verification_token_store_failure_answers_like_an_unregistered_address() {
+    for error in write_refusals() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        seed_user(&ctx, "unproven@example.com").await;
+        let failing = FailingDbOpContext::failing_with(
+            ctx,
+            vec![("database.update", users::TABLE)],
+            error.clone(),
+        );
+
+        let path = "/b/auth/api/resend-verification";
+        let unregistered = wire(&failing, path, "nobody@example.com").await;
+        let registered = wire(&failing, path, "unproven@example.com").await;
+
+        assert_eq!(
+            unregistered.0, 200,
+            "the unregistered answer is the constant 200"
+        );
+        assert_eq!(
+            registered, unregistered,
+            "a {:?} storing the verification token must not be visible to the caller",
+            error.code
+        );
+    }
 }

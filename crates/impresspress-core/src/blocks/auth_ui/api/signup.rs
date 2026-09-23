@@ -12,7 +12,10 @@ use crate::{
             repo::{local_credentials, users},
         },
         auth_ui::{
-            contracts::{SignupRequest, SignupResponse, SignupUser, TokenType},
+            contracts::{
+                AuthenticatedUser, EmailVerified, PendingSignupUser, SignupRequest, SignupResponse,
+                TokenType,
+            },
             redirect::{default_post_login_redirect, is_safe_local_redirect},
         },
         crud,
@@ -44,20 +47,10 @@ async fn user_exists(ctx: &dyn Context, email_lower: &str) -> Result<bool, Wafer
 /// oversight; a deployment that needs signup not to reveal registered
 /// addresses turns verification on.
 fn pending_verification(email: String) -> SignupResponse {
-    SignupResponse {
-        email_verified: false,
-        message: Some("Account created. Please verify your email before signing in.".to_string()),
-        access_token: None,
-        refresh_token: None,
-        token_type: None,
-        expires_in: None,
-        default_redirect: None,
-        user: SignupUser {
-            id: None,
-            email,
-            roles: None,
-            name: None,
-        },
+    SignupResponse::PendingVerification {
+        email_verified: EmailVerified,
+        message: "Account created. Please verify your email before signing in.".to_string(),
+        user: PendingSignupUser { email },
     }
 }
 
@@ -255,19 +248,18 @@ pub async fn handle(
     ResponseBuilder::new()
         .status(201)
         .set_cookie(&issued.cookie)
-        .json(&SignupResponse {
-            email_verified: true,
-            message: None,
-            access_token: Some(issued.access_token),
-            refresh_token: Some(issued.refresh_token),
-            token_type: Some(TokenType::Bearer),
-            expires_in: Some(issued.access_lifetime),
-            default_redirect: Some(default_redirect),
-            user: SignupUser {
-                id: Some(user.id),
+        .json(&SignupResponse::SignedIn {
+            email_verified: EmailVerified,
+            access_token: issued.access_token,
+            refresh_token: issued.refresh_token,
+            token_type: TokenType::Bearer,
+            expires_in: issued.access_lifetime,
+            default_redirect,
+            user: AuthenticatedUser {
+                id: user.id,
                 email: email_lower,
-                roles: Some(roles),
-                name: Some(user.display_name),
+                roles,
+                name: user.display_name,
             },
         })
 }
@@ -431,5 +423,67 @@ mod tests {
         let resp = signup(&ctx, "dupe@example.com", "some-other-password").await;
         assert!(resp.get("access_token").is_none());
         assert!(resp.get("default_redirect").is_none());
+    }
+
+    /// `email_verified` and the tokens are one fact on every path the
+    /// endpoint has: verification off or on, a fresh address or a
+    /// registered one. Driven through the block's own route table, so the
+    /// body checked is the one a browser receives, and each body must also
+    /// decode as the published contract.
+    #[tokio::test]
+    async fn email_verified_is_true_exactly_when_the_reply_carries_tokens() {
+        use wafer_run::Block;
+
+        use crate::blocks::auth_ui::AuthUiBlock;
+
+        async fn post(ctx: &TestContext, email: &str) -> (u16, serde_json::Value) {
+            let mut msg = crate::test_support::anon_msg("create", "/b/auth/api/signup");
+            msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.7");
+            let body = serde_json::json!({"email": email, "password": "correct-horse-battery"});
+            let parts = wafer_block::http_codec::collect_http_response(
+                AuthUiBlock::default()
+                    .handle(
+                        ctx,
+                        msg,
+                        InputStream::from_bytes(serde_json::to_vec(&body).expect("body")),
+                    )
+                    .await,
+            )
+            .await;
+            let json = serde_json::from_slice(&parts.body).expect("signup answers JSON");
+            (parts.status, json)
+        }
+
+        for require_verification in [false, true] {
+            let mut ctx = ctx_with_crypto().await;
+            ctx.set_config(
+                "WAFER_RUN__AUTH__REQUIRE_VERIFICATION",
+                if require_verification {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            let fresh = post(&ctx, "someone@example.com").await;
+            let registered = post(&ctx, "someone@example.com").await;
+
+            for (path, (status, body)) in [("fresh", fresh), ("registered", registered)] {
+                let case = format!("verification {require_verification}, {path} address");
+                assert_eq!(status, 201, "{case}: {body}");
+                assert_eq!(
+                    body["email_verified"].as_bool(),
+                    Some(body.get("access_token").is_some()),
+                    "{case}: `email_verified` must say whether tokens were issued: {body}"
+                );
+                let decoded: SignupResponse = serde_json::from_value(body.clone())
+                    .unwrap_or_else(|e| panic!("{case}: not the published contract ({e}): {body}"));
+                let signed_in = !require_verification && path == "fresh";
+                assert_eq!(
+                    matches!(decoded, SignupResponse::SignedIn { .. }),
+                    signed_in,
+                    "{case}: wrong variant: {body}"
+                );
+            }
+        }
     }
 }
