@@ -43,6 +43,8 @@ pub(super) fn entry() -> Entry {
             "/b/userportal/config",
             Exempt::NotAPage("public JSON the chrome reads for the portal's branding"),
         )],
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[
             "delete /b/userportal/sessions/{family}",
             "delete /b/userportal/security/providers/{provider}",
@@ -151,6 +153,7 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
                 Page::at("/b/userportal/admin/buttons"),
                 Page::at(format!("/b/userportal/admin/buttons/{button_id}/edit")),
             ],
+            probes: Vec::new(),
             operator_input: OPERATOR_INPUT,
         }
     })

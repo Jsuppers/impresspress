@@ -30,6 +30,8 @@ pub(super) fn entry() -> Entry {
         // `/b/tickets/admin` answers 302 to `/b/tickets/admin/tickets`.
         exempt: &[("/b/tickets/admin", Exempt::Redirect)],
         // No mutating htmx control on any tickets page; see the module doc.
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[],
     }
 }
@@ -100,6 +102,16 @@ async fn fixture() -> Fixture {
             Page::at("/b/tickets/admin/types"),
             Page::at("/b/tickets/admin/settings"),
             Page::at("/b/tickets/admin/endpoints"),
+        ],
+        probes: vec![
+            (
+                "/b/tickets/api/admin/tickets/{id}",
+                format!("/b/tickets/api/admin/tickets/{}", ticket.id),
+            ),
+            (
+                "/b/tickets/api/admin/tickets/{id}/analyses",
+                format!("/b/tickets/api/admin/tickets/{}/analyses", ticket.id),
+            ),
         ],
         operator_input: &[],
     }

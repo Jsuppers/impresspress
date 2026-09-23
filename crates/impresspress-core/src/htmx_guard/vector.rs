@@ -52,6 +52,7 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
             site: Site(vec![vector]),
             caller: admin_caller,
             pages: vec![Page::at("/b/vector/"), Page::at("/b/vector/docs/")],
+            probes: Vec::new(),
             operator_input: OPERATOR_INPUT,
         }
     })
@@ -66,6 +67,8 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/vector",
         fixture: Some(fixture),
         exempt: &[],
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &["create /b/vector/api/indexes"],
     }
 }

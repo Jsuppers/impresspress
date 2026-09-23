@@ -419,6 +419,11 @@ pub struct Fixture {
     /// query [`crawl`] does not follow) worth rendering on its own. The tabs
     /// and views a page links to are found by [`crawl`], not listed here.
     pub pages: Vec<Page>,
+    /// `(row template, URL)`: where each non-page `GET` row that needs one
+    /// is dispatched — its path parameters filled with ids and names the
+    /// fixture seeded, plus any query it requires — so it answers its
+    /// success path rather than a not-found.
+    pub probes: Vec<(&'static str, String)>,
     /// What an operator types into the fields the pages render empty. Every
     /// entry is a value the page itself would accept.
     pub operator_input: &'static [(&'static str, &'static str)],

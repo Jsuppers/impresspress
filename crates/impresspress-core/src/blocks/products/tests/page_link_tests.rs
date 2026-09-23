@@ -492,6 +492,7 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
                     })
             })
             .collect(),
+        probes: Vec::new(),
         operator_input: &[],
     };
 

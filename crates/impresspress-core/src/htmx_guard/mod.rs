@@ -10,11 +10,13 @@
 //! - every `GET` row a block declares is one of its pages, publishes a
 //!   response schema (so it is JSON, not a page), or is exempt with a stated
 //!   reason — a new page or tab cannot escape the guard by not being listed;
-//! - every `GET` row that is not a page is dispatched once, and must not
-//!   answer a page: a schema or an exemption is a claim about the answer, and
-//!   the answer is what is checked, not the claim;
+//! - every `GET` row that is not a page is dispatched once, at seeded ids,
+//!   and must succeed without answering a page: a schema or an exemption is
+//!   a claim about the answer, and the answer is what is checked, not the
+//!   claim;
 //! - every page of every entry, and every tab and view those pages link to,
-//!   is rendered, and every control on it fired.
+//!   is rendered, and every control on it fired — and the tabs and views the
+//!   crawl reaches are exactly the ones the entry names.
 
 mod auth_ui;
 #[cfg(feature = "block-dev")]
@@ -62,8 +64,11 @@ enum Exempt {
     /// A static asset (script, stylesheet), not a page. Its answer must not
     /// be HTML.
     Asset,
-    /// Some other answer that is not a page — a download, a plain-text probe —
-    /// with what it is. Its answer must not be HTML.
+    /// Some other answer that is not a page — a download, a plain-text probe,
+    /// a hand-off to an external site — with what it is. Its answer must not
+    /// be HTML, and a redirect it answers must leave the site: a redirect to
+    /// one of the site's own pages is a [`Exempt::Redirect`], whose target
+    /// is checked.
     NotAPage(&'static str),
 }
 
@@ -79,12 +84,6 @@ impl Exempt {
     }
 }
 
-/// What every path parameter of a `GET` row is filled with to dispatch it:
-/// a value no fixture seeds, so a row with parameters answers its not-found
-/// path. The row's answer is checked for what it is (HTML or not), which a
-/// not-found answers the same way as a found one.
-const PROBE_PARAM: &str = "htmx-guard-probe";
-
 /// How the guard covers one block.
 struct Entry {
     /// The block's `BlockInfo::name`.
@@ -97,6 +96,14 @@ struct Entry {
     exempt: &'static [(&'static str, Exempt)],
     /// `"{action} {template}"` of the controls its pages must keep reaching.
     must_fire: &'static [&'static str],
+    /// The URL of every view the crawl reaches beyond the fixture's own
+    /// pages — exactly: a view that stops being linked fails, and so does a
+    /// new one nobody named.
+    must_reach: &'static [&'static str],
+    /// Non-page `GET` rows whose success no fixture can reach, each with why.
+    /// They are still dispatched, and must still not answer a page; every
+    /// other non-page row must succeed.
+    cannot_succeed: &'static [(&'static str, &'static str)],
 }
 
 #[expect(
@@ -127,6 +134,19 @@ fn entries() -> Vec<Entry> {
             ("/b/admin/email", Exempt::Redirect),
             ("/b/admin/permissions", Exempt::Redirect),
         ],
+        must_reach: &[
+            "/b/admin/users?tab=roles",
+            "/b/admin/users?tab=api-keys",
+            "/b/admin/blocks?tab=services",
+            "/b/admin/blocks?tab=infrastructure",
+            "/b/admin/blocks?tab=custom",
+            "/b/admin/database?tab=schema",
+            "/b/admin/database?tab=sql",
+            "/b/admin/logs?tab=audit",
+            "/b/admin/settings/variables?tab=all",
+            "/b/admin/settings/permissions?subtab=database",
+        ],
+        cannot_succeed: &[],
         must_fire: crate::blocks::admin::htmx_contract_tests::MUST_FIRE,
     });
     entries.push(auth_ui::entry());
@@ -271,32 +291,15 @@ fn is_row_of(template: &str, path: &str) -> bool {
         || (!path.ends_with('/') && match_template(template, &format!("{path}/")).is_some())
 }
 
-/// `template` with every `{param}` / `{param...}` filled with [`PROBE_PARAM`].
-fn probe_path(template: &str) -> String {
-    let mut path = String::new();
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        let close = open
-            + rest[open..]
-                .find('}')
-                .expect("a template parameter is closed");
-        path.push_str(&rest[..open]);
-        path.push_str(PROBE_PARAM);
-        rest = &rest[close + 1..];
-    }
-    path.push_str(rest);
-    path
-}
-
 /// Every `GET` row that is not a page — schema'd or exempt — is dispatched
-/// through its block, as the fixture's visitor, and must not answer a page.
-/// A route whose handler renders HTML under a response schema (or under a
-/// JSON / asset / download exemption) would otherwise be accepted on its
-/// label and never looked at, and a page among those rows has no controls
-/// the guard would ever fire. A redirect must land on a page the crawl
-/// renders.
+/// through its block as the fixture's visitor, at the URL the fixture's
+/// `probes` give it (seeded ids, required query), and must succeed without
+/// answering a page. A route whose handler renders HTML under a response
+/// schema (or under a JSON / asset / download exemption) would otherwise be
+/// accepted on its label, and one that answers 401 or 500 would pass for
+/// answering JSON. A redirect must land on a page the crawl renders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_get_row_that_is_not_a_page_answers_something_other_than_a_page() {
+async fn every_get_row_that_is_not_a_page_succeeds_without_answering_a_page() {
     let infos = registered();
     let mut wrong: Vec<String> = Vec::new();
     for entry in entries() {
@@ -312,6 +315,7 @@ async fn every_get_row_that_is_not_a_page_answers_something_other_than_a_page() 
             .iter()
             .map(|view| view.page(&fixture).url())
             .collect();
+        let mut probed: BTreeSet<&str> = BTreeSet::new();
         for row in info
             .endpoints
             .iter()
@@ -325,40 +329,105 @@ async fn every_get_row_that_is_not_a_page_answers_something_other_than_a_page() 
             if row.output_schema.is_none() && exempt.is_none() {
                 continue;
             }
-            let path = probe_path(&row.path);
-            let (_, answer) = send(&fixture, "retrieve", &path, "", false).await;
+            let label = match exempt {
+                Some(why) => format!("exempt as a {}", why.reason()),
+                None => "publishes a response schema".to_string(),
+            };
+            let probe = fixture.probes.iter().find(|(t, _)| *t == row.path);
+            let url = match probe {
+                Some((template, url)) => {
+                    probed.insert(template);
+                    url.clone()
+                }
+                None if row.path.contains('{') => {
+                    wrong.push(format!(
+                        "{}: GET {} has path parameters and the fixture gives it no probe URL",
+                        entry.block, row.path
+                    ));
+                    continue;
+                }
+                None => row.path.clone(),
+            };
+            let (_, answer) = send(&fixture, "retrieve", &url, "", false).await;
+            let answered = format!(
+                "answers {} {}: {}",
+                answer.status,
+                answer.content_type,
+                answer.body.chars().take(200).collect::<String>()
+            );
             if answer.content_type.starts_with("text/html") {
                 wrong.push(format!(
-                    "{}: GET {} ({}) answers {} {}, a page: {}",
-                    entry.block,
-                    row.path,
-                    match exempt {
-                        Some(why) => format!("exempt as a {}", why.reason()),
-                        None => "publishes a response schema".to_string(),
-                    },
-                    answer.status,
-                    answer.content_type,
-                    answer.body.chars().take(200).collect::<String>()
+                    "{}: GET {url} ({label}) is a page: {answered}",
+                    entry.block
                 ));
                 continue;
             }
-            if matches!(exempt, Some(Exempt::Redirect)) {
-                let lands = (300..400).contains(&answer.status)
-                    && answer
-                        .location
-                        .as_deref()
-                        .is_some_and(|to| rendered.iter().any(|page| page == to));
-                if !lands {
-                    wrong.push(format!(
-                        "{}: GET {} is exempt as a redirect to a rendered page, and answers \
-                         {} to {:?}; the crawl renders {rendered:?}",
-                        entry.block, row.path, answer.status, answer.location
-                    ));
-                }
+            if entry.cannot_succeed.iter().any(|(t, _)| *t == row.path) {
+                continue;
+            }
+            let redirect = (300..400).contains(&answer.status);
+            let to = answer.location.as_deref().unwrap_or_default();
+            let fine = match exempt {
+                Some(Exempt::Redirect) => redirect && rendered.iter().any(|page| page == to),
+                Some(Exempt::NotAPage(_)) if redirect => to.starts_with("https://"),
+                _ => (200..300).contains(&answer.status),
+            };
+            if !fine {
+                wrong.push(format!(
+                    "{}: GET {url} ({label}) {answered} (location {:?}); a redirect must be \
+                     to a page the crawl renders, or leave the site under NotAPage",
+                    entry.block, answer.location
+                ));
+            }
+        }
+        for (template, _) in &fixture.probes {
+            if !probed.contains(template) {
+                wrong.push(format!(
+                    "{}: probe for {template}, which is not a non-page GET row",
+                    entry.block
+                ));
+            }
+        }
+        for (template, _) in entry.cannot_succeed {
+            if !info
+                .endpoints
+                .iter()
+                .any(|e| e.method == HttpMethod::Get && e.path == *template)
+            {
+                wrong.push(format!(
+                    "{}: cannot_succeed {template} is not a GET row of the block",
+                    entry.block
+                ));
             }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The crawl reaches exactly the views each entry names: the tabs and views
+/// the guard exists to render cannot silently drop out of it, and a new one
+/// is named the day it is linked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_crawl_reaches_exactly_the_views_each_entry_names() {
+    for entry in entries() {
+        let Some(make) = entry.fixture else {
+            continue;
+        };
+        let fixture = make().await;
+        let own: Vec<String> = fixture.pages.iter().map(|p| p.url()).collect();
+        let views: BTreeSet<String> = crawl(&fixture)
+            .await
+            .iter()
+            .map(|view| view.page(&fixture).url())
+            .filter(|url| !own.contains(url))
+            .collect();
+        let named: BTreeSet<String> = entry.must_reach.iter().map(|v| v.to_string()).collect();
+        assert_eq!(
+            views, named,
+            "{}: the views the crawl reached (left) are not the views the entry names (right)",
+            entry.block
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

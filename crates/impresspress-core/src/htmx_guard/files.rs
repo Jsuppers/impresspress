@@ -36,6 +36,8 @@ pub(super) fn entry() -> Entry {
             ),
         ],
         // No mutating htmx control on any files page; see the module doc.
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[],
     }
 }
@@ -73,6 +75,11 @@ async fn fixture() -> Fixture {
             ("uploaded_by".into(), json!("admin_1")),
         ]);
         repo::objects::seed(&ctx, row).await.expect("seed object");
+        // The object's bytes, through the storage block the way the upload
+        // route stores them, so a download answers them.
+        wafer_core::clients::storage::put(&ctx, "photos", key, b"png", "image/png")
+            .await
+            .expect("store the object's bytes");
     }
     let share: HashMap<String, serde_json::Value> = HashMap::from([
         ("token".into(), json!("tok123abc")),
@@ -106,6 +113,24 @@ async fn fixture() -> Fixture {
             Page::at("/b/cloudstorage/"),
             Page::at("/b/storage/photos/"),
             Page::at("/b/storage/photos/nested/"),
+        ],
+        probes: vec![
+            (
+                "/b/storage/api/buckets/{name}/objects",
+                "/b/storage/api/buckets/photos/objects".to_string(),
+            ),
+            (
+                "/b/storage/api/buckets/{name}/objects/{key...}",
+                "/b/storage/api/buckets/photos/objects/nested/b.png".to_string(),
+            ),
+            (
+                "/b/storage/api/search",
+                "/b/storage/api/search?q=png".to_string(),
+            ),
+            (
+                "/b/storage/direct/{token}",
+                "/b/storage/direct/tok123abc".to_string(),
+            ),
         ],
         operator_input: &[],
     }

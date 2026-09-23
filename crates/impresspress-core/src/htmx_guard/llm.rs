@@ -112,6 +112,10 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
                 Page::at("/b/llm/models"),
                 Page::at("/b/llm/settings"),
             ],
+            probes: vec![(
+                "/b/llm/api/models/{backend_id}/{model_id}/status",
+                "/b/llm/api/models/probe-provider/probe-model/status".to_string(),
+            )],
             operator_input: OPERATOR_INPUT,
         }
     })
@@ -126,6 +130,8 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/llm",
         fixture: Some(fixture),
         exempt: &[],
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[
             "create /b/llm/api/providers",
             "create /b/llm/api/providers/{id}/discover-models",

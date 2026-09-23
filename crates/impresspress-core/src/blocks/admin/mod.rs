@@ -2059,7 +2059,7 @@ pub(crate) mod page_link_tests {
     }
 
     const PROBE_BLOCK: &str = "impresspress/probe";
-    const PROBE_VARIABLE: &str = "PROBE_SETTING";
+    pub(crate) const PROBE_VARIABLE: &str = "PROBE_SETTING";
 
     /// A variables row an admin surface has PINNED, so the pages render the
     /// "Reset to environment" control for it. Separate from [`PROBE_VARIABLE`]

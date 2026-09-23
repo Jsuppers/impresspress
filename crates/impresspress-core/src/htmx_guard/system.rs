@@ -27,6 +27,8 @@ pub(super) fn entry() -> Entry {
             ),
             ("/b/static/{filename}", Exempt::Asset),
         ],
+        must_reach: &[],
+        cannot_succeed: &[],
         must_fire: &[],
     }
 }
@@ -43,6 +45,14 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
             site: Site(vec![Arc::new(SystemBlock::new()) as Arc<dyn Block>]),
             caller,
             pages: Vec::new(),
+            // The favicon, by the content-hashed name the pages link it by.
+            probes: vec![(
+                "/b/static/{filename}",
+                format!(
+                    "/b/static/{}",
+                    crate::ui::assets::entry("favicon.ico").filename
+                ),
+            )],
             operator_input: &[],
         }
     })
