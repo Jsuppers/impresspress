@@ -444,29 +444,35 @@ impl PendingClaim<'_> {
 /// upload over both caps is refused for its bytes.
 const STORAGE_GUARD: usize = 0;
 /// Index in [`quota_guards`] of the per-bucket file-count guard, present when
-/// `max_files_per_bucket` is positive.
+/// `max_files_per_bucket` is positive and the write does not replace a row
+/// of the uploader's own.
 const FILE_COUNT_GUARD: usize = 1;
 
 /// The caps `claim`'s write must leave its uploader within, measured over the
-/// table as it stands at the write. `replacing` is the id of the row the write
-/// takes over, which the guards leave out: its size and its place in the
-/// bucket are the claim's once the write lands, whoever they were charged to
-/// before.
+/// table as it stands at the write. `replacing` is the row the write takes
+/// over, as it was read, which the guards leave out: its size and its place
+/// in the bucket are the claim's once the write lands, whoever they were
+/// charged to before.
 ///
 /// - [`STORAGE_GUARD`]: the uploader's `SUM(size)`, plus the claim's size, is
 ///   at most `max_storage_bytes`.
 /// - [`FILE_COUNT_GUARD`]: the uploader's rows in the bucket number fewer
 ///   than `max_files_per_bucket`, so the write leaves at most that many. A
-///   cap of `0` or less is no cap, and adds no guard.
-fn quota_guards(claim: &PendingClaim<'_>, replacing: Option<&str>) -> Vec<CapGuard> {
+///   cap of `0` or less is no cap, and adds no guard. Nor does a write that
+///   replaces a row the uploader already holds: it adds no file, so a user
+///   over the cap — an admin lowered it below what they hold — can still
+///   overwrite what they have. The take-over is conditional on the claim the
+///   row was read with, so the row is still theirs when the write lands.
+fn quota_guards(claim: &PendingClaim<'_>, replacing: Option<&ObjectRow>) -> Vec<CapGuard> {
     let mut owned = owned_objects_filter(claim.uploaded_by);
-    if let Some(id) = replacing {
+    if let Some(row) = replacing {
         owned.push(Filter {
             field: "id".to_string(),
             operator: FilterOp::NotEqual,
-            value: serde_json::Value::String(id.to_string()),
+            value: serde_json::Value::String(row.id.clone()),
         });
     }
+    let replaces_own = replacing.is_some_and(|row| row.uploaded_by == claim.uploaded_by);
     let size = i64::try_from(claim.size).unwrap_or(i64::MAX);
     let mut guards = vec![CapGuard::SumAtMost {
         field: "size".to_string(),
@@ -474,7 +480,7 @@ fn quota_guards(claim: &PendingClaim<'_>, replacing: Option<&str>) -> Vec<CapGua
         add: size,
         cap: claim.quota.max_storage_bytes,
     }];
-    if claim.quota.max_files_per_bucket > 0 {
+    if claim.quota.max_files_per_bucket > 0 && !replaces_own {
         let mut in_bucket = owned;
         in_bucket.push(Filter {
             field: "bucket".to_string(),
@@ -607,6 +613,8 @@ async fn claim_existing(
 ) -> Result<Reservation, ReserveError> {
     let superseded_blobs = existing.blobs();
     let StoredRow { row, claim_id, .. } = existing;
+    // Before `row`'s fields move into `replaced`.
+    let guards = quota_guards(claim, Some(&row));
     let replaced = match row.status {
         ObjectStatus::Complete => Some(ReplacedObject {
             size: row.size,
@@ -648,10 +656,22 @@ async fn claim_existing(
     // clocks said. And conditional on the caps, with this row left out of
     // them: what it held is replaced by what this claim writes.
     let unchanged = still_claimed_by(&row.id, claim_id.as_deref());
-    let guards = quota_guards(claim, Some(&row.id));
     match db::update_guarded(ctx, TABLE, &unchanged, data, &guards).await? {
         UpdateGuardedResponse::Updated { .. } => {}
-        UpdateGuardedResponse::Refused { guard } => return Err(refused_by(guard)),
+        // The guards are checked before the claim filter, so a refusal does
+        // not say the row was still as read. When another upload has claimed
+        // it since, "another upload holds this key" is the answer that tells
+        // the user what to do, so one read decides which to give.
+        UpdateGuardedResponse::Refused { guard } => {
+            let still_as_read = find_stored(ctx, claim.bucket, claim.key)
+                .await?
+                .is_some_and(|now| now.row.id == row.id && now.claim_id == claim_id);
+            return Err(if still_as_read {
+                refused_by(guard)
+            } else {
+                ReserveError::Held
+            });
+        }
         UpdateGuardedResponse::NoMatch => return Err(ReserveError::Held),
     }
     Ok(Reservation {
@@ -1316,6 +1336,64 @@ mod tests {
             (row.row.size, row.claim_id.as_deref()),
             (5, Some("claim-a")),
             "the row still describes the first claim"
+        );
+    }
+
+    /// A take-over refused by a cap after another upload claimed the row
+    /// since it was read answers `Held` — retry once that upload settles —
+    /// not the quota refusal: the guards are checked before the claim filter,
+    /// so the refusal alone does not say the row was still as read.
+    #[tokio::test]
+    async fn a_refused_take_over_of_a_row_claimed_since_it_was_read_is_held() {
+        let ctx = crate::test_support::TestContext::with_files().await;
+        seed(
+            &ctx,
+            crate::util::json_map(json!({
+                "bucket": "assets",
+                "key": "same.txt",
+                "size": 3,
+                "status": ObjectStatus::Complete,
+                "uploaded_by": "alice",
+                "uploaded_at": "2026-05-06T10:00:00Z",
+            })),
+        )
+        .await
+        .expect("seed a stored object");
+        let stale_read = find_stored(&ctx, "assets", "same.txt")
+            .await
+            .expect("read")
+            .expect("the row");
+        reserve_upload(
+            &ctx,
+            "assets",
+            "same.txt",
+            4,
+            "text/plain",
+            "carol",
+            &QuotaConfig::effective_default(),
+        )
+        .await
+        .expect("carol takes the row over");
+
+        let tiny = QuotaConfig {
+            max_storage_bytes: 1,
+            ..QuotaConfig::effective_default()
+        };
+        let bob = PendingClaim {
+            bucket: "assets",
+            key: "same.txt",
+            size: 9,
+            content_type: "text/plain",
+            uploaded_by: "bob",
+            uploaded_at: "2026-05-06T10:00:02Z",
+            claim_id: "claim-bob",
+            quota: &tiny,
+        };
+        let refused = claim_existing(&ctx, stale_read, &bob).await;
+
+        assert!(
+            matches!(refused, Err(ReserveError::Held)),
+            "carol's upload holds the key: {refused:?}"
         );
     }
 

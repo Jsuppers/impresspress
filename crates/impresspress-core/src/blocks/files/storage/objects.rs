@@ -1760,6 +1760,57 @@ mod integration_tests {
         );
     }
 
+    /// A user already over the per-bucket cap — an admin lowered it below
+    /// what they hold — can still overwrite their own file: the overwrite adds
+    /// no file, so the count guard is not set on it. A new file in that
+    /// bucket is still refused.
+    #[tokio::test]
+    async fn a_user_over_the_bucket_cap_can_still_replace_their_own_file() {
+        let (ctx, storage) = alice_capped_at_files_per_bucket_with_storage(2).await;
+        for key in ["one.txt", "two.txt", "three.txt"] {
+            repo::objects::seed(
+                &ctx,
+                crate::util::json_map(serde_json::json!({
+                    "bucket": "a",
+                    "key": key,
+                    "size": 5,
+                    "content_type": "text/plain",
+                    "status": ObjectStatus::Complete,
+                    "uploaded_by": "alice",
+                    "uploaded_at": "2026-09-01T00:00:00+00:00",
+                })),
+            )
+            .await
+            .expect("seed one of alice's files");
+        }
+
+        let replace = alice_uploads(&ctx, "a", "one.txt").await;
+        assert_eq!(
+            output_json(replace).await["uploaded"],
+            serde_json::json!(true),
+            "replacing her own file adds none, over the cap or not",
+        );
+        assert_eq!(
+            repo::objects::count_for_uploader_in_bucket(&ctx, "alice", "a")
+                .await
+                .expect("count"),
+            3,
+        );
+
+        let new_file = alice_uploads(&ctx, "a", "four.txt").await;
+        assert!(
+            output_is_error(new_file, "InvalidArgument").await,
+            "a new file in a bucket over its cap is still refused",
+        );
+        assert!(
+            !storage
+                .blob_keys("a")
+                .iter()
+                .any(|blob| blob.ends_with("four.txt")),
+            "nothing may be stored for a refused upload"
+        );
+    }
+
     /// An upload still in flight counts against the bucket's cap, as its bytes
     /// count against the storage cap: an upload whose check runs after
     /// another upload's reservation has landed sees that reservation and is
