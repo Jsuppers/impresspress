@@ -2447,8 +2447,9 @@ fn real_crypto_service() -> wafer_block_crypto::service::Argon2JwtCryptoService 
 /// that map's iteration order, which `RandomState` randomizes per map. Two
 /// mints of an identical claim set therefore produce byte-identical tokens
 /// only when the two maps happen to agree, measured at about once in forty
-/// thousand for the refresh token's payload of nine claims. `iat`/`exp` are whole seconds, so
-/// a second mint also has to land inside the first one's second.
+/// thousand for the refresh token's payload of nine claims. `iat`/`exp` are
+/// whole seconds, so a second mint also has to land inside the first one's
+/// second.
 ///
 /// Neither is a property a handler may rely on: the first is a coin the
 /// standard library flips, and the second is ordinary in production (a client

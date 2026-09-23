@@ -47,9 +47,10 @@
 //! A third gate stops the inventory being walked around: in a gated file
 //! `err_internal` may only be called by name, never renamed, stored, wrapped
 //! in a macro, or wrapped in a function, trait default method or bound
-//! closure that forwards its caller's error. Everywhere else the blind spot stands —
-//! an empty `STILL_HAND_MAPPED` means no file writes the *shape*, not that
-//! every refusal is classified — and `NOT_YET_GATED` lists where it stands.
+//! closure that forwards its caller's error. Everywhere else the blind spot
+//! stands — an empty `STILL_HAND_MAPPED` means no file writes the *shape*,
+//! not that every refusal is classified — and `NOT_YET_GATED` lists where it
+//! stands.
 //!
 //! What the inventory does NOT see, in a gated file or anywhere: a database
 //! failure answered through `err_internal_no_cause` or

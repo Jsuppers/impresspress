@@ -1226,11 +1226,11 @@ pub(crate) mod helpers {
             let refresh = crypto::verify(&ctx, &refresh_token)
                 .await
                 .expect("verify refresh token");
+            let access_jti = jti(&access).expect("the access token carries a jti");
             let refresh_jti = jti(&refresh).expect("the refresh token carries a jti");
             assert_eq!(refresh_jti.len(), 32, "a 16-byte nonce, hex: {refresh_jti}");
             assert_ne!(
-                Some(refresh_jti),
-                jti(&access),
+                refresh_jti, access_jti,
                 "the refresh token's jti must be its own draw, not the access token's"
             );
         }
