@@ -3211,7 +3211,7 @@ async fn seed_a_deleted_product_with_a_money_surface(
     use super::super::{
         contracts::PricingPreviewRequest,
         offer_pricing,
-        repo::{offers as offer_repo, payment_links, products},
+        repo::{offers as offer_repo, products},
     };
 
     let offer_id = seed_published_offer(ctx, product_id).await;
@@ -3228,12 +3228,10 @@ async fn seed_a_deleted_product_with_a_money_surface(
         offer_pricing::InputScope::Management,
     )
     .expect("price the offer");
-    let link_id =
-        payment_links::create_pending(ctx, &offer_id, "", "", "", false, "close-me", &preview, 0)
-            .await
-            .expect("a pending Payment Link")
-            .managed
-            .id;
+    let link_id = seed_pending_payment_link(ctx, &offer_id, "close-me", &preview)
+        .await
+        .managed
+        .id;
 
     products::soft_delete(ctx, product_id)
         .await

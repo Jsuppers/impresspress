@@ -3601,19 +3601,7 @@ async fn payment_link_deactivation_classifies_a_provider_rejection_as_terminal()
         offer_pricing::InputScope::Management,
     )
     .unwrap();
-    let pending = repo::payment_links::create_pending(
-        &ctx,
-        &offer_id,
-        "",
-        "",
-        "",
-        false,
-        "deactivate-config",
-        &preview,
-        0,
-    )
-    .await
-    .unwrap();
+    let pending = seed_pending_payment_link(&ctx, &offer_id, "deactivate-config", &preview).await;
     let link_id = pending.managed.id;
     repo::payment_links::mark_synced(
         &ctx,
@@ -4161,19 +4149,8 @@ async fn synced_offer_archive_is_provider_first_retryable_and_idempotent() {
         offer_pricing::InputScope::Management,
     )
     .unwrap();
-    let pending_link = repo::payment_links::create_pending(
-        &ctx,
-        &offer_id,
-        "",
-        "",
-        "",
-        false,
-        "archive-link-config",
-        &preview,
-        0,
-    )
-    .await
-    .unwrap();
+    let pending_link =
+        seed_pending_payment_link(&ctx, &offer_id, "archive-link-config", &preview).await;
     let link_id = pending_link.managed.id;
     repo::payment_links::mark_synced(
         &ctx,
@@ -5275,12 +5252,14 @@ async fn payment_link_retry_adopts_the_link_stripe_created_when_recording_it_fai
     let (product, offer_id, request) =
         seed_payment_link_configuration(&ctx, "product_link_adopt").await;
 
-    // Only `mark_synced` updates the table on a first attempt: the pending
-    // row is a create, so the Stripe call itself goes through.
+    // A first attempt takes two filtered updates on the table: the pending
+    // row's attempt start, then `mark_synced`. Letting the first through
+    // fails only the write after Stripe has answered.
     let failing = crate::test_support::FailingDbOpContext::new(
         ctx.clone(),
-        vec![("database.update", repo::payment_links::TABLE)],
-    );
+        vec![("database.update_where_count", repo::payment_links::TABLE)],
+    )
+    .after_passing(1);
     stripe::create_payment_link(&failing, &product, &offer_id, &request)
         .await
         .expect_err("the local write after Stripe succeeded fails");
@@ -5951,19 +5930,8 @@ async fn payment_link_redelivery_resumes_partial_order_and_backfills_snapshot() 
         offer_pricing::InputScope::Management,
     )
     .unwrap();
-    let pending_link = repo::payment_links::create_pending(
-        &ctx,
-        &offer_id,
-        "",
-        "",
-        "",
-        false,
-        "resume-link-config",
-        &preview,
-        0,
-    )
-    .await
-    .unwrap();
+    let pending_link =
+        seed_pending_payment_link(&ctx, &offer_id, "resume-link-config", &preview).await;
     let link_id = pending_link.managed.id;
     repo::payment_links::mark_synced(
         &ctx,
@@ -6457,19 +6425,8 @@ async fn a_paid_link_for_a_soft_deleted_product_still_reconciles_into_an_order()
         offer_pricing::InputScope::Management,
     )
     .unwrap();
-    let pending_link = repo::payment_links::create_pending(
-        &ctx,
-        &offer_id,
-        "",
-        "",
-        "",
-        false,
-        "deleted-product-link-config",
-        &preview,
-        0,
-    )
-    .await
-    .unwrap();
+    let pending_link =
+        seed_pending_payment_link(&ctx, &offer_id, "deleted-product-link-config", &preview).await;
     let link_id = pending_link.managed.id;
     repo::payment_links::mark_synced(
         &ctx,
@@ -8270,21 +8227,10 @@ async fn payment_link_account_mismatch_is_500_not_a_wrap_denial() {
         offer_pricing::InputScope::Management,
     )
     .unwrap();
-    let link_id = repo::payment_links::create_pending(
-        &ctx,
-        &offer_id,
-        "",
-        "",
-        "",
-        false,
-        "foreign-link-config",
-        &preview,
-        0,
-    )
-    .await
-    .unwrap()
-    .managed
-    .id;
+    let link_id = seed_pending_payment_link(&ctx, &offer_id, "foreign-link-config", &preview)
+        .await
+        .managed
+        .id;
 
     let event = serde_json::json!({
         "id": "evt_payment_link_foreign",

@@ -2255,29 +2255,35 @@ pub(crate) async fn create_payment_link(
         fee_basis_points,
     )
     .map_err(|error| WaferError::new(wafer_run::ErrorCode::InvalidArgument, error))?;
-    let pending = match unfinished {
-        Some(id) => {
-            repo::payment_links::restart_pending(
-                ctx,
-                &id,
-                &seller_account_id,
-                &stripe_account_id,
-                &preview,
-                fee_basis_points,
-            )
-            .await?
+    let link_id = match &unfinished {
+        Some(id) => id.clone(),
+        None => {
+            repo::payment_links::pending_id(ctx, offer_id, &preset_id, &configuration_hash).await?
         }
+    };
+    // The row id travels in the request's metadata, so the request is
+    // complete before the attempt is recorded — and the row can record the
+    // exact bytes its idempotency key covers.
+    push_form(&mut body, "metadata[impresspress_payment_link_id]", &link_id);
+    let idempotency_key = payment_link_idempotency_key(&stripe_account_id, &body);
+    let attempt = repo::payment_links::Attempt {
+        seller_account_id: &seller_account_id,
+        stripe_account_id: &stripe_account_id,
+        pricing_snapshot: &preview,
+        fee_basis_points,
+        request: &body,
+    };
+    let pending = match unfinished {
+        Some(_) => repo::payment_links::restart_pending(ctx, &link_id, &attempt).await?,
         None => {
             repo::payment_links::create_pending(
                 ctx,
+                &link_id,
                 offer_id,
                 &preset_id,
-                &seller_account_id,
-                &stripe_account_id,
                 livemode,
                 &configuration_hash,
-                &preview,
-                fee_basis_points,
+                &attempt,
             )
             .await?
         }
@@ -2285,12 +2291,6 @@ pub(crate) async fn create_payment_link(
     if pending.managed.sync_status == "synced" {
         return Ok(pending.managed);
     }
-    push_form(
-        &mut body,
-        "metadata[impresspress_payment_link_id]",
-        &pending.managed.id,
-    );
-    let idempotency_key = payment_link_idempotency_key(&stripe_account_id, &body);
     let response = match client
         .request_json(
             ctx,
@@ -2331,7 +2331,34 @@ pub(crate) async fn create_payment_link(
     // `payment_link_idempotency_key`) cannot reach it; the log line names the
     // link so it can be reconciled.
     match repo::payment_links::mark_synced(ctx, &pending.managed.id, stripe_id, url).await {
-        Ok(stored) => Ok(stored.managed),
+        Ok(Some(stored)) => Ok(stored.managed),
+        Ok(None) => {
+            // The row was retired between this request and its result — an
+            // owner deactivating it, or a refusal recorded by a twin. No row
+            // will ever point at this link, so it must not stay buyable.
+            deactivate_stripe_payment_link(
+                ctx,
+                &client,
+                &stripe_account_id,
+                stripe_id,
+                &pending.managed.id,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    link_id = %pending.managed.id,
+                    stripe_payment_link_id = %stripe_id,
+                    error = %error,
+                    "Stripe created a Payment Link for a retired row that could not be \
+                     deactivated"
+                );
+                error
+            })?;
+            Err(WaferError::new(
+                wafer_run::ErrorCode::Aborted,
+                "the Payment Link was retired while Stripe created it; retry",
+            ))
+        }
         Err(error) => {
             tracing::error!(
                 link_id = %pending.managed.id,
@@ -2342,6 +2369,31 @@ pub(crate) async fn create_payment_link(
             Err(error)
         }
     }
+}
+
+/// Take a Payment Link down at Stripe. The key is the durable local row id,
+/// so a repeat of the same deactivation is the same request.
+async fn deactivate_stripe_payment_link(
+    ctx: &dyn Context,
+    client: &StripeClient,
+    stripe_account_id: &str,
+    stripe_payment_link_id: &str,
+    link_id: &str,
+) -> Result<(), WaferError> {
+    client
+        .request_json(
+            ctx,
+            "POST",
+            &format!(
+                "/v1/payment_links/{}",
+                crate::util::url_path_encode(stripe_payment_link_id)
+            ),
+            Some(stripe_account_id),
+            Some(&format!("impresspress_deactivate_payment_link_{link_id}")),
+            Some(vec![("active".to_string(), "false".to_string())]),
+        )
+        .await?;
+    Ok(())
 }
 
 /// The Stripe idempotency key for one Payment Link request: a digest of the
@@ -2375,7 +2427,11 @@ pub(crate) async fn deactivate_payment_link(
     if !stored.managed.active {
         return Ok(stored.managed);
     }
-    if stored.stripe_payment_link_id.is_empty() {
+    if stored.stripe_payment_link_id.is_empty() && stored.stripe_request.is_empty() {
+        // The request is written before it is sent, so a row that records
+        // none has nothing at Stripe to take down. (A row written before the
+        // column existed is indistinguishable from one, and deactivates
+        // locally as it always did.)
         return repo::payment_links::deactivate_local(ctx, offer_id, link_id).await;
     }
     if !stripe_secret_operations_allowed(ctx).await {
@@ -2385,20 +2441,87 @@ pub(crate) async fn deactivate_payment_link(
         ));
     }
     let client = StripeClient::load(ctx).await?;
-    client
+    let stripe_payment_link_id = if stored.stripe_payment_link_id.is_empty() {
+        resolve_unrecorded_payment_link(ctx, &client, &stored).await?
+    } else {
+        stored.stripe_payment_link_id.clone()
+    };
+    deactivate_stripe_payment_link(
+        ctx,
+        &client,
+        &stored.stripe_account_id,
+        &stripe_payment_link_id,
+        link_id,
+    )
+    .await?;
+    repo::payment_links::deactivate_local(ctx, offer_id, link_id).await
+}
+
+/// How long Stripe keeps an idempotency key's saved result. Stripe documents
+/// "at least 24 hours"; the shorter end of that promise is the only one a
+/// re-send may rely on.
+const STRIPE_IDEMPOTENCY_KEY_RETENTION_HOURS: i64 = 24;
+
+/// The Stripe link id of a row whose attempt never recorded one.
+///
+/// Re-sends the attempt's own request under its own idempotency key. While
+/// Stripe retains the key it replays the saved result, which names the link
+/// that attempt created — so the link can be deactivated instead of staying
+/// live and buyable behind a local row nobody can see. Past the retention
+/// window a re-send would execute as a fresh request and mint a second live
+/// link, so the row is refused instead: the original link id is in the error
+/// log the failed attempt wrote.
+async fn resolve_unrecorded_payment_link(
+    ctx: &dyn Context,
+    client: &StripeClient,
+    stored: &repo::payment_links::StoredPaymentLink,
+) -> Result<String, WaferError> {
+    let sent_at = chrono::DateTime::parse_from_rfc3339(&stored.stripe_request_at)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("Payment Link request timestamp is unreadable: {error}"),
+            )
+        })?;
+    if chrono::Utc::now() - sent_at
+        > chrono::Duration::hours(STRIPE_IDEMPOTENCY_KEY_RETENTION_HOURS)
+    {
+        return Err(WaferError::new(
+            wafer_run::ErrorCode::Aborted,
+            format!(
+                "Payment Link {} has an unrecorded Stripe request older than Stripe's \
+                 {STRIPE_IDEMPOTENCY_KEY_RETENTION_HOURS} hour idempotency-key retention; \
+                 re-sending it would create a second live link. Deactivate the link this \
+                 row's attempt logged directly at Stripe.",
+                stored.managed.id
+            ),
+        ));
+    }
+    let response = client
         .request_json(
             ctx,
             "POST",
-            &format!(
-                "/v1/payment_links/{}",
-                crate::util::url_path_encode(&stored.stripe_payment_link_id)
-            ),
+            "/v1/payment_links",
             Some(&stored.stripe_account_id),
-            Some(&format!("impresspress_deactivate_payment_link_{link_id}")),
-            Some(vec![("active".to_string(), "false".to_string())]),
+            Some(&payment_link_idempotency_key(
+                &stored.stripe_account_id,
+                &stored.stripe_request,
+            )),
+            Some(stored.stripe_request.clone()),
         )
         .await?;
-    repo::payment_links::deactivate_local(ctx, offer_id, link_id).await
+    let stripe_id = response
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if stripe_id.is_empty() {
+        return Err(WaferError::new(
+            wafer_run::ErrorCode::Internal,
+            "Stripe Payment Link response was incomplete",
+        ));
+    }
+    Ok(stripe_id.to_string())
 }
 
 async fn reconcile_payment_link_session(

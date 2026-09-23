@@ -210,3 +210,36 @@ pub async fn output_is_error(out: OutputStream, expected: ErrorCode) -> bool {
         Err(TerminalNotResponse::Error(e)) if e.code == expected
     )
 }
+
+/// Seed the `syncing` row a first Payment Link synchronization attempt
+/// writes: no preset, the platform account, test mode, no application fee and
+/// no Stripe request in flight. Returns the row.
+pub async fn seed_pending_payment_link(
+    ctx: &TestContext,
+    offer_id: &str,
+    configuration_hash: &str,
+    pricing_snapshot: &crate::blocks::products::contracts::PricingPreview,
+) -> crate::blocks::products::repo::payment_links::StoredPaymentLink {
+    use crate::blocks::products::repo::payment_links;
+
+    let id = payment_links::pending_id(ctx, offer_id, "", configuration_hash)
+        .await
+        .expect("the pending row id");
+    payment_links::create_pending(
+        ctx,
+        &id,
+        offer_id,
+        "",
+        false,
+        configuration_hash,
+        &payment_links::Attempt {
+            seller_account_id: "",
+            stripe_account_id: "",
+            pricing_snapshot,
+            fee_basis_points: 0,
+            request: &[],
+        },
+    )
+    .await
+    .expect("a pending Payment Link")
+}

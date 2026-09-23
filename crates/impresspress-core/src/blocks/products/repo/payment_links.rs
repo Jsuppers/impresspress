@@ -27,6 +27,26 @@ pub(crate) struct StoredPaymentLink {
     pub livemode: bool,
     pub pricing_snapshot: Option<PricingPreview>,
     pub fee_basis_points: u16,
+    /// The form parameters of the attempt this row has in flight, in the
+    /// order they were sent. Empty when no attempt has been sent, which is
+    /// also the state of a row written before the column existed.
+    pub stripe_request: Vec<(String, String)>,
+    /// When [`Self::stripe_request`] was recorded, RFC 3339. Empty alongside
+    /// an empty request.
+    pub stripe_request_at: String,
+}
+
+/// The values one synchronization attempt sends to Stripe on behalf of a row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Attempt<'a> {
+    pub seller_account_id: &'a str,
+    pub stripe_account_id: &'a str,
+    pub pricing_snapshot: &'a PricingPreview,
+    pub fee_basis_points: u16,
+    /// The exact form this attempt sends, which with the account decides its
+    /// idempotency key. Recorded before the request goes out so a
+    /// deactivation can re-send it and learn what Stripe did with it.
+    pub request: &'a [(String, String)],
 }
 
 fn hydrate(record: Record) -> Result<StoredPaymentLink, WaferError> {
@@ -56,6 +76,15 @@ fn hydrate(record: Record) -> Result<StoredPaymentLink, WaferError> {
                 "invalid persisted Payment Link application fee",
             )
         })?;
+    let stripe_request: Vec<(String, String)> = match record.str_field("stripe_request") {
+        "" => Vec::new(),
+        raw => serde_json::from_str(raw).map_err(|error| {
+            WaferError::new(
+                ErrorCode::Internal,
+                format!("invalid persisted Payment Link request: {error}"),
+            )
+        })?,
+    };
     Ok(StoredPaymentLink {
         managed: ManagedPaymentLink {
             id: record.id.clone(),
@@ -73,6 +102,8 @@ fn hydrate(record: Record) -> Result<StoredPaymentLink, WaferError> {
         livemode: record.bool_field("livemode"),
         pricing_snapshot,
         fee_basis_points,
+        stripe_request,
+        stripe_request_at: record.str_field("stripe_request_at").to_string(),
     })
 }
 
@@ -84,27 +115,23 @@ fn offer_filter(offer_id: &str) -> Filter {
     }
 }
 
-/// The values one synchronization attempt sends to Stripe on behalf of a row.
-/// A retry of the same configuration rewrites them, so the row always
-/// describes the attempt that is in flight.
-fn attempt_fields(
-    seller_account_id: &str,
-    stripe_account_id: &str,
-    pricing_snapshot: &PricingPreview,
-    fee_basis_points: u16,
-) -> Result<HashMap<String, Value>, WaferError> {
+/// The columns one synchronization attempt writes on its row. A retry of the
+/// same configuration rewrites them, so the row always describes the attempt
+/// that is in flight.
+fn attempt_fields(attempt: &Attempt<'_>) -> Result<HashMap<String, Value>, WaferError> {
+    let now = chrono::Utc::now().to_rfc3339();
     Ok(HashMap::from([
         (
             "seller_account_id".to_string(),
-            Value::String(seller_account_id.to_string()),
+            Value::String(attempt.seller_account_id.to_string()),
         ),
         (
             "stripe_account_id".to_string(),
-            Value::String(stripe_account_id.to_string()),
+            Value::String(attempt.stripe_account_id.to_string()),
         ),
         (
             "pricing_snapshot".to_string(),
-            Value::String(serde_json::to_string(pricing_snapshot).map_err(|error| {
+            Value::String(serde_json::to_string(attempt.pricing_snapshot).map_err(|error| {
                 WaferError::new(
                     ErrorCode::Internal,
                     format!("could not encode Payment Link pricing snapshot: {error}"),
@@ -113,17 +140,24 @@ fn attempt_fields(
         ),
         (
             "fee_basis_points".to_string(),
-            Value::from(fee_basis_points),
+            Value::from(attempt.fee_basis_points),
         ),
+        (
+            "stripe_request".to_string(),
+            Value::String(serde_json::to_string(attempt.request).map_err(|error| {
+                WaferError::new(
+                    ErrorCode::Internal,
+                    format!("could not encode Payment Link request: {error}"),
+                )
+            })?),
+        ),
+        ("stripe_request_at".to_string(), Value::String(now.clone())),
         (
             "sync_status".to_string(),
             Value::String("syncing".to_string()),
         ),
         ("sync_error".to_string(), Value::String(String::new())),
-        (
-            "updated_at".to_string(),
-            Value::String(chrono::Utc::now().to_rfc3339()),
-        ),
+        ("updated_at".to_string(), Value::String(now)),
     ]))
 }
 
@@ -195,45 +229,50 @@ fn configuration_link_id(
         .to_string()
 }
 
-/// Insert the current generation's row for a configuration (unless a
-/// concurrent attempt already did) and start an attempt on it; see
-/// [`restart_pending`] for what comes back.
+/// The row id the next attempt at a configuration uses when no active row
+/// exists for it: the id of the configuration's current generation.
 ///
 /// The generation is the number of retired rows for the configuration. Rows
 /// are never deleted and a retired row never comes back, so the count only
-/// grows and every retired row's generation is below it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "`ctx` plus one argument for each value the pending payment-link \
-              row records"
-)]
-pub(crate) async fn create_pending(
+/// grows and every retired row's generation is below it. The caller needs
+/// the id before the row is written, because the id travels in the Stripe
+/// request's metadata and therefore decides the request's idempotency key.
+pub(crate) async fn pending_id(
     ctx: &dyn Context,
     offer_id: &str,
     preset_id: &str,
-    seller_account_id: &str,
-    stripe_account_id: &str,
-    livemode: bool,
     configuration_hash: &str,
-    pricing_snapshot: &PricingPreview,
-    fee_basis_points: u16,
-) -> Result<StoredPaymentLink, WaferError> {
+) -> Result<String, WaferError> {
     let generation = db::count(
         ctx,
         TABLE,
         &configuration_filters(offer_id, preset_id, configuration_hash, false),
     )
     .await?;
-    let id = configuration_link_id(offer_id, preset_id, configuration_hash, generation);
-    let mut data = attempt_fields(
-        seller_account_id,
-        stripe_account_id,
-        pricing_snapshot,
-        fee_basis_points,
-    )?;
+    Ok(configuration_link_id(
+        offer_id,
+        preset_id,
+        configuration_hash,
+        generation,
+    ))
+}
+
+/// Insert the row [`pending_id`] named (unless a concurrent attempt already
+/// did) and start an attempt on it; see [`restart_pending`] for what comes
+/// back.
+pub(crate) async fn create_pending(
+    ctx: &dyn Context,
+    id: &str,
+    offer_id: &str,
+    preset_id: &str,
+    livemode: bool,
+    configuration_hash: &str,
+    attempt: &Attempt<'_>,
+) -> Result<StoredPaymentLink, WaferError> {
+    let mut data = attempt_fields(attempt)?;
     let created_at = data["updated_at"].clone();
     data.extend([
-        ("id".to_string(), Value::String(id.clone())),
+        ("id".to_string(), Value::String(id.to_string())),
         ("offer_id".to_string(), Value::String(offer_id.to_string())),
         (
             "preset_id".to_string(),
@@ -266,15 +305,7 @@ pub(crate) async fn create_pending(
         OnConflict::SetColumns(Vec::new()),
     )
     .await?;
-    restart_pending(
-        ctx,
-        &id,
-        seller_account_id,
-        stripe_account_id,
-        pricing_snapshot,
-        fee_basis_points,
-    )
-    .await
+    restart_pending(ctx, id, attempt).await
 }
 
 /// Start an attempt on an active, not-yet-synced row: put it in `syncing`
@@ -287,10 +318,7 @@ pub(crate) async fn create_pending(
 pub(crate) async fn restart_pending(
     ctx: &dyn Context,
     id: &str,
-    seller_account_id: &str,
-    stripe_account_id: &str,
-    pricing_snapshot: &PricingPreview,
-    fee_basis_points: u16,
+    attempt: &Attempt<'_>,
 ) -> Result<StoredPaymentLink, WaferError> {
     let started = db::update_by_filters_count(
         ctx,
@@ -304,12 +332,7 @@ pub(crate) async fn restart_pending(
             },
             not_synced_filter(),
         ],
-        attempt_fields(
-            seller_account_id,
-            stripe_account_id,
-            pricing_snapshot,
-            fee_basis_points,
-        )?,
+        attempt_fields(attempt)?,
     )
     .await?;
     let stored = hydrate(db::get(ctx, TABLE, id).await?)?;
@@ -322,36 +345,53 @@ pub(crate) async fn restart_pending(
     Ok(stored)
 }
 
+/// Record the link Stripe created against its row, but only while the row is
+/// still active. `None` means the row was retired while Stripe was minting
+/// the link: nothing local will ever point at that link, so the caller has to
+/// take it down at Stripe rather than leave a live link no row records.
+///
+/// A row a concurrent twin already marked `synced` is updated again — both
+/// attempts hold the same link id under the same idempotency key, so the
+/// write is the same write.
 pub(crate) async fn mark_synced(
     ctx: &dyn Context,
     id: &str,
     stripe_payment_link_id: &str,
     url: &str,
-) -> Result<StoredPaymentLink, WaferError> {
-    hydrate(
-        db::update(
-            ctx,
-            TABLE,
-            id,
-            HashMap::from([
-                (
-                    "stripe_payment_link_id".to_string(),
-                    Value::String(stripe_payment_link_id.to_string()),
-                ),
-                ("url".to_string(), Value::String(url.to_string())),
-                (
-                    "sync_status".to_string(),
-                    Value::String("synced".to_string()),
-                ),
-                ("sync_error".to_string(), Value::String(String::new())),
-                (
-                    "updated_at".to_string(),
-                    Value::String(chrono::Utc::now().to_rfc3339()),
-                ),
-            ]),
-        )
-        .await?,
+) -> Result<Option<StoredPaymentLink>, WaferError> {
+    let recorded = db::update_by_filters_count(
+        ctx,
+        TABLE,
+        vec![
+            id_filter(id),
+            Filter {
+                field: "active".to_string(),
+                operator: FilterOp::Equal,
+                value: Value::Bool(true),
+            },
+        ],
+        HashMap::from([
+            (
+                "stripe_payment_link_id".to_string(),
+                Value::String(stripe_payment_link_id.to_string()),
+            ),
+            ("url".to_string(), Value::String(url.to_string())),
+            (
+                "sync_status".to_string(),
+                Value::String("synced".to_string()),
+            ),
+            ("sync_error".to_string(), Value::String(String::new())),
+            (
+                "updated_at".to_string(),
+                Value::String(chrono::Utc::now().to_rfc3339()),
+            ),
+        ]),
     )
+    .await?;
+    if recorded == 0 {
+        return Ok(None);
+    }
+    hydrate(db::get(ctx, TABLE, id).await?).map(Some)
 }
 
 /// Record an attempt whose outcome at Stripe is unknown (a transport

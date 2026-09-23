@@ -11,7 +11,8 @@ use super::{
     },
     harness::{
         admin_create_msg, admin_get_msg, create_msg, ctx, ctx_with, delete_msg, dispatch,
-        output_is_error, output_to_json, request_msg, seed, update_msg,
+        output_is_error, output_to_json, request_msg, seed, seed_pending_payment_link,
+        update_msg,
     },
 };
 use crate::util::RecordExt;
@@ -759,13 +760,10 @@ async fn an_admin_can_close_a_soft_deleted_products_money_surface() {
         offer_pricing::InputScope::Management,
     )
     .unwrap();
-    let link_id = repo::payment_links::create_pending(
-        &test_ctx, &offer_id, "", "", "", false, "close-me", &preview, 0,
-    )
-    .await
-    .unwrap()
-    .managed
-    .id;
+    let link_id = seed_pending_payment_link(&test_ctx, &offer_id, "close-me", &preview)
+        .await
+        .managed
+        .id;
 
     repo::products::soft_delete(&test_ctx, "product_gone")
         .await
