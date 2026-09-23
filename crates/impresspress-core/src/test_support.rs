@@ -24,6 +24,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use wafer_core::interfaces::crypto::service::{CryptoError, CryptoService};
 use wafer_run::{
     context::Context,
     streams::output::{BufferedResponse, TerminalNotResponse},
@@ -2402,22 +2403,174 @@ impl Context for EcholessWriteContext {
     }
 }
 
+/// The JWT secret the registered `wafer-run/crypto` block signs with.
+///
+/// Distinct from [`TEST_JWT_SECRET`], which is what the hand-rolled
+/// [`access_token_for`] signs with; this one is long enough for
+/// `Argon2JwtCryptoService`'s minimum.
+const CRYPTO_BLOCK_JWT_SECRET: &str = "test-jwt-secret-padded-to-min-32-bytes-aaaa";
+
 impl TestContext {
     /// [`TestContext::with_auth`] plus a real `wafer-run/crypto` block, so
     /// handlers that mint or verify JWTs (login, signup, refresh) run end to
     /// end against a fixed test secret.
     pub async fn with_auth_and_crypto() -> Self {
+        Self::with_auth_and_crypto_service(Arc::new(real_crypto_service())).await
+    }
+
+    /// [`TestContext::with_auth_and_crypto`] over [`PinnedMintCrypto`]: every
+    /// token the test mints is signed as if two mints of one claim set were
+    /// the same mint. Use it to decide what a handler does when two tokens
+    /// would otherwise be indistinguishable.
+    pub async fn with_auth_and_pinned_mint_crypto() -> Self {
+        Self::with_auth_and_crypto_service(Arc::new(PinnedMintCrypto::new())).await
+    }
+
+    async fn with_auth_and_crypto_service(svc: Arc<dyn CryptoService>) -> Self {
         let mut ctx = Self::with_auth().await;
-        let svc = Arc::new(
-            wafer_block_crypto::service::Argon2JwtCryptoService::new(
-                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-            )
-            .expect("test secret is long enough"),
-        );
         let crypto_block: Arc<dyn wafer_run::Block> =
             Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
         ctx.register_block("wafer-run/crypto", crypto_block);
         ctx
+    }
+}
+
+fn real_crypto_service() -> wafer_block_crypto::service::Argon2JwtCryptoService {
+    wafer_block_crypto::service::Argon2JwtCryptoService::new(CRYPTO_BLOCK_JWT_SECRET.to_string())
+        .expect("test secret is long enough")
+}
+
+/// The production crypto service with the two things that make one claim set
+/// mint two different tokens pinned: the clock, and the claim order.
+///
+/// A JWT payload is `serde_json` over a `HashMap`, so its keys come out in
+/// that map's iteration order, which `RandomState` randomizes per map. Two
+/// mints of an identical claim set therefore produce byte-identical tokens
+/// only when the two maps happen to agree, measured at about once in fifty
+/// thousand for a payload of eight claims. `iat`/`exp` are whole seconds, so
+/// a second mint also has to land inside the first one's second.
+///
+/// Neither is a property a handler may rely on: the first is a coin the
+/// standard library flips, and the second is ordinary in production (a client
+/// that refreshes right after logging in). A test that has to state what
+/// happens when two mints are indistinguishable cannot wait for a
+/// coincidence that rare, so this service makes it certain instead:
+/// every token is stamped with the instant this service was built, and every
+/// payload is written in sorted-key order. A mint path that needs its tokens
+/// to differ has to put something that differs in the claims, and a test over
+/// this service is what proves it does.
+///
+/// It re-encodes what the real service signed rather than signing from
+/// scratch — same header, same key derivation, same claims, each token
+/// keeping its own lifetime — so it stays a pin on the payload, not a second
+/// implementation of JWT signing.
+pub struct PinnedMintCrypto {
+    inner: wafer_block_crypto::service::Argon2JwtCryptoService,
+    /// The `iat` every token minted through this service carries.
+    minted_at: i64,
+}
+
+impl Default for PinnedMintCrypto {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PinnedMintCrypto {
+    pub fn new() -> Self {
+        Self {
+            inner: real_crypto_service(),
+            minted_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    /// Re-encode `token`'s payload with sorted keys and this service's pinned
+    /// `iat`, then re-sign it with `key`. The token's lifetime (`exp - iat`)
+    /// is carried over from what the inner service stamped.
+    fn pin(&self, token: String, key: &[u8]) -> Result<String, CryptoError> {
+        use wafer_block_crypto::primitives::{b64url_decode, b64url_encode, hmac_sha256};
+
+        let mut parts = token.split('.');
+        let (Some(header), Some(payload), Some(_signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(CryptoError::SignError(format!(
+                "the crypto service did not return a compact JWT: {token}"
+            )));
+        };
+        let mut claims: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&b64url_decode(payload)?).map_err(|e| {
+                CryptoError::SignError(format!("JWT payload is not an object: {e}"))
+            })?;
+
+        let iat = claims
+            .get("iat")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| CryptoError::SignError("JWT payload has no iat".to_string()))?;
+        let exp = claims
+            .get("exp")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| CryptoError::SignError("JWT payload has no exp".to_string()))?;
+        claims.insert("iat".to_string(), serde_json::json!(self.minted_at));
+        claims.insert(
+            "exp".to_string(),
+            serde_json::json!(self.minted_at + exp - iat),
+        );
+
+        let canonical = serde_json::to_string(&claims)
+            .map_err(|e| CryptoError::SignError(format!("re-encoding the JWT payload: {e}")))?;
+        let signing_input = format!("{header}.{}", b64url_encode(canonical.as_bytes()));
+        let signature = hmac_sha256(key, signing_input.as_bytes());
+        Ok(format!("{signing_input}.{}", b64url_encode(&signature)))
+    }
+}
+
+impl CryptoService for PinnedMintCrypto {
+    fn hash(&self, password: &str) -> Result<String, CryptoError> {
+        self.inner.hash(password)
+    }
+
+    fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+        self.inner.compare_hash(password, hash)
+    }
+
+    fn sign(
+        &self,
+        claims: HashMap<String, serde_json::Value>,
+        expiry: std::time::Duration,
+    ) -> Result<String, CryptoError> {
+        let signed = self.inner.sign(claims, expiry)?;
+        self.pin(signed, CRYPTO_BLOCK_JWT_SECRET.as_bytes())
+    }
+
+    fn verify(&self, token: &str) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
+        self.inner.verify(token)
+    }
+
+    fn sign_for(
+        &self,
+        block_id: &str,
+        claims: HashMap<String, serde_json::Value>,
+        expiry: std::time::Duration,
+    ) -> Result<String, CryptoError> {
+        let signed = self.inner.sign_for(block_id, claims, expiry)?;
+        let derived = wafer_block_crypto::primitives::derive_block_key(
+            CRYPTO_BLOCK_JWT_SECRET.as_bytes(),
+            block_id,
+        );
+        self.pin(signed, derived.as_bytes())
+    }
+
+    fn verify_for(
+        &self,
+        block_id: &str,
+        token: &str,
+    ) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
+        self.inner.verify_for(block_id, token)
+    }
+
+    fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+        self.inner.random_bytes(n)
     }
 }
 

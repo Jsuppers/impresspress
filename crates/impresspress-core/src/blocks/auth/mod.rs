@@ -680,6 +680,15 @@ pub(crate) mod helpers {
     /// in-flight JWT (SEC-042) without affecting other live sessions for
     /// the same user.
     ///
+    /// Refresh tokens carry one too, for a different reason: everything else
+    /// on a refresh JWT is the same on both sides of a rotation — same user,
+    /// same family, same auth method, same issuer — and `iat`/`exp` are whole
+    /// seconds. Without a per-token nonce, a rotation inside the second its
+    /// predecessor was minted in differs from that predecessor only in the
+    /// order a `HashMap` happened to serialize the payload in; when that
+    /// order repeats, the successor IS the predecessor, and its
+    /// `token_hash` collides with the row the rotation has just revoked.
+    ///
     /// Access tokens also carry the user's current `auth_version` (P2c) —
     /// see the module-level docs above `current_auth_version` — so a later
     /// password-change/disable/role-change bump invalidates this token on
@@ -692,22 +701,30 @@ pub(crate) mod helpers {
         auth_method: &str,
         family: Option<&str>,
     ) -> std::result::Result<(String, String, String), wafer_run::OutputStream> {
-        // SEC-042: per-token random id so logout can revoke a single JWT
-        // without touching other live sessions for the same user. When
-        // minting a brand-new family (`family` is `None`), draw the family
-        // id and jti from a single 32-byte host call and split it into two
-        // 16-byte halves (first half -> family, second half -> jti) instead
-        // of two sequential 16-byte round-trips — each `crypto::random_bytes`
-        // call is a host round-trip on Cloudflare.
-        let (family, jti) = match family {
-            Some(f) => match crypto::random_bytes(ctx, 16).await {
-                Ok(bytes) => (f.to_string(), hex_encode(&bytes)),
-                Err(e) => return Err(wafer_run::OutputStream::error(e)),
-            },
-            None => match crypto::random_bytes(ctx, 32).await {
-                Ok(bytes) => (hex_encode(&bytes[..16]), hex_encode(&bytes[16..])),
-                Err(e) => return Err(wafer_run::OutputStream::error(e)),
-            },
+        // Two per-token random ids: the access token's (SEC-042: logout
+        // revokes a single JWT without touching the user's other live
+        // sessions) and the refresh token's (what makes one rotation's
+        // output differ from the mint before it — see the doc comment).
+        // Both, plus the family id when minting a brand-new family
+        // (`family` is `None`), come out of ONE `crypto::random_bytes` call
+        // split into 16-byte pieces, because each call is a host round-trip
+        // on Cloudflare.
+        let want = if family.is_some() { 32 } else { 48 };
+        let bytes = match crypto::random_bytes(ctx, want).await {
+            Ok(bytes) => bytes,
+            Err(e) => return Err(wafer_run::OutputStream::error(e)),
+        };
+        let (family, jti, refresh_jti) = match family {
+            Some(f) => (
+                f.to_string(),
+                hex_encode(&bytes[..16]),
+                hex_encode(&bytes[16..]),
+            ),
+            None => (
+                hex_encode(&bytes[..16]),
+                hex_encode(&bytes[16..32]),
+                hex_encode(&bytes[32..]),
+            ),
         };
 
         let access_lifetime_secs = access_token_lifetime_secs(ctx).await;
@@ -801,6 +818,11 @@ pub(crate) mod helpers {
             serde_json::Value::String(auth_method.to_string()),
         );
         refresh_claims.insert("iss".to_string(), serde_json::Value::String(issuer.clone()));
+        // The nonce that makes this token its own. Never read back: a refresh
+        // token is identified by the `token_hash` of the whole JWT
+        // (`repo::tokens`), and `verify_access_token` refuses anything whose
+        // `type` is not `access` before it looks at a `jti` at all.
+        refresh_claims.insert("jti".to_string(), serde_json::Value::String(refresh_jti));
 
         let refresh_token = crypto::sign(
             ctx,
