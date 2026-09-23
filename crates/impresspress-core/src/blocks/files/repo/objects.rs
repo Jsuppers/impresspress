@@ -203,6 +203,10 @@ pub struct ReplacedObject {
 pub struct Reservation {
     /// Row id of the reservation — a new row, or the row it took over.
     pub id: String,
+    /// The bucket the claimed key is in.
+    pub bucket: String,
+    /// The claimed key.
+    pub key: String,
     /// This reservation's token, written to the row's `claim_id` column when
     /// the claim was taken. Random per reservation, so the row still carries
     /// it exactly as long as no other reservation has taken the row since —
@@ -300,6 +304,8 @@ pub async fn reserve_upload(
     if let Some(id) = insert_unless_taken(ctx, &claim).await? {
         return Ok(Reservation {
             id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
             claim_id,
             replaced: None,
         });
@@ -427,6 +433,8 @@ async fn claim_existing(
     }
     Ok(Reservation {
         id: row.id,
+        bucket: claim.bucket.to_string(),
+        key: claim.key.to_string(),
         claim_id: claim.claim_id.to_string(),
         replaced,
     })
@@ -482,11 +490,11 @@ async fn insert_unless_taken(
     Ok((inserted > 0).then_some(id))
 }
 
-/// The refusal [`mark_complete`] and [`release_reservation`] answer when the
-/// row no longer carries the reservation's `claim_id`: it passed
-/// [`PENDING_RESERVATION_TTL_SECONDS`] and another upload took the key over,
-/// or the uploader's sweep deleted it. Either way the row is not this
-/// reservation's to settle.
+/// The refusal [`release_reservation`] answers when the row no longer carries
+/// the reservation's `claim_id`: another upload took the key over after the
+/// reservation passed [`PENDING_RESERVATION_TTL_SECONDS`], the uploader's
+/// sweep removed it, or the object or its bucket was deleted meanwhile.
+/// Whichever it was, the row is not this reservation's to put back or delete.
 fn claim_lost() -> WaferError {
     WaferError::new(
         ErrorCode::Aborted,
@@ -526,24 +534,85 @@ pub async fn release_reservation(
     Ok(())
 }
 
+/// How [`mark_complete`] settled a [`Reservation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// The row still carried this reservation and now records the upload.
+    Completed,
+    /// The key's row belongs to another upload: this reservation outlived
+    /// [`PENDING_RESERVATION_TTL_SECONDS`] and was taken over, or the key was
+    /// deleted and claimed again since.
+    TakenOver,
+    /// The key has no row at all: the object or its bucket was deleted while
+    /// the upload was in flight (or the uploader's sweep removed the
+    /// reservation). Nothing records the bytes the upload stored.
+    Deleted,
+}
+
 /// Flip a reservation's [`ObjectStatus::Pending`] row to
 /// [`ObjectStatus::Complete`] after its storage upload succeeded — the only
 /// thing that settles a [`Reservation`] as a stored object.
 ///
-/// Only while the row still carries this reservation's `claim_id`; otherwise
-/// [`ErrorCode::Aborted`] and nothing is written — the row belongs to another
-/// upload now, whose own completion is the one that settles it.
+/// Only while the row still carries this reservation's `claim_id`. When it
+/// does not, nothing is written, and the key's row is read again to say why:
+/// [`Completion::TakenOver`] when another upload holds the key,
+/// [`Completion::Deleted`] when nothing does. A database failure is an `Err`,
+/// never one of those.
 ///
 /// A row left `pending` is swept within the hour
-/// (`quota::sweep_stale_pending`), so this failing means the upload is not
+/// (`quota::sweep_stale_pending`), so an `Err` means the upload is not
 /// recorded: the caller reports it rather than answering `uploaded: true`.
-pub async fn mark_complete(ctx: &dyn Context, reservation: &Reservation) -> Result<(), WaferError> {
+pub async fn mark_complete(
+    ctx: &dyn Context,
+    reservation: &Reservation,
+) -> Result<Completion, WaferError> {
     let data = crate::util::json_map(serde_json::json!({ "status": ObjectStatus::Complete }));
     let mine = still_claimed_by(&reservation.id, Some(&reservation.claim_id));
-    if db::update_by_filters_count(ctx, TABLE, mine, data).await? == 0 {
-        return Err(claim_lost());
+    if db::update_by_filters_count(ctx, TABLE, mine, data).await? > 0 {
+        return Ok(Completion::Completed);
     }
-    Ok(())
+    Ok(
+        match find_by_bucket_key(ctx, &reservation.bucket, &reservation.key).await? {
+            Some(_) => Completion::TakenOver,
+            None => Completion::Deleted,
+        },
+    )
+}
+
+/// Claim `(bucket, key)` only if it has no row at all, as a `Pending`
+/// reservation of zero bytes. `None` when any row holds the key.
+///
+/// For a caller that must touch the key's blob without an upload of its own
+/// — deleting bytes nothing records — and must not do so while an upload
+/// holds the key, whose bytes the blob may already be. Holding the row is
+/// what makes the blob this caller's to touch; [`release_reservation`] gives
+/// it back.
+pub async fn claim_vacant_key(
+    ctx: &dyn Context,
+    bucket: &str,
+    key: &str,
+    uploaded_by: &str,
+) -> Result<Option<Reservation>, WaferError> {
+    let uploaded_at = crate::util::now_rfc3339();
+    let claim_id = uuid::Uuid::new_v4().to_string();
+    let claim = PendingClaim {
+        bucket,
+        key,
+        size: 0,
+        content_type: "application/octet-stream",
+        uploaded_by,
+        uploaded_at: &uploaded_at,
+        claim_id: &claim_id,
+    };
+    Ok(insert_unless_taken(ctx, &claim)
+        .await?
+        .map(|id| Reservation {
+            id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            claim_id,
+            replaced: None,
+        }))
 }
 
 /// Delete every object row in `bucket` (bucket-deletion metadata cleanup).
@@ -756,6 +825,23 @@ pub async fn list_all(ctx: &dyn Context) -> Result<Vec<ObjectRow>, WaferError> {
         .iter()
         .map(ObjectRow::from_record)
         .collect()
+}
+
+/// Test helper: set the `uploaded_at` of the key's row, to age a reservation.
+#[cfg(test)]
+pub async fn backdate_upload(
+    ctx: &dyn Context,
+    bucket: &str,
+    key: &str,
+    uploaded_at: &str,
+) -> Result<i64, WaferError> {
+    db::update_by_filters_count(
+        ctx,
+        TABLE,
+        bucket_key_filters(bucket, key),
+        crate::util::json_map(serde_json::json!({ "uploaded_at": uploaded_at })),
+    )
+    .await
 }
 
 /// Test helper: every row of `TABLE`, undecoded — each column exactly as
@@ -973,12 +1059,12 @@ mod tests {
             .expect("bob takes over the orphan");
         assert_eq!(bob.id, alice.id, "one key, one row");
 
-        let completed = mark_complete(&ctx, &alice).await;
+        let completed = mark_complete(&ctx, &alice).await.expect("the row is read");
         let released = release_reservation(&ctx, &alice).await;
 
         assert_eq!(
-            completed.map_err(|e| e.code),
-            Err(ErrorCode::Aborted),
+            completed,
+            Completion::TakenOver,
             "alice no longer holds the row"
         );
         assert_eq!(
@@ -994,9 +1080,11 @@ mod tests {
             "bob's upload is still in flight and must stay so"
         );
 
-        mark_complete(&ctx, &bob)
-            .await
-            .expect("bob settles his own reservation");
+        assert_eq!(
+            mark_complete(&ctx, &bob).await.expect("the row is read"),
+            Completion::Completed,
+            "bob settles his own reservation"
+        );
     }
 
     /// A key held by the uploader's OWN fresh reservation is refused with
@@ -1024,8 +1112,10 @@ mod tests {
             matches!(other, Err(ReserveError::Held)),
             "bob is told another upload holds it: {other:?}"
         );
-        mark_complete(&ctx, &first)
-            .await
-            .expect("neither refusal touched alice's reservation");
+        assert_eq!(
+            mark_complete(&ctx, &first).await.expect("the row is read"),
+            Completion::Completed,
+            "neither refusal touched alice's reservation"
+        );
     }
 }

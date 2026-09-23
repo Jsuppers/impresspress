@@ -17,7 +17,10 @@ use crate::{
             contracts::{
                 DeletedResponse, ObjectInfoResponse, ObjectListResponse, ObjectUploadedResponse,
             },
-            repo::{self, objects::ReserveError},
+            repo::{
+                self,
+                objects::{Completion, ReserveError},
+            },
         },
     },
     http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
@@ -344,15 +347,24 @@ pub(in crate::blocks::files) async fn handle_upload_object(
             // user is told so (`ReserveError::HeldByOwnEarlierUpload`) — until
             // `sweep_stale_pending` clears it and a retry can claim it.
             match repo::objects::mark_complete(ctx, &reservation).await {
-                Ok(()) => {}
+                Ok(Completion::Completed) => {}
                 // The reservation outlived its TTL and another upload took
                 // the key over: the row is that upload's to settle now, and
                 // the key records that upload, not this one.
-                Err(e) if e.code == ErrorCode::Aborted => {
+                Ok(Completion::TakenOver) => {
                     return err_conflict(
                         "This upload took too long and another upload has taken the key; \
                          retry",
                     )
+                }
+                // The object or its bucket was deleted mid-upload. The bytes
+                // just stored are recorded nowhere, so they are not kept.
+                Ok(Completion::Deleted) => {
+                    discard_unrecorded_blob(ctx, bucket, &key, msg.user_id()).await;
+                    return err_conflict(
+                        "The object or its bucket was deleted while this upload was in \
+                         progress, so the upload was not recorded",
+                    );
                 }
                 Err(e) => {
                     return crud::db_error_internal(e, "Upload stored but could not be recorded")
@@ -374,6 +386,33 @@ pub(in crate::blocks::files) async fn handle_upload_object(
             }
             err_internal("Upload failed", e)
         }
+    }
+}
+
+/// Delete the blob an upload stored under `(bucket, key)` after its row was
+/// deleted mid-upload, so no stored bytes are left that nothing records or
+/// charges.
+///
+/// Only while no row holds the key: the key is claimed first
+/// ([`repo::objects::claim_vacant_key`]) and released after. If another
+/// upload has claimed it meanwhile, the blob is that upload's to overwrite,
+/// and deleting it could delete that upload's bytes instead — so it is left.
+/// Best effort: a failure is logged, and the caller has already decided its
+/// answer.
+async fn discard_unrecorded_blob(ctx: &dyn Context, bucket: &str, key: &str, user_id: &str) {
+    let claim = match repo::objects::claim_vacant_key(ctx, bucket, key, user_id).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, bucket, key, "could not claim the key to discard an unrecorded upload");
+            return;
+        }
+    };
+    if let Err(e) = store::delete(ctx, bucket, key).await {
+        tracing::warn!(error = %e, bucket, key, "could not delete an unrecorded upload's blob");
+    }
+    if let Err(e) = repo::objects::release_reservation(ctx, &claim).await {
+        tracing::warn!(error = %e, bucket, key, "could not release the key after discarding an unrecorded upload");
     }
 }
 
@@ -1869,6 +1908,186 @@ mod integration_tests {
             ("replacement".len() as i64, ObjectStatus::Complete),
             "the failed replacement put the stored object's row back"
         );
+    }
+
+    /// What happens to the key's row while an upload's bytes are being
+    /// stored, for [`DuringPut`].
+    #[derive(Clone, Copy)]
+    enum MeanwhileTheKey {
+        /// Deleted, as `DELETE …/objects/{key}` or a bucket delete does.
+        IsDeleted,
+        /// Taken over by bob, as if alice's reservation had outlived its TTL.
+        IsTakenOverByBob,
+    }
+
+    /// A context on which, the first time the upload stores its bytes,
+    /// something else happens to the key's row just before.
+    #[derive(Clone)]
+    struct DuringPut {
+        inner: TestContext,
+        meanwhile: MeanwhileTheKey,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl wafer_run::context::Context for DuringPut {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            is_write: bool,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, is_write)
+        }
+
+        async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+            if name == "wafer-run/storage"
+                && msg.action() == wafer_block::ServiceOp::STORAGE_PUT
+                && !self.done.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                match self.meanwhile {
+                    MeanwhileTheKey::IsDeleted => {
+                        repo::objects::delete_by_bucket_key(&self.inner, "assets", "same.txt")
+                            .await
+                            .expect("the key is deleted mid-upload");
+                    }
+                    MeanwhileTheKey::IsTakenOverByBob => {
+                        let stale = (chrono::Utc::now()
+                            - chrono::Duration::seconds(
+                                2 * repo::objects::PENDING_RESERVATION_TTL_SECONDS,
+                            ))
+                        .to_rfc3339();
+                        repo::objects::backdate_upload(&self.inner, "assets", "same.txt", &stale)
+                            .await
+                            .expect("alice's reservation outlives its TTL");
+                        repo::objects::reserve_upload(
+                            &self.inner,
+                            "assets",
+                            "same.txt",
+                            9,
+                            "text/csv",
+                            "bob",
+                        )
+                        .await
+                        .expect("bob takes the orphan over");
+                    }
+                }
+            }
+            self.inner.call_block(name, msg, input).await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> std::sync::Arc<dyn wafer_run::context::Context> {
+            std::sync::Arc::new(self.clone())
+        }
+    }
+
+    /// Alice uploads `assets/same.txt` while `meanwhile` happens to its row;
+    /// answers the status and the error message the client receives.
+    async fn upload_while(ctx: &TestContext, meanwhile: MeanwhileTheKey) -> (u16, String) {
+        let during = DuringPut {
+            inner: ctx.clone(),
+            meanwhile,
+            done: std::sync::Arc::default(),
+        };
+        let out = wafer_block::http_codec::collect_http_response(
+            handle_upload_object(
+                &during,
+                &upload_msg("assets", "same.txt", "text/plain"),
+                InputStream::from_bytes(b"alice's bytes".to_vec()),
+            )
+            .await,
+        )
+        .await;
+        let message = serde_json::from_slice::<serde_json::Value>(&out.body)
+            .ok()
+            .and_then(|body| body["message"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        (out.status, message)
+    }
+
+    /// The object was deleted while its upload was storing the bytes. The
+    /// upload is told so — not that another upload took the key, when none
+    /// exists — and the bytes it stored, which nothing records or charges,
+    /// are not kept.
+    #[tokio::test]
+    async fn an_upload_whose_object_was_deleted_meanwhile_is_told_so_and_keeps_nothing() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let (status, message) = upload_while(&ctx, MeanwhileTheKey::IsDeleted).await;
+
+        assert_eq!(status, 409, "{message}");
+        assert!(message.contains("was deleted"), "{message}");
+        assert!(
+            store::get(&ctx, "assets", "same.txt").await.is_err(),
+            "bytes nothing records must not be left in storage"
+        );
+        assert!(
+            repo::objects::list_all(&ctx)
+                .await
+                .expect("rows")
+                .is_empty(),
+            "the discard gives the key back"
+        );
+    }
+
+    /// Another upload took the key over while this one was storing its
+    /// bytes. This upload is told so, and settles nothing: the row is still
+    /// the other upload's, in flight.
+    #[tokio::test]
+    async fn an_upload_whose_key_was_taken_over_meanwhile_is_told_so() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+
+        let (status, message) = upload_while(&ctx, MeanwhileTheKey::IsTakenOverByBob).await;
+
+        assert_eq!(status, 409, "{message}");
+        assert!(
+            message.contains("another upload has taken the key"),
+            "{message}"
+        );
+        let rows = repo::objects::list_all(&ctx).await.expect("rows");
+        assert_eq!(
+            (rows.len(), rows[0].uploaded_by.as_str(), rows[0].status),
+            (1, "bob", ObjectStatus::Pending),
+            "bob's upload is still in flight"
+        );
+    }
+
+    /// A fault while recording the upload is a 500, whatever its code. An
+    /// `Aborted` also arrives from the runtime itself — a target block that
+    /// dropped the request — and is not a lost claim.
+    #[tokio::test]
+    async fn an_aborted_fault_while_recording_is_a_500_not_a_lost_claim() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "assets", "alice").await;
+        let failing = FailingDbOpContext::failing_with(
+            ctx.clone(),
+            vec![("database.update_where_count", repo::objects::TABLE)],
+            wafer_run::WaferError::new(ErrorCode::Aborted, "target block dropped the request"),
+        );
+
+        let out = handle_upload_object(
+            &failing,
+            &upload_msg("assets", "same.txt", "text/plain"),
+            InputStream::from_bytes(b"bytes".to_vec()),
+        )
+        .await;
+
+        assert_eq!(crate::test_support::output_http_status(out).await, 500);
     }
 
     /// A multipart upload without `?key=` falls back to the file part's

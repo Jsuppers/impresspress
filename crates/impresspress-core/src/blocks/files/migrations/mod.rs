@@ -301,9 +301,12 @@ mod replay_tests {
             repo::objects::reserve_upload(&ctx, "photos", "a.png", 8, "image/png", "alice")
                 .await
                 .expect("reserve");
-        repo::objects::mark_complete(&ctx, &stored)
-            .await
-            .expect("a stored object");
+        assert_eq!(
+            repo::objects::mark_complete(&ctx, &stored)
+                .await
+                .expect("a stored object"),
+            repo::objects::Completion::Completed
+        );
         repo::objects::reserve_upload(&ctx, "photos", "b.png", 4, "image/png", "alice")
             .await
             .expect("an upload in flight");
