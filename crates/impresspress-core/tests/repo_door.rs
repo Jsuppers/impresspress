@@ -965,10 +965,10 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         &[
             "blocks/files/mod.rs",
             // `("database.delete_where"/"delete_where_count", objects::TABLE)`
-            // — the object-delete metadata-cleanup failure test
+            // — the object-delete metadata-cleanup failure test; and
+            // `("database.insert_guarded", objects::TABLE)` — the upload's
+            // fail-closed test for the reservation that enforces the quota
             "blocks/files/storage/objects.rs",
-            // `("database.sum", objects::TABLE)` — the quota fail-closed test
-            "blocks/files/quota.rs",
             // `("database.sum", objects::TABLE)` — the same, through the
             // `/b/cloudstorage/quota` handler
             "blocks/files/cloud.rs",
@@ -1019,8 +1019,9 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         "quota",
         &[
             "blocks/files/mod.rs",
-            // `("database.list", quota::TABLE)` — the quota fail-closed test
-            "blocks/files/quota.rs",
+            // `("database.list", quota::TABLE)` — the upload's fail-closed
+            // test for the quota override lookup
+            "blocks/files/storage/objects.rs",
         ],
     ),
     ("views", &["blocks/files/mod.rs"]),
@@ -1308,7 +1309,8 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     // `config_tests` and its WRAP-denial tests name the table so
     // `FailingDbOpContext` lands on the settings read or write under test
     // rather than on some other table's. Same category as
-    // `blocks/admin/pages/blocks.rs` and `blocks/files/quota.rs` above.
+    // `blocks/admin/pages/blocks.rs` and `blocks/files/storage/objects.rs`
+    // above.
     (
         "llm_settings",
         &["blocks/llm/mod.rs", "blocks/llm/error_mapping_tests.rs"],
