@@ -18,7 +18,11 @@
 //! - `store::get(ctx, "@wafer-run/web/public", "key")` → cross-block read of `wafer-run/web/public/key`
 //!
 //! Cross-block access is **denied by default** and requires a WRAP grant with
-//! `resource_type = Storage` matching the target path.
+//! `resource_type = Storage` matching the target resource — the object path
+//! (`wafer-run/web/public/key`) for object ops, the folder for folder ops.
+//!
+//! A folder or key with an empty, `.` or `..` segment is refused (and
+//! audited as `BLOCKED: path traversal`) before either check runs.
 
 use std::sync::Arc;
 
@@ -351,6 +355,65 @@ impl Block for ImpresspressStorageBlock {
             Err(e) => return OutputStream::error(e),
         };
 
+        // Refuse a traversal shape before anything authorizes on it.
+        // `wrap_resource` is the full resource the op touches — the resolved
+        // folder for folder/list ops, `{folder}/{key}` for object ops — so
+        // this one check covers the folder AND the object key. A path with an
+        // empty, `.` or `..` segment is refused outright rather than
+        // normalized: authorization is textual and prefix-based, so
+        // `uploads/../../impresspress/auth/x` sits under the caller's own
+        // namespace as text while naming another block's object. A segment
+        // that merely contains dots (`a..b`) is a plain name and passes.
+        if !wafer_block::wrap::is_traversal_safe_path(&resolved.wrap_resource) {
+            let _ = log_storage_access(
+                ctx,
+                &caller,
+                &msg.kind,
+                &resolved.wrap_resource,
+                "BLOCKED: path traversal".to_string(),
+            )
+            .await;
+            return OutputStream::error(WaferError::new(
+                ErrorCode::PermissionDenied,
+                "storage path traversal not allowed",
+            ));
+        }
+
+        // Cross-block access requires a WRAP grant with resource_type =
+        // Storage covering the object itself, not just its folder: a grant
+        // like `wafer-run/web/site/*` is written against object paths.
+        //
+        // The resource is passed `@`-prefixed because that marker is what
+        // `check_access` reads as "cross-block": an unprefixed Storage
+        // resource is the caller's own namespace to it and is admitted for
+        // any attributable caller without looking at a grant.
+        if resolved.cross_block {
+            let is_write = access == "write";
+            let grants = self
+                .wrap_grants
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Err(e) = wafer_run::wrap::check_access(
+                Some(&caller),
+                &format!("@{}", resolved.wrap_resource),
+                is_write,
+                Some(&ResourceType::Storage),
+                &grants,
+                &self.wrap_admin_block,
+            ) {
+                let _ = log_storage_access(
+                    ctx,
+                    &caller,
+                    &msg.kind,
+                    &resolved.wrap_resource,
+                    format!("BLOCKED: {}", e.message),
+                )
+                .await;
+                return OutputStream::error(e);
+            }
+        }
+
         // SEC-003: keep wrap.resource meta in sync with the namespacing
         // rewrite so the downstream wafer-core handler's cross-validation
         // passes. The expected value depends on the op (folder vs
@@ -364,50 +427,6 @@ impl Block for ImpresspressStorageBlock {
             wafer_block::meta::META_WRAP_RESOURCE,
             &resolved.wrap_resource,
         );
-
-        // Check for path traversal
-        if resolved.path.contains("..") {
-            let _ = log_storage_access(
-                ctx,
-                &caller,
-                &msg.kind,
-                &resolved.path,
-                "BLOCKED: path traversal".to_string(),
-            )
-            .await;
-            return OutputStream::error(WaferError::new(
-                ErrorCode::PermissionDenied,
-                "storage path traversal not allowed",
-            ));
-        }
-
-        // Cross-block access requires a WRAP grant with resource_type = Storage
-        if resolved.cross_block {
-            let is_write = access == "write";
-            let grants = self
-                .wrap_grants
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Err(e) = wafer_run::wrap::check_access(
-                Some(&caller),
-                &resolved.path,
-                is_write,
-                Some(&ResourceType::Storage),
-                &grants,
-                &self.wrap_admin_block,
-            ) {
-                let _ = log_storage_access(
-                    ctx,
-                    &caller,
-                    &msg.kind,
-                    &resolved.path,
-                    format!("BLOCKED: {}", e.message),
-                )
-                .await;
-                return OutputStream::error(e);
-            }
-        }
 
         // Execute the actual storage operation. Forward events to the caller
         // as they arrive — previously we drained the whole stream into a
@@ -534,8 +553,7 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // Unit tests for pure functions (integration tests would require porting
-    // a TestContext to the streaming protocol — left for a future change).
+    // Unit tests for the pure path-rewriting functions.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -786,5 +804,249 @@ mod tests {
             .expect_err("an op no upstream client emits must be refused");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert_eq!(err.message, format!("{UNKNOWN_OP}storage.teleport"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The shim's own checks, driven through `Block::handle` over a real
+    // object store and the admin schema its audit rows land in.
+    // -----------------------------------------------------------------------
+
+    mod shim {
+        use std::sync::Arc;
+
+        use wafer_core::interfaces::storage::service::StorageService as _;
+        use wafer_run::{Block as _, ErrorCode, InputStream, Message, ResourceGrant, ResourceType};
+
+        use super::super::{create, ImpresspressStorageBlock, STORAGE_ACCESS_LOGS_TABLE};
+        use crate::test_support::{InMemoryStorageService, TestContext};
+
+        const ADMIN: &str = "impresspress/admin";
+
+        /// A context acting as `caller`, with the admin schema (the audit
+        /// table) migrated and WRAP enforcing the admin block's own grants —
+        /// the grant that lets any block write a storage access row.
+        async fn ctx_as(caller: &str) -> TestContext {
+            TestContext::with_admin().await.with_wrap(
+                caller,
+                Vec::new(),
+                wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants,
+                ADMIN,
+            )
+        }
+
+        fn shim(
+            grants: &[ResourceGrant],
+        ) -> (Arc<ImpresspressStorageBlock>, Arc<InMemoryStorageService>) {
+            let store = Arc::new(InMemoryStorageService::new());
+            let block = create(store.clone(), Arc::from(ADMIN));
+            block.update_wrap_grants(grants);
+            (block, store)
+        }
+
+        /// Send one encoded request through the shim; `Ok(body)` on success.
+        async fn send<T: serde::Serialize>(
+            block: &ImpresspressStorageBlock,
+            ctx: &TestContext,
+            op: &str,
+            req: &T,
+        ) -> Result<Vec<u8>, wafer_run::WaferError> {
+            let body = wafer_block::codec::encode(req).expect("encode request");
+            block
+                .handle(ctx, Message::new(op), InputStream::from_bytes(body))
+                .await
+                .collect_buffered()
+                .await
+                .map(|r| r.body)
+                .map_err(wafer_block::WaferError::from)
+        }
+
+        fn put(folder: &str, key: &str) -> wafer_block::wire::storage::PutRequest {
+            wafer_block::wire::storage::PutRequest {
+                folder: folder.into(),
+                key: key.into(),
+                data: b"payload".to_vec(),
+                content_type: "text/plain".into(),
+            }
+        }
+
+        /// `(path, status)` of every storage access row, oldest first.
+        async fn audit_rows(ctx: &TestContext) -> Vec<(String, String)> {
+            crate::db_read::list_every(ctx, STORAGE_ACCESS_LOGS_TABLE, Vec::new())
+                .await
+                .expect("read storage access logs")
+                .into_iter()
+                .map(|r| {
+                    let field = |k: &str| {
+                        r.data
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (field("path"), field("status"))
+                })
+                .collect()
+        }
+
+        /// A `..` in the object KEY is traversal, and it is the shim's to
+        /// refuse and audit: the folder alone (`impresspress/files/uploads`)
+        /// is clean, so a check on the folder never sees it. Left to
+        /// wafer-core, the request died as an `InvalidArgument` with no
+        /// "BLOCKED" row in the audit log the admin storage page reads.
+        #[tokio::test]
+        async fn a_traversal_key_is_refused_and_audited_by_the_shim() {
+            let ctx = ctx_as("impresspress/files").await;
+            let (block, store) = shim(&[]);
+
+            let err = send(
+                &block,
+                &ctx,
+                "storage.put",
+                &put("uploads", "../../impresspress/auth/x"),
+            )
+            .await
+            .expect_err("a traversal key must be refused");
+
+            assert_eq!(err.code, ErrorCode::PermissionDenied, "{}", err.message);
+            assert_eq!(
+                audit_rows(&ctx).await,
+                vec![(
+                    "impresspress/files/uploads/../../impresspress/auth/x".to_string(),
+                    "BLOCKED: path traversal".to_string(),
+                )],
+            );
+            assert!(store.ops().is_empty(), "nothing may reach the store");
+        }
+
+        /// Empty and `.` segments are traversal shapes too: authorization
+        /// is textual, and nothing downstream normalizes them.
+        #[tokio::test]
+        async fn empty_and_dot_segments_are_refused_by_the_shim() {
+            let ctx = ctx_as("impresspress/files").await;
+            let (block, store) = shim(&[]);
+
+            for (folder, key) in [
+                ("uploads", ""),
+                ("uploads", "a//b"),
+                ("uploads", "./x"),
+                ("uploads/.", "x"),
+                ("uploads/", "x"),
+            ] {
+                let err = send(&block, &ctx, "storage.put", &put(folder, key))
+                    .await
+                    .expect_err("a traversal shape must be refused");
+                assert_eq!(
+                    err.code,
+                    ErrorCode::PermissionDenied,
+                    "folder {folder:?} key {key:?}: {}",
+                    err.message,
+                );
+            }
+            let rows = audit_rows(&ctx).await;
+            assert_eq!(rows.len(), 5, "{rows:?}");
+            assert!(rows.iter().all(|(_, s)| s == "BLOCKED: path traversal"));
+            assert!(store.ops().is_empty(), "nothing may reach the store");
+        }
+
+        /// A name that merely CONTAINS dots is a plain name, not traversal.
+        /// The old guard (`path.contains("..")`) refused `a..b` outright.
+        #[tokio::test]
+        async fn a_name_containing_dots_is_not_traversal() {
+            let ctx = ctx_as("impresspress/files").await;
+            let (block, _store) = shim(&[]);
+
+            send(&block, &ctx, "storage.put", &put("a..b", "c..d.txt"))
+                .await
+                .expect("`a..b` is a plain folder name");
+            let got = send(
+                &block,
+                &ctx,
+                "storage.get",
+                &wafer_block::wire::storage::GetRequest {
+                    folder: "a..b".into(),
+                    key: "c..d.txt".into(),
+                },
+            )
+            .await
+            .expect("and the object reads back");
+            assert!(!got.is_empty());
+        }
+
+        /// The shim's cross-block check is its own layer, and it must be able
+        /// to say no. Handed the unprefixed resolved path, `check_access`
+        /// read the reach as the caller's OWN namespace and admitted every
+        /// attributable caller without consulting a grant — so an ungranted
+        /// block read another block's object straight through the shim.
+        #[tokio::test]
+        async fn an_ungranted_cross_block_read_is_refused_and_audited_by_the_shim() {
+            let ctx = ctx_as("test/ungranted").await;
+            let (block, store) = shim(&[]);
+            store
+                .put(
+                    "impresspress/files/uploads",
+                    "secret.txt",
+                    b"private",
+                    "text/plain",
+                )
+                .await
+                .expect("seed the other block's object");
+
+            let err = send(
+                &block,
+                &ctx,
+                "storage.get",
+                &wafer_block::wire::storage::GetRequest {
+                    folder: "@impresspress/files/uploads".into(),
+                    key: "secret.txt".into(),
+                },
+            )
+            .await
+            .expect_err("a cross-block read with no grant must be refused");
+
+            assert_eq!(err.code, ErrorCode::PermissionDenied, "{}", err.message);
+            let rows = audit_rows(&ctx).await;
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].0, "impresspress/files/uploads/secret.txt");
+            assert!(rows[0].1.starts_with("BLOCKED: "), "{rows:?}");
+        }
+
+        /// The counterpart: a grant written against object paths
+        /// (`wafer-run/web/site/*`, the dev block's shape) admits an object
+        /// under it — the check runs on the object, not on its folder, which
+        /// that pattern does not match.
+        #[tokio::test]
+        async fn a_cross_block_grant_admits_the_objects_under_it() {
+            let ctx = ctx_as("test/granted").await;
+            let read_write = ResourceGrant::read_write("test/granted", "wafer-run/web/site/*");
+            let read_only = ResourceGrant::read("test/granted", "wafer-run/web/site/*");
+            let (block, store) = shim(&[read_write.typed(ResourceType::Storage)]);
+
+            send(
+                &block,
+                &ctx,
+                "storage.put",
+                &put("@wafer-run/web/site", "index.html"),
+            )
+            .await
+            .expect("the grant covers wafer-run/web/site/index.html");
+            let (bytes, _) = store
+                .get("wafer-run/web/site", "index.html")
+                .await
+                .expect("the object landed in the granted namespace");
+            assert_eq!(bytes, b"payload".to_vec());
+
+            // A write grant is needed for a write: the same pattern as a
+            // read-only grant refuses the put.
+            let (read_only, _) = shim(&[read_only.typed(ResourceType::Storage)]);
+            let err = send(
+                &read_only,
+                &ctx,
+                "storage.put",
+                &put("@wafer-run/web/site", "index.html"),
+            )
+            .await
+            .expect_err("a read grant does not admit a write");
+            assert_eq!(err.code, ErrorCode::PermissionDenied);
+        }
     }
 }

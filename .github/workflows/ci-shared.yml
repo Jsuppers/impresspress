@@ -174,6 +174,23 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo test --locked -p impresspress-core --no-default-features --features block-vector,test-support --lib blocks::vector
 
+      # `block-fastembed` is in no default feature set (it pulls ONNX Runtime),
+      # so no other lane compiles `blocks::fastembed` or runs its tests. Those
+      # tests drive the block through its loader seam
+      # (`FastembedBlock::with_loader`), so no model is downloaded: what they
+      # pin is how the load is scheduled — off the executor, exactly once,
+      # retried after a failure.
+      - name: Test the fastembed block (no default features)
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --locked -p impresspress-core --no-default-features --features block-fastembed,test-support --lib blocks::fastembed
+
+      # The workspace clippy above lints the default feature set, which leaves
+      # `blocks::fastembed` out. Lint the crate with it compiled in; the
+      # `tests/` targets assume the default block set, hence the defaults stay on.
+      - name: Clippy (block-fastembed)
+        run: cargo clippy --locked -p impresspress-core --features block-fastembed,test-support --all-targets -- -D warnings
+
       # `block-dev` is deliberately absent from `default` (the dev sandbox's
       # control plane must not exist in a normal bundle), so the workspace
       # clippy above compiles none of it — not the block, and not the ~4 200
