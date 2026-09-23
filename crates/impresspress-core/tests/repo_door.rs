@@ -1195,6 +1195,14 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // it. It never names this table, and it issues no query at
             // all — see the note on the `variables` door above.
             "secret_tables.rs",
+            // The same false attribution as `secret_tables.rs` above, from
+            // the other direction: the admin block names
+            // `platform_state::variables::TABLE` in its `collections(..)`
+            // and, separately, carries `"impresspress/products"` as the
+            // grantee of a `ResourceGrant` — a block id in a string, which
+            // is what puts the "products" qualifier in the file. It never
+            // names this table.
+            "blocks/admin/mod.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             "blocks/products/tests/offer_pricing_tests.rs",
