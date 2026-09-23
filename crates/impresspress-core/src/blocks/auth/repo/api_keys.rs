@@ -53,6 +53,10 @@ impl ApiKeyRow {
     /// An expiry that does not parse counts as expired. A key whose end date
     /// cannot be read is a key with no enforceable end, and `"never"` —
     /// which sorts after every timestamp — is exactly how one got minted.
+    ///
+    /// The comparison is `>=`, not `>`: a key expires AT the instant it
+    /// names, not one tick after it. The text comparison this replaced was
+    /// `>`, so a key stayed valid through its own expiry second.
     pub fn is_expired(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
         match self.expires_at.as_deref().filter(|exp| !exp.is_empty()) {
             Some(exp) => parse_iso(exp).is_none_or(|exp| now >= exp),

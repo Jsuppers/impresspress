@@ -6,11 +6,26 @@
 -- on each rotation; rotated rows are marked `revoked = 1` (not deleted) so
 -- a subsequent attempt with the same token reveals a reuse attack.
 --
--- Pre-prod posture (see workspace/.../active-development-can-wipe-prod-db.md):
--- existing rows from the legacy schema have an empty raw `token` column
--- value to us — we simply DROP the legacy table and start fresh. Users
--- log back in on next deploy.
-DROP TABLE IF EXISTS wafer_run__auth__tokens;
+-- THIS FILE MUST NOT DROP THE TABLE. It used to open with
+-- `DROP TABLE IF EXISTS wafer_run__auth__tokens;`, to discard the legacy
+-- row layout on the one upgrade that introduced this schema. But auth
+-- migrations re-run AS A SET whenever any one of them changes, so that DROP
+-- ran again on every later schema change and deleted every live refresh
+-- token with it: `auth_ui::api::refresh` refuses a token whose row is gone,
+-- so every signed-in user was silently logged out within one access-token
+-- lifetime, on an upgrade that had nothing to do with tokens.
+-- `re_run_survival_tests::refresh_tokens_survive_a_full_re_run` pins that
+-- they survive.
+--
+-- What that costs: a database still carrying the PRE-004 layout (one that
+-- has not applied this file even once — impossible for any deployment that
+-- has booted since 005 landed, since the set re-runs together) keeps its
+-- legacy table, and `CREATE TABLE IF NOT EXISTS` is a no-op on it, so the
+-- columns below are missing and the first refresh write fails "no such
+-- column". The remedy there is one statement — `DROP TABLE
+-- wafer_run__auth__tokens` by hand, then re-run migrations — and it costs
+-- that deployment exactly what this DROP used to cost EVERY deployment on
+-- EVERY auth schema change.
 
 CREATE TABLE IF NOT EXISTS wafer_run__auth__tokens (
     id           TEXT PRIMARY KEY,

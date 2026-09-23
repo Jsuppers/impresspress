@@ -531,12 +531,89 @@ mod api_key_expiry_tests {
         for (stored, id) in seeded {
             let key = row(&ctx, &id).await;
             assert!(key.is_revoked(), "{stored:?} names no instant");
-            let expiry = key.expires_at.clone().expect("the repair stamps an expiry");
-            assert!(
-                crate::blocks::auth::repo::parse_iso(&expiry).is_some(),
-                "{stored:?} was replaced by {expiry}, which must itself be readable"
+            assert_eq!(
+                key.expires_at.as_deref(),
+                Some(stored),
+                "the stored text is the only record of why the key was revoked"
             );
             assert!(key.is_expired(chrono::Utc::now()));
+        }
+    }
+
+    /// SQLite's `substr`/`length` are character functions that stop at the
+    /// first NUL, so a value whose readable prefix is a clean timestamp
+    /// passes every shape test while the row is something else entirely.
+    /// Respelling it to the prefix would resurrect a key `parse_iso`
+    /// refuses.
+    #[tokio::test]
+    async fn an_expiry_with_an_embedded_nul_is_not_respelled_into_a_clean_one() {
+        let ctx = upgrading_deployment().await;
+        let stored = "2026-06-01T12:00:00Z\u{0}junk";
+        let id = seed_key(&ctx, "nul", Some(stored)).await;
+        // Non-vacuity: the NUL has to survive the round trip, or the row
+        // under test is not the row this guards against.
+        assert_eq!(
+            row(&ctx, &id).await.expires_at.as_deref(),
+            Some(stored),
+            "the seeded NUL must reach the column"
+        );
+
+        apply_the_repair(&ctx).await;
+
+        let key = row(&ctx, &id).await;
+        assert_ne!(
+            key.expires_at.as_deref(),
+            Some("2026-06-01T12:00:00Z"),
+            "the prefix is not the value"
+        );
+        assert!(
+            key.is_revoked(),
+            "the byte guard sends it to the revoke arm"
+        );
+        assert!(key.is_expired(chrono::Utc::now()));
+    }
+
+    /// The documented gap: both arms decide by SHAPE, and a shape is not an
+    /// instant. `2026-02-31T00:00:00Z` is well-formed and names no day, so
+    /// `parse_iso` rejects it while arm 2's test calls it readable. The key
+    /// is dead to the reader and the row still looks active — the migration
+    /// header, RELEASE.md and the PR all say so, and this pins it so the
+    /// claim cannot quietly become false in either direction.
+    #[tokio::test]
+    async fn a_well_formed_impossible_instant_is_left_as_it_is() {
+        let ctx = upgrading_deployment().await;
+        let stored = "2026-02-31T00:00:00Z";
+        assert!(
+            crate::blocks::auth::repo::parse_iso(stored).is_none(),
+            "{stored} names no day"
+        );
+        let id = seed_key(&ctx, "impossible", Some(stored)).await;
+
+        apply_the_repair(&ctx).await;
+
+        let key = row(&ctx, &id).await;
+        assert_eq!(key.expires_at.as_deref(), Some(stored));
+        assert!(!key.is_revoked(), "the shape tests cannot see this one");
+        // Dead anyway: the reader is what enforces the expiry.
+        assert!(key.is_expired(chrono::Utc::now()));
+    }
+
+    /// What `<input type="date">` and `<input type="datetime-local">` post.
+    /// RFC 3339 requires an offset, so neither is readable, and both are
+    /// revoked rather than silently inert.
+    #[tokio::test]
+    async fn the_shapes_an_html_date_field_posts_are_revoked() {
+        let ctx = upgrading_deployment().await;
+        let mut seeded = Vec::new();
+        for stored in ["2027-01-31", "2027-01-31T09:00"] {
+            seeded.push((stored, seed_key(&ctx, stored, Some(stored)).await));
+        }
+
+        apply_the_repair(&ctx).await;
+
+        for (stored, id) in seeded {
+            let key = row(&ctx, &id).await;
+            assert!(key.is_revoked(), "{stored} carries no offset");
         }
     }
 
@@ -606,5 +683,104 @@ mod api_key_expiry_tests {
             (row(&ctx, &broken).await, row(&ctx, &utc).await),
             after_first
         );
+    }
+}
+
+#[cfg(test)]
+mod re_run_survival_tests {
+    //! What a full re-run of the auth set does to live rows.
+    //!
+    //! The set re-runs whenever ANY auth migration's SQL changes, so every
+    //! statement in it runs again on a database full of real rows. A `DROP
+    //! TABLE` in that set is not a one-time upgrade step — it is a delete
+    //! that fires on every later schema change.
+    //!
+    //! Seeded and read back through the repo doors, and re-applied through
+    //! `apply_migrations` — the path `--run-migrations` takes — so what is
+    //! asserted is what the block sees. The second apply is given its own
+    //! state key because the hash gate would otherwise skip identical SQL;
+    //! in production the hash differs precisely because a migration changed.
+
+    use super::SQLITE_MIGRATIONS;
+    use crate::{
+        blocks::auth::repo::{
+            sessions::{self, NewSession},
+            tokens,
+        },
+        migration_helper,
+        test_support::TestContext,
+    };
+
+    async fn upgrading_deployment() -> TestContext {
+        let mut ctx = TestContext::with_auth().await;
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+        ctx.seed_auth_user("u1").await;
+        ctx
+    }
+
+    async fn re_run_the_whole_set(ctx: &TestContext) {
+        let sql: Vec<&str> = SQLITE_MIGRATIONS.iter().map(|(_, s)| *s).collect();
+        migration_helper::apply_migrations(ctx, "wafer-run/auth#rerun", &sql, &[])
+            .await
+            .expect("re-apply the auth schema");
+    }
+
+    /// `004_refresh_tokens` opened with `DROP TABLE IF EXISTS
+    /// wafer_run__auth__tokens`. `auth_ui::api::refresh` refuses a token
+    /// whose row is gone, so adding any auth migration logged every
+    /// signed-in user out within one access-token lifetime — on an upgrade
+    /// that never mentioned tokens.
+    #[tokio::test]
+    async fn refresh_tokens_survive_a_full_re_run() {
+        let ctx = upgrading_deployment().await;
+        tokens::insert(
+            &ctx,
+            "u1",
+            "raw-refresh-token",
+            "fam-1",
+            0,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .expect("seed the refresh token");
+
+        re_run_the_whole_set(&ctx).await;
+
+        let row = tokens::find_by_token(&ctx, "raw-refresh-token")
+            .await
+            .expect("the tokens table must still be readable");
+        assert!(
+            row.is_some(),
+            "a live refresh token must survive an auth schema change"
+        );
+    }
+
+    /// The one drop the set still carries, stated rather than discovered:
+    /// `012_sessions_family` recreates `wafer_run__auth__sessions`. Nothing
+    /// authenticates against that table — it is the device list, and
+    /// `record_login_family` re-inserts a device on its next token refresh —
+    /// so emptying it signs nobody out. RELEASE.md says so on both notes.
+    #[tokio::test]
+    async fn the_device_list_is_the_only_thing_a_re_run_empties() {
+        let ctx = upgrading_deployment().await;
+        sessions::insert(
+            &ctx,
+            NewSession {
+                family: "fam-1".into(),
+                user_id: "u1".into(),
+                auth_method: "password".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .expect("seed the device row");
+        assert_eq!(sessions::list_for_user(&ctx, "u1").await.unwrap().len(), 1);
+
+        re_run_the_whole_set(&ctx).await;
+
+        assert!(sessions::list_for_user(&ctx, "u1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

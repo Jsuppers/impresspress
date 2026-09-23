@@ -1435,13 +1435,18 @@ jobs:
       # dialect file nothing executes is a typo waiting to brick a Postgres
       # deployment for good: the error aborts the batch, `apply_if_blessed`
       # never stamps the hash, and every later boot re-runs and re-fails.
+      #
+      # The block set is a GLOB and must stay one. A hand-written list of
+      # block names makes the sentence above a claim rather than a fact: a
+      # block missing from it is silently unexecuted, and so is every dialect
+      # file it ever adds. Sorted order gives each block its own files in
+      # migration order, which is the ordering that matters — the only
+      # cross-table `REFERENCES` in any dialect file are within one block.
       - name: Apply all PostgreSQL migrations in order
         run: |
-          for block in products files admin; do
-            for migration in crates/impresspress-core/src/blocks/${block}/migrations/*.postgres.sql; do
-              echo "applying ${migration}"
-              psql --set ON_ERROR_STOP=1 --file "${migration}"
-            done
+          for migration in crates/impresspress-core/src/blocks/*/migrations/*.postgres.sql; do
+            echo "applying ${migration}"
+            psql --set ON_ERROR_STOP=1 --file "${migration}"
           done
 
       - name: Verify commerce schema and deterministic templates

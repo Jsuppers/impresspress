@@ -17,12 +17,19 @@
 -- and a revocation an operator can see instead of a key that silently
 -- stopped working.
 --
--- The boundary between the two arms is `repo::parse_iso`, whose accepted and
--- rejected spellings are pinned by
--- `repo::tests::parse_iso_reads_rfc_3339_and_nothing_else`. Neither arm
--- parses anything: every test below is a literal `substr` comparison, so a
--- stored string cannot make this migration fail, and a migration that fails
--- is never stamped and re-runs (and re-fails) on every boot.
+-- WHAT IT DOES NOT CATCH. The arms below decide by SHAPE, and a shape is not
+-- an instant: `2026-02-31T00:00:00Z` and a 29 February outside a leap year
+-- are well-formed and name no day, so `repo::parse_iso` rejects them while
+-- arm 2's test calls them readable. Such a row is left exactly as it is —
+-- the reader refuses it, so the key is dead, but the admin API-keys tab
+-- still shows it active and nothing says why. An operator who finds a key
+-- that will not authenticate should revoke it there. Every other spelling
+-- `parse_iso` rejects IS caught, because it is caught on shape.
+--
+-- Neither arm parses anything: every test below is a literal `substr`
+-- comparison, so a stored string cannot make this migration fail, and a
+-- migration that fails is never stamped and re-runs (and re-fails) on every
+-- boot.
 --
 -- Adding this file changes the auth block's SQL hash, so the upgrade that
 -- applies it re-runs every auth migration, 012's sessions-table drop
@@ -34,31 +41,51 @@
 -- exact `IN` list is deliberate: a wildcard would also match a string that
 -- merely ENDS in `Z`, and rewriting `…T12:00:00<junk>Z` into a valid
 -- timestamp would bring a key the reader refuses back to life.
+--
+-- The `length(...)` pair is the same guard for the other way in. SQLite's
+-- `substr` and `length` are character functions that STOP AT THE FIRST NUL,
+-- so `'2026-06-01T12:00:00Z' || x'00' || 'junk'` passes every test above and
+-- would be rewritten to the clean timestamp its prefix spells — resurrecting
+-- a key `parse_iso` refuses. Casting to BLOB makes `length` count bytes
+-- instead, and every spelling this arm accepts is pure ASCII, so the two
+-- lengths agree for exactly the values that carry no NUL and no multi-byte
+-- character.
 UPDATE wafer_run__auth__api_keys
    SET expires_at = substr(expires_at, 1, 10) || 'T' || substr(expires_at, 12, 8) || 'Z',
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
- WHERE substr(expires_at, 1, 19) GLOB
+ WHERE length(cast(expires_at AS BLOB)) = length(expires_at)
+   AND substr(expires_at, 1, 19) GLOB
        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
    AND substr(expires_at, 20) IN ('Z', 'z', '+00:00', '-00:00')
    AND expires_at <> substr(expires_at, 1, 10) || 'T' || substr(expires_at, 12, 8) || 'Z';
 
 -- Arm 2: an expiry that names no instant. The key is already dead to the
--- reader; this records that as a revocation, and gives the column a value it
--- can hold. A sub-second fraction and a non-zero offset are left alone: the
--- reader reads both correctly, and respelling either needs arithmetic this
--- file will not do.
+-- reader; this records that as a revocation, so the admin API-keys tab shows
+-- it revoked rather than active.
+--
+-- `expires_at` is left exactly as it was found. Overwriting it with the
+-- repair's own timestamp would destroy the only record of why the key was
+-- revoked, on a repair whose whole purpose is telling the operator that. The
+-- column therefore keeps one format for every key that still works, and the
+-- original text for the ones that do not.
+--
+-- A sub-second fraction and a non-zero offset are readable, so neither arm
+-- touches them: the reader reads both correctly, and respelling either needs
+-- arithmetic this file will not do.
 --
 -- `expires_at IS NULL` and `expires_at = ''` are the two spellings of "this
--- key does not expire" and are not touched by either arm.
+-- key does not expire" and are not touched by either arm. The `revoked_at`
+-- guard makes a re-run a no-op rather than a re-stamp.
 UPDATE wafer_run__auth__api_keys
-   SET revoked_at = COALESCE(NULLIF(revoked_at, ''), strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-       expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+   SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
  WHERE expires_at IS NOT NULL
    AND expires_at <> ''
+   AND (revoked_at IS NULL OR revoked_at = '')
    AND NOT (
-         substr(expires_at, 1, 19) GLOB
-         '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+         length(cast(expires_at AS BLOB)) = length(expires_at)
+         AND substr(expires_at, 1, 19) GLOB
+             '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][Tt ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
          AND (
               substr(expires_at, 20) IN ('Z', 'z')
            OR substr(expires_at, 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]'
