@@ -600,8 +600,11 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         {
             Ok(form) => form,
             Err(e) => {
-                tracing::error!(error = %e, "legalpages settings: current values read failed");
-                return ui::server_error_response(msg);
+                return crud::db_error_page(
+                    msg,
+                    e,
+                    "legalpages settings: current values read failed",
+                )
             }
         };
 

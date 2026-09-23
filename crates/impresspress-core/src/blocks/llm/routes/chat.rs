@@ -181,7 +181,12 @@ async fn dispatch_chat(
         .await
     {
         Ok(resolved) => resolved,
-        Err(e) => return Err(err_internal("resolve_provider failed", e)),
+        Err(e) => {
+            return Err(crate::blocks::crud::db_error_internal(
+                e,
+                "resolve_provider failed",
+            ))
+        }
     };
 
     // 4. Map the legacy `impresspress/provider-llm` default into a concrete
@@ -216,7 +221,12 @@ async fn dispatch_chat(
     };
     let stream = match llm_client::chat_stream(ctx, &chat_req).await {
         Ok(s) => s,
-        Err(e) => return Err(err_internal("llm chat dispatch", e.message)),
+        Err(e) => {
+            return Err(crate::blocks::crud::db_error_internal(
+                e,
+                "llm chat dispatch",
+            ))
+        }
     };
     Ok(DispatchOutcome {
         thread_id,
@@ -274,7 +284,7 @@ pub(in crate::blocks::llm) async fn handle_chat(
     while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(c) => c,
-            Err(e) => return err_internal("llm service error", e.message),
+            Err(e) => return crate::blocks::crud::db_error_internal(e, "llm service error"),
         };
         budget_exhausted |= chunk.finish_reason == Some(FinishReason::Length);
         match chunk.delta {

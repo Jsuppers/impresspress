@@ -17,7 +17,7 @@ use self::{
 use crate::{
     blocks::crud,
     endpoint_match::{self, request_schema_of, EndpointRoute},
-    http::{err_bad_request, err_internal, ok_json, require_row, ResponseBuilder},
+    http::{err_bad_request, ok_json, require_row, ResponseBuilder},
     ui::{self, templates, SiteConfig},
 };
 
@@ -235,8 +235,7 @@ impl LegalPagesBlock {
         let published = match documents::find_published(ctx, doc_type).await {
             Ok(row) => row,
             Err(e) => {
-                tracing::warn!(error = %e, "legalpages: db list failed");
-                return err_internal("Database error", e);
+                return crud::db_error_internal(e, "legalpages: published document read failed")
             }
         };
 

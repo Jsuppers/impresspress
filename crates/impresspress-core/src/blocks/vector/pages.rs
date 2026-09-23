@@ -161,7 +161,7 @@ pub(super) async fn create_index(
     };
 
     if let Err(e) = vclient::create_index(ctx, cfg.clone()).await {
-        return err_internal("create_index failed", e);
+        return crud::db_error_internal(e, "create_index failed");
     }
 
     // Record the index in the registry so queries against it can look up
@@ -195,7 +195,7 @@ pub(super) async fn create_index(
     )
     .await
     {
-        return err_internal("registry write failed", e);
+        return crud::db_error_internal(e, "registry write failed");
     }
 
     // htmx callers (the admin modal) want HTML back so the swap renders
@@ -204,7 +204,7 @@ pub(super) async fn create_index(
     if !msg.get_meta("http.header.hx-request").is_empty() {
         let body_html = match super::pages_ui::render_index_list_fragment(ctx).await {
             Ok(m) => m,
-            Err(e) => return err_internal("Failed to refresh", e),
+            Err(e) => return crud::db_error_internal(e, "Failed to refresh"),
         };
         let trigger = r#"{"showToast":{"message":"Index created","type":"success"},"closeModal":{"id":"create-vector-index"}}"#;
         return crate::http::ResponseBuilder::new()
@@ -239,7 +239,7 @@ pub(super) async fn list_indexes(ctx: &dyn Context) -> OutputStream {
     }
     match discover_indexes(ctx).await {
         Ok(indexes) => ok_json(&IndexListResponse { indexes }),
-        Err(e) => err_internal("list indexes failed", e),
+        Err(e) => crud::db_error_internal(e, "list indexes failed"),
     }
 }
 
@@ -390,7 +390,7 @@ pub(super) async fn stats(ctx: &dyn Context) -> OutputStream {
     }
     let indexes = match discover_indexes(ctx).await {
         Ok(v) => v,
-        Err(e) => return err_internal("stats failed", e),
+        Err(e) => return crud::db_error_internal(e, "stats failed"),
     };
 
     let mut out: Vec<IndexStatsView> = Vec::with_capacity(indexes.len());
@@ -741,7 +741,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     if body.contextual {
         match ingestion::add_context(ctx, &body.text, chunks).await {
             Ok(c) => chunks = c,
-            Err(e) => return err_internal("add_context failed", e),
+            Err(e) => return crud::db_error_internal(e, "add_context failed"),
         }
     }
     if chunks.is_empty() {
@@ -753,7 +753,7 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     let (_model_name, _dims, vectors) =
         match vclient::embed(ctx, embedding_block, chunks.clone()).await {
             Ok(tuple) => tuple,
-            Err(e) => return err_internal("embed failed", e),
+            Err(e) => return crud::db_error_internal(e, "embed failed"),
         };
 
     if vectors.len() != chunks.len() {
@@ -827,7 +827,7 @@ pub(super) async fn embed(ctx: &dyn Context, input: InputStream) -> OutputStream
             vectors,
         }),
         Err(e) if e.code == ErrorCode::InvalidArgument => err_bad_request(&e.message),
-        Err(e) => err_internal("embed failed", e),
+        Err(e) => crud::db_error_internal(e, "embed failed"),
     }
 }
 

@@ -111,9 +111,11 @@ fn llm_error_response(context: &str, e: LlmError) -> OutputStream {
 /// the one-shot legacy-provider migration (which is why it takes the
 /// provider-admin handle rather than the whole block).
 ///
-/// Errors are returned to the caller; callers translate to 500. We do not
-/// silently swallow — a failure here means the in-memory service is stale
-/// and the admin needs to know.
+/// Errors are returned to the caller, which answers them through
+/// `crud::db_error_internal`: the row read keeps its database code, so a WRAP
+/// denial is a 403 and a quota a 429, and a router that refused the snapshot
+/// is an `Internal` failure — a 500. We do not silently swallow — a failure
+/// here means the in-memory service is stale and the admin needs to know.
 ///
 /// A handle with no router to configure ([`ProviderAdmin::manages_providers`]
 /// false) fails here too. The mutating handlers never see that, because they
@@ -124,15 +126,14 @@ fn llm_error_response(context: &str, e: LlmError) -> OutputStream {
 pub(in crate::blocks::llm) async fn reload_provider_service(
     ctx: &dyn Context,
     provider_admin: &dyn ProviderAdmin,
-) -> Result<(), String> {
+) -> Result<(), WaferError> {
     let records = db_read::list_bounded(
         ctx,
         PROVIDERS_TABLE,
         vec![],
         Bound::Curated("LLM providers are configured by an admin"),
     )
-    .await
-    .map_err(|e| format!("provider reload list failed: {e}"))?;
+    .await?;
     let mut configs: Vec<ProviderConfig> = Vec::with_capacity(records.len());
     for rec in &records {
         match row_to_config(rec) {
@@ -148,10 +149,12 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
             }
         }
     }
-    provider_admin
-        .configure(configs)
-        .map_err(|e| format!("provider configure failed: {e}"))?;
-    Ok(())
+    provider_admin.configure(configs).map_err(|e| {
+        WaferError::new(
+            ErrorCode::Internal,
+            format!("provider configure failed: {e}"),
+        )
+    })
 }
 
 /// Resolve a provider's `key_var` into its plaintext `api_key` via the
@@ -352,7 +355,7 @@ pub(in crate::blocks::llm) async fn create_provider(
     };
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
-        return err_internal("reload_provider_service failed", e);
+        return crud::db_error_internal(e, "reload_provider_service failed");
     }
 
     ok_json(&ProviderView::from_config(&record.id, &cfg))
@@ -437,7 +440,7 @@ pub(in crate::blocks::llm) async fn update_provider(
     };
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
-        return err_internal("reload_provider_service failed", e);
+        return crud::db_error_internal(e, "reload_provider_service failed");
     }
 
     ok_json(&ProviderView::from_config(&record.id, &cfg))
@@ -467,7 +470,7 @@ pub(in crate::blocks::llm) async fn delete_provider(
     }
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
-        return err_internal("reload_provider_service failed", e);
+        return crud::db_error_internal(e, "reload_provider_service failed");
     }
 
     if crate::ui::is_htmx(msg) {
@@ -516,7 +519,7 @@ pub(in crate::blocks::llm) async fn discover_models(
     // started or the row is disabled (and so was excluded from the last
     // configure call).
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
-        return err_internal("reload_provider_service failed", e);
+        return crud::db_error_internal(e, "reload_provider_service failed");
     }
 
     let models = match block.provider_admin.discover_models(&cfg.name).await {
@@ -528,11 +531,11 @@ pub(in crate::blocks::llm) async fn discover_models(
     let mut data = models_row(&cfg.models);
     crate::util::stamp_updated(&mut data);
     if let Err(e) = db::update(ctx, PROVIDERS_TABLE, &id, data).await {
-        return err_internal("Database error", e);
+        return crud::db_error(e, "Provider not found", "Database error");
     }
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
-        return err_internal("reload_provider_service failed", e);
+        return crud::db_error_internal(e, "reload_provider_service failed");
     }
 
     ok_json(&DiscoveredModelsResponse { models: cfg.models })

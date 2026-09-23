@@ -77,11 +77,13 @@ pub enum RoomError {
     Answered,
     BadCode,
     TooBig,
-    Db(String),
+    /// A failed store call, its code kept so a WRAP denial stays a 403 and a
+    /// quota a 429 (`crud::db_error_internal`).
+    Db(WaferError),
 }
 
-fn db_err(e: wafer_run::WaferError) -> RoomError {
-    RoomError::Db(e.message)
+fn db_err(e: WaferError) -> RoomError {
+    RoomError::Db(e)
 }
 
 /// Current UTC time as an ISO-8601 string with a literal `Z` suffix
@@ -191,7 +193,7 @@ async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> 
         // that does not.
         ErrorCode::Internal | ErrorCode::Aborted => {}
         // Anything else (WRAP refusal, quota, ...) is not a code collision.
-        _ => return RoomError::Db(error.message),
+        _ => return RoomError::Db(error),
     }
     match db_read::list_bounded(
         ctx,
@@ -202,7 +204,7 @@ async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> 
     .await
     {
         Ok(rows) if !rows.is_empty() => RoomError::Taken,
-        _ => RoomError::Db(error.message),
+        _ => RoomError::Db(error),
     }
 }
 

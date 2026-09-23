@@ -5,7 +5,7 @@
 
 use maud::{html, Markup};
 use wafer_core::clients::vector as vclient;
-use wafer_run::{context::Context, Message, OutputStream};
+use wafer_run::{context::Context, Message, OutputStream, WaferError};
 
 use super::service::{display_index_name, vector_backend_available, IndexRow};
 use crate::ui::{
@@ -16,10 +16,8 @@ use crate::ui::{
 
 /// htmx-friendly success render for `POST /b/vector/api/indexes` — re-loads
 /// the index list so the modal swap shows the new row.
-pub async fn render_index_list_fragment(ctx: &dyn Context) -> Result<Markup, String> {
-    let rows = super::service::list_index_rows(ctx)
-        .await
-        .map_err(|e| e.to_string())?;
+pub async fn render_index_list_fragment(ctx: &dyn Context) -> Result<Markup, WaferError> {
+    let rows = super::service::list_index_rows(ctx).await?;
     Ok(html! {
         div #vector-index-list { (render_index_list_table(&rows)) }
         (render_create_index_modal())
@@ -153,17 +151,18 @@ pub fn render_index_detail_sections(
 ///
 /// Reads the per-index metadata registry (`impresspress__vector__registry`)
 /// and decorates each row with a live vector count from the underlying
-/// `_meta` table. A failure to load the registry (e.g. fresh DB where the
-/// table doesn't exist yet) falls through to the empty state — the
-/// `wafer-block-sqlite` service returns an empty list rather than erroring
-/// for unknown collections, so this only logs when something more serious
-/// happens.
+/// `_meta` table. "No vector indexes yet" is what a deployment with none
+/// renders, so a registry that could not be read fails the page instead of
+/// borrowing that sentence.
 pub async fn index_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let rows = match super::service::list_index_rows(ctx).await {
         Ok(rs) => rs,
         Err(e) => {
-            tracing::warn!(error = %e, "vector index list failed");
-            Vec::new()
+            return crate::blocks::crud::db_error_page(
+                msg,
+                e,
+                "vector index list page: registry read failed",
+            )
         }
     };
 
@@ -235,8 +234,9 @@ pub async fn index_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// storage name, and looks up the registry row + meta-table count via
 /// `service::get_index_row`. Schema columns are introspected from the
 /// `_meta` table — empty on a fresh DB, in which case the helper omits
-/// the schema table. Any 404 path (invalid name, missing row) goes to
-/// `ui::not_found_response`.
+/// the schema table. An invalid name or a missing row goes to
+/// `ui::not_found_response`; a registry read that failed is not a missing
+/// row and answers through `crud::db_error_page`.
 pub async fn index_detail_page(ctx: &dyn Context, msg: &Message, name: &str) -> OutputStream {
     if super::service::validate_index_name(name).is_err() {
         return ui::not_found_response(msg);
@@ -247,8 +247,11 @@ pub async fn index_detail_page(ctx: &dyn Context, msg: &Message, name: &str) -> 
         Ok(Some(r)) => r,
         Ok(None) => return ui::not_found_response(msg),
         Err(e) => {
-            tracing::warn!(error = %e, "vector index lookup failed");
-            return ui::not_found_response(msg);
+            return crate::blocks::crud::db_error_page(
+                msg,
+                e,
+                "vector index detail page: registry read failed",
+            )
         }
     };
 

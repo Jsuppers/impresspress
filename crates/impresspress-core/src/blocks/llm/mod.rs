@@ -24,7 +24,7 @@ use crate::{
         messages::contracts::{EntryKind, EntryRole},
     },
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
-    http::{err_bad_request, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_not_found, ok_json},
     llm_target::DefaultTarget,
 };
 
@@ -621,7 +621,7 @@ impl LlmBlock {
         if let Some(thread_id) = body.thread_id {
             let existing = match repo::settings::find_for_thread(ctx, &thread_id).await {
                 Ok(existing) => existing,
-                Err(e) => return err_internal("Database error", e),
+                Err(e) => return crud::db_error_internal(e, "Database error"),
             };
 
             let written = match existing {
@@ -650,7 +650,7 @@ impl LlmBlock {
                 Ok(row) => ok_json(&ConfigUpdateResponse::Override(ThreadOverrideView::from(
                     &row,
                 ))),
-                Err(e) => err_internal("Database error", e),
+                Err(e) => crud::db_error_internal(e, "Database error"),
             };
         }
 

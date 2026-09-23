@@ -13,8 +13,8 @@ use std::{collections::HashMap, time::Duration};
 use serde::{Deserialize, Serialize};
 use wafer_core::clients::{config, network as net};
 use wafer_run::{
-    context::Context, BlockInfo, ConfigVar, InputStream, InputType, InstanceMode, LifecycleType,
-    OutputStream,
+    context::Context, BlockInfo, ConfigVar, ErrorCode, InputStream, InputType, InstanceMode,
+    LifecycleType, OutputStream, WaferError,
 };
 
 use super::rate_limit::{RateLimit, UserRateLimiter};
@@ -218,7 +218,7 @@ async fn handle_send(
         return err_bad_request(&e);
     }
     if let Err(e) = check_recipient_allowed(ctx, &req.to).await {
-        return err_bad_request(&e);
+        return OutputStream::error(e);
     }
     if let Err(e) = check_send_rate_limits(limiter, ctx, &req.to).await {
         return e;
@@ -255,7 +255,7 @@ async fn handle_send_template(
         return err_bad_request(&e);
     }
     if let Err(e) = check_recipient_allowed(ctx, &req.to).await {
-        return err_bad_request(&e);
+        return OutputStream::error(e);
     }
     if let Err(e) = check_send_rate_limits(limiter, ctx, &req.to).await {
         return e;
@@ -603,8 +603,9 @@ fn glob_match_inner(pat: &[u8], val: &[u8]) -> bool {
 }
 
 /// Check the recipient against `IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS`.
-/// Empty/unset = allow (startup warning already emitted in lifecycle).
-async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), String> {
+/// Empty/unset = allow (startup warning already emitted in lifecycle). A
+/// recipient no pattern admits is the caller's `InvalidArgument`, a 400.
+async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), WaferError> {
     let patterns =
         config::get_default(ctx, "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS", "").await;
     let patterns = patterns.trim();
@@ -620,8 +621,9 @@ async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), Stri
             return Ok(());
         }
     }
-    Err(format!(
-        "recipient '{to}' does not match any allowed pattern"
+    Err(WaferError::new(
+        ErrorCode::InvalidArgument,
+        format!("recipient '{to}' does not match any allowed pattern"),
     ))
 }
 

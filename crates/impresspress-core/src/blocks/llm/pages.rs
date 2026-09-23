@@ -13,7 +13,10 @@ use super::{
     messages_list, messages_list_contexts, record_field, repo, ContextView, DEFAULT_MODEL_VAR,
     DEFAULT_PROVIDER, DEFAULT_PROVIDER_VAR,
 };
-use crate::ui::{self, components, icons, shell::Crumb};
+use crate::{
+    blocks::crud,
+    ui::{self, components, icons, shell::Crumb},
+};
 
 // ---------------------------------------------------------------------------
 // Unified chat page (handles `/b/llm/` and `/b/llm/threads/{id}`)
@@ -122,10 +125,7 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // exactly because these two lines swallowed it.
     let threads = match messages_list_contexts(ctx, msg).await {
         Ok(threads) => threads,
-        Err(e) => {
-            tracing::error!(error = %e, "llm chat page: thread list failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "llm chat page: thread list failed"),
     };
 
     // Entries for the selected thread, if any. Empty when no thread is
@@ -133,10 +133,7 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let entries = match thread_id {
         Some(tid) => match messages_list(ctx, msg, tid).await {
             Ok(entries) => entries,
-            Err(e) => {
-                tracing::error!(error = %e, thread_id = %tid, "llm chat page: entry list failed");
-                return ui::server_error_response(msg);
-            }
+            Err(e) => return crud::db_error_page(msg, e, "llm chat page: entry list failed"),
         },
         None => Vec::new(),
     };
@@ -406,10 +403,7 @@ pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // settings table fails the page rather than borrowing that sentence.
     let overrides = match repo::settings::list_all(ctx).await {
         Ok(rows) => rows,
-        Err(e) => {
-            tracing::error!(error = %e, "llm settings page: override read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "llm settings page: override read failed"),
     };
 
     let content = html! {
