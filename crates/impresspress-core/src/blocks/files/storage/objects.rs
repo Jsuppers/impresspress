@@ -23,7 +23,7 @@ use crate::{
             },
         },
     },
-    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_not_found, ok_json},
 };
 
 /// Collect an `InputStream` into `Vec<u8>` with a hard size cap. Errors out
@@ -239,7 +239,7 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         Ok(quota) => quota,
         // Fail closed: reading the body against the default cap during an
         // outage would admit a file an admin-lowered override forbids.
-        Err(e) => return err_internal("Quota lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "Quota lookup failed"),
     };
     let Ok(body_bytes) = collect_with_cap(input, quota.max_file_size_bytes).await else {
         return err_bad_request(&format!(
@@ -427,7 +427,7 @@ pub(in crate::blocks::files) async fn handle_upload_object(
                     delete_blobs(ctx, bucket, &[reservation.blob_key.as_str()]).await;
                 }
             }
-            err_internal("Upload failed", e)
+            crud::db_error_internal(e, "Upload failed")
         }
     }
 }

@@ -12,7 +12,7 @@ use crate::{
         crud,
         files::{contracts, repo},
     },
-    http::{err_bad_request, err_forbidden, err_internal, ok_json},
+    http::{err_bad_request, err_forbidden, ok_json},
 };
 
 pub(in crate::blocks::files) async fn handle_list_buckets(
@@ -34,7 +34,7 @@ pub(in crate::blocks::files) async fn handle_list_buckets(
             truncated: rows.truncated,
             buckets: rows.rows.into_iter().map(|r| r.name).collect(),
         }),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -115,7 +115,7 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
                 "failed to roll back the bucket row after its storage folder could not be created",
             );
         }
-        return err_internal("Failed to create bucket", e);
+        return crud::db_error_internal(e, "Failed to create bucket");
     }
     ok_json(&contracts::BucketCreatedResponse {
         name: body.name,

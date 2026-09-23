@@ -5,7 +5,7 @@ use maud::{html, Markup, PreEscaped};
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::files::repo,
+    blocks::{crud, files::repo},
     db_read::CappedList,
     ui::{
         self,
@@ -173,10 +173,7 @@ pub async fn bucket_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream 
 
     let rows = match list_buckets_for_user(ctx, &user_id).await {
         Ok(rows) => rows,
-        Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "bucket list page: read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "bucket list page"),
     };
 
     let new_bucket_btn = button(

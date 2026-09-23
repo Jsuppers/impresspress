@@ -766,6 +766,9 @@ mod grant_tests {
 }
 
 #[cfg(test)]
+mod error_mapping_tests;
+
+#[cfg(test)]
 mod test_support {
     use std::sync::Arc;
 

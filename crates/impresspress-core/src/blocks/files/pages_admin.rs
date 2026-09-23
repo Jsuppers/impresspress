@@ -5,6 +5,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use super::{models::QuotaConfig, repo};
 use crate::{
+    blocks::crud,
     ui::{self, components, icons, shell::Crumb},
     util::format_bytes,
 };
@@ -139,10 +140,7 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let stats = match load_admin_stats(ctx).await {
         Ok(stats) => stats,
-        Err(e) => {
-            tracing::error!(error = %e, "storage admin overview: stats read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "storage admin overview: stats read"),
     };
 
     // Tabs go in the `filters` slot (their padding gutter matches
@@ -276,10 +274,7 @@ pub async fn buckets(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let rows: Vec<AdminBucketRow> = match repo::buckets::list_recent(ctx, 100).await {
         Ok(page) => page.rows.iter().map(AdminBucketRow::from).collect(),
-        Err(e) => {
-            tracing::error!(error = %e, "storage admin buckets: read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "storage admin buckets"),
     };
 
     // Admin can create buckets the same way users do — re-use the
@@ -402,10 +397,7 @@ pub async fn shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let rows: Vec<AdminShareRow> = match repo::shares::list_recent(ctx, 100, 0).await {
         Ok(page) => page.rows.iter().map(AdminShareRow::from).collect(),
-        Err(e) => {
-            tracing::error!(error = %e, "storage admin shares: read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "storage admin shares"),
     };
 
     let body = list_page(
@@ -522,10 +514,7 @@ pub async fn quotas(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let rows: Vec<AdminQuotaRow> = match repo::quota::list_recent(ctx, 100).await {
         Ok(page) => page.rows.iter().map(AdminQuotaRow::from).collect(),
-        Err(e) => {
-            tracing::error!(error = %e, "storage admin quotas: read failed");
-            return ui::server_error_response(msg);
-        }
+        Err(e) => return crud::db_error_page(msg, e, "storage admin quotas"),
     };
 
     let body = list_page(

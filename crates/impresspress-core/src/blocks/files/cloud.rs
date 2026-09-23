@@ -18,13 +18,13 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_not_found, ok_json},
 };
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match repo::shares::list_for_user(ctx, msg.user_id(), 100).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -198,7 +198,7 @@ pub(super) async fn handle_create_share(
             direct_url: format!("/b/storage/direct/{token}"),
             token,
         }),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -228,11 +228,11 @@ pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> Out
 pub(super) async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let quota = match super::quota::get_user_quota(ctx, msg.user_id()).await {
         Ok(quota) => quota,
-        Err(e) => return err_internal("Quota lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "Quota lookup failed"),
     };
     let usage = match super::quota::get_user_usage(ctx, msg.user_id()).await {
         Ok(usage) => usage,
-        Err(e) => return err_internal("Quota usage lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "Quota usage lookup failed"),
     };
     ok_json(&QuotaResponse { quota, usage })
 }
@@ -242,7 +242,7 @@ pub(super) async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -
     let offset = ((page - 1) * page_size) as i64;
     match repo::shares::list_recent(ctx, page_size as i64, offset).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -254,14 +254,14 @@ pub(super) async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> Outp
 
     match repo::shares::list_access_logs(ctx, share_id, page_size as i64, offset).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
 pub(super) async fn handle_admin_quotas(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     match repo::quota::list(ctx, 1000).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -300,7 +300,7 @@ pub(super) async fn handle_update_quota(
 
     match repo::quota::upsert_for_user(ctx, user_id, body).await {
         Ok(row) => ok_json(&RecordView::from_row(row)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 

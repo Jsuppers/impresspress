@@ -141,8 +141,7 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     let shares = match list_shares_for_user(ctx, &user_id).await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "cloud storage page: share list failed");
-            return crate::ui::server_error_response(msg);
+            return crate::blocks::crud::db_error_page(msg, e, "cloud storage page: share list")
         }
     };
     // Same quota source as upload enforcement (`repo::objects::reserve_upload`
@@ -155,11 +154,10 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
             used_bytes,
             limit_bytes: limit.max_storage_bytes,
         },
+        // A quota card showing "0 B used" during an outage misleads; the page
+        // fails like the API does.
         (Err(e), _) | (_, Err(e)) => {
-            // A quota card showing "0 B used" during an outage misleads;
-            // the page fails like the API does.
-            tracing::error!(error = %e, user_id = %user_id, "cloud storage page: quota lookup failed");
-            return crate::ui::server_error_response(msg);
+            return crate::blocks::crud::db_error_page(msg, e, "cloud storage page: quota lookup")
         }
     };
 

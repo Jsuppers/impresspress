@@ -238,10 +238,7 @@ pub async fn object_list_page(
 
     let all_objects = match list_objects_in_bucket(ctx, bucket).await {
         Ok(rows) => rows,
-        Err(e) => {
-            tracing::error!(error = %e, bucket = %bucket, "object list page: read failed");
-            return crate::ui::server_error_response(msg);
-        }
+        Err(e) => return crate::blocks::crud::db_error_page(msg, e, "object list page"),
     };
     let listing = group_objects_by_prefix(&all_objects, current_prefix);
 
