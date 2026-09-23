@@ -1001,7 +1001,7 @@ mod tests {
         let mut request = Message::new("retrieve");
         request.set_meta(
             "http.header.authorization",
-            &format!(
+            format!(
                 "Bearer {}",
                 crate::test_support::access_token_for(&user.id, &["user"])
             ),
