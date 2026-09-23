@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 use wafer_core::clients::database as db;
 use wafer_run::{Block, InputStream, Message};
 
-use super::{Entry, ASSET};
+use super::{Entry, Exempt};
 use crate::{
     blocks::products::ProductsBlock,
     test_support::{
@@ -134,14 +134,13 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
     })
 }
 
-/// Every products page, with the query that selects each view carrying
-/// controls of its own.
+/// Every products page, with the purchases filter the admin list links to.
+/// The Deleted views are the crawl's to find, from the Live lists' links.
 fn pages() -> Vec<Page> {
     vec![
         Page::at("/b/products"),
         Page::at("/b/products/"),
         Page::at("/b/products/my-products"),
-        Page::at("/b/products/my-products").with("view", "deleted"),
         Page::at("/b/products/my-products/new"),
         Page::at("/b/products/my-products/mine"),
         Page::at("/b/products/my-products/mine_gone/close"),
@@ -153,7 +152,6 @@ fn pages() -> Vec<Page> {
         Page::at("/b/products/admin"),
         Page::at("/b/products/admin/"),
         Page::at("/b/products/admin/manage"),
-        Page::at("/b/products/admin/manage").with("view", "deleted"),
         Page::at("/b/products/admin/new"),
         Page::at("/b/products/admin/products/live"),
         Page::at("/b/products/admin/products/gone/close"),
@@ -170,7 +168,7 @@ fn pages() -> Vec<Page> {
 
 /// `GET` rows that are not pages and publish no schema. Every other `GET` row
 /// of the block publishes a response schema.
-const EXEMPT: &[(&str, &str)] = &[("/b/products/storefront.js", ASSET)];
+const EXEMPT: &[(&str, Exempt)] = &[("/b/products/storefront.js", Exempt::Asset)];
 
 /// Write one fixture row under `id`.
 async fn seed(ctx: &TestContext, table: &str, id: &str, data: serde_json::Value) {

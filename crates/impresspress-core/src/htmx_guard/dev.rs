@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use wafer_run::{Block, Message};
 
-use super::{Entry, ASSET, JSON_API};
+use super::{Entry, Exempt};
 use crate::{
     blocks::dev::{test_support::FakeControl, DevBlock},
     test_support::{
@@ -19,13 +19,13 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/dev",
         fixture: Some(fixture),
         exempt: &[
-            ("/b/dev/static/dev.js", ASSET),
-            ("/b/dev/static/dev.css", ASSET),
-            ("/b/dev/static/compiler-adapter.js", ASSET),
-            ("/b/dev/api/tools.json", JSON_API),
+            ("/b/dev/static/dev.js", Exempt::Asset),
+            ("/b/dev/static/dev.css", Exempt::Asset),
+            ("/b/dev/static/compiler-adapter.js", Exempt::Asset),
+            ("/b/dev/api/tools.json", Exempt::JsonApi),
             (
                 "/b/dev/api/export",
-                "a site-export archive download; renders no page",
+                Exempt::NotAPage("a site-export archive download"),
             ),
         ],
         must_fire: &[],

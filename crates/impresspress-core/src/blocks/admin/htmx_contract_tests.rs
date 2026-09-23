@@ -48,7 +48,7 @@ pub(crate) fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fi
                 .iter()
                 .map(|(_, path, query)| {
                     query.iter().fold(Page::at(*path), |page, (name, value)| {
-                        page.with(name, *value)
+                        page.with(*name, *value)
                     })
                 })
                 .collect(),

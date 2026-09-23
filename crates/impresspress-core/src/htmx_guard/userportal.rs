@@ -6,7 +6,7 @@ use std::sync::Arc;
 use wafer_core::clients::crypto;
 use wafer_run::{Block, InputStream, Message};
 
-use super::Entry;
+use super::{Entry, Exempt};
 use crate::{
     blocks::{
         auth::repo::{local_credentials, provider_links, sessions},
@@ -41,7 +41,7 @@ pub(super) fn entry() -> Entry {
         fixture: Some(fixture),
         exempt: &[(
             "/b/userportal/config",
-            "public JSON the chrome reads for the portal's branding; renders no page",
+            Exempt::NotAPage("public JSON the chrome reads for the portal's branding"),
         )],
         must_fire: &[
             "delete /b/userportal/sessions/{family}",

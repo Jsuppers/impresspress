@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use wafer_run::{Block, Message};
 
-use super::{Entry, JSON_API};
+use super::{Entry, Exempt};
 use crate::{
     blocks::auth_ui::AuthUiBlock,
     test_support::{
@@ -23,17 +23,19 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/auth-ui",
         fixture: Some(fixture),
         exempt: &[
-            ("/b/auth/api/api-keys", JSON_API),
-            ("/b/auth/api/verify", JSON_API),
-            ("/b/auth/api/oauth/providers", JSON_API),
+            ("/b/auth/api/api-keys", Exempt::JsonApi),
+            ("/b/auth/api/verify", Exempt::JsonApi),
+            ("/b/auth/api/oauth/providers", Exempt::JsonApi),
             (
                 "/b/auth/oauth/login",
-                "redirects the browser to the OAuth provider; renders no page",
+                Exempt::NotAPage("redirects the browser to the OAuth provider"),
             ),
             (
                 "/b/auth/oauth/callback",
-                "the OAuth provider's return leg: consumes a one-time state and code no \
-                 fixture can mint, then redirects",
+                Exempt::NotAPage(
+                    "the OAuth provider's return leg: consumes a one-time state and code no \
+                     fixture can mint, then redirects",
+                ),
             ),
         ],
         must_fire: &[],

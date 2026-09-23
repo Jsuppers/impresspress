@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use wafer_run::{Block, Message};
 
-use super::{Entry, REDIRECT};
+use super::{Entry, Exempt};
 use crate::{
     blocks::tickets::{
         models::{ActorType, CreateTicketInput, TicketSource, TicketTypeInput},
@@ -28,7 +28,7 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/tickets",
         fixture: Some(|| Box::pin(fixture())),
         // `/b/tickets/admin` answers 302 to `/b/tickets/admin/tickets`.
-        exempt: &[("/b/tickets/admin", REDIRECT)],
+        exempt: &[("/b/tickets/admin", Exempt::Redirect)],
         // No mutating htmx control on any tickets page; see the module doc.
         must_fire: &[],
     }

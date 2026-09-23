@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use wafer_run::{Block, LifecycleEvent, LifecycleType, Message};
 
-use super::{Entry, JSON_API};
+use super::{Entry, Exempt};
 use crate::{
     blocks::legalpages::LegalPagesBlock,
     test_support::{
@@ -25,8 +25,8 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/legalpages",
         fixture: Some(|| Box::pin(fixture())),
         exempt: &[
-            ("/b/legalpages/api/documents", JSON_API),
-            ("/b/legalpages/api/documents/{id}", JSON_API),
+            ("/b/legalpages/api/documents", Exempt::JsonApi),
+            ("/b/legalpages/api/documents/{id}", Exempt::JsonApi),
         ],
         // No mutating htmx control on any legalpages page; see the module doc.
         must_fire: &[],

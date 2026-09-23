@@ -6,7 +6,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use wafer_run::{Block, Message};
 
-use super::{Entry, JSON_API};
+use super::{Entry, Exempt};
 use crate::{
     blocks::messages::{test_support::ctx_with_messages, MessagesBlock},
     test_support::{
@@ -68,9 +68,9 @@ pub(super) fn entry() -> Entry {
         block: "impresspress/messages",
         fixture: Some(fixture),
         exempt: &[
-            ("/b/messages/api/contexts/{id}", JSON_API),
-            ("/b/messages/api/contexts/{id}/entries", JSON_API),
-            ("/b/messages/api/entries/{id}", JSON_API),
+            ("/b/messages/api/contexts/{id}", Exempt::JsonApi),
+            ("/b/messages/api/contexts/{id}/entries", Exempt::JsonApi),
+            ("/b/messages/api/entries/{id}", Exempt::JsonApi),
         ],
         must_fire: &[
             "create /b/messages/api/contexts",

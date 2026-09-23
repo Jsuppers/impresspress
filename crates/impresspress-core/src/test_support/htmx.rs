@@ -16,7 +16,8 @@
 //! `{"deleted": true}`. Both have shipped.
 //!
 //! [`fire_every_control`] closes the gap for one block's pages. It renders
-//! each page of a [`Fixture`], finds every element carrying
+//! every page [`crawl`] reaches from a [`Fixture`] — its pages, and every tab
+//! and view they link to — finds every element carrying
 //! `hx-post`/`hx-put`/`hx-patch`/`hx-delete`, builds the request htmx would
 //! send — a form's fields serialized the way a browser serializes them, plus
 //! what the operator types into the fields the page leaves empty — and
@@ -312,20 +313,25 @@ pub fn encoded_fields(control: &Control, operator_input: &[(&str, &str)]) -> Str
 pub struct Answer {
     pub status: u16,
     pub content_type: String,
+    /// The `Location` header, on a redirect.
+    pub location: Option<String>,
     pub body: String,
 }
 
 /// Collect `out` the way the HTTP boundary does.
 pub async fn answer(out: OutputStream) -> Answer {
     let parts = wafer_block::http_codec::collect_http_response(out).await;
-    Answer {
-        status: parts.status,
-        content_type: parts
+    let header = |name: &str| {
+        parts
             .headers
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.clone())
-            .unwrap_or_default(),
+    };
+    Answer {
+        status: parts.status,
+        content_type: header("content-type").unwrap_or_default(),
+        location: header("location"),
         body: String::from_utf8_lossy(&parts.body).into_owned(),
     }
 }
@@ -359,10 +365,10 @@ impl Site {
 }
 
 /// One page, as a concrete request: its path and query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     pub path: String,
-    pub query: Vec<(&'static str, String)>,
+    pub query: Vec<(String, String)>,
 }
 
 impl Page {
@@ -373,9 +379,29 @@ impl Page {
         }
     }
 
-    pub fn with(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.query.push((name, value.into()));
+    pub fn with(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query.push((name.into(), value.into()));
         self
+    }
+
+    /// The URL a browser requests for this page.
+    pub fn url(&self) -> String {
+        if self.query.is_empty() {
+            return self.path.clone();
+        }
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in &self.query {
+            query.append_pair(name, value);
+        }
+        format!("{}?{}", self.path, query.finish())
+    }
+
+    /// What makes two pages the same request, whatever order their query
+    /// parameters were written in.
+    fn key(&self) -> (String, Vec<(String, String)>) {
+        let mut query = self.query.clone();
+        query.sort();
+        (self.path.clone(), query)
     }
 }
 
@@ -388,6 +414,10 @@ pub struct Fixture {
     /// The request message a visitor of these pages sends for
     /// `(action, path)` — their identity and roles.
     pub caller: fn(&str, &str) -> Message,
+    /// The pages the crawl starts from: every page reachable only by a
+    /// route (not by a link on another page), and every filter a page links
+    /// to with a parameter [`crawl`] does not follow. The tabs and views a
+    /// page links to are found by [`crawl`], not listed here.
     pub pages: Vec<Page>,
     /// What an operator types into the fields the pages render empty. Every
     /// entry is a value the page itself would accept.
@@ -453,16 +483,7 @@ pub async fn send(
 /// document: a page that fails to render has no controls to check, and would
 /// pass for that reason.
 pub async fn render(fixture: &Fixture, page: &Page) -> String {
-    let url = if page.query.is_empty() {
-        page.path.clone()
-    } else {
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        for (name, value) in &page.query {
-            query.append_pair(name, value);
-        }
-        format!("{}?{}", page.path, query.finish())
-    };
-    let (_, answer) = send(fixture, "retrieve", &url, "", false).await;
+    let (_, answer) = send(fixture, "retrieve", &page.url(), "", false).await;
     assert_eq!(
         answer.status, 200,
         "{page:?} did not render: {}",
@@ -476,25 +497,122 @@ pub async fn render(fixture: &Fixture, page: &Page) -> String {
     answer.body
 }
 
-/// Fire every mutating htmx control on every page `make` builds, each against
-/// its own fresh fixture, and require a 2xx that is HTML wherever it swaps.
-/// Returns `"{action} {template}"` for every route a control reached, so a
-/// caller can pin the ones its pages must keep rendering.
+/// The query parameters that select a view of a page — a tab, a sub-tab, a
+/// deleted-records view — rather than filter or page through its rows.
+/// [`crawl`] follows a link that changes only these.
+pub const VIEW_PARAMS: &[&str] = &["tab", "subtab", "view"];
+
+/// A page [`crawl`] reached: one of the fixture's pages, or that page's path
+/// under the view query a link on a reached page carries. Held as an index
+/// rather than a [`Page`] because a fixture's pages name its seeded ids, and
+/// every control is fired against a fresh fixture whose ids differ.
+#[derive(Debug, Clone)]
+pub struct Reached {
+    base: usize,
+    view: Option<Vec<(String, String)>>,
+}
+
+impl Reached {
+    /// The concrete page over `fixture`.
+    pub fn page(&self, fixture: &Fixture) -> Page {
+        let base = &fixture.pages[self.base];
+        match &self.view {
+            None => base.clone(),
+            Some(query) => Page {
+                path: base.path.clone(),
+                query: query.clone(),
+            },
+        }
+    }
+}
+
+/// Every view of its own path that `html` links to: the query of each
+/// `href`/`hx-get` whose path is `path` and whose parameters are all
+/// [`VIEW_PARAMS`], in document order.
+fn view_links(html: &str, path: &str) -> Vec<Vec<(String, String)>> {
+    let mut found: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    for attr in ["href=\"", "hx-get=\""] {
+        for (pos, _) in html.match_indices(attr) {
+            if !html[..pos].ends_with(char::is_whitespace) {
+                continue;
+            }
+            let rest = &html[pos + attr.len()..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let url = unescape(&rest[..end]);
+            let Some((link_path, query)) = url.split_once('?') else {
+                continue;
+            };
+            if link_path != path {
+                continue;
+            }
+            let query: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+            if !query.is_empty()
+                && query
+                    .iter()
+                    .all(|(name, _)| VIEW_PARAMS.contains(&name.as_str()))
+            {
+                found.push((pos, query));
+            }
+        }
+    }
+    found.sort_by_key(|(pos, _)| *pos);
+    found.into_iter().map(|(_, query)| query).collect()
+}
+
+/// Every page the fixture's pages lead to: each page, and every view of its
+/// own path a reached page links to, followed until no new view appears.
+/// A tab is rendered because a page links to it, not because a list names
+/// it, so a new tab is covered the day it is linked. Breadth-first in
+/// document order, so two crawls of one fixture reach the same pages in the
+/// same order.
+pub async fn crawl(fixture: &Fixture) -> Vec<Reached> {
+    let mut reached: Vec<Reached> = (0..fixture.pages.len())
+        .map(|base| Reached { base, view: None })
+        .collect();
+    let mut seen: BTreeSet<(String, Vec<(String, String)>)> =
+        fixture.pages.iter().map(Page::key).collect();
+    let mut next = 0;
+    while next < reached.len() {
+        let base = reached[next].base;
+        let page = reached[next].page(fixture);
+        for query in view_links(&render(fixture, &page).await, &page.path) {
+            let view = Reached {
+                base,
+                view: Some(query),
+            };
+            if seen.insert(view.page(fixture).key()) {
+                reached.push(view);
+            }
+        }
+        next += 1;
+    }
+    reached
+}
+
+/// Fire every mutating htmx control on every page [`crawl`] reaches from the
+/// pages `make` builds, each against its own fresh fixture, and require a 2xx
+/// that is HTML wherever it swaps. Returns `"{action} {template}"` for every
+/// route a control reached, so a caller can pin the ones its pages must keep
+/// rendering.
 pub async fn fire_every_control(make: MakeFixture) -> BTreeSet<String> {
     let mut fired = BTreeSet::new();
-    let page_count = make().await.pages.len();
-    for page_index in 0..page_count {
+    let reached = crawl(&make().await).await;
+    for view in &reached {
         let signatures: Vec<String> = {
             let fixture = make().await;
-            let page = &fixture.pages[page_index];
-            mutating_controls(&render(&fixture, page).await)
+            let page = view.page(&fixture);
+            mutating_controls(&render(&fixture, &page).await)
                 .iter()
                 .map(|control| control.signature(&fixture.site))
                 .collect()
         };
         for (index, signature) in signatures.iter().enumerate() {
             let fixture = make().await;
-            let page = fixture.pages[page_index].clone();
+            let page = view.page(&fixture);
             let controls = mutating_controls(&render(&fixture, &page).await);
             let control = &controls[index];
             assert_eq!(
@@ -559,6 +677,38 @@ mod tests {
             disable.signature(&site),
             other_disable.signature(&site),
             "the same route on another row's id is the same control"
+        );
+    }
+
+    /// The crawl follows a link to its own path that changes only the view
+    /// — from `href` or `hx-get`, `&amp;`-escaped or not — and nothing that
+    /// filters or pages, reaches another path, or is not a link attribute.
+    #[test]
+    fn a_page_links_to_its_views_by_tab_subtab_and_view() {
+        let html = r#"
+            <a class="tab" href="/b/admin/blocks?tab=services" hx-get="/b/admin/blocks?tab=services">S</a>
+            <a href="/b/admin/blocks?tab=custom&amp;subtab=x">C</a>
+            <a href="/b/admin/blocks?view=deleted">D</a>
+            <a href="/b/admin/blocks?page=2">next</a>
+            <a href="/b/admin/blocks?tab=services&amp;runtime=wasm">filtered</a>
+            <a href="/b/admin/blocks">default</a>
+            <a href="/b/admin/users?tab=roles">elsewhere</a>
+            <div data-href="/b/admin/blocks?tab=hidden"></div>
+        "#;
+        let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            view_links(html, "/b/admin/blocks"),
+            vec![
+                owned(&[("tab", "services")]),
+                owned(&[("tab", "services")]),
+                owned(&[("tab", "custom"), ("subtab", "x")]),
+                owned(&[("view", "deleted")]),
+            ]
         );
     }
 

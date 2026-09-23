@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 use serde_json::json;
 use wafer_run::{Block, Message};
 
-use super::Entry;
+use super::{Entry, Exempt};
 use crate::{
     blocks::files::{repo, test_wrap, FilesBlock},
     test_support::{
@@ -22,7 +22,7 @@ use crate::{
 
 /// The files block's own download routes: they answer with the object's
 /// bytes under its stored content type, not a page.
-const DOWNLOAD: &str = "file download (the object's bytes), not a page";
+const DOWNLOAD: Exempt = Exempt::NotAPage("file download (the object's bytes)");
 
 pub(super) fn entry() -> Entry {
     Entry {
@@ -32,7 +32,7 @@ pub(super) fn entry() -> Entry {
             ("/b/storage/api/buckets/{name}/objects/{key...}", DOWNLOAD),
             (
                 "/b/storage/direct/{token}",
-                "a share link's download (the object's bytes), not a page",
+                Exempt::NotAPage("a share link's download (the object's bytes)"),
             ),
         ],
         // No mutating htmx control on any files page; see the module doc.
