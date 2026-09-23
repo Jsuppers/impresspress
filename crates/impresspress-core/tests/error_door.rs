@@ -1542,7 +1542,7 @@ fn the_evasion_gate_catches_each_way_around() {
 /// `"unplanned"` is a block no plan item has scheduled yet.
 const NOT_YET_GATED: &[(&str, usize, &str)] = &[
     ("dev", 6, "N25"),
-    ("files", 6, "N25"),
+    ("files", 5, "N25"),
     ("tickets", 1, "N25"),
 ];
 
