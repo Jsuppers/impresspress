@@ -1740,8 +1740,9 @@ fn cause_dropped_is_the_whole_backlog() {
 /// inline (`format!("…{e}")`), or is either of those wrapped in maud's
 /// `PreEscaped(…)`. A name holds an error when it is bound:
 ///
-/// - by an `Err(…)` pattern — every name the pattern binds, so
-///   `Err(WaferError { message, .. })` binds `message` — in a `match` arm
+/// - by an `Err(…)` anywhere in a pattern — every name it binds, so
+///   `Err(WaferError { message, .. })` binds `message`, and `Some(Err(e))`
+///   and `(Err(e), _) | (_, Err(e))` bind `e` — in a `match` arm
 ///   (`Err(e) => { … }`, `Err(e) if guard => …`, `Err(e) => html! { … }`,
 ///   in Rust or in maud's `@match`), for the arm's body; in an `if let` or
 ///   `while let` (maud's `@if let` too), for its block; or in a
@@ -1833,6 +1834,34 @@ fn error_text_renders(src: &str) -> usize {
         }
     }
 
+    /// Every name an `Err(…)` inside the pattern `trees` binds, at any
+    /// depth: `e` in `Err(e)`, `Some(Err(e))` and `(Err(e), _) | (_, Err(e))`.
+    fn err_names(trees: &[TokenTree]) -> Vec<String> {
+        let mut names = Vec::new();
+        for (i, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Ident(ident) if ident == "Err" => {
+                    if let Some(TokenTree::Group(pattern)) = trees.get(i + 1) {
+                        if pattern.delimiter() == Delimiter::Parenthesis {
+                            names.extend(bound_names(pattern.stream()));
+                        }
+                    }
+                }
+                // `Err`'s own group was read above; this reaches the nested
+                // ones (`Some(Err(e))`), and re-reading `Err(e)`'s group
+                // finds no further `Err` in it.
+                TokenTree::Group(group) => {
+                    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                    names.extend(err_names(&inner));
+                }
+                _ => {}
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// For each sibling index, the names bound as holding an error there: an
     /// `Err(…)` arm's body, an `if let`'s block, the rest of the block after
     /// a `let … else`, a `fn`'s body for its error-typed parameters.
@@ -1856,33 +1885,26 @@ fn error_text_renders(src: &str) -> usize {
                 }
                 continue;
             }
-            if !is_ident(trees.get(at), "Err") {
-                continue;
-            }
-            let Some(TokenTree::Group(pattern)) = trees.get(at + 1) else {
-                continue;
-            };
-            if pattern.delimiter() != Delimiter::Parenthesis {
-                continue;
-            }
-            let names = bound_names(pattern.stream());
-            if names.is_empty() {
-                continue;
-            }
-            let mut next = at + 2;
-            // A guard: `Err(e) if … =>`. `==`, `>=` and `<=` are two
-            // puncts, but only an arm's arrow is `=` followed by `>`.
-            if is_ident(trees.get(next), "if") {
-                match (next..trees.len())
-                    .find(|&i| is_punct(trees.get(i), '=') && is_punct(trees.get(i + 1), '>'))
-                {
-                    Some(arrow) => next = arrow,
-                    None => continue,
+            // An arm: `=>`, with its pattern reaching back to the previous
+            // arm's comma or brace body. An `Err(…)` anywhere in it binds —
+            // `Some(Err(e))`, `(Err(e), _) | (_, Err(e))` — and a guard
+            // (`if …`) is not part of it.
+            if is_punct(trees.get(at), '=') && is_punct(trees.get(at + 1), '>') {
+                let from = (0..at)
+                    .rev()
+                    .find(|&i| {
+                        is_punct(trees.get(i), ',') || is_group(trees.get(i), Delimiter::Brace)
+                    })
+                    .map_or(0, |i| i + 1);
+                let to = (from..at)
+                    .find(|&i| is_ident(trees.get(i), "if"))
+                    .unwrap_or(at);
+                let names = err_names(&trees[from..to]);
+                if names.is_empty() {
+                    continue;
                 }
-            }
-            if is_punct(trees.get(next), '=') && is_punct(trees.get(next + 1), '>') {
-                // An arm: its brace body, or everything up to its comma.
-                let start = next + 2;
+                // Its brace body, or everything up to its comma.
+                let start = at + 2;
                 let end = if is_group(trees.get(start), Delimiter::Brace) {
                     start + 1
                 } else {
@@ -1893,24 +1915,35 @@ fn error_text_renders(src: &str) -> usize {
                 for slot in &mut held[start..end] {
                     slot.extend(names.iter().cloned());
                 }
-            } else if is_punct(trees.get(next), '=') {
-                let after_let = at >= 1 && is_ident(trees.get(at - 1), "let");
-                let conditional = after_let
-                    && at >= 2
-                    && (is_ident(trees.get(at - 2), "if") || is_ident(trees.get(at - 2), "while"));
-                if after_let && !conditional {
-                    // `let Err(e) = r else { … };`: bound after the statement.
-                    let end_of_statement = (next..trees.len())
-                        .find(|&i| is_punct(trees.get(i), ';'))
-                        .unwrap_or(trees.len());
-                    for slot in &mut held[end_of_statement..] {
-                        slot.extend(names.iter().cloned());
-                    }
-                } else if let Some(body) =
-                    (next + 1..trees.len()).find(|&i| is_group(trees.get(i), Delimiter::Brace))
+                continue;
+            }
+            // A `let`: its pattern runs to the `=`.
+            if !is_ident(trees.get(at), "let") {
+                continue;
+            }
+            let Some(eq) = (at + 1..trees.len()).find(|&i| is_punct(trees.get(i), '=')) else {
+                continue;
+            };
+            let names = err_names(&trees[at + 1..eq]);
+            if names.is_empty() {
+                continue;
+            }
+            let conditional = at >= 1
+                && (is_ident(trees.get(at - 1), "if") || is_ident(trees.get(at - 1), "while"));
+            if conditional {
+                // `if let Err(e) = … { body }`: the first block after `=`.
+                if let Some(body) =
+                    (eq + 1..trees.len()).find(|&i| is_group(trees.get(i), Delimiter::Brace))
                 {
-                    // `if let Err(e) = … { body }`: the first block after `=`.
                     held[body].extend(names.iter().cloned());
+                }
+            } else {
+                // `let Err(e) = r else { … };`: bound after the statement.
+                let end_of_statement = (eq..trees.len())
+                    .find(|&i| is_punct(trees.get(i), ';'))
+                    .unwrap_or(trees.len());
+                for slot in &mut held[end_of_statement..] {
+                    slot.extend(names.iter().cloned());
                 }
             }
         }
@@ -2125,6 +2158,20 @@ fn the_error_text_scan_catches_the_shapes() {
         // `let … else`: the name is bound for the rest of the block.
         (
             "fn a() -> Markup { let Err(e) = r else { return html! {} }; html! { p { (e) } } }\n",
+            1,
+        ),
+        // An `Err` nested inside the arm's pattern, or either side of an
+        // or-pattern.
+        (
+            "fn a() -> Markup { match (x, y) { (Ok(a), Ok(b)) => html! { (a) (b) }, (Err(e), _) | (_, Err(e)) => html! { p { (e) } }, } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Some(Err(e)) => { p { (e.message) } } _ => {} } } }\n",
+            1,
+        ),
+        (
+            "fn a() -> Markup { if let Some(Err(e)) = r { return html! { (e) }; } html! {} }\n",
             1,
         ),
         // Marked as markup, which is worse, not better.
