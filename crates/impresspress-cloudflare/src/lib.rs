@@ -363,6 +363,8 @@ where
         match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING) {
             Ok(batch_db) => {
                 ctx.wait_until(async move {
+                    use wafer_core::interfaces::database::service::DatabaseService as _;
+
                     let mut by_table: std::collections::HashMap<
                         &'static str,
                         Vec<std::collections::HashMap<String, serde_json::Value>>,

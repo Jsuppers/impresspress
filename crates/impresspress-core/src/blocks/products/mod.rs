@@ -29,13 +29,12 @@ mod tests;
 // `block-dev`-gated because `blocks::dev::data_snapshot` is the ONLY consumer
 // of all three, and the dev block is off in every default build: an
 // ungated re-export is three `unused_imports` warnings (and a dead
-// `upsert_from_snapshot`) in every build that does not compile the sandbox.
+// `snapshot_upsert`) in every build that does not compile the sandbox.
 // The gate says what the re-export is for as well as keeping the default
 // build warning-free.
 #[cfg(feature = "block-dev")]
 pub(crate) use repo::products::{
-    list_every_live as list_live_products, upsert_from_snapshot as upsert_product_from_snapshot,
-    TABLE,
+    list_every_live as list_live_products, snapshot_upsert as product_snapshot_upsert, TABLE,
 };
 // `stripe_events` has two non-production readers and no production one, so
 // its re-export carries both of their cfgs rather than claiming the name is

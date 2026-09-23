@@ -358,6 +358,10 @@ match db::get(ctx, TABLE, id) {
 }
 ```
 
+A write that duplicates a primary or `unique()` key fails with
+`AlreadyExists`, so a unique column is its own duplicate check — insert, and
+answer `409` on that code, rather than counting first.
+
 A `PermissionDenied` almost always means the block did not claim the resource
 it just tried to reach. Fix the declaration in `block()`, not the call.
 

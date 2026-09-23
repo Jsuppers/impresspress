@@ -54,7 +54,8 @@ use std::{collections::HashMap, sync::Arc};
 use impresspress_core::cache_key;
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::service::{
-    AggregateSpec, Column, DatabaseError, DatabaseService, Record, RecordList, Table, UpsertSpec,
+    AggregateSpec, CapGuard, Column, DatabaseError, DatabaseService, GuardedInsert, GuardedUpdate,
+    Record, RecordList, Table, UpsertSpec, WriteOp, WriteOutcome,
 };
 
 /// KV TTL applied to every row-cache PUT (24 h).
@@ -727,6 +728,106 @@ impl DatabaseService for KvCachedD1DatabaseService {
 
         Ok(())
     }
+
+    /// `create` for every row: each row's cache keys are derived from the
+    /// data being written, exactly as a single `create` derives them, so a
+    /// cached table is served here rather than refused.
+    async fn create_many(
+        &self,
+        collection: &str,
+        rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, DatabaseError> {
+        let cached = cache_key::classify_table(collection);
+        let mut invalidate: Vec<String> = cached
+            .map(|t| {
+                rows.iter()
+                    .flat_map(|row| cache_key::invalidate_keys(t, row))
+                    .collect()
+            })
+            .unwrap_or_default();
+        invalidate.sort();
+        invalidate.dedup();
+
+        let inserted = self.inner.create_many(collection, rows).await?;
+
+        self.invalidate_all(collection, &invalidate, "create_many")
+            .await;
+        self.bump_config_version(collection, "create_many").await;
+        Ok(inserted)
+    }
+
+    /// Refused when any op targets a cached table, like the other bulk
+    /// writes: an `Update`/`Delete` by id would need the old row's keys, and
+    /// an `UpdateWhere`/`Upsert` the whole matched set's. Otherwise forwarded,
+    /// then the config version is bumped once per written table that feeds a
+    /// cached runtime.
+    async fn batch(&self, ops: Vec<WriteOp>) -> Result<Vec<WriteOutcome>, DatabaseError> {
+        if let Some(op) = ops
+            .iter()
+            .find(|op| cache_key::classify_table(op.collection()).is_some())
+        {
+            return Err(DatabaseError::Internal(format!(
+                "batch not supported on cached table `{}` (would require KV invalidation)",
+                op.collection()
+            )));
+        }
+        let mut written: Vec<String> = ops.iter().map(|op| op.collection().to_string()).collect();
+        written.sort();
+        written.dedup();
+
+        let outcomes = self.inner.batch(ops).await?;
+
+        for collection in &written {
+            self.bump_config_version(collection, "batch").await;
+        }
+        Ok(outcomes)
+    }
+
+    /// `create` behind a guard: an inserted row invalidates its keys and
+    /// bumps the version as `create` does; a refused one wrote nothing.
+    async fn insert_guarded(
+        &self,
+        collection: &str,
+        data: HashMap<String, serde_json::Value>,
+        guards: &[CapGuard],
+    ) -> Result<GuardedInsert, DatabaseError> {
+        let invalidate = cache_key::classify_table(collection)
+            .map(|t| cache_key::invalidate_keys(t, &data))
+            .unwrap_or_default();
+
+        let outcome = self.inner.insert_guarded(collection, data, guards).await?;
+
+        if matches!(outcome, GuardedInsert::Inserted(_)) {
+            self.invalidate_all(collection, &invalidate, "insert_guarded")
+                .await;
+            self.bump_config_version(collection, "insert_guarded").await;
+        }
+        Ok(outcome)
+    }
+
+    /// A filtered write, so refused on a cached table like `update_where`.
+    async fn update_guarded(
+        &self,
+        collection: &str,
+        filters: &[Filter],
+        data: HashMap<String, serde_json::Value>,
+        guards: &[CapGuard],
+    ) -> Result<GuardedUpdate, DatabaseError> {
+        if cache_key::classify_table(collection).is_some() {
+            return Err(DatabaseError::Internal(format!(
+                "update_guarded not supported on cached table `{collection}` \
+                 (would require KV mass-invalidation)"
+            )));
+        }
+        let outcome = self
+            .inner
+            .update_guarded(collection, filters, data, guards)
+            .await?;
+        if matches!(outcome, GuardedUpdate::Updated { .. }) {
+            self.bump_config_version(collection, "update_guarded").await;
+        }
+        Ok(outcome)
+    }
 }
 
 #[cfg(test)]
@@ -893,6 +994,49 @@ mod tests {
             unreachable!()
         }
 
+        async fn create_many(
+            &self,
+            _collection: &str,
+            _rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
+        ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+            unreachable!()
+        }
+
+        async fn batch(
+            &self,
+            _ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+        ) -> Result<
+            Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            unreachable!()
+        }
+
+        async fn insert_guarded(
+            &self,
+            _collection: &str,
+            _data: std::collections::HashMap<String, serde_json::Value>,
+            _guards: &[wafer_core::interfaces::database::service::CapGuard],
+        ) -> Result<
+            wafer_core::interfaces::database::service::GuardedInsert,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            unreachable!()
+        }
+
+        async fn update_guarded(
+            &self,
+            _collection: &str,
+            _filters: &[wafer_block::db::Filter],
+            _data: std::collections::HashMap<String, serde_json::Value>,
+            _guards: &[wafer_core::interfaces::database::service::CapGuard],
+        ) -> Result<
+            wafer_core::interfaces::database::service::GuardedUpdate,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            unreachable!()
+        }
+
         async fn upsert(&self, _collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
             unreachable!()
         }
@@ -940,6 +1084,32 @@ mod tests {
 
     fn variables_list_opts() -> ListOptions {
         cache_key::block_list_opts(cache_key::CachedTable::Variables, "GDSF__SITE")
+    }
+
+    /// A `batch` that writes a cached table is refused before it reaches the
+    /// database (the mock's `batch` is `unreachable!`), however many of its
+    /// other ops are on uncached tables: an `Update`/`Delete` by id there
+    /// would leave the old row's KV entry serving for up to its 24 h TTL.
+    #[wasm_bindgen_test]
+    async fn a_batch_touching_a_cached_table_is_refused_before_it_writes() {
+        let (svc, _kv) = cached_service(KvGet::Missing);
+        let err = svc
+            .batch(vec![
+                WriteOp::Create {
+                    collection: "impresspress__files__objects".into(),
+                    data: HashMap::new(),
+                },
+                WriteOp::Delete {
+                    collection: variables::TABLE.into(),
+                    id: "v1".into(),
+                },
+            ])
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&err, DatabaseError::Internal(msg) if msg.contains(variables::TABLE)),
+            "{err:?}"
+        );
     }
 
     /// THE August 30/31 write-storm mechanism, row-cache side: a failed KV

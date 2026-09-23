@@ -1120,14 +1120,27 @@ impl TestContext {
     /// working means a handler's "read current state, then try to persist a
     /// change" shape (block-settings toggle, etc.) exercises the exact
     /// branch under test instead of failing earlier for an unrelated reason.
-    pub fn break_writes(mut self) -> Self {
-        let broken: Arc<dyn wafer_core::interfaces::database::service::DatabaseService> =
-            Arc::new(FailingWritesDb {
-                inner: self.db_service.clone(),
-            });
-        self.db_service = broken.clone();
+    pub fn break_writes(self) -> Self {
+        self.wrap_database_service(|inner| Arc::new(FailingWritesDb { inner }))
+    }
+
+    /// Put a decorator between every database call this context makes and
+    /// the in-memory SQLite behind it: `wrap` receives the current service
+    /// and returns the one the database block — and so every `db::*` call a
+    /// block under test makes — goes through from now on. What
+    /// [`Self::break_writes`] and [`Self::break_reads`] are built on, and how
+    /// a test observes which database operations a code path issues.
+    pub fn wrap_database_service(
+        mut self,
+        wrap: impl FnOnce(
+            Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+        )
+            -> Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+    ) -> Self {
+        let wrapped = wrap(self.db_service.clone());
+        self.db_service = wrapped.clone();
         self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
-            broken,
+            wrapped,
         ));
         if self.config_store {
             self.install_config_block();
@@ -1162,20 +1175,24 @@ impl TestContext {
         self.with_failing_reads(false)
     }
 
-    fn with_failing_reads(mut self, fail_get: bool) -> Self {
-        let broken: Arc<dyn wafer_core::interfaces::database::service::DatabaseService> =
-            Arc::new(FailingReadsDb {
-                inner: self.db_service.clone(),
-                fail_get,
-            });
-        self.db_service = broken.clone();
-        self.database_block = Arc::new(wafer_core::service_blocks::database::DatabaseBlock::new(
-            broken,
-        ));
-        if self.config_store {
-            self.install_config_block();
-        }
-        self
+    fn with_failing_reads(self, fail_get: bool) -> Self {
+        self.wrap_database_service(|inner| Arc::new(FailingReadsDb { inner, fail_get }))
+    }
+
+    /// Record the writes every database call from here on makes — see
+    /// [`WriteLog`] — while forwarding each to the real database. The log
+    /// is how a test proves a code path writes a table in one call rather
+    /// than one per row.
+    pub fn record_writes(self) -> (Self, Arc<std::sync::Mutex<WriteLog>>) {
+        let log = Arc::new(std::sync::Mutex::new(WriteLog::default()));
+        let recorder = log.clone();
+        let ctx = self.wrap_database_service(move |inner| {
+            Arc::new(RecordingDb {
+                inner,
+                log: recorder,
+            })
+        });
+        (ctx, log)
     }
 
     /// Toggle `STRICT_SCHEMA` directly on the backing `DatabaseService`, the
@@ -1193,6 +1210,125 @@ impl TestContext {
     /// production deployment (Cloudflare/D1) would.
     pub fn set_strict_schema(&self, enabled: bool) {
         self.db_service.set_strict_schema(enabled);
+    }
+}
+
+/// The writes a code path made through [`TestContext::record_writes`], by
+/// operation, with the size of every multi-write call.
+#[derive(Debug, Default)]
+pub struct WriteLog {
+    /// Single-row `create` calls.
+    pub creates: usize,
+    /// Single-row `upsert` calls.
+    pub upserts: usize,
+    /// Single-row `delete` calls.
+    pub deletes: usize,
+    /// Rows per `create_many` call, in call order.
+    pub create_many_rows: Vec<usize>,
+    /// Ops per `batch` call, in call order.
+    pub batch_ops: Vec<usize>,
+}
+
+/// The decorator behind [`TestContext::record_writes`]: notes the writes
+/// [`WriteLog`] counts and forwards every call, those included, to `inner`.
+struct RecordingDb {
+    inner: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+    log: Arc<std::sync::Mutex<WriteLog>>,
+}
+
+impl RecordingDb {
+    fn inner_service(&self) -> &dyn wafer_core::interfaces::database::service::DatabaseService {
+        self.inner.as_ref()
+    }
+
+    fn note(&self, record: impl FnOnce(&mut WriteLog)) {
+        record(&mut self.log.lock().expect("write log"));
+    }
+}
+
+wafer_core::forward_database_service! {
+    impl DatabaseService for RecordingDb {
+        forward_to inner_service();
+
+        ops {
+            get: forward,
+            list: forward,
+            create: custom,
+            create_many: custom,
+            update: forward,
+            delete: custom,
+            count: forward,
+            sum: forward,
+            query_raw: forward,
+            exec_raw: forward,
+            delete_where: forward,
+            delete_where_count: forward,
+            take_where: forward,
+            update_where: forward,
+            update_where_count: forward,
+            increment_field_where: forward,
+            upsert: custom,
+            aggregate: forward,
+            batch: custom,
+            insert_guarded: forward,
+            update_guarded: forward,
+            ensure_schema_table: forward,
+            ensure_schema_tables: forward,
+            schema_table_exists: forward,
+            schema_drop_table: forward,
+            schema_add_column: forward,
+            set_strict_schema: forward,
+        }
+
+        async fn create(
+            &self,
+            collection: &str,
+            data: HashMap<String, serde_json::Value>,
+        ) -> Result<
+            wafer_core::interfaces::database::service::Record,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            self.note(|log| log.creates += 1);
+            self.inner.create(collection, data).await
+        }
+
+        async fn create_many(
+            &self,
+            collection: &str,
+            rows: Vec<HashMap<String, serde_json::Value>>,
+        ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+            self.note(|log| log.create_many_rows.push(rows.len()));
+            self.inner.create_many(collection, rows).await
+        }
+
+        async fn delete(
+            &self,
+            collection: &str,
+            id: &str,
+        ) -> Result<(), wafer_core::interfaces::database::service::DatabaseError> {
+            self.note(|log| log.deletes += 1);
+            self.inner.delete(collection, id).await
+        }
+
+        async fn upsert(
+            &self,
+            collection: &str,
+            spec: wafer_core::interfaces::database::service::UpsertSpec,
+        ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+            self.note(|log| log.upserts += 1);
+            self.inner.upsert(collection, spec).await
+        }
+
+        async fn batch(
+            &self,
+            ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+        ) -> Result<
+            Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            self.note(|log| log.batch_ops.push(ops.len()));
+            self.inner.batch(ops).await
+        }
     }
 }
 
@@ -1396,6 +1532,55 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
         spec: wafer_core::interfaces::database::service::UpsertSpec,
     ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
         self.inner.upsert(collection, spec).await
+    }
+
+    // The multi-write and guarded ops are writes: delegated, like `create`.
+    // A guarded write's guard check reads the table inside the write's own
+    // transaction, which no real backend can fail separately from the write.
+
+    async fn create_many(
+        &self,
+        collection: &str,
+        rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        self.inner.create_many(collection, rows).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+    ) -> Result<
+        Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner.batch(ops).await
+    }
+
+    async fn insert_guarded(
+        &self,
+        collection: &str,
+        data: HashMap<String, serde_json::Value>,
+        guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedInsert,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner.insert_guarded(collection, data, guards).await
+    }
+
+    async fn update_guarded(
+        &self,
+        collection: &str,
+        filters: &[wafer_block::db::Filter],
+        data: HashMap<String, serde_json::Value>,
+        guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedUpdate,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner
+            .update_guarded(collection, filters, data, guards)
+            .await
     }
 
     async fn aggregate(
@@ -1633,6 +1818,49 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingWrite
         _collection: &str,
         _spec: wafer_core::interfaces::database::service::UpsertSpec,
     ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn create_many(
+        &self,
+        _collection: &str,
+        _rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        Err(simulated_write_failure())
+    }
+
+    async fn batch(
+        &self,
+        _ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+    ) -> Result<
+        Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        Err(simulated_write_failure())
+    }
+
+    async fn insert_guarded(
+        &self,
+        _collection: &str,
+        _data: HashMap<String, serde_json::Value>,
+        _guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedInsert,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        Err(simulated_write_failure())
+    }
+
+    async fn update_guarded(
+        &self,
+        _collection: &str,
+        _filters: &[wafer_block::db::Filter],
+        _data: HashMap<String, serde_json::Value>,
+        _guards: &[wafer_core::interfaces::database::service::CapGuard],
+    ) -> Result<
+        wafer_core::interfaces::database::service::GuardedUpdate,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
         Err(simulated_write_failure())
     }
 

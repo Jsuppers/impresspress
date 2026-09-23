@@ -377,6 +377,49 @@ mod boot_hook_tests {
             Ok(0)
         }
 
+        async fn create_many(
+            &self,
+            _collection: &str,
+            _rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
+        ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+            unreachable!()
+        }
+
+        async fn batch(
+            &self,
+            _ops: Vec<wafer_core::interfaces::database::service::WriteOp>,
+        ) -> Result<
+            Vec<wafer_core::interfaces::database::service::WriteOutcome>,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            unreachable!()
+        }
+
+        async fn insert_guarded(
+            &self,
+            _collection: &str,
+            _data: std::collections::HashMap<String, serde_json::Value>,
+            _guards: &[wafer_core::interfaces::database::service::CapGuard],
+        ) -> Result<
+            wafer_core::interfaces::database::service::GuardedInsert,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            unreachable!()
+        }
+
+        async fn update_guarded(
+            &self,
+            _collection: &str,
+            _filters: &[wafer_block::db::Filter],
+            _data: std::collections::HashMap<String, serde_json::Value>,
+            _guards: &[wafer_core::interfaces::database::service::CapGuard],
+        ) -> Result<
+            wafer_core::interfaces::database::service::GuardedUpdate,
+            wafer_core::interfaces::database::service::DatabaseError,
+        > {
+            unreachable!()
+        }
+
         async fn upsert(&self, collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
             self.note(format!("upsert {collection}"));
             Ok(0)

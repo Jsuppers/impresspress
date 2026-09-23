@@ -566,12 +566,11 @@ async fn restore_product(ctx: &dyn Context, id: &str) -> OutputStream {
             // repeating it creates no duplicate record and no ancillary
             // state.
             //
-            // (Retrying is the best available answer, not the ideal one. The
-            // ideal is for the write's own error to say "unique constraint
-            // violated" — then nothing needs re-reading. No `DatabaseService`
-            // backend maps constraint violations to `ErrorCode::AlreadyExists`
-            // today, and sniffing driver message text would be both magic and
-            // backend-specific, so that fix belongs in wafer-run.)
+            // (The write's own error does say which index refused it —
+            // `AlreadyExists` on every backend in this workspace — but not
+            // which live product holds the slug, and not whether it still
+            // does. The probe is what names the claimant, and a clear probe
+            // is what says the restore would now go through.)
             SlugProbe::Clear(slug) => match repo::products::restore(ctx, id).await {
                 Ok(record) => product_json(&record),
                 // The row stopped being a deleted product in the meantime —

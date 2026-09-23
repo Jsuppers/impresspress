@@ -179,31 +179,25 @@ fn seal(failure: DbFailure, context: &str) -> OutputStream {
 /// pick another — which is what [`ErrorCode::AlreadyExists`] resolves to in
 /// `wafer_block::http_codec::error_code_to_http_status`.
 ///
-/// It has to be decided by re-reading rather than by the write's own error,
-/// because no `DatabaseService` backend classifies a constraint violation:
-/// `wafer_core`'s `db_error_to_wafer` has three arms (`NotFound`, `Internal`,
-/// `Other`) and the last two both become [`ErrorCode::Internal`] with the
-/// driver's text *sanitized* away unless it is one of a few preserved
-/// substrings. So there is nothing in the error to match on, and matching on
-/// driver message text would be both magic and backend-specific. The same
-/// reasoning, and the same probe-after-the-write shape, is already written out
-/// at `products::handlers::product::restore_slug_conflict`.
+/// The write's own error answers it. `wafer_core`'s `DatabaseService` contract
+/// names a write that duplicates a primary or unique key
+/// `DatabaseError::AlreadyExists`, and the database handler's
+/// `db_error_to_wafer` sends that to the caller as [`ErrorCode::AlreadyExists`]
+/// — native SQLite and PostgreSQL from the driver's code, Cloudflare D1 and the
+/// browser's sql.js from SQLite's text
+/// ([`crate::sqlite_text_error::statement_error`]). That code goes straight to
+/// the 409, with no re-read. It must not reach [`db_error_internal`], which
+/// classifies only `NotFound`, `PermissionDenied` and `ResourceExhausted` and
+/// folds everything else into a 500.
 ///
-/// The forward path is [`ErrorCode::AlreadyExists`]: a backend that DOES
-/// classify the violation has already answered the question the probe exists to
-/// ask, so that code short-circuits straight to the 409 and no re-read happens
-/// at all. It is wired up now rather than when such a backend lands, because
-/// sending it to [`db_error_internal`] instead — which classifies only
-/// `NotFound`, `PermissionDenied` and `ResourceExhausted`, and folds everything
-/// else into a 500 — would re-introduce this exact bug on the day the backend
-/// improved, with every test still green because the in-memory SQLite these run
-/// against answers `Internal`.
-///
-/// [`ErrorCode::Aborted`] is a probe candidate alongside `Internal` for the same
-/// reason in reverse: `error_code_to_http_status` already renders it 409, and
-/// the "concurrency conflict" it names is precisely what a unique-index
-/// collision is. If the key turns out to be taken, that is this conflict; if it
-/// does not, the write's own failure is kept.
+/// A `DatabaseService` that does not classify — an adapter outside this
+/// workspace, which the trait asks to map its driver's violation but cannot
+/// make it — reports the same refusal as [`ErrorCode::Internal`], so that code
+/// is settled by re-reading the key. [`ErrorCode::Aborted`] is re-read too:
+/// `error_code_to_http_status` already renders it 409, and the "concurrency
+/// conflict" it names is what a unique-index collision is. If the key turns
+/// out to be taken, that is this conflict; if it does not, the write's own
+/// failure is kept.
 ///
 /// Probing **after** the failed write rather than before it is what closes the
 /// race: a pre-check that found the key free leaves a gap in which a competing
@@ -229,11 +223,10 @@ pub async fn taken_key_or_db_error(
     context: &str,
 ) -> OutputStream {
     match error.code {
-        // For a backend that classifies the violation itself. No backend at
-        // the current wafer pin does: they answer `Internal`, which the arm
-        // below settles by re-reading the key.
+        // Every backend in this workspace classifies the violation itself.
         ErrorCode::AlreadyExists => return err_conflict(conflict),
-        // The two codes a constraint violation can arrive as unclassified.
+        // The two codes a constraint violation can arrive as from a backend
+        // that does not.
         ErrorCode::Internal | ErrorCode::Aborted => {}
         // A WRAP refusal (403) or a quota (429) is not a name collision and
         // keeps the status `crud` gives it.
@@ -832,16 +825,11 @@ mod tests {
 
     use super::taken_key_or_db_error;
 
-    /// A backend that DOES classify the violation short-circuits: the 409 comes
-    /// straight off `AlreadyExists` and the probe is never run.
-    ///
-    /// This is the forward path the helper documents. Before it was wired up,
-    /// `AlreadyExists` fell through to `crud::db_error_internal`, which
-    /// classifies only `NotFound` / `PermissionDenied` / `ResourceExhausted`
-    /// and folds the rest into a 500 — so the day a backend started reporting
-    /// constraint violations properly, this bug would have come back, with
-    /// every other test still green because the in-memory SQLite these run
-    /// against answers `Internal`.
+    /// A backend that classifies the violation short-circuits: the 409 comes
+    /// straight off `AlreadyExists` and the probe is never run. Sent to
+    /// `crud::db_error_internal` instead — which classifies only `NotFound` /
+    /// `PermissionDenied` / `ResourceExhausted` and folds the rest into a 500 —
+    /// every taken key would be a 500 again.
     #[tokio::test]
     async fn a_backend_classified_already_exists_is_the_conflict_without_a_probe() {
         let probed = std::cell::Cell::new(false);
