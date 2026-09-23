@@ -27,7 +27,7 @@ use super::{
         routes::{Route, ROUTES},
         ProductsBlock,
     },
-    harness::{ctx_with, seed},
+    harness::{ctx_with, seed, seed_pending_payment_link},
 };
 use crate::{
     endpoint_match::{self, endpoint_auth},
@@ -321,13 +321,10 @@ async fn publish_offer(
         offer_pricing::InputScope::Management,
     )
     .expect("price the offer");
-    let link_id = repo::payment_links::create_pending(
-        ctx, &offer_id, "", "", "", false, "close-me", &preview, 0,
-    )
-    .await
-    .expect("a pending Payment Link")
-    .managed
-    .id;
+    let link_id = seed_pending_payment_link(ctx, &offer_id, "close-me", &preview)
+        .await
+        .managed
+        .id;
     (offer_id, link_id)
 }
 

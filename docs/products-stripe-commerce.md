@@ -267,6 +267,8 @@ Impresspress verifies the exact raw body with Stripe's timestamped signature, cl
 
 Return success from infrastructure only after the handler response is complete. Do not transform the body before signature verification.
 
+Every delivery that *claims* the event spends one of its 8 processing attempts, and then whatever the handler hits spends it: a database outage, a Stripe error, or a runtime access denial (a missing WRAP grant, a refused capability) raised by a call the handler makes. A denial is not a separate class — it spends the attempt exactly as a 500 does, so a misconfigured grant can exhaust an event on its own. Deliveries that do not claim the event spend nothing, even though they also answer non-2xx: one that finds another delivery's live lease, and one that arrives inside the backoff window of a prior failure, are both refused before the attempt counter moves. That window is `30 x 2^(n-1)` seconds after failed attempt *n*, capped at one hour and about 63 minutes across the whole budget, but it only refuses early redeliveries — the cadence that decides how long recovery really takes is Stripe's own redelivery schedule, not this one. A claim whose lease expires without recording an outcome is re-claimed by the next delivery as the next attempt; only the 8th failure, or an expired lease on that last attempt, moves the row to `dead_letter` and acknowledges the delivery, so Stripe stops redelivering and only an admin replay moves it again.
+
 ## Stripe mutation idempotency policy
 
 - Checkout Sessions use the immutable local purchase/order ID.
@@ -289,6 +291,8 @@ Use **Admin → Products → Stripe setup** for the two health queues.
 3. Fix the database/config/provider condition.
 4. Use replay only after confirming the event is failed/dead-letter. Replay re-enters the normal signed pipeline and retains idempotency/order guards.
 5. Verify the event becomes `processed` and the affected order/subscription/seller projection is correct.
+
+A `dead_letter` row is terminal on its own: the delivery was acknowledged, so no Stripe redelivery will revisit it and replay is the only thing that moves it.
 
 Admin APIs:
 
@@ -315,6 +319,8 @@ If an operation dead-letters, inspect Stripe using the provider refund ID/accoun
 - **Suspected secret leak:** revoke/rotate the Stripe key or webhook secret in Stripe, update Impresspress, retest connection/signatures, and inspect recent provider/webhook operations. Publishable-key rotation must match mode.
 - **Webhook backlog:** keep the destination enabled, repair the failure, replay dead letters, and allow normal Stripe retries. Do not delete event ledger rows.
 - **Provider timeout:** do not repeat a mutation with a new key. Use the reconciliation queue or the same durable local action.
+- **Payment Link with no recorded link ID:** a row left `syncing` or `error` can still have a live, buyable link at Stripe, because the link ID is recorded only after Stripe answers. Deactivating such a row always retires it locally and queues a `payment_link.deactivate` provider operation. Archiving an offer, and the seller suspension that archives every offer a seller owns, do the same for *any* link Stripe will not take down, recorded ID or not: the row retires and the takedown is queued, so a provider outage cannot stop the off switch. (The direct deactivate action on a link with a recorded ID still fails loudly instead — a caller is watching it and can repeat it.) A queued takedown is not a completed one: nothing drains the provider-operation queue on its own, so run the reconcile action below, and until it succeeds treat the link as live. The operation re-sends that row's recorded request under its own idempotency key: within Stripe's 24 hour key retention that answers with the link the attempt created; if the attempt never reached Stripe's idempotency layer (a 429, a dropped connection) the re-send instead creates the link now. Either way the ID is written to the row before the takedown, so a failure after that point is an ordinary retry. Past the retention window nothing local can name the link, and the operation dead-letters with the instruction below rather than minting a second live link.
+- **Dead-lettered `payment_link.deactivate`:** find it in **Admin → Products → Stripe setup** under provider operations; its aggregate ID is the Payment Link row. In the Stripe Dashboard, search Payment Links for `metadata[impresspress_payment_link_id]=<that row ID>` and deactivate what you find — that metadata is written on every link Impresspress creates, so it is the handle even for a row whose attempt never logged an ID. The local row is already retired, so nothing else is owed once the link is down.
 - **Account mismatch:** stop processing, verify platform versus connected-account webhook scope and stored seller account. Never rewrite ownership to make an event fit.
 - **Mode mismatch:** restore matching keys/destination; do not migrate test IDs into live rows.
 - **Seller suspension/dispute:** use Impresspress suspension for catalog control and Stripe Express Dashboard for provider evidence, balance, and payout actions.

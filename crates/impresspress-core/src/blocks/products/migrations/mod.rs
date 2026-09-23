@@ -72,6 +72,9 @@ const SQL_019_POSTGRES: &str = include_str!("019_offer_draft_revision.postgres.s
 const SQL_020_SQLITE: &str = include_str!("020_normalize_blank_deleted_at.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_020_POSTGRES: &str = include_str!("020_normalize_blank_deleted_at.postgres.sql");
+const SQL_021_SQLITE: &str = include_str!("021_payment_link_request.sqlite.sql");
+#[cfg(any(feature = "postgres", test))]
+const SQL_021_POSTGRES: &str = include_str!("021_payment_link_request.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle_init` apply path.
@@ -97,6 +100,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("018_provider_operation_leases", SQL_018_SQLITE),
     ("019_offer_draft_revision", SQL_019_SQLITE),
     ("020_normalize_blank_deleted_at", SQL_020_SQLITE),
+    ("021_payment_link_request", SQL_021_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, one per entry in
@@ -130,6 +134,7 @@ const POSTGRES_MIGRATION_FILES: &[&str] = &[
     SQL_018_POSTGRES,
     SQL_019_POSTGRES,
     SQL_020_POSTGRES,
+    SQL_021_POSTGRES,
 ];
 
 /// The PostgreSQL scripts a deployment actually applies. Empty when the
@@ -164,7 +169,7 @@ mod strict_upgrade_tests {
         SQL_012_POSTGRES, SQL_012_SQLITE, SQL_013_POSTGRES, SQL_013_SQLITE, SQL_014_POSTGRES,
         SQL_014_SQLITE, SQL_015_POSTGRES, SQL_015_SQLITE, SQL_016_POSTGRES, SQL_016_SQLITE,
         SQL_017_POSTGRES, SQL_017_SQLITE, SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES,
-        SQL_019_SQLITE, SQL_020_POSTGRES, SQL_020_SQLITE,
+        SQL_019_SQLITE, SQL_020_POSTGRES, SQL_020_SQLITE, SQL_021_POSTGRES, SQL_021_SQLITE,
     };
     use crate::migration_helper::apply_ddl_via_service;
 
@@ -680,6 +685,23 @@ mod strict_upgrade_tests {
             assert!(
                 SQL_006_POSTGRES.contains(fragment),
                 "PostgreSQL Payment Link snapshot migration is missing {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_link_request_migration_matches_sqlite_and_postgres() {
+        for fragment in [
+            "stripe_request TEXT NOT NULL",
+            "stripe_request_at TEXT NOT NULL",
+        ] {
+            assert!(
+                SQL_021_SQLITE.contains(fragment),
+                "SQLite Payment Link request migration is missing {fragment}"
+            );
+            assert!(
+                SQL_021_POSTGRES.contains(fragment),
+                "PostgreSQL Payment Link request migration is missing {fragment}"
             );
         }
     }

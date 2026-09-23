@@ -17,6 +17,10 @@ use crate::{
 
 pub(crate) const TABLE: &str = "impresspress__products__provider_operations";
 pub(crate) const REFUND_RECONCILE: &str = "refund.reconcile";
+/// Take a Stripe Payment Link down for a local row that no longer sells it.
+/// Its aggregate is the Payment Link row id, which is also the handle the
+/// link carries in its Stripe metadata.
+pub(crate) const PAYMENT_LINK_DEACTIVATE: &str = "payment_link.deactivate";
 const LEASE_SECONDS: i64 = 300;
 
 /// The `status` column of an operation row, as the enum that defines it.
