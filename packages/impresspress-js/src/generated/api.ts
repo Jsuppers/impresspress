@@ -13291,8 +13291,7 @@ export interface paths {
                             }[];
                             /**
                              * Format: int64
-                             * @description Total number of objects matching the filter (across all pages). See
-                             *     `ObjectList::total_count` for the lower-bound caveat on some backends.
+                             * @description Total number of objects matching the filter (across all pages).
                              */
                             total_count: number;
                         };

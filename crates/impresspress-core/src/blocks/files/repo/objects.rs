@@ -56,7 +56,7 @@ pub struct ObjectRow {
     pub status: ObjectStatus,
     pub uploaded_by: String,
     /// When the upload was reserved — the timestamp the object browser
-    /// renders as "modified", and the one `delete_stale_pending` compares.
+    /// renders as "modified", and the one `list_stale_pending` compares.
     pub uploaded_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -141,7 +141,7 @@ fn escape_like(input: &str) -> String {
 
 /// The storage key a reservation stores its upload's bytes under, within the
 /// object's bucket: the object's key with `claim_id` in front of its last
-/// segment — `docs/report.pdf` becomes `docs/{claim_id}~report.pdf`.
+/// segment — `reports/q3.pdf` becomes `reports/{claim_id}~q3.pdf`.
 ///
 /// A key per reservation is what stops an upload that lost its claim from
 /// overwriting the bytes of the upload that took the key over: its late
@@ -227,7 +227,7 @@ pub const PENDING_RESERVATION_TTL_SECONDS: i64 = 3600;
 
 /// The RFC 3339 instant before which a `Pending` row's `uploaded_at` makes it
 /// stale — compared as a string, the way the column is written and the way
-/// [`delete_stale_pending`] compares it.
+/// [`list_stale_pending`] compares it.
 pub fn pending_reservation_cutoff() -> String {
     (chrono::Utc::now() - chrono::Duration::seconds(PENDING_RESERVATION_TTL_SECONDS)).to_rfc3339()
 }
@@ -305,8 +305,8 @@ pub enum ReserveError {
     /// than [`PENDING_RESERVATION_TTL_SECONDS`]: an upload of theirs still in
     /// flight, or one whose storage write finished but whose row could not be
     /// marked complete. The row cannot say which, so it is not taken over
-    /// early — two uploads of one key in flight at once would leave the row
-    /// describing one of them and the blob holding whichever stored last.
+    /// early — the row describes one upload in flight, and a second would
+    /// leave the first with no row to settle.
     /// `since` is that reservation's `uploaded_at`; the key is free
     /// [`PENDING_RESERVATION_TTL_SECONDS`] after it.
     HeldByOwnEarlierUpload { since: String },
@@ -342,8 +342,8 @@ impl From<WaferError> for ReserveError {
 ///   [`release_reservation`] puts the old values back if the upload fails.
 /// - **`Pending`, younger than [`PENDING_RESERVATION_TTL_SECONDS`]**: an
 ///   upload of the key is in flight, or was and could not be recorded.
-///   Refused: taking it over would leave two uploads writing one blob and one
-///   row. [`ReserveError::HeldByOwnEarlierUpload`] when that reservation is
+///   Refused: the row records one upload in flight, and taking it over
+///   would leave that upload's completion nothing to settle. [`ReserveError::HeldByOwnEarlierUpload`] when that reservation is
 ///   this uploader's own, [`ReserveError::Held`] otherwise.
 /// - **`Pending`, older**: an orphan. Taken over as a fresh claim, with
 ///   nothing to put back.
@@ -1119,8 +1119,8 @@ mod tests {
     fn a_claims_blob_key_prefixes_the_file_name_with_the_claim() {
         assert_eq!(claim_blob_key("a.png", "c1"), "c1~a.png");
         assert_eq!(
-            claim_blob_key("docs/2026/report.pdf", "c1"),
-            "docs/2026/c1~report.pdf"
+            claim_blob_key("reports/2026/q3.pdf", "c1"),
+            "reports/2026/c1~q3.pdf"
         );
     }
 

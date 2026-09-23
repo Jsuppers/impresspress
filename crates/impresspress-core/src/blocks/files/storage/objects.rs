@@ -1105,10 +1105,10 @@ mod integration_tests {
         );
     }
 
-    /// `(bucket, key)` is one object and `store::put` overwrites the blob, so
-    /// re-uploading a key REPLACES what is stored there. The metadata row is
-    /// the same row: inserting a second one is refused by the unique index,
-    /// which every re-upload used to answer 500 with.
+    /// `(bucket, key)` is one object, so re-uploading a key REPLACES what is
+    /// stored there: the row is pointed at the new upload's bytes. The
+    /// metadata row is the same row — inserting a second one is refused by
+    /// the unique index, which a re-upload must not answer with a 500.
     #[tokio::test]
     async fn re_uploading_an_existing_key_replaces_the_object() {
         let ctx = ctx_with_storage().await;
@@ -2011,7 +2011,7 @@ mod integration_tests {
         /// Taken over by bob, as if alice's reservation had outlived its TTL.
         IsTakenOverByBob,
         /// Deleted, and then claimed afresh by bob's upload of the same key.
-        IsDeletedAndClaimedByBob,
+        GetsDeletedThenClaimedByBob,
     }
 
     /// A context on which, the first time the upload stores its bytes,
@@ -2066,7 +2066,7 @@ mod integration_tests {
                         .await
                         .expect("bob takes the orphan over");
                     }
-                    MeanwhileTheKey::IsDeletedAndClaimedByBob => {
+                    MeanwhileTheKey::GetsDeletedThenClaimedByBob => {
                         repo::objects::delete_by_bucket_key(&self.inner, "assets", "same.txt")
                             .await
                             .expect("the key is deleted mid-upload");
@@ -2405,7 +2405,8 @@ mod integration_tests {
         let (ctx, storage) = ctx_with_storage_handle().await;
         seed_bucket(&ctx, "assets", "alice").await;
 
-        let (status, message) = upload_while(&ctx, MeanwhileTheKey::IsDeletedAndClaimedByBob).await;
+        let (status, message) =
+            upload_while(&ctx, MeanwhileTheKey::GetsDeletedThenClaimedByBob).await;
 
         assert_eq!(status, 409, "{message}");
         assert!(
@@ -2544,14 +2545,14 @@ mod integration_tests {
     async fn the_object_listing_names_object_keys_and_filters_by_prefix() {
         let ctx = ctx_with_storage().await;
         seed_bucket(&ctx, "assets", "alice").await;
-        for key in ["docs/b.txt", "docs/a.txt", "other.txt"] {
+        for key in ["notes/b.txt", "notes/a.txt", "other.txt"] {
             let out = alice_uploads(&ctx, "assets", key).await;
             assert_eq!(output_json(out).await["uploaded"], serde_json::json!(true));
         }
         seed_legacy_object(
             &ctx,
             "assets",
-            "docs/legacy.txt",
+            "notes/legacy.txt",
             b"old",
             "text/plain",
             "alice",
@@ -2578,7 +2579,12 @@ mod integration_tests {
         let all = output_json(handle_list_objects(&ctx, &list("")).await).await;
         assert_eq!(
             keys(&all),
-            ["docs/a.txt", "docs/b.txt", "docs/legacy.txt", "other.txt"]
+            [
+                "notes/a.txt",
+                "notes/b.txt",
+                "notes/legacy.txt",
+                "other.txt"
+            ]
         );
         assert_eq!(all["total_count"], serde_json::json!(4));
         assert_eq!(all["objects"][0]["size"], serde_json::json!(5));
@@ -2587,9 +2593,12 @@ mod integration_tests {
             serde_json::json!("text/plain")
         );
 
-        let docs = output_json(handle_list_objects(&ctx, &list("docs/")).await).await;
-        assert_eq!(keys(&docs), ["docs/a.txt", "docs/b.txt", "docs/legacy.txt"]);
-        assert_eq!(docs["total_count"], serde_json::json!(3));
+        let notes = output_json(handle_list_objects(&ctx, &list("notes/")).await).await;
+        assert_eq!(
+            keys(&notes),
+            ["notes/a.txt", "notes/b.txt", "notes/legacy.txt"]
+        );
+        assert_eq!(notes["total_count"], serde_json::json!(3));
     }
 
     /// **Fails on the pre-fix tree.** The pending sweep reclaims the blob of

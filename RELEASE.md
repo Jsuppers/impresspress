@@ -367,6 +367,62 @@ and the column is added on the first upload. If you have turned
 `WAFER_RUN__DATABASE__STRICT_SCHEMA` **on**, the migration is not optional:
 every upload fails on the missing column until it runs.
 
+### Files: each upload stores its bytes under a key of its own (migration 005) — upgrade with `--run-migrations`
+
+**What was wrong.** Every upload wrote its bytes at the object key, so every
+upload of one key wrote the same blob. The claim token (migration 004) kept the
+metadata row exact, but not the bytes: an upload whose reservation outlived its
+hour and was taken over could still store its bytes after the upload that took
+over had finished — and overwrite them. That upload's row, complete and
+describing its own upload, then served the first upload's content to everyone
+who can read the file.
+
+**What changes.** Each upload stores its bytes under a storage key derived from
+the object key and its reservation (`reports/{claim}~q3.pdf` for
+`reports/q3.pdf`), and migration `005_object_blob_key` adds a nullable
+`blob_key` column to `impresspress__files__objects` naming the blob the row
+serves. Downloads, share links and `GET /b/storage/api/buckets/{name}/objects`
+resolve an object's bytes through its row. A replacement deletes the blob it
+supersedes only after the row points at the new one; an upload that lost its
+key, or whose object was deleted, deletes only its own blob. The hourly-TTL
+sweep of abandoned uploads now deletes their blobs as well as their rows.
+
+**Existing objects.** Nothing is copied or rewritten. Rows from before 005 keep
+a `NULL` `blob_key`, which means their bytes are at the object key — where they
+are — and they are served from there until a replacement supersedes them.
+
+**Visible differences.**
+- The object listing reads the metadata rows instead of listing storage. It
+  names the same object keys, now includes uploads still in flight (as the
+  object browser page already did), and its `prefix` filter follows the
+  database's `LIKE`: case-insensitive for ASCII on SQLite and D1,
+  case-sensitive on PostgreSQL.
+- An upload that loses its key to another upload answers `409` "Another upload
+  now holds this key, so this upload was not recorded; retry" (it used to say
+  it "took too long", which was false when the object had been deleted and the
+  key claimed again).
+- A blob in storage that no row names is no longer downloadable by its key.
+  Such blobs were already charged to nobody and absent from the object browser.
+
+**Re-running the files migrations is safe for live data.** Adding 005 changes
+the hash of the files block's migration set, so the next `--run-migrations`
+boot (on Cloudflare, the first deploy of this release) re-runs **all** of them,
+001 onwards, over the existing tables. As for 004, nothing is dropped and no
+live row changes: 005 is an `ADD COLUMN` that PostgreSQL skips (`IF NOT
+EXISTS`) and SQLite/D1 answer with a duplicate-column error the runner treats
+as done. Pinned on SQLite by `replay_tests` and on PostgreSQL by the CI step
+that replays the set over seeded rows. Nobody is signed out; files migrations
+touch no auth table.
+
+**Without the migration, and during a rollout.** As for 004: a native
+deployment with strict schema off adds the column on the first upload, one with
+`WAFER_RUN__DATABASE__STRICT_SCHEMA` on fails every upload until 005 runs, and
+Cloudflare deploys always run it. While a rollout is part-way, an isolate still
+on the previous release writes a replacement's bytes at the object key and
+leaves `blob_key` as it was, so that row keeps serving the blob it named before
+rather than the replacement, until the next upload of the key; the gap closes
+once every isolate runs this release.
+
 ### Products: `PLATFORM_COUNTRY` no longer defaults to `US` — set it if you ship
 
 **What changes.** `IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY` now has one
