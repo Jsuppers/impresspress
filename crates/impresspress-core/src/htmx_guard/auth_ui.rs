@@ -73,9 +73,9 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
     Box::pin(async {
         let mut ctx = TestContext::with_auth_and_crypto().await;
         // One provider configured, so the OAuth start hands off to it.
-        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
+        ctx.set_config(crate::config_vars::ENABLE_OAUTH_KEY, "true");
         ctx.set_config(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID",
+            crate::blocks::auth_ui::OAUTH_GOOGLE_CLIENT_ID_KEY,
             "htmx-guard-client",
         );
         let ctx = ctx;

@@ -406,15 +406,14 @@ async fn apply_rate_limit(
 /// invariant the runtime enforces (see `block_name_to_var_prefix`). The
 /// auth-identity vars JWT_SECRET / REQUIRE_VERIFICATION / ALLOWED_EMAIL_DOMAINS
 /// are `WAFER_RUN__AUTH__*` and declared in `auth::config` instead.
+/// Block config key: the Google OAuth client ID.
+pub(crate) const OAUTH_GOOGLE_CLIENT_ID_KEY: &str = "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID";
+
 pub(crate) fn config_vars() -> Vec<ConfigVar> {
     vec![
-        ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID",
-            "Google OAuth client ID",
-            "",
-        )
-        .name("Google Client ID")
-        .optional(),
+        ConfigVar::new(OAUTH_GOOGLE_CLIENT_ID_KEY, "Google OAuth client ID", "")
+            .name("Google Client ID")
+            .optional(),
         ConfigVar::new(
             "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_SECRET",
             "Google OAuth client secret",
