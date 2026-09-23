@@ -457,8 +457,8 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             // the KV row cache classifies tables by wire name; its tests pin
             // the name rather than read it back from the constant
             "cache_key.rs",
-            // the fail-closed diagnostic on the router's auth_version read
-            // names the grant an operator has to go and add
+            // the WRAP test of the router's auth_version read names, in its
+            // failure message, the grant an operator has to go and add
             "crypto.rs",
         ],
     ),

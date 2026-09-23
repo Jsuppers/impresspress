@@ -63,8 +63,9 @@ pub struct AccessClaims {
     pub family: String,
 }
 
-/// Verify an access token and return its claims, or `None` if it does not
-/// authenticate.
+/// Verify an access token: `Ok(Some(claims))` when it authenticates,
+/// `Ok(None)` when it does not, and `Err` when the check could not be
+/// completed.
 ///
 /// The single gate every access JWT passes through, in this order:
 ///
@@ -93,8 +94,16 @@ pub struct AccessClaims {
 ///    missing claim defaults to `0`, matching the column's default, so tokens
 ///    minted before the claim existed keep working until the first bump. The
 ///    read goes through `current_auth_version`'s short-lived cache, so this
-///    costs no DB round trip per request. It fails closed: a lookup error
-///    rejects the token rather than risk accepting a stale credential.
+///    costs no DB round trip per request.
+///
+/// Rules 4 and 5 read the database, and a read that fails is neither answer:
+/// accepting the token could honour a revoked credential, and rejecting it
+/// tells a signed-in caller they are signed out — the SDK's `getUser`
+/// resolves `null` on the 401 that follows, so a database blip would sign
+/// every user out of the UI. So a failed read is `Err`, already classified
+/// for the client by `blocks::auth::credential_check_failed` (a WRAP refusal
+/// keeps its 403 or 429, anything else is a 503), and the caller answers the
+/// request with it instead of treating the caller as anonymous.
 ///
 /// Both consumers call this and nothing else: [`extract_auth_meta`] (the
 /// pipeline's per-request meta population) and
@@ -105,7 +114,7 @@ pub async fn verify_access_token(
     token: &str,
     jwt_secret: &str,
     expected_iss: &str,
-) -> Option<AccessClaims> {
+) -> Result<Option<AccessClaims>, wafer_run::WaferError> {
     // Session tokens (access + refresh) are minted by the `impresspress/auth-ui`
     // block — login, signup, bootstrap, refresh, and the oauth callback all
     // hit handlers dispatched in that block's context, and the crypto handler
@@ -116,24 +125,33 @@ pub async fn verify_access_token(
         jwt_secret.as_bytes(),
         crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
     );
-    let claims =
-        primitives::jwt_verify(token, derived_secret.as_bytes(), JwtExpPolicy::Required).ok()?;
+    let Ok(claims) =
+        primitives::jwt_verify(token, derived_secret.as_bytes(), JwtExpPolicy::Required)
+    else {
+        return Ok(None);
+    };
 
     let token_type = claims.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if token_type != "access" {
-        return None;
+        return Ok(None);
     }
 
     if !expected_iss.is_empty() {
         let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
         if iss != expected_iss {
-            return None;
+            return Ok(None);
         }
     }
 
     let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
-    if !jti.is_empty() && crate::blocks::auth::repo::jwt_blocklist::contains(ctx, jti).await {
-        return None;
+    if !jti.is_empty()
+        && crate::blocks::auth::repo::jwt_blocklist::contains(ctx, jti)
+            .await
+            .map_err(|e| {
+                crate::blocks::auth::credential_check_failed(e, "auth: jwt blocklist lookup")
+            })?
+    {
+        return Ok(None);
     }
 
     let sub = claims.get("sub").and_then(|v| v.as_str());
@@ -142,16 +160,13 @@ pub async fn verify_access_token(
             .get(crate::blocks::auth::repo::users::AUTH_VERSION_FIELD)
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        match crate::blocks::auth::current_auth_version(ctx, uid).await {
-            Ok(current) if claim_version < current => return None,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    user_id = %uid,
-                    "verify_access_token: auth_version lookup failed, rejecting token: {e}"
-                );
-                return None;
-            }
+        let current = crate::blocks::auth::current_auth_version(ctx, uid)
+            .await
+            .map_err(|e| {
+                crate::blocks::auth::credential_check_failed(e, "auth: auth_version lookup")
+            })?;
+        if claim_version < current {
+            return Ok(None);
         }
     }
 
@@ -171,7 +186,7 @@ pub async fn verify_access_token(
             .to_string()
     };
 
-    Some(AccessClaims {
+    Ok(Some(AccessClaims {
         sub: sub.map(str::to_owned),
         email: claims
             .get("email")
@@ -185,7 +200,7 @@ pub async fn verify_access_token(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-    })
+    }))
 }
 
 /// Extract JWT claims from an `Authorization: Bearer <token>` header and
@@ -194,23 +209,26 @@ pub async fn verify_access_token(
 /// Sets: `auth.user_id`, `auth.user_email`, `auth.user_roles`, and (when
 /// present in the JWT) `auth.jti`, `auth.exp` and `auth.family`.
 ///
-/// Silently does nothing when [`verify_access_token`] refuses the token —
-/// the request continues as unauthenticated. Every rejection rule and its
-/// reasoning lives there; this function is the meta-setting shell over it.
+/// Sets nothing when [`verify_access_token`] refuses the token — the request
+/// continues as unauthenticated. Returns its `Err` when the check could not
+/// be completed, which the pipeline answers the request with: the caller is
+/// neither authenticated nor anonymous until the check can run. Every
+/// rejection rule and its reasoning lives there; this function is the
+/// meta-setting shell over it.
 pub async fn extract_auth_meta(
     ctx: &dyn wafer_run::context::Context,
     auth_header: &str,
     jwt_secret: &str,
     expected_iss: &str,
     msg: &mut wafer_run::Message,
-) {
+) -> Result<(), wafer_run::WaferError> {
     use wafer_run::*;
 
     let Some(token) = auth_header.strip_prefix("Bearer ") else {
-        return;
+        return Ok(());
     };
-    let Some(claims) = verify_access_token(ctx, token, jwt_secret, expected_iss).await else {
-        return;
+    let Some(claims) = verify_access_token(ctx, token, jwt_secret, expected_iss).await? else {
+        return Ok(());
     };
 
     if let Some(sub) = claims.sub.as_deref() {
@@ -234,6 +252,7 @@ pub async fn extract_auth_meta(
     if !claims.family.is_empty() {
         msg.set_meta(META_AUTH_FAMILY, &claims.family);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +355,7 @@ mod tests {
         let token = sign_access_jwt(secret, "user-a", Some("jti-1"), 3600);
         let claims = verify_access_token(&ctx, &token, secret, "")
             .await
+            .expect("the check completes")
             .expect("a freshly minted access token must verify");
         assert_eq!(claims.sub.as_deref(), Some("user-a"));
         assert_eq!(claims.jti, "jti-1");
@@ -356,6 +376,7 @@ mod tests {
             primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes()).unwrap();
         assert!(verify_access_token(&ctx, &token, master, "")
             .await
+            .expect("the check completes")
             .is_none());
     }
 
@@ -369,6 +390,7 @@ mod tests {
         });
         assert!(verify_access_token(&ctx, &token, secret, "https://here")
             .await
+            .expect("the check completes")
             .is_none());
     }
 
@@ -389,6 +411,7 @@ mod tests {
         .expect("insert blocklist row");
         assert!(verify_access_token(&ctx, &token, secret, "")
             .await
+            .expect("the check completes")
             .is_none());
     }
 
@@ -424,6 +447,7 @@ mod tests {
         });
         assert!(verify_access_token(&ctx, &token, secret, "")
             .await
+            .expect("the check completes")
             .is_none());
     }
 
@@ -439,7 +463,9 @@ mod tests {
             claims.insert("family".to_string(), serde_json::json!("fam-42"));
         });
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(META_AUTH_FAMILY), "fam-42");
     }
 
@@ -452,7 +478,9 @@ mod tests {
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", None, 3600);
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(META_AUTH_FAMILY), "");
     }
 
@@ -489,7 +517,9 @@ mod tests {
             primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes()).unwrap();
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(wafer_run::META_AUTH_USER_ID), "");
     }
 
@@ -510,7 +540,9 @@ mod tests {
             primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes()).unwrap();
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(wafer_run::META_AUTH_USER_ID), "");
     }
 
@@ -528,7 +560,9 @@ mod tests {
             primitives::jwt_sign(claims, Duration::from_secs(3600), master.as_bytes()).unwrap();
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(wafer_run::META_AUTH_USER_ID), "");
     }
 
@@ -539,7 +573,9 @@ mod tests {
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", Some("jti-1"), 3600);
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(wafer_run::META_AUTH_USER_ID), "user-a");
         assert_eq!(msg.get_meta(META_AUTH_JTI), "jti-1");
         assert!(!msg.get_meta(META_AUTH_EXP).is_empty());
@@ -571,7 +607,9 @@ mod tests {
             .expect("sign with derived");
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), master, "", &mut msg)
+            .await
+            .expect("the check completes");
 
         assert_eq!(
             msg.get_meta(wafer_run::META_AUTH_USER_ID),
@@ -602,7 +640,9 @@ mod tests {
         .expect("insert blocklist row");
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect("the check completes");
         // Blocklisted: no auth meta should be set — request continues as
         // anonymous, same as if the JWT had expired or been tampered with.
         assert_eq!(msg.get_meta(wafer_run::META_AUTH_USER_ID), "");
@@ -630,11 +670,15 @@ mod tests {
         let live = sign_access_jwt(secret, "user-a", Some("session-2"), 3600);
 
         let mut m1 = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {blocked}"), secret, "", &mut m1).await;
+        extract_auth_meta(&ctx, &format!("Bearer {blocked}"), secret, "", &mut m1)
+            .await
+            .expect("the check completes");
         assert_eq!(m1.get_meta(wafer_run::META_AUTH_USER_ID), "");
 
         let mut m2 = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {live}"), secret, "", &mut m2).await;
+        extract_auth_meta(&ctx, &format!("Bearer {live}"), secret, "", &mut m2)
+            .await
+            .expect("the check completes");
         assert_eq!(m2.get_meta(wafer_run::META_AUTH_USER_ID), "user-a");
     }
 
@@ -692,7 +736,9 @@ mod tests {
         let token = sign_access_jwt_with_version(secret, &uid, 0, 3600);
 
         let mut before = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut before).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut before)
+            .await
+            .expect("the check completes");
         assert_eq!(
             before.get_meta(wafer_run::META_AUTH_USER_ID),
             uid,
@@ -706,7 +752,9 @@ mod tests {
             .expect("bump auth_version");
 
         let mut after = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut after).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut after)
+            .await
+            .expect("the check completes");
         assert_eq!(
             after.get_meta(wafer_run::META_AUTH_USER_ID),
             "",
@@ -729,7 +777,9 @@ mod tests {
         let token = sign_access_jwt_with_version(secret, &uid, 1, 3600);
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(
             msg.get_meta(wafer_run::META_AUTH_USER_ID),
             uid,
@@ -749,7 +799,9 @@ mod tests {
 
         let token = sign_access_jwt(secret, &uid, None, 3600);
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&ctx, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(wafer_run::META_AUTH_USER_ID), uid);
     }
 
@@ -764,7 +816,8 @@ mod tests {
     /// not the auth block's own. This test opts the fixture into real WRAP
     /// enforcement (`with_wrap`, exercising `auth_grants()` — the same
     /// grant list the runtime registers) so a missing grant here fails the
-    /// same way it fails in production: the token is silently rejected.
+    /// same way it fails in production: the read is refused, and so is every
+    /// request bearing an access JWT.
     #[tokio::test]
     async fn extract_auth_meta_auth_version_read_is_wrap_authorized_for_the_router() {
         use wafer_run::Message;
@@ -785,13 +838,17 @@ mod tests {
         );
 
         let mut msg = Message::new("http.request");
-        extract_auth_meta(&wrapped, &format!("Bearer {token}"), secret, "", &mut msg).await;
+        extract_auth_meta(&wrapped, &format!("Bearer {token}"), secret, "", &mut msg)
+            .await
+            .expect(
+                "the router's auth_version read must be WRAP-authorized — if this fails, the \
+                 router's read grant on wafer_run__auth__users (auth::service::auth_grants) \
+                 is missing or doesn't cover the caller/table pair",
+            );
         assert_eq!(
             msg.get_meta(wafer_run::META_AUTH_USER_ID),
             uid,
-            "a valid access token must authenticate under WRAP enforcement — if this fails, \
-             the router's read grant on wafer_run__auth__users (auth::service::auth_grants) \
-             is missing or doesn't cover the caller/table pair"
+            "a valid access token must authenticate under WRAP enforcement"
         );
     }
 }

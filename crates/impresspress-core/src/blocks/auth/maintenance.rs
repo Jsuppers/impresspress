@@ -249,8 +249,8 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(jwt_blocklist::contains(&ctx, "jti-live").await);
-        assert!(!jwt_blocklist::contains(&ctx, "jti-dead").await);
+        assert!(jwt_blocklist::contains(&ctx, "jti-live").await.unwrap());
+        assert!(!jwt_blocklist::contains(&ctx, "jti-dead").await.unwrap());
         assert!(oauth_pkce::take(&ctx, "pkce-live").await.unwrap().is_some());
     }
 

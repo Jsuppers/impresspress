@@ -353,6 +353,35 @@ pub(crate) async fn current_auth_version(
     current_auth_version_at(ctx, user_id, crate::util::now_millis() as i64).await
 }
 
+/// A credential check that could not be completed, as the error the request
+/// is answered with.
+///
+/// Both request-time credential checks read the database —
+/// `crate::crypto::verify_access_token` (the JWT blocklist and
+/// `auth_version`) and [`authenticate_api_key`] (the key, its user and their
+/// roles) — and a failed read decides neither way: the request is not
+/// authenticated, and it is not anonymous either, because answering it as
+/// anonymous tells a signed-in client it has been signed out. So the request
+/// is refused with this. A refusal the database classifier keeps
+/// ([`crate::blocks::crud::classify_db_error`]: a WRAP denial's 403 "Access
+/// denied", a quota's 429) is answered as it stands; any other fault is
+/// logged under `context` and answered `Unavailable` (503), the status a
+/// client retries rather than one that means "sign in again".
+pub(crate) fn credential_check_failed(error: WaferError, context: &str) -> WaferError {
+    use crate::blocks::crud::{classify_db_error, DbFailure};
+
+    match classify_db_error(error, None, context) {
+        DbFailure::Refused(refusal) => refusal,
+        DbFailure::Internal(fault) => {
+            tracing::error!(context = %context, error = %fault, "credential check failed");
+            WaferError::new(
+                wafer_run::ErrorCode::Unavailable,
+                "Authentication is temporarily unavailable",
+            )
+        }
+    }
+}
+
 /// Drop `user_id`'s cached `auth_version` entry, if any.
 fn invalidate_auth_version_cache(user_id: &str) {
     auth_version_cache()
@@ -1275,78 +1304,69 @@ pub(crate) mod helpers {
 ///
 /// Hashes the key with SHA-256, looks it up in the database by key_hash,
 /// checks it's not revoked/expired, and sets auth meta on the message.
-/// Silently does nothing if the key is invalid (request continues as
-/// unauthenticated), matching JWT behavior.
+/// Sets nothing if the key is invalid (the request continues as
+/// unauthenticated), matching JWT behavior. A lookup that fails — the key,
+/// its user or their roles — is `Err`, as [`credential_check_failed`]
+/// classifies it, and the pipeline answers the request with it: demoting the
+/// request to anonymous would tell the key's holder it had been revoked.
 pub async fn authenticate_api_key(
     ctx: &dyn wafer_run::context::Context,
     api_key: &str,
     msg: &mut wafer_run::Message,
-) {
+) -> Result<(), WaferError> {
     use wafer_run::*;
 
     use crate::util::sha256_hex;
 
     let key_hash = sha256_hex(api_key.as_bytes());
 
-    // Look up by key_hash via the typed api_keys repo. A real DB error (WRAP
-    // denial, connection blip) would otherwise silently demote the request to
-    // anonymous — that's still the right fallback for availability, but it
-    // must be observable, so the repo logs and returns None-equivalent here.
-    let key_row = match repo::api_keys::find_by_key_hash(ctx, &key_hash).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!("authenticate_api_key: lookup failed: {e}");
-            return;
-        }
+    let Some(key_row) = repo::api_keys::find_by_key_hash(ctx, &key_hash)
+        .await
+        .map_err(|e| credential_check_failed(e, "auth: api key lookup"))?
+    else {
+        return Ok(());
     };
 
     // Reject revoked or expired keys.
     if key_row.is_revoked() {
-        return;
+        return Ok(());
     }
     if key_row.is_expired(chrono::Utc::now()) {
-        return;
+        return Ok(());
     }
 
     // Look up the user to get email and roles.
     if key_row.user_id.is_empty() {
-        return;
+        return Ok(());
     }
-    let user = match repo::users::find_by_id(ctx, &key_row.user_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(user_id = %key_row.user_id, "authenticate_api_key: user lookup failed: {e}");
-            return;
-        }
+    let Some(user) = repo::users::find_by_id(ctx, &key_row.user_id)
+        .await
+        .map_err(|e| credential_check_failed(e, "auth: api key user lookup"))?
+    else {
+        return Ok(());
     };
 
     // Deleted or disabled accounts must not authenticate, even with a
     // still-valid API key. Login/refresh/OAuth already enforce this on their
     // own row loads; this is the same gate for the key path.
     if !user.is_active() {
-        return;
+        return Ok(());
     }
 
     // Fetch roles from user_roles collection (roles are not stored on the
-    // user record). Mirrors the key_row/user lookups above: a real DB error
-    // (WRAP denial, connection blip) must not silently stamp an empty/wrong
-    // roles list on an otherwise-valid key — log it and fall back to
-    // anonymous instead (SB-3).
-    let roles = match helpers::get_user_roles(ctx, &key_row.user_id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(user_id = %key_row.user_id, "authenticate_api_key: roles lookup failed: {e}");
-            return;
-        }
-    };
+    // user record). A failed read must not stamp an empty or wrong roles list
+    // on an otherwise-valid key (SB-3), so it refuses the request like the
+    // lookups above.
+    let roles = helpers::get_user_roles(ctx, &key_row.user_id)
+        .await
+        .map_err(|e| credential_check_failed(e, "auth: api key roles lookup"))?;
     let roles_str = roles.join(",");
 
     // Set auth meta (same fields as JWT auth)
     msg.set_meta(META_AUTH_USER_ID, &key_row.user_id);
     msg.set_meta(META_AUTH_USER_EMAIL, &user.email);
     msg.set_meta(META_AUTH_USER_ROLES, &roles_str);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1449,7 +1469,9 @@ mod api_key_lifecycle_tests {
     /// it refused the key.
     async fn authenticated_as(ctx: &TestContext, raw_key: &str) -> String {
         let mut msg = Message::new("http");
-        authenticate_api_key(ctx, raw_key, &mut msg).await;
+        authenticate_api_key(ctx, raw_key, &mut msg)
+            .await
+            .expect("the check completes");
         msg.get_meta(META_AUTH_USER_ID).to_string()
     }
 
@@ -1511,7 +1533,9 @@ mod api_key_lifecycle_tests {
         let uid = seed_user_and_key(&ctx, "raw-active-key").await;
 
         let mut msg = Message::new("http");
-        authenticate_api_key(&ctx, "raw-active-key", &mut msg).await;
+        authenticate_api_key(&ctx, "raw-active-key", &mut msg)
+            .await
+            .expect("the check completes");
         assert_eq!(msg.get_meta(META_AUTH_USER_ID), uid);
     }
 
@@ -1530,7 +1554,9 @@ mod api_key_lifecycle_tests {
             .expect("disable the key's owner");
 
         let mut msg = Message::new("http");
-        authenticate_api_key(&ctx, "raw-disabled-key", &mut msg).await;
+        authenticate_api_key(&ctx, "raw-disabled-key", &mut msg)
+            .await
+            .expect("the check completes");
         // No auth meta stamped → request stays anonymous.
         assert_eq!(msg.get_meta(META_AUTH_USER_ID), "");
     }
