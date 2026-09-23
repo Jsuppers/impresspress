@@ -210,13 +210,15 @@ pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) 
 
     let offer_rows = match offers::list_public_for_product(ctx, product_id).await {
         Ok(offers) => offers,
-        Err(error) => return err_internal("Could not load product offers", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load product offers"),
     };
     let mut public_offers = Vec::with_capacity(offer_rows.len());
     for offer in offer_rows {
         let links = match payment_links::list_public_for_offer(ctx, &offer.id).await {
             Ok(links) => links,
-            Err(error) => return err_internal("Could not load offer Payment Links", error),
+            Err(error) => {
+                return crud::db_error_internal(error, "Could not load offer Payment Links")
+            }
         };
         public_offers.push(StorefrontOffer {
             id: offer.id,

@@ -75,8 +75,9 @@ use wafer_run::{BlockInfo, ConfigVar, InputType, InstanceMode};
 
 use super::rate_limit::{apply_route_limit, UserRateLimiter};
 use crate::{
+    blocks::crud,
     endpoint_match,
-    http::{err_forbidden, err_internal, err_not_found},
+    http::{err_forbidden, err_not_found},
 };
 
 /// Adapter-injected runtime identity. The browser service-worker adapter sets
@@ -398,7 +399,7 @@ crate::impresspress_feature_block! {
             match repo::seller_accounts::is_suspended(ctx, msg.user_id()).await {
                 Ok(true) => return err_forbidden("Seller account is suspended"),
                 Ok(false) => {}
-                Err(error) => return err_internal("Could not verify seller status", error),
+                Err(error) => return crud::db_error_internal(error, "Could not verify seller status"),
             }
         }
         handlers::run(ctx, &msg, route, input).await
