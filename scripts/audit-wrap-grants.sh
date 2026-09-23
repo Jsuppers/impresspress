@@ -578,7 +578,11 @@ done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' 
 #
 # Each grant entry is encoded as:
 #   "${owner_block_id}|${grantee}|${resource}|${type}"
-# where TYPE is "Database" by default or whatever appears after .typed().
+# where TYPE is "Db" by default or the `ResourceType` variant named in
+# `.typed()`. The default and the `.typed()` spelling have to be the SAME
+# string: they were "Database" and the variant name until a `.typed(Db)`
+# grant was declared, which indexed as "Db", matched nothing, and was
+# silently ignored by the coverage check.
 
 GRANTS=()
 
@@ -814,6 +818,28 @@ storage_path_to_owner() {
   echo ""
 }
 
+# Drop a `//` line comment from one line of Rust, ignoring a `//` that sits
+# inside a double-quoted string — a grant resource is routinely a URL
+# (`read("*", "https://api.example.com/*")`), and cutting at the scheme's
+# slashes would corrupt the argument this script then resolves. Escaped
+# quotes do not occur in these declarations and are not modelled.
+strip_rust_line_comment() {
+  awk '''{
+    inq = 0
+    for (i = 1; i <= length($0); i++) {
+      c = substr($0, i, 1)
+      if (c == "\"") { inq = !inq }
+      else if (!inq && c == "/" && substr($0, i + 1, 1) == "/") {
+        print substr($0, 1, i - 1); next
+      }
+    }
+    print
+  }''' <<< "$1"
+}
+
+declare -i unparsed_grants=0
+UNPARSED_GRANT_LINES=()
+
 while IFS= read -r line; do
   file="${line%%:*}"
   rest="${line#*:}"
@@ -832,7 +858,10 @@ while IFS= read -r line; do
   if ! [[ "$stmt" =~ $re_grant ]]; then
     probe=$((lineno + 1))
     until [[ "$stmt" == *')'* ]] || [ "$probe" -gt $((lineno + 8)) ]; do
-      stmt="$stmt $(sed -n "${probe}p" "$file" 2>/dev/null)"
+      # Comment-stripped: a `//` note on an argument's own line would
+      # otherwise be joined INTO that argument, and the garbage grantee that
+      # produces reports every call the grant covers as MISSING.
+      stmt="$stmt $(strip_rust_line_comment "$(sed -n "${probe}p" "$file" 2>/dev/null)")"
       probe=$((probe + 1))
     done
   fi
@@ -846,14 +875,19 @@ while IFS= read -r line; do
     resource_raw="${resource_raw%,}"
     grantee="$(resolve_token "$grantee_raw" "$file")"
     resource="$(resolve_token "$resource_raw" "$file")"
-    # Grant type: default Database; `.typed(...)` on the same line picks
+    # Grant type: default Db; `.typed(...)` on the same line picks
     # another. rustfmt puts a long `.typed(...)` on its own continuation
     # line, so that line is read too — without it admin's
     # `read("*", "*").typed(Network)` and `read_write("*", "*").typed(Crypto)`
-    # index as Database wildcards that cover every admin-owned table for
+    # index as Db wildcards that cover every admin-owned table for
     # every caller, and no missing grant on an admin table can ever be
     # reported.
-    type="Database"
+    #
+    # The default is spelled the way `ResourceType::Db` is, so a grant that
+    # declares its type explicitly indexes the same as one that leaves it
+    # open. An unrecognized variant is warned about below rather than
+    # quietly indexed as a type nothing matches.
+    type="Db"
     re_typed='\.typed\(([^)]*ResourceType::)?([A-Za-z]+)\)'
     if [[ "$stmt" =~ $re_typed ]]; then
       type="${BASH_REMATCH[2]}"
@@ -866,6 +900,15 @@ while IFS= read -r line; do
     # Owning block = the block this file lives in
     owner="$(file_to_block_id "$file")"
     GRANTS+=("${owner}|${grantee}|${resource}|${type}|${kind}")
+  else
+    # A declaration this parser could not read is a grant the audit does not
+    # know exists — which is the exact silence this walk is for. It surfaces
+    # downstream as a MISSING finding for a call that IS granted, or as no
+    # finding at all when another grant happens to cover the same call, so
+    # it is announced here rather than left to be inferred.
+    unparsed_grants=$((unparsed_grants + 1))
+    UNPARSED_GRANT_LINES+=("${file}:${lineno}")
+    echo "::warning file=${file},line=${lineno}::WRAP grant audit could not parse this ResourceGrant declaration; it is absent from the grant index"
   fi
 done < <(grep -rEn "${GREP_EXCLUDE[@]}" "ResourceGrant::(read|read_write)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
@@ -873,7 +916,7 @@ done < <(grep -rEn "${GREP_EXCLUDE[@]}" "ResourceGrant::(read|read_write)\(" "$B
 
 # Returns "OK" if a grant covers (caller, table); otherwise "MISSING".
 # Grant matches when:
-#   - resource_type is Database (or the grant's type is empty/wildcard)
+#   - resource_type is Db (or the grant's type is empty/wildcard)
 #   - grantee == caller OR grantee == "*"
 #   - resource == table OR (resource ends with "*" AND table starts with the prefix)
 check_coverage() {
@@ -891,7 +934,7 @@ check_coverage() {
   for g in "${GRANTS[@]}"; do
     IFS='|' read -r g_owner g_grantee g_resource g_type _g_kind <<< "$g"
     [ "$g_owner" != "$owner" ] && continue
-    [ "$g_type" != "Database" ] && continue
+    [ "$g_type" != "Db" ] && continue
     if [ "$g_grantee" != "*" ] && [ "$g_grantee" != "$caller" ]; then
       continue
     fi
@@ -1102,6 +1145,14 @@ done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' 
 # attributes both writes to the admin block and sees nothing to check. This
 # phase attributes them to the block that made the call, checked exactly like
 # a `db::*` callsite naming the table (same pragmas, same report).
+#
+# What it does NOT see, so this is not read as more than it is: the two
+# references are named literally below, so a call spelled through an
+# unqualified import (`use ...::save_settings;` then a bare
+# `save_settings(..)`) and any future shared helper outside `src/blocks/`
+# that wraps `audit_log` are both invisible until added to that pattern; and
+# because this phase honours Phase 3's pragmas, an `// audit-allow-file:`
+# added for a `db::*` callsite exempts that file's audit-writer calls too.
 AUDIT_WRITER_TABLE="${CONST_VALUE[AUDIT_LOGS_TABLE]:-}"
 if [ -z "$AUDIT_WRITER_TABLE" ]; then
   echo "::error::AUDIT_LOGS_TABLE not indexed — the admin audit writer cannot be walked." >&2
@@ -1196,6 +1247,10 @@ echo
 echo "WRAP grant audit — $(date)"
 echo
 echo "Indexed: ${#CONST_VALUE[@]} constants, ${#GRANTS[@]} grant decls."
+if [ "${#UNPARSED_GRANT_LINES[@]}" -gt 0 ]; then
+  echo "UNPARSED ResourceGrant declarations (${unparsed_grants}) — absent from the index above:"
+  printf '  %s\n' "${UNPARSED_GRANT_LINES[@]}"
+fi
 echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed (${ps_total} reached through platform_state, ${audit_writer_total} through the audit writer)."
 echo "Storage:  ${storage_total} unique (caller, resource) pairs; ${storage_allowed} pragma-allowed."
 echo
