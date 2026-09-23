@@ -4,7 +4,7 @@
 //! The vector service and the embedding blocks are WRAP-authorized like the
 //! database, and their refusals carry the same codes: a
 //! `PermissionDenied` is a 403 and a quota a 429 (`crud::db_error_internal`),
-//! never the sanitized 500 every one of these sites used to answer. Each test
+//! not the sanitized 500. Each test
 //! drives a real route through [`VectorBlock`]'s own dispatch over a context
 //! that refuses the one call the site under test makes.
 //!
@@ -206,7 +206,7 @@ async fn a_refused_vector_service_is_403() {
 
 /// Creating an index writes the registry row, and the admin modal's htmx
 /// submit then re-reads the registry for the refreshed list. Either refused
-/// was a 500 — the second after a `String` had already dropped the code.
+/// is a 403.
 #[tokio::test]
 async fn a_refused_registry_write_or_refresh_is_403() {
     let ctx = fixture(false).await;
@@ -242,7 +242,7 @@ async fn a_refused_registry_write_or_refresh_is_403() {
 }
 
 /// The embed route and the ingest's embed step both call the embedding
-/// block, and both answered its refusal with a 500.
+/// block, and both answer its refusal with the door's 403.
 #[tokio::test]
 async fn a_refused_embedding_block_is_403() {
     let ctx = fixture(false).await;
@@ -273,8 +273,8 @@ async fn a_refused_embedding_block_is_403() {
     report(misses);
 }
 
-/// The index list page rendered a refused registry read as "No vector
-/// indexes yet", and the detail page as a 404. Both are the 403 page.
+/// A refused registry read is the 403 page on the index list — not "No
+/// vector indexes yet" — and on the detail page — not a 404.
 #[tokio::test]
 async fn refused_registry_reads_are_the_403_page() {
     let ctx = fixture(false).await;

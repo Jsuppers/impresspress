@@ -141,8 +141,8 @@ async fn provider_list_denial_is_403() {
 }
 
 /// Every provider write reloads the router from the providers table. That
-/// reload returned its failure as a `String`, so a refused read was a 500
-/// on all five of its call sites — after the write had already landed.
+/// reload's refused read is a 403 at all five of its call sites — not a 500
+/// from an error flattened to a `String`, after the write had landed.
 #[tokio::test]
 async fn a_refused_reload_read_is_403_on_every_provider_write() {
     let mut misses = Vec::new();
@@ -223,7 +223,7 @@ async fn a_refused_reload_read_is_403_on_every_provider_write() {
 }
 
 /// Discovery writes the discovered model list back to the row; a refused
-/// write was a 500.
+/// write is a 403.
 #[tokio::test]
 async fn a_refused_discovery_write_back_is_403() {
     let (ctx, id) = with_a_provider().await;
@@ -245,7 +245,7 @@ async fn a_refused_discovery_write_back_is_403() {
     report(misses);
 }
 
-/// A per-thread override is read, then written; either refused was a 500.
+/// A per-thread override is read, then written; either refused is a 403.
 #[tokio::test]
 async fn a_refused_thread_override_is_403() {
     let ctx = TestContext::with_llm().await;
@@ -333,8 +333,8 @@ fn chat_body(thread_id: &str) -> String {
 }
 
 /// The chat prelude reads the thread's override, then dispatches to the
-/// llm service. The read's refusal and the service's were both 500s — the
-/// service's with its code dropped (`err_internal(…, e.message)`).
+/// llm service. Each refused is a 403: the service's refusal keeps its code
+/// rather than being reduced to its message.
 #[tokio::test]
 async fn a_refused_chat_prelude_is_403() {
     let mut misses = Vec::new();
@@ -363,7 +363,7 @@ async fn a_refused_chat_prelude_is_403() {
     report(misses);
 }
 
-/// The aggregated model list drops the service's code no more.
+/// The aggregated model list keeps the service's code.
 #[tokio::test]
 async fn a_refused_model_list_is_403() {
     let mut ctx = TestContext::with_llm().await;
@@ -420,7 +420,7 @@ impl Context for MessagesRefused {
 }
 
 /// Every llm page whose read failed is the styled 403 page, not the 500
-/// page (`server_error_response`, `err_internal`) it used to be.
+/// page.
 #[tokio::test]
 async fn refused_page_reads_are_the_403_page() {
     let mut misses = Vec::new();

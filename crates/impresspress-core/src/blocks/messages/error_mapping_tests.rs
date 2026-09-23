@@ -1,7 +1,7 @@
 //! What a failed read answers on the messages admin pages.
 //!
 //! A WRAP `PermissionDenied` is the styled 403 page (`crud::db_error_page`),
-//! never the 500 page these three reads answered. Each test drives the real
+//! not the 500 page, at all three of its reads. Each test drives the real
 //! page through [`MessagesBlock`]'s own dispatch over a context that refuses
 //! the one read the site under test makes.
 

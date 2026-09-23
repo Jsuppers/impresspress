@@ -1,7 +1,7 @@
 //! What a failed read answers on the legal pages.
 //!
 //! A WRAP `PermissionDenied` — a deployment that never granted the block its
-//! own table or settings — is a 403, never the 500 these two sites answered.
+//! own table or settings — is a 403 at both of its reads, not a 500.
 //! Each test drives the real route through [`LegalPagesBlock`]'s own dispatch
 //! as a caller holding no grants, so the refusal is the one
 //! `wrap::check_access` gives, and every read before the site under test
@@ -30,8 +30,8 @@ async fn dispatch(ctx: &TestContext, msg: wafer_run::Message) -> OutputStream {
         .await
 }
 
-/// The public terms page read its published document and answered a refusal
-/// with `err_internal`: a 500.
+/// The public terms page's published-document read, refused, is the door's
+/// 403 — not the sanitized 500 `err_internal` gives.
 #[tokio::test]
 async fn a_refused_published_document_read_is_403() {
     let ctx = ungranted().await;
@@ -50,8 +50,8 @@ async fn a_refused_published_document_read_is_403() {
 }
 
 /// The settings page renders every value through the config service, which
-/// WRAP guards like the database. A refusal was the 500 page; it is the 403
-/// page, with none of the denial's own text.
+/// WRAP guards like the database. A refusal is the 403 page, not the 500
+/// page, and carries none of the denial's own text.
 #[tokio::test]
 async fn a_refused_settings_read_is_the_403_page() {
     let ctx = ungranted().await;

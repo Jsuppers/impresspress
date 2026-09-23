@@ -307,10 +307,9 @@ mod tests {
             .await
     }
 
-    /// A room store the block was never granted answered `500 Internal server
-    /// error` on every route: `RoomError::Db` carried only the failure's text,
-    /// so its `PermissionDenied` was gone before the route could answer it. It
-    /// is the database door's 403 now, on the room write and on the room read.
+    /// A room store the block was never granted is the database door's 403 on
+    /// the room write and on the room read: `RoomError::Db` carries the
+    /// failure itself, so its `PermissionDenied` reaches the route.
     #[tokio::test]
     async fn a_refused_room_store_is_403() {
         use wafer_run::{streams::output::TerminalNotResponse, ErrorCode};

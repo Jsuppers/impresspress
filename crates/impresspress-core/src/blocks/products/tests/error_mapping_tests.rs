@@ -598,7 +598,7 @@ async fn settings_page_config_denial_is_the_403_page_not_a_500() {
 
 /// Records a miss unless `msg` answers the styled 403 page a refused read
 /// gets — not a 200 page printing the refusal's own text where the table
-/// would be, which is what these six list pages answered.
+/// would be.
 async fn expect_refused_page(
     misses: &mut Vec<String>,
     ctx: &dyn wafer_run::context::Context,
