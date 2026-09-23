@@ -389,6 +389,7 @@ pub(super) async fn handle_list_permissions(ctx: &dyn Context) -> OutputStream {
 /// `POST /b/admin/api/iam/permissions`.
 pub(super) async fn handle_create_permission(
     ctx: &dyn Context,
+    msg: &Message,
     input: InputStream,
 ) -> OutputStream {
     #[derive(serde::Deserialize)]
@@ -409,7 +410,20 @@ pub(super) async fn handle_create_permission(
     }));
     crate::util::stamp_created(&mut data);
     match db::create(ctx, PERMISSIONS_TABLE, data).await {
-        Ok(record) => ok_json(&record),
+        Ok(record) => {
+            // The permission catalogue is what roles are written against, so
+            // adding an entry is an admin mutation like every other one on
+            // this page — audited with the same writer, after the row lands.
+            audit_log(
+                ctx,
+                msg.user_id(),
+                "permission.create",
+                &format!("permissions/{}", record.id),
+                msg.remote_addr(),
+            )
+            .await;
+            ok_json(&record)
+        }
         // `permissions.name` is UNIQUE: a second permission of the same name is
         // a 409, not a 500 — the same classification `ops::create_variable` and
         // `ops::create_role` make, through the same helper. It also stops this
@@ -468,7 +482,17 @@ pub(super) async fn handle_delete_permission(ctx: &dyn Context, msg: &Message) -
         Err(response) => return response,
     };
     match db::delete(ctx, PERMISSIONS_TABLE, id).await {
-        Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+        Ok(()) => {
+            audit_log(
+                ctx,
+                msg.user_id(),
+                "permission.delete",
+                &format!("permissions/{id}"),
+                msg.remote_addr(),
+            )
+            .await;
+            ok_json(&serde_json::json!({"deleted": true}))
+        }
         Err(e) => crud::db_error(e, "Permission not found", "Database error"),
     }
 }
@@ -697,7 +721,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::admin::test_support::routed,
-        test_support::{admin_msg, output_is_error, output_json, TestContext},
+        test_support::{admin_msg, audit_rows, output_is_error, output_json, TestContext},
     };
 
     /// `PATCH /b/admin/api/iam/roles/{role_id}`, with `{id}` bound by the
@@ -1141,9 +1165,11 @@ mod tests {
         let ctx = TestContext::with_admin().await;
         let permission =
             serde_json::json!({"name": "posts.write", "resource": "posts", "actions": ["write"]});
-        output_json(handle_create_permission(&ctx, body_input(permission.clone())).await).await;
+        let msg = routed(admin_msg("create", "/b/admin/api/iam/permissions"));
+        output_json(handle_create_permission(&ctx, &msg, body_input(permission.clone())).await)
+            .await;
 
-        let out = handle_create_permission(&ctx, body_input(permission)).await;
+        let out = handle_create_permission(&ctx, &msg, body_input(permission)).await;
         assert_eq!(
             crate::test_support::output_http_status(out).await,
             409,
@@ -2062,5 +2088,111 @@ mod tests {
                 .is_empty(),
             "precondition: the late pass really revoked the in-flight grant"
         );
+    }
+
+    /// Dispatch one admin JSON request through the block's own `handle` —
+    /// the route table binds `{id}`, and `handle_create_permission` gets the
+    /// `Message` the route hands it rather than one a test built.
+    async fn permissions_api(
+        ctx: &TestContext,
+        action: &str,
+        path: &str,
+        body: &str,
+    ) -> OutputStream {
+        wafer_run::Block::handle(
+            &crate::blocks::admin::AdminBlock::new(),
+            ctx,
+            routed(admin_msg(action, path)),
+            InputStream::from_bytes(body.as_bytes().to_vec()),
+        )
+        .await
+    }
+
+    /// The permission catalogue is what every role is written against, so
+    /// adding an entry has to leave the same trail a role does. It wrote
+    /// none: the route handed `handle_create_permission` no `Message`, so it
+    /// had no admin to attribute the change to.
+    #[tokio::test]
+    async fn creating_a_permission_writes_an_audit_row_naming_it() {
+        let ctx = TestContext::with_admin().await;
+
+        let created = output_json(
+            permissions_api(
+                &ctx,
+                "create",
+                "/b/admin/api/iam/permissions",
+                r#"{"name":"posts.publish","resource":"posts","actions":["publish"]}"#,
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("the created row's id");
+
+        let rows = audit_rows(&ctx, "permission.create").await;
+        assert_eq!(rows.len(), 1, "one row per created permission");
+        assert_eq!(rows[0].str_field("resource"), format!("permissions/{id}"));
+        assert_eq!(
+            rows[0].str_field("user_id"),
+            "admin_1",
+            "attributed to the admin the route authenticated"
+        );
+    }
+
+    /// Deleting a permission silently un-grants whatever referenced it, so
+    /// it is the half of the pair that most needs a row. It returned
+    /// `{"deleted": true}` and wrote nothing.
+    #[tokio::test]
+    async fn deleting_a_permission_writes_an_audit_row_naming_it() {
+        let ctx = TestContext::with_admin().await;
+        let created = output_json(
+            permissions_api(
+                &ctx,
+                "create",
+                "/b/admin/api/iam/permissions",
+                r#"{"name":"posts.publish","resource":"posts","actions":["publish"]}"#,
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"]
+            .as_str()
+            .expect("the created row's id")
+            .to_string();
+
+        let deleted = output_json(
+            permissions_api(
+                &ctx,
+                "delete",
+                &format!("/b/admin/api/iam/permissions/{id}"),
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted["deleted"], serde_json::json!(true));
+
+        let rows = audit_rows(&ctx, "permission.delete").await;
+        assert_eq!(rows.len(), 1, "one row per deleted permission");
+        assert_eq!(rows[0].str_field("resource"), format!("permissions/{id}"));
+    }
+
+    /// A delete that found no row changed nothing, so it must not claim in
+    /// the trail that a permission was removed.
+    #[tokio::test]
+    async fn a_delete_that_matched_nothing_is_not_audited() {
+        let ctx = TestContext::with_admin().await;
+
+        let out = permissions_api(
+            &ctx,
+            "delete",
+            "/b/admin/api/iam/permissions/no-such-permission",
+            "",
+        )
+        .await;
+        assert!(
+            output_is_error(out, "NotFound").await,
+            "a 404, not a success"
+        );
+        assert_eq!(audit_rows(&ctx, "permission.delete").await.len(), 0);
     }
 }

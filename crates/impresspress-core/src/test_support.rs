@@ -2703,6 +2703,41 @@ pub fn admin_msg(action: &str, path: &str) -> Message {
     m
 }
 
+/// The admin audit-log rows whose `action` is exactly `action`, in write
+/// order.
+///
+/// Lives here rather than in the admin block's test module because
+/// [`crate::blocks::admin::logs::audit_log`] is the ONE audit writer:
+/// userportal's portal buttons and `ui::settings_form`'s five settings pages
+/// write their rows into the same table under their own WRAP identity, so a
+/// test in any block asserts against it the same way.
+///
+/// `ctx` must be able to read that table — for a fixture built with
+/// [`TestContext::with_wrap`] as a non-admin block, count through an
+/// un-wrapped clone so a missing READ grant cannot be mistaken for a missing
+/// row.
+pub async fn audit_rows(
+    ctx: &dyn Context,
+    action: &str,
+) -> Vec<wafer_core::clients::database::Record> {
+    crate::db_read::list_every(
+        ctx,
+        crate::blocks::admin::AUDIT_LOGS_TABLE,
+        vec![wafer_block::db::Filter {
+            field: "action".to_string(),
+            operator: wafer_block::db::FilterOp::Equal,
+            value: serde_json::Value::String(action.to_string()),
+        }],
+    )
+    .await
+    .expect("read the audit log")
+}
+
+/// How many admin audit-log rows carry `action`. See [`audit_rows`].
+pub async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
+    audit_rows(ctx, action).await.len()
+}
+
 /// Drain an `OutputStream` to a `BufferedResponse`. Panics if the stream
 /// terminates with anything other than `Complete` or `Halt`.
 ///
