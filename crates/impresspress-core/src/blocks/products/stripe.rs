@@ -2264,7 +2264,11 @@ pub(crate) async fn create_payment_link(
     // The row id travels in the request's metadata, so the request is
     // complete before the attempt is recorded — and the row can record the
     // exact bytes its idempotency key covers.
-    push_form(&mut body, "metadata[impresspress_payment_link_id]", &link_id);
+    push_form(
+        &mut body,
+        "metadata[impresspress_payment_link_id]",
+        &link_id,
+    );
     let idempotency_key = payment_link_idempotency_key(&stripe_account_id, &body);
     let attempt = repo::payment_links::Attempt {
         seller_account_id: &seller_account_id,

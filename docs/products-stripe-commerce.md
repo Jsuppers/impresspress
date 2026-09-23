@@ -267,6 +267,8 @@ Impresspress verifies the exact raw body with Stripe's timestamped signature, cl
 
 Return success from infrastructure only after the handler response is complete. Do not transform the body before signature verification.
 
+Every delivery that does not answer 2xx spends one of the event's 8 processing attempts, whatever failed: a database outage, a Stripe error, or a runtime access denial (a missing WRAP grant, a refused capability) raised by a call the handler makes. A denial is not a separate class — it spends the budget exactly as a 500 does, so a misconfigured grant can exhaust an event on its own. A failed attempt then holds the row for `30 x 2^(n-1)` seconds, capped at one hour and about 63 minutes across the whole budget; a redelivery inside that window is refused without spending an attempt, so the cadence that decides how long recovery really takes is Stripe's own redelivery schedule, not this one. The 8th failure — or a processing lease that expires without recording an outcome — moves the row to `dead_letter` and acknowledges the delivery, so Stripe stops redelivering and only an admin replay moves it again.
+
 ## Stripe mutation idempotency policy
 
 - Checkout Sessions use the immutable local purchase/order ID.
@@ -289,6 +291,8 @@ Use **Admin → Products → Stripe setup** for the two health queues.
 3. Fix the database/config/provider condition.
 4. Use replay only after confirming the event is failed/dead-letter. Replay re-enters the normal signed pipeline and retains idempotency/order guards.
 5. Verify the event becomes `processed` and the affected order/subscription/seller projection is correct.
+
+A `dead_letter` row is terminal on its own: the delivery was acknowledged, so no Stripe redelivery will revisit it and replay is the only thing that moves it.
 
 Admin APIs:
 
@@ -315,6 +319,7 @@ If an operation dead-letters, inspect Stripe using the provider refund ID/accoun
 - **Suspected secret leak:** revoke/rotate the Stripe key or webhook secret in Stripe, update Impresspress, retest connection/signatures, and inspect recent provider/webhook operations. Publishable-key rotation must match mode.
 - **Webhook backlog:** keep the destination enabled, repair the failure, replay dead letters, and allow normal Stripe retries. Do not delete event ledger rows.
 - **Provider timeout:** do not repeat a mutation with a new key. Use the reconciliation queue or the same durable local action.
+- **Payment Link with no recorded link ID:** a row left `syncing` or `error` can still have a live, buyable link at Stripe. Deactivating it re-sends that row's recorded request under its own idempotency key, which within Stripe's 24 hour key retention answers with the link the attempt created, and that link is deactivated. Past the retention window the deactivation is refused with 409 naming the row, because a re-send would create a second live link rather than name the first: take the link ID from the `Stripe created a Payment Link that could not be recorded locally` error log for that row, deactivate it in the Stripe Dashboard, then write that ID into the row's `stripe_payment_link_id` so the normal deactivation completes. Archiving the offer refuses the same way until the row is settled.
 - **Account mismatch:** stop processing, verify platform versus connected-account webhook scope and stored seller account. Never rewrite ownership to make an event fit.
 - **Mode mismatch:** restore matching keys/destination; do not migrate test IDs into live rows.
 - **Seller suspension/dispute:** use Impresspress suspension for catalog control and Stripe Express Dashboard for provider evidence, balance, and payout actions.

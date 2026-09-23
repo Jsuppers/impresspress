@@ -5309,6 +5309,274 @@ async fn payment_link_retry_adopts_the_link_stripe_created_when_recording_it_fai
     );
 }
 
+/// Fail the write that records the link Stripe just minted, leaving a row in
+/// `syncing` over a live Payment Link. Returns the product, the offer and the
+/// stuck row's id.
+async fn a_live_link_no_row_records(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+    stripe: &IdempotentPaymentLinkStripe,
+) -> (db::Record, String, String) {
+    let (product, offer_id, request) = seed_payment_link_configuration(ctx, product_id).await;
+    // A first attempt takes two filtered updates on the table: the pending
+    // row's attempt start, then `mark_synced`. Letting the first through
+    // fails only the write after Stripe has answered.
+    let failing = crate::test_support::FailingDbOpContext::new(
+        ctx.clone(),
+        vec![("database.update_where_count", repo::payment_links::TABLE)],
+    )
+    .after_passing(1);
+    stripe::create_payment_link(&failing, &product, &offer_id, &request)
+        .await
+        .expect_err("the local write after Stripe succeeded fails");
+    assert_eq!(
+        stripe.links_created.lock().unwrap().clone(),
+        vec!["plink_minted_1".to_string()],
+        "Stripe holds one live link"
+    );
+    let stuck = repo::payment_links::get_for_offer(
+        ctx,
+        &offer_id,
+        &repo::payment_links::list_for_offer(ctx, &offer_id)
+            .await
+            .unwrap()[0]
+            .id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stuck.managed.sync_status, "syncing");
+    assert!(
+        stuck.stripe_payment_link_id.is_empty(),
+        "the row records no link id"
+    );
+    assert!(
+        !stuck.stripe_request.is_empty() && !stuck.stripe_request_at.is_empty(),
+        "the attempt's request is recorded before it is sent: {stuck:?}"
+    );
+    (product, offer_id, stuck.managed.id)
+}
+
+/// The requests the Stripe stand-in received, as `(url, body)`.
+fn stripe_calls(stripe: &IdempotentPaymentLinkStripe) -> Vec<(String, String)> {
+    stripe
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            (
+                request.url.clone(),
+                String::from_utf8_lossy(request.body.as_deref().unwrap_or_default()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// `true` when Stripe was told to take `stripe_payment_link_id` down.
+fn was_deactivated_at_stripe(calls: &[(String, String)], stripe_payment_link_id: &str) -> bool {
+    calls.iter().any(|(url, body)| {
+        url.ends_with(&format!("/v1/payment_links/{stripe_payment_link_id}"))
+            && body.contains("active=false")
+    })
+}
+
+/// Deactivate a Payment Link the way an admin does: the real
+/// `DELETE /b/products/api/admin/.../payment-links/{link_id}` route, through
+/// the central router.
+async fn deactivate_link_over_the_wire(
+    ctx: &crate::test_support::TestContext,
+    product_id: &str,
+    offer_id: &str,
+    link_id: &str,
+) -> wafer_run::OutputStream {
+    let (mut msg, input) = delete_msg(
+        &format!(
+            "/b/products/api/admin/products/{product_id}/offers/{offer_id}/payment-links/{link_id}"
+        ),
+        "admin_1",
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    dispatch_routed(ctx, msg, input).await
+}
+
+/// A row whose attempt never recorded a link id can still have a live,
+/// buyable link at Stripe. Deactivating it must take that link down: an
+/// inactive local row over a live Payment Link is a checkout page that goes
+/// on charging buyers with nothing left to reconcile them against.
+#[tokio::test]
+async fn deactivating_a_row_with_no_recorded_link_takes_the_link_down_at_stripe() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let (product, offer_id, link_id) =
+        a_live_link_no_row_records(&ctx, "product_link_unrecorded", &stripe).await;
+
+    let deactivated =
+        output_to_json(deactivate_link_over_the_wire(&ctx, &product.id, &offer_id, &link_id).await)
+            .await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "the row must come back deactivated: {deactivated}"
+    );
+
+    let calls = stripe_calls(&stripe);
+    assert!(
+        was_deactivated_at_stripe(&calls, "plink_minted_1"),
+        "the live link must be deactivated at Stripe: {calls:?}"
+    );
+    assert_eq!(
+        stripe.links_created.lock().unwrap().len(),
+        1,
+        "learning the link id must replay the saved result, not mint a second link"
+    );
+}
+
+/// Past Stripe's idempotency-key retention the saved result is gone, so
+/// re-sending the attempt's request would create a second live link instead
+/// of naming the first. The deactivation refuses, and names the row.
+#[tokio::test]
+async fn deactivating_a_row_whose_request_stripe_has_forgotten_is_refused() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let (product, offer_id, link_id) =
+        a_live_link_no_row_records(&ctx, "product_link_forgotten", &stripe).await;
+    db::update(
+        &ctx,
+        repo::payment_links::TABLE,
+        &link_id,
+        HashMap::from([(
+            "stripe_request_at".to_string(),
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339()),
+        )]),
+    )
+    .await
+    .unwrap();
+    let calls_before = stripe_calls(&stripe).len();
+
+    let refusal = deactivate_link_over_the_wire(&ctx, &product.id, &offer_id, &link_id).await;
+    let Err(wafer_run::streams::output::TerminalNotResponse::Error(error)) =
+        refusal.collect_buffered().await
+    else {
+        panic!("a request Stripe has forgotten must be refused, not deactivated locally");
+    };
+    // `domain_error` maps a domain `Aborted` onto the wire's 409.
+    assert_eq!(error.code, ErrorCode::AlreadyExists, "{error:?}");
+    assert!(
+        error.message.contains(&link_id),
+        "the refusal must name the row an operator has to reconcile: {}",
+        error.message
+    );
+    assert_eq!(
+        stripe_calls(&stripe).len(),
+        calls_before,
+        "a refusal must not send anything to Stripe"
+    );
+    assert!(
+        repo::payment_links::get_for_offer(&ctx, &offer_id, &link_id)
+            .await
+            .unwrap()
+            .managed
+            .active,
+        "the row stays active so it and its link can still be reconciled"
+    );
+}
+
+/// A row no request has ever been sent for has nothing at Stripe, and
+/// deactivates locally. (A guard: rows written before the request column
+/// existed look exactly like this, and must keep deactivating.)
+#[tokio::test]
+async fn deactivating_a_row_with_no_stripe_request_stays_local() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let product_id = "product_link_never_sent";
+    let offer_id = seed_active_offer(&ctx, product_id, "").await;
+    let offer = repo::offers::get_managed(&ctx, &offer_id).await.unwrap();
+    let preview = offer_pricing::evaluate_offer(
+        &offer.offer,
+        &PricingPreviewRequest {
+            offer_id: offer_id.clone(),
+            quantity: 1,
+            inputs: serde_json::from_value(serde_json::json!({"pages": 2})).unwrap(),
+        },
+        offer_pricing::InputScope::Management,
+    )
+    .unwrap();
+    let link_id = seed_pending_payment_link(&ctx, &offer_id, "never-sent", &preview)
+        .await
+        .managed
+        .id;
+
+    let deactivated =
+        output_to_json(deactivate_link_over_the_wire(&ctx, product_id, &offer_id, &link_id).await)
+            .await;
+    assert_eq!(
+        deactivated["active"],
+        serde_json::json!(false),
+        "{deactivated}"
+    );
+    assert!(
+        stripe.requests.lock().unwrap().is_empty(),
+        "a row with no request in flight must not reach Stripe"
+    );
+}
+
+/// The other order of the same race: the row is retired while Stripe is
+/// minting its link. Nothing local will ever point at that link, so the
+/// create must take it down at Stripe instead of reporting success over a
+/// row that says the configuration is not for sale.
+#[tokio::test]
+async fn a_link_minted_for_a_row_retired_mid_flight_is_deactivated_at_stripe() {
+    let mut ctx = ctx_with(&[("IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "sk_test_x")]).await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    let (product, offer_id, request) =
+        seed_payment_link_configuration(&ctx, "product_link_retired").await;
+
+    // Park the create inside Stripe, retire its row there, then let it go:
+    // it comes back from Stripe holding a link its row no longer wants.
+    stripe
+        .held
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let create = stripe::create_payment_link(&ctx, &product, &offer_id, &request);
+    let retire = async {
+        stripe.held.started.notified().await;
+        let rows = repo::payment_links::list_for_offer(&ctx, &offer_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the create writes its row before it calls Stripe"
+        );
+        repo::payment_links::deactivate_local(&ctx, &offer_id, &rows[0].id)
+            .await
+            .expect("retire the row mid-flight");
+        stripe.held.release.notify_one();
+        rows[0].id.clone()
+    };
+    let (created, link_id) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(create, retire)
+    })
+    .await
+    .expect("the create must reach Stripe");
+
+    let error = created.expect_err("a create whose row was retired cannot report success");
+    assert_eq!(error.code, ErrorCode::Aborted, "{error:?}");
+    let calls = stripe_calls(&stripe);
+    assert!(
+        was_deactivated_at_stripe(&calls, "plink_minted_1"),
+        "the link minted for the retired row must be deactivated at Stripe: {calls:?}"
+    );
+    let stored = repo::payment_links::get_for_offer(&ctx, &offer_id, &link_id)
+        .await
+        .unwrap();
+    assert!(!stored.managed.active);
+    assert!(
+        stored.stripe_payment_link_id.is_empty() && stored.managed.url.is_empty(),
+        "a retired row must not be given the link it no longer owns"
+    );
+}
+
 /// A configuration that can never produce a valid Stripe request is refused
 /// before anything is written: retrying it must not pile up `syncing` rows.
 #[tokio::test]

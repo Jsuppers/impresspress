@@ -11,8 +11,7 @@ use super::{
     },
     harness::{
         admin_create_msg, admin_get_msg, create_msg, ctx, ctx_with, delete_msg, dispatch,
-        output_is_error, output_to_json, request_msg, seed, seed_pending_payment_link,
-        update_msg,
+        output_is_error, output_to_json, request_msg, seed, seed_pending_payment_link, update_msg,
     },
 };
 use crate::util::RecordExt;

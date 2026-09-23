@@ -169,7 +169,7 @@ mod strict_upgrade_tests {
         SQL_012_POSTGRES, SQL_012_SQLITE, SQL_013_POSTGRES, SQL_013_SQLITE, SQL_014_POSTGRES,
         SQL_014_SQLITE, SQL_015_POSTGRES, SQL_015_SQLITE, SQL_016_POSTGRES, SQL_016_SQLITE,
         SQL_017_POSTGRES, SQL_017_SQLITE, SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES,
-        SQL_019_SQLITE, SQL_020_POSTGRES, SQL_020_SQLITE,
+        SQL_019_SQLITE, SQL_020_POSTGRES, SQL_020_SQLITE, SQL_021_POSTGRES, SQL_021_SQLITE,
     };
     use crate::migration_helper::apply_ddl_via_service;
 
@@ -685,6 +685,23 @@ mod strict_upgrade_tests {
             assert!(
                 SQL_006_POSTGRES.contains(fragment),
                 "PostgreSQL Payment Link snapshot migration is missing {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_link_request_migration_matches_sqlite_and_postgres() {
+        for fragment in [
+            "stripe_request TEXT NOT NULL",
+            "stripe_request_at TEXT NOT NULL",
+        ] {
+            assert!(
+                SQL_021_SQLITE.contains(fragment),
+                "SQLite Payment Link request migration is missing {fragment}"
+            );
+            assert!(
+                SQL_021_POSTGRES.contains(fragment),
+                "PostgreSQL Payment Link request migration is missing {fragment}"
             );
         }
     }

@@ -76,14 +76,19 @@ fn hydrate(record: Record) -> Result<StoredPaymentLink, WaferError> {
                 "invalid persisted Payment Link application fee",
             )
         })?;
-    let stripe_request: Vec<(String, String)> = match record.str_field("stripe_request") {
-        "" => Vec::new(),
-        raw => serde_json::from_str(raw).map_err(|error| {
-            WaferError::new(
-                ErrorCode::Internal,
-                format!("invalid persisted Payment Link request: {error}"),
-            )
-        })?,
+    // Stored as JSON text, which the database layer may hand back already
+    // decoded — as `pricing_snapshot` above is.
+    let invalid_request = |error: serde_json::Error| {
+        WaferError::new(
+            ErrorCode::Internal,
+            format!("invalid persisted Payment Link request: {error}"),
+        )
+    };
+    let stripe_request: Vec<(String, String)> = match record.data.get("stripe_request") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(raw)) if raw.is_empty() => Vec::new(),
+        Some(Value::String(raw)) => serde_json::from_str(raw).map_err(invalid_request)?,
+        Some(value) => serde_json::from_value(value.clone()).map_err(invalid_request)?,
     };
     Ok(StoredPaymentLink {
         managed: ManagedPaymentLink {
@@ -131,12 +136,14 @@ fn attempt_fields(attempt: &Attempt<'_>) -> Result<HashMap<String, Value>, Wafer
         ),
         (
             "pricing_snapshot".to_string(),
-            Value::String(serde_json::to_string(attempt.pricing_snapshot).map_err(|error| {
-                WaferError::new(
-                    ErrorCode::Internal,
-                    format!("could not encode Payment Link pricing snapshot: {error}"),
-                )
-            })?),
+            Value::String(
+                serde_json::to_string(attempt.pricing_snapshot).map_err(|error| {
+                    WaferError::new(
+                        ErrorCode::Internal,
+                        format!("could not encode Payment Link pricing snapshot: {error}"),
+                    )
+                })?,
+            ),
         ),
         (
             "fee_basis_points".to_string(),
