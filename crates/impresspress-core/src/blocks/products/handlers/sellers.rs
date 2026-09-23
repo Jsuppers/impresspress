@@ -110,7 +110,7 @@ pub(super) async fn get(ctx: &dyn Context, msg: &Message) -> OutputStream {
     };
     let products = match repo::products::list_owned_by(ctx, &seller.user_id).await {
         Ok(products) => products,
-        Err(error) => return err_internal("Could not list seller products", error),
+        Err(error) => return crud::db_error_internal(error, "Could not list seller products"),
     };
     let truncated = products.truncated;
     let products = match products
@@ -249,7 +249,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
     let user_id = account.str_field("user_id").to_string();
     let products = match repo::products::list_owned_by_including_deleted(ctx, &user_id).await {
         Ok(products) => products,
-        Err(error) => return err_internal("Could not load seller products", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load seller products"),
     };
     if suspended {
         for product in &products {
@@ -304,7 +304,7 @@ async fn set_suspended(ctx: &dyn Context, msg: &Message, suspended: bool) -> Out
         // cover everything the seller owns), so filtering the write on
         // liveness here would silently exempt exactly those rows.
         if let Err(error) = repo::products::update_including_deleted(ctx, &product.id, data).await {
-            return err_internal("Could not update seller product state", error);
+            return crud::db_error_internal(error, "Could not update seller product state");
         }
     }
     match repo::seller_accounts::set_admin_suspended(ctx, id, suspended).await {

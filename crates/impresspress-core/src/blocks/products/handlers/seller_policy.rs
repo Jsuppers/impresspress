@@ -7,8 +7,11 @@ use wafer_core::clients::{config, database as db};
 use wafer_run::{context::Context, OutputStream};
 
 use crate::{
-    blocks::products::{money, repo},
-    http::{err_bad_request, err_internal},
+    blocks::{
+        crud,
+        products::{money, repo},
+    },
+    http::err_bad_request,
     util::RecordExt,
 };
 
@@ -158,7 +161,7 @@ pub(crate) async fn ensure_product_capacity(
         }],
     )
     .await
-    .map_err(|error| err_internal("Could not enforce seller product limit", error))?;
+    .map_err(|error| crud::db_error_internal(error, "Could not enforce seller product limit"))?;
     if count >= limit {
         return Err(err_bad_request(&format!(
             "Seller product limit reached ({limit}); delete a product or ask an administrator to raise the limit"

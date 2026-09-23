@@ -27,7 +27,7 @@ use crate::{
             repo::{self, groups::TABLE as GROUPS_TABLE},
         },
     },
-    http::{err_internal, err_unauthorized, ok_json},
+    http::{err_unauthorized, ok_json},
 };
 
 /// User-owned group rows (`/b/products/groups/{id}`), owned via `user_id`.
@@ -125,7 +125,7 @@ pub(super) async fn handle_user_list_groups(ctx: &dyn Context, msg: &Message) ->
     }];
     match repo::groups::list_by_name(ctx, owned, 1000).await {
         Ok(result) => ok_json(&GroupListResponse::from_record_list(&result)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -250,7 +250,7 @@ pub(super) async fn handle_user_group_products(ctx: &dyn Context, msg: &Message)
     .await
     {
         Ok(list) => ok_json(&ProductListResponse::from_record_list(&list)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -264,6 +264,6 @@ pub(super) async fn handle_user_list_group_templates(
 ) -> OutputStream {
     match repo::group_templates::list_by_name(ctx, 1000).await {
         Ok(result) => ok_json(&GroupTemplateListResponse::from_record_list(&result)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }

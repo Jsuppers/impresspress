@@ -3,8 +3,11 @@
 use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
-    blocks::products::{contracts::SubscriptionStatusResponse, repo},
-    http::{err_internal, err_unauthorized, ok_json},
+    blocks::{
+        crud,
+        products::{contracts::SubscriptionStatusResponse, repo},
+    },
+    http::{err_unauthorized, ok_json},
 };
 
 pub(super) async fn handle_subscription(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -17,7 +20,7 @@ pub(super) async fn handle_subscription(ctx: &dyn Context, msg: &Message) -> Out
     // have no subscription" and potentially misread as a cancellation.
     let subscription = match repo::subscriptions::subscription_for_user(ctx, &user_id).await {
         Ok(subscription) => subscription,
-        Err(e) => return err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
     ok_json(&SubscriptionStatusResponse { subscription })
 }

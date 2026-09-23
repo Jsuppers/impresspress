@@ -811,7 +811,7 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
     // the copy did not set.
     let created = match create_product_row(ctx, data).await {
         Ok(created) => created,
-        Err(error) => return err_internal("Could not duplicate product", error),
+        Err(error) => return crud::db_error_internal(error, "Could not duplicate product"),
     };
     let duplicated_offers = match offer_repo::duplicate_for_product(
         ctx,
@@ -833,7 +833,7 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
             if let Err(cleanup_error) = repo::products::purge(ctx, &created.id).await {
                 tracing::error!(product_id = %created.id, error = %cleanup_error, "could not compensate duplicated product");
             }
-            return err_internal("Could not duplicate product pricing", error);
+            return crud::db_error_internal(error, "Could not duplicate product pricing");
         }
     };
     let product = match ProductView::from_record(&created) {

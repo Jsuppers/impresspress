@@ -13,6 +13,7 @@ use super::{
     },
     money, repo, stripe_provider,
 };
+use crate::blocks::crud;
 
 fn display_money(amount_minor: i64, currency: &str) -> String {
     let currency = money::normalize_currency(currency).unwrap_or_else(|_| currency.to_uppercase());
@@ -209,23 +210,23 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // misleading, not just cosmetically wrong.
     let products_count = match repo::products::count(ctx, &[]).await {
         Ok(n) => n,
-        Err(e) => return crate::http::err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
     let groups_count = match repo::groups::count(ctx, &[]).await {
         Ok(n) => n,
-        Err(e) => return crate::http::err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
     let purchases_count = match repo::purchases::count_all(ctx).await {
         Ok(n) => n,
-        Err(e) => return crate::http::err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
     let offers_count = match repo::offers::count(ctx, &[]).await {
         Ok(n) => n,
-        Err(e) => return crate::http::err_internal("Database error", e),
+        Err(e) => return crud::db_error_internal(e, "Database error"),
     };
     let analytics = match repo::purchases::commerce_analytics(ctx, None).await {
         Ok(analytics) => analytics,
-        Err(error) => return crate::http::err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
     let user_products_enabled = super::handlers::user_products_enabled(ctx).await;
 
@@ -598,7 +599,7 @@ pub async fn deleted_product_close(
     }
     let offers = match repo::offers::list_for_product(ctx, product_id).await {
         Ok(offers) => offers,
-        Err(error) => return crate::http::err_internal("Could not load product pricing", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load product pricing"),
     };
     // One listing per offer rather than a join: `list_links` is the same read
     // the API exposes, and there are as many of them as the offer list the
@@ -607,7 +608,7 @@ pub async fn deleted_product_close(
     for offer in &offers {
         match repo::payment_links::list_for_offer(ctx, &offer.offer.id).await {
             Ok(list) => links.push(list),
-            Err(error) => return crate::http::err_internal("Could not load payment links", error),
+            Err(error) => return crud::db_error_internal(error, "Could not load payment links"),
         }
     }
 
@@ -715,12 +716,12 @@ pub async fn deleted_product_close(
 pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let sellers = match repo::seller_accounts::list_rows(ctx).await {
         Ok(sellers) => sellers,
-        Err(error) => return crate::http::err_internal("Could not list sellers", error),
+        Err(error) => return crud::db_error_internal(error, "Could not list sellers"),
     };
     let seller_total = if sellers.truncated {
         match repo::seller_accounts::count_all(ctx).await {
             Ok(total) => total,
-            Err(error) => return crate::http::err_internal("Could not count sellers", error),
+            Err(error) => return crud::db_error_internal(error, "Could not count sellers"),
         }
     } else {
         sellers.rows.len() as i64
@@ -730,7 +731,7 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // bound.
     let product_counts = match repo::products::live_counts_by_owner(ctx, "user").await {
         Ok(counts) => counts,
-        Err(error) => return crate::http::err_internal("Could not count seller products", error),
+        Err(error) => return crud::db_error_internal(error, "Could not count seller products"),
     };
     // The queue's predicate goes into the query for the same reason. The
     // total comes from a COUNT so the heading states how many listings are
@@ -738,12 +739,12 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let pending_total = match repo::products::count_pending_review(ctx).await {
         Ok(total) => total,
         Err(error) => {
-            return crate::http::err_internal("Could not count the moderation queue", error)
+            return crud::db_error_internal(error, "Could not count the moderation queue")
         }
     };
     let pending = match repo::products::list_pending_review(ctx).await {
         Ok(pending) => pending,
-        Err(error) => return crate::http::err_internal("Could not list seller products", error),
+        Err(error) => return crud::db_error_internal(error, "Could not list seller products"),
     };
     let selling_enabled = super::handlers::user_products_enabled(ctx).await;
 
@@ -847,11 +848,11 @@ pub async fn admin_seller_detail(
     let seller = match repo::seller_accounts::get_row(ctx, seller_id).await {
         Ok(Some(seller)) => seller,
         Ok(None) => return crate::http::err_not_found("Seller not found"),
-        Err(error) => return crate::http::err_internal("Could not load seller", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load seller"),
     };
     let products = match repo::products::list_owned_by(ctx, &seller.user_id).await {
         Ok(products) => products,
-        Err(error) => return crate::http::err_internal("Could not list seller products", error),
+        Err(error) => return crud::db_error_internal(error, "Could not list seller products"),
     };
     let suspended = seller.status == SellerStatus::Suspended;
     let action = if suspended { "reactivate" } else { "suspend" };
@@ -1693,7 +1694,7 @@ pub async fn product_manager(
     }
     let offers = match repo::offers::list_for_product(ctx, product_id).await {
         Ok(offers) => offers,
-        Err(error) => return crate::http::err_internal("Could not load product pricing", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load product pricing"),
     };
     let seller_enabled = !admin && super::handlers::user_products_enabled(ctx).await;
     let product_api_url = if admin {
@@ -2365,7 +2366,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let seller_enabled = super::handlers::user_products_enabled(ctx).await;
     let purchases_count = match repo::purchases::count_for_user(ctx, &user_id).await {
         Ok(count) => count,
-        Err(error) => return crate::http::err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
 
     let (product_count, seller_account, fee_basis_points) = if seller_enabled {
@@ -2386,7 +2387,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
         .await
         {
             Ok(count) => count,
-            Err(error) => return crate::http::err_internal("Database error", error),
+            Err(error) => return crud::db_error_internal(error, "Database error"),
         };
         let account = match repo::seller_accounts::get_for_user(ctx, &user_id).await {
             Ok(Some(record)) => match repo::seller_accounts::to_contract(&record, fee) {
@@ -2394,7 +2395,7 @@ pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 Err(error) => return crate::http::err_internal("Seller account error", error),
             },
             Ok(None) => None,
-            Err(error) => return crate::http::err_internal("Database error", error),
+            Err(error) => return crud::db_error_internal(error, "Database error"),
         };
         (count, account, fee)
     } else {
@@ -2473,7 +2474,7 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
     };
     let account_record = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(account) => account,
-        Err(error) => return crate::http::err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
     let account = match account_record.as_ref() {
         Some(record) => match repo::seller_accounts::to_contract(record, fee_basis_points) {
@@ -2485,14 +2486,14 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
     let analytics = match account_record.as_ref() {
         Some(record) => match repo::purchases::commerce_analytics(ctx, Some(&record.id)).await {
             Ok(analytics) => analytics,
-            Err(error) => return crate::http::err_internal("Database error", error),
+            Err(error) => return crud::db_error_internal(error, "Database error"),
         },
         None => Vec::new(),
     };
     let failures = match account_record.as_ref() {
         Some(record) => match repo::purchases::recent_seller_failures(ctx, &record.id, 5).await {
             Ok(failures) => failures,
-            Err(error) => return crate::http::err_internal("Database error", error),
+            Err(error) => return crud::db_error_internal(error, "Database error"),
         },
         None => Vec::new(),
     };
@@ -2535,7 +2536,7 @@ pub async fn seller_orders(ctx: &dyn Context, msg: &Message) -> OutputStream {
             )
             .await;
         }
-        Err(error) => return crate::http::err_internal("Database error", error),
+        Err(error) => return crud::db_error_internal(error, "Database error"),
     };
     let (page, page_size, _) = msg.pagination_params(20);
     let status_filter = msg.query("status").to_string();
@@ -2653,7 +2654,7 @@ async fn order_detail(
             let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
                 Ok(Some(account)) => account,
                 Ok(None) => return crate::http::err_forbidden("Seller setup is required"),
-                Err(error) => return crate::http::err_internal("Database error", error),
+                Err(error) => return crud::db_error_internal(error, "Database error"),
             };
             if purchase.str_field("seller_account_id") != account.id {
                 return crate::http::err_forbidden("Access denied");
@@ -2662,15 +2663,15 @@ async fn order_detail(
     }
     let line_items = match repo::purchases::list_line_items(ctx, purchase_id).await {
         Ok(items) => items,
-        Err(error) => return crate::http::err_internal("Could not load order items", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load order items"),
     };
     let refunds = match repo::refunds::list_for_purchase(ctx, purchase_id).await {
         Ok(refunds) => refunds,
-        Err(error) => return crate::http::err_internal("Could not load refunds", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load refunds"),
     };
     let disputes = match repo::disputes::list_for_purchase(ctx, purchase_id).await {
         Ok(disputes) => disputes,
-        Err(error) => return crate::http::err_internal("Could not load disputes", error),
+        Err(error) => return crud::db_error_internal(error, "Could not load disputes"),
     };
     let currency = purchase.str_field("currency");
     let refunded_total = purchase.i64_field("refunded_total_cents");
