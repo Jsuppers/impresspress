@@ -104,6 +104,11 @@
 //!   block-count quota is `409` (the workspace conflicts with a limit — the
 //!   payload is not too large). All of them carry `Cache-Control: no-store`,
 //!   as design §12 requires of every `/b/dev` response.
+//! * A failed storage call — the manifest, a blob — is classified by
+//!   `super::no_store_db_error_internal`: a WRAP denial is a `403` and a
+//!   storage quota a `429`, both `no-store`; anything else is the sanitized
+//!   `500`. A blob the manifest names but the store does not have is that
+//!   `500`, never a `404`: the path exists and its content has gone.
 
 use base64ct::{Base64, Encoding};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
@@ -116,13 +121,13 @@ use super::{
         FileListResponse, FileReadRequest, FileReadResponse, FileWriteRequest, FileWriteResponse,
         GenerationSummary,
     },
-    no_store, no_store_error, no_store_error_status,
+    no_store, no_store_db_error_internal, no_store_error, no_store_error_status,
     paths::{self, WorkspaceArea},
     repo::generations::GenerationCause,
     workspace::{self, FileEntry, Workspace},
     DevShared,
 };
-use crate::{blocks::crud, http::err_internal};
+use crate::blocks::crud;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -138,7 +143,7 @@ pub async fn handle_list(ctx: &dyn Context, shared: &DevShared, msg: &Message) -
         let _serialized = shared.workspace.lock().await;
         match workspace::load(ctx).await {
             Ok(ws) => ws,
-            Err(e) => return err_internal("dev workspace load", e),
+            Err(e) => return no_store_db_error_internal(e, "dev workspace load"),
         }
     };
     let prefix = query.prefix.unwrap_or_default();
@@ -172,7 +177,7 @@ pub async fn handle_read(
     let _serialized = shared.workspace.lock().await;
     let ws = match workspace::load(ctx).await {
         Ok(ws) => ws,
-        Err(e) => return err_internal("dev workspace load", e),
+        Err(e) => return no_store_db_error_internal(e, "dev workspace load"),
     };
     let Some(entry) = ws.get(&request.path) else {
         return no_store_error(
@@ -185,7 +190,7 @@ pub async fn handle_read(
         // A manifest entry naming a blob that is not there is corruption, not
         // a missing file: the path exists, its content has gone. Under the
         // lock this can no longer mean "a mutation moved underneath the read".
-        Err(e) => return err_internal("dev workspace blob read", e),
+        Err(e) => return no_store_db_error_internal(e, "dev workspace blob read"),
     };
     let (encoding, content) = encode_content(&entry.content_type, bytes);
     no_store().json(&FileReadResponse {
@@ -243,7 +248,7 @@ pub async fn handle_write(
         let _serialized = shared.workspace.lock().await;
         let mut ws = match workspace::load(ctx).await {
             Ok(ws) => ws,
-            Err(e) => return err_internal("dev workspace load", e),
+            Err(e) => return no_store_db_error_internal(e, "dev workspace load"),
         };
         let current = ws.get(&request.path);
         if !hash_matches(current, request.expected_sha256.as_deref()) {
@@ -293,11 +298,11 @@ pub async fn handle_write(
             // Charge the workspace only when the store actually grew.
             Ok(blobs::Stored::New) => ws.record_blob_stored(bytes.len() as u64),
             Ok(blobs::Stored::Deduplicated) => {}
-            Err(e) => return err_internal("dev workspace blob write", e),
+            Err(e) => return no_store_db_error_internal(e, "dev workspace blob write"),
         }
         let entry = ws.insert(&request.path, sha, bytes.len() as u64);
         if let Err(e) = workspace::save(ctx, &ws).await {
-            return err_internal("dev workspace save", e);
+            return no_store_db_error_internal(e, "dev workspace save");
         }
         entry
     };
@@ -339,7 +344,7 @@ pub async fn handle_delete(
         let _serialized = shared.workspace.lock().await;
         let mut ws = match workspace::load(ctx).await {
             Ok(ws) => ws,
-            Err(e) => return err_internal("dev workspace load", e),
+            Err(e) => return no_store_db_error_internal(e, "dev workspace load"),
         };
         let current = ws.get(&request.path);
         if !hash_matches(current, Some(&request.expected_sha256)) {
@@ -349,7 +354,7 @@ pub async fn handle_delete(
         // it.
         ws.remove(&request.path);
         if let Err(e) = workspace::save(ctx, &ws).await {
-            return err_internal("dev workspace save", e);
+            return no_store_db_error_internal(e, "dev workspace save");
         }
     }
     let generation = match publish_if_site(ctx, shared, &area, GenerationCause::SiteDelete).await {

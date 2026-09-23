@@ -56,6 +56,9 @@ pub mod zip;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+#[cfg(test)]
+mod error_mapping_tests;
+
 use std::sync::Arc;
 
 use wafer_run::{
