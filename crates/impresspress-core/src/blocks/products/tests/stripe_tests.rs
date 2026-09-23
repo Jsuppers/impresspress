@@ -5642,6 +5642,118 @@ async fn a_takedown_that_fails_at_stripe_is_retried_from_the_recorded_link_id() 
     );
 }
 
+/// The other way a link can refuse to go down: the row names it, but Stripe
+/// will not answer. A provider outage is exactly when a fraud control has to
+/// complete, so suspension retires the row, queues the takedown and carries
+/// on rather than stopping on the first failing link.
+#[tokio::test]
+async fn seller_suspension_is_not_blocked_when_stripe_refuses_the_takedown() {
+    let mut ctx = ctx_with(&[
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            "sk_test_stripe_down",
+        ),
+        ("WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "true"),
+    ])
+    .await;
+    let stripe = register_idempotent_payment_link_stripe(&mut ctx, 0);
+    // Every deactivation this test makes fails.
+    *stripe.deactivations_failed.lock().unwrap() = 10;
+    seed(
+        &ctx,
+        repo::seller_accounts::TABLE,
+        "seller_stripe_down_account",
+        HashMap::from([
+            (
+                "user_id".to_string(),
+                serde_json::json!("seller_stripe_down"),
+            ),
+            ("status".to_string(), serde_json::json!("active")),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stripe_down"),
+            ),
+            ("details_submitted".to_string(), serde_json::json!(true)),
+            ("charges_enabled".to_string(), serde_json::json!(true)),
+            ("payouts_enabled".to_string(), serde_json::json!(true)),
+            ("fee_basis_points".to_string(), serde_json::json!(200)),
+        ]),
+    )
+    .await;
+    let product_id = "seller_stripe_down_product";
+    let offer_id = seed_active_offer(&ctx, product_id, "seller_stripe_down").await;
+    // A fully synchronized link: the row names it, so this is not the
+    // unresolvable case — only Stripe is refusing.
+    let link_id = "link_stripe_down";
+    seed(
+        &ctx,
+        repo::payment_links::TABLE,
+        link_id,
+        HashMap::from([
+            ("offer_id".to_string(), serde_json::json!(&offer_id)),
+            (
+                "stripe_account_id".to_string(),
+                serde_json::json!("acct_stripe_down"),
+            ),
+            (
+                "stripe_payment_link_id".to_string(),
+                serde_json::json!("plink_stripe_down"),
+            ),
+            (
+                "url".to_string(),
+                serde_json::json!("https://buy.stripe.com/plink_stripe_down"),
+            ),
+            ("active".to_string(), serde_json::json!(true)),
+            ("sync_status".to_string(), serde_json::json!("synced")),
+        ]),
+    )
+    .await;
+
+    let (msg, input) = admin_create_msg(
+        "/b/products/api/admin/sellers/seller_stripe_down_account/suspend",
+        serde_json::json!({}),
+    );
+    let suspended = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(
+        suspended["status"],
+        serde_json::json!("suspended"),
+        "a Stripe outage must not stop the fraud control: {suspended}"
+    );
+    assert_eq!(
+        db::get(&ctx, repo::products::TABLE, product_id)
+            .await
+            .unwrap()
+            .str_field("status"),
+        "archived"
+    );
+    assert!(
+        !repo::payment_links::get(&ctx, link_id)
+            .await
+            .unwrap()
+            .managed
+            .active,
+        "the row must retire even though its link is still live"
+    );
+    assert_eq!(
+        deactivations_of(&stripe, "plink_stripe_down"),
+        1,
+        "the takedown was attempted once, and Stripe refused it"
+    );
+    assert_eq!(
+        takedown_operation(&ctx, link_id).await.str_field("status"),
+        "pending",
+        "the link is still live, so the takedown must be due"
+    );
+
+    // And the queue an administrator reconciles finishes the job.
+    *stripe.deactivations_failed.lock().unwrap() = 0;
+    let result = super::super::stripe_provider::reconcile_provider_operations(&ctx, 25)
+        .await
+        .expect("reconcile the queue");
+    assert_eq!(result.succeeded, 1, "{result:?}");
+    assert_eq!(deactivations_of(&stripe, "plink_stripe_down"), 2);
+}
+
 /// Suspending a seller is a fraud control: it must not be stoppable by one
 /// Payment Link row whose Stripe link nothing can name any more.
 #[tokio::test]

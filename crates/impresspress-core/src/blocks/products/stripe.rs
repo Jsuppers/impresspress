@@ -1907,7 +1907,7 @@ pub(crate) async fn archive_offer_catalog(
         return repo::offers::archive(ctx, product_id, offer_id).await;
     }
     for link in active_links {
-        deactivate_payment_link(ctx, offer_id, &link.id).await?;
+        retire_payment_link_for_archival(ctx, offer_id, &link.id).await?;
     }
     if synced_components.is_empty() {
         return repo::offers::archive(ctx, product_id, offer_id).await;
@@ -2391,7 +2391,7 @@ async fn deactivate_stripe_payment_link(
                 crate::util::url_path_encode(stripe_payment_link_id)
             ),
             Some(stripe_account_id),
-            Some(&format!("impresspress_deactivate_payment_link_{link_id}")),
+            Some(&payment_link_deactivate_key(link_id)),
             Some(vec![("active".to_string(), "false".to_string())]),
         )
         .await?;
@@ -2420,6 +2420,40 @@ fn payment_link_idempotency_key(stripe_account_id: &str, form: &[(String, String
         "impresspress_payment_link_{}",
         sha256_hex(request.as_bytes())
     )
+}
+
+/// Take a Payment Link down for an offer being archived, and retire its row
+/// even when Stripe will not answer.
+///
+/// Archival is the off switch, and seller suspension runs it over every offer
+/// a seller owns as a fraud control. A Stripe outage is exactly when that has
+/// to complete, so a provider failure hands the link to the durable takedown
+/// queue and the sweep carries on; the row retires either way, so nothing
+/// local goes on selling it. The direct deactivation route propagates
+/// instead — there a caller is watching and can repeat the action.
+async fn retire_payment_link_for_archival(
+    ctx: &dyn Context,
+    offer_id: &str,
+    link_id: &str,
+) -> Result<(), WaferError> {
+    let Err(error) = deactivate_payment_link(ctx, offer_id, link_id).await else {
+        return Ok(());
+    };
+    if !stripe_secret_operations_allowed(ctx).await {
+        // Queuing buys nothing in a runtime that cannot reach Stripe at all,
+        // and the refusal is the honest answer to "archive this".
+        return Err(error);
+    }
+    let stored = repo::payment_links::get(ctx, link_id).await?;
+    tracing::warn!(
+        link_id = %link_id,
+        stripe_payment_link_id = %stored.stripe_payment_link_id,
+        error = %error,
+        "archiving an offer could not take its Payment Link down at Stripe; queued for retry"
+    );
+    queue_payment_link_takedown(ctx, link_id, &stored.stripe_account_id).await;
+    repo::payment_links::deactivate_local(ctx, offer_id, link_id).await?;
+    Ok(())
 }
 
 pub(crate) async fn deactivate_payment_link(
@@ -2469,11 +2503,19 @@ pub(crate) async fn deactivate_payment_link(
     repo::payment_links::deactivate_local(ctx, offer_id, link_id).await
 }
 
-/// Queue the durable takedown of `link_id`'s Stripe link and try to settle it
-/// now. A failure here is never the caller's to handle: the queued operation
-/// is the retry, and the administrator's provider-operation queue is where an
-/// unsettled one surfaces.
-async fn enqueue_payment_link_takedown(ctx: &dyn Context, link_id: &str, stripe_account_id: &str) {
+/// Record the durable takedown of `link_id`'s Stripe link without attempting
+/// it. `false` when nothing durable holds it, which is only ever a database
+/// failure.
+///
+/// Queuing is not doing: nothing drains the provider-operation queue on its
+/// own, so a takedown recorded here runs when an administrator reconciles
+/// provider operations (or a scheduler calls that endpoint), and the link can
+/// go on taking money until then.
+async fn queue_payment_link_takedown(
+    ctx: &dyn Context,
+    link_id: &str,
+    stripe_account_id: &str,
+) -> bool {
     if let Err(error) = repo::provider_operations::ensure(
         ctx,
         repo::provider_operations::PAYMENT_LINK_DEACTIVATE,
@@ -2492,6 +2534,17 @@ async fn enqueue_payment_link_takedown(ctx: &dyn Context, link_id: &str, stripe_
             error = %error,
             "could not enqueue the takedown of a Payment Link whose id no row records"
         );
+        return false;
+    }
+    true
+}
+
+/// Queue the durable takedown of `link_id`'s Stripe link and try to settle it
+/// now. A failure here is never the caller's to handle: the queued operation
+/// is the retry, and the administrator's provider-operation queue is where an
+/// unsettled one surfaces.
+async fn enqueue_payment_link_takedown(ctx: &dyn Context, link_id: &str, stripe_account_id: &str) {
+    if !queue_payment_link_takedown(ctx, link_id, stripe_account_id).await {
         return;
     }
     match take_down_payment_link(ctx, link_id).await {
@@ -2532,12 +2585,15 @@ async fn enqueue_payment_link_takedown(ctx: &dyn Context, link_id: &str, stripe_
             }
         }
         Err(error) => {
-            // Transient as far as anything here can tell. The operation is
-            // due and the reconciliation worker owns it from here.
+            // Transient as far as anything here can tell, and the operation
+            // is due. Nothing drains the queue on its own, though: it runs at
+            // the next administrator reconcile, and this link keeps taking
+            // money until it does.
             tracing::warn!(
                 link_id = %link_id,
                 error = %error,
-                "a Payment Link takedown was queued for retry"
+                "a Payment Link takedown is due in the provider-operation queue; it runs at \
+                 the next administrator reconcile"
             );
         }
     }
