@@ -388,15 +388,6 @@ async fn send_email(
 ) -> bool {
     let api_key = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "").await;
     let domain = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN", "").await;
-    let from = {
-        let f = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_FROM", "").await;
-        if f.is_empty() {
-            default_from(&app_name(ctx).await, &domain)
-        } else {
-            f
-        }
-    };
-
     if api_key.is_empty() || domain.is_empty() {
         // Email not configured — don't fail the caller, but make the
         // resulting {"sent": false} diagnosable from the logs.
@@ -407,6 +398,15 @@ async fn send_email(
         );
         return false;
     }
+
+    let from = {
+        let f = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_FROM", "").await;
+        if f.is_empty() {
+            default_from(&app_name(ctx).await, &domain)
+        } else {
+            f
+        }
+    };
 
     // Build form-encoded body
     let mut parts = vec![

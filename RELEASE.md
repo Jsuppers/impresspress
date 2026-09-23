@@ -608,8 +608,10 @@ project's own marketing domain. Both are removed, along with the equally unsent
 **What to do.** Nothing is required. A deployment that booted an earlier release
 still holds a `WAFER_RUN_SHARED__SITE_URL` row in its variables table. It is
 harmless — nothing reads it — and it is listed on Admin → Settings → Variables
-like any other key no block declares, where you can delete it. An exported
-`WAFER_RUN_SHARED__SITE_URL` is now ignored at boot.
+like any other key no block declares, where you can delete it. Setting
+`WAFER_RUN_SHARED__SITE_URL` anywhere now has no effect: native boot no longer
+copies it from the environment into the variables table, and no code reads it
+on any target.
 
 **The default sender's display name is your App Name.** With
 `IMPRESSPRESS__EMAIL__MAILGUN_FROM` unset, mail used to go out as
