@@ -5,14 +5,14 @@ use wafer_core::clients::storage as store;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use super::{
-    access::is_bucket_access_denied, params::extract_bucket_name, validation::is_valid_bucket_name,
+    access::require_bucket_access, params::extract_bucket_name, validation::is_valid_bucket_name,
 };
 use crate::{
     blocks::{
         crud,
         files::{contracts, repo},
     },
-    http::{err_bad_request, err_forbidden, ok_json},
+    http::{err_bad_request, ok_json},
 };
 
 pub(in crate::blocks::files) async fn handle_list_buckets(
@@ -134,8 +134,8 @@ pub(in crate::blocks::files) async fn handle_delete_bucket(
     if !is_valid_bucket_name(bucket) {
         return err_bad_request("Invalid bucket name");
     }
-    if is_bucket_access_denied(ctx, msg, bucket).await {
-        return err_forbidden("Access denied to this bucket");
+    if let Err(refusal) = require_bucket_access(ctx, msg, bucket).await {
+        return refusal;
     }
 
     // Storage first, tolerating "already gone": if an earlier attempt removed

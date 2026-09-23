@@ -4,7 +4,7 @@
 //! table is the single source of truth for bucket existence / ownership /
 //! visibility — both the admin and user listing paths read it, and
 //! [`find_owned`] is *the* ownership lookup every access-control caller
-//! derives from (`storage::bucket_owned_by` → `is_bucket_access_denied`,
+//! derives from (`storage::bucket_owned_by` → `require_bucket_access`,
 //! the SSR portal's owner check, and the share-creation path).
 
 use wafer_block::db::{Filter, FilterOp, ListOptions, SortField};
@@ -79,9 +79,8 @@ fn created_by_filter(user_id: &str) -> Filter {
 /// else — callers cannot distinguish the two, by design).
 ///
 /// This is the single bucket-ownership predicate for the files block;
-/// `storage::bucket_owned_by` layers the fail-closed bool + logging on top,
-/// and the admin-bypass policy split lives in
-/// `storage::is_bucket_access_denied` (see its docs).
+/// `storage::bucket_owned_by` projects it to a bool, and the admin-bypass
+/// policy split lives in `storage::require_bucket_access` (see its docs).
 pub async fn find_owned(
     ctx: &dyn Context,
     name: &str,

@@ -232,8 +232,10 @@ pub async fn object_list_page(
     }
     // SSR portal is strictly owner-scoped (no admin bypass) — see the
     // `bucket_owned_by` doc comment for the admin-policy split vs the JSON API.
-    if !crate::blocks::files::storage::bucket_owned_by(ctx, &user_id, bucket).await {
-        return crate::ui::not_found_response(msg);
+    match crate::blocks::files::storage::bucket_owned_by(ctx, &user_id, bucket).await {
+        Ok(true) => {}
+        Ok(false) => return crate::ui::not_found_response(msg),
+        Err(e) => return crate::blocks::crud::db_error_page(msg, e, "object list page: ownership"),
     }
 
     let all_objects = match list_objects_in_bucket(ctx, bucket).await {
@@ -661,7 +663,7 @@ mod integration_tests {
         // pins the documented policy split: the SSR portal routes through the
         // shared `storage::bucket_owned_by` predicate and deliberately does
         // NOT grant the admin bypass that the JSON API's
-        // `is_bucket_access_denied` does — so even an admin sees a 404 here.
+        // `require_bucket_access` does — so even an admin sees a 404 here.
         let ctx = TestContext::with_files().await;
         let mut row: HashMap<String, serde_json::Value> = HashMap::new();
         row.insert("name".into(), json!("secrets"));

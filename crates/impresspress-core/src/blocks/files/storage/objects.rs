@@ -6,7 +6,7 @@ use wafer_core::clients::storage as store;
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use super::{
-    access::is_bucket_access_denied,
+    access::require_bucket_access,
     params::{extract_bucket_name, extract_object_key},
     validation::{is_valid_bucket_name, is_valid_storage_key},
 };
@@ -23,7 +23,7 @@ use crate::{
             },
         },
     },
-    http::{err_bad_request, err_conflict, err_forbidden, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_not_found, ok_json},
 };
 
 /// Collect an `InputStream` into `Vec<u8>` with a hard size cap. Errors out
@@ -66,8 +66,8 @@ pub(in crate::blocks::files) async fn handle_list_objects(
     if !is_valid_bucket_name(bucket) {
         return err_bad_request("Invalid bucket name");
     }
-    if is_bucket_access_denied(ctx, msg, bucket).await {
-        return err_forbidden("Access denied to this bucket");
+    if let Err(refusal) = require_bucket_access(ctx, msg, bucket).await {
+        return refusal;
     }
 
     let prefix = msg.query("prefix");
@@ -142,8 +142,8 @@ pub(in crate::blocks::files) async fn handle_get_object(
     if !is_valid_storage_key(key) {
         return err_bad_request("Invalid object key");
     }
-    if is_bucket_access_denied(ctx, msg, bucket).await {
-        return err_forbidden("Access denied to this bucket");
+    if let Err(refusal) = require_bucket_access(ctx, msg, bucket).await {
+        return refusal;
     }
 
     // Track view in DB
@@ -211,8 +211,8 @@ pub(in crate::blocks::files) async fn handle_upload_object(
     if !query_key.is_empty() && !is_valid_storage_key(&query_key) {
         return err_bad_request("Invalid object key");
     }
-    if is_bucket_access_denied(ctx, msg, bucket).await {
-        return err_forbidden("Access denied to this bucket");
+    if let Err(refusal) = require_bucket_access(ctx, msg, bucket).await {
+        return refusal;
     }
 
     // Best-effort sweep before the reservation: orphan `pending` rows (see
@@ -479,8 +479,8 @@ pub(in crate::blocks::files) async fn handle_delete_object(
     if !is_valid_storage_key(key) {
         return err_bad_request("Invalid object key");
     }
-    if is_bucket_access_denied(ctx, msg, bucket).await {
-        return err_forbidden("Access denied to this bucket");
+    if let Err(refusal) = require_bucket_access(ctx, msg, bucket).await {
+        return refusal;
     }
 
     // The row says which blobs are the object's (`StoredRow::blobs`). No row,

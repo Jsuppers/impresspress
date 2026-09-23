@@ -26,7 +26,7 @@ mod params;
 mod search;
 mod validation;
 
-pub(in crate::blocks::files) use access::{bucket_owned_by, is_bucket_access_denied};
+pub(in crate::blocks::files) use access::{bucket_owned_by, require_bucket_access};
 pub(in crate::blocks::files) use admin::handle_stats;
 pub(in crate::blocks::files) use buckets::{
     handle_create_bucket, handle_delete_bucket, handle_list_buckets,

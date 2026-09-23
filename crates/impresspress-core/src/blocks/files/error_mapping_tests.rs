@@ -324,3 +324,92 @@ async fn refused_page_reads_are_the_403_page() {
     }
     report(misses);
 }
+
+/// The bucket-ownership read is the authorization on every bucket-scoped
+/// route. A refused read is the door's WRAP denial — not "you do not own this
+/// bucket" (the JSON 403 with its own message), and not the portal's 404.
+#[tokio::test]
+async fn a_refused_ownership_read_is_the_doors_denial() {
+    let ctx = with_a_file().await;
+    let buckets = || denied(&ctx, repo::buckets::TABLE);
+    let mut misses = Vec::new();
+
+    expect_wrap_denial(
+        &mut misses,
+        api(
+            &buckets(),
+            user("create", "/b/cloudstorage/shares"),
+            br#"{"bucket":"photos","key":"a.png"}"#,
+        )
+        .await,
+        "POST /b/cloudstorage/shares (the ownership read)",
+    )
+    .await;
+    expect_wrap_denial(
+        &mut misses,
+        api(
+            &buckets(),
+            user("retrieve", "/b/storage/api/buckets/photos/objects"),
+            b"",
+        )
+        .await,
+        "GET …/objects (the ownership read)",
+    )
+    .await;
+    expect_refused_page(
+        &mut misses,
+        &buckets(),
+        user("retrieve", "/b/storage/photos/"),
+    )
+    .await;
+    report(misses);
+}
+
+/// The config service, refusing every call the way WRAP refuses one, under
+/// the declaration of the block it stands in for.
+struct RefusingConfig(std::sync::Arc<dyn Block>);
+
+#[wafer_block::wafer_async_trait]
+impl Block for RefusingConfig {
+    fn info(&self) -> wafer_run::BlockInfo {
+        self.0.info()
+    }
+
+    async fn handle(&self, _: &dyn Context, _: Message, _: InputStream) -> OutputStream {
+        OutputStream::error(wrap_denial())
+    }
+}
+
+/// A share's lifetime is capped by a configured ceiling. A ceiling that could
+/// not be read is not the default: a deployment that lowered it would hand
+/// out the longer default link while its config store is unreachable. The
+/// share is refused through the door instead, as an upload is when its quota
+/// cannot be read.
+#[tokio::test]
+async fn an_unreadable_share_expiry_ceiling_refuses_the_share() {
+    let mut ctx = with_a_file().await;
+    let config = ctx
+        .blocks
+        .lock()
+        .expect("blocks")
+        .get("wafer-run/config")
+        .cloned()
+        .expect("the fixture registers a config block");
+    ctx.register_block(
+        "wafer-run/config",
+        std::sync::Arc::new(RefusingConfig(config)),
+    );
+    let mut misses = Vec::new();
+    expect_wrap_denial(
+        &mut misses,
+        api(
+            &ctx,
+            user("create", "/b/cloudstorage/shares"),
+            br#"{"bucket":"photos","key":"a.png"}"#,
+        )
+        .await,
+        "POST /b/cloudstorage/shares (the expiry ceiling)",
+    )
+    .await;
+    report(misses);
+}
