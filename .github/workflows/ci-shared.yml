@@ -274,9 +274,12 @@ jobs:
   #
   # No Postgres service container: the `postgres` feature is a pure cfg flag on
   # impresspress-core (`postgres = []`), and on impresspress-native it only
-  # pulls `wafer-block-postgres` in as a dependency. Nothing under it opens a
-  # connection at test time — the assertions are all against embedded SQL text.
-  # `postgres-migrations` is where a real server belongs, and it has one.
+  # pulls `wafer-block-postgres` in as a dependency. The migration assertions
+  # are all against embedded SQL text; the one connection attempt is
+  # impresspress-native's `connect_error_does_not_leak_the_password`, which
+  # dials a closed port and needs the connect to fail (it waits out the pool's
+  # 30 s acquire timeout). `postgres-migrations` is where a real server
+  # belongs, and it has one.
   #
   # impresspress-native is built alongside impresspress-core because it holds
   # the only non-test postgres-gated Rust (`make_postgres_database_service`),
