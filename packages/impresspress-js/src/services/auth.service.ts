@@ -38,26 +38,37 @@ export interface SignInResult {
   default_redirect: string;
 }
 
-export interface SignUpResult {
-  /**
-   * `id`, `name` and `roles` arrive only when the signup signed the user in.
-   * A signup awaiting email verification carries `email` alone: it answers
-   * the same bytes whether or not the address was already registered.
-   */
-  user: { id?: string; email: string; name?: string; roles?: string[] };
-  emailVerified: boolean;
-  message?: string;
-  tokens?: AuthTokens;
-  default_redirect?: string;
-}
+/**
+ * What `signUp` resolves to, told apart by `emailVerified`: `true` means the
+ * user is signed in and `tokens` are set; `false` means verification is
+ * pending, nothing was issued, and `user` carries the address alone — that
+ * reply reads the same whether or not the address was already registered.
+ */
+export type SignUpResult =
+  | {
+      emailVerified: true;
+      user: AuthSessionUser;
+      tokens: AuthTokens;
+      default_redirect: string;
+      message?: undefined;
+    }
+  | {
+      emailVerified: false;
+      user: { email: string; id?: undefined; name?: undefined; roles?: undefined };
+      message: string;
+      tokens?: undefined;
+      default_redirect?: undefined;
+    };
 
 /**
- * The two shapes `POST /b/auth/api/signup` answers, told apart by
+ * The two bodies `POST /b/auth/api/signup` answers, told apart by
  * `email_verified`. Only the reply that signed the user in names the account;
  * the one awaiting verification carries the address alone, because it must
  * read the same whether or not that address was already registered.
+ * `test/generated-contract.test.ts` checks the server's published union fits
+ * this one.
  */
-type SignUpReply =
+export type SignUpReply =
   | {
       email_verified: true;
       access_token: string;
@@ -69,7 +80,7 @@ type SignUpReply =
     }
   | {
       email_verified: false;
-      message?: string;
+      message: string;
       user: { email: string };
     };
 
@@ -114,11 +125,9 @@ export class AuthService extends BaseService {
 
     if (!res.email_verified) {
       return {
-        user: res.user,
+        user: { email: res.user.email },
         emailVerified: false,
         message: res.message,
-        tokens: undefined,
-        default_redirect: undefined,
       };
     }
 
@@ -134,7 +143,6 @@ export class AuthService extends BaseService {
     return {
       user: res.user,
       emailVerified: true,
-      message: undefined,
       tokens,
       default_redirect: res.default_redirect,
     };

@@ -48,6 +48,56 @@ describe("AuthService", () => {
     expect(c.auth.isAuthenticated()).toBe(true);
   });
 
+  it("signUp with verification off returns the signed-in branch and caches its tokens", async () => {
+    fetchMock.mockResolvedValueOnce(
+      fakeJsonResponse(
+        {
+          email_verified: true,
+          access_token: "a",
+          refresh_token: "r",
+          token_type: "Bearer",
+          expires_in: 1800,
+          default_redirect: "/b/userportal/",
+          user: { id: "u1", email: "a@b.com", roles: ["user"], name: "" },
+        },
+        201,
+      ),
+    );
+
+    const c = client();
+    const result = await c.auth.signUp({ email: "a@b.com", password: "pw" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/b/auth/api/signup");
+    if (!result.emailVerified) throw new Error("expected the signed-in branch");
+    expect(result.tokens.access_token).toBe("a");
+    expect(result.user.id).toBe("u1");
+    expect(result.default_redirect).toBe("/b/userportal/");
+    expect(c.auth.isAuthenticated()).toBe(true);
+  });
+
+  it("signUp awaiting verification returns the pending branch and signs nobody in", async () => {
+    fetchMock.mockResolvedValueOnce(
+      fakeJsonResponse(
+        {
+          email_verified: false,
+          message: "Account created. Please verify your email before signing in.",
+          user: { email: "a@b.com" },
+        },
+        201,
+      ),
+    );
+
+    const c = client();
+    const result = await c.auth.signUp({ email: "a@b.com", password: "pw" });
+
+    expect(result).toEqual({
+      emailVerified: false,
+      message: "Account created. Please verify your email before signing in.",
+      user: { email: "a@b.com" },
+    });
+    expect(c.auth.isAuthenticated()).toBe(false);
+  });
+
   it("getUser unwraps the {user} envelope GET /me actually returns", async () => {
     fetchMock.mockResolvedValueOnce(
       fakeJsonResponse({ user: { id: "u1", email: "a@b.com", roles: ["user"] } }),

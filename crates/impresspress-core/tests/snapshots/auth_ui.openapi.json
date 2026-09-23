@@ -578,67 +578,109 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "`POST /b/auth/api/signup` response body.\n\nAuto-logs in (issues tokens) unless email verification is required, in\nwhich case only email_verified/message/user are returned. An address that\nis already registered gets that verification-required reply either way,\nso with verification off the reply reveals whether an address is registered.",
-                "properties": {
-                  "access_token": {
-                    "type": "string"
-                  },
-                  "default_redirect": {
-                    "type": "string"
-                  },
-                  "email_verified": {
-                    "type": "boolean"
-                  },
-                  "expires_in": {
-                    "format": "uint64",
-                    "minimum": 0,
-                    "type": "integer"
-                  },
-                  "message": {
-                    "description": "Present when verification is required or the email is already registered",
-                    "type": "string"
-                  },
-                  "refresh_token": {
-                    "type": "string"
-                  },
-                  "token_type": {
-                    "description": "The only `token_type` this API issues.",
-                    "enum": [
-                      "Bearer"
-                    ],
-                    "type": "string"
-                  },
-                  "user": {
-                    "description": "The new account. `id`, `roles` and `name` are present only on the\nauto-login path; the verification-required reply carries `email` alone.",
+                "anyOf": [
+                  {
+                    "description": "Verification is not required: the new account is signed in.",
                     "properties": {
-                      "email": {
+                      "access_token": {
                         "type": "string"
                       },
-                      "id": {
+                      "default_redirect": {
+                        "description": "Role-aware post-login redirect path",
                         "type": "string"
                       },
-                      "name": {
+                      "email_verified": {
+                        "const": true,
+                        "type": "boolean"
+                      },
+                      "expires_in": {
+                        "description": "Access token lifetime in seconds",
+                        "format": "uint64",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "refresh_token": {
                         "type": "string"
                       },
-                      "roles": {
-                        "items": {
-                          "type": "string"
+                      "token_type": {
+                        "description": "The only `token_type` this API issues.",
+                        "enum": [
+                          "Bearer"
+                        ],
+                        "type": "string"
+                      },
+                      "user": {
+                        "description": "The caller's identity, as returned by a successful authentication.",
+                        "properties": {
+                          "email": {
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "roles": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
                         },
-                        "type": "array"
+                        "required": [
+                          "id",
+                          "email",
+                          "roles",
+                          "name"
+                        ],
+                        "type": "object"
                       }
                     },
                     "required": [
-                      "email"
+                      "email_verified",
+                      "access_token",
+                      "refresh_token",
+                      "token_type",
+                      "expires_in",
+                      "default_redirect",
+                      "user"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "description": "Verification is required, or the address is already registered: no\ntokens are issued.",
+                    "properties": {
+                      "email_verified": {
+                        "const": false,
+                        "type": "boolean"
+                      },
+                      "message": {
+                        "type": "string"
+                      },
+                      "user": {
+                        "description": "The address a signup awaiting verification was made for.",
+                        "properties": {
+                          "email": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "email"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "email_verified",
+                      "message",
+                      "user"
                     ],
                     "type": "object"
                   }
-                },
-                "required": [
-                  "email_verified",
-                  "user"
                 ],
-                "title": "SignupResponse",
-                "type": "object"
+                "description": "`POST /b/auth/api/signup` response body: signed in with tokens, or\nawaiting email verification with none.",
+                "title": "SignupResponse"
               }
             }
           },
