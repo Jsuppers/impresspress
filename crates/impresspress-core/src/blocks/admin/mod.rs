@@ -594,16 +594,40 @@ crate::impresspress_feature_block! {
                 // buttons. Named rather than `"*"`: the two wildcard grants
                 // above are for logs every block writes by construction,
                 // where this list is the set of admin surfaces that happen
-                // not to live in the admin block. `ResourceGrant` has no
-                // write-only form, so each grantee can read the trail as
-                // well — all four serve admin-only routes.
-                wafer_run::ResourceGrant::read_write("impresspress/userportal", AUDIT_LOGS_TABLE),
-                wafer_run::ResourceGrant::read_write("impresspress/products", AUDIT_LOGS_TABLE),
-                wafer_run::ResourceGrant::read_write("impresspress/legalpages", AUDIT_LOGS_TABLE),
+                // not to live in the admin block.
+                //
+                // What these grants actually confer, stated plainly because
+                // it is more than appending a row. WRAP carries ONE write
+                // bit: `wrap::grant_allows` refuses a write only when
+                // `!grant.write`, and every mutating database op —
+                // `database.create`, `.update`, `.delete` alike — authorizes
+                // as `(collection, ResourceType::Db, true)`
+                // (`wafer-core`'s `interfaces/database/handler.rs`). So each
+                // grantee can rewrite and DELETE audit rows, not only add
+                // them, and `read_write` has no read-less form to narrow it
+                // to. The grant is also block-scoped, not route-scoped: it
+                // covers every code path in that block, not just the
+                // settings-save and portal-button handlers that need it.
+                // Tightening this needs an append-only channel in wafer-run,
+                // not a different grant here.
+                //
+                // `.typed(Db)` because an UNtyped grant is a wildcard across
+                // every resource type (`grant_allows` skips the type check
+                // when `grant.resource_type` is `None`), which would let this
+                // table name authorize a Config, Storage, Crypto, Network or
+                // Vector access too. Nothing reaches those under this name
+                // today; the type is declared so nothing can.
+                wafer_run::ResourceGrant::read_write("impresspress/userportal", AUDIT_LOGS_TABLE)
+                    .typed(wafer_run::ResourceType::Db),
+                wafer_run::ResourceGrant::read_write("impresspress/products", AUDIT_LOGS_TABLE)
+                    .typed(wafer_run::ResourceType::Db),
+                wafer_run::ResourceGrant::read_write("impresspress/legalpages", AUDIT_LOGS_TABLE)
+                    .typed(wafer_run::ResourceType::Db),
                 wafer_run::ResourceGrant::read_write(
                     super::auth_ui::AUTH_UI_BLOCK_ID,
                     AUDIT_LOGS_TABLE,
-                ),
+                )
+                .typed(wafer_run::ResourceType::Db),
                 // Default: allow all blocks to make outbound network requests.
                 // Remove this grant via the admin UI to restrict network access.
                 wafer_run::ResourceGrant::read("*", "*")
@@ -966,10 +990,8 @@ mod tests {
         );
         // Synthetic on purpose: this entry exists only to pin the
         // "no stored row ⇒ enabled" branch, and naming a real block here
-        // would both imply something about that block and hand
-        // `tests/repo_door.rs` the qualifier half of a door match (its
-        // `products_variables` door pairs the substring `products` with the
-        // `variables::TABLE` const this file already carries).
+        // would imply something about that block's default state that this
+        // test does not mean to assert.
         ctx.register_block_info(
             "example/widget",
             wafer_run::BlockInfo::new("example/widget", "1.0.0", "http.handler", "widget"),
