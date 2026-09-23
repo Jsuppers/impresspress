@@ -573,13 +573,16 @@ while IFS= read -r file; do
 done < <(find "$BLOCKS_DIR" -path "$GUEST_TEMPLATES_DIR" -prune -o -name '*.rs' -print 2>/dev/null)
 
 # ---------- Phase 2: collect grants per-owning-block ----------
-# Pattern:  ResourceGrant::{read,read_write}(GRANTEE, RESOURCE)[.typed(TYPE)]
+# Pattern:  ResourceGrant::{read,read_write,append}(GRANTEE, RESOURCE)[.typed(TYPE)]
 # Grants live in a block's `BlockInfo::grants(vec![...])` — we attribute the
 # grant to the file's owning block (the directory or .rs filename under
 # blocks/).
 #
 # Each grant entry is encoded as:
-#   "${owner_block_id}|${grantee}|${resource}|${type}"
+#   "${owner_block_id}|${grantee}|${resource}|${type}|${kind}"
+# where KIND is the constructor (`read`, `read_write`, `append`). An `append`
+# grant is typed `Db` by construction and covers only inserts — see
+# `check_coverage`.
 # where TYPE is "Db" by default or the `ResourceType` variant named in
 # `.typed()`. The default and the `.typed()` spelling must be the SAME
 # string, and both must be a name upstream defines: a grant indexed under
@@ -863,10 +866,11 @@ while IFS= read -r line; do
   rest="${line#*:}"
   lineno="${rest%%:*}"
   rest="${rest#*:}"
-  # Match: ResourceGrant::read("a", "b")  or  ResourceGrant::read_write(IDENT, IDENT)
+  # Match: ResourceGrant::read("a", "b"), ResourceGrant::read_write(IDENT, IDENT)
+  # or ResourceGrant::append(IDENT, IDENT)
   # The args may be string literals or constant identifiers (with optional `super::module::` qualifier).
   # Bash requires the regex stored in a variable when it contains parens.
-  re_grant='ResourceGrant::(read|read_write)\(([^,]+),[[:space:]]*([^)]+)\)'
+  re_grant='ResourceGrant::(read|read_write|append)\(([^,]+),[[:space:]]*([^)]+)\)'
   # rustfmt breaks a declaration whose arguments do not fit onto continuation
   # lines, leaving only `ResourceGrant::read_write(` on the matched line. Read
   # the rest of the statement before testing: a grant the audit cannot see is
@@ -938,17 +942,20 @@ while IFS= read -r line; do
     UNPARSED_GRANT_LINES+=("${file}:${lineno}")
     echo "::warning file=${file},line=${lineno}::WRAP grant audit could not parse this ResourceGrant declaration; it is absent from the grant index"
   fi
-done < <(grep -rEn "${GREP_EXCLUDE[@]}" "ResourceGrant::(read|read_write)\(" "$BLOCKS_DIR" 2>/dev/null || true)
+done < <(grep -rEn "${GREP_EXCLUDE[@]}" "ResourceGrant::(read|read_write|append)\(" "$BLOCKS_DIR" 2>/dev/null || true)
 
 # ---------- Phase 3: walk db::* callsites and check coverage ----------
 
-# Returns "OK" if a grant covers (caller, table); otherwise "MISSING".
-# Grant matches when:
+# Returns "OK" if a grant covers (caller, table, access); otherwise "MISSING".
+# ACCESS is `append` for an insert (`db::create`, the audit writer) and
+# `other` for everything else. Grant matches when:
 #   - resource_type is Db (or the grant's type is empty/wildcard)
 #   - grantee == caller OR grantee == "*"
 #   - resource == table OR (resource ends with "*" AND table starts with the prefix)
+#   - the grant is not `append`, or ACCESS is `append`: an append-only grant
+#     admits inserts and nothing else, not even a read
 check_coverage() {
-  local caller="$1" table="$2"
+  local caller="$1" table="$2" access="$3"
   local owner
   owner="$(table_to_owner "$table")"
   if [ -z "$owner" ]; then
@@ -960,9 +967,10 @@ check_coverage() {
     return
   fi
   for g in "${GRANTS[@]}"; do
-    IFS='|' read -r g_owner g_grantee g_resource g_type _g_kind <<< "$g"
+    IFS='|' read -r g_owner g_grantee g_resource g_type g_kind <<< "$g"
     [ "$g_owner" != "$owner" ] && continue
     [ "$g_type" != "Db" ] && continue
+    [ "$g_kind" = "append" ] && [ "$access" != "append" ] && continue
     if [ "$g_grantee" != "*" ] && [ "$g_grantee" != "$caller" ]; then
       continue
     fi
@@ -1069,10 +1077,14 @@ while IFS= read -r line; do
   # Permit an optional `&` prefix on the arg. Pattern in a variable for bash regex.
   re_dbcall='db::(list|create|update|delete|count|get|find_one)[[:space:]]*\([[:space:]]*ctx[[:space:]]*,[[:space:]]*&?([A-Za-z_:]+|"[^"]+")[[:space:]]*[,)]'
   if [[ "$rest" =~ $re_dbcall ]]; then
+    op="${BASH_REMATCH[1]}"
     arg="${BASH_REMATCH[2]}"
     table="$(resolve_token "$arg" "$file")"
     caller="$(file_to_block_id "$file")"
-    pair_key="${caller}|${table}"
+    if [ "$op" = "create" ]; then access="append"; else access="other"; fi
+    # Keyed on the access too: a caller's insert and its update of the same
+    # table need different grants, so the first must not hide the second.
+    pair_key="${caller}|${table}|${access}"
     [ -n "${SEEN_PAIRS[$pair_key]:-}" ] && continue
     SEEN_PAIRS["$pair_key"]=1
     total=$((total + 1))
@@ -1090,13 +1102,13 @@ while IFS= read -r line; do
       UNRESOLVED_LINES+=("${file}:${lineno}: ${caller} → ${table}")
       continue
     fi
-    result="$(check_coverage "$caller" "$table")"
+    result="$(check_coverage "$caller" "$table" "$access")"
     case "$result" in
       OK|OWN) ;;
       MISSING)
         missing=$((missing + 1))
         owner="$(table_to_owner "$table")"
-        MISSING_LINES+=("${file}:${lineno}: ${caller} → ${table} (owned by ${owner})")
+        MISSING_LINES+=("${file}:${lineno}: ${caller} → ${table} [db::${op}] (owned by ${owner})")
         ;;
       NON_CONVENTIONAL)
         nonconv=$((nonconv + 1))
@@ -1128,7 +1140,9 @@ while IFS= read -r file; do
   for module in $modules; do
     [ -z "$module" ] && continue
     table="${PLATFORM_TABLE[$module]:-<unresolved:platform_state::${module}>}"
-    pair_key="${caller}|${table}"
+    # A platform_state module's functions read as well as write, so the
+    # reference is checked as a general access.
+    pair_key="${caller}|${table}|other"
     [ -n "${SEEN_PAIRS[$pair_key]:-}" ] && continue
     SEEN_PAIRS["$pair_key"]=1
     ps_total=$((ps_total + 1))
@@ -1143,7 +1157,7 @@ while IFS= read -r file; do
       UNRESOLVED_LINES+=("${file}:${lineno}: ${caller} → ${table}")
       continue
     fi
-    result="$(check_coverage "$caller" "$table")"
+    result="$(check_coverage "$caller" "$table" other)"
     case "$result" in
       OK|OWN) ;;
       MISSING)
@@ -1192,7 +1206,8 @@ while IFS= read -r line; do
   rest="${line#*:}"
   lineno="${rest%%:*}"
   caller="$(file_to_block_id "$file")"
-  pair_key="${caller}|${AUDIT_WRITER_TABLE}"
+  # The writer only inserts (`db::create`), so an append grant covers it.
+  pair_key="${caller}|${AUDIT_WRITER_TABLE}|append"
   [ -n "${SEEN_PAIRS[$pair_key]:-}" ] && continue
   SEEN_PAIRS["$pair_key"]=1
   audit_writer_total=$((audit_writer_total + 1))
@@ -1202,7 +1217,7 @@ while IFS= read -r line; do
     ALLOWED_LINES+=("${file}:${lineno}: ${caller} → ${AUDIT_WRITER_TABLE} (via the audit writer)")
     continue
   fi
-  result="$(check_coverage "$caller" "$AUDIT_WRITER_TABLE")"
+  result="$(check_coverage "$caller" "$AUDIT_WRITER_TABLE" append)"
   case "$result" in
     OK|OWN) ;;
     MISSING)
@@ -1288,11 +1303,12 @@ run_self_check() {
   trap "rm -rf '$tmp'" RETURN
 
   # Writes a two-block fixture: the admin block declaring the grant handed
-  # on stdin, and a userportal file whose `db::create` on the admin table is
-  # covered by exactly that grant. The callsite is what makes a misread
-  # grant observable — a dropped or corrupted one stops covering the call,
-  # so the walk reports MISSING and the run fails.
+  # on stdin, and a userportal file whose `db::create` (or `db::$1`) on the
+  # admin table is covered by exactly that grant. The callsite is what makes
+  # a misread grant observable — a dropped or corrupted one stops covering
+  # the call, so the walk reports MISSING and the run fails.
   _fixture() {
+    local op="${1:-create}"
     rm -rf "${tmp:?}/blocks"
     mkdir -p "$tmp/blocks/admin" "$tmp/blocks/userportal"
     {
@@ -1302,10 +1318,10 @@ run_self_check() {
       echo 'pub const AUDIT_LOGS_TABLE: &str = "impresspress__admin__audit_logs";'
       cat
     } > "$tmp/blocks/admin/mod.rs"
-    cat > "$tmp/blocks/userportal/pages.rs" <<'CALLER'
+    cat > "$tmp/blocks/userportal/pages.rs" <<CALLER
 use crate::blocks::admin::FIXTURE_TABLE;
 async fn writes_the_admin_table(ctx: &dyn Context) {
-    let _ = db::create(ctx, FIXTURE_TABLE, data).await;
+    let _ = db::${op}(ctx, FIXTURE_TABLE, data).await;
 }
 CALLER
   }
@@ -1363,6 +1379,20 @@ FIXTURE
   out="$(_run)" && status=0 || status=$?
   _expect "comment inside a declaration" 0 "OK — no missing WRAP grants."
 
+  # An append-only grant covers the insert...
+  _fixture <<'FIXTURE'
+    wafer_run::ResourceGrant::append("impresspress/userportal", FIXTURE_TABLE),
+FIXTURE
+  out="$(_run)" && status=0 || status=$?
+  _expect "append grant, insert" 0 "OK — no missing WRAP grants."
+
+  # ...and nothing else: an update under it is a missing grant.
+  _fixture update <<'FIXTURE'
+    wafer_run::ResourceGrant::append("impresspress/userportal", FIXTURE_TABLE),
+FIXTURE
+  out="$(_run)" && status=0 || status=$?
+  _expect "append grant, update" 1 "impresspress/userportal → impresspress__admin__fixture [db::update]"
+
   if [ "$failures" -gt 0 ]; then
     echo "::error::WRAP grant audit self-check failed (${failures} assertion(s)); the grant walk cannot be trusted." >&2
     return 1
@@ -1392,7 +1422,7 @@ if [ "${#BAD_TYPE_GRANT_LINES[@]}" -gt 0 ]; then
   echo "UNKNOWN ResourceType variants (${bad_type_grants}) — indexed under a type nothing matches:"
   printf '  %s\n' "${BAD_TYPE_GRANT_LINES[@]}"
 fi
-echo "Database: ${total} unique (caller, table) pairs; ${allowed} pragma-allowed (${ps_total} reached through platform_state, ${audit_writer_total} through the audit writer)."
+echo "Database: ${total} unique (caller, table, access) triples; ${allowed} pragma-allowed (${ps_total} reached through platform_state, ${audit_writer_total} through the audit writer)."
 echo "Storage:  ${storage_total} unique (caller, resource) pairs; ${storage_allowed} pragma-allowed."
 echo
 

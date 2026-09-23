@@ -63,7 +63,19 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
 // ---------------------------------------------------------------------------
 
 /// Record an admin action in the audit_logs table.
-/// Fire-and-forget: errors are logged but don't block the caller.
+///
+/// Runs under the CALLING block's WRAP identity. Blocks other than admin
+/// hold only an append-only grant on the table, which refuses an insert
+/// naming `id`, `created_at` or `updated_at` — so none is supplied: the
+/// database assigns the id and stamps both timestamps itself, which also
+/// means no caller can back-date an entry.
+///
+/// Called after the audited change has committed, so a failed write does
+/// not fail the caller's request: the change happened, and answering an
+/// error would tell the client it did not and invite a retry of a mutation
+/// that already ran. The failure is logged at `error` with its code — an
+/// action with no audit row is an incident for an operator to see, not a
+/// warning to scroll past.
 pub async fn audit_log(
     ctx: &dyn Context,
     user_id: &str,
@@ -76,10 +88,16 @@ pub async fn audit_log(
     data.insert("action".to_string(), serde_json::json!(action));
     data.insert("resource".to_string(), serde_json::json!(resource));
     data.insert("ip_address".to_string(), serde_json::json!(ip_address));
-    crate::util::stamp_created(&mut data);
 
     if let Err(e) = db::create(ctx, AUDIT_LOGS_TABLE, data).await {
-        tracing::warn!(action, resource, "audit_log write failed: {}", e.message);
+        tracing::error!(
+            caller = ctx.caller_id().unwrap_or("<none>"),
+            action,
+            resource,
+            code = ?e.code,
+            error = %e.message,
+            "audit_log write failed; the audited action has no audit row"
+        );
     }
 }
 
@@ -210,5 +228,177 @@ mod tests {
             body["records"][0]["action"],
             serde_json::json!("role.create")
         );
+    }
+
+    /// The block every append-grant test acts as: one of the four the admin
+    /// block grants the audit table to, append-only.
+    const USERPORTAL: &str = "impresspress/userportal";
+
+    /// Stands in for `impresspress/userportal` on a real runtime, so the
+    /// database handler sees that block id as the caller exactly as it sees
+    /// the real one. `audit` runs the real writer; `update` / `delete` try
+    /// to rewrite or erase the row named by the `probe.id` meta.
+    struct AsUserportal;
+
+    #[async_trait::async_trait]
+    impl wafer_run::Block for AsUserportal {
+        fn info(&self) -> wafer_run::BlockInfo {
+            wafer_run::BlockInfo::new(USERPORTAL, "0.0.1", "test/probe@v1", "audit-table probe")
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn Context,
+            _event: wafer_run::LifecycleEvent,
+        ) -> Result<(), wafer_run::WaferError> {
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            ctx: &dyn Context,
+            msg: Message,
+            _input: wafer_run::InputStream,
+        ) -> OutputStream {
+            let id = msg.get_meta("probe.id").to_string();
+            let result = match msg.kind.as_str() {
+                "audit" => {
+                    audit_log(
+                        ctx,
+                        "admin-1",
+                        "portal.button.create",
+                        "buttons/b-1",
+                        "203.0.113.7",
+                    )
+                    .await;
+                    Ok(())
+                }
+                "update" => {
+                    let data = std::collections::HashMap::from([(
+                        "action".to_string(),
+                        serde_json::json!("rewritten"),
+                    )]);
+                    db::update(ctx, AUDIT_LOGS_TABLE, &id, data)
+                        .await
+                        .map(|_| ())
+                }
+                "delete" => db::delete(ctx, AUDIT_LOGS_TABLE, &id).await,
+                other => panic!("unknown probe op {other}"),
+            };
+            match result {
+                Ok(()) => OutputStream::respond(Vec::new()),
+                Err(e) => OutputStream::error(e),
+            }
+        }
+    }
+
+    /// A sealed runtime holding the real admin block (whose `BlockInfo`
+    /// declares the audit-table grants), the real database block over
+    /// in-memory SQLite with the admin schema applied, and [`AsUserportal`].
+    async fn runtime_with_userportal() -> (
+        wafer_run::Wafer,
+        std::sync::Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+    ) {
+        let sqlite: std::sync::Arc<dyn wafer_core::interfaces::database::service::DatabaseService> =
+            std::sync::Arc::new(
+                wafer_block_sqlite::service::SQLiteDatabaseService::open_in_memory()
+                    .expect("open in-memory sqlite"),
+            );
+        crate::migration_helper::apply_ddl_via_service(
+            &sqlite,
+            crate::blocks::admin::migrations::ddl_files("sqlite"),
+        )
+        .await
+        .expect("apply admin migrations");
+
+        let mut wafer = wafer_run::Wafer::builder()
+            .disable_inventory()
+            .disable_lockfile()
+            .build()
+            .expect("build a bare runtime");
+        wafer.set_admin_block(crate::blocks::admin::ADMIN_BLOCK_ID);
+        wafer_core::service_blocks::database::register_with_tables(
+            &mut wafer,
+            sqlite.clone(),
+            Vec::new(),
+        )
+        .expect("register the database block");
+        wafer
+            .register_block(
+                crate::blocks::admin::ADMIN_BLOCK_ID,
+                std::sync::Arc::new(crate::blocks::admin::AdminBlock::new()),
+            )
+            .expect("register the admin block");
+        wafer
+            .register_block(USERPORTAL, std::sync::Arc::new(AsUserportal))
+            .expect("register the userportal probe");
+        wafer.seal().await.expect("seal");
+        (wafer, sqlite)
+    }
+
+    async fn run_probe(
+        wafer: &wafer_run::Wafer,
+        op: &str,
+        id: &str,
+    ) -> Result<(), wafer_run::WaferError> {
+        let mut msg = Message::new(op);
+        msg.set_meta("probe.id", id.to_string());
+        match wafer
+            .run_block(USERPORTAL, msg, wafer_run::InputStream::empty())
+            .await
+            .collect_buffered()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(wafer_run::TerminalNotResponse::Error(e)) => Err(e),
+            Err(other) => panic!("{op}: neither a response nor an error: {other:?}"),
+        }
+    }
+
+    /// Userportal holds an append-only grant on the audit table, through the
+    /// real runtime's WRAP check and the real database handler: the audit
+    /// writer's row lands, stamped by the database, and the same block is
+    /// refused when it tries to rewrite or erase that row.
+    #[tokio::test]
+    async fn an_append_grantee_writes_audit_rows_and_cannot_rewrite_or_erase_them() {
+        let (wafer, sqlite) = runtime_with_userportal().await;
+
+        run_probe(&wafer, "audit", "")
+            .await
+            .expect("the audit write");
+        let rows = sqlite
+            .list(AUDIT_LOGS_TABLE, &wafer_block::db::ListOptions::default())
+            .await
+            .expect("read the audit table host-side")
+            .records;
+        assert_eq!(rows.len(), 1, "the audit row must land: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.data["action"],
+            serde_json::json!("portal.button.create")
+        );
+        assert!(!row.id.is_empty(), "the database assigns the id");
+        for stamp in ["created_at", "updated_at"] {
+            assert!(
+                row.data[stamp].as_str().is_some_and(|s| !s.is_empty()),
+                "the database stamps {stamp}: {row:?}"
+            );
+        }
+
+        for op in ["update", "delete"] {
+            let Err(err) = run_probe(&wafer, op, &row.id).await else {
+                panic!("an append grant must not admit {op}");
+            };
+            assert_eq!(
+                err.code,
+                wafer_run::ErrorCode::PermissionDenied,
+                "{op}: {err:?}"
+            );
+        }
+        let after = sqlite
+            .get(AUDIT_LOGS_TABLE, &row.id)
+            .await
+            .expect("the row survives");
+        assert_eq!(after.data, row.data, "the refused ops changed nothing");
     }
 }
