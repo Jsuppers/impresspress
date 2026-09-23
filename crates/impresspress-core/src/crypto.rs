@@ -98,9 +98,9 @@ pub struct AccessClaims {
 ///
 /// Rules 4 and 5 read the database, and a read that fails is neither answer:
 /// accepting the token could honour a revoked credential, and rejecting it
-/// tells a signed-in caller they are signed out — the SDK's `getUser`
-/// resolves `null` on the 401 that follows, so a database blip would sign
-/// every user out of the UI. So a failed read is `Err`, already classified
+/// tells a signed-in caller they are signed out — the router redirects their
+/// pages to the login form, so a database blip would sign every user out of
+/// the UI. So a failed read is `Err`, already classified
 /// for the client by `blocks::auth::credential_check_failed` (a WRAP refusal
 /// keeps its 403 or 429, anything else is a 503), and the caller answers the
 /// request with it instead of treating the caller as anonymous.

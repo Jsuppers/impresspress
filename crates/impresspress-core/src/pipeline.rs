@@ -322,8 +322,9 @@ pub async fn handle_request(
     // 2. Validate JWT or API key and set auth meta. A credential the check
     //    could not be completed for (its database read failed) refuses the
     //    request here: continuing as anonymous would answer a signed-in
-    //    caller "sign in" — a 401, on which the SDK's `getUser` resolves
-    //    `null` — for as long as the database is unreachable.
+    //    caller "sign in" — the router redirects a page to the login form
+    //    and refuses an API call "authentication required" — for as long as
+    //    the database is unreachable.
     if let Some(header) = auth_header {
         let checked = if header.starts_with("Bearer ") {
             // [SEC-038] Read the deployment's expected issuer once per request
