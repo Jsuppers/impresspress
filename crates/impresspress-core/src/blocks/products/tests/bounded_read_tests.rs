@@ -48,7 +48,11 @@ async fn assert_unpaged_read_refuses(ctx: &TestContext, table: &str) {
     let refused = db::list_all(ctx, table, vec![])
         .await
         .expect_err("a capped read of a table past the ceiling must refuse");
-    assert_eq!(refused.code, wafer_run::ErrorCode::OutOfRange, "{refused:?}");
+    assert_eq!(
+        refused.code,
+        wafer_run::ErrorCode::OutOfRange,
+        "{refused:?}"
+    );
 }
 
 /// Gross volume is the sum over EVERY paid order, not over the first page of
