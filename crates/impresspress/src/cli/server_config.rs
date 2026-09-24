@@ -23,6 +23,8 @@ pub fn filter_to_declared_keys(env_vars: HashMap<String, String>) -> Vec<(String
 mod tests {
     use std::collections::HashMap;
 
+    use impresspress_core::config_vars::{APP_NAME_KEY, DEPLOY_TOKEN_KEY};
+
     use super::filter_to_declared_keys;
 
     fn filtered(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -42,17 +44,15 @@ mod tests {
     /// recover.
     #[test]
     fn a_declared_shared_var_survives_and_an_undeclared_key_does_not() {
+        const UNDECLARED: &str = "WAFER_RUN_SHARED__NOT_A_REAL_VAR";
         let out = filtered(&[
-            ("WAFER_RUN_SHARED__APP_NAME", "Foo"),
-            ("WAFER_RUN_SHARED__NOT_A_REAL_VAR", "x"),
-            ("IMPRESSPRESS_DEPLOY_TOKEN", "tok"),
+            (APP_NAME_KEY, "Foo"),
+            (UNDECLARED, "x"),
+            (DEPLOY_TOKEN_KEY, "tok"),
         ]);
-        assert_eq!(
-            out.get("WAFER_RUN_SHARED__APP_NAME").map(String::as_str),
-            Some("Foo")
-        );
-        assert!(!out.contains_key("WAFER_RUN_SHARED__NOT_A_REAL_VAR"));
-        assert!(!out.contains_key("IMPRESSPRESS_DEPLOY_TOKEN"));
+        assert_eq!(out.get(APP_NAME_KEY).map(String::as_str), Some("Foo"));
+        assert!(!out.contains_key(UNDECLARED));
+        assert!(!out.contains_key(DEPLOY_TOKEN_KEY));
     }
 
     /// The JWT signing secret does NOT reach the variables seeder from the

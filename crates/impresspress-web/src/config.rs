@@ -15,6 +15,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use impresspress_core::{
+    blocks::auth::config::{BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY},
+    config_vars::{EMBEDDED_SCRIPTS_KEY, HAS_LANDING_PAGE_KEY},
+};
 use wafer_core::interfaces::database::service::DatabaseService;
 
 use crate::SandboxMode;
@@ -53,7 +57,7 @@ pub async fn seed_and_load_variables(
     // `INSERT OR IGNORE`: a prior boot or admin-UI edit always wins.
     impresspress_core::platform_state::variables::seed_if_absent(
         db,
-        "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL",
+        BOOTSTRAP_ADMIN_EMAIL_KEY,
         "admin@example.com",
         "Admin Email",
         "Admin account email",
@@ -62,7 +66,7 @@ pub async fn seed_and_load_variables(
     .await?;
     impresspress_core::platform_state::variables::seed_if_absent(
         db,
-        "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD",
+        BOOTSTRAP_ADMIN_PASSWORD_KEY,
         "admin123",
         "Admin Password",
         "Admin account password",
@@ -73,7 +77,7 @@ pub async fn seed_and_load_variables(
     // Native/server targets leave this var unset and skip the injection.
     impresspress_core::platform_state::variables::seed_if_absent(
         db,
-        "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS",
+        EMBEDDED_SCRIPTS_KEY,
         "/webllm-engine.js",
         "Embedded Scripts",
         "Module-type script URLs embedded in every page",
@@ -115,7 +119,7 @@ pub async fn seed_and_load_variables(
     // so the common case is a read.
     impresspress_core::platform_state::variables::set(
         db,
-        "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+        HAS_LANDING_PAGE_KEY,
         if mode.runtime_present() {
             "true"
         } else {

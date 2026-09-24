@@ -42,6 +42,13 @@ pub const PREPARED_PLAN_MODULE_SHA256_VAR: &str = "IMPRESSPRESS_PREPARED_PLAN_MO
 pub const RELEASE_ASSET_MANIFEST_SHA256_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST_SHA256";
 pub const RELEASE_ASSET_KEYS_SHA256_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_KEYS_SHA256";
 
+/// Version-bound Worker vars exposing the immutable release asset set: the
+/// deploy writes them into the generated `wrangler.toml`, the Worker reads
+/// them to resolve release-managed keys without a mutable global pointer.
+pub const RELEASE_ASSET_ID_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_ID";
+pub const RELEASE_ASSET_PREFIX_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_PREFIX";
+pub const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST";
+
 const SHA256_PREFIX: &str = "sha256:";
 
 /// Errors produced while preparing, decoding, or verifying a plan.

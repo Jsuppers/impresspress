@@ -26,9 +26,11 @@ use super::{
 /// Existing applications may continue reading logical R2 keys during the
 /// compatibility period; runtimes that understand these bindings can resolve
 /// release-managed keys without consulting a mutable global pointer.
-pub const RELEASE_ASSET_ID_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_ID";
-pub const RELEASE_ASSET_PREFIX_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_PREFIX";
-pub const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST";
+pub const RELEASE_ASSET_ID_VAR: &str = impresspress_core::prepared_plan::RELEASE_ASSET_ID_VAR;
+pub const RELEASE_ASSET_PREFIX_VAR: &str =
+    impresspress_core::prepared_plan::RELEASE_ASSET_PREFIX_VAR;
+pub const RELEASE_ASSET_MANIFEST_VAR: &str =
+    impresspress_core::prepared_plan::RELEASE_ASSET_MANIFEST_VAR;
 pub const PREPARED_WAFER_LOCK_IDENTITY_VAR: &str =
     impresspress_core::PREPARED_WAFER_LOCK_IDENTITY_JSON_VAR;
 

@@ -31,8 +31,11 @@ use std::{
     time::Duration,
 };
 
+pub(crate) use impresspress_core::prepared_plan::{
+    RELEASE_ASSET_ID_VAR, RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR,
+};
 use impresspress_core::{
-    release_inventory::{is_normalized_logical_key, ReleaseInventory},
+    release_inventory::{is_normalized_logical_key, ReleaseInventory, RELEASES_ROOT},
     IsolateCell,
 };
 use wafer_block::{
@@ -57,12 +60,6 @@ use wafer_core::interfaces::{
     },
 };
 use wafer_run::{ConfigError, ConfigSource, EnvBlockConfig};
-
-pub(crate) const RELEASE_ASSET_ID_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_ID";
-pub(crate) const RELEASE_ASSET_PREFIX_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_PREFIX";
-pub(crate) const RELEASE_ASSET_MANIFEST_VAR: &str = "IMPRESSPRESS_RELEASE_ASSET_MANIFEST";
-
-use impresspress_core::release_inventory::RELEASES_ROOT;
 
 /// Pure, Worker-version-bound release identity. This contains no R2 handle
 /// and no key inventory — the inventory itself is fetched lazily (and

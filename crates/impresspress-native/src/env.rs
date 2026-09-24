@@ -59,6 +59,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use impresspress_core::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY;
+
     use super::*;
 
     #[test]
@@ -66,29 +68,23 @@ mod tests {
         let input = vec![
             // Shared app config — keep.
             (
-                "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL".to_string(),
+                BOOTSTRAP_ADMIN_EMAIL_KEY.to_string(),
                 "admin@example.com".to_string(),
             ),
             // Block-scoped — keep.
             ("WAFER_RUN__AUTH__JWT_SECRET".to_string(), "abc".to_string()),
             // Infra — drop.
-            (
-                "IMPRESSPRESS_LISTEN".to_string(),
-                "0.0.0.0:8090".to_string(),
-            ),
-            (
-                "IMPRESSPRESS_DB_PATH".to_string(),
-                "data/impresspress.db".to_string(),
-            ),
+            (LISTEN_VAR.to_string(), "0.0.0.0:8090".to_string()),
+            (DB_PATH_VAR.to_string(), "data/impresspress.db".to_string()),
             // Plain env vars without `__` — drop.
             ("PATH".to_string(), "/usr/bin".to_string()),
             ("HOME".to_string(), "/home/joris".to_string()),
         ];
         let out = filter_app_env_vars(input);
-        assert!(out.contains_key("WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL"));
+        assert!(out.contains_key(BOOTSTRAP_ADMIN_EMAIL_KEY));
         assert!(out.contains_key("WAFER_RUN__AUTH__JWT_SECRET"));
-        assert!(!out.contains_key("IMPRESSPRESS_LISTEN"));
-        assert!(!out.contains_key("IMPRESSPRESS_DB_PATH"));
+        assert!(!out.contains_key(LISTEN_VAR));
+        assert!(!out.contains_key(DB_PATH_VAR));
         assert!(!out.contains_key("PATH"));
         assert!(!out.contains_key("HOME"));
     }
@@ -99,6 +95,14 @@ mod tests {
         assert!(out.is_empty());
     }
 }
+
+/// The `IMPRESSPRESS_*` process environment variables [`InfraConfig`] reads.
+const LISTEN_VAR: &str = "IMPRESSPRESS_LISTEN";
+const DB_TYPE_VAR: &str = "IMPRESSPRESS_DB_TYPE";
+const DB_PATH_VAR: &str = "IMPRESSPRESS_DB_PATH";
+const DB_URL_VAR: &str = "IMPRESSPRESS_DB_URL";
+const STORAGE_TYPE_VAR: &str = "IMPRESSPRESS_STORAGE_TYPE";
+const STORAGE_ROOT_VAR: &str = "IMPRESSPRESS_STORAGE_ROOT";
 
 /// Infrastructure config read from `IMPRESSPRESS_*` env vars.
 ///
@@ -116,12 +120,12 @@ pub struct InfraConfig {
 impl InfraConfig {
     pub fn from_env() -> Self {
         Self {
-            listen: env_or("IMPRESSPRESS_LISTEN", "0.0.0.0:8090"),
-            db_type: env_or("IMPRESSPRESS_DB_TYPE", "sqlite"),
-            db_path: env_or("IMPRESSPRESS_DB_PATH", "data/impresspress.db"),
-            db_url: std::env::var("IMPRESSPRESS_DB_URL").ok(),
-            storage_type: env_or("IMPRESSPRESS_STORAGE_TYPE", "local"),
-            storage_root: env_or("IMPRESSPRESS_STORAGE_ROOT", "data/storage"),
+            listen: env_or(LISTEN_VAR, "0.0.0.0:8090"),
+            db_type: env_or(DB_TYPE_VAR, "sqlite"),
+            db_path: env_or(DB_PATH_VAR, "data/impresspress.db"),
+            db_url: std::env::var(DB_URL_VAR).ok(),
+            storage_type: env_or(STORAGE_TYPE_VAR, "local"),
+            storage_root: env_or(STORAGE_ROOT_VAR, "data/storage"),
         }
     }
 }
