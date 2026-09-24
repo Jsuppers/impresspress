@@ -1026,7 +1026,8 @@ pub async fn converge_on_boot(
             .await
             .map_err(|e| e.message)?
         {
-            Journalled::Loaded(row, manifest) => {
+            Journalled::Loaded(loaded) => {
+                let (row, manifest) = *loaded;
                 // A failed convergence is not a failed boot, and the failure
                 // is not discarded: `activate_staged` has already written it
                 // to the generation's `failure_message` and put the journal
@@ -1163,7 +1164,8 @@ async fn retire_abandoned(
     }
     if let Some(desired) = state.desired_generation_id.as_deref() {
         match load_journalled(ctx, desired).await {
-            Ok(Journalled::Loaded(_row, manifest)) => {
+            Ok(Journalled::Loaded(loaded)) => {
+                let (_row, manifest) = &*loaded;
                 vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
             }
             // A dangling desired vouches for nothing; the dangling-desired
@@ -1243,7 +1245,7 @@ async fn active_or_clear(
         return Ok((None, state.clone()));
     };
     match load_journalled(ctx, &id).await.map_err(|e| e.message)? {
-        Journalled::Loaded(row, manifest) => Ok((Some((row, manifest)), state.clone())),
+        Journalled::Loaded(loaded) => Ok((Some(*loaded), state.clone())),
         Journalled::Dangling(reason) => {
             tracing::error!(
                 generation_id = %id,
@@ -1290,7 +1292,7 @@ async fn restore_active_site(
 /// A generation the journal names, as boot recovery reads it.
 enum Journalled {
     /// The row and its manifest.
-    Loaded(GenerationRow, GenerationManifest),
+    Loaded(Box<(GenerationRow, GenerationManifest)>),
     /// The row is gone, or a manifest column does not parse — nothing a retry
     /// can change — with why.
     Dangling(String),
@@ -1316,7 +1318,7 @@ async fn load_journalled(ctx: &dyn Context, id: &str) -> Result<Journalled, Wafe
         }
     };
     Ok(match generation::from_row(&row) {
-        Ok(manifest) => Journalled::Loaded(row, manifest),
+        Ok(manifest) => Journalled::Loaded(Box::new((row, manifest))),
         Err(e) => Journalled::Dangling(e.message),
     })
 }
