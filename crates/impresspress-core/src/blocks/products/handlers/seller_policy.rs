@@ -9,16 +9,17 @@ use wafer_run::{context::Context, OutputStream};
 use crate::{
     blocks::{
         crud,
-        products::{money, repo},
+        products::{
+            config::{
+                SELLER_ALLOWED_CATEGORIES, SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES,
+                SELLER_MAX_PRODUCTS,
+            },
+            money, repo,
+        },
     },
     http::err_bad_request,
     util::RecordExt,
 };
-
-const TEMPLATES_KEY: &str = "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_TEMPLATES";
-const CURRENCIES_KEY: &str = "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CURRENCIES";
-const CATEGORIES_KEY: &str = "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CATEGORIES";
-const MAX_PRODUCTS_KEY: &str = "IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS";
 
 fn csv_values(raw: &str, uppercase: bool) -> HashSet<String> {
     raw.split(',')
@@ -39,11 +40,11 @@ async fn configured_values(ctx: &dyn Context, key: &str, uppercase: bool) -> Has
 }
 
 pub(crate) async fn allowed_templates(ctx: &dyn Context) -> HashSet<String> {
-    configured_values(ctx, TEMPLATES_KEY, false).await
+    configured_values(ctx, SELLER_ALLOWED_TEMPLATES, false).await
 }
 
 pub(crate) async fn allowed_currencies(ctx: &dyn Context) -> HashSet<String> {
-    configured_values(ctx, CURRENCIES_KEY, true).await
+    configured_values(ctx, SELLER_ALLOWED_CURRENCIES, true).await
 }
 
 pub(crate) async fn validate_product_fields(
@@ -71,7 +72,7 @@ pub(crate) async fn validate_product_fields(
         let Some(category) = category.as_str() else {
             return Err(err_bad_request("category must be a string"));
         };
-        let allowed = configured_values(ctx, CATEGORIES_KEY, false).await;
+        let allowed = configured_values(ctx, SELLER_ALLOWED_CATEGORIES, false).await;
         if !allowed.is_empty()
             && !category.trim().is_empty()
             && !allowed.contains(&category.trim().to_ascii_lowercase())
@@ -138,7 +139,7 @@ pub(crate) async fn ensure_product_capacity(
     ctx: &dyn Context,
     user_id: &str,
 ) -> Result<(), OutputStream> {
-    let configured = config::get_default(ctx, MAX_PRODUCTS_KEY, "0").await;
+    let configured = config::get_default(ctx, SELLER_MAX_PRODUCTS, "0").await;
     let limit = match configured.trim().parse::<i64>() {
         Ok(limit) if limit >= 0 => limit,
         Ok(_) | Err(_) => {

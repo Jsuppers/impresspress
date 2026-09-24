@@ -413,11 +413,10 @@ mod tests {
         // WAFER_RUN_SHARED__AUTH__SIGNUP_ENABLED was a dead duplicate of the
         // shared WAFER_RUN_SHARED__ALLOW_SIGNUP toggle (opposite default, no
         // reader) and has been removed. The admin UI must not advertise it.
+        const RETIRED: &str = "WAFER_RUN_SHARED__AUTH__SIGNUP_ENABLED";
         let vars = auth_config_vars();
         assert!(
-            !vars
-                .iter()
-                .any(|v| v.key == "WAFER_RUN_SHARED__AUTH__SIGNUP_ENABLED"),
+            !vars.iter().any(|v| v.key == RETIRED),
             "dead SIGNUP_ENABLED var must not be advertised"
         );
     }

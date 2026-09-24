@@ -36,7 +36,7 @@ use wafer_block::wire::llm::{
 use wafer_core::clients::llm;
 use wafer_run::{context::Context, InputStream, Message, WaferError};
 
-use crate::llm_target::{DefaultTarget, ResolvedTarget, TargetGap};
+use crate::llm_target::{DefaultTarget, ResolvedTarget, TargetGap, DEFAULT_MAX_TOKENS_VAR};
 
 /// Approximate max tokens per chunk. We use whitespace-split as a proxy
 /// for tokenization — close enough for bge-m3 / MiniLM at this
@@ -257,7 +257,7 @@ async fn default_llm_target(ctx: &dyn Context) -> Option<ResolvedTarget> {
             // budget. Reported as what it is — the two sides of this contract
             // disagreeing — rather than as a variable nobody has to set.
             tracing::warn!(
-                var = "IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS",
+                var = DEFAULT_MAX_TOKENS_VAR,
                 "contextual retrieval skipped: the llm block published a target with no usable \
                  max-token budget"
             );
@@ -587,7 +587,7 @@ mod contextual_retrieval_tests {
     async fn a_contextual_ingest_reaches_an_anthropic_provider() {
         use crate::blocks::llm::{
             provider_admin::NoopProviderAdmin, providers::fake_provider::FakeProvider,
-            DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
+            DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR,
         };
 
         let fake = FakeProvider::anthropic("A report about widget sales.").await;

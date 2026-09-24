@@ -18,6 +18,7 @@ use self::{
 };
 use crate::{
     blocks::crud,
+    config_vars::PRIMARY_COLOR_KEY,
     endpoint_match::{self, request_schema_of, EndpointRoute},
     http::{err_bad_request, ok_json, require_row, ResponseBuilder},
     ui::{self, templates, SiteConfig},
@@ -182,6 +183,13 @@ fn id_path_schema() -> serde_json::Value {
     })
 }
 
+/// Config key: the public legal pages' background colour.
+pub(crate) const BG_COLOR_KEY: &str = "IMPRESSPRESS__LEGALPAGES__BG_COLOR";
+/// Config key: where the public legal pages' back button points.
+pub(crate) const BACK_URL_KEY: &str = "IMPRESSPRESS__LEGALPAGES__BACK_URL";
+/// Config key: custom footer HTML on the public legal pages.
+pub(crate) const FOOTER_KEY: &str = "IMPRESSPRESS__LEGALPAGES__FOOTER";
+
 /// The legalpages block's own declared config vars. Single source of truth for
 /// both `BlockInfo::config_keys` and the admin settings page (rendered via
 /// `ui::settings_form`, not a parallel tuple table that had drifted on the
@@ -189,7 +197,7 @@ fn id_path_schema() -> serde_json::Value {
 pub(crate) fn config_vars() -> Vec<ConfigVar> {
     vec![
         ConfigVar::new(
-            "IMPRESSPRESS__LEGALPAGES__BG_COLOR",
+            BG_COLOR_KEY,
             "Background color for public legal pages (empty = use design token default)",
             "",
         )
@@ -197,20 +205,16 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Color)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__LEGALPAGES__BACK_URL",
+            BACK_URL_KEY,
             "Back button URL in the header (e.g., your website homepage)",
             "/",
         )
         .name("Back Button URL")
         .input_type(InputType::Url),
-        ConfigVar::new(
-            "IMPRESSPRESS__LEGALPAGES__FOOTER",
-            "Custom footer text (HTML allowed)",
-            "",
-        )
-        .name("Footer Text")
-        .input_type(InputType::Textarea)
-        .optional(),
+        ConfigVar::new(FOOTER_KEY, "Custom footer text (HTML allowed)", "")
+            .name("Footer Text")
+            .input_type(InputType::Textarea)
+            .optional(),
     ]
 }
 
@@ -227,10 +231,10 @@ impl LegalPagesBlock {
         use wafer_core::clients::config;
 
         let site = SiteConfig::load(ctx).await;
-        let bg_color = config::get_default(ctx, "IMPRESSPRESS__LEGALPAGES__BG_COLOR", "").await;
-        let back_url = config::get_default(ctx, "IMPRESSPRESS__LEGALPAGES__BACK_URL", "/").await;
-        let custom_footer = config::get_default(ctx, "IMPRESSPRESS__LEGALPAGES__FOOTER", "").await;
-        let primary_color = config::get_default(ctx, "WAFER_RUN_SHARED__PRIMARY_COLOR", "").await;
+        let bg_color = config::get_default(ctx, BG_COLOR_KEY, "").await;
+        let back_url = config::get_default(ctx, BACK_URL_KEY, "/").await;
+        let custom_footer = config::get_default(ctx, FOOTER_KEY, "").await;
+        let primary_color = config::get_default(ctx, PRIMARY_COLOR_KEY, "").await;
 
         let type_label = doc_type.title();
 
@@ -1282,7 +1286,7 @@ mod write_loss_tests {
         use crate::test_support::{anon_msg, output_html};
 
         let mut ctx = test_ctx().await;
-        ctx.set_config("IMPRESSPRESS__LEGALPAGES__BG_COLOR", "#123456");
+        ctx.set_config(BG_COLOR_KEY, "#123456");
         let ctx = ctx.with_wrap(
             LegalPagesBlock::BLOCK_NAME,
             wafer_run::Block::info(&LegalPagesBlock::new()).requires,

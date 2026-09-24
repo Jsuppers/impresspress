@@ -95,13 +95,19 @@ impl RateLimit {
         window: Duration::from_secs(60),
     };
 
+    /// The config key that overrides the limit for category `name`:
+    /// `WAFER_RUN_SHARED__RATE_LIMIT_{NAME}`.
+    pub fn override_key(name: &str) -> String {
+        format!("WAFER_RUN_SHARED__RATE_LIMIT_{}", name.to_uppercase())
+    }
+
     /// Read config override for this rate limit category.
     ///
-    /// Looks up `RATE_LIMIT_{name}` in config. Format: `requests/seconds` (e.g. `50/60`).
+    /// Looks up [`Self::override_key`] in config. Format: `requests/seconds` (e.g. `50/60`).
     /// Set to `0` to disable rate limiting for this category.
     /// Returns `None` if disabled, otherwise the resolved limit.
     pub async fn resolve(self, ctx: &dyn Context, name: &str) -> Option<Self> {
-        let key = format!("WAFER_RUN_SHARED__RATE_LIMIT_{}", name.to_uppercase());
+        let key = Self::override_key(name);
         let default = format!("{}/{}", self.max_requests, self.window.as_secs());
         let value = config::get_default(ctx, &key, &default).await;
 

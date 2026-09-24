@@ -27,7 +27,7 @@ use crate::{
     },
     endpoint_match::{self, request_schema_of, response_schema_of, EndpointRoute},
     http::{err_bad_request, err_not_found, ok_json},
-    llm_target::DefaultTarget,
+    llm_target::{DefaultTarget, DEFAULT_MAX_TOKENS_VAR},
 };
 
 /// In-block dispatch targets, one per declared HTTP endpoint.
@@ -230,8 +230,14 @@ impl LlmBlock {
 
 pub(super) const DEFAULT_PROVIDER_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_PROVIDER";
 pub(super) const DEFAULT_MODEL_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MODEL";
-pub(super) const DEFAULT_MAX_TOKENS_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS";
 pub(super) const DEFAULT_PROVIDER: &str = "impresspress/provider-llm";
+
+/// The variable name the provider form suggests for a provider's API key.
+///
+/// An example, not a declared key: an admin names whichever variable holds
+/// the key in the provider's `key_var`, and `routes::reload_provider_service`
+/// resolves it into the in-memory provider.
+pub(super) const EXAMPLE_KEY_VAR: &str = "IMPRESSPRESS__LLM__OPENAI_KEY";
 
 /// Output-token budget used when a chat request names none.
 ///

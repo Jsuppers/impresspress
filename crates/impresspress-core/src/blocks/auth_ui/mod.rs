@@ -399,6 +399,22 @@ async fn apply_rate_limit(
 
 /// Block config key: the Google OAuth client ID.
 pub(crate) const OAUTH_GOOGLE_CLIENT_ID_KEY: &str = "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID";
+/// Block config key: the Google OAuth client secret.
+pub(crate) const OAUTH_GOOGLE_CLIENT_SECRET_KEY: &str =
+    "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_SECRET";
+/// Block config key: the GitHub OAuth client ID.
+pub(crate) const OAUTH_GITHUB_CLIENT_ID_KEY: &str = "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_ID";
+/// Block config key: the GitHub OAuth client secret.
+pub(crate) const OAUTH_GITHUB_CLIENT_SECRET_KEY: &str =
+    "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_SECRET";
+/// Block config key: the Microsoft OAuth client ID.
+pub(crate) const OAUTH_MICROSOFT_CLIENT_ID_KEY: &str =
+    "IMPRESSPRESS__AUTH_UI__OAUTH_MICROSOFT_CLIENT_ID";
+/// Block config key: the Microsoft OAuth client secret.
+pub(crate) const OAUTH_MICROSOFT_CLIENT_SECRET_KEY: &str =
+    "IMPRESSPRESS__AUTH_UI__OAUTH_MICROSOFT_CLIENT_SECRET";
+/// Block config key: the OAuth callback URL registered with each provider.
+pub(crate) const OAUTH_REDIRECT_URI_KEY: &str = "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI";
 
 /// The auth-ui block's own declared config vars (OAuth provider creds). Single
 /// source of truth for both `BlockInfo::config_keys` and the admin settings
@@ -415,22 +431,18 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
             .name("Google Client ID")
             .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_SECRET",
+            OAUTH_GOOGLE_CLIENT_SECRET_KEY,
             "Google OAuth client secret",
             "",
         )
         .name("Google Client Secret")
         .input_type(InputType::Password)
         .optional(),
+        ConfigVar::new(OAUTH_GITHUB_CLIENT_ID_KEY, "GitHub OAuth client ID", "")
+            .name("GitHub Client ID")
+            .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_ID",
-            "GitHub OAuth client ID",
-            "",
-        )
-        .name("GitHub Client ID")
-        .optional(),
-        ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_SECRET",
+            OAUTH_GITHUB_CLIENT_SECRET_KEY,
             "GitHub OAuth client secret",
             "",
         )
@@ -438,28 +450,24 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Password)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_MICROSOFT_CLIENT_ID",
+            OAUTH_MICROSOFT_CLIENT_ID_KEY,
             "Microsoft OAuth client ID",
             "",
         )
         .name("Microsoft Client ID")
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_MICROSOFT_CLIENT_SECRET",
+            OAUTH_MICROSOFT_CLIENT_SECRET_KEY,
             "Microsoft OAuth client secret",
             "",
         )
         .name("Microsoft Client Secret")
         .input_type(InputType::Password)
         .optional(),
-        ConfigVar::new(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI",
-            "OAuth callback URL",
-            "",
-        )
-        .name("OAuth Redirect URI")
-        .input_type(InputType::Url)
-        .optional(),
+        ConfigVar::new(OAUTH_REDIRECT_URI_KEY, "OAuth callback URL", "")
+            .name("OAuth Redirect URI")
+            .input_type(InputType::Url)
+            .optional(),
     ]
 }
 
@@ -938,6 +946,7 @@ mod oauth_start_limit_tests {
     use super::*;
     use crate::{
         blocks::auth::repo::oauth_pkce,
+        config_vars::ENABLE_OAUTH_KEY,
         test_support::{anon_msg, output_http_status, TestContext},
     };
 
@@ -957,8 +966,8 @@ mod oauth_start_limit_tests {
     #[tokio::test]
     async fn oauth_start_is_ip_rate_limited_before_it_writes_state() {
         let mut ctx = TestContext::with_auth().await;
-        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
-        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID", "client-id");
+        ctx.set_config(ENABLE_OAUTH_KEY, "true");
+        ctx.set_config(OAUTH_GOOGLE_CLIENT_ID_KEY, "client-id");
         ctx.register_block("impresspress/auth-ui", Arc::new(AuthUiBlock::new()));
 
         let budget = RateLimit::AUTH.max_requests as usize;
@@ -994,8 +1003,8 @@ mod oauth_start_limit_tests {
     #[tokio::test]
     async fn oauth_starts_do_not_spend_the_login_budget() {
         let mut ctx = TestContext::with_auth_and_crypto().await;
-        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
-        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GOOGLE_CLIENT_ID", "client-id");
+        ctx.set_config(ENABLE_OAUTH_KEY, "true");
+        ctx.set_config(OAUTH_GOOGLE_CLIENT_ID_KEY, "client-id");
         ctx.register_block("impresspress/auth-ui", Arc::new(AuthUiBlock::new()));
 
         for _ in 0..=RateLimit::AUTH.max_requests {
