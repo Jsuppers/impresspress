@@ -1152,6 +1152,7 @@ impl TestContext {
     pub fn refuse_config_writes(&mut self) {
         self.refuse_config_op(
             wafer_block::common::ServiceOp::CONFIG_SET,
+            None,
             WaferError::new(ErrorCode::Internal, "simulated config write failure"),
         );
     }
@@ -1161,10 +1162,21 @@ impl TestContext {
     /// prove a handler sends the refusal through its classifier instead of
     /// answering with a default or echoing the refusal's own text.
     pub fn refuse_config_reads(&mut self, error: WaferError) {
-        self.refuse_config_op(wafer_block::common::ServiceOp::CONFIG_GET, error);
+        self.refuse_config_op(wafer_block::common::ServiceOp::CONFIG_GET, None, error);
     }
 
-    fn refuse_config_op(&mut self, op: &'static str, error: WaferError) {
+    /// [`Self::refuse_config_reads`] for the one key `key`: every other read
+    /// reaches the registered config block. Reproduces a caller that holds a
+    /// grant for most keys but not this one.
+    pub fn refuse_config_reads_of(&mut self, key: &str, error: WaferError) {
+        self.refuse_config_op(
+            wafer_block::common::ServiceOp::CONFIG_GET,
+            Some(key.to_string()),
+            error,
+        );
+    }
+
+    fn refuse_config_op(&mut self, op: &'static str, key: Option<String>, error: WaferError) {
         let inner = self
             .blocks
             .lock()
@@ -1174,7 +1186,12 @@ impl TestContext {
             .expect("every fixture registers a config block");
         self.register_block(
             "wafer-run/config",
-            Arc::new(RefusingConfigOp { inner, op, error }),
+            Arc::new(RefusingConfigOp {
+                inner,
+                op,
+                key,
+                error,
+            }),
         );
     }
 
@@ -2904,11 +2921,12 @@ impl TestContext {
 }
 
 /// The config block behind [`TestContext::refuse_config_writes`] and
-/// [`TestContext::refuse_config_reads`]: every `op` answers `error`,
-/// everything else reaches the wrapped block.
+/// [`TestContext::refuse_config_reads`]: every `op` (on `key`, when one is
+/// named) answers `error`, everything else reaches the wrapped block.
 struct RefusingConfigOp {
     inner: Arc<dyn Block>,
     op: &'static str,
+    key: Option<String>,
     error: WaferError,
 }
 
@@ -2919,10 +2937,25 @@ impl Block for RefusingConfigOp {
     }
 
     async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
-        if msg.kind == self.op {
+        if msg.kind != self.op {
+            return self.inner.handle(ctx, msg, input).await;
+        }
+        let Some(key) = &self.key else {
+            return OutputStream::error(self.error.clone());
+        };
+        let body = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
+        let requested = wafer_block::codec::decode::<wafer_block::wire::config::GetRequest>(&body)
+            .map(|req| req.key)
+            .unwrap_or_default();
+        if &requested == key {
             return OutputStream::error(self.error.clone());
         }
-        self.inner.handle(ctx, msg, input).await
+        self.inner
+            .handle(ctx, msg, InputStream::from_bytes(body))
+            .await
     }
 }
 
