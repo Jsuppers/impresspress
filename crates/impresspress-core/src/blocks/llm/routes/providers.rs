@@ -934,8 +934,9 @@ mod tests {
         );
     }
 
-    /// A variable the llm block holds no grant for.
-    const UNREADABLE_VAR: &str = "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY";
+    /// A variable the fixture refuses to let the llm block read, as WRAP
+    /// refuses another block's secret.
+    const UNREADABLE_VAR: &str = "IMPRESSPRESS__LLM__TEST_UNREADABLE_KEY";
 
     fn refused() -> WaferError {
         WaferError::new(
