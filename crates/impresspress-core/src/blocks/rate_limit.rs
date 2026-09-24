@@ -19,12 +19,61 @@ use wafer_run::{context::Context, OutputStream, WaferError};
 pub struct UserRateLimiter {
     #[cfg(not(target_arch = "wasm32"))]
     buckets: Mutex<HashMap<String, RateBucket>>,
+    /// Most buckets the native map holds; see [`evict_for_new_key`].
+    #[cfg(not(target_arch = "wasm32"))]
+    capacity: usize,
 }
+
+/// Default [`UserRateLimiter`] capacity on native.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_BUCKETS: usize = 50_000;
 
 #[cfg(not(target_arch = "wasm32"))]
 struct RateBucket {
     count: u32,
     window_start: Instant,
+    /// The limit this bucket was last charged under. Categories differ in
+    /// window and budget, so expiry and "throttled" are per bucket, never
+    /// judged by whichever category's request happens to trigger eviction.
+    limit: RateLimit,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RateBucket {
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.window_start) > self.limit.window
+    }
+
+    fn throttled(&self) -> bool {
+        self.count >= self.limit.max_requests
+    }
+}
+
+/// Make room for one new key in a map at `capacity`.
+///
+/// Expired buckets go first: they hold nothing. If that frees nothing, the
+/// map drops live buckets down to 90% of `capacity`, cheapest first: buckets
+/// still under their budget before throttled ones, lower counts before
+/// higher, older windows before newer. So a flood of fresh keys (one per /64
+/// of a /48 costs one request each) evicts its own one-request buckets, and a
+/// client that is being throttled keeps its counter; resetting every bucket
+/// at once would hand each throttled client a new budget.
+#[cfg(not(target_arch = "wasm32"))]
+fn evict_for_new_key(buckets: &mut HashMap<String, RateBucket>, capacity: usize, now: Instant) {
+    buckets.retain(|_, b| !b.expired(now));
+    if buckets.len() < capacity {
+        return;
+    }
+    let target = capacity - capacity / 10;
+    let excess = buckets.len() + 1 - target;
+    let mut victims: Vec<(bool, u32, Instant, String)> = buckets
+        .iter()
+        .map(|(key, b)| (b.throttled(), b.count, b.window_start, key.clone()))
+        .collect();
+    victims.sort_unstable();
+    for (_, _, _, key) in victims.into_iter().take(excess) {
+        buckets.remove(&key);
+    }
 }
 
 /// Rate limit configuration: max requests allowed within a time window.
@@ -154,6 +203,16 @@ impl UserRateLimiter {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             buckets: Mutex::new(HashMap::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            capacity: MAX_BUCKETS,
+        }
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            capacity,
         }
     }
 
@@ -167,22 +226,19 @@ impl UserRateLimiter {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
-        // Evict expired entries when map gets large
-        if buckets.len() > 5_000 {
-            buckets.retain(|_, b| now.duration_since(b.window_start) <= limit.window);
-        }
-        // Hard cap
-        if buckets.len() > 50_000 {
-            buckets.clear();
+        if !buckets.contains_key(key) && buckets.len() >= self.capacity {
+            evict_for_new_key(&mut buckets, self.capacity, now);
         }
 
         let bucket = buckets.entry(key.to_string()).or_insert(RateBucket {
             count: 0,
             window_start: now,
+            limit,
         });
+        bucket.limit = limit;
 
         // Reset window if expired
-        if now.duration_since(bucket.window_start) > limit.window {
+        if bucket.expired(now) {
             bucket.count = 0;
             bucket.window_start = now;
         }
@@ -532,6 +588,73 @@ mod tests {
         fn clone_arc(&self) -> std::sync::Arc<dyn Context> {
             std::sync::Arc::new(self.clone())
         }
+    }
+
+    /// Filling the map with fresh keys (a /48 holder has 65,536 /64s) must
+    /// not reset a client that is being throttled, and the map stays bounded.
+    #[tokio::test]
+    async fn filling_the_map_keeps_a_throttled_bucket() {
+        let ctx = TestCtx;
+        let limiter = UserRateLimiter::with_capacity(10);
+        let limit = RateLimit {
+            max_requests: 2,
+            window: Duration::from_secs(60),
+        };
+        for _ in 0..2 {
+            assert!(limiter.check(&ctx, "victim:auth", limit).await.is_ok());
+        }
+        assert!(limiter.check(&ctx, "victim:auth", limit).await.is_err());
+
+        for i in 0..100 {
+            let key = format!("2001:db8:0:{i:x}::/64:auth");
+            assert!(limiter.check(&ctx, &key, limit).await.is_ok());
+        }
+        assert!(
+            limiter.check(&ctx, "victim:auth", limit).await.is_err(),
+            "a flood of new keys reset a throttled client's counter"
+        );
+        let len = limiter
+            .buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert!(len <= 10, "the map grew past its capacity: {len}");
+    }
+
+    /// An expired bucket is evicted before any live one, whatever category
+    /// triggered the eviction: here a short-window request makes room while
+    /// a long-window throttled bucket keeps its count.
+    #[tokio::test]
+    async fn eviction_judges_expiry_by_each_buckets_own_window() {
+        let ctx = TestCtx;
+        let limiter = UserRateLimiter::with_capacity(2);
+        let hourly = RateLimit {
+            max_requests: 1,
+            window: Duration::from_secs(3600),
+        };
+        let brief = RateLimit {
+            max_requests: 5,
+            window: Duration::from_millis(50),
+        };
+        assert!(limiter
+            .check(&ctx, "mailer:auth_email", hourly)
+            .await
+            .is_ok());
+        assert!(limiter
+            .check(&ctx, "mailer:auth_email", hourly)
+            .await
+            .is_err());
+        assert!(limiter.check(&ctx, "old:signal", brief).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(limiter.check(&ctx, "new:signal", brief).await.is_ok());
+        {
+            let buckets = limiter.buckets.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!buckets.contains_key("old:signal"));
+        }
+        assert!(limiter
+            .check(&ctx, "mailer:auth_email", hourly)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

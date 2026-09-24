@@ -34,11 +34,15 @@ users sharing one only share a budget when they are already one site (a home,
 an office LAN); a deployment where that is common raises the category by key,
 as for a shared IPv4 egress (`WAFER_RUN_SHARED__RATE_LIMIT_{NAME}`).
 
-**Your data.** Nothing to migrate. Buckets are windowed counters: the ones
-keyed by a full IPv6 address are never charged again and expire with their
-window. On native they live in memory; on Cloudflare they are rows in the
-`rate_limits` table that no request reads again, and the tickets maintenance
-sweep prunes them with every other stale counter.
+**Your data.** Nothing to migrate. Buckets are windowed counters, and no
+request produces a full-address IPv6 key any more, so the old ones are never
+charged again. On native they live in memory and go with the next restart or
+eviction. On Cloudflare they are rows in the `rate_limits` table; a row is read
+only by its own key, so a leftover one is harmless — it limits nobody and costs
+only its storage. Nothing deletes them automatically: the tickets retention
+prune (`POST /b/tickets/api/admin/retention/prune`, or a `tickets.maintenance`
+message if the deployment schedules one) removes them along with every other
+stale counter, and without it they stay.
 
 ### Dev sandbox: a hyphenated block spells its collections with `_`
 
