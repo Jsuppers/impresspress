@@ -278,6 +278,12 @@ async fn reference_returns_the_authoring_guide() {
     )
     .await;
     assert_eq!(body["wafer_guest_version"], WAFER_GUEST_VERSION);
+    // The module a block built against an older copy writes over its own:
+    // the stale-module diagnostic points here.
+    assert_eq!(
+        body["wafer_guest_module"].as_str(),
+        Some(Template::WAFER_GUEST)
+    );
 
     let markdown = body["markdown"].as_str().expect("markdown");
     for needle in [
