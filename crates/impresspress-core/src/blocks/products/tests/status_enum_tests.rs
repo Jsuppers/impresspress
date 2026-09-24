@@ -317,35 +317,40 @@ fn every_status_enum_round_trips_the_literal_its_column_holds() {
     assert_eq!(wire(ApprovalStatus::Suspended), "suspended");
 }
 
-/// The platform-billing projection has stored the British spelling since
-/// `repo::subscriptions::cancel_and_reset_addons` was written, while every
-/// Stripe-sourced column stores `canceled`. `repo::subscription_status_rank`
-/// used to be the only thing that knew, as a two-arm string match; the alias is
-/// now the one place the two spellings meet, so a row holding either reads
-/// as the same variant.
+/// Every subscription status has one spelling, Stripe's. The British
+/// `cancelled` the platform-billing projection used to store is gone from the
+/// tables (`022_canonical_subscription_status`) and from the type, so a row
+/// still holding it is a data fault, reported as `Internal` naming the row —
+/// not a second way to say `Canceled`.
+///
+/// Two past bugs came from the second spelling: a ranking that had to match
+/// `"canceled" | "cancelled"`, and a compare-and-swap that re-serialised the
+/// parsed status and so never matched a `cancelled` row. With one decodable
+/// spelling per variant, the value a filter serialises IS the value the row
+/// stores.
 #[test]
-fn the_legacy_cancelled_spelling_reads_as_canceled() {
-    assert_eq!(
-        crate::util::enum_column::<SubscriptionStatus>(
-            &record_with("subscription_status", "cancelled"),
-            "subscription_status",
-        )
-        .expect("the legacy spelling decodes"),
-        SubscriptionStatus::Canceled,
+fn the_british_cancelled_spelling_is_refused_not_aliased() {
+    let error = crate::util::enum_column::<SubscriptionStatus>(
+        &record_with("status", "cancelled"),
+        "status",
+    )
+    .expect_err("the British spelling is not a subscription status");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(
+        error.message.contains("row_1") && error.message.contains("cancelled"),
+        "the message names the row and the value: {}",
+        error.message
     );
+
     assert_eq!(
         crate::util::enum_column::<SubscriptionStatus>(
-            &record_with("subscription_status", "canceled"),
-            "subscription_status",
+            &record_with("status", "canceled"),
+            "status",
         )
         .expect("the Stripe spelling decodes"),
         SubscriptionStatus::Canceled,
     );
-    // Both are terminal, which is the fact the ranking exists for.
     assert!(SubscriptionStatus::Canceled.is_terminal());
-    assert!(!SubscriptionStatus::PastDue.is_terminal());
-    // And a same-second delivery may only move toward the more terminal of
-    // the two, whichever spelling the stored row holds.
     assert!(!repo::subscription_transition_allowed(
         SubscriptionStatus::Canceled,
         100,
@@ -360,24 +365,32 @@ fn the_legacy_cancelled_spelling_reads_as_canceled() {
     ));
 }
 
-/// **The one column this PR deliberately did not type, and why.**
-///
-/// `impresspress__products__subscriptions.status` is the same vocabulary as
-/// the order column, but `SubscriptionView` republishes it verbatim to
-/// `GET /b/products/subscription`, and this table has stored the British
-/// `cancelled` since `cancel_and_reset_addons` was written. Giving the field
-/// the enum would serialize the canonical `canceled` instead, so every
-/// subscription cancelled from that release on would report a different
-/// string from the rows already in the table.
-///
-/// This test is the pin on that decision: the write is still the stored
-/// literal, the published field still carries it unchanged, and the *reads*
-/// are nonetheless reconciled — `SubscriptionStatus` parses the stored
-/// spelling to the same variant the Stripe-sourced columns produce. A later
-/// change that types the field has to move the stored rows too, and this test
-/// is what makes it notice.
+/// Every variant's stored spelling decodes back to that variant, and to
+/// nothing else. This is what lets every compare-and-swap on a status column
+/// filter on the parsed status re-serialised: the text it compares against
+/// is exactly the text the row holds.
+#[test]
+fn every_subscription_status_round_trips_through_its_one_spelling() {
+    for status in SubscriptionStatus::ALL {
+        let spelling = wire(status);
+        assert_eq!(
+            crate::util::enum_column::<SubscriptionStatus>(
+                &record_with("status", &spelling),
+                "status",
+            )
+            .expect("a serialised status decodes"),
+            status,
+            "{spelling:?} must decode to the variant that wrote it"
+        );
+    }
+}
+
+/// `GET /b/products/subscription` publishes the platform subscription's
+/// status as a [`SubscriptionStatus`], and the cancellation webhook's write
+/// is the canonical `canceled` — the spelling every other subscription
+/// status column and Stripe itself use.
 #[tokio::test]
-async fn the_platform_subscription_view_still_publishes_the_stored_spelling() {
+async fn the_platform_subscription_view_publishes_the_canonical_spelling() {
     let ctx = ctx().await;
     seed(
         &ctx,
@@ -408,25 +421,11 @@ async fn the_platform_subscription_view_still_publishes_the_stored_spelling() {
         .await
         .expect("the subscription reads back")
         .expect("the row exists");
+    assert_eq!(view.status, SubscriptionStatus::Canceled);
     assert_eq!(
-        view.status, "cancelled",
-        "the published field is the stored spelling, not the canonical one",
-    );
-    assert_ne!(
-        view.status,
-        wire(SubscriptionStatus::Canceled),
-        "and the two spellings are still different strings, which is the whole point",
-    );
-
-    // The read side is reconciled even though the write side is not: both
-    // spellings parse to the one variant.
-    assert_eq!(
-        crate::util::enum_column::<SubscriptionStatus>(
-            &record_with("status", &view.status),
-            "status",
-        )
-        .expect("the stored spelling decodes"),
-        SubscriptionStatus::Canceled,
+        serde_json::to_value(&view).expect("the view serialises")["status"],
+        "canceled",
+        "the published field is Stripe's spelling"
     );
 }
 
@@ -506,70 +505,41 @@ fn the_paid_subset_of_order_status_is_the_three_that_took_money() {
     );
 }
 
-/// `set_addon_totals` excludes a terminal subscription by naming the spellings
-/// its `status` column can hold, because SQL cannot ask the type. The constant
-/// and [`SubscriptionStatus::is_terminal`] therefore have to say the same
-/// thing: a variant that becomes terminal without being listed would have
-/// add-on quota written onto a row that can never go live again, and one
-/// listed without being terminal would stop having its quota recorded at all.
+/// `SubscriptionStatus::ALL` lists every variant the enum defines.
 ///
-/// Both spellings of the cancelled state are covered. The platform-billing
-/// projection has stored `cancelled` since it was written and every
-/// Stripe-sourced write spells it `canceled`; the type reads both through its
-/// serde alias, so only this test can see the constant miss one.
+/// `set_addon_totals` excludes a terminal row by naming every terminal
+/// variant in its filter, taken from `ALL`, because SQL cannot ask the type.
+/// A variant missing from `ALL` that is terminal would have add-on quota
+/// written onto a row that can never go live again.
+///
+/// `slot` is exhaustive on purpose. Adding a variant stops this test
+/// compiling, which is the reminder to add it to `ALL` as well; the assertion
+/// then checks it actually was.
 #[test]
-fn subscription_terminal_spellings_match_the_type() {
-    use crate::blocks::products::repo::subscriptions::TERMINAL_STATUS_SPELLINGS;
-
-    // The alias is not a serialized spelling, so `wire` cannot produce it.
-    // It is a stored literal all the same — see `cancel_and_reset_addons`.
-    let stored_aliases = [("cancelled", SubscriptionStatus::Canceled)];
-
-    let mut terminal_variants = 0;
-    for status in [
-        SubscriptionStatus::Unset,
-        SubscriptionStatus::Incomplete,
-        SubscriptionStatus::IncompleteExpired,
-        SubscriptionStatus::Trialing,
-        SubscriptionStatus::Active,
-        SubscriptionStatus::PastDue,
-        SubscriptionStatus::Unpaid,
-        SubscriptionStatus::Paused,
-        SubscriptionStatus::Canceled,
-    ] {
-        let spelling = wire(status);
-        assert_eq!(
-            TERMINAL_STATUS_SPELLINGS.contains(&spelling.as_str()),
-            status.is_terminal(),
-            "{spelling:?} is listed as terminal but `is_terminal` disagrees (or vice versa)"
-        );
-        terminal_variants += usize::from(status.is_terminal());
+fn subscription_status_all_lists_every_variant() {
+    fn slot(status: SubscriptionStatus) -> usize {
+        match status {
+            SubscriptionStatus::Unset => 0,
+            SubscriptionStatus::Incomplete => 1,
+            SubscriptionStatus::IncompleteExpired => 2,
+            SubscriptionStatus::Trialing => 3,
+            SubscriptionStatus::Active => 4,
+            SubscriptionStatus::PastDue => 5,
+            SubscriptionStatus::Unpaid => 6,
+            SubscriptionStatus::Paused => 7,
+            SubscriptionStatus::Canceled => 8,
+        }
     }
 
-    for (spelling, status) in stored_aliases {
+    let mut seen = [false; 9];
+    for status in SubscriptionStatus::ALL {
         assert!(
-            status.is_terminal(),
-            "{spelling:?} aliases a status that is no longer terminal — \
-             it must leave TERMINAL_STATUS_SPELLINGS with it"
-        );
-        assert!(
-            TERMINAL_STATUS_SPELLINGS.contains(&spelling),
-            "{spelling:?} is a stored spelling of a terminal status and must be excluded"
+            !std::mem::replace(&mut seen[slot(status)], true),
+            "{status:?} is listed twice in SubscriptionStatus::ALL"
         );
     }
-
-    // Nothing else is in the constant: every entry above accounted for one.
-    assert_eq!(
-        TERMINAL_STATUS_SPELLINGS.len(),
-        terminal_variants + stored_aliases.len(),
-        "TERMINAL_STATUS_SPELLINGS holds a spelling no SubscriptionStatus produces"
+    assert!(
+        seen.iter().all(|listed| *listed),
+        "a variant this test knows about is missing from SubscriptionStatus::ALL: {seen:?}"
     );
-
-    // A round trip through the type, so the constant's literals are the ones
-    // the column stores rather than lookalikes.
-    for spelling in TERMINAL_STATUS_SPELLINGS {
-        let status: SubscriptionStatus =
-            serde_json::from_value(json!(spelling)).expect("a stored spelling must decode");
-        assert!(status.is_terminal(), "{spelling:?} decodes as non-terminal");
-    }
 }

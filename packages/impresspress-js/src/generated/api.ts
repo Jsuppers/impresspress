@@ -12861,8 +12861,11 @@ export interface paths {
                                 id: string;
                                 /** @description Plan name. */
                                 plan: string;
-                                /** @description Stripe subscription lifecycle state. */
-                                status: string;
+                                /**
+                                 * @description Stripe subscription lifecycle state.
+                                 * @enum {string}
+                                 */
+                                status: "" | "incomplete" | "incomplete_expired" | "trialing" | "active" | "past_due" | "unpaid" | "paused" | "canceled";
                                 /** @description Stripe Subscription id, or empty. */
                                 stripe_subscription_id: string;
                                 /**

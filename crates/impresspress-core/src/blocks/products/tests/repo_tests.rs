@@ -8,7 +8,7 @@ use crate::blocks::products::{
     repo,
 };
 
-/// `cancel_and_reset_addons` flips status to cancelled and zeroes every addon
+/// `cancel_and_reset_addons` flips status to `canceled` and zeroes every addon
 /// column for the matched subscription.
 #[tokio::test]
 async fn cancel_and_reset_addons_zeroes_addons_and_cancels() {
@@ -42,7 +42,7 @@ async fn cancel_and_reset_addons_zeroes_addons_and_cancels() {
         .expect("row exists");
     assert_eq!(
         rec.data.get("status").and_then(|v| v.as_str()),
-        Some("cancelled")
+        Some("canceled")
     );
     assert_eq!(
         rec.data.get("addon_projects").and_then(|v| v.as_i64()),

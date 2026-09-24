@@ -40,14 +40,6 @@ pub(crate) fn retry_delay_seconds(attempts: u64) -> i64 {
     (30_i64.saturating_mul(2_i64.pow(exponent))).min(3600)
 }
 
-// `subscription_status_rank` and `subscription_status_is_terminal` lived here
-// as `&str` functions, and the two spellings of the terminal state met in the
-// first one's `"canceled" | "cancelled"` arm. Both are methods on
-// [`SubscriptionStatus`] now — the ranking is a property of the lifecycle, not
-// of this module — and the two spellings meet in the type's `cancelled` serde
-// alias, so every comparison in the block sees one variant whichever spelling
-// a row holds.
-
 /// Whether a subscription webhook write may apply over the stored projection:
 /// strictly older events never apply, nothing leaves a terminal status, and
 /// an equal-second delivery may only move toward a more-terminal status.

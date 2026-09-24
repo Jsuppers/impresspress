@@ -1659,7 +1659,7 @@ async fn commerce_invoice_events_recover_past_due_without_resurrecting_or_reorde
     )
     .await
     .unwrap();
-    assert_eq!(platform.data["status"], "cancelled");
+    assert_eq!(platform.data["status"], "canceled");
     assert_eq!(platform.data["stripe_event_created"], 400);
 }
 
@@ -1779,7 +1779,7 @@ async fn same_second_subscription_update_cannot_resurrect_deleted_subscription()
     )
     .await
     .unwrap();
-    assert_eq!(platform.data["status"], "cancelled");
+    assert_eq!(platform.data["status"], "canceled");
     assert_eq!(platform.data["stripe_event_created"], 200);
 }
 
@@ -2087,7 +2087,7 @@ async fn invoice_payment_failed_after_deletion_does_not_regress_terminal_state()
     )
     .await
     .unwrap();
-    assert_eq!(platform.data["status"], "cancelled");
+    assert_eq!(platform.data["status"], "canceled");
     assert_eq!(platform.data["stripe_event_created"], 300);
     assert!(
         platform.data["grace_period_end"]
@@ -2222,7 +2222,7 @@ async fn platform_subscription_checkout_is_ordered_and_allows_newer_resubscripti
     )
     .await
     .unwrap();
-    assert_eq!(subscription.data["status"], "cancelled");
+    assert_eq!(subscription.data["status"], "canceled");
     assert_eq!(subscription.data["stripe_event_created"], 400);
 
     let resubscribe = checkout(
@@ -7703,9 +7703,9 @@ async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
     seed_platform_subscription(&ctx, "sub_statusless", "owner_statusless", "active").await;
     seed_platform_subscription(
         &ctx,
-        "sub_statusless_cancelled",
-        "owner_statusless_cancelled",
-        "cancelled",
+        "sub_statusless_canceled",
+        "owner_statusless_canceled",
+        "canceled",
     )
     .await;
 
@@ -7779,29 +7779,27 @@ async fn a_subscription_update_without_a_status_keeps_the_stored_status() {
     assert_eq!(subscription.data["stripe_event_created"], 200);
 
     // A statusless event on a terminal row restates the terminal status, so
-    // it applies and reaches the compare-and-swap on a `cancelled` row; the
-    // row keeps its stored spelling, which re-serialising the parsed status
-    // would change.
+    // it applies and reaches the compare-and-swap on a `canceled` row, whose
+    // filter has to match the stored text for the plan to land.
     deliver(statusless(
-        "evt_statusless_cancelled",
-        "sub_statusless_cancelled",
+        "evt_statusless_canceled",
+        "sub_statusless_canceled",
         200,
         "business",
     ))
     .await;
-    assert_eq!(
-        row("sub_statusless_cancelled").await.data["status"],
-        "cancelled"
-    );
+    let subscription = row("sub_statusless_canceled").await;
+    assert_eq!(subscription.data["status"], "canceled");
+    assert_eq!(subscription.data["plan"], "business");
+    assert_eq!(subscription.data["stripe_event_created"], 200);
 }
 
-/// `customer.subscription.deleted` stores the platform row as `cancelled`,
-/// which parses as [`SubscriptionStatus::Canceled`]. A later
-/// `customer.subscription.updated` that restates `canceled` is allowed by the
-/// transition rules, and its compare-and-swap has to match the text the row
-/// holds. The re-serialised `canceled` never matches it, so every attempt
-/// would read as a concurrent change and the delivery would fail until it
-/// dead-lettered.
+/// `customer.subscription.deleted` stores the platform row as `canceled`. A
+/// later `customer.subscription.updated` that restates `canceled` is allowed
+/// by the transition rules, and its compare-and-swap filters on the parsed
+/// status re-serialised. That only matches because the deletion wrote the
+/// same spelling: had it written anything else, every attempt would read as
+/// a concurrent change and the delivery would fail until it dead-lettered.
 #[tokio::test]
 async fn a_canceled_update_after_the_deletion_is_applied_not_retried() {
     let ctx = ctx_with(&[(
@@ -7866,25 +7864,21 @@ async fn a_canceled_update_after_the_deletion_is_applied_not_retried() {
     )
     .await
     .unwrap();
-    // Either spelling is the terminal state; which one the explicit write
-    // leaves is not what this test is about.
-    assert_eq!(
-        serde_json::from_value::<SubscriptionStatus>(subscription.data["status"].clone()).unwrap(),
-        SubscriptionStatus::Canceled
-    );
+    assert_eq!(subscription.data["status"], "canceled");
     assert_eq!(subscription.data["addon_r2_bytes"], 0);
+
+    // And the subscriber reads Stripe's spelling back from the endpoint that
+    // publishes the row.
+    let (msg, input) = get_msg("/b/products/subscription", "owner_deleted");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(body["subscription"]["status"], "canceled", "{body}");
 }
 
-/// `mark_past_due` compare-and-swaps on the parsed status re-serialised,
-/// which a row holding `cancelled` would never match — and it may, because
-/// `subscription_transition_allowed` refuses terminal -> `past_due` before
-/// the write, so such a row never reaches it. This guard (it passes whatever
-/// the CAS filter compares) pins that precondition: the delivery is answered
-/// and sealed, not retried into the dead-letter queue, and no grace window
-/// appears. Relaxing the terminal rule without moving the filter to the
-/// stored text would break it.
+/// A failed invoice on a canceled row is refused by the transition rules
+/// (terminal -> `past_due`), so the delivery is answered and sealed, not
+/// retried into the dead-letter queue, and no grace window appears.
 #[tokio::test]
-async fn a_failed_invoice_on_a_cancelled_row_is_refused_not_dead_lettered() {
+async fn a_failed_invoice_on_a_canceled_row_is_refused_not_dead_lettered() {
     let ctx = ctx_with(&[(
         "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
         WEBHOOK_SECRET,
@@ -7894,12 +7888,12 @@ async fn a_failed_invoice_on_a_cancelled_row_is_refused_not_dead_lettered() {
         &ctx,
         "sub_failed_invoice",
         "owner_failed_invoice",
-        "cancelled",
+        "canceled",
     )
     .await;
 
     let payment_failed = serde_json::json!({
-        "id": "evt_failed_invoice_cancelled",
+        "id": "evt_failed_invoice_canceled",
         "type": "invoice.payment_failed",
         "created": 400,
         "livemode": false,
@@ -7915,7 +7909,7 @@ async fn a_failed_invoice_on_a_cancelled_row_is_refused_not_dead_lettered() {
     let event_row = db::get(
         &ctx,
         "impresspress__products__stripe_events",
-        "evt_failed_invoice_cancelled",
+        "evt_failed_invoice_canceled",
     )
     .await
     .unwrap();
@@ -7931,7 +7925,7 @@ async fn a_failed_invoice_on_a_cancelled_row_is_refused_not_dead_lettered() {
     )
     .await
     .unwrap();
-    assert_eq!(subscription.data["status"], "cancelled");
+    assert_eq!(subscription.data["status"], "canceled");
     assert_eq!(subscription.data["stripe_event_created"], 100);
     assert!(
         subscription.data["grace_period_end"]
@@ -8067,10 +8061,8 @@ async fn an_addon_total_write_that_fails_does_not_report_success() {
 /// The states that stay excluded are the terminal ones — a row that can never
 /// go live again, because Stripe issues a new subscription id for a
 /// resubscription. `customer.subscription.updated` can be delivered after
-/// `customer.subscription.deleted`, and writing quota onto a cancelled row
-/// would undo the zeroing `cancel_and_reset_addons` just did. Both stored
-/// spellings of the cancelled state are covered: the platform-billing
-/// projection writes `cancelled`, every Stripe-sourced write `canceled`.
+/// `customer.subscription.deleted`, and writing quota onto a canceled row
+/// would undo the zeroing `cancel_and_reset_addons` just did.
 #[tokio::test]
 async fn addon_totals_reach_every_live_subscription_state_and_no_terminal_one() {
     let ctx = ctx_with(&[(
@@ -8083,7 +8075,7 @@ async fn addon_totals_reach_every_live_subscription_state_and_no_terminal_one() 
     // A terminal row is probed with an `active` delivery, which is the
     // redelivery that would resurrect it; 5 is what `seed_platform_subscription`
     // leaves in the column, so "unchanged" is distinguishable from "zeroed".
-    let cases: [(&str, &str, i64); 9] = [
+    let cases: [(&str, &str, i64); 8] = [
         ("incomplete", "incomplete", 3072),
         ("trialing", "trialing", 3072),
         ("active", "active", 3072),
@@ -8091,7 +8083,6 @@ async fn addon_totals_reach_every_live_subscription_state_and_no_terminal_one() 
         ("unpaid", "unpaid", 3072),
         ("paused", "paused", 3072),
         ("canceled", "active", 5),
-        ("cancelled", "active", 5),
         ("incomplete_expired", "active", 5),
     ];
 

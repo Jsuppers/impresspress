@@ -909,14 +909,16 @@ pub enum ProviderPaymentStatus {
 /// column is `TEXT NOT NULL DEFAULT ''`
 /// (`009_commerce_subscription_state.sqlite.sql`).
 ///
-/// The `cancelled` alias is the reconciliation `repo::subscription_status_rank`
-/// used to perform as a two-arm string match. The platform-billing
-/// projection (`impresspress__products__subscriptions`) has stored the
-/// British spelling since it was written, while every Stripe-sourced column
-/// stores `canceled`; a row holding either reads as [`Self::Canceled`]
-/// here. No stored row is rewritten — see
-/// `repo::subscriptions::cancel_and_reset_addons` for why the write is
-/// still the literal.
+/// The same vocabulary is the `status` column of the platform-billing
+/// projection (`impresspress__products__subscriptions`).
+//
+// Each variant has exactly one spelling, Stripe's, and it is the only one
+// either column stores: every write serialises a variant, and migration
+// `022_canonical_subscription_status` rewrote the British `cancelled` the
+// projection used to store. A stored value outside the set — that spelling
+// included — is refused by `enum_column` as a data fault, so the lifecycle
+// comparisons and the compare-and-swap filters, which compare the stored
+// text against a serialised variant, always compare like with like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
@@ -929,11 +931,25 @@ pub enum SubscriptionStatus {
     PastDue,
     Unpaid,
     Paused,
-    #[serde(alias = "cancelled")]
     Canceled,
 }
 
 impl SubscriptionStatus {
+    /// Every variant, in declaration order. SQL cannot ask the type which
+    /// statuses are terminal, so a filter over the column names them from
+    /// this list.
+    pub const ALL: [Self; 9] = [
+        Self::Unset,
+        Self::Incomplete,
+        Self::IncompleteExpired,
+        Self::Trialing,
+        Self::Active,
+        Self::PastDue,
+        Self::Unpaid,
+        Self::Paused,
+        Self::Canceled,
+    ];
+
     /// Parse the `subscription_status` column of an order row.
     pub fn from_record(record: &Record) -> Result<Self, WaferError> {
         enum_column(record, "subscription_status")
@@ -3465,19 +3481,8 @@ pub struct SubscriptionView {
     pub id: String,
     /// Plan name.
     pub plan: String,
-    // Deliberately NOT [`SubscriptionStatus`], though it is the same column
-    // vocabulary. This projection republishes the stored value verbatim, and
-    // the platform-billing table has stored the British `cancelled` since
-    // `repo::subscriptions::cancel_and_reset_addons` was written. Typing the
-    // field would serialize the canonical `canceled` instead, so every
-    // subscription cancelled from that release on would report a different
-    // string from the rows already in the table — a wire change on a
-    // published field, and one no reader could tell from a data migration.
-    // Normalising the column is its own change, with its own row rewrite.
-    // `tests::status_enum_tests` pins the current spelling; reads inside the
-    // block are already reconciled through the type's `cancelled` alias.
     /// Stripe subscription lifecycle state.
-    pub status: String,
+    pub status: SubscriptionStatus,
     /// Stripe Subscription id, or empty.
     pub stripe_subscription_id: String,
     /// RFC 3339 end of the grace period after a failed payment, or `null`.
@@ -3497,12 +3502,13 @@ pub struct SubscriptionView {
 }
 
 impl SubscriptionView {
-    /// Project an `impresspress__products__subscriptions` row.
-    pub fn from_record(record: &Record) -> Self {
-        Self {
+    /// Project an `impresspress__products__subscriptions` row. A `status`
+    /// outside [`SubscriptionStatus`] is an `Internal` fault naming the row.
+    pub fn from_record(record: &Record) -> Result<Self, WaferError> {
+        Ok(Self {
             id: record.id.clone(),
             plan: record.str_field("plan").to_string(),
-            status: record.str_field("status").to_string(),
+            status: enum_column(record, "status")?,
             stripe_subscription_id: record.str_field("stripe_subscription_id").to_string(),
             grace_period_end: timestamp_field(record, "grace_period_end"),
             addon_projects: record.i64_field("addon_projects"),
@@ -3511,7 +3517,7 @@ impl SubscriptionView {
             addon_d1_bytes: record.i64_field("addon_d1_bytes"),
             created_at: record.str_field("created_at").to_string(),
             updated_at: record.str_field("updated_at").to_string(),
-        }
+        })
     }
 }
 
