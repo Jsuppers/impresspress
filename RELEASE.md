@@ -99,33 +99,90 @@ header: it must identify the caller through `request.user_id` /
 `request.roles`, which the host fills in. Staging already refused a block that
 declared either header (`cap-headers`), so no accepted block was granted them.
 
-### Vector: index names are lowercase (migration 002) — upgrade with `--run-migrations`
+### Dev sandbox: blocks built before this release must be recompiled (guest ABI 2)
+
+**What changes.** The host refuses a list query with a page size of `0`, and the
+vendored `src/wafer_guest.rs` sent exactly that for every `db::list` without a
+`.limit(n)`. The module now leaves the limit out (every matching row), which
+changes what a compiled block sends, so its `WAFER_GUEST_VERSION` is 2.
+
+**Your blocks.** A block compiled against version 1 keeps serving, but each of
+its `db::list` calls without a `.limit(n)` now fails with `InvalidArgument`.
+Staging refuses a version-1 build with the `wafer-guest-version` diagnostic,
+and so does importing a seed bundle that carries one.
+
+**What to do.** For each block: replace `blocks/<name>/src/wafer_guest.rs` with
+the current module — `GET /b/dev/api/reference` returns it as
+`wafer_guest_module`, and a newly scaffolded block has it — then compile and
+stage again. The block's own files are unchanged. Re-export any seed bundle
+afterwards.
+
+### Native: proxy and connection settings for the HTTP listener
+
+**What changes.** Six infrastructure variables configure the native HTTP
+listener; each is unset by default, which keeps the listener's own default.
+
+- `IMPRESSPRESS_TRUSTED_PROXIES` — comma-separated IPs or CIDR ranges of
+  reverse proxies whose `X-Forwarded-For` is honored. Unset trusts none, so
+  behind a proxy every client shares the proxy's address, and one rate-limit
+  bucket. Set it when you run behind one.
+- `IMPRESSPRESS_HEADER_READ_TIMEOUT_SECS`, `IMPRESSPRESS_BODY_READ_TIMEOUT_SECS`,
+  `IMPRESSPRESS_WRITE_TIMEOUT_SECS` — how long a client may take to send its
+  headers, to send its body (a slower body is answered `408`), and to read the
+  response. Slow clients that used to hold a connection open indefinitely are
+  now cut off; raise these if yours are legitimately slow.
+- `IMPRESSPRESS_MAX_CONNECTIONS` — connections open at once; further clients
+  wait in the accept backlog.
+- `IMPRESSPRESS_SHUTDOWN_GRACE_SECS` — how long a stopping server lets open
+  requests finish. Shutdown may now wait up to this long.
+
+A value the listener cannot use fails boot with a message naming the setting.
+
+### Cloudflare: outbound redirects are followed, hop by hop
+
+**What changes.** An outbound request from a block used to fail when the far
+end answered with a redirect. The Worker now hands the redirect back to the
+network service, which follows it as a new request: each hop is checked
+against the calling block's network grant and the internal-address filter,
+so a redirect to an address the block may not reach, or to an internal one,
+is refused before it is contacted. The browser still refuses redirects.
+
+### Logs: a block's log line names the block that wrote it
+
+**What changes.** A line a block writes through the logger now leads with the
+registered name of the block that wrote it, and carries the block's text as a
+quoted `msg` field: `caller=site/shop msg="order placed" order=o_1`. Control
+characters in the text are escaped, so one call is one line. Native logs
+carry the same fields; a JSON log collector finds the block's text under
+`msg` rather than `message`. Adjust any log query that matched on it.
+
+### Vector: index names are lowercase, and existing mixed-case indexes move at start
 
 **What changes.** An index name is 1 to 33 characters of lowercase letters,
 digits and `_`. The database layer now refuses any other table name rather
 than rewriting it, and an index's tables are named after it
 (`impresspress__vector__{name}_meta` and its siblings), so an uppercase name
-(`Docs`) can no longer be created, opened, queried or deleted, and a name
-longer than 33 characters would give a table name longer than the 63 bytes
-PostgreSQL keeps.
+(`Docs`) can no longer be created, and a name longer than 33 characters would
+give a table name longer than the 63 bytes PostgreSQL keeps.
 
-**Your data.** Migration `002_lowercase_index_names` renames each registry row
-to its lowercase spelling. The index's tables need no rename: they live in the
-SQLite vector database, which already treats `Docs` and `docs` as the same
-table. Where two registry rows fold to one name (`Docs` beside `docs`) they
-already addressed the same tables; the lowercase row is kept, otherwise the
-lowest-sorting spelling, and the other rows are deleted. Adding 002 re-runs
-the vector migration set, which is safe: 001 is `CREATE … IF NOT EXISTS` and
-002 finds nothing to change the second time.
+**Your data.** Nothing to run. Each time the vector block starts, it moves every
+index registered with an uppercase letter to its lowercase name — the index's
+tables, its entries and its keyword search, then its registry row
+(`vector.rename_index`, one transaction per index on native SQLite and in the
+browser). `Docs` becomes `docs` and answers under that name with everything
+it held. The move is logged at info level, and a start that finds nothing to
+move does nothing.
 
-**Without the migration.** Until 002 runs, one index whose name has an
-uppercase letter is enough to make the vector admin's index list answer an
-error (its vector count cannot be read under that name), and the index itself
-cannot be opened, queried or deleted. An index named with more than 33
-characters cannot be opened, queried or deleted under this release at all,
-migration or not, and one long enough that a table name passes 63 bytes breaks
-the list the same way: delete it before upgrading.
+**Two indexes that differ only by case** (`Docs` beside `docs`) are never
+merged. The uppercase one is left as it is and named in an error log ("two
+vector indexes differ only by case"); it cannot be opened until you delete
+one of the two. Any other index that cannot be moved is named in an error log
+with the reason, and the rest of the vector block keeps working.
 
+**Until the move has run**, an index whose name has an uppercase letter makes
+the vector admin's index list answer an error and cannot be opened, queried
+or deleted. An index named with more than 33 characters cannot be opened,
+queried or deleted under this release at all: delete it before upgrading.
 
 ### Config: your `.env` applies again, and one boot decides the ties
 
@@ -484,9 +541,9 @@ nothing is backfilled, and nobody is signed out.
 deployment that skips `--run-migrations` logs the generic `schema drift;
 redeploy with --run-migrations to apply` warning for the files block on each
 boot. With strict schema off (the default there), an upload of a new key still
-works and adds the column. Replacing an object fails until the column exists —
-the take-over checks the row's `claim_id`, and a condition never adds a column
-— so run the migration rather than rely on a first upload. If you have turned
+works and adds the column. Replacing an object answers `500` until the column
+exists — the take-over checks the row's `claim_id`, and a condition never adds
+a column — so run the migration rather than rely on a first upload. If you have turned
 `WAFER_RUN__DATABASE__STRICT_SCHEMA` **on**, every upload fails on the missing
 column until it runs.
 
