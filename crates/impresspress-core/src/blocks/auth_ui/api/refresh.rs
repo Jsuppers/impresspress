@@ -20,7 +20,10 @@ use wafer_run::{context::Context, InputStream, OutputStream};
 use crate::{
     blocks::{
         auth::{
-            helpers::{ensure_admin_role, expected_issuer, issue_tokens_and_cookie},
+            helpers::{
+                ensure_admin_role, expected_issuer, issue_tokens_and_cookie, Rotation,
+                SessionLifetime,
+            },
             repo::{tokens, users},
         },
         auth_ui::contracts::{RefreshRequest, RefreshResponse, TokenType},
@@ -143,6 +146,14 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // this very token first, and this one is refused with the same answer a
     // replayed token gets. If issuance then fails the user is logged out —
     // recoverable, and the alternative is a live token nobody can account for.
+    // The lifetime is resolved before the claim: a misconfigured one refuses
+    // the refresh and leaves the presented token live, rather than revoking it
+    // for an issuance that cannot succeed (see `SessionLifetime`).
+    let lifetime = match SessionLifetime::resolve_or_error(ctx).await {
+        Ok(lifetime) => lifetime,
+        Err(r) => return r,
+    };
+
     match tokens::revoke_if_live(ctx, &row.id).await {
         Ok(true) => {}
         Ok(false) => return refuse_not_live(ctx, &row, NotLive::CasLoss).await,
@@ -153,20 +164,22 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Err(e) => return crud::db_error_internal(e, "Refresh could not rotate the token"),
     }
 
-    // Re-issue within the *preserved* family (SEC-039): passing
-    // `Some(&row.family)` makes `generate_tokens` carry the existing family on
-    // the new refresh JWT so its `family` claim agrees with the DB row that
-    // anchors reuse detection. `generation = row.generation + 1` advances the
-    // rotation counter. This is the same shared issuance tail every other
+    // Re-issue within the *preserved* family (SEC-039): `Rotation::Within`
+    // makes `generate_tokens` carry the existing family on the new refresh JWT
+    // so its `family` claim agrees with the DB row that anchors reuse
+    // detection, and `row.generation + 1` advances the rotation counter. This is the same shared issuance tail every other
     // login flow uses, so the userportal session row is written here too.
     let issued = match issue_tokens_and_cookie(
         ctx,
+        &lifetime,
         &user_id,
         &email,
         &roles,
         &prior_auth_method,
-        Some(&row.family),
-        row.generation + 1,
+        Rotation::Within {
+            family: &row.family,
+            generation: row.generation + 1,
+        },
     )
     .await
     {

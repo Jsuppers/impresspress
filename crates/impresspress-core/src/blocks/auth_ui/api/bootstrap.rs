@@ -18,7 +18,7 @@ use crate::{
     blocks::{
         auth::{
             bootstrap,
-            helpers::issue_tokens_and_cookie,
+            helpers::{issue_tokens_and_cookie, Rotation, SessionLifetime},
             repo::{bootstrap_tokens, users},
             service::hash_token,
         },
@@ -78,6 +78,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     //    delete are now the same SQL statement, the database serializes the
     //    two attempts — only one caller can ever observe `true` here, so
     //    only one can proceed past this point.
+    // 0. Resolve the session lifetime before the token is spent: a
+    //    misconfigured one refuses the redemption and leaves the single-use
+    //    token redeemable (see `SessionLifetime`).
+    let lifetime = match SessionLifetime::resolve_or_error(ctx).await {
+        Ok(lifetime) => lifetime,
+        Err(r) => return r,
+    };
+
     match bootstrap_tokens::take_valid_by_hash(ctx, &token_hash).await {
         Ok(true) => {}
         Ok(false) => return err_unauthorized("invalid or expired bootstrap token"),
@@ -107,11 +115,20 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
 
     // 5. Mint a session — same shared token-issuance tail as login/signup.
     let roles = vec!["admin".to_string()];
-    let issued =
-        match issue_tokens_and_cookie(ctx, &user.id, &email, &roles, "password", None, 0).await {
-            Ok(i) => i,
-            Err(r) => return r,
-        };
+    let issued = match issue_tokens_and_cookie(
+        ctx,
+        &lifetime,
+        &user.id,
+        &email,
+        &roles,
+        "password",
+        Rotation::NewFamily,
+    )
+    .await
+    {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
 
     // 6. Set the auth cookie + redirect to a real post-login destination. The
     //    form is a plain HTML POST (no JS), so a 302 with Set-Cookie is the

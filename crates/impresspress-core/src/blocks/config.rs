@@ -72,7 +72,7 @@ use crate::{
     config_generation::config_write_generation,
     // audit-allow: this block never reaches the table under WRAP — it reads and writes through `variables`' boot-flavour API (`load_all`, `find_by_key`, `set`) over the raw `DatabaseService` that `builder::registration` hands it, the same way `D1ConfigSource` reads this table, so no grant applies (a `ctx`-routed read IS denied: see `the_config_block_reads_the_variables_table_under_wrap`); the audit also derives the caller `impresspress/config` from the file path, while the block registers as `wafer-run/config`
     platform_state::variables,
-    util::{is_sensitive_key, validate_url_value},
+    util::{is_sensitive_key, validate_config_value},
 };
 
 /// Keys the boot map always answers, whatever the variables table holds — and
@@ -519,13 +519,11 @@ impl VariablesConfigBlock {
                 format!("Cannot set {key} to an empty value"),
             )));
         }
-        if key.ends_with("_URL") {
-            if let Err(e) = validate_url_value(value) {
-                return Err(OutputStream::error(WaferError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("Invalid value for {key}: {e}"),
-                )));
-            }
+        if let Err(e) = validate_config_value(key, value) {
+            return Err(OutputStream::error(WaferError::new(
+                ErrorCode::InvalidArgument,
+                format!("Invalid value for {key}: {e}"),
+            )));
         }
 
         // What this asserts ON TOP of the key's own declaration, which
@@ -1098,6 +1096,32 @@ mod boot_owned_key_tests {
                 .is_none(),
             "a refused write must not leave a row behind"
         );
+    }
+
+    /// `CONFIG_SET` refuses a session lifetime past its bound, like the admin
+    /// write surfaces: the value would fail every login
+    /// (`auth::helpers::session_lifetime_days`).
+    #[tokio::test]
+    async fn config_set_refuses_an_out_of_range_session_lifetime() {
+        let key = crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+        let ctx = booted_with(&[]).await;
+
+        let result = wafer_core::clients::config::set(&ctx, key, "100000000").await;
+        assert!(
+            result.is_err(),
+            "CONFIG_SET of an out-of-range session lifetime must fail"
+        );
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .is_none(),
+            "a refused write must not leave a row behind"
+        );
+
+        wafer_core::clients::config::set(&ctx, key, "30")
+            .await
+            .expect("an in-range lifetime is stored");
     }
 
     /// `CONFIG_SET` refuses the mask, like every other write surface.

@@ -10,6 +10,7 @@ use crate::{
         auth::{
             helpers::{
                 email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
+                Rotation, SessionLifetime,
             },
             repo::users,
         },
@@ -140,6 +141,19 @@ pub async fn handle(
     // failure is a real backend fault on a new address and is reported as
     // one — it is not the enumeration oracle, because a registered address
     // never reaches it.
+    // Resolved before the account exists when this signup will sign the user
+    // in: a misconfigured session lifetime then refuses the request instead of
+    // creating an account that answers "already registered" to the retry (see
+    // `SessionLifetime`). A signup awaiting verification issues nothing.
+    let lifetime = if require_verification {
+        None
+    } else {
+        match SessionLifetime::resolve_or_error(ctx).await {
+            Ok(lifetime) => Some(lifetime),
+            Err(r) => return r,
+        }
+    };
+
     let user = match users::insert_with_password(
         ctx,
         users::NewUser {
@@ -172,7 +186,8 @@ pub async fn handle(
 
     let roles = vec![role.to_string()];
 
-    if require_verification {
+    // `None` exactly when verification is required (resolved above).
+    let Some(lifetime) = lifetime else {
         // After the response: see above. The body cannot carry a send
         // failure anyway — it is the same body the registered branch
         // answers, and one that varied with whether mail went out would be
@@ -193,19 +208,26 @@ pub async fn handle(
         return ResponseBuilder::new()
             .status(201)
             .json(&pending_verification(email_lower));
-    }
+    };
 
     // Mint tokens, persist the refresh + session rows, build the cookie
     // (only when email verification is NOT required) — this is the
     // auto-login path: a brand-new user is fully signed in by the time this
     // response reaches the browser, no separate login step needed.
-    let issued =
-        match issue_tokens_and_cookie(ctx, &user.id, &email_lower, &roles, "password", None, 0)
-            .await
-        {
-            Ok(i) => i,
-            Err(r) => return r,
-        };
+    let issued = match issue_tokens_and_cookie(
+        ctx,
+        &lifetime,
+        &user.id,
+        &email_lower,
+        &roles,
+        "password",
+        Rotation::NewFamily,
+    )
+    .await
+    {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
 
     // Role-aware post-login default (Fix 2 / signup UX): a brand-new signup
     // is (almost) never an admin, so this sends them to `/b/userportal/`

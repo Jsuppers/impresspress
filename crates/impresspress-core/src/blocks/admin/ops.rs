@@ -26,12 +26,12 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
 use super::{logs::audit_log, ROLES_TABLE};
-/// SSRF URL validator for `InputType::Url` writes. The single implementation
-/// lives in [`crate::util::validate_url_value`]; re-exported here so the admin
-/// variable create/update paths and the generic settings form
-/// (`ui::settings_form::save_settings`) validate through the exact same impl and
-/// can't diverge on what a URL value is allowed to be.
-pub(super) use crate::util::validate_url_value;
+/// The config-value write rule. The single implementation lives in
+/// [`crate::util::validate_config_value`]; re-exported here so the admin
+/// variable create/update paths, the `config.set` writer and the generic
+/// settings form (`ui::settings_form::save_settings`) validate through the
+/// exact same impl and can't diverge on what a value is allowed to be.
+pub(super) use crate::util::validate_config_value;
 /// `MASKED_VALUE` / `is_sensitive_key`: the single source of truth lives in
 /// [`crate::util`] so the generic ConfigVar-driven settings form
 /// (`ui::settings_form`) can share it too — masking on a DB `sensitive` flag
@@ -975,9 +975,10 @@ pub(super) async fn delete_variable(
     Ok(())
 }
 
-/// Create a config variable, writing an audit-log row. Validates `_URL` keys
-/// against [`validate_url_value`] (SSRF). `key` must be non-empty, and must
-/// not name a key the runtime owns ([`reject_runtime_owned_key`]).
+/// Create a config variable, writing an audit-log row. Validates the value
+/// with [`validate_config_value`] (SSRF for `_URL` keys, bounded lifetimes).
+/// `key` must be non-empty, and must not name a key the runtime owns
+/// ([`reject_runtime_owned_key`]).
 ///
 /// `value` must also be non-empty for a key something MASKS — judged on the
 /// key alone, not on the `sensitive` argument, for the reason spelled out at
@@ -1024,11 +1025,9 @@ pub(super) async fn create_variable(
         )));
     }
 
-    // Validate URL-type keys (SSRF) on both surfaces.
-    if key.ends_with("_URL") {
-        if let Err(e) = validate_url_value(value) {
-            return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
-        }
+    // The per-key value rule (URL/SSRF, bounded lifetimes) on both surfaces.
+    if let Err(e) = validate_config_value(key, value) {
+        return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
     }
 
     let new = NewVariable {
@@ -1113,7 +1112,8 @@ async fn stored_sensitive_flag(ctx: &dyn Context, key: &str) -> Result<i64, Outp
 /// says, which is what covers Password-typed declared vars; the exception is a
 /// SPENT provisioning credential, which [`is_clearable_provisioning_credential`]
 /// names and which must stay clearable because nothing can delete it either)
-/// and the `_URL` SSRF validation on both surfaces.
+/// and the [`validate_config_value`] rule (`_URL` SSRF, bounded lifetimes) on
+/// both surfaces.
 ///
 /// Also refuses a value that is the mask a read path emitted rather than a
 /// value the caller means — see [`is_masked_submission`]. Both surfaces route
@@ -1202,11 +1202,9 @@ pub(super) async fn update_variable(
                 "Cannot set {key} to an empty value"
             )));
         }
-        // Validate URL-type keys (SSRF) on both surfaces.
-        if key.ends_with("_URL") {
-            if let Err(e) = validate_url_value(value) {
-                return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
-            }
+        // The per-key value rule (URL/SSRF, bounded lifetimes) on both surfaces.
+        if let Err(e) = validate_config_value(key, value) {
+            return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
         }
     } else if variables::get_by_key(ctx, key)
         .await
@@ -1906,6 +1904,137 @@ mod tests {
             resp["user"]["email"],
             serde_json::json!(EMAIL),
             "clearing the spent provisioning copy must not affect authentication: {resp}"
+        );
+    }
+
+    /// A session lifetime already stored past its bound fails the login with
+    /// a 500 instead of taking the server down.
+    ///
+    /// The lifetime is added to the current time for the refresh token's
+    /// expiry, and `100000000` days reaches past the last date chrono can
+    /// represent, where `DateTime + Duration` panics — and a release build
+    /// aborts on a panic, so every login killed the native process. The write
+    /// surfaces refuse such a value now, so the row is staged directly, as an
+    /// older build or the process environment could have left it. Drives the
+    /// real login handler through the production config block.
+    #[tokio::test]
+    async fn an_out_of_range_stored_session_lifetime_fails_login_with_a_500_not_a_crash() {
+        use crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+
+        const EMAIL: &str = "lifetime@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        crate::blocks::auth::repo::local_credentials::insert(
+            &ctx,
+            &crate::test_support::seed_user(EMAIL).insert(&ctx).await.id,
+            &wafer_core::clients::crypto::hash(&ctx, PASSWORD)
+                .await
+                .expect("hash the password"),
+            false,
+        )
+        .await
+        .expect("store the credential");
+        variables::seed_row_with_flag(&ctx, SESSION_LIFETIME_DAYS_KEY, "100000000", 0).await;
+        // The raw fixture insert skips the repo's generation bump; without it
+        // a config snapshot warmed earlier would keep serving the default.
+        crate::config_generation::note_config_write();
+
+        let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
+        let status = crate::test_support::output_http_status(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(body.into_bytes()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status, 500,
+            "a misconfigured session lifetime must refuse the login, not issue tokens"
+        );
+    }
+
+    /// A refresh refused for a misconfigured session lifetime leaves the
+    /// presented refresh token live.
+    ///
+    /// The refresh handler claims the token row (compare-and-set revoke)
+    /// before it mints the successor. Reading the lifetime only inside
+    /// issuance meant the claim had already spent the token when the read
+    /// failed, so every session died at its next refresh even after the
+    /// operator fixed the value. Drives the real login and refresh handlers:
+    /// the same token must refresh once the value is corrected.
+    #[tokio::test]
+    async fn a_refresh_refused_for_a_bad_session_lifetime_keeps_the_token_live() {
+        use crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+
+        const EMAIL: &str = "refresh-lifetime@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        crate::blocks::auth::repo::local_credentials::insert(
+            &ctx,
+            &crate::test_support::seed_user(EMAIL).insert(&ctx).await.id,
+            &wafer_core::clients::crypto::hash(&ctx, PASSWORD)
+                .await
+                .expect("hash the password"),
+            false,
+        )
+        .await
+        .expect("store the credential");
+
+        let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
+        let login = crate::test_support::output_json(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(body.into_bytes()),
+            )
+            .await,
+        )
+        .await;
+        let refresh_token = login["refresh_token"]
+            .as_str()
+            .expect("login returns a refresh token")
+            .to_string();
+        let refresh = || async {
+            let body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
+            crate::test_support::output_http_status(
+                crate::blocks::auth_ui::api::refresh::handle(
+                    &ctx,
+                    wafer_run::InputStream::from_bytes(body.into_bytes()),
+                )
+                .await,
+            )
+            .await
+        };
+
+        variables::seed_row_with_flag(&ctx, SESSION_LIFETIME_DAYS_KEY, "100000000", 0).await;
+        // The raw fixture insert skips the repo's generation bump.
+        crate::config_generation::note_config_write();
+        assert_eq!(
+            refresh().await,
+            500,
+            "the misconfigured lifetime refuses the refresh"
+        );
+
+        // The operator corrects it through the admin API.
+        expect_ok(
+            update_variable(
+                &ctx,
+                &admin_msg("update", "/admin/settings"),
+                SESSION_LIFETIME_DAYS_KEY,
+                VariableUpdate {
+                    value: Some("7"),
+                    description: None,
+                    sensitive: None,
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            refresh().await,
+            200,
+            "the refused refresh must not have spent the token"
         );
     }
 

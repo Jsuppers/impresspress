@@ -910,6 +910,36 @@ Like every `WAFER_RUN_SHARED__RATE_LIMIT_*` category it is set by key — proces
 environment or the `variables` table — and no `ConfigVar` declares it, so it
 does not appear as a field on any admin settings page. No migration is involved.
 
+### Auth: `SESSION_LIFETIME_DAYS` must be a whole number from 1 to 3650
+
+**What changes.** `WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS` is now
+checked. Before this release, any positive number was accepted. A value above
+about 95,000,000 crashed the native server on every login. A value of `0`, a
+non-number such as `abc`, or a padded value such as ` 7` was quietly read as the
+default of 7 days. From this release:
+
+- The admin Variables page, the settings API and `CONFIG_SET` refuse any value
+  outside 1–3650 with a 400.
+- The boot seeders do not store an environment export that fails this rule.
+  The boot log names it at ERROR ("refusing to seed this config key from the
+  environment"), and the stored value, or else the default, stays in effect.
+- A value **already stored** outside the range is refused when it is read.
+  Login, signup, refresh, bootstrap redemption and the OAuth callback then
+  answer with a 500 that names the key. The request that fails does not use up
+  the refresh token, bootstrap token or OAuth state it presented, so sessions
+  resume once the value is corrected.
+
+**What to check before upgrading.** Look at the stored value (Admin → Settings →
+Variables). If it is not a whole number from 1 to 3650, set a valid one before
+you upgrade. After upgrading with a bad stored value, nobody can sign in or
+refresh until it is fixed. The fix depends on who owns the row:
+
+- *The environment owns the row* (no admin ever edited it). Export a valid value
+  and restart; the boot replaces the row.
+- *An admin edited the row.* Correct it on the Variables page from a session
+  that is still signed in. If no session is left, the stored row has to be
+  edited directly in the database.
+
 ### Auth: a refused database call is a 403, not a 500
 
 **What changes.** When WRAP refused one of the auth routes' database calls — a

@@ -34,6 +34,10 @@ pub const TTL_KEY: &str = "IMPRESSPRESS__SIGNAL__ROOM_TTL_SECONDS";
 pub const MAX_SDP_KEY: &str = "IMPRESSPRESS__SIGNAL__MAX_SDP_BYTES";
 pub const STUN_KEY: &str = "IMPRESSPRESS__SIGNAL__STUN_URLS";
 pub const DEFAULT_TTL_SECONDS: i64 = 600;
+/// Longest room lifetime [`TTL_KEY`] can grant: a day. The TTL is added to the
+/// current time to stamp a room's expiry, and an unbounded value reaches past
+/// the last date chrono can represent, where that addition panics.
+pub const MAX_TTL_SECONDS: i64 = 86_400;
 pub const DEFAULT_MAX_SDP_BYTES: usize = 16_384;
 pub const DEFAULT_STUN_URLS: &str = "stun:stun.l.google.com:19302";
 
@@ -44,8 +48,10 @@ pub fn config_vars() -> Vec<ConfigVar> {
     vec![
         ConfigVar::new(
             TTL_KEY,
-            "How long a signalling room stays open before it expires and its \
-             code is free again",
+            &format!(
+                "How long a signalling room stays open before it expires and its \
+                 code is free again (1 to {MAX_TTL_SECONDS} seconds)"
+            ),
             &DEFAULT_TTL_SECONDS.to_string(),
         )
         .name("Room TTL (seconds)")
