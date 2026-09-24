@@ -208,7 +208,7 @@ async fn get_by_stripe_sub(
                 operator: FilterOp::Equal,
                 value: serde_json::json!(stripe_subscription_id),
             }],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },
@@ -573,7 +573,7 @@ pub(crate) async fn find_user_by_stripe_sub(
                 operator: FilterOp::Equal,
                 value: serde_json::json!(stripe_subscription_id),
             }],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },
@@ -619,7 +619,7 @@ pub(crate) async fn active_plan_exists(
                     value: serde_json::json!(plan),
                 },
             ],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },

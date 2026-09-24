@@ -72,6 +72,7 @@ pub mod kv;
 pub mod llm_target;
 pub mod llm_wire;
 pub mod log_level;
+pub mod log_line;
 pub mod metrics;
 pub mod migration_helper;
 pub mod multipart;

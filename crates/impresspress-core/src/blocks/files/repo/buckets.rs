@@ -143,13 +143,13 @@ pub async fn list_owned_sorted(
 }
 
 /// Most recently created buckets, newest first (admin listing).
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Page<BucketRow>, WaferError> {
+pub async fn list_recent(ctx: &dyn Context, limit: u32) -> Result<Page<BucketRow>, WaferError> {
     let opts = ListOptions {
         sort: vec![SortField {
             field: "created_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     Ok(Page::decode(

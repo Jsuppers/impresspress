@@ -11,6 +11,7 @@
 
 use std::fmt;
 
+use impresspress_core::log_line::LogLine;
 use tracing::{
     field::{Field as TracingField, Visit},
     span, Event, Level, Metadata, Subscriber,
@@ -27,32 +28,31 @@ pub struct ConsoleLogger;
 unsafe impl Send for ConsoleLogger {}
 unsafe impl Sync for ConsoleLogger {}
 
-fn format_message(msg: &str, fields: &[Field]) -> String {
-    if fields.is_empty() {
-        return msg.to_string();
+/// A block's record as one console line — see `impresspress_core::log_line`.
+fn format_message(caller: Option<&str>, msg: &str, fields: &[Field]) -> String {
+    LogLine {
+        caller,
+        msg,
+        fields,
     }
-    let field_str: Vec<String> = fields
-        .iter()
-        .map(|f| format!("{}={}", f.key, f.value))
-        .collect();
-    format!("{} {}", msg, field_str.join(" "))
+    .to_string()
 }
 
 impl LoggerService for ConsoleLogger {
-    fn debug(&self, msg: &str, fields: &[Field]) {
-        console::log_1(&format_message(msg, fields).into());
+    fn debug(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        console::log_1(&format_message(caller, msg, fields).into());
     }
 
-    fn info(&self, msg: &str, fields: &[Field]) {
-        console::log_1(&format_message(msg, fields).into());
+    fn info(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        console::log_1(&format_message(caller, msg, fields).into());
     }
 
-    fn warn(&self, msg: &str, fields: &[Field]) {
-        console::warn_1(&format_message(msg, fields).into());
+    fn warn(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        console::warn_1(&format_message(caller, msg, fields).into());
     }
 
-    fn error(&self, msg: &str, fields: &[Field]) {
-        console::error_1(&format_message(msg, fields).into());
+    fn error(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        console::error_1(&format_message(caller, msg, fields).into());
     }
 }
 
@@ -63,9 +63,8 @@ pub fn make_console_logger(
 
 // ─── `tracing` → console bridge ──────────────────────────────────────────────
 
-/// Collects an event's `message` and its remaining fields into one line, in the
-/// same `message key=value key=value` shape [`format_message`] produces for the
-/// block-facing logger, so both halves read alike in the console.
+/// Collects an event's `message` and its remaining fields into one line:
+/// `target message key=value key=value`.
 #[derive(Default)]
 struct LineVisitor {
     message: String,

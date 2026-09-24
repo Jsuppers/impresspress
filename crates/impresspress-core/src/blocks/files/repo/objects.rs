@@ -873,7 +873,7 @@ pub async fn list_stale_pending(
     ctx: &dyn Context,
     user_id: &str,
     cutoff: &str,
-    limit: i64,
+    limit: u32,
 ) -> Result<Vec<StoredRow>, WaferError> {
     let filters = vec![
         Filter {
@@ -894,7 +894,7 @@ pub async fn list_stale_pending(
             field: "uploaded_at".to_string(),
             desc: false,
         }],
-        limit,
+        limit: Some(limit),
         skip_count: true,
         ..Default::default()
     };
@@ -913,7 +913,7 @@ pub async fn search_completed(
     ctx: &dyn Context,
     user_id: &str,
     query: &str,
-    limit: i64,
+    limit: u32,
     offset: i64,
 ) -> Result<Page<ObjectRow>, WaferError> {
     let opts = ListOptions {
@@ -940,7 +940,7 @@ pub async fn search_completed(
             field: "uploaded_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         offset,
         skip_count: false,
         ..Default::default()
@@ -958,7 +958,7 @@ pub async fn list_page_for_bucket(
     ctx: &dyn Context,
     bucket: &str,
     prefix: &str,
-    limit: i64,
+    limit: u32,
     offset: i64,
 ) -> Result<Page<ObjectRow>, WaferError> {
     let mut filters = vec![Filter {
@@ -979,7 +979,7 @@ pub async fn list_page_for_bucket(
             field: "key".to_string(),
             desc: false,
         }],
-        limit,
+        limit: Some(limit),
         offset,
         skip_count: false,
         ..Default::default()
@@ -992,7 +992,7 @@ pub async fn list_page_for_bucket(
 pub async fn list_for_bucket(
     ctx: &dyn Context,
     bucket: &str,
-    limit: i64,
+    limit: u32,
 ) -> Result<Page<ObjectRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![Filter {
@@ -1004,7 +1004,7 @@ pub async fn list_for_bucket(
             field: "key".to_string(),
             desc: false,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     Page::try_decode(db::list(ctx, TABLE, &opts).await?, ObjectRow::from_record)

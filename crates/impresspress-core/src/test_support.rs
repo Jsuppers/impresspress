@@ -2902,19 +2902,6 @@ impl CryptoService for PinnedMintCrypto {
         self.inner.compare_hash(password, hash)
     }
 
-    fn sign(
-        &self,
-        claims: HashMap<String, serde_json::Value>,
-        expiry: std::time::Duration,
-    ) -> Result<String, CryptoError> {
-        let signed = self.inner.sign(claims, expiry)?;
-        self.pin(signed, CRYPTO_BLOCK_JWT_SECRET.as_bytes())
-    }
-
-    fn verify(&self, token: &str) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
-        self.inner.verify(token)
-    }
-
     fn sign_for(
         &self,
         block_id: &str,

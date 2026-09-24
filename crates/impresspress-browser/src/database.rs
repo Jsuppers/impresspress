@@ -88,7 +88,7 @@ use std::{
 // name in their own signatures are imported here.
 use wafer_block::db::Filter;
 use wafer_core::interfaces::database::{
-    codec::{record_from_json_row, scalar_f64, scalar_i64},
+    codec::{record_from_json_row, scalar_f64, scalar_i64, JsonColumns},
     exec::{DbExec, TxOp, TxResult},
     schema_cache::SchemaCache,
     service::{
@@ -300,11 +300,12 @@ impl DbExec for BrowserDatabaseService {
         &self,
         sql: &str,
         params: &[serde_json::Value],
+        json: &JsonColumns,
     ) -> Result<Vec<Record>, DatabaseError> {
         Ok(self
             .query_json_rows(sql, params)?
             .into_iter()
-            .map(record_from_json_row)
+            .map(|row| record_from_json_row(row, json))
             .collect())
     }
 
@@ -312,8 +313,9 @@ impl DbExec for BrowserDatabaseService {
         &self,
         sql: &str,
         params: &[serde_json::Value],
+        json: &JsonColumns,
     ) -> Result<Record, DatabaseError> {
-        let records = self.run_fetch(sql, params).await?;
+        let records = self.run_fetch(sql, params, json).await?;
         records.into_iter().next().ok_or(DatabaseError::NotFound)
     }
 
@@ -349,8 +351,9 @@ impl DbExec for BrowserDatabaseService {
         &self,
         sql: &str,
         params: &[serde_json::Value],
+        json: &JsonColumns,
     ) -> Result<Vec<Record>, DatabaseError> {
-        self.run_fetch(sql, params).await
+        self.run_fetch(sql, params, json).await
     }
 
     async fn run_scalar_i64(
@@ -385,10 +388,10 @@ impl DbExec for BrowserDatabaseService {
                 let rows = bridge::db_exec_raw(sql, params_js).map_err(|e| statement_failed(&e))?;
                 Ok(TxResult::Execute(rows as i64))
             }
-            TxOp::Returning { sql, params } => Ok(TxResult::Returning(
+            TxOp::Returning { sql, params, json } => Ok(TxResult::Returning(
                 self.query_json_rows(sql, params)?
                     .into_iter()
-                    .map(record_from_json_row)
+                    .map(|row| record_from_json_row(row, json))
                     .collect(),
             )),
         })
@@ -789,27 +792,44 @@ mod conformance {
 mod codec_policy {
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use super::{record_from_json_row, scalar_f64, scalar_i64};
+    use super::{record_from_json_row, scalar_f64, scalar_i64, JsonColumns};
 
     /// sql.js stores JSON columns as TEXT; the shared codec restores the
-    /// structure the writer put in, so a block reading this column sees a
-    /// `Value::Object` on all three adapters.
+    /// structure the writer put in for a column declared JSON, so a block
+    /// reading it sees a `Value::Object` on all three adapters.
     #[wasm_bindgen_test]
-    fn json_text_columns_are_reparsed() {
+    fn json_declared_columns_are_reparsed() {
         let rec = record_from_json_row(
             serde_json::json!({"id": "1", "meta": "{\"k\":\"v\"}", "tags": "[1,2]"}),
+            &JsonColumns::new(["meta", "tags"]),
         );
         assert_eq!(rec.id, "1");
         assert_eq!(rec.data.get("meta").unwrap(), &serde_json::json!({"k":"v"}));
         assert_eq!(rec.data.get("tags").unwrap(), &serde_json::json!([1, 2]));
     }
 
+    /// Text in a column not declared JSON stays the string that was written,
+    /// however much it looks like JSON.
+    #[wasm_bindgen_test]
+    fn json_looking_text_in_a_text_column_stays_a_string() {
+        let rec = record_from_json_row(
+            serde_json::json!({"id": "1", "title": "{\"k\":\"v\"}", "tags": "[1,2]"}),
+            JsonColumns::NONE,
+        );
+        assert_eq!(
+            rec.data.get("title").unwrap(),
+            &serde_json::json!("{\"k\":\"v\"}")
+        );
+        assert_eq!(rec.data.get("tags").unwrap(), &serde_json::json!("[1,2]"));
+    }
+
     /// A plain string that does not look like JSON stays a string, and one
-    /// that looks like JSON but does not parse stays a string too.
+    /// that does not parse stays a string even in a JSON column.
     #[wasm_bindgen_test]
     fn non_json_text_is_left_alone() {
         let rec = record_from_json_row(
             serde_json::json!({"id": "1", "note": "hello world", "broken": "{not json"}),
+            &JsonColumns::new(["broken"]),
         );
         assert_eq!(
             rec.data.get("note").unwrap(),
@@ -826,7 +846,7 @@ mod codec_policy {
     /// map.
     #[wasm_bindgen_test]
     fn numeric_id_is_stringified_and_retained() {
-        let rec = record_from_json_row(serde_json::json!({"id": 7, "v": "x"}));
+        let rec = record_from_json_row(serde_json::json!({"id": 7, "v": "x"}), JsonColumns::NONE);
         assert_eq!(rec.id, "7");
         assert_eq!(rec.data.get("id").unwrap(), &serde_json::json!(7));
     }
@@ -838,7 +858,7 @@ mod codec_policy {
     /// answer wins. This fails against the pre-unification tree.
     #[wasm_bindgen_test]
     fn a_non_object_row_is_an_empty_record_not_an_error() {
-        let rec = record_from_json_row(serde_json::json!(42));
+        let rec = record_from_json_row(serde_json::json!(42), JsonColumns::NONE);
         assert_eq!(rec.id, "");
         assert!(rec.data.is_empty());
     }

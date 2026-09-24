@@ -224,7 +224,7 @@ pub async fn paginated(
 /// "Recent Errors" card.
 pub async fn list_recent_errors(
     ctx: &dyn Context,
-    limit: i64,
+    limit: u32,
 ) -> Result<Vec<RequestLogRow>, WaferError> {
     let opts = ListOptions {
         columns: Some(vec![
@@ -237,7 +237,7 @@ pub async fn list_recent_errors(
         ]),
         filters: vec![is_error()],
         sort: newest_first(),
-        limit,
+        limit: Some(limit),
         skip_count: true,
         ..Default::default()
     };
@@ -257,7 +257,7 @@ pub async fn list_for_path(
     method: &str,
     path: &str,
     offset: i64,
-    limit: i64,
+    limit: u32,
 ) -> Result<Vec<RequestLogRow>, WaferError> {
     let opts = ListOptions {
         columns: Some(vec![
@@ -281,7 +281,7 @@ pub async fn list_for_path(
             },
         ],
         sort: newest_first(),
-        limit,
+        limit: Some(limit),
         offset,
         skip_count: true,
         ..Default::default()

@@ -43,7 +43,7 @@ pub async fn list_tickets(ctx: &dyn Context, msg: &Message) -> OutputStream {
         source: query.source.as_deref(),
         assignee_id: query.assignee_id.as_deref(),
     };
-    match repo::list_tickets(ctx, &filters, i64::from(query.page_size), offset).await {
+    match repo::list_tickets(ctx, &filters, query.page_size, offset).await {
         Ok(rows) => ok_json(&TicketListResponse::from_record_list(&rows)),
         Err(error) => crud::db_error_internal(error, "Could not list tickets"),
     }
@@ -153,7 +153,7 @@ pub async fn add_analysis(ctx: &dyn Context, msg: &Message, input: InputStream) 
 pub async fn list_types(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let query = TicketTypeListQuery::from_message(msg);
     let offset = i64::from(query.page.saturating_sub(1)) * i64::from(query.page_size);
-    match repo::list_types(ctx, false, i64::from(query.page_size), offset).await {
+    match repo::list_types(ctx, false, query.page_size, offset).await {
         Ok(rows) => ok_json(&TicketTypeListResponse::from_record_list(&rows)),
         Err(error) => crud::db_error_internal(error, "Could not list ticket types"),
     }

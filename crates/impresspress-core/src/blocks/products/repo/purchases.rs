@@ -31,7 +31,7 @@ pub(crate) const LINE_ITEMS_TABLE: &str = "impresspress__products__line_items";
 pub(crate) async fn recent_seller_failures(
     ctx: &dyn Context,
     seller_account_id: &str,
-    limit: i64,
+    limit: u32,
 ) -> Result<Vec<SellerFailureSummary>, WaferError> {
     let limit = limit.clamp(1, 50);
     let terminal = db::list(
@@ -54,7 +54,7 @@ pub(crate) async fn recent_seller_failures(
                 field: "created_at".to_string(),
                 desc: true,
             }],
-            limit,
+            limit: Some(limit),
             ..Default::default()
         },
     )
@@ -83,7 +83,7 @@ pub(crate) async fn recent_seller_failures(
                 field: "created_at".to_string(),
                 desc: true,
             }],
-            limit,
+            limit: Some(limit),
             ..Default::default()
         },
     )
@@ -566,7 +566,7 @@ pub(crate) async fn customer_for_buyer(
                 field: "created_at".to_string(),
                 desc: true,
             }],
-            limit: 100,
+            limit: Some(100),
             skip_count: true,
             ..Default::default()
         },
@@ -587,7 +587,7 @@ pub(crate) async fn customer_for_buyer(
                     field: "created_at".to_string(),
                     desc: true,
                 }],
-                limit: 100,
+                limit: Some(100),
                 skip_count: true,
                 ..Default::default()
             },
@@ -1787,7 +1787,7 @@ async fn paid_order_ids_by_currency(
             cursor.as_deref(),
         )
         .await?;
-        let short = (page.len() as i64) < db_read::KEYSET_PAGE;
+        let short = page.len() < db_read::KEYSET_PAGE as usize;
         cursor = page.last().map(|row| row.id.clone());
         for row in page {
             let currency =
@@ -2179,7 +2179,7 @@ pub(crate) async fn line_item_exists_for_product(
                     value: serde_json::json!(product_id),
                 },
             ],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },

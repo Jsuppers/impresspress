@@ -299,7 +299,7 @@ impl LegalPagesBlock {
             Ok(value) => value,
             Err(resp) => return resp,
         };
-        match documents::list_page(ctx, doc_type, page as i64, page_size as i64).await {
+        match documents::list_page(ctx, doc_type, page as i64, page_size as u32).await {
             Ok(page) => ok_json(&DocumentListView::from_page(&page)),
             Err(e) => crud::db_error_internal(e, "Database error"),
         }

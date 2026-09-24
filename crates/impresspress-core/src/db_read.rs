@@ -35,11 +35,11 @@ use wafer_run::{context::Context, ErrorCode, WaferError};
 /// Matches the limit `wafer-core`'s `list_all` used, so no call site's
 /// behaviour changes below the ceiling; above it, this module reports rather
 /// than truncates.
-pub const UNPAGED_LIMIT: i64 = 10_000;
+pub const UNPAGED_LIMIT: u32 = 10_000;
 
 /// Rows per round-trip for the exhaustive reads ([`list_every`],
 /// [`page_after`]).
-pub const KEYSET_PAGE: i64 = 1_000;
+pub const KEYSET_PAGE: u32 = 1_000;
 
 /// Why a one-shot read of `collection` cannot return a large result.
 ///
@@ -148,7 +148,7 @@ async fn over_read(
     collection: &str,
     filters: Vec<Filter>,
     sort: Vec<SortField>,
-    limit: i64,
+    limit: u32,
 ) -> Result<Capped, WaferError> {
     let result = db::list(
         ctx,
@@ -158,14 +158,14 @@ async fn over_read(
             sort,
             // The extra row is the signal. `skip_count` keeps the backend off
             // the `SELECT COUNT(*)` round-trip that no caller here reads.
-            limit: limit.saturating_add(1),
+            limit: Some(limit.saturating_add(1)),
             skip_count: true,
             ..Default::default()
         },
     )
     .await?;
     let mut rows = result.records;
-    let truncated = rows.len() as i64 > limit;
+    let truncated = rows.len() > limit as usize;
     if truncated {
         rows.truncate(limit as usize);
     }
@@ -292,7 +292,7 @@ pub async fn page_after(
                 field: "id".to_string(),
                 desc: false,
             }],
-            limit: KEYSET_PAGE,
+            limit: Some(KEYSET_PAGE),
             skip_count: true,
             columns,
             ..Default::default()
@@ -347,7 +347,7 @@ pub async fn list_every(
     let mut cursor: Option<String> = None;
     loop {
         let page = page_after(ctx, collection, filters.clone(), None, cursor.as_deref()).await?;
-        let short = (page.len() as i64) < KEYSET_PAGE;
+        let short = page.len() < KEYSET_PAGE as usize;
         cursor = page.last().map(|row| row.id.clone());
         all.extend(page);
         if short || cursor.is_none() {

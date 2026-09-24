@@ -308,6 +308,7 @@ pub enum PreparedResourceType {
     Crypto,
     Network,
     Vector,
+    Auth,
 }
 
 /// One deployment-owned WRAP grant.

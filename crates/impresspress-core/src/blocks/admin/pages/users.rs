@@ -115,7 +115,7 @@ async fn users_tab(
         ctx,
         &ActiveUserQuery {
             page: page as i64,
-            page_size: page_size as i64,
+            page_size: page_size as u32,
             search: (!search.is_empty()).then(|| search.clone()),
         },
     )
@@ -480,7 +480,7 @@ async fn roles_tab(ctx: &dyn Context) -> Result<Markup, WaferError> {
             field: "name".into(),
             desc: false,
         }],
-        limit: 100,
+        limit: Some(100),
         ..Default::default()
     };
     let list = db::list(ctx, ROLES_TABLE, &opts).await?;

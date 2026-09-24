@@ -703,7 +703,7 @@ pub struct ActiveUserQuery {
     /// 1-based; values below 1 clamp to 1.
     pub page: i64,
     /// Rows per page; values below 1 fall back to 20.
-    pub page_size: i64,
+    pub page_size: u32,
     /// Case-insensitive `LIKE '%…%'` over the email address AND the user
     /// id. Both admin surfaces asked a different one of those two questions
     /// before this function existed; one door means one answer.
@@ -734,7 +734,7 @@ pub async fn list_active_page(
     } else {
         query.page_size
     };
-    let offset = (page - 1).saturating_mul(page_size);
+    let offset = (page - 1).saturating_mul(i64::from(page_size));
     let search = query.search.as_deref().filter(|s| !s.is_empty());
 
     let opts = match search {
@@ -749,7 +749,7 @@ pub async fn list_active_page(
                     ]),
                 ])]),
                 sort: newest_first(),
-                limit: page_size,
+                limit: Some(page_size),
                 offset,
                 skip_count: false,
                 ..Default::default()
@@ -758,7 +758,7 @@ pub async fn list_active_page(
         None => ListOptions {
             filters: vec![active_filter()],
             sort: newest_first(),
-            limit: page_size,
+            limit: Some(page_size),
             offset,
             skip_count: false,
             ..Default::default()
@@ -777,7 +777,7 @@ pub async fn list_active_page(
         rows,
         total_count: list.total_count,
         page,
-        page_size,
+        page_size: i64::from(page_size),
     })
 }
 
@@ -864,11 +864,11 @@ pub async fn daily_signups(
 /// The `limit` most recently created live accounts, newest first — the
 /// admin dashboard's "Recent Users" card. `skip_count: true`: the card
 /// shows rows, never a total.
-pub async fn list_recent_active(ctx: &dyn Context, limit: i64) -> Result<Vec<UserRow>, WaferError> {
+pub async fn list_recent_active(ctx: &dyn Context, limit: u32) -> Result<Vec<UserRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![active_filter()],
         sort: newest_first(),
-        limit,
+        limit: Some(limit),
         skip_count: true,
         ..Default::default()
     };

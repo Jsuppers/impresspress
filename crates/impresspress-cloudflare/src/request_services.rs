@@ -801,18 +801,6 @@ impl CryptoService for ScopedCryptoService {
         crypto()?.compare_hash(password, hash)
     }
 
-    fn sign(
-        &self,
-        claims: HashMap<String, serde_json::Value>,
-        expiry: Duration,
-    ) -> Result<String, CryptoError> {
-        crypto()?.sign(claims, expiry)
-    }
-
-    fn verify(&self, token: &str) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
-        crypto()?.verify(token)
-    }
-
     fn sign_for(
         &self,
         block_id: &str,
@@ -864,20 +852,20 @@ impl ScopedLoggerService {
 }
 
 impl LoggerService for ScopedLoggerService {
-    fn debug(&self, msg: &str, fields: &[Field]) {
-        self.with_logger(|logger| logger.debug(msg, fields));
+    fn debug(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        self.with_logger(|logger| logger.debug(caller, msg, fields));
     }
 
-    fn info(&self, msg: &str, fields: &[Field]) {
-        self.with_logger(|logger| logger.info(msg, fields));
+    fn info(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        self.with_logger(|logger| logger.info(caller, msg, fields));
     }
 
-    fn warn(&self, msg: &str, fields: &[Field]) {
-        self.with_logger(|logger| logger.warn(msg, fields));
+    fn warn(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        self.with_logger(|logger| logger.warn(caller, msg, fields));
     }
 
-    fn error(&self, msg: &str, fields: &[Field]) {
-        self.with_logger(|logger| logger.error(msg, fields));
+    fn error(&self, caller: Option<&str>, msg: &str, fields: &[Field]) {
+        self.with_logger(|logger| logger.error(caller, msg, fields));
     }
 }
 

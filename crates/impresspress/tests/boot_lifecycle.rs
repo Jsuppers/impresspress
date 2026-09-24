@@ -123,7 +123,7 @@ async fn boot_first_run_ok_and_second_run_idempotent() {
 
     // --- Stamp format: block_settings rows carry 64-hex current_hash == blessed_hash. ---
     let opts = wafer_block::db::ListOptions {
-        limit: 10_000,
+        limit: Some(10_000),
         skip_count: true,
         ..Default::default()
     };

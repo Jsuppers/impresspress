@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// One more row than a single unpaged read can return.
-const PAST_THE_CEILING: i64 = db_read::UNPAGED_LIMIT + 1;
+const PAST_THE_CEILING: i64 = db_read::UNPAGED_LIMIT as i64 + 1;
 
 /// Insert `PAST_THE_CEILING` completed USD orders of `total_cents` each,
 /// numbered `ord_000001` upward so `id` ordering is the insertion order.
@@ -73,12 +73,12 @@ async fn gross_volume_counts_every_order_past_the_unpaged_ceiling() {
     let unpaged = db::list_all(&ctx, repo::purchases::PURCHASES_TABLE, vec![])
         .await
         .expect("unpaged read");
-    assert_eq!(unpaged.len() as i64, db_read::UNPAGED_LIMIT);
+    assert_eq!(unpaged.len(), db_read::UNPAGED_LIMIT as usize);
     let scanned: i64 = unpaged
         .iter()
         .map(|record| crate::util::RecordExt::i64_field(record, "total_cents"))
         .sum();
-    assert_eq!(scanned, db_read::UNPAGED_LIMIT * 100);
+    assert_eq!(scanned, i64::from(db_read::UNPAGED_LIMIT) * 100);
     assert_ne!(
         scanned, analytics[0].gross_volume_minor,
         "the row scan this replaced is short by the truncated tail"
@@ -134,8 +134,8 @@ async fn top_products_cover_every_paid_order_past_the_ceiling() {
         db::list_all(&ctx, repo::purchases::LINE_ITEMS_TABLE, vec![])
             .await
             .expect("unpaged read")
-            .len() as i64,
-        db_read::UNPAGED_LIMIT,
+            .len(),
+        db_read::UNPAGED_LIMIT as usize,
         "the line-item read this replaced stops one row short"
     );
     let top = &analytics[0].top_products;
@@ -177,8 +177,8 @@ async fn suspension_reads_every_product_the_seller_owns() {
         db::list_all(&ctx, repo::products::TABLE, vec![])
             .await
             .expect("unpaged read")
-            .len() as i64,
-        db_read::UNPAGED_LIMIT,
+            .len(),
+        db_read::UNPAGED_LIMIT as usize,
         "the read this replaced stops one product short"
     );
 }

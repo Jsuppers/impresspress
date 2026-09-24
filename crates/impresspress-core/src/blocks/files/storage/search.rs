@@ -24,7 +24,7 @@ pub(in crate::blocks::files) async fn handle_search(
         ctx,
         msg.user_id(),
         &query,
-        page_size as i64,
+        page_size as u32,
         offset as i64,
     )
     .await

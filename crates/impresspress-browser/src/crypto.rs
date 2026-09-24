@@ -141,18 +141,6 @@ impl CryptoService for BrowserCryptoService {
         primitives::verify_password_any_scheme(password, hash_str)
     }
 
-    fn sign(
-        &self,
-        claims: HashMap<String, serde_json::Value>,
-        expiry: Duration,
-    ) -> Result<String, CryptoError> {
-        self.jwt()?.sign(claims, expiry)
-    }
-
-    fn verify(&self, token: &str) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
-        self.jwt()?.verify(token)
-    }
-
     fn sign_for(
         &self,
         block_id: &str,
@@ -263,7 +251,7 @@ mod password_parity {
     fn a_truncated_hash_is_refused_instead_of_verifying_at_64_bits() {
         let truncated = "$pbkdf2-sha256$i=10000$AAECAwQFBgcICQoLDA0ODw==$2flfZcLfnSg=";
         match svc().compare_hash(LEGACY_PASSWORD, truncated) {
-            Err(CryptoError::VerifyError(msg)) => assert!(
+            Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("32 bytes"),
                 "the refusal must name the required derived-key length: {msg}"
             ),
@@ -292,13 +280,13 @@ mod password_parity {
     /// mismatch: reporting it as a mismatch tells the logs that a user who
     /// cannot possibly sign in keeps mistyping.
     #[wasm_bindgen_test]
-    fn an_unknown_scheme_is_a_verify_error_not_a_mismatch() {
+    fn an_unknown_scheme_is_a_malformed_hash_not_a_mismatch() {
         match svc().compare_hash(LEGACY_PASSWORD, "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA") {
-            Err(CryptoError::VerifyError(msg)) => assert!(
+            Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("unrecognised password hash scheme"),
                 "unexpected message: {msg}"
             ),
-            other => panic!("expected a VerifyError for an unknown scheme, got {other:?}"),
+            other => panic!("expected a MalformedHash for an unknown scheme, got {other:?}"),
         }
     }
 
@@ -316,7 +304,8 @@ mod password_parity {
         svc.compare_hash(LEGACY_PASSWORD, &hash)
             .expect("verify without a JWT secret");
         assert!(
-            svc.sign(
+            svc.sign_for(
+                "impresspress/auth",
                 std::collections::HashMap::new(),
                 std::time::Duration::from_secs(60)
             )

@@ -344,7 +344,12 @@ pub(super) fn register_vector_block(
             "failed to open SQLite connection at '{db_path}' for vector service: {e}"
         ))
     })?;
-    let vec_svc: Arc<dyn VectorService> = Arc::new(SqliteVecService::new(vec_conn));
+    let vec_svc: Arc<dyn VectorService> =
+        Arc::new(SqliteVecService::new(vec_conn).map_err(|e| {
+            RuntimeError::Config(format!(
+                "failed to start the vector service on '{db_path}': {e}"
+            ))
+        })?);
 
     let emb_svc: Arc<dyn EmbeddingService> = match FastembedService::default_model() {
         Ok(svc) => Arc::new(svc),

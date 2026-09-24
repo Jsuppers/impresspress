@@ -85,7 +85,7 @@ async fn active_for_purchase(
                 field: "created_at".to_string(),
                 desc: true,
             }],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },

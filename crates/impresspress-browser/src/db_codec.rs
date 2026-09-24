@@ -81,8 +81,8 @@ pub(crate) fn empty_params() -> JsValue {
 /// Decode the JS array of plain row objects `bridge::db_query_raw` resolves
 /// (NOT a JSON string) into `Vec<serde_json::Value>` — one JSON object per
 /// row, keyed by column name. This is the whole of the bridge's decode job:
-/// what a row object then *means* (`Record` id/data split, JSON-in-TEXT
-/// re-parse, single-column scalar extraction) is the shared codec's, not
+/// what a row object then *means* (`Record` id/data split, a JSON column's
+/// text parsed, single-column scalar extraction) is the shared codec's, not
 /// ours. Consumed by `database.rs` (which hands each row to
 /// `codec::record_from_json_row`) and by `vector/service.rs`'s raw-row
 /// callers, which want the plain per-column value shape.

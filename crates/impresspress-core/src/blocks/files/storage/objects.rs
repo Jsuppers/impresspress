@@ -81,7 +81,7 @@ pub(in crate::blocks::files) async fn handle_list_objects(
         ctx,
         bucket,
         prefix,
-        page_size as i64,
+        page_size as u32,
         offset as i64,
     )
     .await

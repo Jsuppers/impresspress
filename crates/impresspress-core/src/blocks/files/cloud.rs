@@ -237,7 +237,7 @@ pub(super) async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> Output
 pub(super) async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let (page, page_size, _) = msg.pagination_params(20);
     let offset = ((page - 1) * page_size) as i64;
-    match repo::shares::list_recent(ctx, page_size as i64, offset).await {
+    match repo::shares::list_recent(ctx, page_size as u32, offset).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
         Err(e) => crud::db_error_internal(e, "Database error"),
     }
@@ -249,7 +249,7 @@ pub(super) async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> Outp
     let share_id = (!share_id.is_empty()).then_some(share_id.as_str());
     let offset = ((page - 1) * page_size) as i64;
 
-    match repo::shares::list_access_logs(ctx, share_id, page_size as i64, offset).await {
+    match repo::shares::list_access_logs(ctx, share_id, page_size as u32, offset).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
         Err(e) => crud::db_error_internal(e, "Database error"),
     }

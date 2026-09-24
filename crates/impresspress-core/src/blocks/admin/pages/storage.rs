@@ -84,7 +84,7 @@ async fn storage_logs_tab(
                 field: "created_at".into(),
                 desc: true,
             }],
-            limit: 100,
+            limit: Some(100),
             skip_count: true,
             ..Default::default()
         },

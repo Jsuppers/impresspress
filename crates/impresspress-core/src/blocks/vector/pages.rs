@@ -547,7 +547,7 @@ async fn load_index_metadata(
                 operator: FilterOp::Equal,
                 value: serde_json::json!(prefixed_index),
             }],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },

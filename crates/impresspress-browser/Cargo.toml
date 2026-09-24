@@ -79,6 +79,12 @@ bytemuck = { version = "1", default-features = false }
 getrandom = { version = "0.2", features = ["js"] }
 uuid = { version = "1", features = ["v4", "js"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Native tests run `vector::sql`'s statements on a real SQLite — the engine
+# sql.js compiles to — since the sql.js bridge itself is not available to a
+# native (or Node) test.
+rusqlite = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 # `RequestInit` is test-only: the adapter reads the `Request` the Service

@@ -270,7 +270,7 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
     let method = msg.query("method").to_string();
     let path = msg.query("path").to_string();
     let offset: i64 = msg.query("offset").parse().unwrap_or(0);
-    let limit: i64 = 20;
+    let limit: u32 = 20;
 
     // One more than the page shows, to learn whether a next page exists.
     let rows = match request_logs::list_for_path(ctx, &method, &path, offset, limit + 1).await {
@@ -278,7 +278,7 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
         Err(e) => return crate::blocks::crud::db_error_internal(e, "Network inbound detail"),
     };
 
-    let has_more = rows.len() as i64 > limit;
+    let has_more = rows.len() > limit as usize;
     let display_rows = if has_more {
         &rows[..limit as usize]
     } else {
@@ -306,7 +306,7 @@ pub async fn network_inbound_detail(ctx: &dyn Context, msg: &Message) -> OutputS
             html! { p .text-center .text-muted { "No requests logged for this path" } },
         ))
         @if has_more {
-            @let next_offset = offset + limit;
+            @let next_offset = offset + i64::from(limit);
             div .text-center .p-2 {
                 button .btn .btn--secondary .btn--sm
                     hx-get={"/b/admin/network/detail/inbound?method=" (method) "&path=" (path) "&offset=" (next_offset)}

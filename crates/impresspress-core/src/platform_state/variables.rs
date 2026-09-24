@@ -288,7 +288,7 @@ pub async fn find_by_key(
 ) -> Result<Option<VariableRow>, String> {
     let opts = ListOptions {
         filters: vec![key_filter(key)],
-        limit: 1,
+        limit: Some(1),
         offset: 0,
         skip_count: true,
         ..Default::default()
@@ -1453,7 +1453,7 @@ pub async fn load_all(db: &Arc<dyn DatabaseService>) -> Result<HashMap<String, S
 async fn load_rows(db: &Arc<dyn DatabaseService>) -> Result<Vec<LoadedRow>, String> {
     let opts = ListOptions {
         offset: 0,
-        limit: 100_000,
+        limit: Some(100_000),
         skip_count: true,
         ..Default::default()
     };
@@ -3808,7 +3808,7 @@ mod boot_tests {
                 .list(
                     TABLE,
                     &ListOptions {
-                        limit: 10,
+                        limit: Some(10),
                         skip_count: true,
                         ..Default::default()
                     },

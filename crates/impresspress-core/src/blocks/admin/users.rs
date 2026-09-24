@@ -24,7 +24,7 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
         ctx,
         &ActiveUserQuery {
             page: i64::from(query.page),
-            page_size: i64::from(query.page_size),
+            page_size: query.page_size,
             search: query.search.clone(),
         },
     )

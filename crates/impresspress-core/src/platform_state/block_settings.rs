@@ -454,7 +454,7 @@ pub async fn upsert_fields(
             field: "created_at".into(),
             desc: false,
         }],
-        limit: 1,
+        limit: Some(1),
         offset: 0,
         skip_count: true,
         ..Default::default()

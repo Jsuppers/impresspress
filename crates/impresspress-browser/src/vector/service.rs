@@ -9,8 +9,8 @@ use std::{collections::HashMap, sync::Mutex};
 use wafer_core::interfaces::vector::{
     self as vector_rrf,
     service::{
-        DistanceMetric, MetadataFilter, Result as VResult, SearchMode, VectorEntry, VectorError,
-        VectorIndexConfig, VectorMatch, VectorService,
+        check_rename, DistanceMetric, MetadataFilter, Result as VResult, SearchMode, VectorEntry,
+        VectorError, VectorIndexConfig, VectorMatch, VectorService,
     },
 };
 
@@ -178,6 +178,60 @@ impl VectorService for BrowserVectorService {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(name);
+        Ok(())
+    }
+
+    /// Move a legacy mixed-case index to its lowercase name: tables, rows,
+    /// keyword search and registry row, in one transaction.
+    ///
+    /// `from` must be registered under exactly that spelling
+    /// (`IndexNotFound` otherwise, which a startup migration reads as
+    /// already moved). A registry row for `to`, or any table `to` would
+    /// occupy under any spelling, is `IndexAlreadyExists`: two indexes that
+    /// differ only by case are never merged. sql.js shares SQLite's
+    /// case-insensitive table names, so `Docs` and `docs` registry rows can
+    /// point at the same tables; refusing leaves the operator to delete one.
+    async fn rename_index(&self, from: &str, to: &str) -> VResult<()> {
+        check_rename(from, to)?;
+        exec_ddl(
+            &[sql::build_registry_ddl()],
+            &[sql::REGISTRY_TABLE.to_string()],
+        )?;
+        let state = self
+            .read_registry_row(from)?
+            .ok_or_else(|| VectorError::IndexNotFound(from.into()))?;
+        if self.read_registry_row(to)?.is_some() {
+            return Err(VectorError::IndexAlreadyExists(to.into()));
+        }
+        let (conflicts, conflict_params) = sql::build_rename_conflicts_sql(from, to);
+        let params_js = db_codec::params_to_js(&conflict_params).map_err(VectorError::Internal)?;
+        let taken = bridge::db_query_raw(&conflicts, params_js)
+            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        if !db_codec::rows_from_js(taken)
+            .map_err(VectorError::Internal)?
+            .is_empty()
+        {
+            return Err(VectorError::IndexAlreadyExists(to.into()));
+        }
+
+        let mut touched = sql::index_tables(from, true);
+        touched.extend(sql::index_tables(to, true));
+        database::with_flush_mapped(
+            async {
+                let moved =
+                    in_transaction(&sql::build_rename_index_sql(from, to, state.keyword_search));
+                for table in &touched {
+                    database::forget_table_schema(table);
+                }
+                moved
+            },
+            VectorError::Internal,
+        )
+        .await?;
+
+        let mut indexes = self.indexes.lock().unwrap_or_else(|p| p.into_inner());
+        indexes.remove(from);
+        indexes.insert(to.to_string(), state);
         Ok(())
     }
 
@@ -504,6 +558,31 @@ fn exec_ddl(statements: &[String], tables: &[String]) -> VResult<()> {
         database::forget_table_schema(table);
     }
     ran
+}
+
+/// Run `statements` between `BEGIN` and `COMMIT`, rolling back on the first
+/// failure so a half-moved index never persists.
+fn in_transaction(statements: &[sql::PreparedStmt]) -> VResult<()> {
+    let run = |sql: &str, params: &[serde_json::Value]| -> VResult<()> {
+        let params_js = db_codec::params_to_js(params).map_err(VectorError::Internal)?;
+        bridge::db_exec_raw(sql, params_js)
+            .map(|_| ())
+            .map_err(|e| VectorError::Internal(js_err(e)))
+    };
+    run("BEGIN", &[])?;
+    let outcome = statements
+        .iter()
+        .try_for_each(|stmt| run(&stmt.sql, &stmt.params))
+        .and_then(|()| run("COMMIT", &[]));
+    if outcome.is_err() {
+        if let Err(rollback) = run("ROLLBACK", &[]) {
+            tracing::error!(
+                error = %rollback,
+                "ROLLBACK after a failed index rename failed; sql.js may still be inside it"
+            );
+        }
+    }
+    outcome
 }
 
 /// A loaded vector row: `(id, vector, metadata)`.

@@ -49,7 +49,7 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
         assignee_id: option(msg.query("assignee_id")),
     };
     let tickets =
-        match repo::list_tickets(ctx, &filters, page_size.min(100) as i64, offset as i64).await {
+        match repo::list_tickets(ctx, &filters, page_size.min(100) as u32, offset as i64).await {
             Ok(rows) => rows,
             Err(error) => return crud::db_error_page(msg, error, "Could not load tickets"),
         };
