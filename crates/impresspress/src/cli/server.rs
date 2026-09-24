@@ -102,22 +102,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     //     steps `boot` deliberately omits because the stateless targets
     //     dispatch per-request instead of binding (wafer-run #239 exposed them
     //     as `run_start_lifecycle` + `bind_all`).
-    builder::boot(
-        &mut wafer,
-        &NativeBootHooks,
-        // `build_native_runtime` reads the admin-created grants from the
-        // platform database and hands them to `ImpresspressBuilder::wrap_grants`
-        // before `build()`, because native seeds and reads everything pre-wafer.
-        builder::GrantSource::PreInstalled(
-            "build_native_runtime loads them from the platform database into \
-             ImpresspressBuilder::wrap_grants before build()",
-        ),
-        // A long-lived server can be inspected and fixed in place, so one
-        // broken block must not wedge the whole process.
-        builder::InitPolicy::Tolerant,
-    )
-    .await
-    .context("boot WAFER runtime")?;
+    boot_native(&mut wafer).await?;
     wafer.run_start_lifecycle().await;
     let wafer = wafer.bind_all();
     tracing::info!("WAFER runtime started — all blocks resolved");
@@ -340,6 +325,49 @@ pub async fn build_native_runtime(
         .context("build impresspress runtime")?;
 
     Ok(wafer)
+}
+
+/// The block a native server cannot run without: it binds the socket every
+/// request arrives on.
+const LISTENER_BLOCK: &str = "wafer-run/http-listener";
+
+/// Boot the native runtime through the shared funnel, tolerantly, and refuse
+/// a boot whose HTTP listener did not initialize.
+///
+/// Tolerant, because a long-lived server can be inspected and fixed in place,
+/// so one broken feature block must not wedge the whole process. The listener
+/// is the exception: its `Init` validates its settings (the `IMPRESSPRESS_*`
+/// listener variables among them), and a listener that failed it binds
+/// nothing — a process that went on would report itself started and serve no
+/// request. So its failure fails the boot, naming the listener's error.
+///
+/// `build_native_runtime` reads the admin-created grants from the platform
+/// database and hands them to `ImpresspressBuilder::wrap_grants` before
+/// `build()`, because native seeds and reads everything pre-wafer: the grants
+/// are `PreInstalled`.
+pub async fn boot_native(wafer: &mut Wafer) -> anyhow::Result<builder::BootReport> {
+    let report = builder::boot(
+        wafer,
+        &NativeBootHooks,
+        builder::GrantSource::PreInstalled(
+            "build_native_runtime loads them from the platform database into \
+             ImpresspressBuilder::wrap_grants before build()",
+        ),
+        builder::InitPolicy::Tolerant,
+    )
+    .await
+    .context("boot WAFER runtime")?;
+    if let Some(listener) = report
+        .blocks
+        .iter()
+        .find(|outcome| outcome.block == LISTENER_BLOCK && !outcome.ok)
+    {
+        return Err(anyhow!(
+            "the HTTP listener did not start, so the server would serve nothing: {}",
+            listener.error.as_deref().unwrap_or("its Init failed")
+        ));
+    }
+    Ok(report)
 }
 
 /// Native [`BootHooks`](builder::BootHooks). Native seeds the variables /
