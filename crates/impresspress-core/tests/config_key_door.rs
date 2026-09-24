@@ -29,6 +29,10 @@
 //!    [`the_fixture_declarers_are_exactly_the_listed_ones`]: which files hold
 //!    a declaration is written down below, and a new one fails until it is
 //!    added with its reason, a dead entry fails until it is removed.
+//! 4. [`no_key_is_spelled_through_a_bypass`]: the three ways to write a key
+//!    that the literal matcher cannot see — see below.
+//! 5. [`every_skipped_tests_dir_is_a_cfg_test_module`]: the directories the
+//!    scan skips are test code.
 //!
 //! ## Test fixtures
 //!
@@ -44,11 +48,19 @@
 //!
 //! ## What the scan matches
 //!
-//! A string literal whose whole content is `WAFER_RUN_SHARED__…`,
-//! `IMPRESSPRESS__…` or `IMPRESSPRESS_…` followed only by `A-Z`, `0-9` and
-//! `_` — the three namespaces the repo's `CLAUDE.md` defines
-//! (`WAFER_RUN_SHARED__*` shared, `{ORG}__{BLOCK}__*` block-scoped,
-//! `IMPRESSPRESS_*` infrastructure). It finds the key at any quote, so a key
+//! A string literal made only of `A-Z`, `0-9` and `_` that is a key in one of
+//! the namespaces the repo's `CLAUDE.md` defines:
+//!
+//! * `WAFER_RUN_SHARED__<NAME>` — shared;
+//! * `IMPRESSPRESS__<BLOCK>__<NAME>` and `WAFER_RUN__<BLOCK>__<NAME>` —
+//!   block-scoped (the `wafer-run/*` blocks' keys, `WAFER_RUN__AUTH__*` among
+//!   them, are the same shape under the `WAFER_RUN` org);
+//! * `IMPRESSPRESS_<NAME>` — infrastructure.
+//!
+//! A block prefix on its own (`IMPRESSPRESS__EMAIL`, `WAFER_RUN__AUTH`) is
+//! not a key: it is the value of the `variables` table's `block` column, and
+//! a test asserting what `key_block_prefix` derives writes it out. It finds
+//! the key at any quote, so a key
 //! embedded in a longer raw string (`r#"name="WAFER_RUN_SHARED__APP_NAME""#`)
 //! counts, which is the point: the rendered form's `name=` attribute is one of
 //! the places that has to agree.
@@ -67,12 +79,30 @@
 //! * A key inside a longer literal that is not quote-delimited — a
 //!   form-encoded request body (`&key_var=IMPRESSPRESS__LLM__OPENAI_KEY&…`)
 //!   or an error message naming the key an operator should set.
-//! * `WAFER_RUN__<BLOCK>__*` keys — the auth block's `WAFER_RUN__AUTH__*`
-//!   family and the `WAFER_RUN__{WEB,SQLITE,STRIPE}` block prefixes, which
-//!   predate the `IMPRESSPRESS__` convention and are outside the pattern.
 //! * The test directories named above, and the other workspace crates.
 //!   `CARGO_MANIFEST_DIR` is this one, which is where `config_vars.rs` and
-//!   every block's declaration lives.
+//!   every block's declaration lives. The skip is by directory NAME: every
+//!   directory called `tests` under `src/` is skipped, on the assumption that
+//!   it holds a `#[cfg(test)] mod tests;` —
+//!   [`every_skipped_tests_dir_is_a_cfg_test_module`] fails the day one does
+//!   not.
+//!
+//! ## Bypasses, and which of them it catches
+//!
+//! Three spellings put a key's bytes in the binary without a key-shaped
+//! literal. [`no_key_is_spelled_through_a_bypass`] refuses each in its common
+//! form:
+//!
+//! * `concat!("WAFER_RUN_SHARED__", "APP_NAME")` — caught when the FIRST
+//!   argument is a literal that starts with a namespace prefix. A `concat!`
+//!   that opens with anything else (`concat!("", "WAFER_RUN_…")`, a macro
+//!   argument) is not.
+//! * `stringify!(WAFER_RUN_SHARED__APP_NAME)` — caught when the argument is
+//!   an identifier starting with a namespace prefix.
+//! * A line-continued literal, `"WAFER_RUN_SHARED__\` followed by `APP_NAME"`
+//!   on the next line — caught when the continuation comes straight after a
+//!   prefix-shaped run of `A-Z0-9_`. One broken anywhere else, or built with
+//!   `format!`, is not.
 
 use impresspress_core::test_support::source_scan::{
     strip_line_comments, strip_test_modules, SourceWalk,
@@ -90,11 +120,15 @@ use impresspress_core::test_support::source_scan::{
 /// * `llm_target.rs` holds the llm block's max-token key because the vector
 ///   block names it too, and the two blocks do not share a cargo feature —
 ///   the reason that module exists.
+/// * `blocks/auth/mod.rs` declares `JWT_SECRET_KEY`, the signing secret no
+///   `ConfigVar` declares: every adapter seeds it at boot, and it sits at the
+///   block root beside `AUTH_BLOCK_ID`, where they all reach it.
 /// * `builder/boot.rs`, `migration_helper.rs`, `prepared_plan.rs` and
 ///   `ui/assets.rs` declare `IMPRESSPRESS_*` infrastructure keys beside the
 ///   code that reads them.
 const DECLARES_A_CONFIG_KEY: &[&str] = &[
     "blocks/auth/config.rs",
+    "blocks/auth/mod.rs",
     "blocks/auth_ui/mod.rs",
     "blocks/dev/seed.rs",
     "blocks/email.rs",
@@ -134,12 +168,10 @@ const DECLARES_A_TEST_FIXTURE_KEY: &[&str] = &[
     "blocks/llm/schema.rs",
 ];
 
-/// The three namespaces a config key can be in. `IMPRESSPRESS_` comes last so
-/// the longer `IMPRESSPRESS__` is tried first; both are accepted, because
-/// `IMPRESSPRESS_*` (no double underscore) is the infrastructure namespace
-/// and `IMPRESSPRESS__<BLOCK>__*` the block-scoped one, and the gate wants
-/// every literal of either.
-const PREFIXES: [&str; 3] = ["WAFER_RUN_SHARED__", "IMPRESSPRESS__", "IMPRESSPRESS_"];
+/// Every namespace prefix a key can start with, for the bypass scan: a
+/// `concat!`, `stringify!` or line continuation that starts with one of these
+/// is assembling a key. `IMPRESSPRESS_` covers `IMPRESSPRESS__` too.
+const NAMESPACES: [&str; 3] = ["WAFER_RUN_SHARED__", "WAFER_RUN__", "IMPRESSPRESS_"];
 
 /// The walk this gate runs over, stated once so its self-test plants its
 /// offender behind the same filters the real scan uses.
@@ -147,16 +179,29 @@ fn scan() -> SourceWalk {
     SourceWalk::crate_src().skip_dir("tests").least(100)
 }
 
-/// Whether `literal` is a config key: one of the three prefixes, at least one
-/// more character, and nothing but `A-Z`, `0-9` and `_` throughout.
+/// Whether `literal` is a config key: nothing but `A-Z`, `0-9` and `_`, and
+/// one of the shapes the module doc lists. A block-scoped namespace needs
+/// both a block and a name (`IMPRESSPRESS__EMAIL__FROM`), so the block prefix
+/// alone (`IMPRESSPRESS__EMAIL`) is not a key.
 fn is_config_key(literal: &str) -> bool {
-    PREFIXES.iter().any(|prefix| {
-        literal
-            .strip_prefix(prefix)
-            .is_some_and(|tail| !tail.is_empty())
-    }) && literal
+    let non_empty = |tail: &str| !tail.is_empty();
+    let block_and_name = |tail: &str| {
+        tail.split_once("__")
+            .is_some_and(|(block, name)| !block.is_empty() && !name.is_empty())
+    };
+    literal
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && if let Some(tail) = literal.strip_prefix("WAFER_RUN_SHARED__") {
+            non_empty(tail)
+        } else if let Some(tail) = literal
+            .strip_prefix("IMPRESSPRESS__")
+            .or_else(|| literal.strip_prefix("WAFER_RUN__"))
+        {
+            block_and_name(tail)
+        } else {
+            literal.strip_prefix("IMPRESSPRESS_").is_some_and(non_empty)
+        }
 }
 
 /// One config key spelled as a literal: the key, and whether that spelling is
@@ -237,6 +282,45 @@ fn spellings(code: &str) -> Vec<Spelling<'_>> {
                 declares: after.starts_with("\";") && ends_in_const_str_binding(&code[..quote]),
                 line: code[line_start..line_end].trim(),
             });
+        }
+    }
+    found
+}
+
+/// The source lines in `code` that spell a key through a bypass the literal
+/// matcher cannot see: a `concat!` whose first argument is a prefix-shaped
+/// literal, a `stringify!` of a prefix-shaped identifier, or a literal whose
+/// prefix-shaped opening is continued onto the next line with `\`.
+fn bypasses(code: &str) -> Vec<&str> {
+    let starts_a_key = |text: &str| NAMESPACES.iter().any(|prefix| text.starts_with(prefix));
+    let line_of = |at: usize| {
+        let start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = code[at..].find('\n').map_or(code.len(), |i| at + i);
+        code[start..end].trim()
+    };
+    let mut found = Vec::new();
+    for (macro_name, opener) in [("concat!(", "\""), ("stringify!(", "")] {
+        let mut at = 0;
+        while let Some(offset) = code[at..].find(macro_name) {
+            let start = at + offset;
+            at = start + macro_name.len();
+            if let Some(argument) = code[at..].trim_start().strip_prefix(opener) {
+                if starts_a_key(argument) {
+                    found.push(line_of(start));
+                }
+            }
+        }
+    }
+    let mut at = 0;
+    while let Some(offset) = code[at..].find('"') {
+        let start = at + offset + 1;
+        at = start;
+        let tail = &code[start..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(tail.len());
+        if starts_a_key(tail) && tail[end..].starts_with("\\\n") {
+            found.push(line_of(start));
         }
     }
     found
@@ -376,6 +460,87 @@ fn the_fixture_declarers_are_exactly_the_listed_ones() {
     );
 }
 
+#[test]
+fn no_key_is_spelled_through_a_bypass() {
+    let files = scanned(&scan());
+    let mut found: Vec<String> = files
+        .iter()
+        .flat_map(|file| {
+            bypasses(&file.code)
+                .into_iter()
+                .map(|line| format!("{}: {line}", file.rel))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    found.sort();
+    assert!(
+        found.is_empty(),
+        "these sites assemble a config key with `concat!`, `stringify!` or a \
+         line continuation, which the literal scan cannot see; name the \
+         declaring constant instead:\n{}",
+        found.join("\n")
+    );
+}
+
+/// The scan skips every directory NAMED `tests` under `src/`. That is only
+/// right while each one is a test module: a `tests/` directory declared
+/// `#[cfg(test)] mod tests;` by its parent module. A production directory
+/// that happened to be called `tests` would be skipped silently.
+#[test]
+fn every_skipped_tests_dir_is_a_cfg_test_module() {
+    fn tests_dirs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "tests") {
+                    out.push(path.clone());
+                }
+                tests_dirs(&path, out);
+            }
+        }
+    }
+    let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    let mut dirs = Vec::new();
+    tests_dirs(src, &mut dirs);
+    assert!(!dirs.is_empty(), "the walk found no tests directory at all");
+    let mut not_test_modules = Vec::new();
+    for dir in &dirs {
+        let parent = dir.parent().expect("a tests dir has a parent");
+        let declaring = if parent == src {
+            src.join("lib.rs")
+        } else if parent.join("mod.rs").is_file() {
+            parent.join("mod.rs")
+        } else {
+            parent.with_extension("rs")
+        };
+        let text = std::fs::read_to_string(&declaring).unwrap_or_default();
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let gated = lines.windows(2).any(|pair| {
+            pair[0] == "#[cfg(test)]"
+                && pair[1]
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub(super) ")
+                    == "mod tests;"
+        });
+        if !gated {
+            not_test_modules.push(format!(
+                "{} (declared in {})",
+                dir.display(),
+                declaring.display()
+            ));
+        }
+    }
+    assert!(
+        not_test_modules.is_empty(),
+        "the scan skips these `tests` directories, but their parent does not \
+         declare them `#[cfg(test)] mod tests;`: {not_test_modules:?}"
+    );
+}
+
 /// The matcher still recognises what it bans, and still lets through what it
 /// does not.
 ///
@@ -398,6 +563,8 @@ fn the_matcher_recognises_the_keys_it_bans() {
         r#"let key = "WAFER_RUN_SHARED__APP_NAME";"#,
         // a match arm
         r#"match key { "WAFER_RUN_SHARED__APP_NAME" => 1, _ => 0 }"#,
+        // a `wafer-run/*` block's key
+        r#"get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false)"#,
     ] {
         let found = spellings(banned);
         assert_eq!(found.len(), 1, "the matcher stopped seeing: {banned}");
@@ -415,8 +582,11 @@ fn the_matcher_recognises_the_keys_it_bans() {
         r#"const TABLE: &str = "impresspress__admin__variables";"#,
         // the namespace prefix on its own carries no key after it
         r#"let p = "IMPRESSPRESS_";"#,
-        // `WAFER_RUN__<BLOCK>__*` is out of the stated pattern
-        r#"const JWT: &str = "WAFER_RUN__AUTH__JWT_SECRET";"#,
+        // a block prefix is the `block` column's value, not a key
+        r#"assert_eq!(key_block_prefix(KEY), "IMPRESSPRESS__EMAIL");"#,
+        r#"assert_eq!(row.block.as_deref(), Some("WAFER_RUN__AUTH"));"#,
+        // a namespace with a block and no name
+        r#"let p = "WAFER_RUN__AUTH__";"#,
         // a shouty constant that is not in any config namespace
         r#"header("X-IMPRESSPRESS", "1")"#,
     ] {
@@ -435,6 +605,7 @@ fn a_declaration_is_a_whole_const_str_binding() {
     for declaration in [
         r#"pub const APP_NAME_KEY: &str = "WAFER_RUN_SHARED__APP_NAME";"#,
         r#"const KEY: &str = "WAFER_RUN_SHARED__FLAG";"#,
+        r#"pub const JWT_SECRET_KEY: &str = "WAFER_RUN__AUTH__JWT_SECRET";"#,
         r#"pub(crate) const FROM: &'static str = "IMPRESSPRESS__EMAIL__FROM";"#,
         // rustfmt's wrap when the line is too long
         "pub(crate) const ALLOWED_RECIPIENT_PATTERNS: &str =\n    \"IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS\";",
@@ -520,4 +691,34 @@ fn the_walk_reaches_the_files_it_claims_to_scan() {
     let (production, fixture_only) = declarers(&files);
     assert_eq!(production, vec!["declares.rs".to_string()]);
     assert_eq!(fixture_only, vec!["fixture.rs".to_string()]);
+}
+
+/// The bypass scan catches each bypass the module doc says it catches, and
+/// passes the ordinary uses of the same macros.
+#[test]
+fn the_bypass_scan_catches_what_it_claims() {
+    for bypass in [
+        r#"let k = concat!("WAFER_RUN_SHARED__", "APP_NAME");"#,
+        r#"let k = concat!( "IMPRESSPRESS__EMAIL__", "FROM");"#,
+        "let k = stringify!(WAFER_RUN__AUTH__JWT_SECRET);",
+        "let k = \"WAFER_RUN_SHARED__\\\n    APP_NAME\";",
+    ] {
+        assert_eq!(
+            bypasses(bypass).len(),
+            1,
+            "the bypass scan missed: {bypass}"
+        );
+    }
+    for ordinary in [
+        r#"include_str!(concat!(env!("OUT_DIR"), "/x.rs"))"#,
+        r#"concat!("impresspress/", "email")"#,
+        "stringify!(Route::Login)",
+        "let long = \"a sentence that goes \\\n    on\";",
+        r#"format!("WAFER_RUN_SHARED__RATE_LIMIT_{}", name)"#,
+    ] {
+        assert!(
+            bypasses(ordinary).is_empty(),
+            "the bypass scan refused an ordinary use: {ordinary}"
+        );
+    }
 }
