@@ -139,10 +139,7 @@ pub(crate) async fn move_legacy_index(
 mod tests {
     use std::sync::Arc;
 
-    use wafer_block::{
-        db::{Filter, FilterOp, SortField},
-        wire::database::OnConflict,
-    };
+    use wafer_block::{db::SortField, wire::database::OnConflict};
     use wafer_block_sqlite::vector::SqliteVecService;
     use wafer_core::{
         clients::{database as db, vector as vclient},
