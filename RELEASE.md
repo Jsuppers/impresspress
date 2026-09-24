@@ -68,11 +68,61 @@ carries no record of which block wrote it and is not moved. Once rebuilt, the
 hyphenated block creates its table under the new name on `init` and starts
 empty. The empty `site__my-shop__*` tables are left behind unused.
 
-**What to do.** An already-active hyphenated block keeps running as it was
-accepted until it is next built: rename its collections and config keys to the
-`_` spelling (a freshly scaffolded block already uses it), rebuild, stage. A
-seed bundle exported with a hyphenated block under the old spelling is refused
-on import with the same diagnostic; re-export it after the rebuild.
+**An already-active hyphenated block stops working until it is rebuilt.** The
+database now refuses a table name that is not lowercase letters, digits and `_`
+instead of stripping it, so every request of a block accepted under the old
+spelling that touches a `site__my-shop__*` collection fails with
+`InvalidArgument` — it no longer reaches `site__myshop__*`, another block's
+table. A block that also declares a `SITE__MY-SHOP__*` config key is refused
+when the runtime registers it, so its generation does not load at all: on the
+next boot the browser console reports that the dev sandbox could not load its
+active blocks, and the site's pages keep serving without them.
+
+**What to do.** Rename the block's collections and config keys to the `_`
+spelling (a freshly scaffolded block already uses it), rebuild, stage. A seed
+bundle exported with a hyphenated block under the old spelling is refused on
+import with the same diagnostic; re-export it after the rebuild.
+
+### Dev sandbox: a block never sees the session cookie, and cannot set one
+
+**What changes.** A sandbox block no longer receives the request's `Cookie`,
+`Authorization` or `Proxy-Authorization` header. The service worker attaches
+the admin's session cookie to every same-origin request, `/b/<name>/` included,
+and until now it reached the block. A block also cannot set `Set-Cookie`,
+`Location`, `Refresh`, `Clear-Site-Data`, CORS, HSTS, `X-Frame-Options` or CSP
+headers on any answer, an error included; before, an error's headers were
+passed through as the block set them. The block reference (`reference.md`,
+"Headers") states the contract.
+
+**What to do.** Nothing, unless a block read the cookie or authorization
+header: it must identify the caller through `request.user_id` /
+`request.roles`, which the host fills in. Staging already refused a block that
+declared either header (`cap-headers`), so no accepted block was granted them.
+
+### Vector: index names are lowercase (migration 002) — upgrade with `--run-migrations`
+
+**What changes.** An index name is 1 to 33 characters of lowercase letters,
+digits and `_`. The database layer now refuses any other table name rather
+than rewriting it, and an index's tables are named after it
+(`impresspress__vector__{name}_meta` and its siblings), so an uppercase name
+(`Docs`) can no longer be created, opened, queried or deleted, and a name
+longer than 33 characters would give a table name longer than the 63 bytes
+PostgreSQL keeps.
+
+**Your data.** Migration `002_lowercase_index_names` renames each registry row
+to its lowercase spelling. The index's tables need no rename: they live in the
+SQLite vector database, which already treats `Docs` and `docs` as the same
+table. Where two registry rows fold to one name (`Docs` beside `docs`) they
+already addressed the same tables; the lowercase row is kept, otherwise the
+lowest-sorting spelling, and the other rows are deleted. Adding 002 re-runs
+the vector migration set, which is safe: 001 is `CREATE … IF NOT EXISTS` and
+002 finds nothing to change the second time.
+
+**Without the migration.** An index whose name has an uppercase letter stays
+listed but cannot be opened until 002 runs. An index named with more than 33
+characters cannot be reached under this release; delete it before upgrading,
+or recreate it under a shorter name after.
+
 
 ### Config: your `.env` applies again, and one boot decides the ties
 
@@ -430,10 +480,12 @@ nothing is backfilled, and nobody is signed out.
 **Without the migration.** Cloudflare deploys always run it. A native
 deployment that skips `--run-migrations` logs the generic `schema drift;
 redeploy with --run-migrations to apply` warning for the files block on each
-boot, and uploads keep working because strict schema is off by default there
-and the column is added on the first upload. If you have turned
-`WAFER_RUN__DATABASE__STRICT_SCHEMA` **on**, the migration is not optional:
-every upload fails on the missing column until it runs.
+boot. With strict schema off (the default there), an upload of a new key still
+works and adds the column. Replacing an object fails until the column exists —
+the take-over checks the row's `claim_id`, and a condition never adds a column
+— so run the migration rather than rely on a first upload. If you have turned
+`WAFER_RUN__DATABASE__STRICT_SCHEMA` **on**, every upload fails on the missing
+column until it runs.
 
 ### Files: each upload stores its bytes under a key of its own (migration 005) — upgrade with `--run-migrations`
 
