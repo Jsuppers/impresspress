@@ -457,8 +457,8 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
             // the KV row cache classifies tables by wire name; its tests pin
             // the name rather than read it back from the constant
             "cache_key.rs",
-            // the fail-closed diagnostic on the router's auth_version read
-            // names the grant an operator has to go and add
+            // the WRAP test of the router's auth_version read names, in its
+            // failure message, the grant an operator has to go and add
             "crypto.rs",
         ],
     ),
@@ -839,6 +839,11 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // the table its database site reads or writes, so the denial
             // lands on the query under test.
             "blocks/admin/error_mapping_tests.rs",
+            // A fault injector: the API-key credential check reads the key,
+            // its user and THEN the user's grants, and
+            // `pipeline::credential_check_tests` fails exactly the grants
+            // read. `break_reads` would fail the key lookup first.
+            "pipeline.rs",
         ],
     ),
     (
@@ -883,6 +888,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // Fault injectors: each user-portal route's WRAP-denial test
             // refuses the table its database site reads or writes.
             "blocks/userportal/error_mapping_tests.rs",
+            // Fault injectors: a request-time credential check reads the JWT
+            // blocklist and the users table (`auth_version`), and
+            // `pipeline::credential_check_tests` and `AuthServiceImpl`'s
+            // require_user test fail one of those reads per case to prove a
+            // failed check refuses the request instead of signing the caller
+            // out. `break_reads` fails every read and cannot tell the two
+            // apart.
+            "pipeline.rs",
+            "blocks/auth/service.rs",
         ],
     ),
     // The auth doors B12 adds. Two categories, both already established

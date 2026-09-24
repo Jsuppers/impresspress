@@ -137,6 +137,43 @@ describe("AuthService", () => {
     await expect(client().auth.getUser()).rejects.toBeInstanceOf(ImpresspressError);
   });
 
+  // The server answers a request whose credential it could not check (a
+  // failed blocklist or auth_version read) with 503, or with the 403 a WRAP
+  // refusal keeps. Neither means "signed out": getUser must propagate it and
+  // leave the session in place, so the next call after the outage succeeds.
+  for (const [status, error] of [
+    [503, "Unavailable"],
+    [403, "PermissionDenied"],
+  ] as const) {
+    it(`getUser propagates a ${status} and keeps the session`, async () => {
+      fetchMock.mockResolvedValueOnce(
+        fakeJsonResponse({
+          access_token: "a",
+          refresh_token: "r",
+          token_type: "Bearer",
+          expires_in: 1800,
+          user: { id: "u1", email: "a@b.com", roles: ["user"] },
+        }),
+      );
+      const c = client();
+      await c.auth.signIn({ email: "a@b.com", password: "pw" });
+
+      fetchMock.mockResolvedValueOnce(
+        fakeJsonResponse(
+          { error, message: "Authentication is temporarily unavailable" },
+          status,
+        ),
+      );
+      const err = await c.auth.getUser().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ImpresspressError);
+      expect((err as ImpresspressError).status).toBe(status);
+      expect(c.auth.isAuthenticated()).toBe(true);
+    });
+  }
+
   it("resetPassword calls the real forgot-password route, not a phantom reset-password GET", async () => {
     fetchMock.mockResolvedValueOnce(fakeJsonResponse({ message: "ok" }));
     await client().auth.resetPassword({ email: "a@b.com" });

@@ -546,7 +546,7 @@ pub async fn update_profile(
 ///
 /// Returns `Ok(0)` when the user row is missing — mirrors
 /// [`is_email_verified`]'s doc-claim collapse. The verify-side check
-/// (`crate::crypto::extract_auth_meta`, via `blocks::auth::current_auth_version`)
+/// (`crate::crypto::verify_access_token`, via `blocks::auth::current_auth_version`)
 /// doesn't otherwise require the row to exist for a JWT to authenticate, so a
 /// missing row must not be indistinguishable from a real DB failure here.
 pub async fn auth_version(ctx: &dyn Context, user_id: &str) -> Result<i64, WaferError> {

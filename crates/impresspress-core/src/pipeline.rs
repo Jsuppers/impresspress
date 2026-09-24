@@ -252,6 +252,37 @@ pub async fn refuse_oversized_body(
     payload_too_large_response(msg)
 }
 
+/// Refuse a request whose credential could not be checked, with the error
+/// `crate::blocks::auth::credential_check_failed` classified, plus the
+/// `request_logs` row any other refusal would have written.
+///
+/// The row carries no user id: the credential that would have named one is
+/// exactly what could not be checked.
+async fn refuse_unchecked_credential(
+    ctx: &dyn Context,
+    msg: &Message,
+    error: WaferError,
+    block_infos: &[BlockInfo],
+    extra_routes: &[ExtraRoute],
+) -> OutputStream {
+    write_request_log(
+        ctx,
+        NewRequestLog {
+            method: msg.action(),
+            path: msg.path(),
+            status_code: i64::from(http_codec::resolve_error_status(&error)),
+            error_message: &error.message,
+            duration_ms: 0,
+            client_ip: msg.remote_addr(),
+            user_id: "",
+        },
+        block_infos,
+        extra_routes,
+    )
+    .await;
+    OutputStream::error(error)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the single request-pipeline entry point: each argument is a distinct \
@@ -288,18 +319,27 @@ pub async fn handle_request(
         return refuse_oversized_body(ctx, &msg, block_infos, extra_routes).await;
     }
 
-    // 2. Validate JWT or API key and set auth meta
+    // 2. Validate JWT or API key and set auth meta. A credential the check
+    //    could not be completed for (its database read failed) refuses the
+    //    request here: continuing as anonymous would answer a signed-in
+    //    caller "sign in" — the router redirects a page to the login form
+    //    and refuses an API call "authentication required" — for as long as
+    //    the database is unreachable.
     if let Some(header) = auth_header {
-        if header.starts_with("Bearer ") {
+        let checked = if header.starts_with("Bearer ") {
             // [SEC-038] Read the deployment's expected issuer once per request
             // so JWTs minted under a different deployment's FRONTEND_URL get
             // rejected even if their HMAC secret matches. [SEC-042] also
             // consults the JWT blocklist via the ctx-aware extractor.
             let expected_iss = crate::blocks::auth::helpers::expected_issuer(ctx).await;
-            crate::crypto::extract_auth_meta(ctx, header, jwt_secret, &expected_iss, &mut msg)
-                .await;
+            crate::crypto::extract_auth_meta(ctx, header, jwt_secret, &expected_iss, &mut msg).await
         } else if let Some(api_key) = header.strip_prefix("ApiKey ") {
-            crate::blocks::auth::authenticate_api_key(ctx, api_key, &mut msg).await;
+            crate::blocks::auth::authenticate_api_key(ctx, api_key, &mut msg).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = checked {
+            return refuse_unchecked_credential(ctx, &msg, error, block_infos, extra_routes).await;
         }
     }
 
@@ -3888,5 +3928,330 @@ mod oversized_body_tests {
         )
         .await;
         assert_ne!(status, 413, "only the marker refuses");
+    }
+}
+
+// Every case routes through `test_support::real_block_infos()`, the real
+// route table the router's access gate reads, which is gated on the full
+// block set.
+#[cfg(all(
+    test,
+    feature = "block-files",
+    feature = "block-messages",
+    feature = "block-products",
+    feature = "block-tickets",
+    feature = "block-llm",
+    feature = "block-vector"
+))]
+mod credential_check_tests {
+    //! A credential whose check could not be completed — its database read
+    //! failed — refuses the request instead of letting it continue as
+    //! anonymous. Anonymous is the answer "sign in again": the router's gate
+    //! redirects a page to the login form and refuses an API call, so a
+    //! database blip would sign every user out of the UI.
+    //!
+    //! Every case drives `handle_request` with a real signed token (or a real
+    //! key) in the `Authorization` header, so step 2 is what resolves it; the
+    //! database fault is injected at the wire op the credential check sends.
+
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use wafer_block_crypto::primitives;
+    use wafer_run::{ErrorCode, InputStream, OutputStream, WaferError};
+
+    use super::handle_request;
+    use crate::{
+        blocks::auth::repo::{api_keys, jwt_blocklist, users},
+        features::AllEnabled,
+        test_support::{
+            anon_msg, real_block_infos, FailingDbOpContext, TestContext, TEST_JWT_SECRET,
+        },
+    };
+
+    /// A user under a fresh id, so no earlier test has left its
+    /// `auth_version` in the verify-side cache — a cache hit would answer the
+    /// read this suite makes fail.
+    async fn seed_user(ctx: &TestContext) -> String {
+        users::insert(
+            ctx,
+            users::NewUser {
+                email: format!("{}@example.com", uuid::Uuid::new_v4()),
+                display_name: "Signed In".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: true,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("seed user")
+        .id
+    }
+
+    /// An access token for `sub` carrying a `jti`, signed and issued the way
+    /// `test_support::access_token_for` signs one, so step 2 reads the
+    /// blocklist as well as `auth_version`.
+    fn bearer(sub: &str) -> String {
+        let derived = primitives::derive_block_key(
+            TEST_JWT_SECRET.as_bytes(),
+            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+        );
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), serde_json::json!(sub));
+        claims.insert("type".to_string(), serde_json::json!("access"));
+        claims.insert(
+            "iss".to_string(),
+            serde_json::json!("http://localhost:5173"),
+        );
+        claims.insert("roles".to_string(), serde_json::json!(["user"]));
+        claims.insert(
+            "jti".to_string(),
+            serde_json::json!(uuid::Uuid::new_v4().to_string()),
+        );
+        let token = primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes())
+            .expect("test jwt_sign");
+        format!("Bearer {token}")
+    }
+
+    /// `GET /b/auth/api/me` — a route the router admits only for a signed-in
+    /// caller — as a browser page (`html`) or an API call, with
+    /// `authorization`.
+    async fn get_me(
+        ctx: &dyn wafer_run::context::Context,
+        authorization: &str,
+        html: bool,
+    ) -> OutputStream {
+        let mut msg = anon_msg("retrieve", "/b/auth/api/me");
+        msg.set_meta(
+            "http.header.accept",
+            if html {
+                "text/html"
+            } else {
+                "application/json"
+            },
+        );
+        handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            Some(authorization),
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await
+    }
+
+    /// Status, `Location` header and body of `out`, as an adapter would send
+    /// them.
+    async fn answer(out: OutputStream) -> (u16, String, String) {
+        let response = wafer_block::http_codec::collect_http_response(out).await;
+        let location = response
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        (response.status, location, body)
+    }
+
+    async fn signed_in_fixture() -> (TestContext, String) {
+        let mut ctx = TestContext::with_auth().await;
+        ctx.set_config(crate::blocks::auth::JWT_SECRET_KEY, TEST_JWT_SECRET);
+        ctx.register_block(
+            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+            Arc::new(crate::blocks::auth_ui::AuthUiBlock::new()),
+        );
+        let uid = seed_user(&ctx).await;
+        (ctx, uid)
+    }
+
+    /// The control every case below departs from: with the database up, the
+    /// same token reaches the handler and is answered as its user.
+    #[tokio::test]
+    async fn a_signed_in_caller_reaches_the_route_while_the_database_answers() {
+        let (ctx, uid) = signed_in_fixture().await;
+        let (status, _, body) = answer(get_me(&ctx, &bearer(&uid), false).await).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(&uid), "{body}");
+    }
+
+    /// The `auth_version` read failing is a 503 — not the router's
+    /// "authentication required", and not, for a page, the redirect to the
+    /// login form that signs the user out of the UI.
+    #[tokio::test]
+    async fn a_failed_auth_version_read_is_a_503_not_a_sign_out() {
+        let (ctx, uid) = signed_in_fixture().await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let (status, location, body) = answer(get_me(&down, &bearer(&uid), false).await).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            body.contains("Authentication is temporarily unavailable"),
+            "the fault's own text stays in the log: {body}"
+        );
+
+        let (status, location_html, body) = answer(get_me(&down, &bearer(&uid), true).await).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            location.is_empty() && location_html.is_empty(),
+            "no redirect to the login form: {location} / {location_html}"
+        );
+    }
+
+    /// The JWT blocklist read failing is refused the same way. Before, the
+    /// lookup "failed closed" by reporting every token as blocklisted — so
+    /// during an outage every signed-in caller looked logged out.
+    #[tokio::test]
+    async fn a_failed_blocklist_read_is_a_503_not_a_sign_out() {
+        let (ctx, uid) = signed_in_fixture().await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.list", jwt_blocklist::TABLE)]);
+
+        let (status, location, body) = answer(get_me(&down, &bearer(&uid), true).await).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            location.is_empty(),
+            "no redirect to the login form: {location}"
+        );
+        assert!(
+            !body.contains("simulated database outage") && !body.contains(jwt_blocklist::TABLE),
+            "the fault's own text stays in the log: {body}"
+        );
+    }
+
+    /// A WRAP refusal keeps the code the database classifier gives it — the
+    /// 403 "Access denied" — instead of becoming the login redirect.
+    #[tokio::test]
+    async fn a_refused_auth_version_read_keeps_its_403() {
+        let (ctx, uid) = signed_in_fixture().await;
+        let refused = FailingDbOpContext::failing_with(
+            ctx,
+            vec![("database.get", users::TABLE)],
+            WaferError::new(
+                ErrorCode::PermissionDenied,
+                "WRAP: impresspress/router may not read the users table",
+            ),
+        );
+
+        let (status, location, body) = answer(get_me(&refused, &bearer(&uid), true).await).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(
+            location.is_empty(),
+            "no redirect to the login form: {location}"
+        );
+        assert!(body.contains("Access denied"), "{body}");
+        assert!(
+            !body.contains("impresspress/router"),
+            "the refusal's grant and table stay in the log: {body}"
+        );
+    }
+
+    /// `GET /b/auth/login` — a public page — with `authorization`, if any.
+    async fn get_login_page(
+        ctx: &dyn wafer_run::context::Context,
+        authorization: Option<&str>,
+    ) -> OutputStream {
+        let mut msg = anon_msg("retrieve", "/b/auth/login");
+        msg.set_meta("http.header.accept", "text/html");
+        handle_request(
+            ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            authorization,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await
+    }
+
+    /// A public route is refused too when it is presented a credential that
+    /// cannot be checked — the request names a caller, and the page would
+    /// otherwise be rendered for an anonymous one — while the same route
+    /// without a credential has nothing to check and is served as ever.
+    #[tokio::test]
+    async fn a_public_route_is_refused_only_when_it_presents_a_credential() {
+        let (ctx, uid) = signed_in_fixture().await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let (status, _, body) = answer(get_login_page(&down, None).await).await;
+        assert_eq!(status, 200, "no credential, nothing to check: {body}");
+
+        let (status, _, body) = answer(get_login_page(&down, Some(&bearer(&uid))).await).await;
+        assert_eq!(status, 503, "{body}");
+    }
+
+    /// A real key for a fresh user, so the API-key cases fail a read the
+    /// check actually reaches.
+    async fn seed_key(ctx: &TestContext) -> String {
+        let uid = seed_user(ctx).await;
+        let raw = format!("sb_test_{}", uuid::Uuid::new_v4().simple());
+        api_keys::insert(
+            ctx,
+            api_keys::NewApiKey {
+                user_id: &uid,
+                name: "test-key",
+                key_hash: &crate::util::sha256_hex(raw.as_bytes()),
+                key_prefix: "sb_test",
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("seed api key");
+        format!("ApiKey {raw}")
+    }
+
+    /// The control for the API-key cases: with the database up, the key
+    /// reaches the route as its user.
+    #[tokio::test]
+    async fn a_valid_api_key_reaches_the_route_while_the_database_answers() {
+        let (ctx, _) = signed_in_fixture().await;
+        let key = seed_key(&ctx).await;
+        let (status, _, body) = answer(get_me(&ctx, &key, false).await).await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// The key is found, and the read of its user fails: a 503, not the
+    /// anonymous answer.
+    #[tokio::test]
+    async fn a_failed_api_key_user_lookup_is_a_503() {
+        let (ctx, _) = signed_in_fixture().await;
+        let key = seed_key(&ctx).await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
+
+        let (status, _, body) = answer(get_me(&down, &key, false).await).await;
+        assert_eq!(status, 503, "{body}");
+    }
+
+    /// The key and its user are found, and the roles read fails: a 503, not
+    /// the anonymous answer and not an identity stamped with no roles.
+    #[tokio::test]
+    async fn a_failed_api_key_roles_lookup_is_a_503() {
+        let (ctx, _) = signed_in_fixture().await;
+        let key = seed_key(&ctx).await;
+        let down = FailingDbOpContext::new(
+            ctx,
+            vec![("database.list", crate::platform_state::user_roles::TABLE)],
+        );
+
+        let (status, _, body) = answer(get_me(&down, &key, false).await).await;
+        assert_eq!(status, 503, "{body}");
+    }
+
+    /// The API-key path is the same check over a different credential: a
+    /// failed key lookup is a 503, not the anonymous answer that tells the
+    /// key's holder it was revoked.
+    #[tokio::test]
+    async fn a_failed_api_key_lookup_is_a_503() {
+        let (ctx, _) = signed_in_fixture().await;
+        let down = FailingDbOpContext::new(ctx, vec![("database.list", api_keys::TABLE)]);
+
+        let (status, _, body) = answer(get_me(&down, "ApiKey any-key", false).await).await;
+        assert_eq!(status, 503, "{body}");
     }
 }

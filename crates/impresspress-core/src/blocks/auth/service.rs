@@ -202,7 +202,10 @@ enum Creds {
 /// Classify the credential on `msg`.
 ///
 /// A token that verifies as an access JWT is that; any other token is a
-/// candidate PAT; no token at all is unauthenticated. The token is whichever
+/// candidate PAT; no token at all is unauthenticated. A token whose
+/// verification could not be completed (a failed blocklist or
+/// `auth_version` read) is neither: it is `AuthError::Backend` with the
+/// error [`crate::crypto::verify_access_token`] classified. The token is whichever
 /// of the `Authorization: Bearer` header and the `auth_token` cookie the
 /// request carries ([`presented_token`]). The `wafer_session` cookie this used
 /// to accept in a branch of its own was issued by nothing.
@@ -220,8 +223,12 @@ async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthEr
         .unwrap_or("")
         .to_string();
     let expected_iss = super::helpers::expected_issuer(ctx).await;
+    // A check that could not be completed is already classified for the
+    // client (`credential_check_failed`), so it is passed on as it stands
+    // rather than through `backend_error`, which would classify it twice.
     if let Some(claims) = crate::crypto::verify_access_token(ctx, &bearer, &secret, &expected_iss)
         .await
+        .map_err(AuthError::Backend)?
         .filter(|c| c.sub.as_deref().is_some_and(|s| !s.is_empty()))
     {
         return Ok(Creds::Jwt(claims.sub.unwrap_or_default()));
@@ -260,20 +267,20 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         // bootstrap_tokens / orgs / api_keys without enumerating each.
         wafer_run::ResourceGrant::read_write("impresspress/auth-ui", "wafer_run__auth__*"),
         // The pipeline router (ImpresspressRouterBlock, id `impresspress/router`)
-        // calls `jwt_blocklist::contains()` from `crate::crypto::extract_auth_meta`
-        // during request preprocessing — SEC-042 logout invalidates JWTs
+        // calls `jwt_blocklist::contains()` from `crate::crypto::verify_access_token`
+        // (through `extract_auth_meta`) during request preprocessing — SEC-042 logout invalidates JWTs
         // via this table. The call runs in the router's context, so the
-        // router needs read access. Without it WRAP denies and the
-        // contains() fail-closed path treats every JWT as blocklisted,
-        // 403-ing every signed-in admin request.
+        // router needs read access. Without it WRAP denies the read and
+        // every request bearing an access JWT is refused with 403 "Access
+        // denied" (`blocks::auth::credential_check_failed`).
         wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__jwt_blocklist"),
         // P2c: same pipeline-preprocessing shape as the blocklist grant
-        // above — `crate::crypto::extract_auth_meta` also calls
+        // above — `crate::crypto::verify_access_token` also calls
         // `blocks::auth::current_auth_version()`, which reads the users row
         // through `repo::users::auth_version()`, in the router's context on
         // every request bearing an access JWT. Without this grant WRAP
-        // denies the users-table read and the fail-closed lookup-error
-        // branch rejects every token, 403-ing every signed-in request.
+        // denies the users-table read and every such request is refused
+        // with 403 "Access denied", the same as the blocklist read above.
         wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__users"),
         // Admin block reads auth tables for the admin dashboards. The
         // wildcard mirrors the legacy AuthBlock grant — admin/pages/users
@@ -644,10 +651,9 @@ mod tests {
             "grants must include products: {consumers:?}"
         );
         // The pipeline router (impresspress/router) calls
-        // jwt_blocklist::contains() during extract_auth_meta to honour
+        // jwt_blocklist::contains() from verify_access_token to honour
         // SEC-042 (logout invalidates JWT). Without a grant, WRAP denies
-        // the read, jwt_blocklist::contains fails closed → true, and
-        // every signed-in request is treated as anonymous.
+        // the read and every signed-in request is refused with a 403.
         assert!(
             consumers.contains(&"impresspress/router"),
             "grants must include router (SEC-042 blocklist read): {consumers:?}"
@@ -855,7 +861,7 @@ mod tests {
     /// The credential is a personal access token, so the refused call is the
     /// PAT lookup `require_user` makes itself. (An access JWT would not get
     /// that far: `crypto::verify_access_token` reads the account's
-    /// `auth_version` first and rejects the token when that read fails.)
+    /// `auth_version` first, and a failed read refuses the request there.)
     ///
     /// The route is the shape every `auth@v1` consumer has: the typed
     /// client's `require_user`, its error handed straight back as the
@@ -951,5 +957,66 @@ mod tests {
                 "{code:?}: the backend's text must not reach the body: {body}"
             );
         }
+    }
+
+    /// An access JWT whose `auth_version` read fails reaches the caller route
+    /// as a 503 — not the 401 a missing credential gets. The token used to be
+    /// refused as unverifiable, fall through to the PAT lookup, find no row
+    /// and answer `Unauthorized`: every `auth@v1` consumer saw its signed-in
+    /// caller as signed out for as long as the database was down.
+    #[tokio::test]
+    async fn a_failed_auth_version_read_reaches_the_caller_route_as_503() {
+        let mut ctx = with_admin_and_jwt_secret().await;
+        AuthServiceImpl::new(BlockState::for_test(Arc::new(ctx.clone())))
+            .init(&ctx)
+            .await
+            .expect("auth init applies the auth migrations");
+        // A fresh user, so the verify-side `auth_version` cache holds no entry
+        // for it that would answer the read this test makes fail.
+        let user = users::insert(
+            &ctx,
+            users::NewUser {
+                email: "down@e.co".into(),
+                display_name: "Down".into(),
+                avatar_url: None,
+                role: "user".into(),
+                email_verified: true,
+                verification_token_hash: None,
+            },
+        )
+        .await
+        .expect("insert user");
+        let down = crate::test_support::FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.get", users::TABLE)],
+        );
+        let service = AuthServiceImpl::new(BlockState::for_test(Arc::new(down)));
+        ctx.register_block(
+            "wafer-run/auth",
+            Arc::new(wafer_core::service_blocks::auth::AuthBlock::new(Arc::new(
+                service,
+            ))),
+        );
+
+        let mut request = Message::new("retrieve");
+        request.set_meta(
+            "http.header.authorization",
+            format!(
+                "Bearer {}",
+                crate::test_support::access_token_for(&user.id, &["user"])
+            ),
+        );
+        let out = match wafer_core::clients::auth::require_user(&ctx, &request).await {
+            Ok(id) => panic!("a failed auth_version read must not authenticate {id}"),
+            Err(e) => wafer_run::OutputStream::error(e),
+        };
+        let response = wafer_block::http_codec::collect_http_response(out).await;
+        let body = String::from_utf8(response.body).expect("UTF-8 body");
+
+        assert_eq!(response.status, 503, "{body}");
+        assert!(
+            !body.contains("simulated database outage"),
+            "the fault's own text must not reach the body: {body}"
+        );
     }
 }

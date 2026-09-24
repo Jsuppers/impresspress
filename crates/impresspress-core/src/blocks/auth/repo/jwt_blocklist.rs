@@ -1,10 +1,10 @@
 //! Row-level access over `wafer_run__auth__jwt_blocklist` (SEC-042).
 //!
 //! Logout calls [`insert`] with the request JWT's `jti` and `exp`.
-//! `pipeline::handle_request` calls [`contains`] after structural JWT
-//! validation in `crate::crypto::extract_auth_meta` — a hit means the
-//! caller logged out (or had their session terminated) before the token's
-//! natural expiry, so the request continues as unauthenticated.
+//! `crate::crypto::verify_access_token` calls [`contains`] after structural
+//! JWT validation — a hit means the caller logged out (or had their session
+//! terminated) before the token's natural expiry, so the token does not
+//! authenticate.
 //!
 //! Rows are at most one per access-token-lifetime per user. [`delete_expired`]
 //! sweeps rows whose `expires_at < cutoff`; presenting an expired JWT
@@ -52,24 +52,21 @@ pub async fn insert(ctx: &dyn Context, new: NewBlocklistEntry<'_>) -> Result<(),
     }
 }
 
-/// True iff `jti` is in the blocklist, used by JWT validation in
-/// `pipeline::handle_request`.
+/// Whether `jti` is in the blocklist, used by
+/// `crate::crypto::verify_access_token`.
 ///
-/// `Ok` → blocklisted, `NOT_FOUND` → not blocklisted. Any other backend
-/// error (WRAP denial, connection blip) fails *closed* — returns `true`
-/// so the request continues as unauthenticated rather than silently
-/// re-enabling revoked JWTs until natural expiry. A `false` on transient
-/// errors is the bigger footgun: a logged-out user keeps full access for
-/// the remainder of the access-token lifetime.
-pub async fn contains(ctx: &dyn Context, jti: &str) -> bool {
+/// A found row is `Ok(true)`, `NOT_FOUND` is `Ok(false)`. Any other backend
+/// error (WRAP denial, connection blip) is returned: the lookup did not
+/// answer, and neither `false` (a logged-out token keeps full access for the
+/// rest of its lifetime) nor `true` (every signed-in caller looks signed out
+/// until the database recovers) is what it would have said. The verifier
+/// refuses the request on it.
+pub async fn contains(ctx: &dyn Context, jti: &str) -> Result<bool, WaferError> {
     use wafer_block::ErrorCode;
     match db::get_by_field(ctx, TABLE, "jti", json!(jti)).await {
-        Ok(_) => true,
-        Err(e) if e.code == ErrorCode::NotFound => false,
-        Err(e) => {
-            tracing::warn!(jti = %jti, "jwt_blocklist contains: db error — failing closed: {e}");
-            true
-        }
+        Ok(_) => Ok(true),
+        Err(e) if e.code == ErrorCode::NotFound => Ok(false),
+        Err(e) => Err(db_failed(&format!("jwt_blocklist contains {jti}"), e)),
     }
 }
 
@@ -118,13 +115,13 @@ mod tests {
         .await
         .expect("insert");
 
-        assert!(contains(&ctx, "jti-1").await);
+        assert!(contains(&ctx, "jti-1").await.unwrap());
     }
 
     #[tokio::test]
     async fn contains_returns_false_for_unknown_jti() {
         let ctx = TestContext::with_auth().await;
-        assert!(!contains(&ctx, "missing").await);
+        assert!(!contains(&ctx, "missing").await.unwrap());
     }
 
     #[tokio::test]
@@ -157,7 +154,7 @@ mod tests {
         let deleted = delete_expired(&ctx, &cutoff).await.expect("sweep");
         assert_eq!(deleted, 1);
 
-        assert!(!contains(&ctx, "old").await);
-        assert!(contains(&ctx, "new").await);
+        assert!(!contains(&ctx, "old").await.unwrap());
+        assert!(contains(&ctx, "new").await.unwrap());
     }
 }
