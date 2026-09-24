@@ -34,10 +34,13 @@ fn error_response(e: RoomError) -> OutputStream {
     }
 }
 
+/// The configured room lifetime, held to `1..=MAX_TTL_SECONDS` so the expiry
+/// stamped from it (`service::open_room`) is always a representable date.
 fn ttl_secs(ctx: &dyn Context) -> i64 {
     ctx.config_get(service::TTL_KEY)
         .and_then(|v| v.parse().ok())
         .unwrap_or(service::DEFAULT_TTL_SECONDS)
+        .clamp(1, service::MAX_TTL_SECONDS)
 }
 
 fn max_sdp_bytes(ctx: &dyn Context) -> usize {
@@ -275,5 +278,29 @@ mod tests {
         assert_eq!(got["ice_servers"][1]["urls"], "stun:two.test:3478");
         assert_eq!(got["room_seconds"], 900);
         assert_eq!(got["code_length"], 6);
+    }
+
+    /// A room TTL past the cap opens a room that lives for the cap, instead of
+    /// panicking while it stamps the expiry: `10000000000000` seconds is past
+    /// the last date chrono can represent.
+    #[tokio::test]
+    async fn an_out_of_range_room_ttl_is_held_to_the_cap() {
+        let mut ctx = TestContext::with_signal().await;
+        ctx.set_config(service::TTL_KEY, "10000000000000");
+        assert_eq!(
+            output_http_status(
+                call(
+                    &ctx,
+                    "create",
+                    "/b/signal/rooms/AB2CD3/offer",
+                    r#"{"sdp":"v=0"}"#
+                )
+                .await
+            )
+            .await,
+            200
+        );
+        let got = output_json(call(&ctx, "retrieve", "/b/signal/config", "").await).await;
+        assert_eq!(got["room_seconds"], service::MAX_TTL_SECONDS);
     }
 }
