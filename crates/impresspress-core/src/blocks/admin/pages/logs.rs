@@ -184,7 +184,9 @@ async fn system_logs_tab(ctx: &dyn Context, msg: &Message) -> Result<Markup, Waf
             },
         ))
 
-        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, &page_href))
+        @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) {
+            (pagination(list.page as u32, per_page, list.total_count as u32, &page_href))
+        }
     })
 }
 
@@ -240,7 +242,9 @@ async fn audit_logs_tab(ctx: &dyn Context, msg: &Message) -> Result<Markup, Wafe
             html! { p .text-center .text-muted { "No audit logs yet" } },
         ))
 
-        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/logs?tab=audit"))
+        @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) {
+            (pagination(list.page as u32, per_page, list.total_count as u32, "/b/admin/logs?tab=audit"))
+        }
     })
 }
 

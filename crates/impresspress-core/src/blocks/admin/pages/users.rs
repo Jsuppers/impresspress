@@ -129,7 +129,9 @@ async fn users_tab(
 
         (table)
 
-        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
+        @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) {
+            (pagination(list.page as u32, per_page, list.total_count as u32, "/b/admin/users"))
+        }
     })
 }
 

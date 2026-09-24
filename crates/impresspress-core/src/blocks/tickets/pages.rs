@@ -146,12 +146,14 @@ pub async fn inbox(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 }
             }
         }
-        (components::pagination(
-            tickets.page as u32,
-            tickets.page_size as u32,
-            tickets.total_count as u32,
-            &pagination_base,
-        ))
+        @if let Some(per_page) = std::num::NonZeroU32::new(page_size.min(100) as u32) {
+            (components::pagination(
+                tickets.page as u32,
+                per_page,
+                tickets.total_count as u32,
+                &pagination_base,
+            ))
+        }
         details .mt-6 {
             summary { "Create internal ticket" }
             form data-json-form data-endpoint="/b/tickets/api/admin/tickets"
