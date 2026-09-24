@@ -7,8 +7,9 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use crate::{
     blocks::{
         auth::{
-            bump_auth_version,
+            bump_auth_version, check_password,
             repo::{local_credentials, tokens, users},
+            PasswordCheck,
         },
         auth_ui::contracts::MessageResponse,
         crud,
@@ -129,15 +130,25 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         Err(e) => return crud::db_error_internal(e, "Credential lookup failed"),
     };
 
-    if crypto::compare_hash(ctx, &body.current_password, &cred.password_hash)
-        .await
-        .is_err()
-    {
-        return refused(
-            msg,
-            ErrorCode::InvalidCredentials,
-            "Current password is incorrect",
-        );
+    // Only a wrong password is "incorrect". A stored hash the crypto service
+    // cannot check (logged with the user id by `check_password`) is this
+    // deployment's fault, not the caller's: the caller is already signed in
+    // as this account, so there is nothing to hide from them, and telling
+    // them their correct password is wrong would send them round in circles.
+    // A comparison that could not run is the classified 403/429/503.
+    match check_password(ctx, user_id, &body.current_password, &cred.password_hash).await {
+        Ok(PasswordCheck::Matches) => {}
+        Ok(PasswordCheck::DoesNotMatch) => {
+            return refused(
+                msg,
+                ErrorCode::InvalidCredentials,
+                "Current password is incorrect",
+            );
+        }
+        Ok(PasswordCheck::Unverifiable(e)) => {
+            return err_internal("Stored password hash could not be checked", e);
+        }
+        Err(e) => return OutputStream::error(e),
     }
 
     let new_hash = match crypto::hash(ctx, &body.new_password).await {
@@ -203,8 +214,8 @@ mod tests {
     use crate::{
         blocks::auth_ui::api::{login, signup},
         test_support::{
-            auth_msg, collect_or_panic, output_is_error, output_json, output_status,
-            FailingDbOpContext, TestContext,
+            auth_msg, collect_or_panic, output_http_status, output_is_error, output_json,
+            output_status, FailingDbOpContext, FailingServiceOpContext, TestContext,
         },
     };
 
@@ -546,5 +557,50 @@ mod tests {
             output_is_error(out, "Internal").await,
             "a failed existence probe must not answer 404"
         );
+    }
+
+    /// A stored hash the crypto service cannot check is this deployment's
+    /// fault. The caller is already signed in as the account, so there is
+    /// nothing to hide from them, and "Current password is incorrect" would
+    /// tell them their correct password is wrong. It is a 500, logged.
+    #[tokio::test]
+    async fn a_malformed_stored_hash_is_a_500_not_an_incorrect_password() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let user_id = signup_user(&ctx, "gina@example.com", "original-horse-battery1").await;
+        local_credentials::update_password(&ctx, &user_id, "not-a-password-hash")
+            .await
+            .expect("overwrite the stored hash");
+
+        let out = handle(
+            &ctx,
+            &auth_msg("update", "/b/auth/api/change-password", &user_id),
+            body("original-horse-battery1", "new-horse-battery-2026"),
+        )
+        .await;
+
+        assert_eq!(output_http_status(out).await, 500);
+    }
+
+    /// A comparison the crypto service could not run is the classified 503,
+    /// not a wrong current password.
+    #[tokio::test]
+    async fn a_crypto_outage_is_a_503_not_an_incorrect_password() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let user_id = signup_user(&ctx, "hank@example.com", "original-horse-battery1").await;
+        let down = FailingServiceOpContext::failing_with(
+            ctx,
+            "wafer-run/crypto",
+            vec!["crypto.compare_hash"],
+            wafer_run::WaferError::new(wafer_run::ErrorCode::Unavailable, "crypto is down"),
+        );
+
+        let out = handle(
+            &down,
+            &auth_msg("update", "/b/auth/api/change-password", &user_id),
+            body("original-horse-battery1", "new-horse-battery-2026"),
+        )
+        .await;
+
+        assert_eq!(output_http_status(out).await, 503);
     }
 }

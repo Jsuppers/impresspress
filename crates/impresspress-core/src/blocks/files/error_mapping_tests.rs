@@ -24,7 +24,7 @@ use super::{
     FilesBlock,
 };
 use crate::test_support::{
-    admin_msg, anon_msg, auth_msg, FailingDbOpContext, FailingStorageOpContext, TestContext,
+    admin_msg, anon_msg, auth_msg, FailingDbOpContext, FailingServiceOpContext, TestContext,
 };
 
 /// The refusal WRAP answers a call its caller holds no grant for. Its text
@@ -49,8 +49,8 @@ fn denied(ctx: &TestContext, table: &'static str) -> FailingDbOpContext {
 }
 
 /// `ops` on `wafer-run/storage`, refused the way WRAP refuses them.
-fn storage_denied(ctx: &TestContext, ops: Vec<&'static str>) -> FailingStorageOpContext {
-    FailingStorageOpContext::failing_with(ctx.clone(), ops, wrap_denial())
+fn storage_denied(ctx: &TestContext, ops: Vec<&'static str>) -> FailingServiceOpContext {
+    FailingServiceOpContext::failing_with(ctx.clone(), "wafer-run/storage", ops, wrap_denial())
 }
 
 /// `msg` with `body` through the block's own `handle`.

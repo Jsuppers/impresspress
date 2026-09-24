@@ -420,7 +420,7 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// `a_refused_room_store_is_403` in `signal/mod.rs`, one real route per
 /// converted site in `files/error_mapping_tests.rs` and
 /// `dev/error_mapping_tests.rs` (storage refusals through
-/// `FailingStorageOpContext`), and `tickets`'
+/// `FailingServiceOpContext`), and `tickets`'
 /// `refused_list_pages_are_the_403_page` in `tickets/pages.rs`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
@@ -607,11 +607,19 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     ),
     (
         "auth_ui/api/change_password.rs",
-        &[Tail {
-            label: "Hash failed",
-            count: 1,
-            why: "crypto: hashing the new password",
-        }],
+        &[
+            Tail {
+                label: "Hash failed",
+                count: 1,
+                why: "crypto: hashing the new password",
+            },
+            Tail {
+                label: "Stored password hash could not be checked",
+                count: 1,
+                why: "crypto: the Internal a stored hash it cannot check gets; every \
+                      other compare_hash failure is classified by check_password",
+            },
+        ],
     ),
     (
         "auth_ui/api/reset_password.rs",

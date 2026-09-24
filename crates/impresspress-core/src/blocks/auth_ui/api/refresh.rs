@@ -20,6 +20,7 @@ use wafer_run::{context::Context, InputStream, OutputStream};
 use crate::{
     blocks::{
         auth::{
+            credential_check_failed,
             helpers::{
                 ensure_admin_role, expected_issuer, issue_tokens_and_cookie, Rotation,
                 SessionLifetime,
@@ -43,8 +44,23 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // Verify the JWT signature/expiry. A valid signature alone is not enough
     // — the row lookup below is the source of truth for "this token has not
     // been used or revoked yet".
-    let Ok(claims) = crypto::verify(ctx, &body.refresh_token).await else {
-        return error_response(ErrorCode::InvalidToken, "Invalid or expired refresh token");
+    //
+    // Only `Unauthenticated` is the crypto service judging the token. Any
+    // other error means the check did not run (WRAP refusal, service down),
+    // and "invalid refresh token" would tell the client its credential is
+    // finished when nothing about it was judged, so it is the classified
+    // 403/429/503 instead — the same rule the token-row read below follows.
+    let claims = match crypto::verify(ctx, &body.refresh_token).await {
+        Ok(claims) => claims,
+        Err(e) if e.code == wafer_run::ErrorCode::Unauthenticated => {
+            return error_response(ErrorCode::InvalidToken, "Invalid or expired refresh token");
+        }
+        Err(e) => {
+            return OutputStream::error(credential_check_failed(
+                e,
+                "auth: refresh token verification",
+            ));
+        }
     };
 
     let Some(user_id) = claims
@@ -759,5 +775,31 @@ mod tests {
             "the rotation that WON must still refresh; burning the family on a \
              lost claim kills the pair it had just minted: {again}"
         );
+    }
+
+    /// Only the crypto service judging the token makes it invalid. A verify
+    /// call that could not run — the service down, or refused by WRAP — is
+    /// the classified 503 or 403: "Invalid or expired refresh token" would
+    /// tell the client its credential is finished when nothing judged it.
+    #[tokio::test]
+    async fn an_unrun_token_verification_is_classified_not_invalid() {
+        use crate::test_support::{output_http_status, FailingServiceOpContext};
+
+        for (code, status) in [
+            (wafer_run::ErrorCode::Unavailable, 503),
+            (wafer_run::ErrorCode::PermissionDenied, 403),
+        ] {
+            let ctx = TestContext::with_auth_and_crypto().await;
+            let token = fresh_refresh_token(&ctx).await;
+            let failing = FailingServiceOpContext::failing_with(
+                ctx,
+                "wafer-run/crypto",
+                vec!["crypto.verify"],
+                wafer_run::WaferError::new(code, "simulated crypto fault"),
+            );
+
+            let out = handle(&failing, refresh_with(&token)).await;
+            assert_eq!(output_http_status(out).await, status, "{code:?}");
+        }
     }
 }

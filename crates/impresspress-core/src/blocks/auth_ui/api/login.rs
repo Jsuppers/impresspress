@@ -1,14 +1,15 @@
 //! POST /b/auth/api/login — relocated from auth/login.rs in Task 5.
 
-use wafer_core::clients::{config, crypto};
+use wafer_core::clients::config;
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
     blocks::{
         auth::{
+            burn_timing_equalization, check_password,
             helpers::{ensure_admin_role, issue_tokens_and_cookie, Rotation, SessionLifetime},
             repo::{local_credentials, users},
-            timing_equalization_hash,
+            PasswordCheck,
         },
         auth_ui::{
             contracts::{AuthenticatedUser, LoginRequest, LoginResponse, TokenType},
@@ -41,8 +42,17 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // The real stored credential, if this login has one at all. A user with
     // no `local_credentials` row (an OAuth-only account) is `None` and takes
-    // the equalization arm below; a failed read is an outage, refused the
-    // same way the users read above refuses one, not a wrong password.
+    // the equalization arm below.
+    //
+    // DELIBERATE, the same rule `forgot_password` and `verify::handle_resend`
+    // follow: only a registered address reaches this read, so a failure here
+    // answered with its own status (403, 500) would tell an anonymous caller
+    // which emails have accounts whenever the credentials table alone is
+    // refused or failing. It is logged with its code and the user id, and the
+    // login continues down the equalization arm, answering — in the same
+    // time — exactly what an unknown email gets. The users read above, which
+    // every login makes, keeps its honest 403/500, so an outage of the
+    // database as a whole is still visible to the caller.
     let stored_hash_owned: String;
     let stored_hash: Option<&str> = match &user_row {
         Some(u) => match local_credentials::find_by_user_id(ctx, &u.id).await {
@@ -51,7 +61,15 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
                 Some(&stored_hash_owned)
             }
             Ok(None) => None,
-            Err(e) => return crud::db_error_internal(e, "Credential lookup failed"),
+            Err(e) => {
+                tracing::error!(
+                    user_id = %u.id,
+                    code = ?e.code,
+                    error = %e,
+                    "login: credential lookup failed; answered as invalid credentials"
+                );
+                None
+            }
         },
         None => None,
     };
@@ -60,21 +78,33 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // the scheme this platform writes, so "no such user" and "wrong password"
     // cost the same and the response time is not a user-enumeration oracle.
     // See `auth::timing_equalization_hash` for why that hash is derived rather
-    // than a constant.
+    // than a constant, and `auth::burn_timing_equalization` for why its
+    // outcome can never be a login.
     //
-    // The equalization comparison's OUTCOME is deliberately discarded: this
-    // arm is reached precisely when there is nothing to authenticate against,
-    // so it can never be a successful login however it returns. (The
-    // placeholder password is a public constant; treating a match as a login
-    // would sign the caller in as any account whose local-credentials row is
-    // missing.)
-    let password_ok = match stored_hash {
-        Some(hash) => crypto::compare_hash(ctx, &body.password, hash)
-            .await
-            .is_ok(),
-        None => {
-            if let Some(equalizer) = timing_equalization_hash(ctx).await {
-                let _ = crypto::compare_hash(ctx, &body.password, equalizer).await;
+    // A stored hash the crypto service cannot check (`Unverifiable`, already
+    // logged with the user id by `check_password`) is answered exactly like a
+    // wrong password, and pays for the same verification: the crypto service
+    // rejects such a hash without doing the work, and a faster or different
+    // answer would tell the caller this email has an account. A comparison
+    // that could not run at all (WRAP refusal, crypto service down) is the
+    // classified 403/429/503 on both arms, known email or not.
+    let password_ok = match (&user_row, stored_hash) {
+        (Some(user), Some(hash)) => {
+            match check_password(ctx, &user.id, &body.password, hash).await {
+                Ok(PasswordCheck::Matches) => true,
+                Ok(PasswordCheck::DoesNotMatch) => false,
+                Ok(PasswordCheck::Unverifiable(_)) => {
+                    if let Err(e) = burn_timing_equalization(ctx, &body.password).await {
+                        return OutputStream::error(e);
+                    }
+                    false
+                }
+                Err(e) => return OutputStream::error(e),
+            }
+        }
+        _ => {
+            if let Err(e) = burn_timing_equalization(ctx, &body.password).await {
+                return OutputStream::error(e);
             }
             false
         }
@@ -321,31 +351,275 @@ mod tests {
         }
     }
 
-    /// A credential read that fails is an outage, and the caller is told so
-    /// with a 500. Answering it as "Invalid email or password" would tell a
-    /// user with the right password that it is wrong, and hide the outage
-    /// behind what looks like ordinary failed logins.
+    /// What a stored credential looks like when the crypto service cannot
+    /// check it: no scheme it knows (`CryptoError::MalformedHash`).
+    const MALFORMED_HASH: &str = "not-a-password-hash";
+
+    /// Sign `email` up through the real signup handler, then overwrite its
+    /// stored hash with [`MALFORMED_HASH`] through the real repo write.
+    /// Returns the user id.
+    async fn user_with_malformed_hash(ctx: &TestContext, email: &str) -> String {
+        use crate::blocks::auth::repo::{local_credentials, users};
+
+        signup_user(ctx, email, "correct-horse-battery").await;
+        let user = users::find_by_email(ctx, email)
+            .await
+            .expect("user read")
+            .expect("signup created the user");
+        local_credentials::update_password(ctx, &user.id, MALFORMED_HASH)
+            .await
+            .expect("overwrite the stored hash");
+        user.id
+    }
+
+    fn credentials(email: &str, password: &str) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::json!({"email": email, "password": password})
+                .to_string()
+                .into_bytes(),
+        )
+    }
+
+    async fn detail_code(out: OutputStream) -> Option<String> {
+        match out.collect_buffered().await {
+            Err(wafer_run::TerminalNotResponse::Error(err)) => {
+                err.detail_code().map(str::to_string)
+            }
+            other => panic!("expected an error terminal, got {other:?}"),
+        }
+    }
+
+    /// A stored hash the crypto service cannot check is answered exactly as a
+    /// wrong password — a different answer would tell the caller the email
+    /// has an account — and logged at error level with the user id, which is
+    /// the only way an operator learns the account cannot sign in until its
+    /// password is reset. The hash itself stays out of the log.
     #[tokio::test]
-    async fn a_failed_credential_read_is_a_500_not_invalid_credentials() {
-        use crate::{blocks::auth::repo::local_credentials, test_support::FailingDbOpContext};
-
+    async fn a_malformed_stored_hash_is_invalid_credentials_and_logged_with_the_user_id() {
         let ctx = ctx_with_crypto().await;
-        signup_user(&ctx, "outage@example.com", "correct-horse-battery").await;
-        let failing =
-            FailingDbOpContext::new(ctx, vec![("database.list", local_credentials::TABLE)]);
+        let user_id = user_with_malformed_hash(&ctx, "broken@example.com").await;
 
-        let body = serde_json::json!({
-            "email": "outage@example.com",
-            "password": "correct-horse-battery",
-        })
-        .to_string();
-        let status =
-            output_http_status(handle(&failing, InputStream::from_bytes(body.into_bytes())).await)
-                .await;
+        let captured = crate::test_support::CapturedEvents::install();
+        let out = handle(
+            &ctx,
+            credentials("broken@example.com", "correct-horse-battery"),
+        )
+        .await;
+        let code = detail_code(out).await;
+        let events = captured.events();
+        drop(captured);
+
+        assert_eq!(code.as_deref(), Some("invalid_credentials"));
+        let logged = events
+            .iter()
+            .find(|e| {
+                e.level == tracing::Level::ERROR
+                    && e.fields.get("user_id").map(String::as_str) == Some(user_id.as_str())
+            })
+            .unwrap_or_else(|| {
+                panic!("no error-level event names user {user_id}; events: {events:?}")
+            });
+        assert!(
+            logged.fields.values().all(|v| !v.contains(MALFORMED_HASH)),
+            "the stored hash must not reach the log: {logged:?}"
+        );
+    }
+
+    /// The crypto service rejects a hash it cannot check without doing the
+    /// work a real verification does, so a login against one would answer
+    /// measurably faster than a wrong password — the same enumeration oracle
+    /// `auth::timing_equalization_hash` exists to close for unknown emails.
+    /// The login burns one verification against the equalization hash to
+    /// cost what a wrong password costs.
+    #[tokio::test]
+    async fn a_malformed_stored_hash_costs_a_full_verification() {
+        use std::sync::{Arc, Mutex};
+
+        use wafer_core::interfaces::crypto::service::{CryptoError, CryptoService};
+
+        /// The real crypto service, recording every hash `compare_hash` is
+        /// asked to check.
+        struct Recording {
+            inner: wafer_block_crypto::service::Argon2JwtCryptoService,
+            compared: Arc<Mutex<Vec<String>>>,
+        }
+        impl CryptoService for Recording {
+            fn hash(&self, password: &str) -> Result<String, CryptoError> {
+                self.inner.hash(password)
+            }
+            fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+                self.compared.lock().unwrap().push(hash.to_string());
+                self.inner.compare_hash(password, hash)
+            }
+            fn sign_for(
+                &self,
+                block_id: &str,
+                claims: std::collections::HashMap<String, serde_json::Value>,
+                expiry: std::time::Duration,
+            ) -> Result<String, CryptoError> {
+                self.inner.sign_for(block_id, claims, expiry)
+            }
+            fn verify_for(
+                &self,
+                block_id: &str,
+                token: &str,
+            ) -> Result<std::collections::HashMap<String, serde_json::Value>, CryptoError>
+            {
+                self.inner.verify_for(block_id, token)
+            }
+            fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+                self.inner.random_bytes(n)
+            }
+        }
+
+        let compared = Arc::new(Mutex::new(Vec::new()));
+        let ctx = TestContext::with_auth_and_crypto_service(Arc::new(Recording {
+            inner: crate::test_support::real_crypto_service(),
+            compared: Arc::clone(&compared),
+        }))
+        .await;
+        user_with_malformed_hash(&ctx, "slow@example.com").await;
+        let equalizer = crate::blocks::auth::timing_equalization_hash(&ctx)
+            .await
+            .expect("the crypto block hashes");
+        compared.lock().unwrap().clear();
+
+        let out = handle(
+            &ctx,
+            credentials("slow@example.com", "correct-horse-battery"),
+        )
+        .await;
+        assert_eq!(
+            detail_code(out).await.as_deref(),
+            Some("invalid_credentials")
+        );
 
         assert_eq!(
-            status, 500,
-            "a failed credential read must surface as a server error, not a wrong password"
+            *compared.lock().unwrap(),
+            vec![MALFORMED_HASH.to_string(), equalizer.to_string()],
+            "after the stored hash is rejected, one verification must run against the \
+             equalization hash"
+        );
+    }
+
+    /// A comparison the crypto service could not run says nothing about the
+    /// password. Answering it "Invalid email or password" tells a user with
+    /// the right password that it is wrong, and hides the outage behind what
+    /// looks like ordinary failed logins. It is a 503 — and for an unknown
+    /// email too, whose equalization comparison fails the same way, so the
+    /// outage does not turn the status into an account-existence oracle.
+    #[tokio::test]
+    async fn a_crypto_outage_is_a_503_for_known_and_unknown_emails() {
+        use crate::test_support::FailingServiceOpContext;
+
+        let ctx = ctx_with_crypto().await;
+        signup_user(&ctx, "known@example.com", "correct-horse-battery").await;
+        // Derived before the outage, as a running deployment would have it.
+        crate::blocks::auth::timing_equalization_hash(&ctx)
+            .await
+            .expect("the crypto block hashes");
+        let down = FailingServiceOpContext::failing_with(
+            ctx,
+            "wafer-run/crypto",
+            vec!["crypto.compare_hash"],
+            wafer_run::WaferError::new(wafer_run::ErrorCode::Unavailable, "crypto is down"),
+        );
+
+        for email in ["known@example.com", "unknown@example.com"] {
+            let status = output_http_status(
+                handle(&down, credentials(email, "correct-horse-battery")).await,
+            )
+            .await;
+            assert_eq!(
+                status, 503,
+                "{email}: an unrun comparison is not a wrong password"
+            );
+        }
+    }
+
+    /// A WRAP refusal of the comparison is the classified 403, not a wrong
+    /// password: the deployment is missing a grant, and the operator needs to
+    /// see that rather than a stream of failed logins.
+    #[tokio::test]
+    async fn a_refused_comparison_is_a_403() {
+        use crate::test_support::FailingServiceOpContext;
+
+        let ctx = ctx_with_crypto().await;
+        signup_user(&ctx, "denied@example.com", "correct-horse-battery").await;
+        let refused = FailingServiceOpContext::failing_with(
+            ctx,
+            "wafer-run/crypto",
+            vec!["crypto.compare_hash"],
+            wafer_run::WaferError::new(
+                wafer_run::ErrorCode::PermissionDenied,
+                "no grant for crypto.compare_hash",
+            ),
+        );
+
+        let status = output_http_status(
+            handle(
+                &refused,
+                credentials("denied@example.com", "correct-horse-battery"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, 403);
+    }
+
+    /// The control: a wrong password is still the plain invalid-credentials
+    /// answer.
+    #[tokio::test]
+    async fn a_wrong_password_is_invalid_credentials() {
+        let ctx = ctx_with_crypto().await;
+        signup_user(&ctx, "typo@example.com", "correct-horse-battery").await;
+
+        let out = handle(&ctx, credentials("typo@example.com", "wrong-horse-battery")).await;
+        assert_eq!(
+            detail_code(out).await.as_deref(),
+            Some("invalid_credentials")
+        );
+    }
+
+    /// An `Internal` from the crypto service that is not a malformed hash is
+    /// its own fault while checking — a failed offload, say — and says
+    /// nothing about the stored credential: it is the classified 503, and the
+    /// log does not send an operator off to reset a password that is fine.
+    #[tokio::test]
+    async fn a_transient_crypto_fault_is_a_503_not_a_reset() {
+        use crate::test_support::{CapturedEvents, FailingServiceOpContext};
+
+        let ctx = ctx_with_crypto().await;
+        signup_user(&ctx, "flaky@example.com", "correct-horse-battery").await;
+        let faulty = FailingServiceOpContext::failing_with(
+            ctx,
+            "wafer-run/crypto",
+            vec!["crypto.compare_hash"],
+            wafer_run::WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                "crypto blocking task failed: task panicked",
+            ),
+        );
+
+        let captured = CapturedEvents::install();
+        let status = output_http_status(
+            handle(
+                &faulty,
+                credentials("flaky@example.com", "correct-horse-battery"),
+            )
+            .await,
+        )
+        .await;
+        let events = captured.events();
+        drop(captured);
+
+        assert_eq!(status, 503);
+        assert!(
+            events.iter().all(|e| e
+                .fields
+                .get("message")
+                .is_none_or(|m| !m.contains("password reset"))),
+            "a transient fault must not be logged as an account needing a reset: {events:?}"
         );
     }
 }
