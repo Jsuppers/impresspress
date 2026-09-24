@@ -159,10 +159,16 @@ fn build_template(name: &str) -> Vec<u8> {
 
 /// Scaffold `template` as block `name` — the three files `dev_create_block`
 /// writes, from [`Template::files`] itself — and build it.
+///
+/// The one edit is the one an author makes before a second block from the
+/// same template can run beside the first: agent tool names are unique
+/// across a runtime, and the template's is not derived from the block name.
 fn build_scaffolded(template: Template, name: &str) -> Vec<u8> {
     let out = tempfile::tempdir().expect("tempdir");
     let block_dir = format!("blocks/{name}/");
+    let tool = format!("\"subscribe_{}\"", name.replace('-', "_"));
     for (path, content) in template.files(name) {
+        let content = content.replace("\"subscribe_newsletter\"", &tool);
         let relative = path
             .strip_prefix(&block_dir)
             .unwrap_or_else(|| panic!("{path} is outside {block_dir}"));
