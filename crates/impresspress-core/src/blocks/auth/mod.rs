@@ -1110,6 +1110,17 @@ pub(crate) mod helpers {
         }
     }
 
+    /// The rotation family an issuance belongs to, and the refresh-row
+    /// generation it persists.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Rotation<'a> {
+        /// Initial authentication: a brand-new family at generation `0`.
+        NewFamily,
+        /// Refresh rotation within an established family (SEC-039);
+        /// `generation` is the predecessor's plus one.
+        Within { family: &'a str, generation: i64 },
+    }
+
     /// Mints the access + refresh JWTs, persists the refresh-token row,
     /// records the login family on the userportal device list, and builds the
     /// `auth_token` cookie — the exact sequence that was previously
@@ -1117,10 +1128,7 @@ pub(crate) mod helpers {
     /// drifted from, silently omitting the session row). Centralising it
     /// guarantees every authentication path is visible on the device list.
     ///
-    /// `family` follows [`generate_tokens`]: `None` mints a brand-new rotation
-    /// family (initial authentication), `Some(existing)` re-issues within an
-    /// established family (refresh rotation). `generation` is the refresh-row
-    /// generation to persist (`0` for a new family, `prev + 1` on rotation).
+    /// `rotation` says which family the tokens belong to: see [`Rotation`].
     ///
     /// [B12] The session row is keyed by that family, not by the access
     /// token, so a rotation touches the row the device already has instead of
@@ -1140,9 +1148,12 @@ pub(crate) mod helpers {
         email: &str,
         roles: &[String],
         auth_method: &str,
-        family: Option<&str>,
-        generation: i64,
+        rotation: Rotation<'_>,
     ) -> std::result::Result<IssuedLogin, wafer_run::OutputStream> {
+        let (family, generation) = match rotation {
+            Rotation::NewFamily => (None, 0),
+            Rotation::Within { family, generation } => (Some(family), generation),
+        };
         let (access_token, refresh_token, issued_family) =
             generate_tokens(ctx, lifetime, user_id, email, roles, auth_method, family).await?;
 

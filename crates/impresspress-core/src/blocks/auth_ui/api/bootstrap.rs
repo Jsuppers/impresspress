@@ -18,7 +18,7 @@ use crate::{
     blocks::{
         auth::{
             bootstrap,
-            helpers::{issue_tokens_and_cookie, SessionLifetime},
+            helpers::{issue_tokens_and_cookie, Rotation, SessionLifetime},
             repo::{bootstrap_tokens, users},
             service::hash_token,
         },
@@ -116,7 +116,13 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     // 5. Mint a session — same shared token-issuance tail as login/signup.
     let roles = vec!["admin".to_string()];
     let issued = match issue_tokens_and_cookie(
-        ctx, &lifetime, &user.id, &email, &roles, "password", None, 0,
+        ctx,
+        &lifetime,
+        &user.id,
+        &email,
+        &roles,
+        "password",
+        Rotation::NewFamily,
     )
     .await
     {

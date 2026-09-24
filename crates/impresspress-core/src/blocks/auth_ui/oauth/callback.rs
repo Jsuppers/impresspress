@@ -12,7 +12,7 @@ use crate::{
             config::REQUIRE_VERIFICATION_KEY,
             helpers::{
                 email_domain_allowed, ensure_admin_role, get_user_roles, initial_role_for,
-                issue_tokens_and_cookie, signup_allowed, SessionLifetime,
+                issue_tokens_and_cookie, signup_allowed, Rotation, SessionLifetime,
             },
             repo::{oauth_pkce, provider_links, users},
         },
@@ -223,8 +223,7 @@ pub async fn handle(
         &email,
         &roles,
         &format!("oauth.{provider}"),
-        None,
-        0,
+        Rotation::NewFamily,
     )
     .await
     {

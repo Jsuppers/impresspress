@@ -10,7 +10,7 @@ use crate::{
         auth::{
             helpers::{
                 email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
-                SessionLifetime,
+                Rotation, SessionLifetime,
             },
             repo::users,
         },
@@ -221,8 +221,7 @@ pub async fn handle(
         &email_lower,
         &roles,
         "password",
-        None,
-        0,
+        Rotation::NewFamily,
     )
     .await
     {

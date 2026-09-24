@@ -21,7 +21,8 @@ use crate::{
     blocks::{
         auth::{
             helpers::{
-                ensure_admin_role, expected_issuer, issue_tokens_and_cookie, SessionLifetime,
+                ensure_admin_role, expected_issuer, issue_tokens_and_cookie, Rotation,
+                SessionLifetime,
             },
             repo::{tokens, users},
         },
@@ -163,11 +164,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Err(e) => return crud::db_error_internal(e, "Refresh could not rotate the token"),
     }
 
-    // Re-issue within the *preserved* family (SEC-039): passing
-    // `Some(&row.family)` makes `generate_tokens` carry the existing family on
-    // the new refresh JWT so its `family` claim agrees with the DB row that
-    // anchors reuse detection. `generation = row.generation + 1` advances the
-    // rotation counter. This is the same shared issuance tail every other
+    // Re-issue within the *preserved* family (SEC-039): `Rotation::Within`
+    // makes `generate_tokens` carry the existing family on the new refresh JWT
+    // so its `family` claim agrees with the DB row that anchors reuse
+    // detection, and `row.generation + 1` advances the rotation counter. This is the same shared issuance tail every other
     // login flow uses, so the userportal session row is written here too.
     let issued = match issue_tokens_and_cookie(
         ctx,
@@ -176,8 +176,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         &email,
         &roles,
         &prior_auth_method,
-        Some(&row.family),
-        row.generation + 1,
+        Rotation::Within {
+            family: &row.family,
+            generation: row.generation + 1,
+        },
     )
     .await
     {

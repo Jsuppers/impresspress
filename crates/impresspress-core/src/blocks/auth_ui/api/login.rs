@@ -6,7 +6,7 @@ use wafer_run::{context::Context, InputStream, OutputStream};
 use crate::{
     blocks::{
         auth::{
-            helpers::{ensure_admin_role, issue_tokens_and_cookie, SessionLifetime},
+            helpers::{ensure_admin_role, issue_tokens_and_cookie, Rotation, SessionLifetime},
             repo::{local_credentials, users},
             timing_equalization_hash,
         },
@@ -123,8 +123,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         &email_lower,
         &roles,
         "password",
-        None,
-        0,
+        Rotation::NewFamily,
     )
     .await
     {
