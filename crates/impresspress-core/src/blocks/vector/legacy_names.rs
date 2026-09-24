@@ -1,59 +1,63 @@
-//! Moves each index registered under a name with uppercase letters to its
-//! lowercase name, once, when the vector block starts.
+//! Moves each index whose name has uppercase letters to its lowercase name,
+//! once, when the vector block starts.
 //!
 //! Index names used to admit `[A-Za-z0-9_]`. The database layer now accepts
 //! only plain lowercase identifiers as table names, and every vector backend
 //! addresses an index's tables by that rule, so an index created as `Docs`
-//! (`impresspress__vector__Docs` in the registry) can no longer be opened,
-//! queried or deleted under either spelling. `vector.rename_index` is the one
-//! operation that accepts such a legacy name: it moves the index's tables,
-//! entries and keyword search to the lowercase name atomically. This step
-//! calls it for every registry row whose name is not a plain identifier and
-//! then renames that registry row.
+//! (`impresspress__vector__Docs`) can no longer be opened, queried or
+//! deleted. `vector.rename_index` is the one operation that accepts such a
+//! legacy name: it moves the index's tables, entries and keyword search to the
+//! lowercase name atomically.
 //!
-//! Idempotent, so every start runs it:
-//! - a row already lowercase is skipped;
-//! - `NotFound` from the rename means no index is stored under the legacy
-//!   spelling. When the lowercase index exists, an earlier start moved the
-//!   index and stopped before renaming the row, so the row is renamed now.
-//! - When a registry row already holds the lowercase name, two indexes differ
-//!   only by case. They are never merged: the legacy one is left as it is and
-//!   named in an error log, for the operator to delete one of the two. The
-//!   backend refuses the same case with `AlreadyExists`, which is reported the
-//!   same way.
+//! Every legacy name is moved, whether the registry
+//! (`impresspress__vector__registry`) names it or only the backend's catalog
+//! does (`vector.list_indexes`, which also lists indexes older than the
+//! registry). A registry row follows its index: it is renamed to the
+//! lowercase name, and when a lowercase row already exists the legacy row is
+//! deleted instead. Two rows that differ only by case describe ONE index: the
+//! SQLite family (native and the browser's sql.js) compares table names
+//! case-insensitively, so `Docs_meta` and `docs_meta` cannot both exist and
+//! both rows point at the same tables. The lowercase row is kept, and what was
+//! done is logged.
+//!
+//! Idempotent, so every start runs it: a name already lowercase is skipped,
+//! and `NotFound` from the rename with the lowercase index present means an
+//! earlier start moved the index and stopped before its registry row, which is
+//! then fixed.
 //!
 //! A transient failure (`Unavailable`) fails the block's `Init`, so the
 //! runtime retries it. Any other refusal names the index in an error log and
-//! leaves it, so one unmovable index does not take the vector block down.
+//! leaves it for the next start, so one unmovable index does not take the
+//! vector block down.
 
 use wafer_block::db::{Filter, FilterOp, SortField};
 use wafer_core::clients::{database as db, vector as vclient};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use super::service::{vector_backend_available, REGISTRY_TABLE};
+use super::service::{vector_backend_available, REGISTRY_TABLE, TABLE_PREFIX};
 use crate::{
     db_read::{self, Bound},
     util::RecordExt,
 };
 
-/// What [`move_legacy_index`] did with one registry row.
+/// What [`move_legacy_index`] found for one legacy name.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Moved {
-    /// The index and its registry row now have the lowercase name.
-    Renamed,
-    /// A registry row or an index already has the lowercase name; nothing
-    /// changed.
-    Twin,
-    /// The backend refused the move for another reason; nothing changed.
+    /// The index was moved to the lowercase name now.
+    Now,
+    /// The index was already under the lowercase name.
+    Already,
+    /// The backend refused the move; nothing changed.
     Refused(String),
 }
 
-/// Run the move for every registry row whose name is not a plain identifier.
+/// Move every legacy-named index, and its registry row, to the lowercase
+/// name.
 pub(crate) async fn rename_legacy_indexes(ctx: &dyn Context) -> Result<(), WaferError> {
     if !vector_backend_available(ctx) {
         return Ok(());
     }
-    let rows = db_read::list_bounded_sorted(
+    let registered: Vec<String> = db_read::list_bounded_sorted(
         ctx,
         REGISTRY_TABLE,
         Vec::new(),
@@ -63,76 +67,108 @@ pub(crate) async fn rename_legacy_indexes(ctx: &dyn Context) -> Result<(), Wafer
         }],
         Bound::Curated("vector indexes are registered from the vector admin surface"),
     )
-    .await?;
-    let names: Vec<String> = rows
+    .await?
+    .iter()
+    .map(|row| row.str_field("prefixed_name").to_string())
+    .collect();
+    let catalog = match vclient::list_indexes(ctx, TABLE_PREFIX).await {
+        Ok(stems) => stems,
+        Err(e) if e.code == ErrorCode::Unavailable => return Err(e),
+        Err(e) => {
+            tracing::error!(
+                error = %e.message,
+                "vector backend could not list its indexes; only registered indexes are \
+                 checked for legacy names"
+            );
+            Vec::new()
+        }
+    };
+
+    let mut legacy: Vec<&String> = registered
         .iter()
-        .map(|row| row.str_field("prefixed_name").to_string())
-        .collect();
-    for legacy in names
-        .iter()
+        .chain(&catalog)
         .filter(|name| !wafer_block::db::is_plain_ident(name))
-    {
-        let lowercase = legacy.to_ascii_lowercase();
-        let registered = names.contains(&lowercase);
-        match move_legacy_index(ctx, legacy, &lowercase, registered).await? {
-            Moved::Renamed => {
-                tracing::info!(from = %legacy, to = %lowercase, "vector index moved to its lowercase name");
+        .collect();
+    legacy.sort();
+    legacy.dedup();
+    for name in legacy {
+        let lowercase = name.to_ascii_lowercase();
+        match move_legacy_index(ctx, name, &lowercase).await? {
+            Moved::Now => {
+                tracing::info!(from = %name, to = %lowercase, "vector index moved to its lowercase name");
             }
-            Moved::Twin => {
-                tracing::error!(
-                    index = %legacy,
-                    twin = %lowercase,
-                    "two vector indexes differ only by case; the uppercase one cannot be \
-                     reached and is left as it is — delete one of the two"
-                );
-            }
+            Moved::Already => {}
             Moved::Refused(reason) => {
-                tracing::error!(index = %legacy, to = %lowercase, reason = %reason, "vector index could not be moved to its lowercase name");
+                tracing::error!(
+                    index = %name,
+                    to = %lowercase,
+                    reason = %reason,
+                    "vector index could not be moved to its lowercase name; the next start tries again"
+                );
+                continue;
             }
+        }
+        if registered.contains(name) {
+            follow_with_registry_row(ctx, name, &lowercase, registered.contains(&lowercase))
+                .await?;
         }
     }
     Ok(())
 }
 
-/// Move the index registered as `legacy` to `lowercase`, then its registry
-/// row. `registered` says whether a registry row already holds `lowercase`.
+/// Move the index stored as `legacy` to `lowercase`.
 pub(crate) async fn move_legacy_index(
     ctx: &dyn Context,
     legacy: &str,
     lowercase: &str,
-    registered: bool,
 ) -> Result<Moved, WaferError> {
-    if registered {
-        return Ok(Moved::Twin);
-    }
     match vclient::rename_index(ctx, legacy, lowercase).await {
-        Ok(()) => {}
+        Ok(()) => Ok(Moved::Now),
+        // Nothing is stored under the legacy spelling: an earlier start moved
+        // it, or it was always stored lowercase under a legacy registry row.
         Err(e) if e.code == ErrorCode::NotFound => match vclient::count(ctx, lowercase).await {
-            // Moved by an earlier start that did not get to the row.
-            Ok(_) => {}
-            Err(e) if e.code == ErrorCode::NotFound => {
-                return Ok(Moved::Refused(format!(
-                    "no index is stored under {legacy:?} or {lowercase:?}"
-                )));
-            }
-            Err(e) => return Err(e),
+            Ok(_) => Ok(Moved::Already),
+            Err(e) if e.code == ErrorCode::NotFound => Ok(Moved::Refused(format!(
+                "no index is stored under {legacy:?} or {lowercase:?}"
+            ))),
+            Err(e) => Err(e),
         },
-        Err(e) if e.code == ErrorCode::AlreadyExists => return Ok(Moved::Twin),
-        Err(e) if e.code == ErrorCode::Unavailable => return Err(e),
-        Err(e) => return Ok(Moved::Refused(e.message)),
+        Err(e) if e.code == ErrorCode::Unavailable => Err(e),
+        Err(e) => Ok(Moved::Refused(e.message)),
     }
-    db::update_by_filters(
-        ctx,
-        REGISTRY_TABLE,
-        vec![Filter {
-            field: "prefixed_name".to_string(),
-            operator: FilterOp::Equal,
-            value: serde_json::json!(legacy),
-        }],
-        crate::util::json_map(serde_json::json!({ "prefixed_name": lowercase })),
-    )
-    .await?;
-    Ok(Moved::Renamed)
+}
+
+/// Point the registry at the moved index: rename the legacy row, or, when a
+/// lowercase row already describes the same index, delete the legacy row.
+async fn follow_with_registry_row(
+    ctx: &dyn Context,
+    legacy: &str,
+    lowercase: &str,
+    lowercase_registered: bool,
+) -> Result<(), WaferError> {
+    let legacy_row = vec![Filter {
+        field: "prefixed_name".to_string(),
+        operator: FilterOp::Equal,
+        value: serde_json::json!(legacy),
+    }];
+    if lowercase_registered {
+        db::delete_by_filters(ctx, REGISTRY_TABLE, legacy_row).await?;
+        tracing::info!(
+            removed = %legacy,
+            kept = %lowercase,
+            "two vector registry rows differed only by case and described one index; \
+             the lowercase row is kept"
+        );
+    } else {
+        db::update_by_filters(
+            ctx,
+            REGISTRY_TABLE,
+            legacy_row,
+            crate::util::json_map(serde_json::json!({ "prefixed_name": lowercase })),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -343,35 +379,57 @@ mod tests {
         assert_eq!(vclient::count(&ctx, LOWERCASE).await.expect("count"), 2);
     }
 
-    /// Two registry rows that differ only by case are never merged: the
-    /// legacy row, its index and the lowercase row are all left as they were.
+    /// Two registry rows that differ only by case describe one index: its
+    /// tables exist once, since SQLite compares table names without case.
+    /// The index is moved, the lowercase row is kept, the legacy row is
+    /// removed, and the entries answer under the lowercase name.
     #[tokio::test]
-    async fn two_indexes_differing_only_by_case_are_left_for_the_operator() {
+    async fn registry_rows_differing_only_by_case_keep_the_lowercase_row_and_the_data() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = legacy_index_file(&dir);
         let ctx = ctx_over(&path).await;
         register(&ctx, LEGACY, "legacy-model").await;
         register(&ctx, LOWERCASE, "lowercase-model").await;
 
-        assert_eq!(
-            move_legacy_index(&ctx, LEGACY, LOWERCASE, true)
-                .await
-                .expect("no fault"),
-            Moved::Twin
-        );
         rename_legacy_indexes(&ctx).await.expect("startup step");
 
         assert_eq!(
             registry(&ctx).await,
-            vec![
-                (LEGACY.to_string(), "legacy-model".to_string()),
-                (LOWERCASE.to_string(), "lowercase-model".to_string()),
-            ]
+            vec![(LOWERCASE.to_string(), "lowercase-model".to_string())]
         );
-        // The legacy tables were not touched: the backend still finds the
-        // index under exactly that spelling.
-        vclient::rename_index(&ctx, LEGACY, LOWERCASE)
-            .await
-            .expect("the legacy index is still there to move");
+        assert_eq!(vclient::count(&ctx, LOWERCASE).await.expect("count"), 2);
+        assert_eq!(nearest(&ctx, LOWERCASE, [1.0, 0.0, 0.0]).await[0], "a");
+    }
+
+    /// An index the registry does not name — one older than the registry,
+    /// which the index list finds in the backend's catalog — is moved too,
+    /// and no registry row is invented for it.
+    #[tokio::test]
+    async fn an_unregistered_mixed_case_index_is_moved_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = legacy_index_file(&dir);
+        let ctx = ctx_over(&path).await;
+
+        rename_legacy_indexes(&ctx).await.expect("startup step");
+
+        assert_eq!(vclient::count(&ctx, LOWERCASE).await.expect("count"), 2);
+        assert_eq!(nearest(&ctx, LOWERCASE, [0.0, 1.0, 0.0]).await[0], "b");
+        assert_eq!(registry(&ctx).await, Vec::new());
+    }
+
+    /// A name no backend stores under either spelling is refused and left.
+    #[tokio::test]
+    async fn a_name_with_no_index_behind_it_is_left_as_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = legacy_index_file(&dir);
+        let ctx = ctx_over(&path).await;
+        let ghost = "impresspress__vector__Ghost";
+
+        assert!(matches!(
+            move_legacy_index(&ctx, ghost, "impresspress__vector__ghost")
+                .await
+                .expect("no fault"),
+            Moved::Refused(_)
+        ));
     }
 }

@@ -235,6 +235,26 @@ impl VectorService for BrowserVectorService {
         Ok(())
     }
 
+    /// Every index registered under `prefix`, in lexical order. The
+    /// registry is this backend's catalog: `create_index` writes a row for
+    /// every index it creates, and an index without one cannot be opened
+    /// here at all.
+    async fn list_indexes(&self, prefix: &str) -> VResult<Vec<String>> {
+        exec_ddl(
+            &[sql::build_registry_ddl()],
+            &[sql::REGISTRY_TABLE.to_string()],
+        )?;
+        let (query, params) = sql::build_registry_list_sql(prefix);
+        let params_js = db_codec::params_to_js(&params).map_err(VectorError::Internal)?;
+        let value = bridge::db_query_raw(&query, params_js)
+            .map_err(|e| VectorError::Internal(js_err(e)))?;
+        Ok(db_codec::rows_from_js(value)
+            .map_err(VectorError::Internal)?
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect())
+    }
+
     async fn upsert(&self, index: &str, entries: Vec<VectorEntry>) -> VResult<()> {
         let state = self
             .lookup(index)?

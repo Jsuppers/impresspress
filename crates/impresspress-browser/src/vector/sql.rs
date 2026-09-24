@@ -100,6 +100,21 @@ pub fn build_registry_select_sql(name: &str) -> (String, Vec<serde_json::Value>)
     )
 }
 
+/// `(sql, params)` listing every registered index whose name starts with
+/// `prefix`, in lexical order. The prefix is compared literally (`substr`,
+/// not `LIKE`, so `_` in it is not a wildcard).
+pub fn build_registry_list_sql(prefix: &str) -> (String, Vec<serde_json::Value>) {
+    (
+        format!(
+            r#"SELECT name FROM "{REGISTRY_TABLE}" WHERE substr(name, 1, ?) = ? ORDER BY name"#
+        ),
+        vec![
+            serde_json::json!(prefix.chars().count()),
+            serde_json::json!(prefix),
+        ],
+    )
+}
+
 /// `(sql, params)` to remove an index's persisted config row.
 pub fn build_registry_delete_sql(name: &str) -> (String, Vec<serde_json::Value>) {
     (
@@ -996,5 +1011,43 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(taken, vec![format!("{to}_fts")]);
+    }
+
+    /// The catalog lists registered names under a literal prefix, in order:
+    /// `_` in the prefix is not a wildcard, and a legacy mixed-case name is
+    /// listed as stored.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_registry_lists_the_names_under_a_literal_prefix() {
+        let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+        conn.execute_batch(&build_registry_ddl()).expect("registry");
+        for name in [
+            "impresspress__vector__docs",
+            "impresspress__vector__Notes",
+            "impresspressXvectorXother",
+            "other__vector__x",
+        ] {
+            let reg = build_registry_upsert_sql(name, 3, DistanceMetric::Cosine, false);
+            conn.execute(&reg.sql, rusqlite::params![name, 3, "cosine", 0])
+                .expect("row");
+        }
+        let (sql, params) = build_registry_list_sql("impresspress__vector__");
+        let names: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(
+                rusqlite::params![params[0].as_i64().unwrap(), params[1].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "impresspress__vector__Notes".to_string(),
+                "impresspress__vector__docs".to_string(),
+            ]
+        );
     }
 }
