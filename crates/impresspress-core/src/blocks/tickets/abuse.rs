@@ -5,7 +5,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use wafer_run::context::Context;
 
-use crate::blocks::rate_limit::{RateLimit, UserRateLimiter};
+use crate::blocks::rate_limit::{ip_bucket, RateLimit, UserRateLimiter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbuseDecision {
@@ -73,8 +73,8 @@ pub fn limit(max_requests: u32, window_secs: u64) -> Option<RateLimit> {
 
 pub fn rotating_identity(secret: &str, now_secs: u64, remote_addr: &str) -> String {
     let day = now_secs / 86_400;
-    let canonical = canonical_ip(remote_addr);
-    hmac_hex(secret.as_bytes(), format!("{day}:{canonical}").as_bytes())
+    let client = ip_bucket(remote_addr);
+    hmac_hex(secret.as_bytes(), format!("{day}:{client}").as_bytes())
 }
 
 pub fn dedupe_hash(
@@ -207,6 +207,22 @@ mod tests {
         assert!(!first.contains("203.0.113.9"));
         assert_eq!(canonical_ip("203.0.113.9:443"), "203.0.113.9");
         assert_eq!(canonical_ip("[2001:db8::1]:443"), "2001:db8::1");
+    }
+
+    /// The per-identity submission limit is keyed by this identity, so it
+    /// must name the client network: one IPv6 client rotating interface ids
+    /// within its /64 is one identity, the next /64 is another.
+    #[test]
+    fn rotating_identity_names_the_ipv6_64() {
+        let one = rotating_identity("secret", 86_400, "2001:db8:1:2::1");
+        let rotated = rotating_identity("secret", 86_400, "[2001:db8:1:2:dead:beef:0:3]:443");
+        let neighbour = rotating_identity("secret", 86_400, "2001:db8:1:3::1");
+        assert_eq!(one, rotated);
+        assert_ne!(one, neighbour);
+        assert_eq!(
+            rotating_identity("secret", 86_400, "::ffff:203.0.113.9"),
+            rotating_identity("secret", 86_400, "203.0.113.9")
+        );
     }
 
     #[test]

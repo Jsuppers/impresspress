@@ -407,14 +407,47 @@ pub async fn check_user_rate_limit_with(
 /// `auth_ui::api::send_template_email`).
 pub const UNKNOWN_IP: &str = "unknown";
 
-/// The identity an IP-keyed rate-limit bucket uses for a request: the remote
-/// address, or [`UNKNOWN_IP`] when the platform didn't populate one.
+/// The identity an IP-keyed rate-limit bucket uses for a request: the client
+/// network [`ip_bucket`] derives from the remote address.
 pub fn ip_identity(msg: &wafer_run::Message) -> String {
-    let ip = msg.remote_addr();
-    if ip.is_empty() {
-        UNKNOWN_IP.to_string()
-    } else {
-        ip.to_string()
+    ip_bucket(msg.remote_addr())
+}
+
+/// The prefix length one IPv6 client is charged under.
+///
+/// A /64 is the smallest network an ISP assigns one subscriber, and a host
+/// picks any of its 2^64 interface ids itself (SLAAC privacy addresses rotate
+/// them routinely), so a bucket per /128 is a bucket per request to anyone
+/// who chooses so.
+const IPV6_CLIENT_PREFIX: u32 = 64;
+
+/// The client network a remote address is rate-limited as, in the one
+/// spelling every IP-keyed bucket uses: an IPv4 address as itself, an IPv6
+/// address as its /64 (`2001:db8:1:2::/64`), and an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`, what a dual-stack socket reports for an IPv4 peer) as
+/// the IPv4 address it carries. A `host:port` form is accepted and the port
+/// dropped. An empty or unparseable address is [`UNKNOWN_IP`].
+pub fn ip_bucket(remote_addr: &str) -> String {
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    let value = remote_addr.trim();
+    let Some(ip) = value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+    else {
+        return UNKNOWN_IP.to_string();
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let mask = u128::MAX << (128 - IPV6_CLIENT_PREFIX);
+                let network = Ipv6Addr::from(u128::from(v6) & mask);
+                format!("{network}/{IPV6_CLIENT_PREFIX}")
+            }
+        },
     }
 }
 
@@ -626,6 +659,93 @@ mod tests {
     fn ip_identity_falls_back_to_unknown() {
         assert_eq!(ip_identity(&msg_with("create", "", "1.2.3.4")), "1.2.3.4");
         assert_eq!(ip_identity(&msg_with("create", "", "")), "unknown");
+        assert_eq!(ip_identity(&msg_with("create", "", "not-an-ip")), "unknown");
+    }
+
+    #[test]
+    fn ip_bucket_spells_each_client_network_once() {
+        // One /64, any interface id, any spelling: one bucket.
+        assert_eq!(ip_bucket("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(
+            ip_bucket("2001:0db8:0001:0002:ffff:ffff:ffff:ffff"),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(ip_bucket("[2001:db8:1:2::9]:443"), "2001:db8:1:2::/64");
+        // The neighbouring /64 is another subscriber.
+        assert_eq!(ip_bucket("2001:db8:1:3::1"), "2001:db8:1:3::/64");
+        // IPv4, bare or with a port, and IPv4-mapped IPv6 are the IPv4 /32.
+        assert_eq!(ip_bucket("203.0.113.9"), "203.0.113.9");
+        assert_eq!(ip_bucket("203.0.113.9:8080"), "203.0.113.9");
+        assert_eq!(ip_bucket("::ffff:203.0.113.9"), "203.0.113.9");
+        assert_eq!(ip_bucket("[::ffff:203.0.113.9]:8080"), "203.0.113.9");
+        assert_eq!(ip_bucket(" "), UNKNOWN_IP);
+    }
+
+    /// Drives the real route limiter: a client rotating interface ids
+    /// within its /64 spends one budget, and a client in the next /64 has
+    /// its own.
+    #[tokio::test]
+    async fn apply_route_limit_charges_an_ipv6_client_per_64() {
+        let ctx = TestCtx;
+        let limiter = UserRateLimiter::new();
+        for suffix in ["1", "2"] {
+            let msg = msg_with("create", "", &format!("2001:db8:1:2::{suffix}"));
+            assert!(
+                apply_route_limit(&limiter, &ctx, &msg, LimitKey::Ip, "auth", TWO_PER_MINUTE)
+                    .await
+                    .is_none()
+            );
+        }
+        let rotated = msg_with("create", "", "2001:db8:1:2:dead:beef:0:3");
+        assert!(
+            apply_route_limit(
+                &limiter,
+                &ctx,
+                &rotated,
+                LimitKey::Ip,
+                "auth",
+                TWO_PER_MINUTE
+            )
+            .await
+            .is_some(),
+            "a third address in the same /64 must hit the /64's limit"
+        );
+        let neighbour = msg_with("create", "", "2001:db8:1:3::1");
+        assert!(
+            apply_route_limit(
+                &limiter,
+                &ctx,
+                &neighbour,
+                LimitKey::Ip,
+                "auth",
+                TWO_PER_MINUTE
+            )
+            .await
+            .is_none(),
+            "a different /64 has its own bucket"
+        );
+    }
+
+    /// A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`; that
+    /// peer must spend the same budget as when it arrives as plain IPv4.
+    #[tokio::test]
+    async fn apply_route_limit_charges_ipv4_mapped_as_ipv4() {
+        let ctx = TestCtx;
+        let limiter = UserRateLimiter::new();
+        for remote in ["198.51.100.7", "::ffff:198.51.100.7"] {
+            let msg = msg_with("create", "", remote);
+            assert!(
+                apply_route_limit(&limiter, &ctx, &msg, LimitKey::Ip, "auth", TWO_PER_MINUTE)
+                    .await
+                    .is_none()
+            );
+        }
+        let again = msg_with("create", "", "198.51.100.7");
+        assert!(
+            apply_route_limit(&limiter, &ctx, &again, LimitKey::Ip, "auth", TWO_PER_MINUTE)
+                .await
+                .is_some()
+        );
     }
 
     const TWO_PER_MINUTE: RateLimit = RateLimit {

@@ -5,7 +5,7 @@ use super::repo;
 use crate::{
     blocks::{
         crud,
-        rate_limit::{check_rate_limit, RateLimit, RateLimitOutcome, UserRateLimiter},
+        rate_limit::{check_rate_limit, ip_identity, RateLimit, RateLimitOutcome, UserRateLimiter},
     },
     http::{err_forbidden, err_internal, err_internal_no_cause, err_not_found},
     util::hex_encode,
@@ -42,18 +42,11 @@ pub async fn handle_direct_access(
         Err(response) => return response,
     };
 
-    // Rate-limit per remote IP before doing any work — `/storage/direct/*` is
-    // public (no auth required) so without this an attacker can enumerate
-    // valid tokens / amplify DOS by issuing many lookups. Identity key falls
-    // back to "unknown" if the platform layer can't expose a remote IP.
-    let identity = {
-        let addr = msg.remote_addr();
-        if addr.is_empty() {
-            "unknown".to_string()
-        } else {
-            addr.to_string()
-        }
-    };
+    // Rate-limit per client network (`ip_identity`) before doing any work —
+    // `/storage/direct/*` is public (no auth required) so without this an
+    // attacker can enumerate valid tokens / amplify DOS by issuing many
+    // lookups.
+    let identity = ip_identity(msg);
     match check_rate_limit(limiter, ctx, &identity, "share_direct", RateLimit::API_READ).await {
         RateLimitOutcome::Limited(r) => return r,
         // Allowed headers can't be attached to a binary file response here —

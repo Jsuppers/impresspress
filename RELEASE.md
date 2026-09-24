@@ -17,6 +17,29 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Rate limits: an IPv6 client is one /64
+
+**What changes.** Every IP-keyed rate-limit bucket (login, signup, password
+reset, verify, token refresh, OAuth start, auth mail, share downloads, signal
+rooms, anonymous commerce, and the tickets per-identity limit) now charges an
+IPv6 client per /64 network instead of per address, and an IPv4-mapped IPv6
+address (`::ffff:a.b.c.d`) as the IPv4 address it carries. IPv4 clients are
+unchanged: one address, one bucket.
+
+**Why.** A host picks the low 64 bits of its IPv6 address itself, so a client
+keyed per address could rotate within its /64 and never reach a limit.
+
+**Who has to act.** Nobody, usually. A /64 is one subscriber's network, so
+users sharing one only share a budget when they are already one site (a home,
+an office LAN); a deployment where that is common raises the category by key,
+as for a shared IPv4 egress (`WAFER_RUN_SHARED__RATE_LIMIT_{NAME}`).
+
+**Your data.** Nothing to migrate. Buckets are windowed counters: the ones
+keyed by a full IPv6 address are never charged again and expire with their
+window. On native they live in memory; on Cloudflare they are rows in the
+`rate_limits` table that no request reads again, and the tickets maintenance
+sweep prunes them with every other stale counter.
+
 ### Dev sandbox: a hyphenated block spells its collections with `_`
 
 **What changes.** A sandbox block whose name has a hyphen (`blocks/my-shop`,
