@@ -2060,10 +2060,9 @@ mod tests {
         assert_eq!(crate::test_support::output_http_status(out).await, 409);
     }
 
-    /// A block-scoped key the fixture rows are stored under, and the block
-    /// prefix migration 002 derives from it.
+    /// A block-scoped key no block declares, which the fixture rows are
+    /// stored under.
     const FROM_KEY: &str = "IMPRESSPRESS__EMAIL__FROM";
-    const FROM_BLOCK: &str = "IMPRESSPRESS__EMAIL";
 
     fn new_var(key: &str) -> NewVariable {
         NewVariable {
@@ -2133,7 +2132,7 @@ mod tests {
         assert_eq!(row.warning, "Changing this breaks DKIM");
         assert_eq!(row.updated_by, "admin_1");
         assert!(!row.created_at.is_empty());
-        assert_eq!(row.block, Some(FROM_BLOCK.to_string()));
+        assert_eq!(row.block, Some("IMPRESSPRESS__EMAIL".to_string()));
     }
 
     /// A write the database REFUSES still reaches the caller as the refusal it
@@ -2175,7 +2174,7 @@ mod tests {
         assert_eq!(inserted.description, "Sender of every outbound email");
         assert_eq!(inserted.warning, "Changing this breaks DKIM");
         assert!(inserted.sensitive);
-        assert_eq!(inserted.block.as_deref(), Some(FROM_BLOCK));
+        assert_eq!(inserted.block.as_deref(), Some("IMPRESSPRESS__EMAIL"));
         assert_eq!(inserted.updated_by, "admin_1");
         assert!(!inserted.created_at.is_empty());
         assert_eq!(inserted.created_at, inserted.updated_at);
@@ -2427,15 +2426,15 @@ mod boot_tests {
     #[tokio::test]
     async fn an_absent_key_is_created_with_its_block_column() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN__AUTH__PROBE";
+        const KEY: &str = "WAFER_RUN__AUTH__PROBE";
         assert_eq!(
-            set(&db, key, "true", "Probe", "d", Some(false))
+            set(&db, KEY, "true", "Probe", "d", Some(false))
                 .await
                 .expect("create"),
             Wrote::Created
         );
 
-        let row = find_by_key(&db, key)
+        let row = find_by_key(&db, KEY)
             .await
             .expect("list")
             .expect("exactly one row per key");
@@ -2463,10 +2462,10 @@ mod boot_tests {
     #[tokio::test]
     async fn seeding_a_row_records_a_config_write_and_a_no_op_does_not() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN__AUTH__SEED_PROBE";
+        const KEY: &str = "WAFER_RUN__AUTH__SEED_PROBE";
 
         let before = crate::config_generation::writes_noted_on_this_thread();
-        assert!(seed_if_absent(&db, key, "v", "Probe", "d", false)
+        assert!(seed_if_absent(&db, KEY, "v", "Probe", "d", false)
             .await
             .expect("seed"));
         let after_insert = crate::config_generation::writes_noted_on_this_thread();
@@ -2476,7 +2475,7 @@ mod boot_tests {
             "a seeded row must record a config write, so every memoized reader re-reads"
         );
 
-        assert!(!seed_if_absent(&db, key, "other", "Probe", "d", false)
+        assert!(!seed_if_absent(&db, KEY, "other", "Probe", "d", false)
             .await
             .expect("re-seed"));
         assert_eq!(

@@ -345,21 +345,20 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         // falls back to defaults, so an operator's REQUIRE_VERIFICATION /
         // ALLOWED_EMAIL_DOMAINS / ACCESS_TOKEN_LIFETIME_SECS settings are
         // ignored. `allows_config_key` is an exact-match check, so each key is
-        // granted explicitly (no wildcard). Literals kept in sync with
-        // `auth::config`'s `*_KEY` consts for the WRAP-grant audit script.
+        // granted explicitly (no wildcard).
         wafer_run::ResourceGrant::read(
             "impresspress/auth-ui",
-            "WAFER_RUN__AUTH__REQUIRE_VERIFICATION",
+            super::config::REQUIRE_VERIFICATION_KEY,
         )
         .typed(wafer_run::ResourceType::Config),
         wafer_run::ResourceGrant::read(
             "impresspress/auth-ui",
-            "WAFER_RUN__AUTH__ALLOWED_EMAIL_DOMAINS",
+            super::config::ALLOWED_EMAIL_DOMAINS_KEY,
         )
         .typed(wafer_run::ResourceType::Config),
         wafer_run::ResourceGrant::read(
             "impresspress/auth-ui",
-            "WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS",
+            super::config::ACCESS_TOKEN_LIFETIME_SECS_KEY,
         )
         .typed(wafer_run::ResourceType::Config),
     ]

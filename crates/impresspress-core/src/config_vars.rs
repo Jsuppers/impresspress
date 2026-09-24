@@ -1029,13 +1029,10 @@ mod screaming_block_tests {
     fn key_block_prefix_two_segments() {
         // Block-scoped key → first two `__`-segments, matching migration 002.
         assert_eq!(
-            key_block_prefix("WAFER_RUN__AUTH__JWT_SECRET"),
+            key_block_prefix(crate::blocks::auth::JWT_SECRET_KEY),
             "WAFER_RUN__AUTH"
         );
-        assert_eq!(
-            key_block_prefix(MAILGUN_API_KEY),
-            screaming_block("impresspress/email")
-        );
+        assert_eq!(key_block_prefix(MAILGUN_API_KEY), "IMPRESSPRESS__EMAIL");
     }
 
     #[test]
@@ -1052,7 +1049,7 @@ mod screaming_block_tests {
         // prefix derived from the block name, so the seeder and the migration
         // backfill agree.
         assert_eq!(
-            key_block_prefix("WAFER_RUN__AUTH__JWT_SECRET"),
+            key_block_prefix(crate::blocks::auth::JWT_SECRET_KEY),
             screaming_block("wafer-run/auth")
         );
     }

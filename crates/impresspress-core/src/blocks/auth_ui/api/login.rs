@@ -97,8 +97,12 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     // Check email verification if required
-    let require_verification =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false).await;
+    let require_verification = crate::config_vars::get_bool(
+        ctx,
+        crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+        false,
+    )
+    .await;
     if require_verification && !user.email_verified {
         return error_response(ErrorCode::EmailNotVerified, "Please verify your email before logging in. Check your inbox for the verification link.");
     }

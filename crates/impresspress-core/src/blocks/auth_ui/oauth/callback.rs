@@ -1195,7 +1195,10 @@ mod security_regression_tests {
 
         /// This deployment requires a verified email address.
         fn require_verification(self) -> Self {
-            self.config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true")
+            self.config(
+                crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+                "true",
+            )
         }
 
         /// Build a ctx with auth migrations, a crypto block (token minting and

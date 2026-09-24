@@ -526,7 +526,7 @@ mod auth_version_cache_tests {
 pub(crate) mod helpers {
     use super::*;
     use crate::{
-        blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY,
+        blocks::auth::config::{ALLOWED_EMAIL_DOMAINS_KEY, BOOTSTRAP_ADMIN_EMAIL_KEY},
         config_vars::{ALLOW_SIGNUP_KEY, ENVIRONMENT_KEY, FRONTEND_URL_KEY},
     };
 
@@ -649,8 +649,7 @@ pub(crate) mod helpers {
         ctx: &dyn wafer_run::context::Context,
         email: &str,
     ) -> bool {
-        let allowed =
-            config_client::get_default(ctx, "WAFER_RUN__AUTH__ALLOWED_EMAIL_DOMAINS", "").await;
+        let allowed = config_client::get_default(ctx, ALLOWED_EMAIL_DOMAINS_KEY, "").await;
         if allowed.is_empty() {
             return true;
         }
@@ -1195,7 +1194,9 @@ pub(crate) mod helpers {
     #[cfg(test)]
     mod access_token_lifetime_tests {
         use super::*;
-        use crate::test_support::TestContext;
+        use crate::{
+            blocks::auth::config::ACCESS_TOKEN_LIFETIME_SECS_KEY, test_support::TestContext,
+        };
 
         #[tokio::test]
         async fn unset_falls_back_to_default() {
@@ -1209,7 +1210,7 @@ pub(crate) mod helpers {
         #[tokio::test]
         async fn honors_a_value_under_the_cap() {
             let mut ctx = TestContext::new().await;
-            ctx.set_config("WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS", "60");
+            ctx.set_config(ACCESS_TOKEN_LIFETIME_SECS_KEY, "60");
             assert_eq!(access_token_lifetime_secs(&ctx).await, 60);
         }
 
@@ -1220,7 +1221,7 @@ pub(crate) mod helpers {
             // the resolved lifetime never exceeds the hard cap.
             let mut ctx = TestContext::new().await;
             ctx.set_config(
-                "WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS",
+                ACCESS_TOKEN_LIFETIME_SECS_KEY,
                 &(config::ACCESS_TOKEN_LIFETIME_SECS_MAX * 10).to_string(),
             );
             assert_eq!(

@@ -114,8 +114,12 @@ pub async fn handle(
         Err(e) => return err_internal("Failed to hash password", e),
     };
 
-    let require_verification =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false).await;
+    let require_verification = crate::config_vars::get_bool(
+        ctx,
+        crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+        false,
+    )
+    .await;
 
     let verification_token = if require_verification {
         match crypto::random_bytes(ctx, 32).await {
@@ -338,7 +342,10 @@ mod tests {
     #[tokio::test]
     async fn verification_required_does_not_auto_login() {
         let mut ctx = ctx_with_crypto().await;
-        ctx.set_config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true");
+        ctx.set_config(
+            crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+            "true",
+        );
 
         let resp = signup(&ctx, "pending@example.com", "correct-horse-battery").await;
 
@@ -389,7 +396,10 @@ mod tests {
     #[tokio::test]
     async fn verification_required_signup_is_byte_identical_for_new_and_registered_addresses() {
         let mut ctx = ctx_with_crypto().await;
-        ctx.set_config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true");
+        ctx.set_config(
+            crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+            "true",
+        );
 
         let fresh = signup_on_the_wire(&ctx, "someone@example.com", "correct-horse-battery").await;
         assert!(
@@ -455,7 +465,7 @@ mod tests {
         for require_verification in [false, true] {
             let mut ctx = ctx_with_crypto().await;
             ctx.set_config(
-                "WAFER_RUN__AUTH__REQUIRE_VERIFICATION",
+                crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
                 if require_verification {
                     "true"
                 } else {
@@ -533,7 +543,10 @@ mod tests {
         use super::super::{run_deferred, CallLog};
 
         let mut ctx = ctx_with_crypto().await;
-        ctx.set_config("WAFER_RUN__AUTH__REQUIRE_VERIFICATION", "true");
+        ctx.set_config(
+            crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+            "true",
+        );
         let ctx = CallLog::new(ctx);
         crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
 

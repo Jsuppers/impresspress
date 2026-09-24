@@ -59,7 +59,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use impresspress_core::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY;
+    use impresspress_core::blocks::auth::{config::BOOTSTRAP_ADMIN_EMAIL_KEY, JWT_SECRET_KEY};
 
     use super::*;
 
@@ -72,7 +72,7 @@ mod tests {
                 "admin@example.com".to_string(),
             ),
             // Block-scoped — keep.
-            ("WAFER_RUN__AUTH__JWT_SECRET".to_string(), "abc".to_string()),
+            (JWT_SECRET_KEY.to_string(), "abc".to_string()),
             // Infra — drop.
             (LISTEN_VAR.to_string(), "0.0.0.0:8090".to_string()),
             (DB_PATH_VAR.to_string(), "data/impresspress.db".to_string()),
@@ -82,7 +82,7 @@ mod tests {
         ];
         let out = filter_app_env_vars(input);
         assert!(out.contains_key(BOOTSTRAP_ADMIN_EMAIL_KEY));
-        assert!(out.contains_key("WAFER_RUN__AUTH__JWT_SECRET"));
+        assert!(out.contains_key(JWT_SECRET_KEY));
         assert!(!out.contains_key(LISTEN_VAR));
         assert!(!out.contains_key(DB_PATH_VAR));
         assert!(!out.contains_key("PATH"));
