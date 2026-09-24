@@ -5,7 +5,7 @@
 //! WebRTC handshake between two browsers that have never met. Every endpoint
 //! is public — blockfarming has no account and no login, so an endpoint that
 //! required one would be an endpoint the game cannot call. Rate limiting per
-//! remote address (`UserRateLimiter`, category `signal`) is the abuse guard
+//! client network (`ip_identity`, category `signal`) is the abuse guard
 //! in place of auth.
 //!
 //! Not a relay, not a lobby, not a matchmaker, not a message bus: it holds at
@@ -216,7 +216,7 @@ crate::impresspress_feature_block! {
     },
     handle: |this, ctx, mut msg, input| {
         // Public and unauthenticated by necessity — the game has no account
-        // — so the bucket is the remote address rather than a user, and it
+        // — so the bucket is the client network rather than a user, and it
         // is checked before dispatch so a flood cannot reach the store at
         // all. See `SIGNAL_LIMIT` for the budget's arithmetic.
         if let RateLimitOutcome::Limited(out) =

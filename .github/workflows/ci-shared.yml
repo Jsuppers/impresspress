@@ -1619,29 +1619,10 @@ jobs:
             test "$(psql --tuples-only --no-align --command "SELECT count(*) FROM auth_015_cases c JOIN wafer_run__auth__api_keys k ON k.id = c.stored WHERE k.expires_at IS NOT DISTINCT FROM c.after AND (coalesce(k.revoked_at, '') <> '') = (c.outcome = 'revoked')")" -eq "$(grep -vc '^#' "${CASES}")"
           done
 
+  # The job lives in `audit.yml` because it also runs weekly on its own
+  # schedule; see that file.
   audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Ignore entries in .cargo/audit.toml carry `expiry=YYYY-MM-DD`
-      # markers so temporary exceptions get re-triaged instead of living
-      # there forever. Fails the job if any marker's date has passed.
-      - name: Check for expired cargo-audit exceptions
-        run: bash scripts/check-audit-expiry.sh
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --quiet
-
-      # Blocking: a new, un-reviewed advisory fails CI. Known-acceptable
-      # exceptions (with owner + expiry) live in .cargo/audit.toml — see
-      # that file for the review/renewal process.
-      - name: Run audit
-        run: cargo audit
+    uses: ./.github/workflows/audit.yml
 
   sdk:
     name: TypeScript SDK
