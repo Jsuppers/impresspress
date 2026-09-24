@@ -509,9 +509,8 @@ mod tests {
     }
 
     /// `storage.put_streaming` reaches the backend's `put_streaming` with its
-    /// body chunks intact, in the caller's namespace, and is logged. The
-    /// block used to buffer every request to rewrite it, so it refused this
-    /// op outright.
+    /// body chunks intact, in the caller's namespace, and is logged: the
+    /// block reads only the header frame, so the body is never buffered here.
     #[tokio::test]
     async fn a_streaming_upload_streams_through_to_the_backend() {
         let mut ctx = ctx_as("impresspress/files", Vec::new()).await;
