@@ -34,6 +34,7 @@ async fn wrap_grants_are_read_through_the_database_service() {
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        listener: Default::default(),
     };
 
     let database = impresspress_native::make_database_service(

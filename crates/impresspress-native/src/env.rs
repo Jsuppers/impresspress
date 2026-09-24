@@ -103,6 +103,68 @@ const DB_PATH_VAR: &str = "IMPRESSPRESS_DB_PATH";
 const DB_URL_VAR: &str = "IMPRESSPRESS_DB_URL";
 const STORAGE_TYPE_VAR: &str = "IMPRESSPRESS_STORAGE_TYPE";
 const STORAGE_ROOT_VAR: &str = "IMPRESSPRESS_STORAGE_ROOT";
+const TRUSTED_PROXIES_VAR: &str = "IMPRESSPRESS_TRUSTED_PROXIES";
+const HEADER_READ_TIMEOUT_VAR: &str = "IMPRESSPRESS_HEADER_READ_TIMEOUT_SECS";
+const BODY_READ_TIMEOUT_VAR: &str = "IMPRESSPRESS_BODY_READ_TIMEOUT_SECS";
+const MAX_CONNECTIONS_VAR: &str = "IMPRESSPRESS_MAX_CONNECTIONS";
+const WRITE_TIMEOUT_VAR: &str = "IMPRESSPRESS_WRITE_TIMEOUT_SECS";
+const SHUTDOWN_GRACE_VAR: &str = "IMPRESSPRESS_SHUTDOWN_GRACE_SECS";
+
+/// The `wafer-run/http-listener` settings an operator sets through
+/// `IMPRESSPRESS_*` variables, one field per listener config key.
+///
+/// A field is `None` when its variable is unset, and the listener's own
+/// default applies: `register_http_listener` passes only the set ones, so
+/// the listener stays the single source of its defaults and of their
+/// validation. A set value is passed as written; the listener checks it at
+/// `Init`, and a bad value fails boot naming the key.
+///
+/// - `IMPRESSPRESS_TRUSTED_PROXIES` → `trusted_proxies`: comma-separated IPs
+///   or CIDR ranges whose `X-Forwarded-For` is honored. Unset trusts none,
+///   so behind a reverse proxy every client shares the proxy's address.
+/// - `IMPRESSPRESS_HEADER_READ_TIMEOUT_SECS` → `header_read_timeout_secs`
+/// - `IMPRESSPRESS_BODY_READ_TIMEOUT_SECS` → `body_read_timeout_secs`
+/// - `IMPRESSPRESS_MAX_CONNECTIONS` → `max_connections`
+/// - `IMPRESSPRESS_WRITE_TIMEOUT_SECS` → `write_timeout_secs`
+/// - `IMPRESSPRESS_SHUTDOWN_GRACE_SECS` → `shutdown_grace_secs`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListenerEnv {
+    pub trusted_proxies: Option<String>,
+    pub header_read_timeout_secs: Option<String>,
+    pub body_read_timeout_secs: Option<String>,
+    pub max_connections: Option<String>,
+    pub write_timeout_secs: Option<String>,
+    pub shutdown_grace_secs: Option<String>,
+}
+
+impl ListenerEnv {
+    /// Read the variables through `var`, which answers `None` for an unset
+    /// one. [`InfraConfig::from_env`] passes the process environment.
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            trusted_proxies: var(TRUSTED_PROXIES_VAR),
+            header_read_timeout_secs: var(HEADER_READ_TIMEOUT_VAR),
+            body_read_timeout_secs: var(BODY_READ_TIMEOUT_VAR),
+            max_connections: var(MAX_CONNECTIONS_VAR),
+            write_timeout_secs: var(WRITE_TIMEOUT_VAR),
+            shutdown_grace_secs: var(SHUTDOWN_GRACE_VAR),
+        }
+    }
+
+    /// The set settings as `(listener config key, value)` pairs.
+    pub fn set(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("trusted_proxies", &self.trusted_proxies),
+            ("header_read_timeout_secs", &self.header_read_timeout_secs),
+            ("body_read_timeout_secs", &self.body_read_timeout_secs),
+            ("max_connections", &self.max_connections),
+            ("write_timeout_secs", &self.write_timeout_secs),
+            ("shutdown_grace_secs", &self.shutdown_grace_secs),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.as_deref().map(|value| (key, value)))
+    }
+}
 
 /// Infrastructure config read from `IMPRESSPRESS_*` env vars.
 ///
@@ -115,6 +177,7 @@ pub struct InfraConfig {
     pub db_url: Option<String>,
     pub storage_type: String,
     pub storage_root: String,
+    pub listener: ListenerEnv,
 }
 
 impl InfraConfig {
@@ -126,6 +189,7 @@ impl InfraConfig {
             db_url: std::env::var(DB_URL_VAR).ok(),
             storage_type: env_or(STORAGE_TYPE_VAR, "local"),
             storage_root: env_or(STORAGE_ROOT_VAR, "data/storage"),
+            listener: ListenerEnv::from_vars(|key| std::env::var(key).ok()),
         }
     }
 }
@@ -142,6 +206,7 @@ impl std::fmt::Debug for InfraConfig {
             )
             .field("storage_type", &self.storage_type)
             .field("storage_root", &self.storage_root)
+            .field("listener", &self.listener)
             .finish()
     }
 }
@@ -159,6 +224,7 @@ mod infra_config_tests {
             db_url: Some("postgres://app:hunter2@db.internal:5432/prod".into()),
             storage_type: "local".into(),
             storage_root: "data/storage".into(),
+            listener: super::ListenerEnv::default(),
         };
         let shown = format!("{infra:?}");
         assert!(!shown.contains("hunter2"), "{shown}");

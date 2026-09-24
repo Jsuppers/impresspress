@@ -80,7 +80,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     // 8. Native-only: register http-listener.
     //    impresspress dispatches all HTTP traffic through the `site-main` flow
     //    (see crates/impresspress-core/src/flows/site_main.rs).
-    register_http_listener(&mut wafer, &infra.listen, "site-main");
+    register_http_listener(&mut wafer, &infra.listen, "site-main", &infra.listener);
 
     // 9. Register observability hooks
     register_observability_hooks(&mut wafer);
