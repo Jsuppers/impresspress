@@ -150,11 +150,11 @@ pub(crate) async fn burn_timing_equalization(
         .map_err(|e| credential_check_failed(e, CONTEXT))?;
     match classify_comparison(crypto::compare_hash(ctx, password, equalizer).await) {
         Comparison::Matches | Comparison::DoesNotMatch => Ok(()),
-        Comparison::Unverifiable(e) => {
+        Comparison::MalformedHash(e) => {
             tracing::error!(
                 error = %e,
-                "the crypto service could not verify against its own timing-equalization \
-                 hash; failed logins may answer faster for unknown accounts"
+                "the crypto service rejected its own timing-equalization hash as malformed; \
+                 failed logins may answer faster for unknown accounts"
             );
             Ok(())
         }
@@ -167,26 +167,27 @@ pub(crate) enum PasswordCheck {
     Matches,
     /// The password is wrong.
     DoesNotMatch,
-    /// The crypto service could not check the stored hash, so the password
-    /// is neither right nor wrong. [`check_password`] has already logged it,
-    /// with the user id, at error level; the error is the crypto service's.
+    /// The stored hash is one the crypto service cannot check
+    /// (`CryptoError::MalformedHash`), so the password is neither right nor
+    /// wrong. [`check_password`] has already logged it, with the user id, at
+    /// error level; the error is the crypto service's.
     Unverifiable(WaferError),
 }
 
 /// Check `password` against `user_id`'s stored `password_hash`.
 ///
 /// `crypto::compare_hash` answers `Unauthenticated` only for a wrong password.
-/// `Internal` is the crypto service saying it could not check the stored
-/// hash: malformed, an unsupported scheme, or cost parameters outside the
-/// accepted range (`CryptoError::MalformedHash`) — or, far more rarely, its
-/// own fault while checking (a failed offload to the blocking pool). Either
-/// way the account cannot sign in with a password until the hash is replaced,
-/// so it is logged at error level with the user id (never the hash) for an
-/// operator to find and reset, and the caller decides what the requester is
-/// told. Every other failure — the call refused by WRAP, the service
-/// unreachable — says nothing about the password, and is `Err`, classified by
-/// [`credential_check_failed`] (a refusal keeps its 403 or 429, anything else
-/// is a 503).
+/// A stored hash that is malformed, names an unsupported scheme, or carries
+/// cost parameters outside the accepted range is `CryptoError::MalformedHash`
+/// (see [`MALFORMED_HASH_PREFIX`]): the account cannot sign in with a password
+/// until the hash is replaced, so it is logged at error level with the user id
+/// (never the hash) for an operator to find and reset, and the caller decides
+/// what the requester is told. Every other failure says nothing about the
+/// password or the stored hash — the call refused by WRAP, the service
+/// unreachable, or the crypto service's own fault while checking (an `Internal`
+/// such as a failed offload to its blocking pool) — and is `Err`, logged and
+/// classified by [`credential_check_failed`] (a refusal keeps its 403 or 429,
+/// anything else is a 503).
 pub(crate) async fn check_password(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
@@ -196,7 +197,7 @@ pub(crate) async fn check_password(
     match classify_comparison(crypto::compare_hash(ctx, password, stored_hash).await) {
         Comparison::Matches => Ok(PasswordCheck::Matches),
         Comparison::DoesNotMatch => Ok(PasswordCheck::DoesNotMatch),
-        Comparison::Unverifiable(e) => {
+        Comparison::MalformedHash(e) => {
             tracing::error!(
                 user_id = %user_id,
                 error = %e,
@@ -208,11 +209,20 @@ pub(crate) async fn check_password(
     }
 }
 
-/// A `crypto::compare_hash` result, by what its error code means.
+/// How a `CryptoError::MalformedHash` reads once it has crossed the wire.
+///
+/// The crypto block sends it as `ErrorCode::Internal` carrying the error's
+/// `Display` (`wafer_core::interfaces::crypto::handler::crypto_error_to_wafer`),
+/// the same code its own faults travel under, so the message is the only thing
+/// that tells a stored hash needing a reset from a transient fault. Pinned
+/// against the variant's `Display` by `malformed_hash_prefix_tests`.
+const MALFORMED_HASH_PREFIX: &str = "malformed password hash: ";
+
+/// A `crypto::compare_hash` result, by what it says about the credential.
 enum Comparison {
     Matches,
     DoesNotMatch,
-    Unverifiable(WaferError),
+    MalformedHash(WaferError),
     Failed(WaferError),
 }
 
@@ -220,8 +230,51 @@ fn classify_comparison(result: Result<(), WaferError>) -> Comparison {
     match result {
         Ok(()) => Comparison::Matches,
         Err(e) if e.code == wafer_run::ErrorCode::Unauthenticated => Comparison::DoesNotMatch,
-        Err(e) if e.code == wafer_run::ErrorCode::Internal => Comparison::Unverifiable(e),
+        Err(e)
+            if e.code == wafer_run::ErrorCode::Internal
+                && e.message.starts_with(MALFORMED_HASH_PREFIX) =>
+        {
+            Comparison::MalformedHash(e)
+        }
         Err(e) => Comparison::Failed(e),
+    }
+}
+
+#[cfg(test)]
+mod malformed_hash_prefix_tests {
+    use wafer_core::interfaces::crypto::service::CryptoError;
+
+    use super::{classify_comparison, Comparison, MALFORMED_HASH_PREFIX};
+
+    /// The prefix is the variant's own `Display`; a rewording upstream would
+    /// otherwise turn every malformed hash into a 503 without a sound.
+    #[test]
+    fn the_prefix_is_how_malformed_hash_displays() {
+        let shown = CryptoError::MalformedHash("argon2: bad params".to_string()).to_string();
+        assert!(
+            shown.starts_with(MALFORMED_HASH_PREFIX),
+            "{shown:?} no longer starts with {MALFORMED_HASH_PREFIX:?}"
+        );
+    }
+
+    /// Only a malformed hash is one; the crypto service's own `Internal`
+    /// faults are failures of the check.
+    #[test]
+    fn only_a_malformed_hash_is_classified_as_one() {
+        let internal = |m: &str| {
+            Err(wafer_run::WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                m,
+            ))
+        };
+        assert!(matches!(
+            classify_comparison(internal("malformed password hash: argon2: bad params")),
+            Comparison::MalformedHash(_)
+        ));
+        assert!(matches!(
+            classify_comparison(internal("crypto blocking task failed: panicked")),
+            Comparison::Failed(_)
+        ));
     }
 }
 

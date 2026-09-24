@@ -42,8 +42,17 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // The real stored credential, if this login has one at all. A user with
     // no `local_credentials` row (an OAuth-only account) is `None` and takes
-    // the equalization arm below; a failed read is an outage, refused the
-    // same way the users read above refuses one, not a wrong password.
+    // the equalization arm below.
+    //
+    // DELIBERATE, the same rule `forgot_password` and `verify::handle_resend`
+    // follow: only a registered address reaches this read, so a failure here
+    // answered with its own status (403, 500) would tell an anonymous caller
+    // which emails have accounts whenever the credentials table alone is
+    // refused or failing. It is logged with its code and the user id, and the
+    // login continues down the equalization arm, answering — in the same
+    // time — exactly what an unknown email gets. The users read above, which
+    // every login makes, keeps its honest 403/500, so an outage of the
+    // database as a whole is still visible to the caller.
     let stored_hash_owned: String;
     let stored_hash: Option<&str> = match &user_row {
         Some(u) => match local_credentials::find_by_user_id(ctx, &u.id).await {
@@ -52,7 +61,15 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
                 Some(&stored_hash_owned)
             }
             Ok(None) => None,
-            Err(e) => return crud::db_error_internal(e, "Credential lookup failed"),
+            Err(e) => {
+                tracing::error!(
+                    user_id = %u.id,
+                    code = ?e.code,
+                    error = %e,
+                    "login: credential lookup failed; answered as invalid credentials"
+                );
+                None
+            }
         },
         None => None,
     };
@@ -334,34 +351,6 @@ mod tests {
         }
     }
 
-    /// A credential read that fails is an outage, and the caller is told so
-    /// with a 500. Answering it as "Invalid email or password" would tell a
-    /// user with the right password that it is wrong, and hide the outage
-    /// behind what looks like ordinary failed logins.
-    #[tokio::test]
-    async fn a_failed_credential_read_is_a_500_not_invalid_credentials() {
-        use crate::{blocks::auth::repo::local_credentials, test_support::FailingDbOpContext};
-
-        let ctx = ctx_with_crypto().await;
-        signup_user(&ctx, "outage@example.com", "correct-horse-battery").await;
-        let failing =
-            FailingDbOpContext::new(ctx, vec![("database.list", local_credentials::TABLE)]);
-
-        let body = serde_json::json!({
-            "email": "outage@example.com",
-            "password": "correct-horse-battery",
-        })
-        .to_string();
-        let status =
-            output_http_status(handle(&failing, InputStream::from_bytes(body.into_bytes())).await)
-                .await;
-
-        assert_eq!(
-            status, 500,
-            "a failed credential read must surface as a server error, not a wrong password"
-        );
-    }
-
     /// What a stored credential looks like when the crypto service cannot
     /// check it: no scheme it knows (`CryptoError::MalformedHash`).
     const MALFORMED_HASH: &str = "not-a-password-hash";
@@ -589,6 +578,48 @@ mod tests {
         assert_eq!(
             detail_code(out).await.as_deref(),
             Some("invalid_credentials")
+        );
+    }
+
+    /// An `Internal` from the crypto service that is not a malformed hash is
+    /// its own fault while checking — a failed offload, say — and says
+    /// nothing about the stored credential: it is the classified 503, and the
+    /// log does not send an operator off to reset a password that is fine.
+    #[tokio::test]
+    async fn a_transient_crypto_fault_is_a_503_not_a_reset() {
+        use crate::test_support::{CapturedEvents, FailingServiceOpContext};
+
+        let ctx = ctx_with_crypto().await;
+        signup_user(&ctx, "flaky@example.com", "correct-horse-battery").await;
+        let faulty = FailingServiceOpContext::failing_with(
+            ctx,
+            "wafer-run/crypto",
+            vec!["crypto.compare_hash"],
+            wafer_run::WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                "crypto blocking task failed: task panicked",
+            ),
+        );
+
+        let captured = CapturedEvents::install();
+        let status = output_http_status(
+            handle(
+                &faulty,
+                credentials("flaky@example.com", "correct-horse-battery"),
+            )
+            .await,
+        )
+        .await;
+        let events = captured.events();
+        drop(captured);
+
+        assert_eq!(status, 503);
+        assert!(
+            events.iter().all(|e| e
+                .fields
+                .get("message")
+                .is_none_or(|m| !m.contains("password reset"))),
+            "a transient fault must not be logged as an account needing a reset: {events:?}"
         );
     }
 }

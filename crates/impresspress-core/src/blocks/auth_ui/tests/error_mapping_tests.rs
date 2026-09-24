@@ -21,7 +21,7 @@ use wafer_run::{context::Context, Block, ErrorCode, InputStream, Message, WaferE
 
 use crate::{
     blocks::{
-        auth::repo::{api_keys, bootstrap_tokens, orgs, tokens, users},
+        auth::repo::{api_keys, bootstrap_tokens, local_credentials, orgs, tokens, users},
         auth_ui::AuthUiBlock,
     },
     test_support::{
@@ -479,13 +479,13 @@ async fn settings_page_config_denial_is_the_403_page_not_a_500() {
     assert!(!html.contains("settings-form"), "{html}");
 }
 
-// --- api/forgot_password.rs + api/verify.rs (resend) ------------------------
+// --- api/forgot_password.rs + api/verify.rs (resend) + api/login.rs --------
 //
-// These two are the exception to this file's rule. Both endpoints answer one
-// constant body for every account state, and the write that fails here is
-// reachable only by a registered address, so a 403 or 500 would tell an
-// anonymous caller which addresses have accounts. They must answer, whole
-// response, what an unregistered address gets, and log the code instead.
+// The exception to this file's rule. A call that only a registered address
+// reaches — the token stores behind forgot-password and resend-verification,
+// and login's credentials read — must not answer with its own 403 or 500, or
+// it tells an anonymous caller which addresses have accounts. They answer,
+// whole response, what an unregistered address gets, and log the code instead.
 
 /// Everything the HTTP boundary sends for one public request to `path`.
 async fn wire(ctx: &dyn Context, path: &str, email: &str) -> (u16, Vec<(String, String)>, String) {
@@ -598,6 +598,53 @@ async fn resend_verification_token_store_failure_answers_like_an_unregistered_ad
             crate::blocks::auth_ui::api::run_deferred().await,
             1,
             "the failing store runs after the response, and fails there"
+        );
+    }
+}
+
+/// Everything the HTTP boundary sends for one login attempt as `email`.
+async fn login_wire(ctx: &dyn Context, email: &str) -> (u16, Vec<(String, String)>, String) {
+    let parts = wafer_block::http_codec::collect_http_response(
+        AuthUiBlock::default()
+            .handle(
+                ctx,
+                login_msg(),
+                InputStream::from_bytes(
+                    serde_json::to_vec(&login_body(email)).expect("serialize body"),
+                ),
+            )
+            .await,
+    )
+    .await;
+    (
+        parts.status,
+        parts.headers,
+        String::from_utf8_lossy(&parts.body).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn login_credential_read_failure_answers_like_an_unregistered_address() {
+    for error in write_refusals() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        signup(&ctx, "known@example.com").await;
+        let failing = FailingDbOpContext::failing_with(
+            ctx,
+            vec![("database.list", local_credentials::TABLE)],
+            error.clone(),
+        );
+
+        let unregistered = login_wire(&failing, "nobody@example.com").await;
+        let registered = login_wire(&failing, "known@example.com").await;
+
+        assert_eq!(
+            unregistered.0, 401,
+            "the unregistered answer is invalid credentials"
+        );
+        assert_eq!(
+            registered, unregistered,
+            "a {:?} reading the credential must not be visible to the caller",
+            error.code
         );
     }
 }
