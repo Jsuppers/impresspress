@@ -18,10 +18,10 @@
 //! So it is a flow step, ahead of the router: every request passes through it,
 //! whatever route it would have matched. It sits after `wafer-run/cors` and
 //! `wafer-run/security-headers` so the refusal carries their headers — they
-//! annotate the message, and the refusal is a `Halt` that takes the message's
-//! meta to the wire with it (see
-//! [`crate::pipeline::payload_too_large_response`], which is also where the
-//! "why not a plain response, why not an error" is written down).
+//! annotate the message, and the flow executor carries a middleware step's
+//! response headers onto the error that stops the flow (see
+//! [`crate::pipeline::payload_too_large_error`], which is also where the
+//! "why an error, not a plain response" is written down).
 //!
 //! One consequence is deliberate and worth naming: this runs *before*
 //! `impresspress/router`, so a refused request has not been through JWT

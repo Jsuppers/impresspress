@@ -168,7 +168,7 @@ pub fn body_too_large(msg: &wafer_run::Message) -> bool {
     msg.get_meta(META_REQ_BODY_TOO_LARGE) == BODY_TOO_LARGE_VALUE
 }
 
-/// The plain-text body the 413 carries when a request body exceeds
+/// The error message the 413 carries when a request body exceeds
 /// [`MAX_REQUEST_BODY_BYTES`]. Shared so the number a client is told is the
 /// number that was enforced.
 pub fn request_too_large_message() -> String {

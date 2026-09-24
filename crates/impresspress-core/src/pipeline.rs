@@ -137,83 +137,45 @@ fn visible_to_caller(
         .collect()
 }
 
-/// Handle a impresspress request.
-///
-/// This is the shared entry point that both CF and native adapters call
-/// after building a Message from the incoming HTTP request.
-///
-/// Steps:
-/// 1. Refuse a request whose body the transport would not carry
-///    ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]) with a 413 — before
-///    everything else, including the discovery/WebMCP early returns, because
-///    its body is already gone. In the site-main flow
-///    [`crate::blocks::body_limit`] has answered before this function runs.
-/// 2. Validate JWT and set auth meta
-/// 3. CSRF: enforce the Fetch-Metadata/Origin policy for cookie-authenticated
-///    unsafe-method requests (see `crate::csrf`)
-/// 4. Route to the appropriate impresspress block
-/// 5. Log the request to `request_logs` (async, best-effort) — a streamed
-///    download with a definite status is audited too; only open-ended streams
-///    (SSE) skip the row
-///
-/// # Errors
-///
-/// Never returns an error directly — errors are encoded inside the
-/// returned `OutputStream` as `StreamEvent::Error`. Request-log
-/// persistence failures are intentionally swallowed (best-effort) so a
-/// failing audit-log table never breaks the response.
 /// The 413 a request whose body exceeded
 /// [`crate::streaming::MAX_REQUEST_BODY_BYTES`] is answered with.
 ///
-/// A **`Halt`** terminal, and each half of that is load-bearing.
+/// An ordinary error terminal: `ResourceExhausted` with an explicit
+/// `resp.status` of 413, because `ErrorCode` has no payload-too-large member
+/// and `http_codec::resolve_error_status` lets the error's own status win over
+/// the code's 429. Its message is [`crate::streaming::request_too_large_message`],
+/// so the JSON error envelope names the limit that was enforced.
 ///
-/// *Halt, not a plain response*: a response terminal does not short-circuit a
-/// flow. The executor stores its body, applies its meta to the message and
-/// runs the next step, so a refusal built that way ahead of the router is
-/// followed by the router serving its own body over it — measured, not
-/// assumed: `an_oversized_body_to_an_unrouted_path_is_413_not_the_spa` caught
-/// exactly that, with the `wafer-run/web` fallback reached and its
-/// `index.html` served under a 413 status. `Halt` is the terminal that stops
-/// the flow *and* reaches the wire.
+/// It has to stop the flow: a plain response terminal does not. The executor
+/// stores its body, applies its meta to the message and runs the next step, so
+/// a refusal built that way ahead of the router is followed by the router
+/// serving its own body over it — `an_oversized_body_to_an_unrouted_path_is_413_not_the_spa`
+/// caught exactly that, with the `wafer-run/web` fallback reached and its
+/// `index.html` served under a 413 status. An error under `on_error: stop`
+/// ends the flow, and the executor carries the response headers the
+/// middleware steps (`wafer-run/cors`, `wafer-run/security-headers`) left on
+/// the message onto it, so a cross-origin uploader's browser can read the 413
+/// instead of reporting a CORS failure.
 ///
-/// *Halt, not an `err_*` error*: the body is the plain-text limit
-/// ([`crate::streaming::request_too_large_message`]), where an error terminal
-/// answers with the JSON error envelope. Either terminal reaches a
-/// cross-origin uploader with the `Access-Control-Allow-Origin` and security
-/// headers `wafer-run/cors` and `wafer-run/security-headers` put on the
-/// *message*: the flow executor carries the response headers a middleware
-/// step set onto every terminal that stops the flow, error or halt, so a
-/// browser sees the 413 rather than a CORS failure.
-///
-/// The halt also carries `msg.meta` itself. Non-`resp.*` entries ride along
-/// inert — `http_codec::response_meta_parts` honours only the canonical
-/// response keys.
-///
-/// `oversized_body_flow.rs` pins all of it against the real executor, the real
+/// `oversized_body_flow.rs` pins that against the real executor, the real
 /// `site-main` flow and the real middleware blocks.
 ///
 /// [`refuse_oversized_body`] is what callers want: this builds the answer,
 /// that one also records it.
-pub fn payload_too_large_response(msg: &Message) -> OutputStream {
-    let mut meta = msg.meta.clone();
-    let mut set = |key: &str, value: &str| {
-        meta.retain(|e: &MetaEntry| e.key != key);
-        meta.push(MetaEntry {
-            key: key.to_string(),
-            value: value.to_string(),
-        });
-    };
-    set(wafer_run::META_RESP_STATUS, "413");
-    set("resp.content_type", "text/plain; charset=utf-8");
-
-    OutputStream::halt(
-        crate::streaming::request_too_large_message().into_bytes(),
-        meta,
-    )
+pub fn payload_too_large_error() -> OutputStream {
+    let mut error = WaferError::new(
+        ErrorCode::ResourceExhausted,
+        crate::streaming::request_too_large_message(),
+    );
+    error.meta.push(MetaEntry {
+        key: wafer_run::META_RESP_STATUS.to_string(),
+        value: "413".to_string(),
+    });
+    OutputStream::error(error)
 }
 
 /// Refuse a request whose body the transport would not carry: the 413 from
-/// [`payload_too_large_response`], plus the `request_logs` row any other
+/// [`payload_too_large_error`], plus the `request_logs` row any other
 /// refusal would have written.
 ///
 /// Two callers, and they cannot both fire for one request:
@@ -249,7 +211,7 @@ pub async fn refuse_oversized_body(
         extra_routes,
     )
     .await;
-    payload_too_large_response(msg)
+    payload_too_large_error()
 }
 
 /// Refuse a request whose credential could not be checked, with the error
@@ -283,6 +245,31 @@ async fn refuse_unchecked_credential(
     OutputStream::error(error)
 }
 
+/// Handle a impresspress request.
+///
+/// This is the shared entry point that both CF and native adapters call
+/// after building a Message from the incoming HTTP request.
+///
+/// Steps:
+/// 1. Refuse a request whose body the transport would not carry
+///    ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]) with a 413 — before
+///    everything else, including the discovery/WebMCP early returns, because
+///    its body is already gone. In the site-main flow
+///    [`crate::blocks::body_limit`] has answered before this function runs.
+/// 2. Validate JWT and set auth meta
+/// 3. CSRF: enforce the Fetch-Metadata/Origin policy for cookie-authenticated
+///    unsafe-method requests (see `crate::csrf`)
+/// 4. Route to the appropriate impresspress block
+/// 5. Log the request to `request_logs` (async, best-effort) — a streamed
+///    download with a definite status is audited too; only open-ended streams
+///    (SSE) skip the row
+///
+/// # Errors
+///
+/// Never returns an error directly — errors are encoded inside the
+/// returned `OutputStream` as `StreamEvent::Error`. Request-log
+/// persistence failures are intentionally swallowed (best-effort) so a
+/// failing audit-log table never breaks the response.
 #[expect(
     clippy::too_many_arguments,
     reason = "the single request-pipeline entry point: each argument is a distinct \
@@ -3802,9 +3789,9 @@ mod oversized_body_tests {
     //! The adapter marks the message and hands over an empty body
     //! ([`crate::streaming::META_REQ_BODY_TOO_LARGE`]); everything after that
     //! is here, on the real `handle_request`: the status, the shape of the
-    //! terminal (which is what decides whether the flow's CORS and security
-    //! headers survive — `tests/oversized_body_flow.rs` pins that half against
-    //! the real executor), and the audit row.
+    //! terminal (which is what decides whether it stops the flow —
+    //! `tests/oversized_body_flow.rs` pins that, and the headers the flow's
+    //! middleware adds to it, against the real executor), and the audit row.
 
     use wafer_run::streams::output::TerminalNotResponse;
 
@@ -3814,7 +3801,7 @@ mod oversized_body_tests {
         platform_state::request_logs,
         routing::{ExtraRoute, RouteAccess},
         streaming::{BODY_TOO_LARGE_VALUE, META_REQ_BODY_TOO_LARGE},
-        test_support::{anon_msg, collect_or_panic, TestContext},
+        test_support::{anon_msg, TestContext},
     };
 
     const UPLOAD_PATH: &str = "/b/storage/api/buckets/p/objects";
@@ -3860,44 +3847,36 @@ mod oversized_body_tests {
     #[tokio::test]
     async fn a_marked_body_is_refused_with_413_and_the_enforced_limit() {
         let ctx = TestContext::with_admin().await;
-        let buf = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
+        let parts = http_codec::collect_http_response(drive(&ctx, marked(UPLOAD_PATH)).await).await;
 
-        assert_eq!(http_codec::resolve_status(&buf.meta, 200), 413);
+        assert_eq!(parts.status, 413);
+        let body: serde_json::Value =
+            serde_json::from_slice(&parts.body).expect("the error envelope is JSON");
         assert_eq!(
-            String::from_utf8(buf.body).unwrap(),
+            body["message"],
             crate::streaming::request_too_large_message(),
             "the client is told the number that was enforced"
         );
     }
 
-    /// The refusal is a `Halt` carrying the message's meta — not an error
-    /// terminal (which `on_error: stop` would short-circuit with none of the
-    /// flow's CORS or security headers) and not a plain response (which does
-    /// not short-circuit a flow at all, so a later step would serve its own
-    /// body over it). `tests/oversized_body_flow.rs` proves both consequences
-    /// against the real executor; this pins the terminal kind at the source.
+    /// The refusal is an error terminal — not a plain response, which does
+    /// not short-circuit a flow, so a later step would serve its own body over
+    /// it. `tests/oversized_body_flow.rs` proves against the real executor
+    /// that the flow's CORS and security headers reach the wire on it; this
+    /// pins the terminal kind at the source.
     #[tokio::test]
-    async fn the_refusal_is_a_halt_carrying_the_requests_meta() {
+    async fn the_refusal_is_an_error_terminal() {
         let ctx = TestContext::with_admin().await;
-        let mut msg = marked(UPLOAD_PATH);
-        msg.set_meta(
-            "resp.header.Access-Control-Allow-Origin",
-            "https://app.example",
-        );
 
-        match drive(&ctx, msg).await.collect_buffered().await {
-            Err(TerminalNotResponse::Halt(buf)) => {
-                assert_eq!(http_codec::resolve_status(&buf.meta, 200), 413);
-                assert!(
-                    buf.meta
-                        .iter()
-                        .any(|e| e.key == "resp.header.Access-Control-Allow-Origin"
-                            && e.value == "https://app.example"),
-                    "the halt must carry the middleware's headers: {:?}",
-                    buf.meta
-                );
+        match drive(&ctx, marked(UPLOAD_PATH))
+            .await
+            .collect_buffered()
+            .await
+        {
+            Err(TerminalNotResponse::Error(error)) => {
+                assert_eq!(http_codec::resolve_error_status(&error), 413);
             }
-            other => panic!("expected a Halt terminal, got {other:?}"),
+            other => panic!("expected an Error terminal, got {other:?}"),
         }
     }
 
@@ -3907,7 +3886,10 @@ mod oversized_body_tests {
     #[tokio::test]
     async fn the_refusal_is_logged_with_its_own_status() {
         let ctx = TestContext::with_admin().await;
-        let _ = collect_or_panic(drive(&ctx, marked(UPLOAD_PATH)).await).await;
+        let _ = drive(&ctx, marked(UPLOAD_PATH))
+            .await
+            .collect_buffered()
+            .await;
 
         let rows = request_logs::paginated(&ctx, 1, 20, "", false)
             .await
