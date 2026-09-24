@@ -335,39 +335,4 @@ mod tests {
             "a failed credential read must surface as a server error, not a wrong password"
         );
     }
-
-    /// A session lifetime already stored past its bound fails the login with
-    /// a 500 instead of taking the server down.
-    ///
-    /// The lifetime is added to the current time for the refresh token's
-    /// expiry, and `100000000` days reaches past the last date chrono can
-    /// represent, where `DateTime + Duration` panics — and a release build
-    /// aborts on a panic, so every login killed the native process. The write
-    /// surfaces refuse such a value now, so the row is staged directly, as an
-    /// older build or the process environment could have left it.
-    #[tokio::test]
-    async fn an_out_of_range_stored_session_lifetime_is_a_500_not_a_crash() {
-        use crate::{blocks::auth::config::SESSION_LIFETIME_DAYS_KEY, platform_state::variables};
-
-        let ctx = ctx_with_crypto().await;
-        signup_user(&ctx, "lifetime@example.com", "correct-horse-battery").await;
-        variables::seed_row_with_flag(&ctx, SESSION_LIFETIME_DAYS_KEY, "100000000", 0).await;
-        // The raw fixture insert skips the repo's generation bump; without it
-        // the config snapshot signup warmed would keep serving the default.
-        crate::config_generation::note_config_write();
-
-        let body = serde_json::json!({
-            "email": "lifetime@example.com",
-            "password": "correct-horse-battery",
-        })
-        .to_string();
-        let status =
-            output_http_status(handle(&ctx, InputStream::from_bytes(body.into_bytes())).await)
-                .await;
-
-        assert_eq!(
-            status, 500,
-            "a misconfigured session lifetime must refuse the login, not issue tokens"
-        );
-    }
 }

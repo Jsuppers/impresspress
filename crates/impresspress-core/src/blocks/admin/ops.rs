@@ -1907,6 +1907,54 @@ mod tests {
         );
     }
 
+    /// A session lifetime already stored past its bound fails the login with
+    /// a 500 instead of taking the server down.
+    ///
+    /// The lifetime is added to the current time for the refresh token's
+    /// expiry, and `100000000` days reaches past the last date chrono can
+    /// represent, where `DateTime + Duration` panics — and a release build
+    /// aborts on a panic, so every login killed the native process. The write
+    /// surfaces refuse such a value now, so the row is staged directly, as an
+    /// older build or the process environment could have left it. Drives the
+    /// real login handler through the production config block.
+    #[tokio::test]
+    async fn an_out_of_range_stored_session_lifetime_fails_login_with_a_500_not_a_crash() {
+        use crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+
+        const EMAIL: &str = "lifetime@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        crate::blocks::auth::repo::local_credentials::insert(
+            &ctx,
+            &crate::test_support::seed_user(EMAIL).insert(&ctx).await.id,
+            &wafer_core::clients::crypto::hash(&ctx, PASSWORD)
+                .await
+                .expect("hash the password"),
+            false,
+        )
+        .await
+        .expect("store the credential");
+        variables::seed_row_with_flag(&ctx, SESSION_LIFETIME_DAYS_KEY, "100000000", 0).await;
+        // The raw fixture insert skips the repo's generation bump; without it
+        // a config snapshot warmed earlier would keep serving the default.
+        crate::config_generation::note_config_write();
+
+        let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
+        let status = crate::test_support::output_http_status(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(body.into_bytes()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status, 500,
+            "a misconfigured session lifetime must refuse the login, not issue tokens"
+        );
+    }
+
     /// A PUT that CREATES an undeclared ad hoc key must protect it the same
     /// way a POST does.
     ///
