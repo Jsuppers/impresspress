@@ -30,11 +30,11 @@ use wafer_run::{context::Context, ErrorCode, InputStream, OutputStream};
 use super::{
     blobs,
     contracts::{CreateBlockRequest, CreateBlockResponse, FileConflict, ReferenceResponse},
-    files, no_store, no_store_error,
+    files, no_store, no_store_db_error_internal, no_store_error,
     paths::{self, WorkspaceArea, BLOCK_NAME_RULE},
     workspace, DevShared, WAFER_GUEST_VERSION,
 };
-use crate::{blocks::crud, http::err_internal};
+use crate::blocks::crud;
 
 /// The two starting points `dev_create_block` offers.
 ///
@@ -218,7 +218,7 @@ pub async fn handle_create(
     let _serialized = shared.workspace.lock().await;
     let mut ws = match workspace::load(ctx).await {
         Ok(ws) => ws,
-        Err(e) => return err_internal("dev workspace load", e),
+        Err(e) => return no_store_db_error_internal(e, "dev workspace load"),
     };
 
     // Refuse if ANY path under `blocks/<name>/` is taken, not just the three
@@ -302,7 +302,7 @@ pub async fn handle_create(
                          next collection"
                     );
                 }
-                return err_internal("dev workspace blob write", e);
+                return no_store_db_error_internal(e, "dev workspace blob write");
             }
         }
     }
@@ -311,7 +311,7 @@ pub async fn handle_create(
         .map(|(path, sha, bytes)| ws.insert(path, sha, bytes.len() as u64))
         .collect();
     if let Err(e) = workspace::save(ctx, &ws).await {
-        return err_internal("dev workspace save", e);
+        return no_store_db_error_internal(e, "dev workspace save");
     }
 
     no_store().json(&CreateBlockResponse {

@@ -385,7 +385,7 @@ const ROUTES: &[EndpointRoute<Route>] = &[
     .output(response_schema_of::<contracts::ObjectUploadedResponse>)
     .tags(&["storage"]),
     // Never declared before this PR; `storage/buckets.rs` refuses a bucket
-    // the caller does not own (`is_bucket_access_denied`).
+    // the caller does not own (`require_bucket_access`).
     EndpointRoute::authenticated(
         HttpMethod::Delete,
         "/b/storage/api/buckets/{name}",
@@ -764,6 +764,9 @@ mod grant_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod error_mapping_tests;
 
 #[cfg(test)]
 mod test_support {

@@ -50,7 +50,7 @@ use wafer_run::{context::Context, ErrorCode, OutputStream, WaferError};
 use super::{
     artifacts, blobs,
     contracts::{ExportFile, ExportManifest},
-    data_snapshot, generation, no_store, no_store_error_status, repo,
+    data_snapshot, generation, no_store, no_store_db_error_internal, no_store_error_status, repo,
     seed::{self, SeedBlock, SeedManifest},
     workspace,
     zip::ZipWriter,
@@ -782,7 +782,7 @@ impl Refusal {
                 no_store_error_status(ErrorCode::ResourceExhausted, 413, &data_too_large(bytes))
             }
             Self::Shell(message) => err_internal("dev export shell", message),
-            Self::Internal(error) => err_internal("dev export", error.message),
+            Self::Internal(error) => no_store_db_error_internal(error, "dev export"),
         }
     }
 

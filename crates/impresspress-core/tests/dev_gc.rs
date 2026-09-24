@@ -32,7 +32,7 @@ use impresspress_core::{
         workspace::{self, FileEntry},
         WAFER_GUEST_VERSION,
     },
-    test_support::{admin_msg, output_http_status, output_json, TestContext},
+    test_support::{admin_msg, output_http_status, output_json, FailingDbOpContext, TestContext},
 };
 use serde_json::json;
 use wafer_core::clients::storage;
@@ -1100,6 +1100,75 @@ async fn a_staged_build_the_journal_vouches_for_is_accepted_at_boot() {
     assert!(
         artifacts::exists(&ctx, &converging).await.expect("exists"),
         "the generation that converged names it",
+    );
+}
+
+/// A journalled generation that could not be READ is not a dangling one. A
+/// transient fault or a WRAP denial on the generations table says nothing
+/// about what the desired generation names, so boot must neither retire the
+/// builds it may vouch for nor abandon the generation: it gives up, and leaves
+/// the journal for the next boot to converge on.
+#[tokio::test]
+async fn a_failed_read_of_the_journalled_generation_settles_nothing() {
+    let control = FakeControl::new();
+    let ctx = TestContext::with_dev(control.clone()).await;
+    let shared = ctx.dev_shared();
+
+    let (spec, bytes) = spec_only(&ctx, "hello").await;
+    let build = stage_build(&ctx, &spec.artifact_sha256, bytes.len() as u64).await;
+    let desired = stage_generation_of(&ctx, SiteManifest::default(), vec![spec]).await;
+    let journal = RuntimeState {
+        active_generation_id: None,
+        desired_generation_id: Some(desired.clone()),
+        activation_phase: ActivationPhase::BuildingRuntime,
+        generation: 0,
+    };
+    runtime_state::write(&ctx, &journal)
+        .await
+        .expect("journal the interrupted activation");
+
+    let unreadable = FailingDbOpContext::failing_with(
+        ctx.clone(),
+        vec![("database.get", generations::TABLE)],
+        wafer_run::WaferError::new(
+            wafer_run::ErrorCode::PermissionDenied,
+            "WRAP: impresspress/dev holds no grant on this table",
+        ),
+    );
+    activation::converge_on_boot(&unreadable, &shared)
+        .await
+        .expect_err("a boot that cannot read its journal gives up");
+
+    assert_eq!(
+        repo::builds::get(&ctx, &build).await.expect("get").status,
+        BuildStatus::Staged,
+        "the compile the journal may vouch for is left in flight",
+    );
+    assert_ne!(
+        generations::get(&ctx, &desired).await.expect("get").status,
+        GenerationStatus::Failed,
+        "the journalled generation is not abandoned",
+    );
+    assert_eq!(
+        runtime_state::read(&ctx)
+            .await
+            .expect("read")
+            .desired_generation_id,
+        Some(desired.clone()),
+        "the journal is kept for the next boot",
+    );
+
+    // The next boot, reading fine, converges on it.
+    let blocks = activation::converge_on_boot(&ctx, &shared)
+        .await
+        .expect("boot");
+    assert_eq!(
+        blocks.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+        vec!["site/hello"],
+    );
+    assert_eq!(
+        repo::builds::get(&ctx, &build).await.expect("get").status,
+        BuildStatus::Valid,
     );
 }
 

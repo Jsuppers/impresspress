@@ -5,9 +5,9 @@
 //! statement that touches it live here, so the handler/page modules above
 //! never issue database calls and never decode a column. Functions are thin
 //! typed wrappers around the pre-existing queries (same filters, same
-//! values) and surface the db client's `WaferError` unchanged, so call-site
-//! error handling (NotFound matching, warn-and-default, `err_internal`)
-//! keeps its exact previous behavior.
+//! values) and surface the db client's `WaferError` unchanged, so each call
+//! site classifies it — through `crud::db_error` / `crud::db_error_internal`
+//! (or `crud::db_error_page` for a page), or by warning and using a default.
 //!
 //! One decode per column is the point, not a tidiness preference. `public`
 //! on the buckets table is `INTEGER` on SQLite and `BOOLEAN` on Postgres and

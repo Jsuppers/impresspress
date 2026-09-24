@@ -152,7 +152,7 @@ pub async fn handle_direct_access(
     match repo::shares::increment_access_count_capped(ctx, &share.id, max).await {
         Ok(true) => {}
         Ok(false) => return err_forbidden("Share link access limit reached"),
-        Err(e) => return err_internal("Share access accounting failed", e),
+        Err(e) => return crud::db_error_internal(e, "Share access accounting failed"),
     }
 
     // The audit trail, unlike the counter, is not load-bearing for the cap:

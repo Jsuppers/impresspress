@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use wafer_run::{context::Context, InputStream, Message, OutputStream};
+use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
     contracts::{
@@ -18,13 +18,13 @@ use super::{
 };
 use crate::{
     blocks::crud,
-    http::{err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found, ok_json},
+    http::{err_bad_request, err_conflict, err_forbidden, err_not_found, ok_json},
 };
 
 pub(super) async fn handle_list_shares(ctx: &dyn Context, msg: &Message) -> OutputStream {
     match repo::shares::list_for_user(ctx, msg.user_id(), 100).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -45,36 +45,30 @@ pub const MAX_SHARE_EXPIRY_HOURS_KEY: &str = "IMPRESSPRESS__FILES__MAX_SHARE_EXP
 /// Default for [`MAX_SHARE_EXPIRY_HOURS_KEY`]: one year.
 pub const DEFAULT_MAX_SHARE_EXPIRY_HOURS: i64 = 24 * 365;
 
-/// The configured ceiling, or the default when the key is unset or unusable.
+/// The configured ceiling, or the default when the key is unset or unusable,
+/// or the lookup's own failure.
 ///
 /// A non-positive or unparseable value would mint an already-expired share
 /// (or, for a huge one, overflow the chrono arithmetic below — both
 /// `Duration::hours` and `DateTime + Duration` panic on overflow in chrono
 /// 0.4.44), so a value this handler cannot honour falls back to the default
 /// the `ConfigVar` declares rather than being obeyed.
-async fn max_share_expiry_hours(ctx: &dyn Context) -> i64 {
+async fn max_share_expiry_hours(ctx: &dyn Context) -> Result<i64, WaferError> {
     // `get`, not `get_default`: the two ways of not having a value are not
-    // the same event. An unset key is the declared default, silently and by
-    // design. A lookup that FAILED means a deployment that lowered this
-    // ceiling is handing out the longer default while the config store is
-    // unreachable, and the operator has to be able to see that in the log.
+    // the same event. An unset key is the declared default, by design. A
+    // lookup that FAILED is not an answer at all: a deployment that lowered
+    // this ceiling would be handing out the longer default while the config
+    // store is unreachable, so the share is refused instead, the way the
+    // upload refuses when its quota cannot be read.
     let raw = match wafer_core::clients::config::get(ctx, MAX_SHARE_EXPIRY_HOURS_KEY).await {
         Ok(value) => value,
         Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-            return DEFAULT_MAX_SHARE_EXPIRY_HOURS
+            return Ok(DEFAULT_MAX_SHARE_EXPIRY_HOURS)
         }
-        Err(e) => {
-            tracing::warn!(
-                key = MAX_SHARE_EXPIRY_HOURS_KEY,
-                error = %e,
-                default = DEFAULT_MAX_SHARE_EXPIRY_HOURS,
-                "share-expiry ceiling unreadable; granting the declared default"
-            );
-            return DEFAULT_MAX_SHARE_EXPIRY_HOURS;
-        }
+        Err(e) => return Err(e),
     };
     match raw.trim().parse::<i64>() {
-        Ok(hours) if hours > 0 && chrono::Duration::try_hours(hours).is_some() => hours,
+        Ok(hours) if hours > 0 && chrono::Duration::try_hours(hours).is_some() => Ok(hours),
         _ => {
             tracing::warn!(
                 key = MAX_SHARE_EXPIRY_HOURS_KEY,
@@ -82,7 +76,7 @@ async fn max_share_expiry_hours(ctx: &dyn Context) -> i64 {
                 default = DEFAULT_MAX_SHARE_EXPIRY_HOURS,
                 "unusable share-expiry ceiling; granting the declared default"
             );
-            DEFAULT_MAX_SHARE_EXPIRY_HOURS
+            Ok(DEFAULT_MAX_SHARE_EXPIRY_HOURS)
         }
     }
 }
@@ -127,8 +121,8 @@ pub(super) async fn handle_create_share(
     // Verify the user owns this bucket (or is admin) — shared helper from
     // storage.rs so the two modules stay in lockstep on what "access
     // denied" means.
-    if super::storage::is_bucket_access_denied(ctx, msg, &body.bucket).await {
-        return err_forbidden("Access denied to this bucket");
+    if let Err(refusal) = super::storage::require_bucket_access(ctx, msg, &body.bucket).await {
+        return refusal;
     }
 
     // Only a stored object is shareable, and the object's row is what says
@@ -159,7 +153,10 @@ pub(super) async fn handle_create_share(
     // Every share link has an end. A request that names no expiry gets the
     // configured ceiling — the longest life this deployment grants — rather
     // than an unexpiring link.
-    let max_hours = max_share_expiry_hours(ctx).await;
+    let max_hours = match max_share_expiry_hours(ctx).await {
+        Ok(hours) => hours,
+        Err(e) => return crud::db_error_internal(e, "Share expiry ceiling lookup failed"),
+    };
     let hours = match body.expires_in_hours {
         None => max_hours,
         Some(h) if !(1..=max_hours).contains(&h) => {
@@ -198,7 +195,7 @@ pub(super) async fn handle_create_share(
             direct_url: format!("/b/storage/direct/{token}"),
             token,
         }),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -228,11 +225,11 @@ pub(super) async fn handle_delete_share(ctx: &dyn Context, msg: &Message) -> Out
 pub(super) async fn handle_get_quota(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let quota = match super::quota::get_user_quota(ctx, msg.user_id()).await {
         Ok(quota) => quota,
-        Err(e) => return err_internal("Quota lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "Quota lookup failed"),
     };
     let usage = match super::quota::get_user_usage(ctx, msg.user_id()).await {
         Ok(usage) => usage,
-        Err(e) => return err_internal("Quota usage lookup failed", e),
+        Err(e) => return crud::db_error_internal(e, "Quota usage lookup failed"),
     };
     ok_json(&QuotaResponse { quota, usage })
 }
@@ -242,7 +239,7 @@ pub(super) async fn handle_admin_list_shares(ctx: &dyn Context, msg: &Message) -
     let offset = ((page - 1) * page_size) as i64;
     match repo::shares::list_recent(ctx, page_size as i64, offset).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -254,14 +251,14 @@ pub(super) async fn handle_access_logs(ctx: &dyn Context, msg: &Message) -> Outp
 
     match repo::shares::list_access_logs(ctx, share_id, page_size as i64, offset).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
 pub(super) async fn handle_admin_quotas(ctx: &dyn Context, _msg: &Message) -> OutputStream {
     match repo::quota::list(ctx, 1000).await {
         Ok(page) => ok_json(&RecordListView::from_page(page)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 
@@ -300,7 +297,7 @@ pub(super) async fn handle_update_quota(
 
     match repo::quota::upsert_for_user(ctx, user_id, body).await {
         Ok(row) => ok_json(&RecordView::from_row(row)),
-        Err(e) => err_internal("Database error", e),
+        Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
 

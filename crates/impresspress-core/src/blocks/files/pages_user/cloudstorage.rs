@@ -141,26 +141,30 @@ pub async fn cloudstorage_page(ctx: &dyn Context, msg: &Message) -> OutputStream
     let shares = match list_shares_for_user(ctx, &user_id).await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::error!(error = %e, user_id = %user_id, "cloud storage page: share list failed");
-            return crate::ui::server_error_response(msg);
+            return crate::blocks::crud::db_error_page(msg, e, "cloud storage page: share list")
         }
     };
     // Same quota source as upload enforcement (`repo::objects::reserve_upload`
     // sums the same rows, and caps them at the same `max_storage_bytes`), so
     // the card can never disagree with what the API enforces.
-    let used_bytes = crate::blocks::files::quota::get_used_bytes(ctx, &user_id).await;
-    let limit = crate::blocks::files::quota::get_user_quota(ctx, &user_id).await;
-    let quota = match (used_bytes, limit) {
-        (Ok(used_bytes), Ok(limit)) => QuotaInfo {
-            used_bytes,
-            limit_bytes: limit.max_storage_bytes,
-        },
-        (Err(e), _) | (_, Err(e)) => {
-            // A quota card showing "0 B used" during an outage misleads;
-            // the page fails like the API does.
-            tracing::error!(error = %e, user_id = %user_id, "cloud storage page: quota lookup failed");
-            return crate::ui::server_error_response(msg);
+    //
+    // A quota card showing "0 B used" during an outage misleads; the page
+    // fails like the API does, and on the first read that fails.
+    let used_bytes = match crate::blocks::files::quota::get_used_bytes(ctx, &user_id).await {
+        Ok(used_bytes) => used_bytes,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "cloud storage page: usage lookup")
         }
+    };
+    let limit = match crate::blocks::files::quota::get_user_quota(ctx, &user_id).await {
+        Ok(limit) => limit,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "cloud storage page: quota lookup")
+        }
+    };
+    let quota = QuotaInfo {
+        used_bytes,
+        limit_bytes: limit.max_storage_bytes,
     };
 
     let shares_with_js = html! {

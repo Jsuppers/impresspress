@@ -9,15 +9,15 @@ use wafer_run::{context::Context, OutputStream, WaferError};
 
 use super::{
     contracts::{ActivationView, ActiveBlockView, StatusResponse},
-    gc, generation, no_store, repo, seed, DevShared, WAFER_GUEST_VERSION,
+    gc, generation, no_store, no_store_db_error_internal, repo, seed, DevShared,
+    WAFER_GUEST_VERSION,
 };
-use crate::http::err_internal;
 
 /// Answer the status endpoint.
 pub async fn handle(ctx: &dyn Context, shared: &DevShared) -> OutputStream {
     match build(ctx, shared).await {
         Ok(response) => no_store().json(&response),
-        Err(e) => err_internal("dev sandbox status", e),
+        Err(e) => no_store_db_error_internal(e, "dev sandbox status"),
     }
 }
 

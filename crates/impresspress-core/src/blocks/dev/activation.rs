@@ -1022,8 +1022,12 @@ pub async fn converge_on_boot(
     let (previous, state) = active_or_clear(ctx, &state).await?;
     retire_abandoned(ctx, &state, previous.as_ref()).await;
     if let Some(desired) = state.desired_generation_id.clone() {
-        match generation::load(ctx, &desired).await {
-            Ok((row, manifest)) => {
+        match load_journalled(ctx, &desired)
+            .await
+            .map_err(|e| e.message)?
+        {
+            Journalled::Loaded(loaded) => {
+                let (row, manifest) = *loaded;
                 // A failed convergence is not a failed boot, and the failure
                 // is not discarded: `activate_staged` has already written it
                 // to the generation's `failure_message` and put the journal
@@ -1048,14 +1052,16 @@ pub async fn converge_on_boot(
             // never serve again over a row nothing can use. Treat it as a
             // convergence that failed: restore what is live, clear the
             // journal, and record the refusal on the row when there is one.
-            Err(e) => {
+            // (A read that merely failed is not this: it returned above, and
+            // the next boot converges on the row.)
+            Journalled::Dangling(reason) => {
                 tracing::error!(
                     generation_id = %desired,
-                    error = %e.message,
+                    error = %reason,
                     "dev sandbox: the activation journal names a generation that cannot be \
                      loaded; restoring the active generation",
                 );
-                abandon_dangling(ctx, &desired, &e.message).await?;
+                abandon_dangling(ctx, &desired, &reason).await?;
                 restore_active_site(ctx, None, previous.as_ref()).await?;
                 clear_journal(ctx, &state).await?;
             }
@@ -1157,11 +1163,27 @@ async fn retire_abandoned(
         vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
     }
     if let Some(desired) = state.desired_generation_id.as_deref() {
-        // A desired that cannot be loaded vouches for nothing; the
-        // dangling-desired arm in `converge_on_boot` deals with the row
-        // itself.
-        if let Ok((_row, manifest)) = generation::load(ctx, desired).await {
-            vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
+        match load_journalled(ctx, desired).await {
+            Ok(Journalled::Loaded(loaded)) => {
+                let (_row, manifest) = &*loaded;
+                vouched.extend(manifest.blocks.iter().map(|b| b.artifact_sha256.clone()));
+            }
+            // A dangling desired vouches for nothing; the dangling-desired
+            // arm in `converge_on_boot` deals with the row itself.
+            Ok(Journalled::Dangling(_)) => {}
+            // A read that failed says nothing about what the desired
+            // generation names, so no build can be judged unvouched: retiring
+            // them now could close the very compile this boot converges on.
+            // They stay in flight for the next boot to settle.
+            Err(e) => {
+                tracing::error!(
+                    generation_id = %desired,
+                    error = %e.message,
+                    "dev sandbox: could not read the journalled generation; leaving the builds \
+                     in flight for the next boot",
+                );
+                return;
+            }
         }
     }
 
@@ -1209,6 +1231,10 @@ async fn retire_abandoned(
 /// `desired` that is *also* unloadable falls into the dangling-desired arm
 /// below and is abandoned there.
 ///
+/// A read of the row that merely failed is not a dangling pointer
+/// ([`load_journalled`]): it is returned, and the pointer kept for the next
+/// boot.
+///
 /// Returns the journal as it stands afterwards, so the caller reads the
 /// cleared state rather than the one it passed in.
 async fn active_or_clear(
@@ -1218,16 +1244,16 @@ async fn active_or_clear(
     let Some(id) = state.active_generation_id.clone() else {
         return Ok((None, state.clone()));
     };
-    match generation::load(ctx, &id).await {
-        Ok(loaded) => Ok((Some(loaded), state.clone())),
-        Err(e) => {
+    match load_journalled(ctx, &id).await.map_err(|e| e.message)? {
+        Journalled::Loaded(loaded) => Ok((Some(*loaded), state.clone())),
+        Journalled::Dangling(reason) => {
             tracing::error!(
                 generation_id = %id,
-                error = %e.message,
+                error = %reason,
                 "dev sandbox: the activation journal names an active generation that cannot be \
                  loaded; clearing it and booting with nothing dynamic",
             );
-            abandon_dangling(ctx, &id, &e.message).await?;
+            abandon_dangling(ctx, &id, &reason).await?;
             let cleared = RuntimeState {
                 active_generation_id: None,
                 ..state.clone()
@@ -1261,6 +1287,40 @@ async fn restore_active_site(
     publish_site(ctx, published, &manifest.site)
         .await
         .map_err(|e| e.message)
+}
+
+/// A generation the journal names, as boot recovery reads it.
+enum Journalled {
+    /// The row and its manifest.
+    Loaded(Box<(GenerationRow, GenerationManifest)>),
+    /// The row is gone, or a manifest column does not parse — nothing a retry
+    /// can change — with why.
+    Dangling(String),
+}
+
+/// Load the generation `id` the journal names, telling a dangling pointer
+/// ([`Journalled::Dangling`]) from a read that failed (`Err`).
+///
+/// The two must not be confused: a dangling pointer is cleared and its row
+/// abandoned, which is right for a row nothing can ever use and destructive
+/// for one a transient fault or a WRAP denial merely hid. So only a missing
+/// row, or a row or manifest that does not decode, is dangling; every other
+/// failure is returned for boot to give up on, leaving the journal as it
+/// was for the next boot.
+async fn load_journalled(ctx: &dyn Context, id: &str) -> Result<Journalled, WaferError> {
+    let row = match repo::generations::lookup(ctx, id).await? {
+        Some(Ok(row)) => row,
+        Some(Err(e)) => return Ok(Journalled::Dangling(e.message)),
+        None => {
+            return Ok(Journalled::Dangling(format!(
+                "generation {id} does not exist"
+            )))
+        }
+    };
+    Ok(match generation::from_row(&row) {
+        Ok(manifest) => Journalled::Loaded(Box::new((row, manifest))),
+        Err(e) => Journalled::Dangling(e.message),
+    })
 }
 
 /// Record why a generation the journal pointed at could not be converged on.

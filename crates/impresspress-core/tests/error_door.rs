@@ -39,9 +39,10 @@
 //! the allowlist sent it to.
 //!
 //! That last blind spot is closed for every block in `GATED_BLOCKS` — the
-//! whole of `admin`, `auth`, `auth_ui`, `legalpages`, `llm`, `messages`,
-//! `products`, `signal`, `userportal` and `vector`, and the top-level
-//! `email.rs` and `fastembed.rs`. Whether an
+//! whole of `admin`, `auth`, `auth_ui`, `dev`, `files`, `legalpages`, `llm`,
+//! `messages`, `products`, `signal`, `tickets`, `userportal` and `vector`,
+//! and the top-level `email.rs` and `fastembed.rs`: every block that calls
+//! `err_internal` at all. Whether an
 //! `err_internal(label, cause)` there wraps a database call is a reading job
 //! per site, so the second gate below does not guess: every `err_internal`
 //! tail left in a gated file is inventoried by its label, with the reason it
@@ -49,10 +50,9 @@
 //! A third gate stops the inventory being walked around: in a gated file
 //! `err_internal` may only be called by name, never renamed, stored, wrapped
 //! in a macro, or wrapped in a function, trait default method or bound
-//! closure that forwards its caller's error. Everywhere else the blind spot
-//! stands — an empty `STILL_HAND_MAPPED` means no file writes the *shape*,
-//! not that every refusal is classified — and `NOT_YET_GATED` lists where it
-//! stands.
+//! closure that forwards its caller's error. A block that is not gated may
+//! not call `err_internal` at all: `NOT_YET_GATED` is empty, and a block that
+//! starts to must be gated or listed there.
 //!
 //! What the inventory does NOT see, in a gated file or anywhere: a database
 //! failure answered through `err_internal_no_cause` or
@@ -337,13 +337,16 @@ const GATED_BLOCKS: &[&str] = &[
     "admin",
     "auth",
     "auth_ui",
+    "dev",
     "email.rs",
     "fastembed.rs",
+    "files",
     "legalpages",
     "llm",
     "messages",
     "products",
     "signal",
+    "tickets",
     "userportal",
     "vector",
 ];
@@ -371,10 +374,11 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// many times it appears and why it is not a database failure. A gated file
 /// that is not listed here has an empty inventory.
 ///
-/// A database failure in these files goes through `crud::db_error_internal`
-/// (or `crud::db_error` where a `NotFound` is the caller's row, or
-/// `crud::db_error_page` for a full page), so a WRAP denial is 403 and a quota
-/// is 429. What is left here is one of four things:
+/// A database or storage failure in these files goes through
+/// `crud::db_error_internal` (or `crud::db_error` where a `NotFound` is the
+/// caller's row, `crud::db_error_page` for a full page, or
+/// `dev::no_store_db_error_internal` in the dev block), so a WRAP denial is 403
+/// and a quota is 429. What is left here is one of five things:
 ///
 /// - **Stripe**: the cause is a Stripe API call. `stripe_client::classify`
 ///   gives it `Internal` or `FailedPrecondition`, never a WRAP code, and a
@@ -388,6 +392,11 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// - **Invariant**: the cause is this process, not a service — a row outside
 ///   its contract, a setting outside its range (`config::get_default` answers
 ///   the default, never a database error), a serialization or the OS RNG.
+/// - **Classified**: the cause already went through
+///   `crud::classify_db_error` and came back `Internal` — its WRAP denials and
+///   quotas were answered before this call. `dev::seal_no_store` is the one:
+///   it seals the dev block's failures with `Cache-Control: no-store`, which
+///   `crud`'s own sealer cannot add.
 ///
 /// The gate compares counts both ways. A label that is not listed, or that
 /// appears more often than listed, is a new tail: route it through the door
@@ -407,8 +416,12 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// `userportal/error_mapping_tests.rs`, and one real route or page per
 /// converted site in `llm/error_mapping_tests.rs`,
 /// `vector/error_mapping_tests.rs`, `messages/error_mapping_tests.rs` and
-/// `legalpages/error_mapping_tests.rs`, and `signal`'s
-/// `a_refused_room_store_is_403` in `signal/mod.rs`.
+/// `legalpages/error_mapping_tests.rs`, `signal`'s
+/// `a_refused_room_store_is_403` in `signal/mod.rs`, one real route per
+/// converted site in `files/error_mapping_tests.rs` and
+/// `dev/error_mapping_tests.rs` (storage refusals through
+/// `FailingStorageOpContext`), and `tickets`'
+/// `refused_list_pages_are_the_403_page` in `tickets/pages.rs`.
 const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     (
         "products/stripe.rs",
@@ -682,12 +695,46 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
             why: "invariant: loading the embedding model into this process",
         }],
     ),
+    (
+        "files/share.rs",
+        &[Tail {
+            label: "Token generation failed",
+            count: 1,
+            why: "crypto: drawing the share token's random bytes",
+        }],
+    ),
+    (
+        "dev/export.rs",
+        &[
+            Tail {
+                label: "dev export archive",
+                count: 1,
+                why: "invariant: writing the zip into memory",
+            },
+            Tail {
+                label: "dev export shell",
+                count: 1,
+                why:
+                    "provider: `ShellSource` answers the host's static shell as a `String` error, \
+                      a type with no database code",
+            },
+        ],
+    ),
+    (
+        "dev/mod.rs",
+        &[Tail {
+            label: "context",
+            count: 1,
+            why: "classified: `seal_no_store`'s `DbFailure::Internal` arm, after \
+                  `crud::classify_db_error` answered WRAP denials and quotas",
+        }],
+    ),
 ];
 
 /// One inventoried tail: its label as [`err_internal_labels`] reads it, how
 /// many times the file uses it, and why it is not a database failure —
-/// `"Stripe: …"`, `"provider: …"`, `"crypto: …"` or `"invariant: …"`, the
-/// only reasons there are.
+/// `"Stripe: …"`, `"provider: …"`, `"crypto: …"`, `"invariant: …"` or
+/// `"classified: …"`, the only reasons there are.
 struct Tail {
     label: &'static str,
     count: usize,
@@ -926,9 +973,15 @@ fn gated_files_tail_only_inventoried_non_database_failures() {
         );
         for tail in *inventory {
             assert!(
-                ["Stripe: ", "provider: ", "crypto: ", "invariant: "]
-                    .iter()
-                    .any(|reason| tail.why.starts_with(reason)),
+                [
+                    "Stripe: ",
+                    "provider: ",
+                    "crypto: ",
+                    "invariant: ",
+                    "classified: "
+                ]
+                .iter()
+                .any(|reason| tail.why.starts_with(reason)),
                 "{rel}: `{}` must say which non-database cause it is",
                 tail.label
             );
@@ -1534,17 +1587,13 @@ fn the_evasion_gate_catches_each_way_around() {
 /// calls may be a database failure answering 500 where a WRAP denial should
 /// be a 403 and a quota a 429.
 ///
-/// A block leaves this list by joining `GATED_BLOCKS`, its tails inventoried.
-/// The counts are exact both ways, so converting a file lowers its block's
-/// count here and a new file with a tail raises it — either way this list is
-/// edited, and the backlog it states stays true. A top-level file under
-/// `src/blocks/` is its own entry; `crud.rs` is the door and is not listed.
-/// `"unplanned"` is a block no plan item has scheduled yet.
-const NOT_YET_GATED: &[(&str, usize, &str)] = &[
-    ("dev", 6, "N25"),
-    ("files", 5, "N25"),
-    ("tickets", 1, "N25"),
-];
+/// **Empty**: `dev`, `files` and `tickets` were the last, and are gated. A
+/// block that starts calling `err_internal` joins `GATED_BLOCKS` with its
+/// tails inventoried, or is listed here with the plan item that will. The
+/// counts are exact both ways, so the backlog this states stays true. A
+/// top-level file under `src/blocks/` is its own entry; `crud.rs` is the door
+/// and is not listed. `"unplanned"` is a block no plan item has scheduled yet.
+const NOT_YET_GATED: &[(&str, usize, &str)] = &[];
 
 /// The block a `src/blocks`-relative path belongs to: its first component.
 fn block_of(rel: &str) -> &str {
@@ -1602,8 +1651,22 @@ const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
         "read: OAuth provider responses, OAuth configuration, and the \
          admin row bootstrap has just inserted — none carries a cause",
     ),
-    ("files", 11, "N25"),
-    ("products", 32, "unplanned"),
+    (
+        "files",
+        3,
+        "read: a share row with no expiry, an unparseable one, or no bucket or \
+         key — the lookup succeeded, so there is no cause to carry",
+    ),
+    (
+        "products",
+        32,
+        "read: a Stripe payload that disagrees with the ledger or is missing a \
+         field, a concurrent or already-scheduled webhook delivery, a checkout \
+         claim or subscription lookup that succeeded and matched nothing, a \
+         resolved checkout component its offer no longer has, and a setting \
+         outside its range (`config::get_default` never errors) — \
+         none carries a cause",
+    ),
     (
         "userportal",
         1,
@@ -1671,22 +1734,31 @@ fn cause_dropped_is_the_whole_backlog() {
 /// its brace does, however deeply the markup inside it nests. An
 /// interpolation is a parenthesized group inside an `html!` invocation that
 /// is not a call's argument list (it does not follow an identifier or a
-/// macro's `!`). It prints the failure when either:
+/// macro's `!`). It prints the failure when its expression starts from a
+/// name that holds an error (`(e)`, `(e.message)`, `(e.to_string())`,
+/// `(&e.message.clone())`), is a `format!` naming one as an argument or
+/// inline (`format!("…{e}")`), or is either of those wrapped in maud's
+/// `PreEscaped(…)`. A name holds an error when it is bound:
 ///
-/// - it is inside the body of an `Err(e)` binding — a `match` arm (`Err(e) =>
-///   { … }` or `Err(e) => html! { … }`, in Rust or in maud's `@match`) or an
-///   `if let Err(e) = … { … }` (maud's `@if let` too), with `ref`/`mut`
-///   patterns alike — and its expression starts from `e` (`(e)`,
-///   `(e.message)`, `(e.to_string())`, `(&e.message.clone())`) or is a
-///   `format!` naming `e` as an argument or inline (`format!("…{e}")`); or
-/// - its expression starts from `x.message` for any `x` — an error handed to
-///   a helper as a parameter, which no binding scan sees.
+/// - by an `Err(…)` anywhere in a pattern — every name it binds, so
+///   `Err(WaferError { message, .. })` binds `message`, and `Some(Err(e))`
+///   and `(Err(e), _) | (_, Err(e))` bind `e` — in a `match` arm
+///   (`Err(e) => { … }`, `Err(e) if guard => …`, `Err(e) => html! { … }`,
+///   in Rust or in maud's `@match`), for the arm's body; in an `if let` or
+///   `while let` (maud's `@if let` too), for its block; or in a
+///   `let Err(e) = r else { … };`, for the rest of the enclosing block; or
+/// - as a parameter of a `fn` whose type names an `…Error`
+///   (`fn notice(e: &WaferError)`), for the function's body — an error
+///   handed to a helper, which no pattern scan sees.
+///
+/// Only names bound that way count: `(notice.message)` is a struct's field,
+/// not an error's text, unless `notice` is one of them.
 ///
 /// What it does NOT follow: the text laundered through something else first
 /// (`@let text = e.to_string();` and then `(text)`, or a helper called with
-/// `e` that returns its message). A classified reason — `(crud::
-/// db_error_notice(e, "…"))` — starts from the door, not from `e`, and is
-/// not the shape.
+/// `e` that returns its message), a closure's parameter, or a generic `E`
+/// parameter. A classified reason — `(crud::db_error_notice(e, "…"))` —
+/// starts from the door, not from `e`, and is not the shape.
 fn error_text_renders(src: &str) -> usize {
     use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
@@ -1698,68 +1770,180 @@ fn error_text_renders(src: &str) -> usize {
         matches!(tree, Some(TokenTree::Ident(ident)) if ident == name)
     }
 
-    /// `e` in `(e)`, `(ref e)`, `(mut e)`, `(ref mut e)`; `None` for `(_)`
-    /// or any other pattern.
-    fn bound_name(pattern: TokenStream) -> Option<String> {
-        let idents: Vec<String> = pattern
-            .into_iter()
-            .map(|tree| match tree {
-                TokenTree::Ident(ident) => Some(ident.to_string()),
-                _ => None,
-            })
-            .collect::<Option<_>>()?;
-        match idents.as_slice() {
-            [.., name]
-                if name != "_"
-                    && idents[..idents.len() - 1]
-                        .iter()
-                        .all(|m| m == "ref" || m == "mut") =>
-            {
-                Some(name.clone())
+    fn is_group(tree: Option<&TokenTree>, delimiter: Delimiter) -> bool {
+        matches!(tree, Some(TokenTree::Group(group)) if group.delimiter() == delimiter)
+    }
+
+    /// Every name `pattern` binds: `e` in `e`, `ref e` or `mut e`, `message`
+    /// in `WaferError { message, .. }`. A capitalized identifier is a unit
+    /// variant or a constant, not a binding; `_` binds nothing.
+    fn bound_names(pattern: TokenStream) -> Vec<String> {
+        use syn::{parse::Parser, visit::Visit};
+
+        struct Bound(Vec<String>);
+        impl<'ast> Visit<'ast> for Bound {
+            fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+                let name = pat.ident.to_string();
+                if name.starts_with(|c: char| c.is_lowercase() || c == '_') {
+                    self.0.push(name);
+                }
+                syn::visit::visit_pat_ident(self, pat);
             }
-            _ => None,
+        }
+        let Ok(pat) = syn::Pat::parse_single.parse2(pattern) else {
+            return Vec::new();
+        };
+        let mut bound = Bound(Vec::new());
+        bound.visit_pat(&pat);
+        bound.0
+    }
+
+    /// The parameters of a `fn` signature whose type names an `…Error`.
+    fn error_parameters(params: TokenStream) -> Vec<String> {
+        use syn::{parse::Parser, punctuated::Punctuated, visit::Visit, FnArg, Token};
+
+        struct Names(bool);
+        impl<'ast> Visit<'ast> for Names {
+            fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+                self.0 |= ident.to_string().ends_with("Error");
+            }
+        }
+        let Ok(args) = Punctuated::<FnArg, Token![,]>::parse_terminated.parse2(params) else {
+            return Vec::new();
+        };
+        args.iter()
+            .filter_map(|arg| match arg {
+                FnArg::Typed(typed) => {
+                    let mut names = Names(false);
+                    names.visit_type(&typed.ty);
+                    names.0.then(|| bound_names(quote_pat(&typed.pat)))
+                }
+                FnArg::Receiver(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// A parameter pattern's own tokens, for [`bound_names`]. Only a plain
+    /// or `mut` identifier is spelled back; a destructuring parameter binds
+    /// nothing this scan follows.
+    fn quote_pat(pat: &syn::Pat) -> TokenStream {
+        match pat {
+            syn::Pat::Ident(ident) => TokenTree::Ident(ident.ident.clone()).into(),
+            _ => TokenStream::new(),
         }
     }
 
-    /// For each sibling index, the names an `Err(name)` binding before it
-    /// holds there: an arm's body (a brace group, or everything up to the
-    /// arm's comma) or an `if let`'s block.
+    /// Every name an `Err(…)` inside the pattern `trees` binds, at any
+    /// depth: `e` in `Err(e)`, `Some(Err(e))` and `(Err(e), _) | (_, Err(e))`.
+    fn err_names(trees: &[TokenTree]) -> Vec<String> {
+        let mut names = Vec::new();
+        for (i, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Ident(ident) if ident == "Err" => {
+                    if let Some(TokenTree::Group(pattern)) = trees.get(i + 1) {
+                        if pattern.delimiter() == Delimiter::Parenthesis {
+                            names.extend(bound_names(pattern.stream()));
+                        }
+                    }
+                }
+                // `Err`'s own group was read above; this reaches the nested
+                // ones (`Some(Err(e))`), and re-reading `Err(e)`'s group
+                // finds no further `Err` in it.
+                TokenTree::Group(group) => {
+                    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                    names.extend(err_names(&inner));
+                }
+                _ => {}
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// For each sibling index, the names bound as holding an error there: an
+    /// `Err(…)` arm's body, an `if let`'s block, the rest of the block after
+    /// a `let … else`, a `fn`'s body for its error-typed parameters.
     fn bindings(trees: &[TokenTree]) -> Vec<Vec<String>> {
         let mut held = vec![Vec::new(); trees.len()];
         for at in 0..trees.len() {
-            if !is_ident(trees.get(at), "Err") {
-                continue;
-            }
-            let Some(TokenTree::Group(pattern)) = trees.get(at + 1) else {
-                continue;
-            };
-            if pattern.delimiter() != Delimiter::Parenthesis {
-                continue;
-            }
-            let Some(name) = bound_name(pattern.stream()) else {
-                continue;
-            };
-            let next = at + 2;
-            if is_punct(trees.get(next), '=') && is_punct(trees.get(next + 1), '>') {
-                // An arm: its brace body, or everything up to its comma.
-                let start = next + 2;
-                let end = match trees.get(start) {
-                    Some(TokenTree::Group(body)) if body.delimiter() == Delimiter::Brace => {
-                        start + 1
+            if is_ident(trees.get(at), "fn") {
+                let Some(params) =
+                    (at + 1..trees.len()).find(|&i| is_group(trees.get(i), Delimiter::Parenthesis))
+                else {
+                    continue;
+                };
+                // The body, unless the signature ends at a `;` first.
+                let body = (params + 1..trees.len()).find(|&i| {
+                    is_group(trees.get(i), Delimiter::Brace) || is_punct(trees.get(i), ';')
+                });
+                if let (Some(TokenTree::Group(params)), Some(body)) = (trees.get(params), body) {
+                    if is_group(trees.get(body), Delimiter::Brace) {
+                        held[body].extend(error_parameters(params.stream()));
                     }
-                    _ => (start..trees.len())
+                }
+                continue;
+            }
+            // An arm: `=>`, with its pattern reaching back to the previous
+            // arm's comma or brace body. An `Err(…)` anywhere in it binds —
+            // `Some(Err(e))`, `(Err(e), _) | (_, Err(e))` — and a guard
+            // (`if …`) is not part of it.
+            if is_punct(trees.get(at), '=') && is_punct(trees.get(at + 1), '>') {
+                let from = (0..at)
+                    .rev()
+                    .find(|&i| {
+                        is_punct(trees.get(i), ',') || is_group(trees.get(i), Delimiter::Brace)
+                    })
+                    .map_or(0, |i| i + 1);
+                let to = (from..at)
+                    .find(|&i| is_ident(trees.get(i), "if"))
+                    .unwrap_or(at);
+                let names = err_names(&trees[from..to]);
+                if names.is_empty() {
+                    continue;
+                }
+                // Its brace body, or everything up to its comma.
+                let start = at + 2;
+                let end = if is_group(trees.get(start), Delimiter::Brace) {
+                    start + 1
+                } else {
+                    (start..trees.len())
                         .find(|&i| is_punct(trees.get(i), ','))
-                        .unwrap_or(trees.len()),
+                        .unwrap_or(trees.len())
                 };
                 for slot in &mut held[start..end] {
-                    slot.push(name.clone());
+                    slot.extend(names.iter().cloned());
                 }
-            } else if is_punct(trees.get(next), '=') {
-                // `if let Err(name) = … { body }`: the first block after `=`.
-                if let Some(body) = (next + 1..trees.len()).find(|&i| {
-                    matches!(&trees[i], TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)
-                }) {
-                    held[body].push(name.clone());
+                continue;
+            }
+            // A `let`: its pattern runs to the `=`.
+            if !is_ident(trees.get(at), "let") {
+                continue;
+            }
+            let Some(eq) = (at + 1..trees.len()).find(|&i| is_punct(trees.get(i), '=')) else {
+                continue;
+            };
+            let names = err_names(&trees[at + 1..eq]);
+            if names.is_empty() {
+                continue;
+            }
+            let conditional = at >= 1
+                && (is_ident(trees.get(at - 1), "if") || is_ident(trees.get(at - 1), "while"));
+            if conditional {
+                // `if let Err(e) = … { body }`: the first block after `=`.
+                if let Some(body) =
+                    (eq + 1..trees.len()).find(|&i| is_group(trees.get(i), Delimiter::Brace))
+                {
+                    held[body].extend(names.iter().cloned());
+                }
+            } else {
+                // `let Err(e) = r else { … };`: bound after the statement.
+                let end_of_statement = (eq..trees.len())
+                    .find(|&i| is_punct(trees.get(i), ';'))
+                    .unwrap_or(trees.len());
+                for slot in &mut held[end_of_statement..] {
+                    slot.extend(names.iter().cloned());
                 }
             }
         }
@@ -1782,7 +1966,8 @@ fn error_text_renders(src: &str) -> usize {
     }
 
     /// Whether the interpolated expression `tokens` prints an error: one of
-    /// `bound` as its root or as a `format!` argument, or any `x.message`.
+    /// `bound` as its root or as a `format!` argument, directly or inside
+    /// `PreEscaped(…)`.
     fn prints_an_error(tokens: TokenStream, bound: &[String]) -> bool {
         let trees: Vec<TokenTree> = tokens.into_iter().collect();
         let start = trees
@@ -1792,13 +1977,21 @@ fn error_text_renders(src: &str) -> usize {
             )
             .unwrap_or(trees.len());
         let expr = &trees[start..];
+        // `PreEscaped(…)` or `maud::PreEscaped(…)`: the wrapper marks the
+        // text as markup, which does not stop it being the error's.
+        if let [path @ .., TokenTree::Ident(wrapper), TokenTree::Group(inner)] = expr {
+            if wrapper == "PreEscaped"
+                && inner.delimiter() == Delimiter::Parenthesis
+                && path.iter().all(|tree| {
+                    matches!(tree, TokenTree::Ident(_))
+                        || matches!(tree, TokenTree::Punct(p) if p.as_char() == ':')
+                })
+            {
+                return prints_an_error(inner.stream(), bound);
+            }
+        }
         match expr {
             [TokenTree::Ident(root), ..] if bound.iter().any(|name| root == name) => true,
-            [TokenTree::Ident(_), TokenTree::Punct(dot), TokenTree::Ident(field), ..]
-                if dot.as_char() == '.' && field == "message" =>
-            {
-                true
-            }
             [TokenTree::Ident(mac), TokenTree::Punct(bang), TokenTree::Group(args), ..]
                 if (mac == "format" || mac == "format_args") && bang.as_char() == '!' =>
             {
@@ -1944,8 +2137,76 @@ fn the_error_text_scan_catches_the_shapes() {
             "fn a() { html! { @match r { Err(e) => { div { span { \"a\" } } div { p { (e) } } } } } }\n",
             1,
         ),
+        // An arm with a guard, in maud and in Rust.
+        (
+            "fn a() { html! { @match r { Err(e) if e.code == ErrorCode::Internal => { p { (e) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() -> Markup { match r { Err(e) if e.code >= 3 => html! { p { (e.message) } }, _ => html! {} } }\n",
+            1,
+        ),
+        // A destructured error: every name the pattern binds.
+        (
+            "fn a() { html! { @match r { Err(WaferError { message, .. }) => { p { (message) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Err(WaferError { message: text, .. }) => { p { (text) } } } } }\n",
+            1,
+        ),
+        // `let … else`: the name is bound for the rest of the block.
+        (
+            "fn a() -> Markup { let Err(e) = r else { return html! {} }; html! { p { (e) } } }\n",
+            1,
+        ),
+        // An `Err` nested inside the arm's pattern, or either side of an
+        // or-pattern.
+        (
+            "fn a() -> Markup { match (x, y) { (Ok(a), Ok(b)) => html! { (a) (b) }, (Err(e), _) | (_, Err(e)) => html! { p { (e) } }, } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Some(Err(e)) => { p { (e.message) } } _ => {} } } }\n",
+            1,
+        ),
+        (
+            "fn a() -> Markup { if let Some(Err(e)) = r { return html! { (e) }; } html! {} }\n",
+            1,
+        ),
+        // Marked as markup, which is worse, not better.
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (PreEscaped(format!(\"<b>{e}</b>\"))) } } } } }\n",
+            1,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (maud::PreEscaped(e.to_string())) } } } } }\n",
+            1,
+        ),
         // Not the shape: calls, a classified reason, an unbound name, the Ok
-        // arm, markup outside the arm, a test.
+        // arm, markup outside the arm, a test, a struct's `.message` field, a
+        // guard that reads the error while the body prints none of it, and
+        // the `else` of a `let … else`, where the name is not bound.
+        (
+            "fn a(notice: &Notice) -> Markup { html! { p .notice { (notice.message) } } }\n",
+            0,
+        ),
+        (
+            "fn a() { html! { @for n in notices { p { (n.message) } } } }\n",
+            0,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) if e.code == ErrorCode::NotFound => { p { \"missing\" } } } } }\n",
+            0,
+        ),
+        (
+            "fn a() { html! { @match r { Err(e) => { p { (PreEscaped(crud::db_error_notice(e, \"x\"))) } } } } }\n",
+            0,
+        ),
+        (
+            "fn a() -> Markup { let Err(e) = r else { return html! { (e) } }; html! {} }\n",
+            0,
+        ),
         ("fn a() { match r { Err(e) => { return Err(e) } } }\n", 0),
         ("fn a() { match r { Err(e) => { return crud::db_error_internal(e, \"x\") } } }\n", 0),
         ("fn a() { match r { Err(e) => { RoomError::Db(e.message) } } }\n", 0),

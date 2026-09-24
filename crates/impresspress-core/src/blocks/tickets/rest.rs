@@ -92,13 +92,8 @@ pub async fn get_ticket(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Err(response) => return response,
     };
     match service::detail(ctx, id).await {
-        // `service_error`'s 404 label is the generic "Resource not found";
-        // this route knows it was looking for a ticket.
-        Err(service::ServiceError::Db(error)) => {
-            crud::db_error(error, "Ticket not found", "Database error")
-        }
         Ok(detail) => ok_json(&TicketDetailResponse::from_detail(detail)),
-        Err(error) => service_error(error),
+        Err(error) => crud::db_error(error, "Ticket not found", "Database error"),
     }
 }
 
