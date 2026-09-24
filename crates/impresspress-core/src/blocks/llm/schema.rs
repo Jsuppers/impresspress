@@ -214,6 +214,7 @@ mod tests {
     use wafer_core::clients::database::Record;
 
     use super::*;
+    use crate::blocks::llm::EXAMPLE_KEY_VAR;
 
     #[test]
     fn config_to_row_encodes_minimal_config() {
@@ -257,7 +258,7 @@ mod tests {
             "http://localhost:11434/v1",
         )
         .with_api_key("resolved-plaintext-secret")
-        .with_key_var("IMPRESSPRESS__LLM__OPENAI_KEY")
+        .with_key_var(EXAMPLE_KEY_VAR)
         .with_models(vec!["llama3".into(), "mistral".into()]);
         let row = config_to_row(&cfg);
         assert!(
@@ -270,7 +271,7 @@ mod tests {
         );
         assert_eq!(
             row.get("key_var").and_then(|v| v.as_str()),
-            Some("IMPRESSPRESS__LLM__OPENAI_KEY")
+            Some(EXAMPLE_KEY_VAR)
         );
         assert_eq!(
             row.get("models"),
@@ -280,6 +281,7 @@ mod tests {
 
     #[test]
     fn roundtrip_drops_api_key_on_load() {
+        const ANTHROPIC_KEY_VAR: &str = "IMPRESSPRESS__LLM__ANTHROPIC_KEY";
         // The runtime api_key (if set) is lost through the DB roundtrip —
         // callers must re-resolve via key_var after loading.
         let cfg = ProviderConfig::new(
@@ -288,7 +290,7 @@ mod tests {
             "https://api.anthropic.com/v1",
         )
         .with_api_key("runtime-only")
-        .with_key_var("IMPRESSPRESS__LLM__ANTHROPIC_KEY")
+        .with_key_var(ANTHROPIC_KEY_VAR)
         .with_models(vec!["claude-opus-4-7".into()]);
         let row = config_to_row(&cfg);
         let record = Record {

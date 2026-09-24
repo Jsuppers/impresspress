@@ -56,7 +56,7 @@ use super::{
     zip::ZipWriter,
     DevShared,
 };
-use crate::http::err_internal;
+use crate::{config_vars::APP_NAME_KEY, http::err_internal};
 
 /// The line `sw.js` carries when it was built for a dev deployment, and the
 /// one it must carry after an export.
@@ -546,7 +546,7 @@ async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
     // the name was. The literal is spelled as every other reader spells it
     // (`ui::SiteConfig`, `pipeline`): `config_vars` declares it in
     // `shared_config_vars()` without exporting a constant for the key.
-    let title = config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "").await;
+    let title = config::get_default(ctx, APP_NAME_KEY, "").await;
     let title = if title.is_empty() {
         "Your ImpressPress site".to_string()
     } else {

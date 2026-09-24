@@ -22,7 +22,14 @@ use super::{
     stripe_client::{publishable_livemode, secret_livemode, StripeClient, DEFAULT_API_VERSION},
     stripe_secret_operations_allowed,
 };
-use crate::util::RecordExt;
+use crate::{
+    blocks::products::config::{
+        CHECKOUT_ALLOWED_ORIGINS, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY,
+        STRIPE_WEBHOOK_SECRET,
+    },
+    config_vars::FRONTEND_URL_KEY,
+    util::RecordExt,
+};
 
 fn bool_at(value: &Value, pointer: &str) -> bool {
     value
@@ -85,16 +92,9 @@ fn capabilities(value: &Value) -> BTreeMap<String, String> {
 }
 
 async fn connection_base(ctx: &dyn Context) -> (String, bool, bool, String) {
-    let publishable =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY", "").await;
-    let webhook =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", "").await;
-    let api_version = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-        DEFAULT_API_VERSION,
-    )
-    .await;
+    let publishable = config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await;
+    let webhook = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await;
+    let api_version = config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_API_VERSION).await;
     (
         publishable.clone(),
         !publishable.trim().is_empty(),
@@ -135,7 +135,7 @@ fn connection_error(
 }
 
 pub(crate) async fn connection_status(ctx: &dyn Context) -> StripeConnectionStatus {
-    let secret = config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "").await;
+    let secret = config::get_default(ctx, STRIPE_SECRET_KEY, "").await;
     let (publishable, publishable_configured, webhook_configured, api_version) =
         connection_base(ctx).await;
     if !stripe_secret_operations_allowed(ctx).await {
@@ -242,14 +242,8 @@ pub(crate) async fn connection_status(ctx: &dyn Context) -> StripeConnectionStat
 }
 
 async fn validate_redirect(ctx: &dyn Context, url: &str) -> Result<(), WaferError> {
-    let frontend = config::get_default(
-        ctx,
-        "WAFER_RUN_SHARED__FRONTEND_URL",
-        "http://localhost:5173",
-    )
-    .await;
-    let allowed =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS", "").await;
+    let frontend = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
+    let allowed = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await;
     if url.trim().is_empty() || !super::stripe::is_allowed_checkout_url(url, &frontend, &allowed) {
         return Err(WaferError::new(
             ErrorCode::InvalidArgument,

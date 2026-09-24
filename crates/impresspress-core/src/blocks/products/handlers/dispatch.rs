@@ -12,7 +12,10 @@ use super::{
     catalog, commerce, group, offers, payment_links, product, provider, sellers, stats,
     subscription, types,
 };
-use crate::blocks::products::{pages, purchase, routes::Route, stripe};
+use crate::{
+    blocks::products::{pages, purchase, routes::Route, stripe},
+    config_vars::ALLOW_USER_PRODUCTS_KEY,
+};
 
 /// Whether `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS` is on — the flag behind
 /// `routes::user_products_refusal`. Visible at `crate::blocks::products`
@@ -20,7 +23,7 @@ use crate::blocks::products::{pages, purchase, routes::Route, stripe};
 /// page (`pages::overview`) can render an accurate notice instead of a silent
 /// empty catalog when it's off.
 pub(in crate::blocks::products) async fn user_products_enabled(ctx: &dyn Context) -> bool {
-    crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", false).await
+    crate::config_vars::get_bool(ctx, ALLOW_USER_PRODUCTS_KEY, false).await
 }
 
 /// Run the handler `route` names.

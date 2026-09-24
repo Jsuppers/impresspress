@@ -97,6 +97,7 @@ mod tests {
     use super::*;
     use crate::{
         blocks::userportal::UserPortalBlock,
+        config_vars::DEFAULT_APP_NAME,
         test_support::{
             anon_msg, auth_msg, output_header, output_html, output_status, TestContext,
         },
@@ -287,7 +288,7 @@ mod tests {
             "blank LOGO_URL must fall back to the app-name lockup; header was: {head}"
         );
         assert!(
-            head.contains("Impresspress"),
+            head.contains(DEFAULT_APP_NAME),
             "the fallback must name the site; header was: {head}"
         );
     }

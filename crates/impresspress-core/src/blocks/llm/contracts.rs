@@ -511,6 +511,7 @@ pub struct ConfigDeleteResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::llm::EXAMPLE_KEY_VAR;
 
     /// The projection is what keeps the resolved key off the wire: a config
     /// holding one still serializes without it.
@@ -522,7 +523,7 @@ mod tests {
             "https://api.openai.com/v1",
         )
         .with_api_key("sk-resolved-plaintext")
-        .with_key_var("IMPRESSPRESS__LLM__OPENAI_KEY")
+        .with_key_var(EXAMPLE_KEY_VAR)
         .with_models(vec!["gpt-4o".into()]);
 
         let value = serde_json::to_value(ProviderView::from_config("row-1", &cfg)).expect("json");
@@ -553,7 +554,7 @@ mod tests {
         );
         assert_eq!(value["id"], "row-1");
         assert_eq!(value["protocol"], "open_ai");
-        assert_eq!(value["key_var"], "IMPRESSPRESS__LLM__OPENAI_KEY");
+        assert_eq!(value["key_var"], EXAMPLE_KEY_VAR);
         assert_eq!(value["models"], serde_json::json!(["gpt-4o"]));
         assert_eq!(value["enabled"], true);
     }

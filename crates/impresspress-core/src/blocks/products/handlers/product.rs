@@ -16,6 +16,7 @@ use crate::{
     blocks::{
         crud,
         products::{
+            config::{DEFAULT_CURRENCY, SELLER_MODERATION_REQUIRED},
             contracts::{
                 ApprovalStatus, CreateProductRequest, ProductDuplicateResponse, ProductListQuery,
                 ProductListResponse, ProductStatus, ProductView, UpdateProductRequest,
@@ -852,12 +853,7 @@ pub(super) async fn handle_duplicate_product(ctx: &dyn Context, msg: &Message) -
 // --- User's own products ---
 
 async fn seller_moderation_required(ctx: &dyn Context) -> bool {
-    crate::config_vars::get_bool(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__SELLER_MODERATION_REQUIRED",
-        true,
-    )
-    .await
+    crate::config_vars::get_bool(ctx, SELLER_MODERATION_REQUIRED, true).await
 }
 
 pub(super) async fn handle_user_list_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -954,9 +950,7 @@ pub(super) async fn handle_user_create_product(
     {
         data.insert(
             "currency".to_string(),
-            serde_json::json!(
-                config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__DEFAULT_CURRENCY", "USD").await
-            ),
+            serde_json::json!(config::get_default(ctx, DEFAULT_CURRENCY, "USD").await),
         );
     }
     stamp_created(&mut data);

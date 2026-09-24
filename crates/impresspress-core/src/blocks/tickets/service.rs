@@ -14,7 +14,12 @@ use super::{
     },
     repo,
 };
-use crate::util::json_map;
+use crate::{
+    blocks::tickets::config::{
+        PUBLIC_ENABLED, RETENTION_REJECTED, RETENTION_RESOLVED, RETENTION_SPAM,
+    },
+    util::json_map,
+};
 
 /// The detail bundle behind both the admin detail page and
 /// `GET /b/tickets/api/admin/tickets/{id}`.
@@ -599,11 +604,9 @@ async fn propagate_expiry(ctx: &dyn Context, ticket_id: &str, expiry: Option<&st
 
 async fn expiry_for(ctx: &dyn Context, status: TicketStatus) -> String {
     let (key, default_days) = match status {
-        TicketStatus::Spam => ("IMPRESSPRESS__TICKETS__RETENTION_SPAM_DAYS", 30),
-        TicketStatus::Rejected | TicketStatus::Duplicate => {
-            ("IMPRESSPRESS__TICKETS__RETENTION_REJECTED_DAYS", 180)
-        }
-        TicketStatus::Resolved => ("IMPRESSPRESS__TICKETS__RETENTION_RESOLVED_DAYS", 365),
+        TicketStatus::Spam => (RETENTION_SPAM, 30),
+        TicketStatus::Rejected | TicketStatus::Duplicate => (RETENTION_REJECTED, 180),
+        TicketStatus::Resolved => (RETENTION_RESOLVED, 365),
         _ => return crate::util::now_rfc3339(),
     };
     let days = config::get_default(ctx, key, &default_days.to_string())
@@ -615,12 +618,7 @@ async fn expiry_for(ctx: &dyn Context, status: TicketStatus) -> String {
 }
 
 async fn public_submissions_enabled(ctx: &dyn Context) -> bool {
-    crate::config_vars::get_bool(
-        ctx,
-        "IMPRESSPRESS__TICKETS__PUBLIC_SUBMISSIONS_ENABLED",
-        false,
-    )
-    .await
+    crate::config_vars::get_bool(ctx, PUBLIC_ENABLED, false).await
 }
 
 fn new_reference() -> String {

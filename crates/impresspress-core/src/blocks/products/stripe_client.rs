@@ -11,6 +11,7 @@ use wafer_core::clients::{config, network};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use super::stripe_secret_operations_allowed;
+use crate::blocks::products::config::{STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_SECRET_KEY};
 
 pub(crate) const DEFAULT_API_VERSION: &str = "2026-02-25.clover";
 
@@ -30,32 +31,21 @@ impl StripeClient {
                 "Stripe secret-key operations are disabled in the browser runtime; configure a trusted remote commerce API instead",
             ));
         }
-        let secret_key =
-            config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "").await;
+        let secret_key = config::get_default(ctx, STRIPE_SECRET_KEY, "").await;
         let livemode = secret_livemode(&secret_key).ok_or_else(|| {
             WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "Stripe secret key must be a test or live secret key",
             )
         })?;
-        let api_version = config::get_default(
-            ctx,
-            "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-            DEFAULT_API_VERSION,
-        )
-        .await;
+        let api_version = config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_API_VERSION).await;
         if !super::stripe::is_stable_stripe_api_version(&api_version) {
             return Err(WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "Stripe API version must be a stable named release",
             ));
         }
-        let api_url = config::get_default(
-            ctx,
-            "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
-            "https://api.stripe.com",
-        )
-        .await;
+        let api_url = config::get_default(ctx, STRIPE_API_URL, "https://api.stripe.com").await;
         Ok(Self {
             secret_key,
             api_url: api_url.trim_end_matches('/').to_string(),

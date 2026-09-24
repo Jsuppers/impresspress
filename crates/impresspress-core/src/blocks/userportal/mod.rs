@@ -8,6 +8,11 @@ use wafer_run::{
 
 use crate::{
     blocks::crud,
+    config_vars::{
+        ALLOW_SIGNUP_KEY, ALLOW_USER_PRODUCTS_KEY, APP_NAME_KEY, AUTH_LOGO_URL_KEY,
+        DEFAULT_APP_NAME, ENABLE_OAUTH_KEY, FAVICON_URL_KEY, LOGO_ICON_URL_KEY, LOGO_URL_KEY,
+        PRIMARY_COLOR_KEY,
+    },
     endpoint_match::{self, EndpointRoute},
     http::{err_bad_request, err_forbidden, err_not_found, ok_json},
     ui::{self, components, icons, settings_form},
@@ -216,18 +221,18 @@ impl UserPortalBlock {
 
         let config_val = serde_json::json!({
             "logo_url": config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await,
-            "app_name": config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await,
+            "app_name": config::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await,
             // Blank = "use the built-in brand accent" (same contract as the
             // admin chrome; see layout::page). The old `#6366f1` fallback here
             // was the pre-rebrand indigo leaking into portal clients.
-            "primary_color": config::get_default(ctx, "WAFER_RUN_SHARED__PRIMARY_COLOR", "").await,
-            "enable_oauth": config::get_default(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", "false").await,
-            "allow_signup": config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", "true").await,
+            "primary_color": config::get_default(ctx, PRIMARY_COLOR_KEY, "").await,
+            "enable_oauth": config::get_default(ctx, ENABLE_OAUTH_KEY, "false").await,
+            "allow_signup": config::get_default(ctx, ALLOW_SIGNUP_KEY, "true").await,
             "show_powered_by": true,
             "features": {
                 "files": is_enabled("impresspress/files"),
                 "products": is_enabled("impresspress/products"),
-                "user_products": config::get_default(ctx, "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS", "false").await,
+                "user_products": config::get_default(ctx, ALLOW_USER_PRODUCTS_KEY, "false").await,
                 "legal_pages": is_enabled("impresspress/legalpages"),
                 "userportal": is_enabled("impresspress/userportal"),
             }
@@ -459,12 +464,12 @@ mod update_profile_csrf_tests {
 /// input types and the favicon default).
 fn branding_vars() -> Vec<wafer_run::ConfigVar> {
     [
-        "WAFER_RUN_SHARED__APP_NAME",
-        "WAFER_RUN_SHARED__LOGO_URL",
-        "WAFER_RUN_SHARED__LOGO_ICON_URL",
-        "WAFER_RUN_SHARED__AUTH_LOGO_URL",
-        "WAFER_RUN_SHARED__FAVICON_URL",
-        "WAFER_RUN_SHARED__PRIMARY_COLOR",
+        APP_NAME_KEY,
+        LOGO_URL_KEY,
+        LOGO_ICON_URL_KEY,
+        AUTH_LOGO_URL_KEY,
+        FAVICON_URL_KEY,
+        PRIMARY_COLOR_KEY,
     ]
     .into_iter()
     .map(crate::config_vars::shared_var)
@@ -566,6 +571,7 @@ mod table_tests {
     use wafer_run::Block as _;
 
     use super::*;
+    use crate::config_vars::APP_NAME_KEY;
 
     /// The branding page is a settings form whose Save posts every field.
     /// When the stored branding cannot be read it is a 500, never the form
@@ -592,7 +598,7 @@ mod table_tests {
     async fn the_branding_form_shows_the_stored_app_name() {
         let ctx = crate::test_support::TestContext::with_userportal().await;
         let app_name = crate::test_support::unique_config_value();
-        wafer_core::clients::config::set(&ctx, "WAFER_RUN_SHARED__APP_NAME", &app_name)
+        wafer_core::clients::config::set(&ctx, APP_NAME_KEY, &app_name)
             .await
             .expect("store the app name");
 
