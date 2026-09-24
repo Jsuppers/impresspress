@@ -175,13 +175,16 @@ answers under that name with everything it held, and its registry row is
 renamed with it. The move is logged at info level, and a start that finds
 nothing to move does nothing.
 
-**Two registry rows that differ only by case** (`Docs` beside `docs`) describe
-one index: SQLite compares table names without case, so both rows point at
-the same tables and the data exists once. The index is moved, the lowercase
-row is kept, the `Docs` row is removed, and the log says so. Delete nothing
-yourself. An index that cannot be moved is named in an error log with the
-reason and tried again on the next start; the rest of the vector block keeps
-working.
+**Two registry rows that differ only by case** (`Docs` beside `docs`) name one
+index: SQLite compares table names without case, so the data exists once.
+Rows that agree are duplicates, and the `Docs` row is removed. Rows that
+disagree only on keyword search are told apart by the index itself, and the
+row that matches it is kept under the lowercase name. Rows that disagree on
+the model or the dimensions cannot be told apart — no vector store reports
+them — so both rows are left, the index is not moved, and an error log names
+both: delete the row that is wrong, and the next start moves the index. An
+index that cannot be moved for any other reason is named in an error log and
+tried again on the next start; the rest of the vector block keeps working.
 
 **Until the move has run**, an index whose name has an uppercase letter makes
 the vector admin's index list answer an error and cannot be opened, queried
