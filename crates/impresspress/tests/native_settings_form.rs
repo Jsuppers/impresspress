@@ -23,7 +23,7 @@
 
 use std::path::Path;
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks, NativeRuntime};
+use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
 use wafer_run::{InputStream, Message};
@@ -63,15 +63,11 @@ async fn the_admin_email_settings_page_renders_its_form_on_the_real_runtime() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let NativeRuntime {
-        mut wafer,
-        storage_block,
-    } = build_native_runtime(&infra, database, &[], false)
+    let mut wafer = build_native_runtime(&infra, database, &[], false)
         .await
         .expect("build impresspress runtime");
     boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,

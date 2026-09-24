@@ -13,10 +13,7 @@
 use std::{path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
-use impresspress_core::{
-    blocks::storage::ImpresspressStorageBlock,
-    builder::{self, ImpresspressBuilder},
-};
+use impresspress_core::builder::{self, ImpresspressBuilder};
 use impresspress_native::{
     collect_app_env_vars, init_tracing, load_dotenv, register_http_listener,
     register_observability_hooks, serve_until_shutdown, InfraConfig,
@@ -78,10 +75,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     .context("construct database service")?;
 
     // 5b-7b. Seed, load, and build the runtime (shared with the tests).
-    let NativeRuntime {
-        mut wafer,
-        storage_block,
-    } = build_native_runtime(&infra, database, &env_vars, run_migrations).await?;
+    let mut wafer = build_native_runtime(&infra, database, &env_vars, run_migrations).await?;
 
     // 8. Native-only: register http-listener.
     //    impresspress dispatches all HTTP traffic through the `site-main` flow
@@ -93,7 +87,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 
     // 11. Boot through the shared funnel, then run the native-only Start
     //     lifecycle + socket bind. `builder::boot` owns the invariant
-    //     grants → seal → init_block(admin) → seed-hook → the rest → post_start
+    //     grants → seal → init_block(admin) → seed-hook → the rest
     //     ordering shared with the Cloudflare/browser targets, replacing the
     //     bespoke `start_with_priority(&[admin])`. Admin-first init guarantees
     //     admin's migrations (which create impresspress__admin__block_settings +
@@ -104,14 +98,12 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     //     strictly), skip auth's bootstrap, and surface as a login 401 on the
     //     freshly-booted server in CI E2E.
     //
-    //     `boot` runs `post_start` (WRAP-grant injection into storage) for us.
     //     Native then runs the Start lifecycle and binds the HTTP socket — the
     //     steps `boot` deliberately omits because the stateless targets
     //     dispatch per-request instead of binding (wafer-run #239 exposed them
     //     as `run_start_lifecycle` + `bind_all`).
     builder::boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         // `build_native_runtime` reads the admin-created grants from the
         // platform database and hands them to `ImpresspressBuilder::wrap_grants`
@@ -139,14 +131,6 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What [`build_native_runtime`] produces: the runtime, built but not yet
-/// sealed or booted, and the storage block [`builder::boot`] needs to run the
-/// lifecycle.
-pub struct NativeRuntime {
-    pub wafer: Wafer,
-    pub storage_block: Arc<ImpresspressStorageBlock>,
-}
-
 /// Build the native runtime over an already-constructed platform database
 /// service: pre-wafer admin DDL, variable seeding, the block-settings
 /// hash-gate load, admin-created WRAP grants, and `ImpresspressBuilder::build()`.
@@ -159,7 +143,7 @@ pub async fn build_native_runtime(
     database: Arc<dyn DatabaseService>,
     env_vars: &[(String, String)],
     run_migrations: bool,
-) -> anyhow::Result<NativeRuntime> {
+) -> anyhow::Result<Wafer> {
     // Create the admin variables / block_settings tables pre-wafer by running
     // admin's migration-file SQL through the service (migration-file-runner
     // exception). Reuses the embedded `.sql` constants admin's gated `Init`
@@ -338,7 +322,7 @@ pub async fn build_native_runtime(
         },
     );
 
-    let (wafer, storage_block) = with_config
+    let wafer = with_config
         .config_source(Arc::new(wafer_run::StaticConfigSource::new(vars.clone())))
         .crypto(impresspress_native::make_jwt_crypto_service(jwt_secret)?)
         .network(
@@ -355,10 +339,7 @@ pub async fn build_native_runtime(
         .build()
         .context("build impresspress runtime")?;
 
-    Ok(NativeRuntime {
-        wafer,
-        storage_block,
-    })
+    Ok(wafer)
 }
 
 /// Native [`BootHooks`](builder::BootHooks). Native seeds the variables /
@@ -366,7 +347,7 @@ pub async fn build_native_runtime(
 /// snapshot need the values at `build()` time), so — like the Cloudflare hook
 /// after its eager pre-build config reads — there is nothing left to seed once
 /// admin's `Init` has run. The shared `boot` funnel still owns the admin-first
-/// ordering and the WRAP-grant injection that closes it; native only needs an
+/// ordering; native only needs an
 /// empty hook — [`builder::BootHooks`] is deliberately not an `Option`, so a
 /// target with nothing to seed says so here rather than by omission — plus the
 /// native-only `run_start_lifecycle` + `bind_all` steps it runs after `boot`

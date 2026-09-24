@@ -181,9 +181,7 @@ async fn build_runtime_with_extra_blocks(
         builder = builder.extra_block(name, block);
     }
 
-    let (wafer, _storage_block) = builder.build().expect("build impresspress runtime");
-
-    wafer
+    builder.build().expect("build impresspress runtime")
 }
 
 /// The hook this fix relies on: `ImpresspressBuilder::build()` must compute

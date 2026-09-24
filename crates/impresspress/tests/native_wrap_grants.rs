@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use impresspress::cli::server::{build_native_runtime, NativeRuntime};
+use impresspress::cli::server::build_native_runtime;
 use impresspress_native::InfraConfig;
 
 #[tokio::test]
@@ -64,7 +64,7 @@ async fn wrap_grants_are_read_through_the_database_service() {
         .await
         .expect("seed grant");
 
-    let NativeRuntime { wafer, .. } = build_native_runtime(&infra, database, &[], false)
+    let wafer = build_native_runtime(&infra, database, &[], false)
         .await
         .expect("build impresspress runtime");
 
