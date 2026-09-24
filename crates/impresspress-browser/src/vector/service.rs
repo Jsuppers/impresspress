@@ -858,7 +858,7 @@ mod rrf_tests {
 ///
 /// What the shared helper actually DOES on a failed operation is asserted in
 /// `database::flush_precedence` (`a_failed_operation_still_flushes`); this
-/// module only has to say that these four sites go through it. That is a
+/// module only has to say that every mutating site goes through it. That is a
 /// source-text property — "no flush of its own, and the shared one at every
 /// mutating site" — and there is nothing else to assert it against without a
 /// live OPFS.
@@ -866,10 +866,10 @@ mod rrf_tests {
 mod one_durability_contract {
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    /// The four `VectorService` methods that mutate the database:
-    /// `create_index`, `delete_index`, `upsert` and `delete`. A fifth would
-    /// have to come here and say which contract it uses.
-    const MUTATING_SITES: usize = 4;
+    /// The five `VectorService` methods that mutate the database:
+    /// `create_index`, `delete_index`, `rename_index`, `upsert` and `delete`.
+    /// A sixth would have to come here and say which contract it uses.
+    const MUTATING_SITES: usize = 5;
 
     /// Code lines only: a comment may name what the code may not.
     fn code_lines(src: &str) -> impl Iterator<Item = (usize, &str)> {
