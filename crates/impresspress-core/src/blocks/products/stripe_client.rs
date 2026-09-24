@@ -10,8 +10,10 @@ use serde_json::Value;
 use wafer_core::clients::{config, network};
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
-use super::stripe_secret_operations_allowed;
-use crate::blocks::products::config::{STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_SECRET_KEY};
+use super::{
+    config::{STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_SECRET_KEY},
+    stripe_secret_operations_allowed,
+};
 
 pub(crate) const DEFAULT_API_VERSION: &str = "2026-02-25.clover";
 

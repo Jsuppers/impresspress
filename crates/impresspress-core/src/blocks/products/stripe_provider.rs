@@ -12,7 +12,10 @@ use wafer_core::clients::config;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 use super::{
-    config::{platform_country, seller_fee_bps},
+    config::{
+        platform_country, seller_fee_bps, CHECKOUT_ALLOWED_ORIGINS, STRIPE_API_VERSION,
+        STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+    },
     contracts::{
         BillingPortalRequest, ProviderReconcileResult, ProviderRedirect, RefundStatus,
         SellerAccount, SellerApproval, SellerCapabilities, SellerOnboardingRequest,
@@ -22,14 +25,7 @@ use super::{
     stripe_client::{publishable_livemode, secret_livemode, StripeClient, DEFAULT_API_VERSION},
     stripe_secret_operations_allowed,
 };
-use crate::{
-    blocks::products::config::{
-        CHECKOUT_ALLOWED_ORIGINS, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY,
-        STRIPE_WEBHOOK_SECRET,
-    },
-    config_vars::FRONTEND_URL_KEY,
-    util::RecordExt,
-};
+use crate::{config_vars::FRONTEND_URL_KEY, util::RecordExt};
 
 fn bool_at(value: &Value, pointer: &str) -> bool {
     value

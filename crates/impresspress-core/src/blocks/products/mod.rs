@@ -72,17 +72,15 @@ pub(crate) use repo::{
 };
 use wafer_run::{BlockInfo, ConfigVar, InputType, InstanceMode};
 
+use self::config::{
+    AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, DEFAULT_CURRENCY, SELLER_ALLOWED_CATEGORIES,
+    SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES, SELLER_MAX_PRODUCTS,
+    SELLER_MODERATION_REQUIRED, STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY,
+    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
+};
 use super::rate_limit::{apply_route_limit, UserRateLimiter};
 use crate::{
-    blocks::{
-        crud,
-        products::config::{
-            AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, DEFAULT_CURRENCY, SELLER_ALLOWED_CATEGORIES,
-            SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES, SELLER_MAX_PRODUCTS,
-            SELLER_MODERATION_REQUIRED, STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY,
-            STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
-        },
-    },
+    blocks::crud,
     endpoint_match,
     http::{err_forbidden, err_not_found},
 };

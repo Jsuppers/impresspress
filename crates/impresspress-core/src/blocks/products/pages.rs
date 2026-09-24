@@ -6,6 +6,13 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     assets,
+    config::{
+        AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, DEFAULT_CURRENCY, PLATFORM_COUNTRY,
+        SELLER_ALLOWED_CATEGORIES, SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES,
+        SELLER_APPLICATION_FEE_BPS, SELLER_MAX_PRODUCTS, SELLER_MODERATION_REQUIRED,
+        STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY,
+        STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
+    },
     contracts::{
         AmountRule, ApprovalStatus, CommerceAnalytics, ManagedOffer, OfferStatus, OfferSyncStatus,
         ProductStatus, SellerAccount, SellerFailureSummary, SellerStatus, StripeConnectionState,
@@ -14,16 +21,7 @@ use super::{
     money, repo, stripe_provider,
 };
 use crate::{
-    blocks::{
-        crud,
-        products::config::{
-            AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, DEFAULT_CURRENCY, PLATFORM_COUNTRY,
-            SELLER_ALLOWED_CATEGORIES, SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES,
-            SELLER_APPLICATION_FEE_BPS, SELLER_MAX_PRODUCTS, SELLER_MODERATION_REQUIRED,
-            STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY,
-            STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
-        },
-    },
+    blocks::crud,
     config_vars::{ALLOW_USER_PRODUCTS_KEY, FRONTEND_URL_KEY},
 };
 

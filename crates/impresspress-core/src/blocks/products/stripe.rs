@@ -14,7 +14,10 @@ use wafer_core::clients::{
 use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
-    config::{platform_country, seller_fee_bps, CountryCode},
+    config::{
+        platform_country, seller_fee_bps, CountryCode, AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS,
+        STRIPE_API_VERSION, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
+    },
     contracts::{
         self, AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, EventStatus,
         ManagedOffer, ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus,
@@ -27,13 +30,7 @@ use super::{
     stripe_provider, stripe_secret_operations_allowed,
 };
 use crate::{
-    blocks::{
-        crud,
-        products::config::{
-            AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, STRIPE_API_VERSION, STRIPE_SECRET_KEY,
-            STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
-        },
-    },
+    blocks::crud,
     config_vars::FRONTEND_URL_KEY,
     http::{
         err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_not_found,
