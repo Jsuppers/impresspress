@@ -275,7 +275,6 @@ pub async fn handle(
 /// plus that the verification-required path still does NOT auto-login.
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
     use crate::{
@@ -284,17 +283,7 @@ mod tests {
     };
 
     async fn ctx_with_crypto() -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
-        let svc = Arc::new(
-            wafer_block_crypto::service::Argon2JwtCryptoService::new(
-                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-            )
-            .expect("test secret is long enough"),
-        );
-        let crypto_block: Arc<dyn wafer_run::Block> =
-            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
-        ctx.register_block("wafer-run/crypto", crypto_block);
-        ctx
+        TestContext::with_auth_and_crypto().await
     }
 
     async fn signup(ctx: &TestContext, email: &str, password: &str) -> serde_json::Value {

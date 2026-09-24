@@ -77,6 +77,18 @@ pub struct TestContext {
     /// WRAP-enforcement caller identity. `None` = WRAP checks skipped (the
     /// default — keeps existing tests untouched). Set via [`with_wrap`].
     caller_id: Option<String>,
+    /// The block whose code runs on this context — what a block reached
+    /// through [`Context::call_block`] sees as its caller. Set by
+    /// [`Self::running_as`] (and by [`with_wrap`]); a callee's context runs
+    /// as the callee.
+    frame: Option<String>,
+    /// The caller a block reached through `call_block` was called by: the
+    /// calling context's [`Self::frame`]. [`Context::caller_id`] answers it
+    /// when the test is not acting as a block through [`with_wrap`], so a
+    /// service that keys on its caller — the crypto block signs a token
+    /// under its caller's derived key — sees the block production would
+    /// attribute the call to, without the test opting into WRAP.
+    calling_block: Option<String>,
     /// The caller block's own `requires` allowlist — the gate production
     /// applies to a `call_block` itself, before the callee's handler makes
     /// any grant check.
@@ -222,6 +234,8 @@ impl TestContext {
             blocks: Arc::new(Mutex::new(HashMap::new())),
             block_infos: Vec::new(),
             caller_id: None,
+            frame: None,
+            calling_block: None,
             caller_requires: Vec::new(),
             wrap_grants: Vec::new(),
             wrap_admin_block: String::new(),
@@ -305,9 +319,19 @@ impl TestContext {
         admin_block: &str,
     ) -> Self {
         self.caller_id = Some(caller_id.to_string());
+        self.frame = Some(caller_id.to_string());
         self.caller_requires = requires;
         self.wrap_grants = grants;
         self.wrap_admin_block = admin_block.to_string();
+        self
+    }
+
+    /// This context runs `block`'s code: every block it reaches through
+    /// `call_block` is called by `block`, as `RuntimeContext::dispatch_call`
+    /// attributes it in production. Unlike [`Self::with_wrap`] it opts into
+    /// no WRAP check; it only says who is calling.
+    pub fn running_as(mut self, block: &str) -> Self {
+        self.frame = Some(block.to_string());
         self
     }
 
@@ -320,6 +344,8 @@ impl TestContext {
     /// mirror of the blocks map.
     fn for_callee(&self, name: &str) -> Self {
         let mut ctx = self.clone();
+        ctx.calling_block = self.frame.clone();
+        ctx.frame = Some(name.to_string());
         ctx.caller_requires = self
             .block_infos
             .iter()
@@ -2028,10 +2054,12 @@ impl Context for TestContext {
         // caller's allowlist and either be refused for calls it does declare
         // or admitted for calls it does not.
         //
-        // Known remaining gap: production also re-points the sub-context's
-        // identity (the callee becomes the `caller_id` of anything IT calls).
-        // This harness keeps `caller_id` fixed, which is why a
-        // `FailingDbOpContext` cannot reach a nested block's database calls.
+        // The sub-context also runs as the callee, so what IT calls sees the
+        // callee as its caller (`Context::caller_id`), as production
+        // re-points it. The WRAP identity does not move: a test that opted in
+        // through `with_wrap` keeps its grants checked as that block, which
+        // is why a `FailingDbOpContext` cannot reach a nested block's
+        // database calls.
         let callee = self.for_callee(name);
 
         match name {
@@ -2064,7 +2092,7 @@ impl Context for TestContext {
     /// object under `unknown/…`, and the per-block isolation the storage
     /// wrapper exists for went untested.
     fn caller_id(&self) -> Option<&str> {
-        self.caller_id.as_deref()
+        self.caller_id.as_deref().or(self.calling_block.as_deref())
     }
 
     fn is_cancelled(&self) -> bool {
@@ -2793,12 +2821,15 @@ impl TestContext {
         Self::with_auth_and_crypto_service(Arc::new(PinnedMintCrypto::new())).await
     }
 
+    /// The fixture runs as `impresspress/auth-ui`, the block every session
+    /// token is minted in: the crypto block signs under its caller's derived
+    /// key and refuses a call with none.
     async fn with_auth_and_crypto_service(svc: Arc<dyn CryptoService>) -> Self {
         let mut ctx = Self::with_auth().await;
         let crypto_block: Arc<dyn wafer_run::Block> =
             Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
         ctx.register_block("wafer-run/crypto", crypto_block);
-        ctx
+        ctx.running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID)
     }
 }
 

@@ -153,7 +153,9 @@ mod timing_equalization_tests {
     /// A context whose `wafer-run/crypto` block WRITES `scheme`, so the
     /// browser's choice is exercisable on the native test lane.
     async fn ctx_writing(scheme: PasswordScheme) -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let svc = Arc::new(
             Argon2JwtCryptoService::new("test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string())
                 .expect("test secret is long enough")

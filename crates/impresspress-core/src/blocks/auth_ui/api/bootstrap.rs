@@ -156,7 +156,6 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
     use crate::test_support::TestContext;
@@ -166,18 +165,7 @@ mod tests {
     /// minting goes through `crypto::sign`/`random_bytes`. Without this the
     /// handler trips on `block 'wafer-run/crypto' not registered`.
     async fn ctx_with_crypto() -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
-        let svc = Arc::new(
-            wafer_block_crypto::service::Argon2JwtCryptoService::new(
-                // ≥ 32 bytes for HMAC-SHA256 minimum-length check.
-                "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),
-            )
-            .expect("test secret is long enough"),
-        );
-        let crypto_block: Arc<dyn wafer_run::Block> =
-            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
-        ctx.register_block("wafer-run/crypto", crypto_block);
-        ctx
+        TestContext::with_auth_and_crypto().await
     }
 
     /// The `Message` the real GET page (`pages::bootstrap::handle_get`)
