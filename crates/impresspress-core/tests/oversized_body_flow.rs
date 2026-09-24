@@ -4,24 +4,25 @@
 //! before the router, and both work by setting `resp.*` meta on the *message*.
 //! Without those headers a cross-origin uploader's browser reports an opaque
 //! CORS failure instead of the 413. The flow executor carries the response
-//! headers a middleware step set onto the terminal that stops the flow, so
-//! `pipeline::payload_too_large_response` (a `Halt`) keeps them, and so would
-//! an `err_*` error terminal under `on_error: stop`.
+//! headers a middleware step set onto the error that stops the flow under
+//! `on_error: stop`, so `pipeline::payload_too_large_error` — an ordinary
+//! error terminal — keeps them.
 //!
 //! That is a claim about `wafer-flow`'s executor, so it is tested against the
 //! real executor rather than restated in a comment: a two-step flow whose first
 //! step is a middleware setting a response header, and whose second step
-//! answers with the refusal impresspress actually ships, or with an error.
+//! answers with the refusal impresspress actually ships.
 //!
 //! The second half of the file drives the **real** `site-main` flow and route
 //! table over the real middleware blocks, with the two terminal blocks stubbed,
 //! because where the refusal happens decides which requests it covers: a
 //! marked request to a path the router hands to `wafer-run/web` must be a 413
-//! and not the SPA.
+//! and not the SPA. The same harness pins the headers on the refusal and on an
+//! ordinary 401 from a `/b/**` route.
 
 use std::sync::Arc;
 
-use impresspress_core::{http::err_bad_request, pipeline::payload_too_large_response};
+use impresspress_core::{http::err_unauthorized, pipeline::payload_too_large_error};
 use wafer_block::{
     core_types::{LifecycleEvent, WaferError},
     http_codec,
@@ -62,25 +63,8 @@ impl Block for RefusingBlock {
     fn info(&self) -> BlockInfo {
         BlockInfo::new("test/refuse", "0.1.0", "test/refuse@v1", "413s")
     }
-    async fn handle(&self, _c: &dyn Context, m: Message, _i: InputStream) -> OutputStream {
-        payload_too_large_response(&m)
-    }
-    async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
-        Ok(())
-    }
-}
-
-/// The same refusal expressed as an error terminal — what an `err_*` helper
-/// would produce.
-struct ErrorTerminalBlock;
-
-#[wafer_block::wafer_async_trait]
-impl Block for ErrorTerminalBlock {
-    fn info(&self) -> BlockInfo {
-        BlockInfo::new("test/err", "0.1.0", "test/err@v1", "errors")
-    }
     async fn handle(&self, _c: &dyn Context, _m: Message, _i: InputStream) -> OutputStream {
-        err_bad_request("request body too large")
+        payload_too_large_error()
     }
     async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
         Ok(())
@@ -142,30 +126,17 @@ async fn the_413_keeps_the_headers_a_middleware_step_set() {
     assert_eq!(
         header,
         Some(MIDDLEWARE_VALUE),
-        "a response terminal must carry the flow's middleware headers — without \
+        "the error terminal must carry the flow's middleware headers — without \
          this a browser reports a CORS failure instead of the 413: {:?}",
         parts.headers,
     );
+    let body: serde_json::Value =
+        serde_json::from_slice(&parts.body).expect("the error envelope is JSON");
     assert_eq!(
-        String::from_utf8(parts.body.clone()).unwrap(),
+        body["message"],
         impresspress_core::streaming::request_too_large_message(),
-        "and the body is the plain-text limit, not an error envelope",
+        "and the envelope names the enforced limit",
     );
-}
-
-/// An error terminal under `on_error: stop` keeps the middleware's header
-/// too: the executor carries the flow's response headers onto the error.
-#[tokio::test]
-async fn an_error_terminal_keeps_those_headers_too() {
-    let parts = run_flow("test/err", Arc::new(ErrorTerminalBlock)).await;
-
-    assert_eq!(parts.status, 400);
-    let header = parts
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("Access-Control-Allow-Origin"))
-        .map(|(_, value)| value.as_str());
-    assert_eq!(header, Some(MIDDLEWARE_VALUE), "{:?}", parts.headers);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +172,12 @@ impl Block for SpaFallbackBlock {
 }
 
 /// Stand-in for `impresspress/router`, the block every declared route resolves
-/// to. It records being reached for the same reason.
+/// to. It records being reached for the same reason, and answers with
+/// `err_unauthorized` when `unauthorized` is set — the refusal the real router
+/// gives an anonymous caller on a protected `/b/**` route.
 struct ApiRouterBlock {
     reached: Arc<std::sync::atomic::AtomicBool>,
+    unauthorized: bool,
 }
 
 #[wafer_block::wafer_async_trait]
@@ -214,6 +188,9 @@ impl Block for ApiRouterBlock {
     async fn handle(&self, _c: &dyn Context, _m: Message, _i: InputStream) -> OutputStream {
         self.reached
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.unauthorized {
+            return err_unauthorized("authentication required");
+        }
         OutputStream::respond(b"api".to_vec())
     }
     async fn lifecycle(&self, _c: &dyn Context, _e: LifecycleEvent) -> Result<(), WaferError> {
@@ -231,8 +208,8 @@ struct FlowRun {
 /// Drive `site_main::JSON` with `site_main::default_routes()` — the real flow
 /// definition and the real route table — over the real middleware blocks,
 /// with the two terminal blocks stubbed so the test can see which one a
-/// request reached.
-async fn run_site_main(path: &str, marked: bool) -> FlowRun {
+/// request reached. `api_unauthorized` makes the API stub refuse with a 401.
+async fn run_site_main(path: &str, marked: bool, api_unauthorized: bool) -> FlowRun {
     let api_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let spa_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -286,6 +263,7 @@ async fn run_site_main(path: &str, marked: bool) -> FlowRun {
             "impresspress/router",
             Arc::new(ApiRouterBlock {
                 reached: api_reached.clone(),
+                unauthorized: api_unauthorized,
             }),
         )
         .expect("register the api stub");
@@ -328,7 +306,7 @@ async fn run_site_main(path: &str, marked: bool) -> FlowRun {
 /// path, not the routed subset.
 #[tokio::test]
 async fn an_oversized_body_to_an_unrouted_path_is_413_not_the_spa() {
-    let run = run_site_main("/some/spa/route", true).await;
+    let run = run_site_main("/some/spa/route", true, false).await;
 
     assert_eq!(run.parts.status, 413);
     assert!(
@@ -341,7 +319,7 @@ async fn an_oversized_body_to_an_unrouted_path_is_413_not_the_spa() {
 /// And on a declared route, where the pipeline would also have refused.
 #[tokio::test]
 async fn an_oversized_body_to_a_declared_route_is_413_before_the_router() {
-    let run = run_site_main("/b/storage/api/buckets/p/objects", true).await;
+    let run = run_site_main("/b/storage/api/buckets/p/objects", true, false).await;
 
     assert_eq!(run.parts.status, 413);
     assert!(
@@ -353,34 +331,68 @@ async fn an_oversized_body_to_a_declared_route_is_413_before_the_router() {
 /// The gate is invisible to everything else: both terminals still serve.
 #[tokio::test]
 async fn an_ordinary_request_still_reaches_its_block() {
-    let api = run_site_main("/b/storage/api/buckets/p/objects", false).await;
+    let api = run_site_main("/b/storage/api/buckets/p/objects", false, false).await;
     assert!(api.api_reached, "a declared route still reaches the router");
     assert_eq!(api.parts.status, 200);
 
-    let spa = run_site_main("/some/spa/route", false).await;
+    let spa = run_site_main("/some/spa/route", false, false).await;
     assert!(spa.spa_reached, "an unclaimed path still reaches the SPA");
     assert_eq!(spa.parts.status, 200);
 }
 
-/// The refusal carries the real CORS block's header, not just a stand-in's —
-/// the flow's own middleware, in the flow's own order.
+/// The response headers `wafer-run/cors` and `wafer-run/security-headers`
+/// put on the message, looked up case-insensitively; `None` for a missing one.
+fn middleware_headers(parts: &http_codec::HttpResponseParts) -> [Option<&str>; 3] {
+    let find = |wanted: &str| {
+        parts
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.as_str())
+    };
+    [
+        find("Access-Control-Allow-Origin"),
+        find("X-Content-Type-Options"),
+        find("Content-Security-Policy"),
+    ]
+}
+
+/// The refusal carries the real CORS and security-headers blocks' headers,
+/// not just a stand-in's — the flow's own middleware, in the flow's own order.
 #[tokio::test]
-async fn the_413_carries_the_real_cors_blocks_header() {
-    let run = run_site_main("/some/spa/route", true).await;
+async fn the_413_carries_the_real_middleware_headers() {
+    let run = run_site_main("/some/spa/route", true, false).await;
 
     // Stated here too: without it this test passes in the broken state, where
-    // the SPA answers 200 and its response carries the same header.
+    // the SPA answers 200 and its response carries the same headers.
     assert_eq!(run.parts.status, 413);
-    let allow_origin = run
-        .parts
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("Access-Control-Allow-Origin"))
-        .map(|(_, value)| value.as_str());
+    let [allow_origin, nosniff, csp] = middleware_headers(&run.parts);
     assert_eq!(
         allow_origin,
         Some("https://app.example"),
         "a cross-origin uploader must be able to read the 413: {:?}",
         run.parts.headers,
     );
+    assert_eq!(nosniff, Some("nosniff"), "{:?}", run.parts.headers);
+    assert!(csp.is_some(), "{:?}", run.parts.headers);
+}
+
+/// Every error behind the middleware keeps its headers, not just the 413: a
+/// 401 from a `/b/**` route reaches a cross-origin caller readable, and with
+/// the security headers.
+#[tokio::test]
+async fn a_401_on_a_b_route_carries_the_real_middleware_headers() {
+    let run = run_site_main("/b/storage/api/buckets/p/objects", false, true).await;
+
+    assert!(run.api_reached);
+    assert_eq!(run.parts.status, 401);
+    let [allow_origin, nosniff, csp] = middleware_headers(&run.parts);
+    assert_eq!(
+        allow_origin,
+        Some("https://app.example"),
+        "a cross-origin caller must be able to read the 401: {:?}",
+        run.parts.headers,
+    );
+    assert_eq!(nosniff, Some("nosniff"), "{:?}", run.parts.headers);
+    assert!(csp.is_some(), "{:?}", run.parts.headers);
 }
