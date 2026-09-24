@@ -256,7 +256,7 @@ pub(crate) async fn claim_due(ctx: &dyn Context, limit: usize) -> Result<ClaimBa
                 field: "created_at".to_string(),
                 desc: false,
             }],
-            limit: (limit.clamp(1, 100) * 4) as i64,
+            limit: Some((limit.clamp(1, 100) * 4) as u32),
             skip_count: true,
             ..Default::default()
         },
@@ -577,7 +577,7 @@ pub(crate) async fn resolve_for_aggregate(
                     value: serde_json::json!(aggregate_id),
                 },
             ],
-            limit: 10,
+            limit: Some(10),
             skip_count: true,
             ..Default::default()
         },

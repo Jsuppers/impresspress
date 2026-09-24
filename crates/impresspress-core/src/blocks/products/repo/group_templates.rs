@@ -9,14 +9,14 @@ pub(crate) const TABLE: &str = "impresspress__products__group_templates";
 /// Every group template, name-ascending. Read-only listing for users.
 pub(crate) async fn list_by_name(
     ctx: &dyn Context,
-    limit: i64,
+    limit: u32,
 ) -> Result<db::RecordList, WaferError> {
     let opts = ListOptions {
         sort: vec![SortField {
             field: "name".to_string(),
             desc: false,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     db::list(ctx, TABLE, &opts).await

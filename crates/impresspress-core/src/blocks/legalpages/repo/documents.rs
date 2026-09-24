@@ -153,7 +153,7 @@ async fn first_matching(
             field: sort_field.to_string(),
             desc: true,
         }],
-        limit: 1,
+        limit: Some(1),
         ..Default::default()
     };
     db::list(ctx, TABLE, &opts)
@@ -242,7 +242,7 @@ pub async fn list_page(
     ctx: &dyn Context,
     doc_type: Option<DocumentType>,
     page: i64,
-    page_size: i64,
+    page_size: u32,
 ) -> Result<Page<DocumentRow>, WaferError> {
     let opts = ListOptions {
         filters: doc_type.map(of_type).unwrap_or_default(),
@@ -250,8 +250,8 @@ pub async fn list_page(
             field: "updated_at".to_string(),
             desc: true,
         }],
-        limit: page_size,
-        offset: page.saturating_sub(1).saturating_mul(page_size),
+        limit: Some(page_size),
+        offset: page.saturating_sub(1).saturating_mul(i64::from(page_size)),
         skip_count: false,
         ..Default::default()
     };

@@ -35,10 +35,7 @@ wafer_block::use_static_blocks!(
 #[cfg(feature = "native-embedding")]
 use super::boot::register_vector_block;
 use super::ImpresspressBuilder;
-use crate::{
-    blocks::{router::ImpresspressRouterBlock, storage::ImpresspressStorageBlock},
-    features::FeatureConfig,
-};
+use crate::{blocks::router::ImpresspressRouterBlock, features::FeatureConfig};
 
 /// The six `wafer-run/*` middleware blocks, by the name each crate's
 /// `register_static_block!` gives it.
@@ -74,7 +71,7 @@ pub fn register_middleware_blocks(wafer: &mut Wafer) -> Result<(), RuntimeError>
 }
 
 impl ImpresspressBuilder {
-    pub fn build(self) -> Result<(Wafer, Arc<ImpresspressStorageBlock>), RuntimeError> {
+    pub fn build(self) -> Result<Wafer, RuntimeError> {
         // 1. Validate required services
         let database = self
             .database
@@ -133,11 +130,7 @@ impl ImpresspressBuilder {
             .add_alias("db", "wafer-run/database")
             .map_err(|e| RuntimeError::Config(format!("add_alias db: {e}")))?;
 
-        // `Arc::from(&'static str)` allocates the inline buffer once; no
-        // `String::to_string` round-trip needed for a literal identifier.
-        let admin_block_id: Arc<str> = Arc::from(crate::blocks::admin::ADMIN_BLOCK_ID);
-        let storage_block = crate::blocks::storage::create(storage, admin_block_id);
-        wafer.register_block("wafer-run/storage", storage_block.clone())?;
+        wafer.register_block("wafer-run/storage", crate::blocks::storage::create(storage))?;
         wafer
             .add_alias("storage", "wafer-run/storage")
             .map_err(|e| RuntimeError::Config(format!("add_alias storage: {e}")))?;
@@ -472,66 +465,14 @@ impl ImpresspressBuilder {
             )),
         )?;
 
-        // 11. Auto-discover WASM blocks from cwd/blocks/**/target/block.wasm
-        //     and flow JSON files from cwd/flows/**/*.json.
+        // 11. Auto-discover WASM blocks and flow JSON files under cwd.
         //     Only available when compiled with the `wasm` feature (wasmi interpreter).
         #[cfg(feature = "wasm")]
         {
-            use std::sync::Arc;
-
-            use wafer_block::Block;
-            use wafer_run::{
-                discovery::{discover_flows, discover_wasm_blocks},
-                wasm::WasmiBlock,
-            };
-
             let cwd = std::env::current_dir().map_err(|e| {
                 RuntimeError::Config(format!("failed to get current directory: {e}"))
             })?;
-
-            // Discover and load WASM blocks.
-            let wasm_paths = discover_wasm_blocks(&cwd.join("blocks"));
-            for wasm_path in &wasm_paths {
-                let bytes = match std::fs::read(wasm_path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(path = %wasm_path.display(), error = %e, "failed to read WASM block — skipping");
-                        continue;
-                    }
-                };
-                let block = match WasmiBlock::load_from_bytes(&bytes) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(path = %wasm_path.display(), error = %e, "failed to load WASM block — skipping");
-                        continue;
-                    }
-                };
-                let name = block.info().name.clone();
-                tracing::info!(name = %name, path = %wasm_path.display(), "discovered WASM block");
-                wafer.register_block(&name, Arc::new(block)).map_err(|e| {
-                    RuntimeError::Wasm(format!("auto-discovered block '{name}': {e}"))
-                })?;
-            }
-
-            // Discover and load flow JSON files.
-            let flow_paths = discover_flows(&cwd.join("flows"));
-            for flow_path in &flow_paths {
-                let json = match std::fs::read_to_string(flow_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(path = %flow_path.display(), error = %e, "failed to read flow JSON — skipping");
-                        continue;
-                    }
-                };
-                match wafer.add_flow_json(&json) {
-                    Ok(()) => {
-                        tracing::info!(path = %flow_path.display(), "discovered flow");
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %flow_path.display(), error = %e, "failed to load flow JSON — skipping");
-                    }
-                }
-            }
+            register_discovered_blocks(&mut wafer, &cwd)?;
         }
 
         // 12. Register site-main flow, configuring its wafer-run/cors and
@@ -567,8 +508,74 @@ impl ImpresspressBuilder {
         // `builder::RuntimeConfig`.
         super::config::write_snapshot(&mut wafer, self.config_snapshot);
 
-        Ok((wafer, storage_block))
+        Ok(wafer)
     }
+}
+
+/// Register the WASM blocks under `root/blocks/**/target/block.wasm` and the
+/// flows under `root/flows/**/*.json` — the deployment directory's own
+/// blocks, which `ImpresspressBuilder::build` discovers under the working
+/// directory.
+///
+/// These are blocks the operator built and placed there, so each is loaded
+/// with [`WasmiBlock::load_approving_declaration`]: the capabilities its
+/// `BlockInfo` declares are its bound, narrowed only by its `capabilities`
+/// block config. A block loaded without a stated bound runs with
+/// `BlockCapabilities::none()`. The fuel and memory limits are the runtime's
+/// own ([`Wafer::resource_limits`]), the ones every other WASM block runs
+/// under. A module that cannot be read or loaded is skipped with a warning;
+/// one that loads but cannot register fails the build.
+///
+/// [`WasmiBlock::load_approving_declaration`]: wafer_run::wasm::WasmiBlock::load_approving_declaration
+#[cfg(feature = "wasm")]
+pub fn register_discovered_blocks(
+    wafer: &mut Wafer,
+    root: &std::path::Path,
+) -> Result<(), RuntimeError> {
+    use wafer_block::Block;
+    use wafer_run::{
+        discovery::{discover_flows, discover_wasm_blocks},
+        wasm::WasmiBlock,
+    };
+
+    for wasm_path in &discover_wasm_blocks(&root.join("blocks")) {
+        let bytes = match std::fs::read(wasm_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %wasm_path.display(), error = %e, "failed to read WASM block — skipping");
+                continue;
+            }
+        };
+        let block = match WasmiBlock::load_approving_declaration(&bytes, wafer.resource_limits()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %wasm_path.display(), error = %e, "failed to load WASM block — skipping");
+                continue;
+            }
+        };
+        let name = block.info().name.clone();
+        tracing::info!(name = %name, path = %wasm_path.display(), "discovered WASM block");
+        wafer
+            .register_block(&name, Arc::new(block))
+            .map_err(|e| RuntimeError::Wasm(format!("auto-discovered block '{name}': {e}")))?;
+    }
+
+    for flow_path in &discover_flows(&root.join("flows")) {
+        let json = match std::fs::read_to_string(flow_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(path = %flow_path.display(), error = %e, "failed to read flow JSON — skipping");
+                continue;
+            }
+        };
+        match wafer.add_flow_json(&json) {
+            Ok(()) => tracing::info!(path = %flow_path.display(), "discovered flow"),
+            Err(e) => {
+                tracing::warn!(path = %flow_path.display(), error = %e, "failed to load flow JSON — skipping");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -45,8 +45,8 @@ use wafer_run::{ConfigError, ConfigSource, EnvBlockConfig};
 /// it against. Silent truncation would show up as some blocks mysteriously
 /// falling back to their defaults, so it is worth a log line even though the
 /// production table holds a few dozen rows against a 10,000 budget.
-fn snapshot_may_be_truncated(returned: usize, limit: i64) -> bool {
-    i64::try_from(returned).is_ok_and(|returned| returned >= limit)
+fn snapshot_may_be_truncated(returned: usize, limit: Option<u32>) -> bool {
+    limit.is_some_and(|limit| returned >= limit as usize)
 }
 
 /// Every variables row, grouped by the `block` column. Rows whose `block`
@@ -189,11 +189,12 @@ impl D1ConfigSource {
         let limit = cache_key::full_table_list_opts().limit;
         if snapshot_may_be_truncated(rows.records.len(), limit) {
             return Err(format!(
-                "variables snapshot returned {} rows, at or above the {limit}-row query limit: \
+                "variables snapshot returned {} rows, at or above the {}-row query limit: \
                  the table may be truncated, and resolving block config from a partial \
                  snapshot would silently leave blocks on their defaults. Raise the limit or \
                  paginate this read.",
-                rows.records.len()
+                rows.records.len(),
+                limit.unwrap_or_default(),
             )
             .into());
         }
@@ -669,14 +670,21 @@ mod tests {
     #[wasm_bindgen_test]
     fn a_full_page_is_detected_as_possible_truncation() {
         let limit = impresspress_core::cache_key::full_table_list_opts().limit;
-        assert!(snapshot_may_be_truncated(limit as usize, limit));
-        assert!(!snapshot_may_be_truncated(limit as usize - 1, limit));
+        let rows = limit.expect("the full-table read is bounded") as usize;
+        assert!(snapshot_may_be_truncated(rows, limit));
+        assert!(!snapshot_may_be_truncated(rows - 1, limit));
         assert!(!snapshot_may_be_truncated(0, limit));
+        assert!(
+            !snapshot_may_be_truncated(rows, None),
+            "an unbounded read is complete"
+        );
     }
 
     #[wasm_bindgen_test]
     async fn a_truncated_snapshot_fails_the_load_instead_of_serving_partial_config() {
-        let limit = impresspress_core::cache_key::full_table_list_opts().limit as usize;
+        let limit = impresspress_core::cache_key::full_table_list_opts()
+            .limit
+            .expect("the full-table read is bounded") as usize;
         let db = CountingDb::new(vec![("WAFER_RUN__AUTH", "K", "v")]);
         // Claim a full page came back, which is indistinguishable from a
         // truncated one.

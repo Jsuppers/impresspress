@@ -98,7 +98,10 @@ fn guest_limits() -> ResourceLimits {
 /// The capabilities are `spec.capabilities` — the **accepted** set the dev
 /// block's static rules produced, never the guest's own declaration. That is
 /// the whole security property of the inspect → rules → probe order, and it is
-/// preserved by this function having no other source for them.
+/// preserved by this function having no other source for them. `WasmiBlock`
+/// keeps them as the guest's bound: sealing the runtime narrows them to what
+/// the guest declares (and its `capabilities` block config), and never widens
+/// them, so a declaration can only ask for less than the spec admits.
 pub fn load_guest(
     spec: &DynamicBlockSpec,
     artifact: &[u8],
@@ -362,7 +365,10 @@ impl RuntimeControl for BrowserRuntimeControl {
                  export, its memory, or the value it wrote could not be decoded",
             ));
         }
-        info.validate()
+        // Validated as the name it reports. `validate_static` then refuses a
+        // report that is not `site/{name}` (NAME_MISMATCH), the name the
+        // runtime registers it under, so the two cannot differ at registration.
+        info.validate(&info.name)
             .map_err(|e| ValidationFailure::new(ValidationStage::Info, format!("{e}")))?;
         Ok(info)
     }
@@ -506,7 +512,7 @@ impl RuntimeControl for BrowserRuntimeControl {
             dynamic.push((spec.clone(), block));
         }
 
-        let (wafer, _storage_block) = factory
+        let wafer = factory
             .build(&dynamic)
             .await
             .map_err(|e| describe_js(&e, "building the runtime"))?;
@@ -567,12 +573,11 @@ impl RuntimeControl for BrowserRuntimeControl {
 /// * `call_block` looks the block up in the live runtime and calls it. The
 ///   runtime has already been sealed and every block's `Init` has run (see
 ///   `builder::boot`), so there is no lazy init left to drive.
-/// * `caller_id` is the dev block. This is the load-bearing field:
-///   `ImpresspressStorageBlock` namespaces every folder by it, so a boot that
-///   reported anything else would read and write `unknown/…` instead of
-///   `impresspress/dev/…`. The storage block's own cross-block WRAP check —
-///   the one that admits the reach into `wafer-run/web/site` — still runs
-///   against the real grant list.
+/// * `caller_id` is the dev block. This is the load-bearing field: the
+///   storage handler behind `wafer-run/storage` resolves every plain folder
+///   into the caller's namespace, so a boot that reported no caller would be
+///   refused every plain folder, and one that reported another block would
+///   read and write that block's objects instead of `impresspress/dev/…`.
 /// * `check_resource_access` runs the **real** WRAP check — the identical
 ///   `wrap::check_access` call `RuntimeContext::check_resource_access` makes,
 ///   keyed on the same caller and against the runtime's own grants and admin
@@ -581,12 +586,12 @@ impl RuntimeControl for BrowserRuntimeControl {
 ///   which a bug in any of it was invisible. It admits what it has to:
 ///   `impresspress__dev__*` tables self-admit under the own-resource rule,
 ///   `__ddl__` / `__schema__` admit any attributable caller, and storage
-///   resources reach this call already rewritten by
-///   `ImpresspressStorageBlock` into un-prefixed paths — the block's own
-///   folder for blobs and artifacts, `wafer-run/web/site/…` for the publisher
-///   — which the storage self-admit rule allows exactly as it does for a
-///   request. That block's own cross-block gate runs too, because this
-///   context calls *into* it rather than around it.
+///   resources reach this call as the path the storage handler resolved:
+///   `impresspress/dev/…` for the block's own blobs and artifacts, which the
+///   owner rule admits, and `wafer-run/web/site/…` for the publisher, which
+///   the runtime grant `wafer-run/web/site/*` (`blocks::dev::wrap_grants`)
+///   admits — exactly as for a request, since the handler authorizes through
+///   this context's `check_resource_access` and nothing else.
 ///
 /// The one thing boot does not reproduce is `RuntimeContext::dispatch_call`'s
 /// `requires` / `allows_call_block` gate, which asks whether the *calling

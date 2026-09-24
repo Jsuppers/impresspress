@@ -42,7 +42,6 @@ use crate::{
 /// inside its function-local scope.
 pub(crate) struct BuiltRuntime {
     pub(crate) wafer: wafer_run::Wafer,
-    pub(crate) storage_block: Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
     pub(crate) db: Arc<dyn DatabaseService>,
     /// Concrete request-current services used while building/sealing this
     /// disposable runtime. The cached [`runtime_cache::ReadyRuntime`] never
@@ -133,7 +132,6 @@ async fn boot_dynamic(
     request_services::scope(built.services.clone(), async {
         impresspress_core::builder::boot(
             &mut built.wafer,
-            &built.storage_block,
             hooks,
             GrantSource::Database(&db),
             policy,
@@ -165,7 +163,6 @@ pub(crate) async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<Bo
     request_services::scope(built.services.clone(), async {
         impresspress_core::builder::boot(
             &mut built.wafer,
-            &built.storage_block,
             &PreparedPlanBootHooks,
             GrantSource::PreInstalled(
                 "ImpresspressBuilder::apply_prepared_plan installs the verified \
@@ -362,57 +359,54 @@ where
     let prepared_identity = prepared_plan
         .map(|_| environment.prepared_runtime_identity())
         .transpose()?;
-    let (wafer, storage_block, block_settings_handle, plan_exporter) =
-        request_services::scope_sync(
-            services.clone(),
-            || -> Result<_, Box<dyn std::error::Error>> {
-                let builder = config_installed
-                    .database(database_proxy)
-                    .storage(storage_proxy.clone())
-                    .crypto(crypto_proxy)
-                    .network(network_proxy)
-                    .logger(logger_proxy)
-                    .block_settings(block_settings)
-                    .config_source(config_source_proxy);
+    let (wafer, block_settings_handle, plan_exporter) = request_services::scope_sync(
+        services.clone(),
+        || -> Result<_, Box<dyn std::error::Error>> {
+            let builder = config_installed
+                .database(database_proxy)
+                .storage(storage_proxy.clone())
+                .crypto(crypto_proxy)
+                .network(network_proxy)
+                .logger(logger_proxy)
+                .block_settings(block_settings)
+                .config_source(config_source_proxy);
 
-                // 5. Consumer registers its blocks.
-                let builder = register_blocks(builder)?;
-                let builder = match (prepared_plan, prepared_identity.as_ref()) {
-                    (Some(plan), Some(identity)) => builder.apply_prepared_plan(
-                        plan,
-                        &identity.application_id,
-                        &identity.application_build_sha256,
-                        &identity.dependency_lock,
-                        &identity.release_assets,
-                    )?,
-                    (None, None) => builder,
-                    _ => return Err("prepared runtime identity invariant violated".into()),
-                };
-                let plan_exporter = builder.prepared_plan_exporter()?;
-                let block_settings_handle = builder.block_settings_handle();
+            // 5. Consumer registers its blocks.
+            let builder = register_blocks(builder)?;
+            let builder = match (prepared_plan, prepared_identity.as_ref()) {
+                (Some(plan), Some(identity)) => builder.apply_prepared_plan(
+                    plan,
+                    &identity.application_id,
+                    &identity.application_build_sha256,
+                    &identity.dependency_lock,
+                    &identity.release_assets,
+                )?,
+                (None, None) => builder,
+                _ => return Err("prepared runtime identity invariant violated".into()),
+            };
+            let plan_exporter = builder.prepared_plan_exporter()?;
+            let block_settings_handle = builder.block_settings_handle();
 
-                // 6. Build runtime. `build()` installs the synchronous
-                // `ctx.config_get` snapshot that `RuntimeConfig::install`
-                // handed over alongside the service map, so blocks can read
-                // embedder-provided keys with no I/O. That is immutable
-                // configuration data, not a request-derived service handle;
-                // Worker-version identity still forces a rebuild when it
-                // changes.
-                let (mut wafer, storage_block) =
-                    builder.build().map_err(|e| format!("builder.build: {e}"))?;
+            // 6. Build runtime. `build()` installs the synchronous
+            // `ctx.config_get` snapshot that `RuntimeConfig::install`
+            // handed over alongside the service map, so blocks can read
+            // embedder-provided keys with no I/O. That is immutable
+            // configuration data, not a request-derived service handle;
+            // Worker-version identity still forces a rebuild when it
+            // changes.
+            let mut wafer = builder.build().map_err(|e| format!("builder.build: {e}"))?;
 
-                // 6a. The consumer receives the scoped storage proxy, never the
-                // request's concrete R2 Bucket. A block may safely retain this
-                // proxy in the isolate-cached runtime.
-                register_post_build(&mut wafer, storage_proxy)
-                    .map_err(|e| format!("register_post_build: {e}"))?;
-                Ok((wafer, storage_block, block_settings_handle, plan_exporter))
-            },
-        )?;
+            // 6a. The consumer receives the scoped storage proxy, never the
+            // request's concrete R2 Bucket. A block may safely retain this
+            // proxy in the isolate-cached runtime.
+            register_post_build(&mut wafer, storage_proxy)
+                .map_err(|e| format!("register_post_build: {e}"))?;
+            Ok((wafer, block_settings_handle, plan_exporter))
+        },
+    )?;
 
     Ok(BuiltRuntime {
         wafer,
-        storage_block,
         db,
         services,
         plan_exporter,

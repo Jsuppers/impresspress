@@ -65,7 +65,7 @@ pub async fn list_contexts(ctx: &dyn Context, msg: &Message) -> OutputStream {
         status: non_empty(msg.query("status")),
         sender_id: non_empty(msg.query("sender_id")),
         parent_id: non_empty(msg.query("parent_id")),
-        page_size: page_size as i64,
+        page_size: page_size as u32,
         offset: offset as i64,
     };
     match service::list_contexts(ctx, &params).await {
@@ -164,7 +164,7 @@ pub async fn list_entries(ctx: &dyn Context, msg: &Message) -> OutputStream {
             Ok(role) => role,
             Err(resp) => return resp,
         },
-        page_size: page_size as i64,
+        page_size: page_size as u32,
         offset: offset as i64,
     };
     match service::list_entries(ctx, &context_id, &params).await {

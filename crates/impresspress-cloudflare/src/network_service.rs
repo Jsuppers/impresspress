@@ -37,8 +37,10 @@ impl WorkerFetchService {
     /// The gate sees the URL the caller asked for and nothing else, so a
     /// followed `3xx` would reach a second URL it never inspected. That half is
     /// closed in [`request_init`], which issues every subrequest with
-    /// `RequestRedirect::Error` rather than the Fetch API's default `follow`;
-    /// see its docs for why refusing beats revalidating on this platform.
+    /// `RequestRedirect::Manual` rather than the Fetch API's default `follow`:
+    /// the `3xx` comes back to wafer-run's network handler, which issues the
+    /// next hop as a new request through this method, gate and grant check
+    /// included.
     ///
     /// Honest boundary: a Worker cannot resolve DNS before `fetch`, so this
     /// precheck is necessarily URL/host-literal-based. It does NOT defend
@@ -46,9 +48,8 @@ impl WorkerFetchService {
     /// private IP at connect time still reaches `fetch`; that residual case is
     /// Cloudflare's own subrequest-SSRF layer to catch (the native path closes
     /// it with a resolve-before-connect resolver, which the Workers `fetch`
-    /// API gives no hook for). With the initial URL gated and redirects
-    /// refused, DNS rebinding is now the sole residual — before the redirect
-    /// mode was set it was not.
+    /// API gives no hook for). With every hop's URL gated, DNS rebinding is
+    /// the sole residual.
     ///
     /// [`do_request`]: NetworkService::do_request
     /// [`do_request_streaming`]: NetworkService::do_request_streaming
@@ -90,23 +91,17 @@ impl WorkerFetchService {
 /// assertable without a live `fetch` — a security property that is otherwise
 /// invisible until it is missing.
 ///
-/// **Redirects are refused, not followed.** The SSRF gate in `send` inspects
-/// the URL the caller asked for and nothing else, and the Fetch API's default
-/// is `redirect: follow`, so a `302 Location: http://169.254.169.254/…` from a
-/// public-looking host would reach an address that gate never saw and hand its
-/// body back to the block. `RequestRedirect::Error` fails the request closed.
-///
-/// `Manual` is not the alternative: it hands back the `3xx` response for the
-/// caller to act on, and every consumer of this service (`blocks::email`,
-/// `products::stripe_client`, `tickets::turnstile`, `auth_ui::oauth`) calls a
-/// fixed API endpoint that does not redirect, so there is nobody to act on it.
-/// The native path revalidates each hop instead of refusing
-/// (`blocks::llm::providers`'s `ssrf_revalidating_redirect_policy` re-runs
-/// `is_ssrf_blocked_url` on every `3xx` target) because reqwest gives it a
-/// per-hop hook; the Workers `fetch` API gives none, so this side declines to
-/// follow. The cost is that a legitimate redirect surfaces to the caller as a
-/// request error — the right trade against a silent fetch of an internal
-/// address.
+/// **Redirects are returned, never followed here.** The SSRF gate in `send`
+/// inspects the URL it is handed and nothing else, and the Fetch API's
+/// default is `redirect: follow`, so a `302 Location: http://169.254.169.254/…`
+/// from a public-looking host would reach an address that gate never saw and
+/// hand its body back to the block. `RequestRedirect::Manual` makes Workers
+/// return the real `3xx`, with its `Location` readable, to wafer-run's network
+/// handler. That handler follows redirects hop by hop: each hop is checked
+/// against the calling block's network grant and issued as a new request
+/// through `send`, so the SSRF gate sees every URL the Worker fetches. A
+/// legitimate redirect therefore works, and one to an internal address is
+/// refused before it is contacted.
 fn request_init(req: &Request) -> Result<worker::RequestInit, NetworkError> {
     let method = match req.method.to_uppercase().as_str() {
         "GET" => worker::Method::Get,
@@ -124,7 +119,7 @@ fn request_init(req: &Request) -> Result<worker::RequestInit, NetworkError> {
 
     let mut init = worker::RequestInit::new();
     init.with_method(method);
-    init.with_redirect(worker::RequestRedirect::Error);
+    init.with_redirect(worker::RequestRedirect::Manual);
     if let Some(ref body) = req.body {
         let uint8arr = js_sys::Uint8Array::from(&body[..]);
         init.with_body(Some(uint8arr.into()));
@@ -288,14 +283,13 @@ mod tests {
         }
     }
 
-    /// **Fails on the pre-fix tree**, where the init left `redirect` at the
-    /// Fetch API's default (`follow`). The URL gate inspects the initial URL
-    /// only, so a public-looking host answering `302 Location:
-    /// http://169.254.169.254/...` reached the metadata service and handed its
-    /// body back to the block. Every subrequest, with a body or without, must
-    /// carry `error`.
+    /// Every subrequest, with a body or without, is issued with
+    /// `redirect: manual`: the Fetch API's default (`follow`) would fetch a
+    /// `3xx` target no gate inspected, and `error` would fail a legitimate
+    /// redirect that wafer-run's network handler can follow hop by hop, each
+    /// hop back through `send`'s SSRF gate and the caller's grant.
     #[wasm_bindgen_test]
-    fn every_subrequest_refuses_to_follow_redirects() {
+    fn every_subrequest_returns_redirects_to_the_handler() {
         for req in [
             request("GET", "https://example.com/x", None),
             request("POST", "https://example.com/x", Some(b"{}".to_vec())),
@@ -304,8 +298,8 @@ mod tests {
             let init = request_init(&req).expect("init");
             assert_eq!(
                 Into::<&str>::into(init.redirect),
-                "error",
-                "{} {} must not follow redirects",
+                "manual",
+                "{} {} must hand a redirect back, not follow or fail it",
                 req.method,
                 req.url
             );

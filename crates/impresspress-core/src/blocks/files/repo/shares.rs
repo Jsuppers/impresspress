@@ -178,7 +178,7 @@ pub async fn delete(ctx: &dyn Context, id: &str) -> Result<(), WaferError> {
 pub async fn list_for_user(
     ctx: &dyn Context,
     user_id: &str,
-    limit: i64,
+    limit: u32,
 ) -> Result<Page<ShareRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![Filter {
@@ -190,7 +190,7 @@ pub async fn list_for_user(
             field: "created_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     Ok(Page::decode(
@@ -228,7 +228,7 @@ pub async fn list_all_for_user(
 /// Newest shares across ALL users (admin listing).
 pub async fn list_recent(
     ctx: &dyn Context,
-    limit: i64,
+    limit: u32,
     offset: i64,
 ) -> Result<Page<ShareRow>, WaferError> {
     let opts = ListOptions {
@@ -236,7 +236,7 @@ pub async fn list_recent(
             field: "created_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         offset,
         ..Default::default()
     };
@@ -307,7 +307,7 @@ pub async fn log_access(
 pub async fn list_access_logs(
     ctx: &dyn Context,
     share_id: Option<&str>,
-    limit: i64,
+    limit: u32,
     offset: i64,
 ) -> Result<Page<AccessLogRow>, WaferError> {
     let mut filters = Vec::new();
@@ -324,7 +324,7 @@ pub async fn list_access_logs(
             field: "accessed_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         offset,
         skip_count: false,
         ..Default::default()

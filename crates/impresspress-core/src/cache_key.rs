@@ -46,7 +46,7 @@ use wafer_block::db::{Filter, FilterOp, ListOptions};
 /// Minimum `limit` value treated as "all matching rows". Matches the
 /// `D1ConfigSource` and admin block list shapes. Anything smaller is
 /// treated as paginated and bypasses cache.
-const FULL_LIMIT_THRESHOLD: i64 = 10_000;
+const FULL_LIMIT_THRESHOLD: u32 = 10_000;
 
 /// Reserved cache-key value for the full-table `block_settings` read —
 /// `platform_state::block_settings::load`'s eager filterless list. Real block names
@@ -92,7 +92,7 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
             operator: FilterOp::Equal,
             value: serde_json::Value::String(value.to_string()),
         }],
-        limit: FULL_LIMIT_THRESHOLD,
+        limit: Some(FULL_LIMIT_THRESHOLD),
         offset: 0,
         skip_count: true,
         ..Default::default()
@@ -114,7 +114,7 @@ pub fn block_list_opts(table: CachedTable, value: &str) -> ListOptions {
 pub fn full_table_list_opts() -> ListOptions {
     ListOptions {
         filters: Vec::new(),
-        limit: FULL_LIMIT_THRESHOLD,
+        limit: Some(FULL_LIMIT_THRESHOLD),
         offset: 0,
         skip_count: true,
         ..Default::default()
@@ -130,7 +130,7 @@ pub fn read_key(table: CachedTable, opts: &ListOptions) -> Option<String> {
     // count-skipping "give me every matching row" list.
     if !opts.skip_count
         || opts.offset != 0
-        || opts.limit < FULL_LIMIT_THRESHOLD
+        || !matches!(opts.limit, Some(limit) if limit >= FULL_LIMIT_THRESHOLD)
         || !opts.sort.is_empty()
     {
         return None;
@@ -321,7 +321,7 @@ mod tests {
                 operator: FilterOp::Equal,
                 value: serde_json::Value::String(value.into()),
             }],
-            limit: 10_000,
+            limit: Some(10_000),
             offset: 0,
             skip_count: true,
             ..Default::default()
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn read_key_no_filters_returns_none() {
         let opts = ListOptions {
-            limit: 10_000,
+            limit: Some(10_000),
             skip_count: true,
             ..Default::default()
         };
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn read_key_small_limit_returns_none() {
         let mut opts = canonical_opts("block", "WAFER_RUN__AUTH");
-        opts.limit = 50;
+        opts.limit = Some(50);
         assert_eq!(read_key(CachedTable::Variables, &opts), None);
     }
 
@@ -488,7 +488,7 @@ mod tests {
     fn full_table_opts() -> ListOptions {
         ListOptions {
             offset: 0,
-            limit: 10_000,
+            limit: Some(10_000),
             skip_count: true,
             ..Default::default()
         }
@@ -539,7 +539,7 @@ mod tests {
         for mutate in [
             |o: &mut ListOptions| o.skip_count = false,
             |o: &mut ListOptions| o.offset = 100,
-            |o: &mut ListOptions| o.limit = 50,
+            |o: &mut ListOptions| o.limit = Some(50),
             |o: &mut ListOptions| {
                 o.sort.push(wafer_block::db::SortField {
                     field: "block_name".into(),

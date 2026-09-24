@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks, NativeRuntime};
+use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
 use wafer_block::{http_codec, InputStream};
@@ -33,6 +33,7 @@ fn infra_for(db_path: &Path, storage_root: &Path) -> InfraConfig {
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        listener: Default::default(),
     }
 }
 
@@ -50,15 +51,11 @@ async fn a_refused_login_is_answered_with_its_detail_code() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let NativeRuntime {
-        mut wafer,
-        storage_block,
-    } = build_native_runtime(&infra, database, &[], false)
+    let mut wafer = build_native_runtime(&infra, database, &[], false)
         .await
         .expect("build impresspress runtime");
     let report = boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         GrantSource::PreInstalled(
             "build_native_runtime loads them from the platform database into \

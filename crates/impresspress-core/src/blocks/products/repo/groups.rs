@@ -29,7 +29,7 @@ pub(crate) async fn count(ctx: &dyn Context, filters: &[Filter]) -> Result<i64, 
 pub(crate) async fn list_by_name(
     ctx: &dyn Context,
     filters: Vec<Filter>,
-    limit: i64,
+    limit: u32,
 ) -> Result<db::RecordList, WaferError> {
     let opts = ListOptions {
         filters,
@@ -37,7 +37,7 @@ pub(crate) async fn list_by_name(
             field: "name".to_string(),
             desc: false,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     db::list(ctx, TABLE, &opts).await

@@ -1,20 +1,17 @@
 //! The 413 for an oversized request body keeps the flow's middleware headers.
 //!
-//! `pipeline::payload_too_large_response` is a `Halt` carrying the message's
-//! meta, rather than an `err_*` error terminal, and that choice is the only
-//! thing standing between a cross-origin uploader and an opaque CORS failure.
 //! The site-main flow runs `wafer-run/security-headers` and `wafer-run/cors`
-//! before the router, and both work by setting `resp.*` meta on the *message*;
-//! a `Halt` takes that meta to the wire (as `wafer-block-cors` does for its own
-//! preflight 204), while an error terminal under `on_error: stop`
-//! short-circuits the flow and carries none of it.
+//! before the router, and both work by setting `resp.*` meta on the *message*.
+//! Without those headers a cross-origin uploader's browser reports an opaque
+//! CORS failure instead of the 413. The flow executor carries the response
+//! headers a middleware step set onto the terminal that stops the flow, so
+//! `pipeline::payload_too_large_response` (a `Halt`) keeps them, and so would
+//! an `err_*` error terminal under `on_error: stop`.
 //!
 //! That is a claim about `wafer-flow`'s executor, so it is tested against the
 //! real executor rather than restated in a comment: a two-step flow whose first
 //! step is a middleware setting a response header, and whose second step
-//! answers with the refusal impresspress actually ships. The second case is the
-//! guard — the same flow with an `err_*` terminal loses the header, which is
-//! what would happen if someone "simplified" the refusal into one.
+//! answers with the refusal impresspress actually ships, or with an error.
 //!
 //! The second half of the file drives the **real** `site-main` flow and route
 //! table over the real middleware blocks, with the two terminal blocks stubbed,
@@ -156,21 +153,19 @@ async fn the_413_keeps_the_headers_a_middleware_step_set() {
     );
 }
 
-/// The guard: the same refusal as an error terminal loses them. This is why
-/// `payload_too_large_response` is not an `err_*` helper.
+/// An error terminal under `on_error: stop` keeps the middleware's header
+/// too: the executor carries the flow's response headers onto the error.
 #[tokio::test]
-async fn an_error_terminal_would_lose_those_headers() {
+async fn an_error_terminal_keeps_those_headers_too() {
     let parts = run_flow("test/err", Arc::new(ErrorTerminalBlock)).await;
 
-    assert!(
-        !parts
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("Access-Control-Allow-Origin")),
-        "if this starts passing the executor changed and the response-terminal \
-         requirement can be revisited: {:?}",
-        parts.headers,
-    );
+    assert_eq!(parts.status, 400);
+    let header = parts
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Access-Control-Allow-Origin"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(header, Some(MIDDLEWARE_VALUE), "{:?}", parts.headers);
 }
 
 // ---------------------------------------------------------------------------

@@ -69,19 +69,23 @@ fn phase_four_producer_surface_is_pinned() {
             .expect("no declared keys resolves to an empty config");
     assert_eq!(resolved.get("ANYTHING"), None);
 
-    // #328: one decode policy for SQL result rows, so a value written through
-    // `create` reads back the same shape on every backend (B25).
+    // #328 / WR-14: one decode policy for SQL result rows, keyed on the
+    // declared column type: a JSON column's text is parsed, any other
+    // column's text stays a string however JSON-like it looks.
     use wafer_core::interfaces::database::codec;
+    let json = codec::JsonColumns::new(["doc"]);
     assert_eq!(
-        codec::decode_text_value("{\"a\":1}"),
+        codec::decode_text("doc", "{\"a\":1}", &json),
         serde_json::json!({"a": 1})
     );
     assert_eq!(
-        codec::decode_text_value("not json"),
-        serde_json::json!("not json")
+        codec::decode_text("title", "{\"a\":1}", &json),
+        serde_json::json!("{\"a\":1}")
     );
-    let _: fn(serde_json::Value) -> wafer_core::interfaces::database::service::Record =
-        codec::record_from_json_row;
+    let _: fn(
+        serde_json::Value,
+        &codec::JsonColumns,
+    ) -> wafer_core::interfaces::database::service::Record = codec::record_from_json_row;
 
     // #328: the three defaulted `DbExec` operations. Named as function items
     // so the signatures resolve without an impl in this crate.

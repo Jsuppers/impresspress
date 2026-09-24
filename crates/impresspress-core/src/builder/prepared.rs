@@ -418,6 +418,7 @@ impl From<&wafer_run::ResourceGrant> for PreparedResourceGrant {
                 wafer_run::ResourceType::Crypto => PreparedResourceType::Crypto,
                 wafer_run::ResourceType::Network => PreparedResourceType::Network,
                 wafer_run::ResourceType::Vector => PreparedResourceType::Vector,
+                wafer_run::ResourceType::Auth => PreparedResourceType::Auth,
             }),
         }
     }
@@ -440,6 +441,7 @@ impl From<PreparedResourceGrant> for wafer_run::ResourceGrant {
                 PreparedResourceType::Crypto => wafer_run::ResourceType::Crypto,
                 PreparedResourceType::Network => wafer_run::ResourceType::Network,
                 PreparedResourceType::Vector => wafer_run::ResourceType::Vector,
+                PreparedResourceType::Auth => wafer_run::ResourceType::Auth,
             }),
         }
     }

@@ -1212,7 +1212,10 @@ mod security_regression_tests {
         /// and drop the OAuth flags the callback needs to get past its own
         /// gates.
         async fn ctx_and_mail(&self) -> (TestContext, MailLog) {
-            let mut ctx = TestContext::with_auth().await;
+            // Runs as auth-ui: the callback mints the session in that block.
+            let mut ctx = TestContext::with_auth()
+                .await
+                .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
 
             // Crypto block — issue_tokens_and_cookie signs JWTs, signup
             // hashes passwords, and both pull random bytes.

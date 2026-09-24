@@ -74,7 +74,7 @@ pub async fn get_user_usage(
 /// storage delete per blob it names; a small batch keeps the cost of one
 /// upload bounded (Workers cap subrequests per invocation), and the next
 /// upload takes the next batch.
-const STALE_SWEEP_BATCH: i64 = 10;
+const STALE_SWEEP_BATCH: u32 = 10;
 
 /// Sweep the given user's `pending`-status object rows older than
 /// [`repo::objects::PENDING_RESERVATION_TTL_SECONDS`], and the blobs they

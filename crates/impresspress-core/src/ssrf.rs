@@ -26,11 +26,15 @@
 //! things follow from that, and both are the caller's to close:
 //!
 //! - **Redirects.** A fetch layer that follows a `3xx` reaches a second URL
-//!   this function never saw, so it must either revalidate every hop against
-//!   this predicate (what the native LLM provider client does, see
-//!   `blocks::llm::providers`) or refuse to follow at all (what the Cloudflare
-//!   and browser network services do — `redirect: error`). Passing the initial
-//!   URL through here and then following redirects is not a gate.
+//!   this function never saw, so every hop must be checked: the native LLM
+//!   provider client revalidates each hop against this predicate (see
+//!   `blocks::llm::providers`); the Cloudflare network service never follows
+//!   one itself (`redirect: manual`) and hands the `3xx` to wafer-run's
+//!   network handler, which issues each hop as a new request — grant-checked,
+//!   and gated here again by that service; the browser's network service
+//!   refuses to follow at all (`redirect: error`, since a browser's `manual`
+//!   redirect is opaque). Passing the initial URL through here and then
+//!   following redirects is not a gate.
 //! - **DNS rebinding.** A public-looking hostname that resolves to a private IP
 //!   at connect time passes this check, and on a Worker or in a browser
 //!   **cannot** be caught here, because neither `fetch` API exposes a

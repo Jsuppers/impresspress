@@ -92,9 +92,9 @@ pub async fn find_for_user(ctx: &dyn Context, user_id: &str) -> Result<QuotaRow,
 }
 
 /// Up to `limit` override rows, unsorted (admin JSON listing).
-pub async fn list(ctx: &dyn Context, limit: i64) -> Result<Page<QuotaRow>, WaferError> {
+pub async fn list(ctx: &dyn Context, limit: u32) -> Result<Page<QuotaRow>, WaferError> {
     let opts = ListOptions {
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     Ok(Page::decode(
@@ -104,13 +104,13 @@ pub async fn list(ctx: &dyn Context, limit: i64) -> Result<Page<QuotaRow>, Wafer
 }
 
 /// Newest override rows first (admin SSR listing).
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Page<QuotaRow>, WaferError> {
+pub async fn list_recent(ctx: &dyn Context, limit: u32) -> Result<Page<QuotaRow>, WaferError> {
     let opts = ListOptions {
         sort: vec![SortField {
             field: "created_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     Ok(Page::decode(

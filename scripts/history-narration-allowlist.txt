@@ -42,7 +42,6 @@
 1	crates/impresspress-core/src/blocks/products/tests/stripe_event_type_tests.rs
 1	crates/impresspress-core/src/blocks/products/tests/stripe_tests.rs
 1	crates/impresspress-core/src/blocks/rate_limit.rs
-1	crates/impresspress-core/src/blocks/storage.rs
 1	crates/impresspress-core/src/blocks/transformers_embed.rs
 1	crates/impresspress-core/src/blocks/userportal/pages/security.rs
 1	crates/impresspress-core/src/blocks/userportal/pages/sessions.rs

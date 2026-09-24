@@ -238,22 +238,15 @@ mod test_helpers {
     /// wiring over [`MemStorage`], so handlers can complete their `store::*`
     /// calls against the same stack the server runs.
     ///
-    /// "Production wiring" is load-bearing, and it is what this fixture used
-    /// to get wrong. It registered the bare `wafer-core` `StorageBlock`, so
-    /// every storage call in this module's tests skipped
-    /// [`crate::blocks::storage::ImpresspressStorageBlock`] — the namespacing
-    /// shim the runtime actually registers under that name
-    /// (`builder::registration`). A call the shim rejects therefore passed
-    /// here and 500'd on the wire: `storage.get_streaming` (every object
-    /// download) was missing from its op match, and 60 merged PRs of green CI
-    /// never saw it. It also left `caller_requires` empty, so a `call_block`
-    /// to a block the files block never declared was admitted here and denied
-    /// in production.
-    ///
-    /// Both gates are now live: the shim is the registered block, and
-    /// [`TestContext::with_files`] itself installs the files block's OWN
-    /// declared `requires` plus the deployment's grants (sourced from the
-    /// admin block's declaration, which is where they live in production).
+    /// "Production wiring" is the block the runtime registers under that
+    /// name (`builder::registration`):
+    /// [`crate::blocks::storage::ImpresspressStorageBlock`], whose wafer-core
+    /// handler resolves every folder into the calling block's namespace and
+    /// authorizes the resolved path. [`TestContext::with_files`] installs the
+    /// files block's OWN declared `requires` plus the deployment's grants
+    /// (sourced from the admin block's declaration, which is where they live
+    /// in production), so a `call_block` or a storage path production refuses
+    /// is refused here too.
     pub(super) async fn ctx_with_storage() -> TestContext {
         ctx_with_storage_handle().await.0
     }
@@ -337,7 +330,7 @@ mod test_helpers {
         let service = Arc::new(MemStorage::default());
         ctx.register_block(
             "wafer-run/storage",
-            crate::blocks::files::test_wrap::storage_block(service.clone()),
+            crate::blocks::storage::create(service.clone()),
         );
         (ctx, service)
     }

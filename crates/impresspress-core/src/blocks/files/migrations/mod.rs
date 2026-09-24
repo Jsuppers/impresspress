@@ -66,12 +66,14 @@ const SQL_003_POSTGRES: &str = include_str!("003_legacy_share_token_expiry.postg
 // tolerates for an `ALTER TABLE … ADD COLUMN`. What shipping it re-runs — the
 // whole set, 001 onwards, over live rows — is pinned by `replay_tests` below.
 //
-// A native deployment that has not run it yet still uploads, as long as
-// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is off: the database service then adds
-// a column a write names but the table lacks (the lazy column-add), which
-// `uploads_work_before_migration_004_has_run` in `storage::objects` exercises.
-// Under strict schema there is no lazy add, so every reservation fails until
-// 004 runs. Cloudflare deploys set strict schema, but every
+// A native deployment that has not run it yet still takes fresh uploads, as
+// long as `WAFER_RUN__DATABASE__STRICT_SCHEMA` is off: the database service
+// then adds a column a write's data names but the table lacks (the lazy
+// column-add). Taking over an existing row filters on `claim_id`, and a filter
+// never adds a column, so a replacement is refused until the column exists —
+// until 004 runs or a fresh upload has added it; `uploads_before_migration_004_has_run`
+// in `storage::objects` exercises both. Under strict schema there is no lazy
+// add, so every reservation fails until 004 runs. Cloudflare deploys set strict schema, but every
 // `impresspress deploy` runs the block migrations in its prepare funnel (the
 // command has no `--run-migrations` opt-out), so they get the column on deploy.
 const SQL_004_SQLITE: &str = include_str!("004_object_claim_id.sqlite.sql");

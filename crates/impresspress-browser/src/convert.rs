@@ -559,7 +559,23 @@ fn finalise_buffered(
             parts_to_response(http_codec::error_to_http_response(&err))
         }
 
-        Err(TerminalNotResponse::Drop) => make_response(Vec::new(), 204, Headers::new()?),
+        // The codec's drop: a 204 carrying the drop's headers and cookies (a
+        // flow's CORS headers on a dropped request) and no `Content-Type`,
+        // since there is no body to describe.
+        Err(TerminalNotResponse::Drop { meta }) => {
+            let headers = Headers::new()?;
+            let without_content_type: Vec<MetaEntry> = meta
+                .into_iter()
+                .filter(|entry| {
+                    !matches!(
+                        http_codec::classify_response_meta(entry),
+                        Some(ResponseMetaPart::ContentType(_))
+                    )
+                })
+                .collect();
+            apply_response_meta(&headers, &without_content_type)?;
+            make_response(Vec::new(), 204, headers)
+        }
 
         Err(TerminalNotResponse::Continue(msg)) => {
             // Codec drift: `Continue` at the HTTP boundary → empty-body 200
@@ -1031,6 +1047,13 @@ mod response_tests {
     /// the error meta names another. The body is compared byte for byte with
     /// `http_codec::error_to_http_response`, the renderer native and
     /// Cloudflare go through.
+    ///
+    /// The error is built here, so this is the contract for a NATIVE block's
+    /// error, which may set cookies (a 401 that clears a session). A WASM
+    /// guest's error never arrives with a cookie or another sensitive header
+    /// it did not declare: `WasmiBlock` strips them from every guest egress,
+    /// and the sandbox refuses a guest that declares any
+    /// (`impresspress-core`'s `wafer_guest_golden` pins that end to end).
     #[wasm_bindgen_test]
     async fn an_error_answers_with_the_codecs_error_body_and_headers() {
         let mut err = WaferError::new(ErrorCode::Unauthenticated, "Not authenticated")
@@ -1062,6 +1085,38 @@ mod response_tests {
         assert_eq!(body.as_bytes(), expected.body.as_slice());
         let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(json["code"], "not_authenticated");
+    }
+
+    /// A drop answers 204 with the headers the flow's drop carries (its CORS
+    /// headers, a cookie a middleware set) and no `Content-Type`, as the
+    /// codec renders it for native and Cloudflare.
+    #[wasm_bindgen_test]
+    async fn a_drop_keeps_its_headers_and_has_no_content_type() {
+        let drop = OutputStream::drop_request_with_meta(vec![
+            meta(
+                "resp.header.Access-Control-Allow-Origin",
+                "https://a.example",
+            ),
+            meta("resp.set_cookie.0", "s=1; Path=/"),
+            meta(META_RESP_CONTENT_TYPE, "text/html"),
+        ]);
+
+        let resp = output_to_response(drop).await.expect("build response");
+
+        assert_eq!(resp.status(), 204);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .unwrap()
+                .as_deref(),
+            Some("https://a.example")
+        );
+        assert_eq!(
+            headers.get("set-cookie").unwrap().as_deref(),
+            Some("s=1; Path=/")
+        );
+        assert_eq!(headers.get("content-type").unwrap(), None);
     }
 
     /// And a body that fits is unaffected — the cap must not change the

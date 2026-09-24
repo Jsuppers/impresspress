@@ -81,7 +81,7 @@ pub(in crate::blocks::files) async fn handle_list_objects(
         ctx,
         bucket,
         prefix,
-        page_size as i64,
+        page_size as u32,
         offset as i64,
     )
     .await
@@ -547,19 +547,15 @@ mod integration_tests {
         body
     }
 
-    /// CRUX regression (found by driving the live app, and the outage the
-    /// whole suite was blind to): upload an object through the real upload
-    /// handler, then download it through the real download handler and assert
-    /// the bytes come back.
+    /// Upload an object through the real upload handler, then download it
+    /// through the real download handler and assert the bytes come back.
     ///
-    /// Nothing in 60 merged PRs did this. The existing download tests seeded
-    /// the object with `store::put` and read it back with `store::get` — both
-    /// buffered ops — while `handle_get_object` issues `storage.get_streaming`
-    /// (`store::get_stream`). That op was missing from
-    /// `blocks::storage::rewrite_request_body`'s match, so the namespacing
-    /// shim answered `InvalidArgument: unknown storage op:
-    /// storage.get_streaming` and every `GET
-    /// /b/storage/api/buckets/{b}/objects/{k}` was a 500 on the live server.
+    /// The upload is a buffered `storage.put` and the download is
+    /// `storage.get_streaming` (`store::get_stream`, from
+    /// `handle_get_object`), so both ops must reach the backend through the
+    /// registered `wafer-run/storage` block; a test that seeds with
+    /// `store::put` and reads with `store::get` would not exercise the op a
+    /// download issues.
     ///
     /// Asserting "not an error" would not have been enough either: the bytes
     /// are the contract, so they are what this asserts.
@@ -2232,10 +2228,13 @@ mod integration_tests {
     }
 
     /// A deployment that took this code without running migration 004 has no
-    /// `claim_id` column. Uploads, replacements and failed replacements still
-    /// work: the database backend adds the column the first write names.
+    /// `claim_id` column. A fresh upload still works: the database backend
+    /// adds a column a write's DATA names. Taking over a row written before
+    /// 004 filters on `claim_id`, and a filter never adds a column, so that
+    /// replacement is refused — leaving the stored row as it was — until the
+    /// column exists: once 004 runs, or once any fresh upload has added it.
     #[tokio::test]
-    async fn uploads_work_before_migration_004_has_run() {
+    async fn uploads_before_migration_004_has_run() {
         let (ctx, storage) = super::super::test_helpers::ctx_with_storage_before_004().await;
         seed_bucket(&ctx, "assets", "alice").await;
         seed_object_row(&ctx, "assets", "old.txt", "alice", 3).await;
@@ -2246,17 +2245,23 @@ mod integration_tests {
             before[0].data
         );
 
-        let replaced = handle_upload_object(
+        let refused = handle_upload_object(
             &ctx,
             &upload_msg("assets", "old.txt", "text/plain"),
             InputStream::from_bytes(b"replacement".to_vec()),
         )
         .await;
+        assert!(output_is_error(refused, "Internal").await);
+        let row = repo::objects::find_by_bucket_key(&ctx, "assets", "old.txt")
+            .await
+            .expect("read")
+            .expect("the row");
         assert_eq!(
-            output_json(replaced).await["uploaded"],
-            serde_json::json!(true),
-            "a row written before 004 is taken over"
+            (row.size, row.status),
+            (3, ObjectStatus::Complete),
+            "a refused take-over leaves the stored row as it was"
         );
+
         let fresh = handle_upload_object(
             &ctx,
             &upload_msg("assets", "new.txt", "text/plain"),
@@ -2266,6 +2271,17 @@ mod integration_tests {
         assert_eq!(
             output_json(fresh).await["uploaded"],
             serde_json::json!(true)
+        );
+        let replaced = handle_upload_object(
+            &ctx,
+            &upload_msg("assets", "old.txt", "text/plain"),
+            InputStream::from_bytes(b"replacement".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            output_json(replaced).await["uploaded"],
+            serde_json::json!(true),
+            "with the column in place, a row written before 004 is taken over"
         );
 
         storage.refuse("put");

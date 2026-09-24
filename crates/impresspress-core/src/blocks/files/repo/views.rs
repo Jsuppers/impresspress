@@ -69,7 +69,7 @@ pub async fn insert(
 pub async fn list_recent_for_user(
     ctx: &dyn Context,
     user_id: &str,
-    limit: i64,
+    limit: u32,
 ) -> Result<Page<ViewRow>, WaferError> {
     let opts = ListOptions {
         filters: vec![Filter {
@@ -81,7 +81,7 @@ pub async fn list_recent_for_user(
             field: "viewed_at".to_string(),
             desc: true,
         }],
-        limit,
+        limit: Some(limit),
         ..Default::default()
     };
     Ok(Page::decode(

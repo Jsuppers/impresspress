@@ -213,7 +213,7 @@ pub async fn load(db: &Arc<dyn DatabaseService>) -> Vec<ResourceGrant> {
         }
     }
     let opts = ListOptions {
-        limit: 10_000,
+        limit: Some(10_000),
         skip_count: true,
         ..Default::default()
     };

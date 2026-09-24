@@ -328,6 +328,7 @@ pub async fn handle_reference(_ctx: &dyn Context) -> OutputStream {
     no_store().json(&ReferenceResponse {
         wafer_guest_version: WAFER_GUEST_VERSION,
         markdown: reference_markdown(),
+        wafer_guest_module: Template::WAFER_GUEST.to_string(),
     })
 }
 

@@ -31,10 +31,12 @@
 //!
 //! Tables themselves must exist before any `create()` — every block ships
 //! explicit `migrations/*.sql` applied from the `Init` lifecycle. The shared
-//! `DbExec::ensure_data_columns`/`ensure_query_columns` add only *columns* on
-//! demand (always `TEXT` on SQLite), matching the native sqlite/postgres
-//! backends. Reads against a missing table return empty/NotFound via the
-//! `dbx_table_exists` guard the defaults run first.
+//! `DbExec::ensure_data_columns` adds only a missing *column* a write's data
+//! names (always `TEXT` on SQLite), and `DbExec::require_columns` refuses a
+//! read, filter or guard naming an unknown column instead of adding it,
+//! matching the native sqlite/postgres backends. Under STRICT_SCHEMA (below)
+//! neither introspects. Reads against a missing table return empty/NotFound
+//! via the `dbx_table_exists` guard the defaults run first.
 //!
 //! ## Schema cache + STRICT_SCHEMA (wafer-run #313)
 //!
@@ -91,7 +93,7 @@ use std::{
 use impresspress_core::IdentityCache;
 use wafer_block::db::{Filter, ListOptions};
 use wafer_core::interfaces::database::{
-    codec::{record_from_json_row, scalar_f64, scalar_i64},
+    codec::{record_from_json_row, scalar_f64, scalar_i64, JsonColumns},
     exec::{BatchOp, BatchResult, DbExec, TxOp, TxResult},
     schema_cache::SchemaCache,
     service::{
@@ -323,17 +325,22 @@ impl DbExec for D1DatabaseService {
         &self,
         sql: &str,
         params: &[serde_json::Value],
+        json: &JsonColumns,
     ) -> Result<Vec<Record>, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
         let results = stmt.all().await.map_err(db_err)?;
         let rows: Vec<serde_json::Value> = results.results().map_err(db_err)?;
-        Ok(rows.into_iter().map(record_from_json_row).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| record_from_json_row(row, json))
+            .collect())
     }
 
     async fn run_fetch_one(
         &self,
         sql: &str,
         params: &[serde_json::Value],
+        json: &JsonColumns,
     ) -> Result<Record, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
         let row = match stmt.first::<serde_json::Value>(None).await {
@@ -343,7 +350,8 @@ impl DbExec for D1DatabaseService {
             Err(e) if is_no_such_table(&e.to_string()) => return Err(DatabaseError::NotFound),
             Err(e) => return Err(db_err(e)),
         };
-        row.map(record_from_json_row).ok_or(DatabaseError::NotFound)
+        row.map(|row| record_from_json_row(row, json))
+            .ok_or(DatabaseError::NotFound)
     }
 
     async fn run_execute(
@@ -379,8 +387,9 @@ impl DbExec for D1DatabaseService {
         &self,
         sql: &str,
         params: &[serde_json::Value],
+        json: &JsonColumns,
     ) -> Result<Vec<Record>, DatabaseError> {
-        self.run_fetch(sql, params).await
+        self.run_fetch(sql, params, json).await
     }
 
     async fn run_scalar_i64(
@@ -491,14 +500,18 @@ impl DbExec for D1DatabaseService {
             // statement.
             check_statement_succeeded(result)?;
             let decoded = match op {
-                BatchOp::Rows { .. } => {
+                BatchOp::Rows { json, .. } => {
                     let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
-                    BatchResult::Rows(rows.into_iter().map(record_from_json_row).collect())
+                    BatchResult::Rows(
+                        rows.into_iter()
+                            .map(|row| record_from_json_row(row, json))
+                            .collect(),
+                    )
                 }
-                BatchOp::FetchOne { .. } => {
+                BatchOp::FetchOne { json, .. } => {
                     let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
                     let row = rows.into_iter().next().ok_or(DatabaseError::NotFound)?;
-                    BatchResult::FetchOne(record_from_json_row(row))
+                    BatchResult::FetchOne(record_from_json_row(row, json))
                 }
                 // Same source as `run_execute`: D1Result meta's `changes`.
                 BatchOp::Execute { .. } => BatchResult::Execute(changes(result)?),
@@ -550,9 +563,13 @@ impl DbExec for D1DatabaseService {
                 check_statement_succeeded(result)?;
                 Ok(match op {
                     TxOp::Execute { .. } => TxResult::Execute(changes(result)?),
-                    TxOp::Returning { .. } => {
+                    TxOp::Returning { json, .. } => {
                         let rows: Vec<serde_json::Value> = result.results().map_err(db_err)?;
-                        TxResult::Returning(rows.into_iter().map(record_from_json_row).collect())
+                        TxResult::Returning(
+                            rows.into_iter()
+                                .map(|row| record_from_json_row(row, json))
+                                .collect(),
+                        )
                     }
                 })
             })
@@ -895,57 +912,52 @@ mod tests {
 
     use super::*;
 
-    /// B25. SQLite — and therefore D1 — has no array/object storage class, so
-    /// the shared write path serialises a structured value to JSON text and
-    /// binds it as TEXT. A backend that does not parse it back hands block code
-    /// a `Value::String` where the same block gets a `Value::Object` everywhere
-    /// else.
-    ///
-    /// This is the row decoder every D1 read goes through: `run_fetch`,
-    /// `run_fetch_one` and the `BatchOp::Rows`/`FetchOne` arms of `run_batch`
-    /// all map their rows with it. Before this test D1 stored each value exactly
-    /// as it arrived, while `wafer-block-sqlite` and the browser's sql.js bridge
-    /// both re-parsed with a byte-identical predicate — so a block reading its
-    /// own JSON column got an object on native and in the browser, and a string
-    /// on Cloudflare.
+    /// SQLite — and therefore D1 — has no array/object storage class, so a
+    /// JSON column's value is stored as JSON text. This is the row decoder
+    /// every D1 read goes through: `run_fetch`, `run_fetch_one` and the
+    /// `BatchOp::Rows`/`FetchOne` arms of `run_batch` all map their rows with
+    /// it, handing it the statement's set of JSON columns. A column in that
+    /// set decodes back to the structure that was written; any other column's
+    /// text stays the string that was written, however much it looks like
+    /// JSON — a title of `[1]` is a title, not an array.
     ///
     /// The end-to-end pin is
-    /// `wafer_core::interfaces::database::conformance::run_conformance`'s
-    /// `check_json_value_round_trip`, which this crate can only *typecheck*
-    /// (see `conformance.rs`: a live run needs a workerd D1 binding CI does not
-    /// have). This is the closest a runnable test gets to it.
+    /// `wafer_core::interfaces::database::conformance::run_conformance`,
+    /// which this crate can only *typecheck* (see `conformance.rs`: a live run
+    /// needs a workerd D1 binding CI does not have).
     #[wasm_bindgen_test]
-    fn a_json_looking_text_column_decodes_back_into_the_value_that_was_written() {
-        let record = record_from_json_row(serde_json::json!({
-            "id": "r1",
-            "meta": "{\"k\":[1,2],\"nested\":{\"b\":true}}",
-            "tags": "[\"a\",\"b\"]",
-            "note": "hello world",
-            "braced_prose": "{not json at all",
-            "count": 3,
-        }));
+    fn a_json_column_decodes_back_and_a_text_column_stays_text() {
+        let record = record_from_json_row(
+            serde_json::json!({
+                "id": "r1",
+                "meta": "{\"k\":[1,2],\"nested\":{\"b\":true}}",
+                "tags": "[\"a\",\"b\"]",
+                "note": "hello world",
+                "braced_prose": "{not json at all",
+                "count": 3,
+            }),
+            &JsonColumns::new(["meta", "braced_prose"]),
+        );
 
         assert_eq!(record.id, "r1");
         assert_eq!(
             record.data.get("meta"),
             Some(&serde_json::json!({"k": [1, 2], "nested": {"b": true}})),
-            "a serialised JSON object in a TEXT column must decode back to the \
-             object, as it does on native sqlite and in the browser",
+            "a JSON column decodes back to the object that was written",
         );
         assert_eq!(
             record.data.get("tags"),
-            Some(&serde_json::json!(["a", "b"])),
-            "a serialised JSON array must decode back to the array",
+            Some(&serde_json::json!("[\"a\",\"b\"]")),
+            "JSON-looking text in a column not declared JSON stays text",
         );
         assert_eq!(
             record.data.get("note"),
             Some(&serde_json::json!("hello world")),
-            "plain text must stay text, or the decode is not narrow enough",
         );
         assert_eq!(
             record.data.get("braced_prose"),
             Some(&serde_json::json!("{not json at all")),
-            "braced text that does not parse must be returned verbatim",
+            "text that does not parse is returned verbatim, even in a JSON column",
         );
         assert_eq!(record.data.get("count"), Some(&serde_json::json!(3)));
     }
@@ -1244,6 +1256,28 @@ mod tests {
             )
             .expect("set bind");
             bind.forget();
+            // A lone statement's `all()`: the executor's one read of a table's
+            // declared column types (which columns hold JSON). It answers no
+            // columns, so every value is written and read as it is.
+            let all = Closure::<dyn Fn() -> js_sys::Promise>::new(move || {
+                let result = js_sys::Object::new();
+                js_sys::Reflect::set(&result, &JsValue::from_str("success"), &JsValue::TRUE)
+                    .expect("set success");
+                js_sys::Reflect::set(
+                    &result,
+                    &JsValue::from_str("results"),
+                    &js_sys::Array::new(),
+                )
+                .expect("set results");
+                js_sys::Promise::resolve(&JsValue::from(result))
+            });
+            js_sys::Reflect::set(
+                &statement,
+                &JsValue::from_str("all"),
+                all.as_ref().unchecked_ref(),
+            )
+            .expect("set all");
+            all.forget();
             JsValue::from(statement)
         });
         js_sys::Reflect::set(
@@ -1378,6 +1412,7 @@ mod tests {
                 TxOp::Returning {
                     sql: "INSERT INTO t (a) VALUES (2) RETURNING *",
                     params: &[],
+                    json: JsonColumns::NONE,
                 },
             ],
         )

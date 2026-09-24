@@ -539,8 +539,10 @@ impl DatabaseService for KvCachedD1DatabaseService {
                                 cache_scrubbed = true;
                             }
                         } else {
-                            let page_size = opts.limit;
                             let total_count = records.len() as i64;
+                            // What the executor reports for an unpaged list:
+                            // the limit asked for, or the rows returned.
+                            let page_size = opts.limit.map_or(total_count, i64::from);
                             tracing::debug!(table = %collection, key = %key, "cache_hit");
                             return Ok(RecordList {
                                 records,

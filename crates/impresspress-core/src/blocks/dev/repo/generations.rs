@@ -320,13 +320,13 @@ pub async fn set_status(
 /// order it imposes is arbitrary; being arbitrary and *stable* is the whole
 /// requirement, and [`list_prunable`] orders rows the same way for exactly
 /// that reason.
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<GenerationRow>, WaferError> {
+pub async fn list_recent(ctx: &dyn Context, limit: u32) -> Result<Vec<GenerationRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
             sort: newest_first(),
-            limit: limit.clamp(1, MAX_LIST_LIMIT),
+            limit: Some(limit.clamp(1, MAX_LIST_LIMIT)),
             skip_count: true,
             ..Default::default()
         },
@@ -340,7 +340,7 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<Generation
 /// It bounds a *page*, not the retention pass: [`super::super::retention`]
 /// deletes what a page holds and asks for the next one, so a ledger far past
 /// the window is collected in full rather than down to this many rows.
-const MAX_LIST_LIMIT: i64 = 200;
+const MAX_LIST_LIMIT: u32 = 200;
 
 /// The generation that is serving, or `None` on a fresh instance.
 ///
@@ -362,7 +362,7 @@ pub async fn find_active(ctx: &dyn Context) -> Result<Option<GenerationRow>, Waf
                 value: serde_json::json!(GenerationStatus::Active.as_str()),
             }],
             sort: newest_first(),
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },
@@ -387,7 +387,7 @@ pub async fn list_in_flight(ctx: &dyn Context) -> Result<Vec<GenerationRow>, Waf
         &ListOptions {
             filters: vec![status_in(GenerationStatus::is_in_flight)],
             sort: newest_first(),
-            limit: MAX_LIST_LIMIT,
+            limit: Some(MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()
         },
@@ -439,7 +439,7 @@ pub async fn list_prunable(
                 ]),
             ])]),
             sort: newest_first(),
-            limit: MAX_LIST_LIMIT,
+            limit: Some(MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()
         },

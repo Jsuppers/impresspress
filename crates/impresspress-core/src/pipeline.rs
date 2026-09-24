@@ -176,19 +176,18 @@ fn visible_to_caller(
 /// `index.html` served under a 413 status. `Halt` is the terminal that stops
 /// the flow *and* reaches the wire.
 ///
-/// *Halt, not an `err_*` error*: this flow is `on_error: stop`, so an error
-/// terminal short-circuits by returning the error stream itself, carrying
-/// none of the message's meta. The `Access-Control-Allow-Origin` and the
-/// security headers that `wafer-run/cors` and `wafer-run/security-headers`
-/// set are on the *message*, so an error-terminal 413 would reach a
-/// cross-origin uploader with no CORS headers — a browser would report a CORS
-/// failure instead of the status, which is the opaque answer this change set
-/// out to remove.
+/// *Halt, not an `err_*` error*: the body is the plain-text limit
+/// ([`crate::streaming::request_too_large_message`]), where an error terminal
+/// answers with the JSON error envelope. Either terminal reaches a
+/// cross-origin uploader with the `Access-Control-Allow-Origin` and security
+/// headers `wafer-run/cors` and `wafer-run/security-headers` put on the
+/// *message*: the flow executor carries the response headers a middleware
+/// step set onto every terminal that stops the flow, error or halt, so a
+/// browser sees the 413 rather than a CORS failure.
 ///
-/// Carrying `msg.meta` through the halt is what preserves those headers;
-/// `wafer-block-cors` does the same for its own preflight 204, for the same
-/// reason. Non-`resp.*` entries ride along inert —
-/// `http_codec::response_meta_parts` honours only the canonical response keys.
+/// The halt also carries `msg.meta` itself. Non-`resp.*` entries ride along
+/// inert — `http_codec::response_meta_parts` honours only the canonical
+/// response keys.
 ///
 /// `oversized_body_flow.rs` pins all of it against the real executor, the real
 /// `site-main` flow and the real middleware blocks.
@@ -610,7 +609,11 @@ pub async fn handle_request(
                 let code = i64::from(http_codec::resolve_error_status(&err));
                 (code, message, OutputStream::error(err))
             }
-            Err(TerminalNotResponse::Drop) => (204, String::new(), OutputStream::drop_request()),
+            Err(TerminalNotResponse::Drop { meta }) => (
+                204,
+                String::new(),
+                OutputStream::drop_request_with_meta(meta),
+            ),
             Err(TerminalNotResponse::Continue(m)) => {
                 (200, String::new(), OutputStream::continue_with(m))
             }

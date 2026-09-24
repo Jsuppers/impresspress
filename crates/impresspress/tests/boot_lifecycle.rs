@@ -17,7 +17,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use impresspress::cli::{
-    server::{build_native_runtime, NativeBootHooks, NativeRuntime},
+    server::{build_native_runtime, NativeBootHooks},
     server_config::filter_to_declared_keys,
 };
 use impresspress_core::builder::{boot, BootHooks, GrantSource, InitPolicy};
@@ -51,23 +51,17 @@ fn infra_for(db_path: &Path, storage_root: &Path) -> InfraConfig {
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        listener: Default::default(),
     }
 }
 
 /// Build one WAFER runtime over the sqlite file at `db_path` through the
 /// binary's own `build_native_runtime` (no process-env vars to seed in this
 /// harness; auto-generated secrets, including the JWT secret, are still
-/// seeded). Returns the built-but-not-yet-inited `Wafer`, its
-/// `ImpresspressStorageBlock`, and the `DatabaseService` handle so the test
-/// can inspect `block_settings` rows directly afterwards.
-async fn build_runtime(
-    db_path: &Path,
-    storage_root: &Path,
-) -> (
-    Wafer,
-    Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
-    Arc<dyn DatabaseService>,
-) {
+/// seeded). Returns the built-but-not-yet-inited `Wafer` and the
+/// `DatabaseService` handle so the test can inspect `block_settings` rows
+/// directly afterwards.
+async fn build_runtime(db_path: &Path, storage_root: &Path) -> (Wafer, Arc<dyn DatabaseService>) {
     build_runtime_with_env(db_path, storage_root, &[]).await
 }
 
@@ -79,24 +73,17 @@ async fn build_runtime_with_env(
     db_path: &Path,
     storage_root: &Path,
     env_vars: &[(String, String)],
-) -> (
-    Wafer,
-    Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
-    Arc<dyn DatabaseService>,
-) {
+) -> (Wafer, Arc<dyn DatabaseService>) {
     let infra = infra_for(db_path, storage_root);
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
 
-    let NativeRuntime {
-        wafer,
-        storage_block,
-    } = build_native_runtime(&infra, database.clone(), env_vars, false)
+    let wafer = build_native_runtime(&infra, database.clone(), env_vars, false)
         .await
         .expect("build impresspress runtime");
 
-    (wafer, storage_block, database)
+    (wafer, database)
 }
 
 #[tokio::test]
@@ -107,10 +94,9 @@ async fn boot_first_run_ok_and_second_run_idempotent() {
     std::fs::create_dir_all(&storage_root).expect("create storage root");
 
     // --- First run: fresh DB, everything must init ok. ---
-    let (mut wafer, storage_block, db) = build_runtime(&db_path, &storage_root).await;
+    let (mut wafer, db) = build_runtime(&db_path, &storage_root).await;
     let report = boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,
@@ -138,7 +124,7 @@ async fn boot_first_run_ok_and_second_run_idempotent() {
 
     // --- Stamp format: block_settings rows carry 64-hex current_hash == blessed_hash. ---
     let opts = wafer_block::db::ListOptions {
-        limit: 10_000,
+        limit: Some(10_000),
         skip_count: true,
         ..Default::default()
     };
@@ -171,10 +157,9 @@ async fn boot_first_run_ok_and_second_run_idempotent() {
     );
 
     // --- Idempotency: second run over the same DB, via a REBUILT runtime, is all-ok. ---
-    let (mut wafer2, storage_block2, _db2) = build_runtime(&db_path, &storage_root).await;
+    let (mut wafer2, _db2) = build_runtime(&db_path, &storage_root).await;
     let report2 = boot(
         &mut wafer2,
-        &storage_block2,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,
@@ -213,10 +198,9 @@ async fn reported_boot_captures_a_seed_failure_without_aborting() {
     let storage_root = tmp.path().join("storage");
     std::fs::create_dir_all(&storage_root).expect("create storage root");
 
-    let (mut wafer, storage_block, _db) = build_runtime(&db_path, &storage_root).await;
+    let (mut wafer, _db) = build_runtime(&db_path, &storage_root).await;
     let report = boot(
         &mut wafer,
-        &storage_block,
         &FailingBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,
@@ -260,16 +244,10 @@ async fn a_seed_failure_aborts_a_tolerant_or_strict_boot() {
         let storage_root = tmp.path().join("storage");
         std::fs::create_dir_all(&storage_root).expect("create storage root");
 
-        let (mut wafer, storage_block, _db) = build_runtime(&db_path, &storage_root).await;
-        let error = boot(
-            &mut wafer,
-            &storage_block,
-            &FailingBootHooks,
-            NATIVE_GRANTS,
-            policy,
-        )
-        .await
-        .expect_err(&format!("a seed failure must abort under {policy:?}"));
+        let (mut wafer, _db) = build_runtime(&db_path, &storage_root).await;
+        let error = boot(&mut wafer, &FailingBootHooks, NATIVE_GRANTS, policy)
+            .await
+            .expect_err(&format!("a seed failure must abort under {policy:?}"));
         assert!(error.to_string().contains("boom"), "{policy:?}: {error}");
     }
 }
@@ -349,10 +327,9 @@ async fn a_prepared_plans_grants_reach_the_sealed_runtime() {
         .apply_prepared_plan(&plan, "app", &build_sha, &lock, &assets)
         .expect("apply prepared plan");
 
-    let (mut wafer, storage_block) = builder.build().expect("build impresspress runtime");
+    let mut wafer = builder.build().expect("build impresspress runtime");
     boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         GrantSource::PreInstalled(
             "ImpresspressBuilder::apply_prepared_plan installs the verified \
@@ -436,7 +413,7 @@ async fn the_native_build_fills_the_synchronous_config_surface() {
     let storage_root = tmp.path().join("storage");
     std::fs::create_dir_all(&storage_root).expect("create storage root");
 
-    let (wafer, _storage_block, _db) = build_runtime(&db_path, &storage_root).await;
+    let (wafer, _db) = build_runtime(&db_path, &storage_root).await;
     let snapshot: &HashMap<String, String> = wafer.config_snapshot();
 
     assert!(
@@ -516,11 +493,10 @@ async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
     };
 
     // --- First boot: fresh database, the operator's value lands. ---
-    let (mut wafer, storage_block, db) =
+    let (mut wafer, db) =
         build_runtime_with_env(&db_path, &storage_root, &environment("First")).await;
     boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,
@@ -530,11 +506,10 @@ async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
     assert_eq!(stored(&db, KEY).await.as_deref(), Some("First"));
 
     // --- Second boot over the same file with a changed environment. ---
-    let (mut wafer2, storage_block2, db2) =
+    let (mut wafer2, db2) =
         build_runtime_with_env(&db_path, &storage_root, &environment("Second")).await;
     boot(
         &mut wafer2,
-        &storage_block2,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,
@@ -571,10 +546,9 @@ async fn a_leftover_row_for_a_retired_var_boots_lists_and_deletes() {
     std::fs::create_dir_all(&storage_root).expect("create storage root");
 
     // --- A deployment that booted before the var was retired. ---
-    let (mut wafer, storage_block, db) = build_runtime(&db_path, &storage_root).await;
+    let (mut wafer, db) = build_runtime(&db_path, &storage_root).await;
     boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,
@@ -601,11 +575,9 @@ async fn a_leftover_row_for_a_retired_var_boots_lists_and_deletes() {
         RETIRED.to_string(),
         "https://env.example".to_string(),
     )]));
-    let (mut wafer, storage_block, db) =
-        build_runtime_with_env(&db_path, &storage_root, &environment).await;
+    let (mut wafer, db) = build_runtime_with_env(&db_path, &storage_root, &environment).await;
     let report = boot(
         &mut wafer,
-        &storage_block,
         &NativeBootHooks,
         NATIVE_GRANTS,
         InitPolicy::Reported,

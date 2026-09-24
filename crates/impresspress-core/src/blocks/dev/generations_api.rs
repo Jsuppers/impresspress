@@ -47,7 +47,7 @@ pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
 }
 
 async fn list(ctx: &dyn Context, limit: u32) -> Result<GenerationListResponse, WaferError> {
-    let rows = repo::generations::list_recent(ctx, i64::from(limit)).await?;
+    let rows = repo::generations::list_recent(ctx, limit).await?;
     let mut generations = Vec::with_capacity(rows.len());
     for row in &rows {
         let manifest = generation::from_row(row)?;

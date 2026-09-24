@@ -14,7 +14,7 @@ use wafer_core::clients::storage;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 /// Storage folder the blobs live in, relative to the block's own namespace —
-/// `wafer-run/storage` rewrites it to `impresspress/dev/blobs` (see
+/// `wafer-run/storage` resolves it to `impresspress/dev/blobs` (see
 /// [`crate::blocks::storage`]).
 pub const FOLDER: &str = "blobs";
 

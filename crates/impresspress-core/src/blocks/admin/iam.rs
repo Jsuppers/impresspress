@@ -32,7 +32,7 @@ pub(super) async fn handle_list_roles(ctx: &dyn Context) -> OutputStream {
             field: "name".to_string(),
             desc: false,
         }],
-        limit: 1000,
+        limit: Some(1000),
         ..Default::default()
     };
     match db::list(ctx, ROLES_TABLE, &opts).await {

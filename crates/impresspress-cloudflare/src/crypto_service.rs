@@ -87,21 +87,9 @@ impl CryptoService for ImpresspressCryptoService {
     /// unaffordable in single-threaded wasm — could never be verified here and
     /// the logs said the user kept mistyping their password. The shared
     /// dispatcher recognises both schemes and answers a distinct
-    /// `VerifyError` for one it does not know, which is never an accept.
+    /// `MalformedHash` for one it does not know, which is never an accept.
     fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
         primitives::verify_password_any_scheme(password, hash)
-    }
-
-    fn sign(
-        &self,
-        claims: HashMap<String, serde_json::Value>,
-        expiry: Duration,
-    ) -> Result<String, CryptoError> {
-        self.jwt()?.sign(claims, expiry)
-    }
-
-    fn verify(&self, token: &str) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
-        self.jwt()?.verify(token)
     }
 
     fn sign_for(
@@ -182,13 +170,13 @@ mod password_parity {
     /// it as one tells the logs that a user who can never sign in keeps
     /// mistyping.
     #[wasm_bindgen_test]
-    fn an_unknown_scheme_is_a_verify_error_not_a_mismatch() {
+    fn an_unknown_scheme_is_a_malformed_hash_not_a_mismatch() {
         match svc().compare_hash("pw", "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA") {
-            Err(CryptoError::VerifyError(msg)) => assert!(
+            Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("unrecognised password hash scheme"),
                 "unexpected message: {msg}"
             ),
-            other => panic!("expected a VerifyError for an unknown scheme, got {other:?}"),
+            other => panic!("expected a MalformedHash for an unknown scheme, got {other:?}"),
         }
     }
 
@@ -202,7 +190,8 @@ mod password_parity {
         svc.compare_hash("pw", &hash)
             .expect("verify without a JWT secret");
         assert!(
-            svc.sign(
+            svc.sign_for(
+                "impresspress/auth",
                 std::collections::HashMap::new(),
                 std::time::Duration::from_secs(60)
             )

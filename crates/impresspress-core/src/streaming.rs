@@ -251,8 +251,8 @@ async fn forward_event(sink: OutputSink, ev: StreamEvent) -> Option<OutputSink> 
             let _ = sink.error(*err).await;
             None
         }
-        StreamEvent::Drop => {
-            let _ = sink.drop_request().await;
+        StreamEvent::Drop { meta } => {
+            let _ = sink.drop_request_with_meta(meta).await;
             None
         }
         StreamEvent::Continue(msg) => {
@@ -379,8 +379,8 @@ pub async fn collect_capped_with_prelude(
             Some(StreamEvent::Error(err)) => {
                 return CappedCollect::Terminal(Err(TerminalNotResponse::Error(*err)))
             }
-            Some(StreamEvent::Drop) => {
-                return CappedCollect::Terminal(Err(TerminalNotResponse::Drop))
+            Some(StreamEvent::Drop { meta: drop_meta }) => {
+                return CappedCollect::Terminal(Err(TerminalNotResponse::Drop { meta: drop_meta }))
             }
             Some(StreamEvent::Continue(msg)) => {
                 return CappedCollect::Terminal(Err(TerminalNotResponse::Continue(msg)))
@@ -417,7 +417,7 @@ pub fn terminal_to_stream(result: Result<BufferedResponse, TerminalNotResponse>)
         Ok(buf) => OutputStream::respond_with_meta(buf.body, buf.meta),
         Err(TerminalNotResponse::Halt(buf)) => OutputStream::halt(buf.body, buf.meta),
         Err(TerminalNotResponse::Error(err)) => OutputStream::error(err),
-        Err(TerminalNotResponse::Drop) => OutputStream::drop_request(),
+        Err(TerminalNotResponse::Drop { meta }) => OutputStream::drop_request_with_meta(meta),
         Err(TerminalNotResponse::Continue(msg)) => OutputStream::continue_with(msg),
         Err(TerminalNotResponse::Malformed) => OutputStream::error(WaferError::new(
             wafer_run::ErrorCode::Internal,
@@ -744,11 +744,24 @@ mod tests {
         .await;
         assert_eq!(parts.status, 403);
 
-        // Drop → 204.
+        // Drop → 204, keeping the headers the drop carries (a flow's CORS
+        // headers on a dropped preflight).
         let parts =
-            http_codec::collect_http_response(terminal_to_stream(Err(TerminalNotResponse::Drop)))
-                .await;
+            http_codec::collect_http_response(terminal_to_stream(Err(TerminalNotResponse::Drop {
+                meta: vec![meta(
+                    "resp.header.access-control-allow-origin",
+                    "https://a.example",
+                )],
+            })))
+            .await;
         assert_eq!(parts.status, 204);
+        assert!(
+            parts.headers.iter().any(|(k, v)| k
+                .eq_ignore_ascii_case("access-control-allow-origin")
+                && v == "https://a.example"),
+            "{:?}",
+            parts.headers
+        );
     }
 
     #[tokio::test]

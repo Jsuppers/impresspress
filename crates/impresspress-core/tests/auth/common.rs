@@ -133,8 +133,8 @@ pub fn sign_access_token_expired(sub: &str, exp_unix: i64) -> String {
 
 /// A [`MigrationTestCtx`] that reports `impresspress/auth-ui` as the calling
 /// block, which is what selects the per-block HKDF key in the crypto handler
-/// (`caller_id: None` would sign with the master key instead, and no
-/// production token is ever signed that way). Used only for minting.
+/// (a call with no calling block is refused: every token is signed under its
+/// caller's key). The context a crypto call made from the fixture runs on.
 struct AsAuthUi(MigrationTestCtx);
 
 #[async_trait::async_trait]
@@ -187,10 +187,16 @@ impl Context for AsAuthUi {
 
 #[async_trait::async_trait]
 impl Context for MigrationTestCtx {
+    /// The fixture runs auth-ui's handlers, so the crypto block is called by
+    /// `impresspress/auth-ui`, as production attributes the call.
     async fn call_block(&self, block_name: &str, msg: Message, input: InputStream) -> OutputStream {
         match block_name {
             "wafer-run/database" => self.db_block.handle(self, msg, input).await,
-            "wafer-run/crypto" => self.crypto_block.handle(self, msg, input).await,
+            "wafer-run/crypto" => {
+                self.crypto_block
+                    .handle(&AsAuthUi(self.clone()), msg, input)
+                    .await
+            }
             _ => OutputStream::error(WaferError::new(
                 wafer_run::ErrorCode::NotFound,
                 format!("block '{block_name}' not registered in test ctx"),

@@ -259,7 +259,7 @@ async fn load_buttons(
                 field: "sort_order".into(),
                 desc: false,
             }],
-            limit: 50,
+            limit: Some(50),
             ..Default::default()
         },
     )

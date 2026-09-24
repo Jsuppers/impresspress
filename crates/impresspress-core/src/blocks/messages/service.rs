@@ -84,7 +84,7 @@ pub struct ListContextsParams {
     pub status: Option<String>,
     pub sender_id: Option<String>,
     pub parent_id: Option<String>,
-    pub page_size: i64,
+    pub page_size: u32,
     pub offset: i64,
 }
 
@@ -109,7 +109,7 @@ pub async fn list_contexts(
             field: "updated_at".to_string(),
             desc: true,
         }],
-        limit: params.page_size,
+        limit: Some(params.page_size),
         offset: params.offset,
         skip_count: false,
         ..Default::default()
@@ -210,7 +210,7 @@ pub async fn add_entry(
 pub struct ListEntriesParams {
     pub kind: Option<EntryKind>,
     pub role: Option<EntryRole>,
-    pub page_size: i64,
+    pub page_size: u32,
     pub offset: i64,
 }
 
@@ -246,7 +246,7 @@ pub async fn list_entries(
             field: "created_at".to_string(),
             desc: false,
         }],
-        limit: params.page_size,
+        limit: Some(params.page_size),
         offset: params.offset,
         skip_count: false,
         ..Default::default()

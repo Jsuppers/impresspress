@@ -62,7 +62,7 @@
 /// `impresspress_core::blocks::dev::WAFER_GUEST_VERSION` and refuses a
 /// mismatch with a `wafer-guest-version` diagnostic — a block compiled
 /// against an older copy is rebuilt, not silently activated.
-pub const WAFER_GUEST_VERSION: u32 = 1;
+pub const WAFER_GUEST_VERSION: u32 = 2;
 
 /// The `BlockInfo::interface` every sandboxed block reports.
 ///
@@ -1872,16 +1872,17 @@ impl Filter {
 
 /// Filters, sort order and paging for [`db::list`].
 ///
-/// `limit` is 0 by default, which the host reads as "no limit". Set one for
-/// anything a user can grow without bound.
+/// `limit` is unset by default, which returns every matching row. Set one
+/// for anything a user can grow without bound. An `offset` needs a `limit`:
+/// the host refuses a skip with no page size.
 #[derive(Clone, Debug, Default)]
 pub struct ListOptions {
     /// Predicates, combined with `AND`.
     pub filters: Vec<Filter>,
     /// Sort order: the column, and whether it is descending.
     pub sort: Vec<(String, bool)>,
-    /// Maximum rows; 0 means no limit.
-    pub limit: i64,
+    /// Maximum rows, at least 1; `None` returns every matching row.
+    pub limit: Option<u32>,
     /// Rows to skip.
     pub offset: i64,
 }
@@ -1904,9 +1905,9 @@ impl ListOptions {
         self
     }
 
-    /// Return at most `limit` rows.
-    pub fn limit(mut self, limit: i64) -> ListOptions {
-        self.limit = limit;
+    /// Return at most `limit` rows; the host refuses `0`.
+    pub fn limit(mut self, limit: u32) -> ListOptions {
+        self.limit = Some(limit);
         self
     }
 
@@ -1990,16 +1991,16 @@ pub mod db {
                 })
                 .collect(),
         );
-        let response = call(
-            DATABASE,
-            "database.list",
-            &Json::obj()
-                .set("collection", Json::str(collection))
-                .set("filters", filters_json(&options.filters))
-                .set("sort", sort)
-                .set("limit", Json::int(options.limit))
-                .set("offset", Json::int(options.offset)),
-        )?;
+        let mut request = Json::obj()
+            .set("collection", Json::str(collection))
+            .set("filters", filters_json(&options.filters))
+            .set("sort", sort)
+            .set("offset", Json::int(options.offset));
+        // Absent is "every row"; the host has no in-band spelling for it.
+        if let Some(limit) = options.limit {
+            request = request.set("limit", Json::int(i64::from(limit)));
+        }
+        let response = call(DATABASE, "database.list", &request)?;
         Ok(response
             .get("records")
             .and_then(Json::as_array)

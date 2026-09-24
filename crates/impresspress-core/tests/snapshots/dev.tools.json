@@ -4333,6 +4333,10 @@
             "description": "The authoring guide, as Markdown: the API, the host services, the\nnamespace rules, the limits, the diagnostic codes, and both templates\nin full.",
             "type": "string"
           },
+          "wafer_guest_module": {
+            "description": "The current `src/wafer_guest.rs`, verbatim: what a block built against\nan older copy writes over its own before compiling again.",
+            "type": "string"
+          },
           "wafer_guest_version": {
             "description": "The `WAFER_GUEST_VERSION` of the support module this reference\ndocuments and `POST /b/dev/api/blocks` writes.",
             "format": "uint32",
@@ -4342,7 +4346,8 @@
         },
         "required": [
           "wafer_guest_version",
-          "markdown"
+          "markdown",
+          "wafer_guest_module"
         ],
         "type": "object"
       }

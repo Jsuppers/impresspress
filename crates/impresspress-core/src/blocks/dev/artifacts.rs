@@ -20,7 +20,7 @@ use wafer_core::{
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
 /// Storage folder the artifacts live in, relative to the block's own
-/// namespace — `wafer-run/storage` rewrites it to
+/// namespace — `wafer-run/storage` resolves it to
 /// `impresspress/dev/artifacts`.
 pub const FOLDER: &str = "artifacts";
 
@@ -28,7 +28,7 @@ pub const FOLDER: &str = "artifacts";
 /// no request context to route through `wafer-run/storage`.
 ///
 /// Derived from the block name rather than written out, because that is what
-/// `impresspress_core::blocks::storage::resolve_folder` does with an
+/// `wafer_core::interfaces::storage::handler::resolve_folder` does with an
 /// own-namespace folder: `{caller}/{folder}`. A literal here would be a second
 /// statement of the namespacing rule, free to drift from the first.
 pub fn namespaced_folder() -> String {

@@ -509,7 +509,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                         })))
                     }))
                 }
-                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
+                @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) { (components::pagination(list.page as u32, per_page, list.total_count as u32, base_href)) }
         }
     };
 
@@ -2024,7 +2024,7 @@ pub async fn purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     ]
                 }).collect();
                 (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { (components::empty_state(icons::shopping_cart(), "No orders yet", "Customer orders will appear here after checkout starts.", None)) }))
-                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/admin/purchases"))
+                @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) { (components::pagination(list.page as u32, per_page, list.total_count as u32, "/b/products/admin/purchases")) }
         }
     };
 
@@ -2590,7 +2590,7 @@ pub async fn seller_orders(ctx: &dyn Context, msg: &Message) -> OutputStream {
                 html! { span .text-muted .text-sm { (order.str_field("created_at").get(..10).unwrap_or("")) } },
             ]).collect();
             (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No seller orders yet" } }))
-            (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/selling/orders"))
+            @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) { (components::pagination(list.page as u32, per_page, list.total_count as u32, "/b/products/selling/orders")) }
     };
     ui::shell_page(
         ctx,
@@ -3106,7 +3106,7 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     ]).collect();
                     (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No products yet" } }))
                 }
-                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, base_href))
+                @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) { (components::pagination(list.page as u32, per_page, list.total_count as u32, base_href)) }
         }
     };
 
@@ -3163,7 +3163,7 @@ pub async fn my_purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
                     ]
                 }).collect();
                 (components::data_table(&cols, rows, Some(move |index| row_hrefs.get(index).cloned()), html! { p .text-muted { "No purchases yet" } }))
-                (components::pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/products/my-purchases"))
+                @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) { (components::pagination(list.page as u32, per_page, list.total_count as u32, "/b/products/my-purchases")) }
         }
     };
 

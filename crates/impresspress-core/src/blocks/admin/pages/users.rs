@@ -115,7 +115,7 @@ async fn users_tab(
         ctx,
         &ActiveUserQuery {
             page: page as i64,
-            page_size: page_size as i64,
+            page_size: page_size as u32,
             search: (!search.is_empty()).then(|| search.clone()),
         },
     )
@@ -129,7 +129,9 @@ async fn users_tab(
 
         (table)
 
-        (pagination(list.page as u32, list.page_size as u32, list.total_count as u32, "/b/admin/users"))
+        @if let Some(per_page) = std::num::NonZeroU32::new(page_size as u32) {
+            (pagination(list.page as u32, per_page, list.total_count as u32, "/b/admin/users"))
+        }
     })
 }
 
@@ -480,7 +482,7 @@ async fn roles_tab(ctx: &dyn Context) -> Result<Markup, WaferError> {
             field: "name".into(),
             desc: false,
         }],
-        limit: 100,
+        limit: Some(100),
         ..Default::default()
     };
     let list = db::list(ctx, ROLES_TABLE, &opts).await?;

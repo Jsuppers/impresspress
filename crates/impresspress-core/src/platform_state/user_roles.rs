@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn list_by_role_returns_every_grant_past_the_unpaged_ceiling() {
         let ctx = TestContext::with_admin().await;
-        let past_the_ceiling = crate::db_read::UNPAGED_LIMIT + 1;
+        let past_the_ceiling = i64::from(crate::db_read::UNPAGED_LIMIT) + 1;
         db::exec_raw(
             &ctx,
             "WITH RECURSIVE seq(n) AS ( \
@@ -470,7 +470,7 @@ mod tests {
         let one_shot = crate::db_read::list_capped(&ctx, TABLE, vec![])
             .await
             .expect("one-shot read");
-        assert_eq!(one_shot.rows.len() as i64, crate::db_read::UNPAGED_LIMIT);
+        assert_eq!(one_shot.rows.len(), crate::db_read::UNPAGED_LIMIT as usize);
         assert!(
             one_shot.truncated,
             "a one-shot read of this table stops one grant short, which is \
@@ -483,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn list_all_reports_that_it_is_a_prefix() {
         let ctx = TestContext::with_admin().await;
-        let past_the_ceiling = crate::db_read::UNPAGED_LIMIT + 1;
+        let past_the_ceiling = i64::from(crate::db_read::UNPAGED_LIMIT) + 1;
         db::exec_raw(
             &ctx,
             "WITH RECURSIVE seq(n) AS ( \
@@ -501,7 +501,7 @@ mod tests {
 
         let listed = list_all(&ctx).await.expect("all");
         assert!(listed.truncated);
-        assert_eq!(listed.rows.len() as i64, crate::db_read::UNPAGED_LIMIT);
+        assert_eq!(listed.rows.len(), crate::db_read::UNPAGED_LIMIT as usize);
         assert_eq!(count_all(&ctx).await.expect("count"), past_the_ceiling);
     }
 

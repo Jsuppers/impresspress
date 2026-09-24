@@ -160,7 +160,7 @@ pub async fn list_for_user(ctx: &dyn Context, user_id: &str) -> Result<Vec<ApiKe
 /// newest first — the admin IAM page's API-keys tab, which is a
 /// deployment-wide view rather than one account's. `key_hash` is populated
 /// on the rows; the tab renders `key_prefix` only.
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<ApiKeyRow>, WaferError> {
+pub async fn list_recent(ctx: &dyn Context, limit: u32) -> Result<Vec<ApiKeyRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
@@ -169,7 +169,7 @@ pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<ApiKeyRow>
                 field: "created_at".into(),
                 desc: true,
             }],
-            limit,
+            limit: Some(limit),
             skip_count: true,
             ..Default::default()
         },

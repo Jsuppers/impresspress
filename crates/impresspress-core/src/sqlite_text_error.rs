@@ -13,9 +13,17 @@
 //!
 //! SQLite spells both kinds of key violation the same way:
 //! `UNIQUE constraint failed: <table>.<column>` — for a `UNIQUE` index, and
-//! for a primary key too, whether it is a rowid alias or not. Every other
-//! failure (a `NOT NULL` or `CHECK` violation, a missing table, a syntax
-//! error) stays [`DatabaseError::Internal`], as it does on the native
+//! for a primary key too, whether it is a rowid alias or not.
+//!
+//! A failure that retrying can cure is [`DatabaseError::Unavailable`], as the
+//! native backends report a busy database or a lost connection: the runtime
+//! retries a block `Init` that failed that way instead of caching the failure
+//! until the isolate is replaced. [`TRANSIENT`] lists the texts: D1's lost
+//! connection, overload, queue-full, storage timeout and internal-error reset
+//! messages, and SQLite's busy database (D1, and sql.js in the browser).
+//!
+//! Every other failure (a `NOT NULL` or `CHECK` violation, a missing table, a
+//! syntax error) stays [`DatabaseError::Internal`], as it does on the native
 //! backends.
 
 use wafer_core::interfaces::database::service::DatabaseError;
@@ -23,12 +31,26 @@ use wafer_core::interfaces::database::service::DatabaseError;
 /// The text SQLite puts in every primary- or unique-key violation.
 const UNIQUE_VIOLATION: &str = "UNIQUE constraint failed";
 
+/// Texts of failures that retrying can cure, matched as substrings.
+const TRANSIENT: &[&str] = &[
+    "Network connection lost",
+    "D1 DB is overloaded",
+    "Too many requests queued",
+    "storage operation exceeded timeout",
+    "D1_ERROR: internal error",
+    "database is locked",
+    "SQLITE_BUSY",
+];
+
 /// `message` — the text of a failed statement — as a [`DatabaseError`]:
 /// [`DatabaseError::AlreadyExists`] for a primary- or unique-key violation,
+/// [`DatabaseError::Unavailable`] for a transient failure ([`TRANSIENT`]),
 /// [`DatabaseError::Internal`] for anything else.
 pub fn statement_error(message: String) -> DatabaseError {
     if message.contains(UNIQUE_VIOLATION) {
         DatabaseError::AlreadyExists(message)
+    } else if TRANSIENT.iter().any(|text| message.contains(text)) {
+        DatabaseError::Unavailable(message)
     } else {
         DatabaseError::Internal(message)
     }
@@ -54,6 +76,28 @@ mod tests {
                     statement_error(text.into()),
                     DatabaseError::AlreadyExists(_)
                 ),
+                "{text}"
+            );
+        }
+    }
+
+    /// D1's and SQLite's transient failures — a lost connection, an
+    /// overloaded or queue-full database, a storage timeout, an internal-error
+    /// reset, a busy database — are `Unavailable`, so the runtime retries a
+    /// block `Init` that hit one. The texts are the ones D1 and sql.js return.
+    #[test]
+    fn a_transient_failure_is_unavailable() {
+        for text in [
+            "D1_ERROR: Network connection lost.: undefined",
+            "D1_ERROR: D1 DB is overloaded. Too many requests queued.: undefined",
+            "D1_ERROR: Too many requests queued.",
+            "D1_ERROR: storage operation exceeded timeout which caused object to be reset.",
+            "D1_ERROR: internal error; reference = abc123",
+            "D1_ERROR: database is locked: SQLITE_BUSY",
+            "sql exec: JsValue(Error: database is locked)",
+        ] {
+            assert!(
+                matches!(statement_error(text.into()), DatabaseError::Unavailable(_)),
                 "{text}"
             );
         }

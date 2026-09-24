@@ -127,7 +127,7 @@ pub async fn handle_stage(
     // The third pre-execution refusal, for the same reason as the other two:
     // a module built against a different `wafer_guest.rs` is not a module
     // this runtime's ABI describes, and loading it would turn a one-line
-    // "rescaffold and recompile" into a trap inside wasmi. A request that
+    // "replace the module and recompile" into a trap inside wasmi. A request that
     // reports no version at all is a compiler that could not read the file;
     // it is recorded as `0` further down and nothing is checked.
     if let Some(reported) = request.wafer_guest_version {

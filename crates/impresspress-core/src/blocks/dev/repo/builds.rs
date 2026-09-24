@@ -16,7 +16,7 @@ use crate::util::RecordExt;
 pub const TABLE: &str = "impresspress__dev__builds";
 
 /// Upper bound on one `list_recent` page.
-const MAX_LIST_LIMIT: i64 = 200;
+const MAX_LIST_LIMIT: u32 = 200;
 
 /// Whether a staged artifact was accepted.
 #[derive(
@@ -224,7 +224,7 @@ pub async fn latest_valid_for_artifact(
             // duplicate-agent-tool rule reads the `BlockInfo` off whichever
             // row it lands on.
             sort: newest_first(),
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },
@@ -241,13 +241,13 @@ pub async fn latest_valid_for_artifact(
 /// [`super::generations::list_recent`] states: the timestamp is
 /// millisecond-resolution on wasm32, and two rows sharing one would otherwise
 /// come back in whatever order the backend chose.
-pub async fn list_recent(ctx: &dyn Context, limit: i64) -> Result<Vec<BuildRow>, WaferError> {
+pub async fn list_recent(ctx: &dyn Context, limit: u32) -> Result<Vec<BuildRow>, WaferError> {
     let list = db::list(
         ctx,
         TABLE,
         &ListOptions {
             sort: newest_first(),
-            limit: limit.clamp(1, MAX_LIST_LIMIT),
+            limit: Some(limit.clamp(1, MAX_LIST_LIMIT)),
             skip_count: true,
             ..Default::default()
         },
@@ -279,7 +279,7 @@ pub async fn list_in_flight(ctx: &dyn Context) -> Result<Vec<BuildRow>, WaferErr
         &ListOptions {
             filters: vec![status_is(BuildStatus::Staged)],
             sort: newest_first(),
-            limit: MAX_LIST_LIMIT,
+            limit: Some(MAX_LIST_LIMIT),
             skip_count: true,
             ..Default::default()
         },
@@ -311,7 +311,7 @@ pub async fn is_in_flight_for_artifact(
                 },
                 status_is(BuildStatus::Staged),
             ],
-            limit: 1,
+            limit: Some(1),
             skip_count: true,
             ..Default::default()
         },
@@ -405,7 +405,7 @@ pub async fn artifact_index(ctx: &dyn Context) -> Result<BTreeMap<String, u64>, 
                     field: "artifact_sha256".into(),
                     desc: false,
                 }],
-                limit: MAX_LIST_LIMIT,
+                limit: Some(MAX_LIST_LIMIT),
                 offset,
                 skip_count: true,
                 ..Default::default()
@@ -419,7 +419,7 @@ pub async fn artifact_index(ctx: &dyn Context) -> Result<BTreeMap<String, u64>, 
                 record.u64_field("artifact_bytes"),
             );
         }
-        if count < MAX_LIST_LIMIT {
+        if count < i64::from(MAX_LIST_LIMIT) {
             return Ok(index);
         }
         offset += count;
@@ -460,7 +460,7 @@ pub async fn list_settled(ctx: &dyn Context) -> Result<Vec<SettledRow>, WaferErr
                     field: "id".into(),
                     desc: false,
                 }],
-                limit: MAX_LIST_LIMIT,
+                limit: Some(MAX_LIST_LIMIT),
                 offset,
                 skip_count: true,
                 ..Default::default()
@@ -472,7 +472,7 @@ pub async fn list_settled(ctx: &dyn Context) -> Result<Vec<SettledRow>, WaferErr
             id: record.id.clone(),
             artifact_sha256: record.str_field("artifact_sha256").to_string(),
         }));
-        if count < MAX_LIST_LIMIT {
+        if count < i64::from(MAX_LIST_LIMIT) {
             return Ok(rows);
         }
         offset += count;
