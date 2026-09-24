@@ -1185,6 +1185,16 @@ pub async fn seed_and_load(
         if value.is_empty() {
             continue;
         }
+        // The key's declared value rule DOES apply here, unlike the URL guard
+        // below: it is about what the value means to its reader, not about who
+        // supplied it. Storing a value the reader refuses would fail that
+        // reader on every call (an out-of-range session lifetime fails every
+        // login), so the export is skipped and named; the stored value, else
+        // the declared default, stays in effect.
+        if let Err(e) = crate::config_vars::check_config_value(key, value) {
+            log_refused_env_value(key, value, &e);
+            continue;
+        }
         // Deliberately NOT `util::validate_url_value`, the guard
         // `blocks::config`'s `CONFIG_SET` and `admin::ops::update_variable`
         // apply to a `*_URL` key. Those two accept values from a browser
@@ -1303,6 +1313,25 @@ pub async fn seed_and_load(
         .into_iter()
         .map(|loaded| (loaded.row.key, loaded.row.value))
         .collect())
+}
+
+/// Name an environment export a boot seeder refused for failing its key's
+/// declared value rule ([`crate::config_vars::check_config_value`]). At ERROR:
+/// the operator set something that is not taking effect. The value is shown
+/// unless the key is sensitive, so the log line says exactly what to fix.
+pub(crate) fn log_refused_env_value(key: &str, value: &str, reason: &str) {
+    let shown = if crate::config_vars::is_sensitive_for_storage(key) {
+        crate::util::MASKED_VALUE
+    } else {
+        value
+    };
+    tracing::error!(
+        key = %key,
+        value = %shown,
+        reason = %reason,
+        "refusing to seed this config key from the environment: its reader cannot use \
+         the value; the stored value, else the declared default, stays in effect"
+    );
 }
 
 /// JWT_SECRET is not declared as an `auto_generate: true` `ConfigVar` by the
@@ -2548,6 +2577,41 @@ mod boot_tests {
                 .value,
             "Bar"
         );
+    }
+
+    /// An export that fails its key's declared value rule is not seeded: it
+    /// is named at ERROR and the stored value, else the declared default,
+    /// stays in effect.
+    ///
+    /// `SESSION_LIFETIME_DAYS=0` (or `abc`, or ` 7`) used to be stored and
+    /// read back as the default. The reader now refuses such a value, so
+    /// storing it would fail every login from that boot on.
+    #[tokio::test]
+    async fn an_export_its_reader_refuses_is_not_seeded() {
+        let db = migrated_db().await;
+        let key = crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+        let env = |v: &str| [(key.to_string(), v.to_string())];
+
+        for refused in ["0", "abc", " 7", "100000000"] {
+            let capture = crate::test_support::MessageCapture::default();
+            let vars = {
+                let _guard = tracing::subscriber::set_default(capture.clone());
+                seed_and_load(&db, &env(refused)).await.expect("boot")
+            };
+            assert_eq!(vars.get(key), None, "{refused:?} must not be seeded");
+            assert_eq!(
+                capture.count_containing("refusing to seed this config key"),
+                1,
+                "the refused export {refused:?} has to be named"
+            );
+        }
+
+        let vars = seed_and_load(&db, &env("14")).await.expect("boot");
+        assert_eq!(vars.get(key).map(String::as_str), Some("14"));
+
+        // A later bad export leaves the good stored value alone.
+        let vars = seed_and_load(&db, &env("0")).await.expect("boot");
+        assert_eq!(vars.get(key).map(String::as_str), Some("14"));
     }
 
     /// THE CONTRACT, both halves. The environment seeds a key no admin has

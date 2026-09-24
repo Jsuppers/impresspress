@@ -28,7 +28,7 @@ use crate::{
     blocks::admin::logs::audit_log,
     config_vars::is_truthy,
     http::{err_bad_request, err_internal, ok_json},
-    util::{is_sensitive_key, validate_config_value, validate_url_value, MASKED_VALUE},
+    util::{is_sensitive_key, validate_declared_config_value, MASKED_VALUE},
 };
 
 /// One titled group of settings within a form (e.g. "Stripe", "OAuth Providers").
@@ -390,9 +390,10 @@ pub async fn save_settings(
         Err(e) => return err_bad_request(&format!("Invalid request: {e}")),
     };
     // Validate every refusable value up front so one bad field can't leave a
-    // half-applied save. `is_url()` (InputType::Url) is the declared rule, and
-    // `validate_url_value` is the same SSRF check the admin variables page runs —
-    // shared so the two write surfaces can't accept divergent inputs.
+    // half-applied save. `util::validate_declared_config_value` is the rule the
+    // admin variables page and `config::set` run (SSRF for a URL, the declared
+    // value rules), with `is_url()` (InputType::Url) also selecting the SSRF
+    // check — shared so the write surfaces can't accept divergent inputs.
     //
     // The mask refusal belongs to the SAME pre-pass and for the same reason: a
     // refusal raised from inside the write loop below goes out after
@@ -465,15 +466,10 @@ pub async fn save_settings(
         let Some(value) = body.get(&var.key) else {
             continue;
         };
-        if var.is_url() {
-            if let Err(e) = validate_url_value(value) {
-                return err_bad_request(&format!("{}: {e}", var.key));
-            }
-        }
-        // The key's own rule, the one `config::set`'s writer runs — checked
-        // here too so a refusal cannot land mid-loop after earlier fields have
-        // already been written.
-        if let Err(e) = validate_config_value(&var.key, value) {
+        // The declared type's URL rule, plus everything `config::set`'s
+        // writer runs — checked here so a refusal cannot land mid-loop after
+        // earlier fields have already been written.
+        if let Err(e) = validate_declared_config_value(var, value) {
             return err_bad_request(&format!("{}: {e}", var.key));
         }
         if value == MASKED_VALUE && current.get(&var.key) != Some(value) {

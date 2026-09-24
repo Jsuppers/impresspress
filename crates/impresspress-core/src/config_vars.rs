@@ -273,6 +273,35 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
     vars
 }
 
+/// The value rule a config key's reader applies, declared by the block that
+/// reads it: `check` refuses exactly the values the reader cannot use.
+///
+/// Run by every write surface ([`crate::util::validate_config_value`]) and by
+/// both boot seeders (`platform_state::variables::seed_and_load`,
+/// `admin::settings::seed_defaults`), so a value that reaches the table from
+/// the admin UI, `CONFIG_SET` or the process environment is always one its
+/// reader accepts. Unlike the `_URL` SSRF check, which guards untrusted web
+/// input and deliberately does not apply to the environment, these rules are
+/// about what the value means, whoever supplies it.
+pub struct ConfigValueRule {
+    pub key: &'static str,
+    pub check: fn(&str) -> Result<(), String>,
+}
+
+/// Every declared [`ConfigValueRule`], gathered from the blocks that own them.
+pub fn config_value_rules() -> Vec<ConfigValueRule> {
+    crate::blocks::auth::config::config_value_rules()
+}
+
+/// Run `key`'s declared [`ConfigValueRule`] on `value`; `Ok` for a key that
+/// declares none.
+pub fn check_config_value(key: &str, value: &str) -> Result<(), String> {
+    config_value_rules()
+        .iter()
+        .filter(|rule| rule.key == key)
+        .try_for_each(|rule| (rule.check)(value))
+}
+
 /// Look up a single `WAFER_RUN_SHARED__*` config var by key.
 ///
 /// The settings pages assemble their sections by pulling the exact

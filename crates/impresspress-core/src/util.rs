@@ -639,28 +639,32 @@ pub(crate) fn validate_url_value(value: &str) -> Result<(), String> {
 
 /// The write rule for a config value, keyed by its key: the single check
 /// every config-value write surface runs before storing anything — the admin
-/// variables create/update paths (`blocks::admin::ops`), the `config.set`
-/// writer (`blocks::config`) and the settings-form pre-pass
-/// (`ui::settings_form::save_settings`) — so a value one surface refuses
-/// cannot be stored through another.
+/// variables create/update paths (`blocks::admin::ops`) and the `config.set`
+/// writer (`blocks::config`) — so a value one surface refuses cannot be stored
+/// through another. The settings form runs [`validate_declared_config_value`],
+/// the same rule with the var's declaration in hand.
 ///
-/// - A `_URL` key runs [`validate_url_value`].
-/// - [`SESSION_LIFETIME_DAYS_KEY`] runs the parser its reader uses,
-///   [`parse_session_lifetime_days`], so the write accepts exactly the values
-///   a login can use: a lifetime past its bound would otherwise fail every
-///   login.
-///
-/// [`SESSION_LIFETIME_DAYS_KEY`]: crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY
-/// [`parse_session_lifetime_days`]: crate::blocks::auth::config::parse_session_lifetime_days
+/// - A `_URL` key runs [`validate_url_value`] (SSRF).
+/// - A key with a declared [`crate::config_vars::ConfigValueRule`] runs it,
+///   so a write accepts exactly the values its reader can use.
 pub(crate) fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
-    use crate::blocks::auth::config::{parse_session_lifetime_days, SESSION_LIFETIME_DAYS_KEY};
-    if key.ends_with("_URL") {
+    config_value_rule(key, key.ends_with("_URL"), value)
+}
+
+/// [`validate_config_value`] for a declared var: its `InputType::Url` also
+/// selects the SSRF check, whatever the key's suffix.
+pub(crate) fn validate_declared_config_value(
+    var: &wafer_run::ConfigVar,
+    value: &str,
+) -> Result<(), String> {
+    config_value_rule(&var.key, var.is_url() || var.key.ends_with("_URL"), value)
+}
+
+fn config_value_rule(key: &str, is_url: bool, value: &str) -> Result<(), String> {
+    if is_url {
         validate_url_value(value)?;
     }
-    if key == SESSION_LIFETIME_DAYS_KEY {
-        parse_session_lifetime_days(value)?;
-    }
-    Ok(())
+    crate::config_vars::check_config_value(key, value)
 }
 
 /// Masked placeholder shown in place of a sensitive value.

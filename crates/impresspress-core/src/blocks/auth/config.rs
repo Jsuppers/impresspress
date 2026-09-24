@@ -77,8 +77,9 @@ pub const SESSION_LIFETIME_DAYS_DEFAULT: u32 = 7;
 /// of days reaches past the last date `chrono` can represent, where that
 /// addition has no answer. Ten years is far beyond any login a deployment
 /// means to grant and far below that edge. Every write surface refuses a
-/// value past it ([`crate::util::validate_config_value`]), and
-/// [`parse_session_lifetime_days`] refuses one already stored.
+/// value past it and both boot seeders skip one from the environment (see
+/// [`config_value_rules`]); [`parse_session_lifetime_days`] refuses one
+/// already stored.
 pub const SESSION_LIFETIME_DAYS_MAX: u32 = 3_650;
 
 /// Default value for [`PASSWORD_MIN_LENGTH_KEY`].
@@ -185,9 +186,9 @@ pub fn auth_identity_config_vars() -> Vec<ConfigVar> {
 }
 
 /// Parse a [`SESSION_LIFETIME_DAYS_KEY`] value: the single rule the reader
-/// (`super::helpers::session_lifetime_days`) and every config write surface
-/// (`crate::util::validate_config_value`) share, so a value the admin form
-/// accepts is one a login can use.
+/// (`super::helpers::session_lifetime_days`) and, through
+/// [`config_value_rules`], every config write surface and boot seeder share,
+/// so a value the admin form accepts is one a login can use.
 ///
 /// Empty means unset and yields [`SESSION_LIFETIME_DAYS_DEFAULT`]. Anything
 /// else must be a whole number from 1 to [`SESSION_LIFETIME_DAYS_MAX`]; the
@@ -202,6 +203,15 @@ pub fn parse_session_lifetime_days(raw: &str) -> Result<u32, String> {
             "must be a whole number of days from 1 to {SESSION_LIFETIME_DAYS_MAX}"
         )),
     }
+}
+
+/// The value rules the auth block's readers apply
+/// ([`crate::config_vars::ConfigValueRule`]).
+pub fn config_value_rules() -> Vec<crate::config_vars::ConfigValueRule> {
+    vec![crate::config_vars::ConfigValueRule {
+        key: SESSION_LIFETIME_DAYS_KEY,
+        check: |value| parse_session_lifetime_days(value).map(drop),
+    }]
 }
 
 /// Runtime view of the auth block's config.

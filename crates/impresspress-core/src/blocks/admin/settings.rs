@@ -475,10 +475,21 @@ pub async fn seed_defaults(ctx: &dyn Context) {
                 // Seed from process env when set (lets `.env` bootstrap a
                 // fresh deployment), otherwise fall back to the declared
                 // default. Empty env values are treated as unset so that
-                // `FOO=` doesn't accidentally clear a meaningful default.
+                // `FOO=` doesn't accidentally clear a meaningful default, and
+                // so is one that fails the key's declared value rule (named
+                // at ERROR, as `seed_and_load` does for the same export).
                 let seed_value = std::env::var(&var.key)
                     .ok()
                     .filter(|v| !v.is_empty())
+                    .filter(
+                        |v| match crate::config_vars::check_config_value(&var.key, v) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                variables::log_refused_env_value(&var.key, v, &e);
+                                false
+                            }
+                        },
+                    )
                     .unwrap_or_else(|| var.default.clone());
                 if !seed_value.is_empty() {
                     let inserted = variables::insert(
