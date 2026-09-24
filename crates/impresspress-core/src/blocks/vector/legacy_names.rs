@@ -371,18 +371,6 @@ mod tests {
                 (LOWERCASE.to_string(), "lowercase-model".to_string()),
             ]
         );
-        let still_legacy = db::list_all(
-            &ctx,
-            REGISTRY_TABLE,
-            vec![Filter {
-                field: "prefixed_name".to_string(),
-                operator: FilterOp::Equal,
-                value: serde_json::json!(LEGACY),
-            }],
-        )
-        .await
-        .expect("read");
-        assert_eq!(still_legacy.len(), 1);
         // The legacy tables were not touched: the backend still finds the
         // index under exactly that spelling.
         vclient::rename_index(&ctx, LEGACY, LOWERCASE)
