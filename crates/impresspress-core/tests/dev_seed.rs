@@ -698,6 +698,55 @@ async fn a_seeded_spec_that_grants_more_than_the_module_asks_for_is_refused() {
     assert!(error.contains("site__hello__notes"), "{error}");
 }
 
+/// The other direction of the same equality: the module declares a
+/// capability the manifest does not carry. Refused too — the check is that
+/// the two describe one block, not only that the manifest asks for no more.
+#[tokio::test]
+async fn a_module_that_asks_for_more_than_the_seeded_spec_is_refused() {
+    let mut info = hello_info("site/hello");
+    info.capabilities = Some(BlockCapabilities {
+        collections: Allowlist::Only(BTreeSet::from(["site__hello__notes".to_string()])),
+        ..BlockCapabilities::none()
+    });
+    let control = FakeControl::new();
+    control.set_validated_info(info);
+    let ctx = TestContext::with_dev(control.clone()).await;
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest(), &bundle())
+        .await
+        .expect_err("a module declaring more than its spec must refuse the import");
+    assert!(
+        error.contains("does not report") && error.contains("site/hello"),
+        "{error}"
+    );
+    assert!(error.contains("site__hello__notes"), "{error}");
+}
+
+/// A bundle exported with a hyphenated block that still claims the hyphen
+/// spelling (`site__my-shop__*`) is refused on import: that spelling is read
+/// and written as `site__myshop__*`, another block's tables.
+#[tokio::test]
+async fn a_seeded_hyphenated_block_claiming_the_hyphen_spelling_is_refused() {
+    let (ctx, control) = fixture().await;
+    let mut manifest = manifest();
+    let spec = &mut manifest.blocks[0].spec;
+    spec.name = "site/my-shop".to_string();
+    spec.routes[0].prefix = "/b/my-shop/".to_string();
+    spec.capabilities = BlockCapabilities {
+        collections: Allowlist::Only(BTreeSet::from(["site__my-shop__notes".to_string()])),
+        ..BlockCapabilities::none()
+    };
+    let bundle = bundle()
+        .with(&seed::artifact_url("my-shop"), ARTIFACT)
+        .with(&seed::source_url("my-shop", "src/lib.rs"), LIB_RS);
+
+    let error = seed::import(&ctx, control.as_ref(), &manifest, &bundle)
+        .await
+        .expect_err("the hyphen spelling must refuse the import");
+    assert!(error.contains("cap-collection"), "{error}");
+    assert!(error.contains("site__my-shop__notes"), "{error}");
+}
+
 /// The seeded build row records the guest's own `BlockInfo`, exactly as
 /// `blocks_api::stage` does.
 ///

@@ -10,7 +10,7 @@
               "description": "Request of `POST /b/dev/api/blocks`.",
               "properties": {
                 "name": {
-                  "description": "The block's short name, e.g. `newsletter`. It becomes the directory\n`blocks/<name>/`, the crate name, the block id `site/<name>`, the\nroute prefix `/b/<name>/` and the collection prefix `site__<name>__`.\n2 to 32 characters: a lowercase letter followed by lowercase letters,\ndigits and hyphens, with no doubled hyphen and no trailing hyphen.",
+                  "description": "The block's short name, e.g. `newsletter`. It becomes the directory\n`blocks/<name>/`, the crate name, the block id `site/<name>`, the\nroute prefix `/b/<name>/` and the collection prefix `site__<name>__`\n(a hyphen spelled `_` there). 2 to 32 characters: a lowercase letter\nfollowed by lowercase letters, digits and hyphens, with no doubled\nhyphen and no trailing hyphen.",
                   "type": "string"
                 },
                 "template": {

@@ -44,6 +44,12 @@ follows from that:
 | Storage folder | `site/<name>` and below | `site/newsletter/uploads` |
 | Config keys | `SITE__<NAME>__*` | `SITE__NEWSLETTER__FROM_ADDRESS` |
 
+A hyphen in the name stays a hyphen in the block id, the routes and the
+storage folder, and is spelled `_` in collections and config keys:
+`blocks/my-shop` claims `site__my_shop__*` and `SITE__MY_SHOP__*`. A
+collection name is lowercase letters, digits and `_` only — the database uses
+it as written.
+
 Naming anything outside those is refused when the block is staged, with a
 diagnostic (`cap-collection`, `cap-folder`, `cap-config`,
 `endpoint-outside-routes`) naming the entry.

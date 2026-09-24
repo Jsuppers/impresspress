@@ -120,7 +120,10 @@ async fn a_hyphenated_name_reaches_every_place_the_name_is_load_bearing() {
     let lib = read_file(&ctx, "blocks/my-shop/src/lib.rs").await;
     assert!(lib.contains(r#"Block::new("site/my-shop""#), "{lib}");
     assert!(lib.contains("/b/my-shop/subscribe"), "{lib}");
-    assert!(lib.contains("site__my-shop__subscribers"), "{lib}");
+    // The collection is spelled the way the runtime spells the block's
+    // namespace, a hyphen as `_`: the one spelling validation accepts.
+    assert!(lib.contains("site__my_shop__subscribers"), "{lib}");
+    assert!(!lib.contains("site__my-shop__"), "{lib}");
     assert!(!lib.contains("site/newsletter"), "no stale block id: {lib}");
     assert!(
         !lib.contains("site__newsletter__"),
