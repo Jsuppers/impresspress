@@ -174,11 +174,21 @@ fn build_template(name: &str) -> Vec<u8> {
 /// same template can run beside the first: agent tool names are unique
 /// across a runtime, and the template's is not derived from the block name.
 fn build_scaffolded(template: Template, name: &str) -> Vec<u8> {
+    build_scaffolded_with(template, name, |content| content)
+}
+
+/// [`build_scaffolded`], with `edit` applied to every file's content — the
+/// change an author makes to the template before compiling it.
+fn build_scaffolded_with(
+    template: Template,
+    name: &str,
+    edit: impl Fn(String) -> String,
+) -> Vec<u8> {
     let out = tempfile::tempdir().expect("tempdir");
     let block_dir = format!("blocks/{name}/");
     let tool = format!("\"subscribe_{}\"", name.replace('-', "_"));
     for (path, content) in template.files(name) {
-        let content = content.replace("\"subscribe_newsletter\"", &tool);
+        let content = edit(content.replace("\"subscribe_newsletter\"", &tool));
         let relative = path
             .strip_prefix(&block_dir)
             .unwrap_or_else(|| panic!("{path} is outside {block_dir}"));
@@ -622,6 +632,42 @@ async fn a_hyphenated_block_cannot_reach_its_unhyphenated_twin() {
         subscriber_emails(&wafer, "myshop").await,
         vec!["twin@example.com".to_string()],
         "site/myshop's table holds only its own rows",
+    );
+}
+
+/// A list with no `limit` returns every row. The guest SDK leaves `limit`
+/// out of the request when the author set none; the host refuses a `0`
+/// page size, which is what the SDK used to send for "no limit".
+#[tokio::test]
+async fn a_list_without_a_limit_returns_every_row() {
+    if !buildable() {
+        return;
+    }
+    // The edit below must remove something, or this is the paged listing.
+    assert!(
+        Template::Table
+            .files("unpaged")
+            .iter()
+            .any(|(_, content)| content.contains(".limit(200)")),
+        "the table template's listing is paged at 200"
+    );
+    let wasm = build_scaffolded_with(Template::Table, "unpaged", |content| {
+        content.replace(".limit(200)", "")
+    });
+    let (block, _spec) = load_as_the_sandbox_does("unpaged", &wasm);
+    let mut wafer = golden_wafer();
+    wafer
+        .register_block("site/unpaged", Arc::new(block))
+        .expect("register site/unpaged");
+    let wafer = wafer.start().await.expect("start the runtime");
+
+    assert_eq!(subscribe(&wafer, "unpaged", "one@example.com").await, 200);
+    assert_eq!(subscribe(&wafer, "unpaged", "two@example.com").await, 200);
+    let mut emails = subscriber_emails(&wafer, "unpaged").await;
+    emails.sort();
+    assert_eq!(
+        emails,
+        vec!["one@example.com".to_string(), "two@example.com".to_string()]
     );
 }
 

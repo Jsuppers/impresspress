@@ -249,15 +249,18 @@ impl Diagnostic {
     /// `BlockInfo` that does not parse — says nothing about the cause.
     ///
     /// Refused before the artifact is stored or executed: the version is
-    /// knowable without running anything, and the fix ("rescaffold, then
-    /// recompile") does not depend on what the module would have reported.
+    /// knowable without running anything, and the fix (replace the module,
+    /// then recompile) does not depend on what the module would have
+    /// reported.
     pub fn stale_guest_module(reported: u32, current: u32) -> Self {
         Self::error(
             WAFER_GUEST_VERSION_CODE,
             format!(
                 "the artifact was compiled against wafer_guest.rs version {reported}; this \
-                 sandbox writes and speaks version {current}. Re-create the block with \
-                 `dev_create_block` (it rewrites src/wafer_guest.rs) and compile again."
+                 sandbox writes and speaks version {current}. Replace the block's \
+                 src/wafer_guest.rs with the current module (`wafer_guest_module` in \
+                 GET /b/dev/api/reference) and compile again; the block's own files are \
+                 unchanged."
             ),
         )
     }

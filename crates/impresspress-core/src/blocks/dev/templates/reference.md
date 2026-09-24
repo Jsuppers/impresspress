@@ -320,7 +320,9 @@ let n = db::count(ctx, TABLE, &[Filter::new("email", "eq", Json::str(email))])?;
 Filter operators are `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `in`,
 `is_null` and `is_not_null`. Anything else is refused by the host.
 
-Always set a `limit` on a list a user can grow.
+Always set a `limit` on a list a user can grow. A list with no `limit`
+returns every matching row; `limit(0)` is refused, and so is an `offset`
+without a `limit`.
 
 ## Storage
 
@@ -460,7 +462,7 @@ The codes you are most likely to see:
 | `package-name` | `Cargo.toml`'s `[package] name` must be the block's directory name |
 | `nested-source` | A file in any subdirectory — the crate is `Cargo.toml` plus a flat `src/` |
 | `artifact-too-large` | Restore the `[profile.release]` size settings |
-| `wafer-guest-version` | Rescaffold: the block was built against an older `wafer_guest.rs` |
+| `wafer-guest-version` | The block was built against an older `wafer_guest.rs`: replace its `src/wafer_guest.rs` with `wafer_guest_module` from `GET /b/dev/api/reference`, then compile again |
 | `guest-load` / `guest-info` / `guest-init` / `guest-probe` | The module was loaded and something failed at that stage — the message is the host's |
 
 ## Template: `hello`

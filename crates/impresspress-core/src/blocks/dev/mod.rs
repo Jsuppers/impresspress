@@ -86,7 +86,7 @@ pub const ROUTE_PREFIX: &str = "/b/dev";
 /// `wafer_guest.rs` ABI version the block scaffolder currently writes.
 /// Published in the status response so the page can tell whether a block it
 /// compiled earlier was built against a stale guest shim.
-pub const WAFER_GUEST_VERSION: u32 = 1;
+pub const WAFER_GUEST_VERSION: u32 = 2;
 
 /// In-block dispatch targets, one per declared HTTP endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

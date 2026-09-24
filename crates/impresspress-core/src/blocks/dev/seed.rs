@@ -357,7 +357,7 @@ async fn import_bundle(
         // the same reason and at the same point: before the module is fetched,
         // stored or executed. A block built against a different
         // `wafer_guest.rs` speaks a contract this runtime no longer
-        // guarantees, and loading it turns a one-line "rescaffold and
+        // guarantees, and loading it turns a one-line "replace the module and
         // recompile" into a trap inside wasmi — on the one boot that can least
         // explain it. `validate_static` cannot produce this verdict
         // (`BlockInfo` carries no such field, spec amendment 8), so the

@@ -426,8 +426,9 @@ pub struct StageBuildRequest {
     /// A value that is not the sandbox's own is refused with a
     /// `wafer-guest-version` diagnostic: the vendored module IS the ABI, so a
     /// block built against an older copy is talking a contract this runtime
-    /// no longer speaks. Rescaffold the block (`dev_create_block` rewrites
-    /// the module) and compile again.
+    /// no longer speaks. Replace the block's `src/wafer_guest.rs` with the
+    /// current module (`GET /b/dev/api/reference`, `wafer_guest_module`) and
+    /// compile again.
     ///
     /// Omit it only if the compiler genuinely could not read the file. It is
     /// then recorded as `0` — "unknown" — and nothing is checked.
@@ -519,6 +520,9 @@ pub struct ReferenceResponse {
     /// namespace rules, the limits, the diagnostic codes, and both templates
     /// in full.
     pub markdown: String,
+    /// The current `src/wafer_guest.rs`, verbatim: what a block built against
+    /// an older copy writes over its own before compiling again.
+    pub wafer_guest_module: String,
 }
 
 /// One entry of the export bundle: where it lands in the zip, and how big it
