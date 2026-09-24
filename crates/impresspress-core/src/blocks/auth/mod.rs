@@ -53,7 +53,8 @@ use crate::platform_state::user_roles;
 // the account carries no local-credentials row, or the password is simply
 // wrong; otherwise the response time is a user-enumeration oracle. It gets
 // that by verifying a password against a throwaway hash whenever there is no
-// real credential to verify against.
+// real credential it can verify against — none stored, or one the crypto
+// service cannot check, which it rejects without doing the work.
 //
 // That only equalizes anything if the throwaway hash is in the scheme THIS
 // deployment's crypto service actually writes, which is why it cannot be a
@@ -81,9 +82,10 @@ use crate::platform_state::user_roles;
 
 /// The password [`timing_equalization_hash`] hashes. Its value is irrelevant
 /// and deliberately public: no comparison against the resulting hash can ever
-/// authenticate anybody, because `login` only reaches that comparison when it
-/// has no credential to authenticate against and discards the result (pinned
-/// by `login::tests::the_timing_equalization_password_cannot_log_anyone_in`).
+/// authenticate anybody, because `login` only reaches that comparison
+/// ([`burn_timing_equalization`]) when it has no credential it can
+/// authenticate against, and discards the result (pinned by
+/// `login::tests::the_timing_equalization_password_cannot_log_anyone_in`).
 pub(crate) const TIMING_EQUALIZATION_PASSWORD: &str =
     "impresspress timing-equalization placeholder; never a credential";
 
@@ -95,15 +97,18 @@ pub(crate) const TIMING_EQUALIZATION_PASSWORD: &str =
 static TIMING_EQUALIZATION_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// A password hash in whatever scheme this deployment's crypto service writes,
-/// for `login` to burn a verification against when it has no real credential.
+/// for `login` to burn a verification against when it has no real credential
+/// (or has one the crypto service cannot check).
 ///
-/// `None` means the crypto service could not produce one at all — a broken or
-/// unregistered `wafer-run/crypto` block. The caller then skips the
-/// equalization rather than substituting something in the wrong scheme, which
-/// would reintroduce exactly the asymmetry described above.
+/// `Err` means the crypto service could not produce one at all — an
+/// unreachable, refused or broken `wafer-run/crypto` block. The caller does
+/// not substitute something in the wrong scheme, which would reintroduce
+/// exactly the asymmetry described above; [`burn_timing_equalization`] answers
+/// the login with the classified error instead, the same answer a real
+/// credential's comparison gets when the crypto service is down.
 pub(crate) async fn timing_equalization_hash(
     ctx: &dyn wafer_run::context::Context,
-) -> Option<&'static str> {
+) -> Result<&'static str, WaferError> {
     timing_equalization_hash_in(&TIMING_EQUALIZATION_HASH, ctx).await
 }
 
@@ -114,22 +119,109 @@ pub(crate) async fn timing_equalization_hash(
 async fn timing_equalization_hash_in<'a>(
     cache: &'a std::sync::OnceLock<String>,
     ctx: &dyn wafer_run::context::Context,
-) -> Option<&'a str> {
+) -> Result<&'a str, WaferError> {
     if let Some(hash) = cache.get() {
-        return Some(hash.as_str());
+        return Ok(hash.as_str());
     }
-    match crypto::hash(ctx, TIMING_EQUALIZATION_PASSWORD).await {
-        Ok(hash) => {
-            let _ = cache.set(hash);
-            cache.get().map(String::as_str)
-        }
-        Err(e) => {
-            tracing::warn!(
-                "could not derive the login timing-equalization hash; failed logins \
-                 for unknown accounts will answer faster than wrong-password ones: {e}"
+    let hash = crypto::hash(ctx, TIMING_EQUALIZATION_PASSWORD).await?;
+    Ok(cache.get_or_init(|| hash).as_str())
+}
+
+/// Spend one password verification against [`timing_equalization_hash`], so a
+/// login with nothing it can verify costs what a wrong password costs.
+///
+/// The comparison's outcome is discarded: the caller reaches this only when
+/// there is nothing to authenticate against, so it can never be a successful
+/// login however it returns. (The placeholder password is a public constant;
+/// treating a match as a login would sign the caller in as any account whose
+/// local-credentials row is missing.) A comparison the crypto service could
+/// not run is not discarded, though: [`check_password`] answers a real
+/// credential's comparison with the same classified error in that case, and
+/// answering this one "invalid credentials" instead would make the response
+/// to an unknown email differ from a known one's for as long as the crypto
+/// service is down.
+pub(crate) async fn burn_timing_equalization(
+    ctx: &dyn wafer_run::context::Context,
+    password: &str,
+) -> Result<(), WaferError> {
+    const CONTEXT: &str = "auth: login timing equalization";
+    let equalizer = timing_equalization_hash(ctx)
+        .await
+        .map_err(|e| credential_check_failed(e, CONTEXT))?;
+    match classify_comparison(crypto::compare_hash(ctx, password, equalizer).await) {
+        Comparison::Matches | Comparison::DoesNotMatch => Ok(()),
+        Comparison::Unverifiable(e) => {
+            tracing::error!(
+                error = %e,
+                "the crypto service could not verify against its own timing-equalization \
+                 hash; failed logins may answer faster for unknown accounts"
             );
-            None
+            Ok(())
         }
+        Comparison::Failed(e) => Err(credential_check_failed(e, CONTEXT)),
+    }
+}
+
+/// What checking a password against a stored credential found.
+pub(crate) enum PasswordCheck {
+    Matches,
+    /// The password is wrong.
+    DoesNotMatch,
+    /// The crypto service could not check the stored hash, so the password
+    /// is neither right nor wrong. [`check_password`] has already logged it,
+    /// with the user id, at error level; the error is the crypto service's.
+    Unverifiable(WaferError),
+}
+
+/// Check `password` against `user_id`'s stored `password_hash`.
+///
+/// `crypto::compare_hash` answers `Unauthenticated` only for a wrong password.
+/// `Internal` is the crypto service saying it could not check the stored
+/// hash: malformed, an unsupported scheme, or cost parameters outside the
+/// accepted range (`CryptoError::MalformedHash`) — or, far more rarely, its
+/// own fault while checking (a failed offload to the blocking pool). Either
+/// way the account cannot sign in with a password until the hash is replaced,
+/// so it is logged at error level with the user id (never the hash) for an
+/// operator to find and reset, and the caller decides what the requester is
+/// told. Every other failure — the call refused by WRAP, the service
+/// unreachable — says nothing about the password, and is `Err`, classified by
+/// [`credential_check_failed`] (a refusal keeps its 403 or 429, anything else
+/// is a 503).
+pub(crate) async fn check_password(
+    ctx: &dyn wafer_run::context::Context,
+    user_id: &str,
+    password: &str,
+    stored_hash: &str,
+) -> Result<PasswordCheck, WaferError> {
+    match classify_comparison(crypto::compare_hash(ctx, password, stored_hash).await) {
+        Comparison::Matches => Ok(PasswordCheck::Matches),
+        Comparison::DoesNotMatch => Ok(PasswordCheck::DoesNotMatch),
+        Comparison::Unverifiable(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "stored password hash could not be checked; the account needs a password reset"
+            );
+            Ok(PasswordCheck::Unverifiable(e))
+        }
+        Comparison::Failed(e) => Err(credential_check_failed(e, "auth: password check")),
+    }
+}
+
+/// A `crypto::compare_hash` result, by what its error code means.
+enum Comparison {
+    Matches,
+    DoesNotMatch,
+    Unverifiable(WaferError),
+    Failed(WaferError),
+}
+
+fn classify_comparison(result: Result<(), WaferError>) -> Comparison {
+    match result {
+        Ok(()) => Comparison::Matches,
+        Err(e) if e.code == wafer_run::ErrorCode::Unauthenticated => Comparison::DoesNotMatch,
+        Err(e) if e.code == wafer_run::ErrorCode::Internal => Comparison::Unverifiable(e),
+        Err(e) => Comparison::Failed(e),
     }
 }
 
@@ -230,13 +322,13 @@ mod timing_equalization_tests {
     }
 
     /// A crypto service that cannot hash yields no equalizer rather than a
-    /// wrong-scheme stand-in; `login` then skips the comparison entirely.
+    /// wrong-scheme stand-in.
     #[tokio::test]
     async fn no_crypto_block_yields_no_equalizer() {
         let ctx = TestContext::with_auth().await;
         let cache = OnceLock::new();
 
-        assert!(timing_equalization_hash_in(&cache, &ctx).await.is_none());
+        assert!(timing_equalization_hash_in(&cache, &ctx).await.is_err());
         assert!(
             cache.get().is_none(),
             "a failure must not be cached as an answer"
@@ -249,7 +341,7 @@ mod timing_equalization_tests {
     #[tokio::test]
     async fn the_process_wide_entry_point_answers() {
         let ctx = ctx_writing(PasswordScheme::default()).await;
-        assert!(timing_equalization_hash(&ctx).await.is_some());
+        assert!(timing_equalization_hash(&ctx).await.is_ok());
     }
 }
 
