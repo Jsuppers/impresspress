@@ -952,6 +952,7 @@ pub(crate) async fn daily_grouped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -1678,10 +1679,7 @@ mod tests {
         // suffix. This key is spelled neither `_SECRET` nor `_KEY`, so before
         // the read path consulted the declaration a row written by an older
         // build sat here unflagged and was served in the clear.
-        assert!(is_sensitive_key(
-            "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD",
-            0
-        ));
+        assert!(is_sensitive_key(BOOTSTRAP_ADMIN_PASSWORD_KEY, 0));
         // None of the three → not sensitive.
         assert!(!is_sensitive_key("SITE_NAME", 0));
     }

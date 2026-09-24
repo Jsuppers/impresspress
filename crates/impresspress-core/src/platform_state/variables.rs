@@ -2016,7 +2016,7 @@ pub async fn delete_by_key(ctx: &dyn Context, key: &str) -> Result<(), WaferErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::{config_vars::APP_NAME_KEY, test_support::TestContext};
 
     /// **A taken key is the write's own answer, on the database these tests
     /// run on.** A second variable with a taken key is refused by the UNIQUE
@@ -2060,6 +2060,11 @@ mod tests {
         assert_eq!(crate::test_support::output_http_status(out).await, 409);
     }
 
+    /// A block-scoped key the fixture rows are stored under, and the block
+    /// prefix migration 002 derives from it.
+    const FROM_KEY: &str = "IMPRESSPRESS__EMAIL__FROM";
+    const FROM_BLOCK: &str = "IMPRESSPRESS__EMAIL";
+
     fn new_var(key: &str) -> NewVariable {
         NewVariable {
             key: key.to_string(),
@@ -2086,7 +2091,7 @@ mod tests {
         let ctx = crate::test_support::EcholessWriteContext::new(TestContext::with_admin().await)
             .without_the_id();
 
-        let row = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
+        let row = insert(&ctx, new_var(FROM_KEY))
             .await
             .expect("the write lands; only the echo is thin");
         assert!(
@@ -2095,7 +2100,7 @@ mod tests {
             row.id,
         );
         assert_eq!(
-            get_by_key(&ctx, "IMPRESSPRESS__EMAIL__FROM")
+            get_by_key(&ctx, FROM_KEY)
                 .await
                 .expect("read back")
                 .expect("stored")
@@ -2117,10 +2122,10 @@ mod tests {
         let ctx = crate::test_support::EcholessWriteContext::new(TestContext::with_admin().await)
             .keeping_columns(&["key", "value"]);
 
-        let row = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
+        let row = insert(&ctx, new_var(FROM_KEY))
             .await
             .expect("the write lands; only the echo is partial");
-        assert_eq!(row.key, "IMPRESSPRESS__EMAIL__FROM");
+        assert_eq!(row.key, FROM_KEY);
         assert_eq!(row.value, "noreply@example.com", "the echoed column");
         assert!(row.sensitive, "and every column the echo omitted");
         assert_eq!(row.name, "From address");
@@ -2128,7 +2133,7 @@ mod tests {
         assert_eq!(row.warning, "Changing this breaks DKIM");
         assert_eq!(row.updated_by, "admin_1");
         assert!(!row.created_at.is_empty());
-        assert_eq!(row.block, Some("IMPRESSPRESS__EMAIL".to_string()));
+        assert_eq!(row.block, Some(FROM_BLOCK.to_string()));
     }
 
     /// A write the database REFUSES still reaches the caller as the refusal it
@@ -2149,7 +2154,7 @@ mod tests {
         );
         let ctx = crate::test_support::EcholessWriteContext::new(denied);
 
-        let error = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
+        let error = insert(&ctx, new_var(FROM_KEY))
             .await
             .expect_err("the write is refused, so the insert must fail");
         assert_eq!(error.code, ErrorCode::PermissionDenied);
@@ -2162,22 +2167,20 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get_by_key_round_trip_every_column() {
         let ctx = TestContext::with_admin().await;
-        let inserted = insert(&ctx, new_var("IMPRESSPRESS__EMAIL__FROM"))
-            .await
-            .expect("insert");
+        let inserted = insert(&ctx, new_var(FROM_KEY)).await.expect("insert");
         assert!(inserted.id.starts_with("var_"), "{}", inserted.id);
-        assert_eq!(inserted.key, "IMPRESSPRESS__EMAIL__FROM");
+        assert_eq!(inserted.key, FROM_KEY);
         assert_eq!(inserted.value, "noreply@example.com");
         assert_eq!(inserted.name, "From address");
         assert_eq!(inserted.description, "Sender of every outbound email");
         assert_eq!(inserted.warning, "Changing this breaks DKIM");
         assert!(inserted.sensitive);
-        assert_eq!(inserted.block.as_deref(), Some("IMPRESSPRESS__EMAIL"));
+        assert_eq!(inserted.block.as_deref(), Some(FROM_BLOCK));
         assert_eq!(inserted.updated_by, "admin_1");
         assert!(!inserted.created_at.is_empty());
         assert_eq!(inserted.created_at, inserted.updated_at);
 
-        let read = get_by_key(&ctx, "IMPRESSPRESS__EMAIL__FROM")
+        let read = get_by_key(&ctx, FROM_KEY)
             .await
             .expect("get")
             .expect("the row exists");
@@ -2193,9 +2196,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_without_a_block_prefix_keeps_the_column_null() {
         let ctx = TestContext::with_admin().await;
-        let row = insert(&ctx, new_var("WAFER_RUN_SHARED__APP_NAME"))
-            .await
-            .expect("insert");
+        let row = insert(&ctx, new_var(APP_NAME_KEY)).await.expect("insert");
         assert_eq!(row.block, None);
         assert!(
             !row.to_data().contains_key("block"),
@@ -2326,6 +2327,13 @@ mod tests {
 #[cfg(test)]
 mod boot_tests {
     use super::*;
+    use crate::{
+        blocks::email::MAILGUN_API_KEY,
+        config_vars::{
+            ALLOW_SIGNUP_KEY, APP_NAME_KEY, AUTH_HEADLINE_KEY, EMBEDDED_SCRIPTS_KEY,
+            ENABLE_OAUTH_KEY, FAVICON_URL_KEY, HAS_LANDING_PAGE_KEY, PRIMARY_COLOR_KEY,
+        },
+    };
 
     /// A `DatabaseService` with the admin schema applied through the
     /// pre-wafer DDL runner (`migration_helper::apply_ddl_via_service` +
@@ -2356,7 +2364,7 @@ mod boot_tests {
     #[tokio::test]
     async fn a_forced_write_overrides_a_value_seed_if_absent_would_have_kept() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+        let key = HAS_LANDING_PAGE_KEY;
 
         // What the admin block's `Init` does with the declared default.
         assert!(
@@ -2397,7 +2405,7 @@ mod boot_tests {
     #[tokio::test]
     async fn re_asserting_the_same_value_is_not_a_write() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+        let key = HAS_LANDING_PAGE_KEY;
         assert_eq!(
             set(&db, key, "true", "n", "d", Some(false))
                 .await
@@ -2483,7 +2491,7 @@ mod boot_tests {
     #[tokio::test]
     async fn a_forced_write_keeps_the_metadata_the_row_already_had() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+        let key = HAS_LANDING_PAGE_KEY;
         seed_if_absent(
             &db,
             key,
@@ -2536,7 +2544,7 @@ mod boot_tests {
     #[tokio::test]
     async fn an_env_var_beats_the_row_already_in_the_table() {
         let ctx = crate::test_support::TestContext::with_admin().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         // The declared default a previous boot stored, carrying no provenance.
         seed_row_with_owner(&ctx, key, "Impresspress", "").await;
 
@@ -2619,7 +2627,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_environment_seeds_until_an_admin_edits_and_never_after() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         let env = |v: &str| [(key.to_string(), v.to_string())];
 
         // Boot 1: fresh database, the environment lands. (The original bug.)
@@ -2663,7 +2671,7 @@ mod boot_tests {
     #[tokio::test]
     async fn an_export_cannot_reopen_signup_an_admin_closed() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+        let key = ALLOW_SIGNUP_KEY;
         let env = [(key.to_string(), "true".to_string())];
 
         seed_and_load(&db, &env).await.expect("boot with signup on");
@@ -2712,7 +2720,7 @@ mod boot_tests {
     #[tokio::test]
     async fn re_saving_the_value_the_environment_supplies_does_not_pin_the_key() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         seed_if_absent(&db, key, "Same", "App Name", "declared", false)
             .await
             .expect("the row a previous boot stored");
@@ -2761,7 +2769,7 @@ mod boot_tests {
     /// assertion refuses.
     #[tokio::test]
     async fn a_row_whose_pin_state_cannot_be_read_is_not_overwritten() {
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         let ctx = crate::test_support::TestContext::with_admin().await;
         seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
 
@@ -2806,11 +2814,11 @@ mod boot_tests {
     #[tokio::test]
     async fn saving_a_settings_form_pins_only_the_field_that_changed() {
         let db = migrated_db().await;
-        let changed = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        let changed = PRIMARY_COLOR_KEY;
         let untouched = [
-            "WAFER_RUN_SHARED__APP_NAME",
+            APP_NAME_KEY,
             crate::config_vars::LOGO_URL_KEY,
-            "WAFER_RUN_SHARED__FAVICON_URL",
+            FAVICON_URL_KEY,
         ];
 
         // What the environment seeded on an earlier boot.
@@ -2871,7 +2879,7 @@ mod boot_tests {
     #[tokio::test]
     async fn reset_to_environment_hands_a_pinned_key_back() {
         let ctx = crate::test_support::TestContext::with_admin().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
 
         insert(
             &ctx,
@@ -2913,7 +2921,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_upgrade_boot_keeps_a_pre_existing_settings_form_edit() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+        let key = ALLOW_SIGNUP_KEY;
 
         // The pre-upgrade world: signup closed through a settings form, which
         // left no marker, and the compose file still says `true`.
@@ -2961,13 +2969,13 @@ mod boot_tests {
     /// stamps it for good.
     #[tokio::test]
     async fn a_pre_upgrade_edit_is_unprotected_unless_the_export_differed() {
-        let key = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+        let key = ALLOW_SIGNUP_KEY;
         // Every case exports SOMETHING, so the gate is recorded on the upgrade
         // boot. That is load-bearing: a boot carrying no exports at all records
         // no gate and leaves the transition armed for the next one, so the key
         // would still be protected — see
         // `a_boot_with_no_environment_records_no_transition_and_writes_nothing`.
-        let filler = ("WAFER_RUN_SHARED__APP_NAME".to_string(), "Shop".to_string());
+        let filler = (APP_NAME_KEY.to_string(), "Shop".to_string());
         // (what the upgrade boot exports for `key`, why the transition passes it over)
         let cases = [
             (None, "the key is not in the exported batch"),
@@ -3028,13 +3036,13 @@ mod boot_tests {
     /// still in the compose file.
     ///
     /// The transition lives inside the env loop precisely so this is covered:
-    /// a pass over `config_vars::shared_config_vars()` would not see
-    /// `IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY` at all, and reverting to a
-    /// revoked key is the expensive version of this mistake.
+    /// a pass over `config_vars::shared_config_vars()` would not see a
+    /// block-scoped key like `IMPRESSPRESS__EMAIL__MAILGUN_API_KEY` at all, and
+    /// reverting to a revoked key is the expensive version of this mistake.
     #[tokio::test]
     async fn the_upgrade_boot_keeps_a_rotated_block_scoped_secret() {
         let db = migrated_db().await;
-        let key = "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY";
+        let key = MAILGUN_API_KEY;
         assert!(
             crate::config_vars::is_sensitive_for_storage(key),
             "the point of this case is a credential"
@@ -3062,7 +3070,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_upgrade_boot_leaves_a_row_that_matches_its_export_alone() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         raw_insert_unowned(&db, key, "Foo").await;
 
         let capture = crate::test_support::MessageCapture::default();
@@ -3100,7 +3108,7 @@ mod boot_tests {
     #[tokio::test]
     async fn a_moved_declared_default_is_not_mistaken_for_an_edit() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__FAVICON_URL";
+        let key = FAVICON_URL_KEY;
         // What an earlier release's default was: a hash this build no longer
         // produces, so it differs from today's declared default.
         raw_insert_unowned(&db, key, "/b/static/favicon-deadbeef.ico").await;
@@ -3111,12 +3119,9 @@ mod boot_tests {
         );
 
         // A boot with no export for that key at all — the ordinary case.
-        seed_and_load(
-            &db,
-            &[("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string())],
-        )
-        .await
-        .expect("upgrade boot");
+        seed_and_load(&db, &[(APP_NAME_KEY.to_string(), "Foo".to_string())])
+            .await
+            .expect("upgrade boot");
 
         assert_eq!(
             pin_of(&find_by_key(&db, key).await.expect("l").expect("r")),
@@ -3137,7 +3142,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_upgrade_boot_keeps_an_edit_that_reverted_to_the_declared_default() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__ENABLE_OAUTH";
+        let key = ENABLE_OAUTH_KEY;
         let declared = crate::config_vars::shared_config_vars()
             .into_iter()
             .find(|var| var.key == key)
@@ -3161,7 +3166,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_upgrade_transition_does_not_reclaim_a_key_after_a_reset() {
         let ctx = crate::test_support::TestContext::with_admin().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         seed_row_with_owner(&ctx, key, "EditedLongAgo", "").await;
 
         ctx.seed_env_vars(&[(key, "FromEnv")]).await;
@@ -3201,7 +3206,7 @@ mod boot_tests {
     #[tokio::test]
     async fn a_reset_is_not_undone_by_a_transition_that_has_not_run_yet() {
         let ctx = crate::test_support::TestContext::with_admin().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
 
         // No exports at all, so no gate is recorded.
         ctx.seed_env_vars(&[]).await;
@@ -3250,7 +3255,7 @@ mod boot_tests {
     #[tokio::test]
     async fn after_the_transition_an_unmarked_row_follows_the_environment() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
 
         // Boot 1 runs the transition over an empty table and records the gate.
         seed_and_load(&db, &[(key.to_string(), "First".to_string())])
@@ -3259,7 +3264,7 @@ mod boot_tests {
 
         // A row that looks exactly like the pre-upgrade case, but arrived after
         // the transition.
-        let other = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        let other = PRIMARY_COLOR_KEY;
         raw_insert_unowned(&db, other, "#000000").await;
 
         let vars = seed_and_load(&db, &[(other.to_string(), "#ff0000".to_string())])
@@ -3282,7 +3287,7 @@ mod boot_tests {
     #[tokio::test]
     async fn a_boot_with_no_environment_records_no_transition_and_writes_nothing() {
         let db = migrated_db().await;
-        raw_insert_unowned(&db, "WAFER_RUN_SHARED__APP_NAME", "Stored").await;
+        raw_insert_unowned(&db, APP_NAME_KEY, "Stored").await;
 
         seed_and_load(&db, &[]).await.expect("first boot");
         let before = crate::config_generation::writes_noted_on_this_thread();
@@ -3310,7 +3315,7 @@ mod boot_tests {
     /// test, so a `warn_export_is_inert` that simply never fired could not pass.
     #[tokio::test]
     async fn the_inert_export_warning_fires_only_when_the_values_differ() {
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
 
         for (stored, exported, expected) in [("Same", "Same", 0), ("Stored", "Exported", 1)] {
             let db = migrated_db().await;
@@ -3348,8 +3353,8 @@ mod boot_tests {
     async fn the_recovery_advice_is_given_once_however_many_keys_are_pinned() {
         let db = migrated_db().await;
         let keys = [
-            "WAFER_RUN_SHARED__APP_NAME",
-            "WAFER_RUN_SHARED__PRIMARY_COLOR",
+            APP_NAME_KEY,
+            PRIMARY_COLOR_KEY,
             crate::config_vars::LOGO_URL_KEY,
         ];
         let env: Vec<(String, String)> = keys
@@ -3398,7 +3403,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_bulk_advice_is_withheld_when_only_an_admin_edit_is_inert() {
         let ctx = crate::test_support::TestContext::with_admin().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
 
         let capture = crate::test_support::MessageCapture::default();
@@ -3430,8 +3435,8 @@ mod boot_tests {
     #[tokio::test]
     async fn the_bulk_advice_claims_no_count_the_page_would_contradict() {
         let ctx = crate::test_support::TestContext::with_admin().await;
-        let kept = "WAFER_RUN_SHARED__APP_NAME";
-        let dropped = "WAFER_RUN_SHARED__AUTH_HEADLINE";
+        let kept = APP_NAME_KEY;
+        let dropped = AUTH_HEADLINE_KEY;
         for key in [kept, dropped] {
             seed_row_with_owner(&ctx, key, "KeptAtUpgrade", PRE_UPGRADE_SENTINEL).await;
         }
@@ -3492,7 +3497,7 @@ mod boot_tests {
     /// one of them existed first.
     #[tokio::test]
     async fn no_boot_line_prints_a_credential() {
-        let key = "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY";
+        let key = MAILGUN_API_KEY;
         const STORED: &str = "sk_live_stored_secret";
         const EXPORTED: &str = "sk_live_exported_secret";
 
@@ -3537,7 +3542,7 @@ mod boot_tests {
     #[tokio::test]
     async fn an_empty_env_value_does_not_blank_out_a_stored_value() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         seed_if_absent(&db, key, "Impresspress", "App Name", "declared", false)
             .await
             .expect("seed");
@@ -3890,7 +3895,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_repair_pass_never_clears_a_flag_an_admin_set() {
         let db = migrated_db().await;
-        let key = "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS";
+        let key = EMBEDDED_SCRIPTS_KEY;
         assert!(
             !crate::config_vars::is_sensitive_for_storage(key),
             "the declaration does not call for a flag here — that is the case under test"
@@ -3918,12 +3923,12 @@ mod boot_tests {
     #[tokio::test]
     async fn the_boot_repair_leaves_an_ordinary_row_alone() {
         let db = migrated_db().await;
-        seed_if_absent(&db, "WAFER_RUN_SHARED__APP_NAME", "Foo", "", "", false)
+        seed_if_absent(&db, APP_NAME_KEY, "Foo", "", "", false)
             .await
             .expect("seed");
         seed_and_load(&db, &[]).await.expect("boot");
         assert!(
-            !find_by_key(&db, "WAFER_RUN_SHARED__APP_NAME")
+            !find_by_key(&db, APP_NAME_KEY)
                 .await
                 .expect("list")
                 .expect("row")
@@ -3956,14 +3961,14 @@ mod boot_tests {
                 "__IMPRESSPRESS_RUNTIME_KIND__".to_string(),
                 "server".to_string(),
             ),
-            ("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string()),
+            (APP_NAME_KEY.to_string(), "Foo".to_string()),
         ];
         let vars = seed_and_load(&db, &env).await.expect("seed and load");
 
         assert_eq!(vars.get(crate::config_vars::DEPLOY_TOKEN_KEY), None);
         assert_eq!(vars.get("__IMPRESSPRESS_RUNTIME_KIND__"), None);
         assert_eq!(
-            vars.get("WAFER_RUN_SHARED__APP_NAME").map(String::as_str),
+            vars.get(APP_NAME_KEY).map(String::as_str),
             Some("Foo"),
             "a legitimate shared key in the same batch still lands"
         );
@@ -3975,7 +3980,7 @@ mod boot_tests {
     #[tokio::test]
     async fn re_applying_the_same_environment_writes_nothing() {
         let db = migrated_db().await;
-        let env = [("WAFER_RUN_SHARED__APP_NAME".to_string(), "Foo".to_string())];
+        let env = [(APP_NAME_KEY.to_string(), "Foo".to_string())];
         seed_and_load(&db, &env).await.expect("first boot");
 
         let before = crate::config_generation::writes_noted_on_this_thread();

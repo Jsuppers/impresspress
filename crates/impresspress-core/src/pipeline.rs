@@ -13,6 +13,7 @@ use wafer_run::{
 };
 
 use crate::{
+    config_vars::{APP_NAME_KEY, DEFAULT_APP_NAME, ENVIRONMENT_KEY},
     endpoint_match,
     features::FeatureConfig,
     http::ResponseBuilder,
@@ -372,10 +373,9 @@ pub async fn handle_request(
         // the existing single-sourced display-name config var (already used
         // for emails, the login page, and the browser `<title>` — see
         // `blocks/email.rs`, `ui/mod.rs`), so discovery documents reuse it
-        // instead of inventing a second name knob; it falls back to the
-        // constant `"Impresspress"`, never to the host.
-        let project_name =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await;
+        // instead of inventing a second name knob; it falls back to
+        // `DEFAULT_APP_NAME`, never to the host.
+        let project_name = config_client::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await;
 
         // Same ceiling and the same resolver as the manifest below, so the
         // three projections of one declaration agree on who is told about
@@ -402,8 +402,7 @@ pub async fn handle_request(
         // omit the header; non-browser clients (curl, the agent runtime,
         // server-side fetchers) don't care about CORS so they still see the
         // body.
-        let environment =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
+        let environment = config_client::get_default(ctx, ENVIRONMENT_KEY, "development").await;
         let is_dev = environment.eq_ignore_ascii_case("development");
 
         // Per-caller by construction, like the manifest: a shared cache
@@ -1095,7 +1094,7 @@ fn replay_buffered(body: Vec<u8>, meta: Vec<MetaEntry>) -> OutputStream {
 mod discovery_tests {
     //! Covers the two OpenAPI/agent-card fixes:
     //!  1. `info.title` (and the agent-card `name`) comes from
-    //!     `WAFER_RUN_SHARED__APP_NAME` (fallback `"Impresspress"`), never from
+    //!     `WAFER_RUN_SHARED__APP_NAME` (fallback `DEFAULT_APP_NAME`), never from
     //!     the `Host` header — an IP-addressed host used to yield the
     //!     literal title `"127"`.
     //!  2. The core developer-facing auth/storage/products endpoints now
@@ -1106,11 +1105,11 @@ mod discovery_tests {
     //! `test_support.rs` now — shared with the per-block openapi snapshot
     //! gate (`tests/openapi_snapshot.rs`) so there is one implementation
     //! rather than two.
-
     use wafer_run::{AuthLevel, BlockEndpoint, BlockInfo, InputStream};
 
     use super::handle_request;
     use crate::{
+        config_vars::{APP_NAME_KEY, DEFAULT_APP_NAME},
         features::{AllEnabled, FeatureConfig},
         routing,
         test_support::{
@@ -1129,7 +1128,7 @@ mod discovery_tests {
         let body = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
 
         assert_eq!(
-            body["info"]["title"], "Impresspress",
+            body["info"]["title"], DEFAULT_APP_NAME,
             "no WAFER_RUN_SHARED__APP_NAME configured — title must fall back to the constant, not derive from the Host header: {body}"
         );
         assert_ne!(body["info"]["title"], "127");
@@ -1138,7 +1137,7 @@ mod discovery_tests {
     #[tokio::test]
     async fn openapi_title_honors_configured_app_name() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "Acme Corp");
+        ctx.set_config(APP_NAME_KEY, "Acme Corp");
         let body = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
 
         assert_eq!(body["info"]["title"], "Acme Corp");
@@ -1147,7 +1146,7 @@ mod discovery_tests {
     #[tokio::test]
     async fn agent_card_name_uses_the_same_configured_project_name() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "Acme Corp");
+        ctx.set_config(APP_NAME_KEY, "Acme Corp");
         let body = discovery_json(&ctx, "/.well-known/agent.json", "127.0.0.1:8093").await;
 
         assert_eq!(
