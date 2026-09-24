@@ -208,10 +208,11 @@ fn merged(
 
 /// Two `;`-separated CSP directive lists as one: `before`'s directives in
 /// order, then `after`'s that `before` does not name. A directive both name
-/// keeps `before`'s sources and gains `after`'s it lacks. `'none'` is the
-/// empty source list, not a source: it cannot stand beside another, so a
-/// directive that is `'none'` on one side takes the other side's sources, and
-/// stays `'none'` only when both sides say so. Names compare
+/// keeps `before`'s sources and gains `after`'s it lacks, `'none'` included.
+/// What `'none'` beside other sources means is left to the security-headers
+/// block, which reads this value through `merge_csp`: in a directive it adds
+/// sources to, `'none'` is dropped from a list that has others; in the
+/// narrow-only `base-uri` and `form-action`, `'none'` wins over the rest. Names compare
 /// ASCII-case-insensitively, as a browser compares them; each is written as
 /// `before` (or, for a new one, `after`) spelled it.
 fn combine_csp(before: &str, after: &str) -> String {
@@ -232,12 +233,6 @@ fn combine_csp(before: &str, after: &str) -> String {
             .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
         {
             Some((_, existing)) => {
-                if is_none(&sources) {
-                    continue;
-                }
-                if is_none(existing) {
-                    existing.clear();
-                }
                 for source in sources {
                     if !existing.contains(&source) {
                         existing.push(source);
@@ -258,11 +253,6 @@ fn combine_csp(before: &str, after: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// A source list that is exactly `'none'`.
-fn is_none(sources: &[String]) -> bool {
-    matches!(sources, [only] if only.eq_ignore_ascii_case("'none'"))
 }
 
 #[cfg(test)]
@@ -519,21 +509,78 @@ mod tests {
         );
     }
 
-    /// `'none'` never ends up beside a source: the side that names sources
-    /// wins whichever side said `'none'`, and two `'none'`s stay `'none'`.
-    #[test]
-    fn none_on_either_side_yields_to_the_other_sides_sources() {
+    /// The `Content-Security-Policy` the security-headers block serves for
+    /// `config`: its own baseline, merged with `config`'s `csp`.
+    async fn served_csp(config: &serde_json::Value) -> String {
+        use wafer_run::Block;
+
+        let ctx = crate::test_support::TestContext::new().await;
+        let block = wafer_block_security_headers::SecurityHeadersBlock::new();
+        block
+            .lifecycle(
+                &ctx,
+                wafer_run::LifecycleEvent {
+                    event_type: wafer_run::LifecycleType::Init,
+                    data: config.to_string().into_bytes(),
+                },
+            )
+            .await
+            .expect("security-headers init");
+        let out = block
+            .handle(
+                &ctx,
+                wafer_run::Message::new("retrieve:/"),
+                wafer_run::InputStream::empty(),
+            )
+            .await;
+        match out.collect_buffered().await {
+            Err(wafer_run::streams::output::TerminalNotResponse::Continue(msg)) => msg
+                .get_meta("resp.header.Content-Security-Policy")
+                .to_string(),
+            _ => panic!("security-headers is a middleware and continues"),
+        }
+    }
+
+    /// The sources a served `policy` gives `name`.
+    fn served_sources<'a>(policy: &'a str, name: &str) -> Vec<&'a str> {
+        policy
+            .split(';')
+            .map(|directive| directive.split_ascii_whitespace().collect::<Vec<_>>())
+            .find(|tokens| tokens.first() == Some(&name))
+            .map(|tokens| tokens[1..].to_vec())
+            .unwrap_or_default()
+    }
+
+    /// `'none'` from either author is served as the security-headers block
+    /// reads it: it gives way to the other author's sources in a directive
+    /// sources are added to, and it wins in the narrow-only `form-action` and
+    /// `base-uri`, so a deliberate `'none'` there is never loosened to
+    /// `'self'`.
+    #[tokio::test]
+    async fn none_is_served_as_the_security_headers_block_reads_it() {
+        let declared = vec![(
+            SECURITY_HEADERS_BLOCK.to_string(),
+            serde_json::json!({ "csp": "frame-src 'none'; form-action 'none'; base-uri 'self'" }),
+        )];
+        let shared = "frame-src https://js.stripe.com; form-action 'self'; base-uri 'none'";
+        let merged = config_for(
+            &site_main_block_configs("", shared, &declared),
+            SECURITY_HEADERS_BLOCK,
+        )
+        .clone();
+        let policy = served_csp(&merged).await;
+
         assert_eq!(
-            combine_csp(
-                "frame-src 'none'; object-src 'none'",
-                "frame-src https://js.stripe.com; object-src 'none'"
-            ),
-            "frame-src https://js.stripe.com; object-src 'none'"
+            served_sources(&policy, "frame-src"),
+            ["https://js.stripe.com"],
+            "{policy}"
         );
         assert_eq!(
-            combine_csp("frame-src 'self'", "frame-src 'NONE'"),
-            "frame-src 'self'"
+            served_sources(&policy, "form-action"),
+            ["'none'"],
+            "{policy}"
         );
+        assert_eq!(served_sources(&policy, "base-uri"), ["'none'"], "{policy}");
     }
 
     /// A config that is not an object has no settings to preserve; the
