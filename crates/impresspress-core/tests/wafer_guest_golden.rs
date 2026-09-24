@@ -45,9 +45,22 @@
 use std::{path::Path, process::Command, sync::Arc};
 
 use impresspress_core::blocks::dev::{control::DynamicBlockSpec, scaffold::Template, validation};
-use wafer_block::{http_codec, streams::input::InputStream, BlockCapabilities, Message};
+use wafer_block::{
+    abi::{GuestAction, GuestResult},
+    http_codec,
+    streams::input::InputStream,
+    BlockCapabilities, ErrorCode, Message, MetaEntry, WaferError,
+};
 use wafer_block_sqlite::service::SQLiteDatabaseService;
 use wafer_run::{wasm::WasmiBlock, ResourceLimits, Wafer};
+
+/// The canonical guest support module, compiled for the host, so a test can
+/// render a `BlockInfo` exactly as a sandbox block does.
+///
+/// It carries its own `#![expect(dead_code)]` — this file uses only part of
+/// the API — so this declaration must not add a second one.
+#[path = "../src/blocks/dev/templates/wafer_guest.rs"]
+mod wafer_guest;
 
 // ---------------------------------------------------------------------------
 // Building a template
@@ -610,6 +623,205 @@ async fn a_hyphenated_block_cannot_reach_its_unhyphenated_twin() {
         vec!["twin@example.com".to_string()],
         "site/myshop's table holds only its own rows",
     );
+}
+
+// ---------------------------------------------------------------------------
+// The header contract
+// ---------------------------------------------------------------------------
+
+/// A guest written against the raw ABI rather than the template SDK, so it
+/// can return what a hostile author could: the SDK only ever renders a
+/// `Respond`.
+///
+/// Its `BlockInfo` is the one the SDK renders for two public `GET` endpoints
+/// and no capabilities, so the sandbox's rules admit it as they would any
+/// block. `GET /b/hostile/echo` answers with the request frame the host
+/// handed it, byte for byte, so the test reads exactly what the guest saw.
+/// Every other request answers an `Error` whose meta tries to set a session
+/// cookie, a redirect and a CORS grant beside one ordinary header.
+fn build_hostile_guest() -> Vec<u8> {
+    fn unused(_: &wafer_guest::Request, _: &wafer_guest::Ctx) -> wafer_guest::Response {
+        wafer_guest::Response::text(500, "never dispatched: the raw guest routes itself")
+    }
+    let info = wafer_guest::render_block_info(
+        &wafer_guest::Block::new("site/hostile", "Tries every egress")
+            .endpoint(
+                wafer_guest::Endpoint::new(wafer_guest::Method::Get, "/b/hostile/echo", unused)
+                    .auth(wafer_guest::Auth::Public),
+            )
+            .endpoint(
+                wafer_guest::Endpoint::new(wafer_guest::Method::Get, "/b/hostile/fail", unused)
+                    .auth(wafer_guest::Auth::Public),
+            ),
+    );
+    let entry = |key: &str, value: &str| MetaEntry {
+        key: key.to_string(),
+        value: value.to_string(),
+    };
+    let error = serde_json::to_string(&GuestResult {
+        action: GuestAction::Error,
+        response: None,
+        error: Some(WaferError {
+            code: ErrorCode::PermissionDenied,
+            message: "refused".to_string(),
+            meta: vec![
+                entry("resp.set_cookie.0", "session=attacker; Path=/"),
+                entry("resp.header.location", "https://evil.example/"),
+                entry("resp.header.access-control-allow-origin", "*"),
+                entry("resp.header.x-guest", "kept"),
+            ],
+        }),
+        message: None,
+    })
+    .expect("render the error result");
+
+    let source = format!(
+        r####"
+const INFO: &str = r###"{info}"###;
+const ERROR_RESULT: &str = r###"{error}"###;
+
+fn pack(bytes: &'static [u8]) -> i64 {{
+    ((bytes.as_ptr() as u32 as i64) << 32) | bytes.len() as i64
+}}
+
+#[no_mangle]
+pub extern "C" fn __wafer_alloc(size: i32) -> i32 {{
+    Box::leak(vec![0u8; size.max(0) as usize].into_boxed_slice()).as_mut_ptr() as i32
+}}
+
+#[no_mangle]
+pub extern "C" fn __wafer_host_codec() -> i32 {{
+    1
+}}
+
+#[no_mangle]
+pub extern "C" fn __wafer_info() -> i64 {{
+    pack(INFO.as_bytes())
+}}
+
+#[no_mangle]
+pub extern "C" fn __wafer_handle(ptr: i32, len: i32) -> i64 {{
+    let frame = unsafe {{ std::slice::from_raw_parts(ptr as *const u8, len as usize) }};
+    let echo = b"/b/hostile/echo";
+    if !frame.windows(echo.len()).any(|w| w == echo) {{
+        return pack(ERROR_RESULT.as_bytes());
+    }}
+    let mut out = String::from(r#"{{"action":"Respond","response":{{"data":["#);
+    for (i, byte) in frame.iter().enumerate() {{
+        if i > 0 {{
+            out.push(',');
+        }}
+        out.push_str(&byte.to_string());
+    }}
+    out.push_str(r#"],"meta":[]}},"error":null,"message":null}}"#);
+    pack(Box::leak(out.into_bytes().into_boxed_slice()))
+}}
+
+#[no_mangle]
+pub extern "C" fn __wafer_lifecycle(_ptr: i32, _len: i32) -> i64 {{
+    pack(br#"{{"Ok":null}}"#)
+}}
+"####
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/lib.rs"), source).expect("write the guest");
+    let manifest = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blocks/dev/templates/hello/Cargo.toml"),
+    )
+    .expect("read the hello manifest")
+    .replace("name = \"hello\"", "name = \"hostile\"");
+    std::fs::write(dir.path().join("Cargo.toml"), manifest).expect("write the manifest");
+    build_crate("hostile", dir.path())
+}
+
+/// The hostile guest, admitted as the sandbox admits it, in a started runtime.
+async fn hostile_runtime() -> Arc<Wafer> {
+    let wasm = build_hostile_guest();
+    let (block, spec) = load_as_the_sandbox_does("hostile", &wasm);
+    assert_eq!(spec.name, "site/hostile");
+    let mut wafer = golden_wafer();
+    wafer
+        .register_block("site/hostile", Arc::new(block))
+        .expect("register site/hostile");
+    wafer.start().await.expect("start the runtime")
+}
+
+/// A sandbox guest never sees the request's credentials. The service worker
+/// puts the admin's session cookie on every same-origin request it forwards,
+/// `/b/{name}/` included, so this is the header a guest would otherwise read.
+/// An ordinary header does arrive, so the guest is shown the request.
+#[tokio::test]
+async fn a_guest_never_sees_the_session_cookie_or_authorization() {
+    if !buildable() {
+        return;
+    }
+    let wafer = hostile_runtime().await;
+
+    let msg = http_codec::build_http_message(
+        "GET",
+        "/b/hostile/echo",
+        "",
+        "127.0.0.1",
+        [
+            ("cookie", "impresspress_session=admin-session"),
+            ("authorization", "Bearer admin-token"),
+            ("x-probe", "visible"),
+        ],
+    );
+    let out = wafer
+        .run_block("site/hostile", msg, InputStream::empty())
+        .await
+        .collect_buffered()
+        .await
+        .expect("a buffered response");
+    let seen = String::from_utf8(out.body).expect("the echoed frame is JSON text");
+
+    assert!(
+        seen.contains("visible"),
+        "the guest was shown the request: {seen}"
+    );
+    assert!(
+        !seen.contains("admin-session"),
+        "the session cookie reached the guest: {seen}"
+    );
+    assert!(
+        !seen.contains("admin-token"),
+        "the credential reached the guest: {seen}"
+    );
+}
+
+/// An `Error` a guest returns cannot set a cookie, a redirect or a CORS
+/// grant: the HTTP response the codec renders from it carries none of them,
+/// only the ordinary header the guest set.
+#[tokio::test]
+async fn a_guest_error_cannot_set_a_cookie_or_a_sensitive_header() {
+    if !buildable() {
+        return;
+    }
+    let wafer = hostile_runtime().await;
+
+    let out = wafer
+        .run_block(
+            "site/hostile",
+            http_msg("GET", "/b/hostile/fail", &[("auth.user_id", "")]),
+            InputStream::empty(),
+        )
+        .await;
+    let parts = http_codec::collect_http_response(out).await;
+
+    assert_eq!(parts.status, 403);
+    let header = |name: &str| {
+        parts
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(header("x-guest"), Some("kept"), "{:?}", parts.headers);
+    for name in ["set-cookie", "location", "access-control-allow-origin"] {
+        assert_eq!(header(name), None, "{name} crossed: {:?}", parts.headers);
+    }
 }
 
 // ---------------------------------------------------------------------------

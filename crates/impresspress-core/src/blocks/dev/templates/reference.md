@@ -126,7 +126,7 @@ fn subscribe(request: &Request, ctx: &Ctx) -> Response { /* … */ }
 | `request.method`, `request.path` | Uppercased method, path without the query |
 | `request.param("id")` | A `{id}` captured by the route template |
 | `request.query("page")` | A decoded query parameter |
-| `request.header("accept")` | A request header; names are lowercase |
+| `request.header("accept")` | A request header; names are lowercase. `cookie` and `authorization` never arrive (see [Headers](#headers)) |
 | `request.json()` | The body as `json::Json` |
 | `request.body` | The raw body bytes |
 | `request.user_id`, `request.user_email`, `request.roles` | Who is calling; `None` when nobody is signed in |
@@ -139,6 +139,29 @@ Response::json(200, &json::Json::obj().set("ok", json::Json::Bool(true)))
 Response::text(404, "not found")
 Response::bytes(200, "image/png", pixels).header("Cache-Control", "no-store")
 ```
+
+### Headers
+
+The host decides which headers cross the block's boundary, in both
+directions, and a block cannot change that:
+
+- **In:** a block never sees the request's `Cookie`, `Authorization` or
+  `Proxy-Authorization` header. The admin's session cookie travels on every
+  same-origin request, `/b/<name>/` included, and it stops at the host. Who is
+  calling reaches the block as `request.user_id`, `request.user_email` and
+  `request.roles` instead.
+- **Out:** a block cannot set `Set-Cookie`, `Location`, `Refresh`,
+  `Clear-Site-Data`, any `Access-Control-*` (CORS) header,
+  `Strict-Transport-Security`, `X-Frame-Options` or
+  `Content-Security-Policy` (or its `-Report-Only` twin). The host drops them
+  from every answer the block gives, an error included. The site's own
+  middleware supplies the CORS and security headers.
+- Every other header (`Cache-Control`, `X-*`, …) passes through as the block
+  set it.
+
+The `headers.readable` / `headers.writable` capabilities that would lift these
+rules are refused at staging (`cap-headers`): a sandbox block serves an
+unauthenticated route, so it is never trusted with the session.
 
 Return an error `Response` for anything a caller can cause. A handler that
 panics **traps the instance** — the crate is built with `panic = "abort"`, so
@@ -386,7 +409,7 @@ it just tried to reach. Fix the declaration in `block()`, not the call.
 | Cross-block calls | only `wafer-run/database`, `wafer-run/storage`, `wafer-run/config` |
 | Raw SQL / raw DDL | never granted |
 | Crypto, vector indexes | never granted |
-| Sensitive headers | never granted — a block never sees the session cookie |
+| Sensitive headers | never granted — see [Headers](#headers) |
 | Compiles at a time | one |
 
 The size settings in the scaffolded `[profile.release]` (`opt-level = "z"`,
@@ -429,6 +452,7 @@ The codes you are most likely to see:
 | `endpoint-outside-routes` | An endpoint path outside `/b/<name>/` |
 | `cap-collection` / `cap-folder` / `cap-config` | A claim outside your namespace |
 | `cap-ddl` / `cap-raw-sql` | Never granted; use `db::ensure_table` and the typed ops |
+| `cap-headers` | Never granted; see [Headers](#headers) |
 | `cap-callable` / `cap-requires-mismatch` | `requires` must name exactly the platform services you use |
 | `tool-name-duplicate` | Another block already publishes that agent tool name |
 | `route-collision` | Another block, or a built-in route, already serves that prefix |
