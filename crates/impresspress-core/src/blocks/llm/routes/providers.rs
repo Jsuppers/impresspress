@@ -138,7 +138,7 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
     for rec in &records {
         match row_to_config(rec) {
             Ok(mut cfg) if cfg.enabled => {
-                resolve_provider_key(ctx, &mut cfg).await;
+                resolve_provider_key(ctx, &mut cfg).await?;
                 configs.push(cfg);
             }
             Ok(_) => {} // disabled — skip
@@ -161,26 +161,33 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
 /// config client. `key_var` takes precedence over any inline `api_key`;
 /// with no `key_var` the config is left untouched.
 ///
-/// Resolution failure (unset var, empty value, denied read) is logged and
-/// leaves `api_key` as-is — the provider then runs unauthenticated, and the
-/// per-protocol encoder decides whether that's an error (`MissingApiKey` →
-/// 401) on the next chat call. Local OpenAI-compatible servers legitimately
-/// run without a key.
-async fn resolve_provider_key(ctx: &dyn Context, cfg: &mut ProviderConfig) {
+/// A variable that is unset or empty is logged and leaves `api_key` as-is —
+/// the provider then runs unauthenticated, and the per-protocol encoder
+/// decides whether that's an error (`MissingApiKey` → 401) on the next chat
+/// call. Local OpenAI-compatible servers legitimately run without a key.
+///
+/// A read that fails is returned, and fails the reload: a refused read says
+/// nothing about whether a key exists, so running the provider without one
+/// would send every chat call out unauthenticated for a fault of our own.
+async fn resolve_provider_key(
+    ctx: &dyn Context,
+    cfg: &mut ProviderConfig,
+) -> Result<(), WaferError> {
     let Some(var) = cfg.key_var.as_deref() else {
-        return;
+        return Ok(());
     };
-    match config::get(ctx, var).await {
-        Ok(value) if !value.is_empty() => cfg.api_key = Some(value),
-        Ok(_) => tracing::warn!(
+    match config::get_optional(ctx, var).await? {
+        Some(value) if !value.is_empty() => cfg.api_key = Some(value),
+        Some(_) => tracing::warn!(
             "provider '{}': key_var `{var}` is set but empty — provider will run unauthenticated",
             cfg.name
         ),
-        Err(e) => tracing::warn!(
-            "provider '{}': failed to resolve key_var `{var}`: {e} — provider will run unauthenticated",
+        None => tracing::warn!(
+            "provider '{}': key_var `{var}` is not set — provider will run unauthenticated",
             cfg.name
         ),
     }
+    Ok(())
 }
 
 /// `GET /b/llm/api/providers` — list all rows. Admin-only.
@@ -891,6 +898,39 @@ mod tests {
             ],
             "{label}: the wire field set must equal ProviderView's, or the published \
              schema describes something the handler does not emit"
+        );
+    }
+
+    /// A `key_var` read that is refused fails the reload: the write answers
+    /// the classified denial and the router is never handed the provider
+    /// without its key.
+    #[tokio::test]
+    async fn a_refused_key_read_fails_the_reload_instead_of_dropping_the_key() {
+        let (mut ctx, admin, block) = keyed_fixture().await;
+        ctx.refuse_config_reads(WaferError::new(
+            ErrorCode::PermissionDenied,
+            "WRAP: impresspress/llm holds no grant on the key variable",
+        ));
+
+        let out = create_provider(
+            &block,
+            &ctx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            create_body(),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_http_json(out).await,
+            serde_json::json!({ "error": "PermissionDenied", "message": "Access denied" }),
+        );
+        assert!(
+            admin.providers_snapshot().is_empty(),
+            "no provider may be configured without its key: {:?}",
+            admin
+                .providers_snapshot()
+                .iter()
+                .map(|p| (&p.name, p.api_key.is_some()))
+                .collect::<Vec<_>>()
         );
     }
 
