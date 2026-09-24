@@ -1516,6 +1516,19 @@ jobs:
           test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at IS NULL")" = "blank_noslug,blank_scarf,live_jacket,live_noslug"
           test "$(psql --tuples-only --no-align --command "SELECT string_agg(id, ',' ORDER BY id) FROM impresspress__products__products WHERE deleted_at = ''")" = "blank_hat_a,blank_hat_b,blank_jacket"
 
+      # 022 rewrites the platform subscription's British `cancelled` to
+      # Stripe's `canceled`, the only spelling `SubscriptionStatus` decodes.
+      # `a_stored_cancelled_subscription_is_rewritten_to_canceled_by_022` pins
+      # it on SQLite; this pins it on real PostgreSQL, twice over, because the
+      # block replays its whole migration set whenever the combined hash moves.
+      - name: Migration 022 canonicalises the subscription status spelling
+        run: |
+          psql --set ON_ERROR_STOP=1 --command "INSERT INTO impresspress__products__subscriptions (id, user_id, status, created_at, updated_at) VALUES ('sub_british', 'user_british', 'cancelled', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('sub_stripe', 'user_stripe', 'canceled', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('sub_active', 'user_active', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+          for pass in 1 2; do
+            psql --set ON_ERROR_STOP=1 --file crates/impresspress-core/src/blocks/products/migrations/022_canonical_subscription_status.postgres.sql
+          done
+          test "$(psql --tuples-only --no-align --command "SELECT string_agg(id || '=' || status, ',' ORDER BY id) FROM impresspress__products__subscriptions")" = "sub_active=active,sub_british=canceled,sub_stripe=canceled"
+
       # Admin 004 collapses repeated `(user_id, role)` grants onto the earliest
       # row and then makes the pair unique. It already ran above against an
       # empty table, so the index exists; it is dropped here to plant what an

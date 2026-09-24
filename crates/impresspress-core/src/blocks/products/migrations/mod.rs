@@ -75,6 +75,9 @@ const SQL_020_POSTGRES: &str = include_str!("020_normalize_blank_deleted_at.post
 const SQL_021_SQLITE: &str = include_str!("021_payment_link_request.sqlite.sql");
 #[cfg(any(feature = "postgres", test))]
 const SQL_021_POSTGRES: &str = include_str!("021_payment_link_request.postgres.sql");
+const SQL_022_SQLITE: &str = include_str!("022_canonical_subscription_status.sqlite.sql");
+#[cfg(any(feature = "postgres", test))]
+const SQL_022_POSTGRES: &str = include_str!("022_canonical_subscription_status.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle_init` apply path.
@@ -101,6 +104,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     ("019_offer_draft_revision", SQL_019_SQLITE),
     ("020_normalize_blank_deleted_at", SQL_020_SQLITE),
     ("021_payment_link_request", SQL_021_SQLITE),
+    ("022_canonical_subscription_status", SQL_022_SQLITE),
 ];
 
 /// Ordered PostgreSQL migration scripts, one per entry in
@@ -135,6 +139,7 @@ const POSTGRES_MIGRATION_FILES: &[&str] = &[
     SQL_019_POSTGRES,
     SQL_020_POSTGRES,
     SQL_021_POSTGRES,
+    SQL_022_POSTGRES,
 ];
 
 /// The PostgreSQL scripts a deployment actually applies. Empty when the
@@ -170,6 +175,7 @@ mod strict_upgrade_tests {
         SQL_014_SQLITE, SQL_015_POSTGRES, SQL_015_SQLITE, SQL_016_POSTGRES, SQL_016_SQLITE,
         SQL_017_POSTGRES, SQL_017_SQLITE, SQL_018_POSTGRES, SQL_018_SQLITE, SQL_019_POSTGRES,
         SQL_019_SQLITE, SQL_020_POSTGRES, SQL_020_SQLITE, SQL_021_POSTGRES, SQL_021_SQLITE,
+        SQL_022_POSTGRES, SQL_022_SQLITE,
     };
     use crate::migration_helper::apply_ddl_via_service;
 
@@ -599,6 +605,119 @@ mod strict_upgrade_tests {
             assert!(
                 SQL_020_POSTGRES.contains(fragment),
                 "PostgreSQL deleted_at normalization migration is missing {fragment}"
+            );
+        }
+    }
+
+    const CANONICAL_STATUS: &str = "022_canonical_subscription_status";
+
+    async fn subscription_statuses(db: &Arc<dyn DatabaseService>) -> Vec<(String, String)> {
+        db.query_raw(
+            "SELECT id, status FROM impresspress__products__subscriptions ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("query subscription statuses")
+        .iter()
+        .map(|row| {
+            let text = |key: &str| {
+                row.data
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (text("id"), text("status"))
+        })
+        .collect()
+    }
+
+    /// A platform subscription stored under the British `cancelled` — the
+    /// spelling `cancel_and_reset_addons` wrote before 022 — is rewritten to
+    /// Stripe's `canceled`, the only spelling `SubscriptionStatus` still
+    /// decodes. Every other status is left exactly as it was.
+    ///
+    /// The block re-applies its WHOLE migration set whenever the combined hash
+    /// changes, so the second half replays every file over the migrated rows:
+    /// nothing is dropped, and the rewrite has nothing left to match.
+    #[tokio::test]
+    async fn a_stored_cancelled_subscription_is_rewritten_to_canceled_by_022() {
+        let db: Arc<dyn DatabaseService> =
+            Arc::new(SQLiteDatabaseService::open_in_memory().unwrap());
+        let before: Vec<&str> = SQLITE_MIGRATIONS
+            .iter()
+            .take_while(|(name, _)| *name != CANONICAL_STATUS)
+            .map(|(_, sql)| *sql)
+            .collect();
+        let from: Vec<&str> = SQLITE_MIGRATIONS
+            .iter()
+            .skip_while(|(name, _)| *name != CANONICAL_STATUS)
+            .map(|(_, sql)| *sql)
+            .collect();
+        assert!(
+            !from.is_empty(),
+            "022 must be wired into SQLITE_MIGRATIONS to reach a deployed database"
+        );
+        apply_ddl_via_service(&db, &before)
+            .await
+            .expect("apply pre-022 products migrations");
+
+        for (id, status) in [
+            ("sub_active", "active"),
+            ("sub_british", "cancelled"),
+            ("sub_expired", "incomplete_expired"),
+            ("sub_past_due", "past_due"),
+            ("sub_stripe", "canceled"),
+        ] {
+            let row = HashMap::from([
+                ("id".to_string(), json!(id)),
+                ("user_id".to_string(), json!(format!("user_{id}"))),
+                ("status".to_string(), json!(status)),
+            ]);
+            db.create("impresspress__products__subscriptions", row)
+                .await
+                .unwrap_or_else(|error| panic!("seed {id}: {error}"));
+        }
+
+        let expected: Vec<(String, String)> = [
+            ("sub_active", "active"),
+            ("sub_british", "canceled"),
+            ("sub_expired", "incomplete_expired"),
+            ("sub_past_due", "past_due"),
+            ("sub_stripe", "canceled"),
+        ]
+        .into_iter()
+        .map(|(id, status)| (id.to_string(), status.to_string()))
+        .collect();
+
+        apply_ddl_via_service(&db, &from).await.expect("apply 022");
+        assert_eq!(subscription_statuses(&db).await, expected);
+
+        let all: Vec<&str> = SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect();
+        apply_ddl_via_service(&db, &all)
+            .await
+            .expect("replay the whole products migration set");
+        assert_eq!(
+            subscription_statuses(&db).await,
+            expected,
+            "a replay of every products migration must keep every row and change nothing"
+        );
+    }
+
+    #[test]
+    fn canonical_subscription_status_migration_matches_sqlite_and_postgres() {
+        for fragment in [
+            "UPDATE impresspress__products__subscriptions",
+            "SET status = 'canceled'",
+            "WHERE status = 'cancelled'",
+        ] {
+            assert!(
+                SQL_022_SQLITE.contains(fragment),
+                "SQLite subscription status migration is missing {fragment}"
+            );
+            assert!(
+                SQL_022_POSTGRES.contains(fragment),
+                "PostgreSQL subscription status migration is missing {fragment}"
             );
         }
     }

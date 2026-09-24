@@ -4619,7 +4619,10 @@ async fn subscription_status_publishes_the_typed_projection() {
     let subscription = typed.subscription.expect("a subscription");
     assert_eq!(subscription.id, "sub_row");
     assert_eq!(subscription.plan, "pro");
-    assert_eq!(subscription.status, "active");
+    assert_eq!(
+        subscription.status,
+        crate::blocks::products::contracts::SubscriptionStatus::Active
+    );
     assert_eq!(subscription.stripe_subscription_id, "sub_stripe_1");
     assert_eq!(subscription.addon_projects, 2);
     assert_eq!(subscription.addon_requests, 0, "table default, not absent");
@@ -4631,6 +4634,21 @@ async fn subscription_status_publishes_the_typed_projection() {
     let (msg, input) = get_msg("/b/products/subscription", "user_2");
     let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body, serde_json::json!({"subscription": null}));
+    // A row still holding the British `cancelled` that migration 022 rewrites
+    // is outside the column's set: the endpoint answers an internal error
+    // rather than publishing a second spelling of `canceled`.
+    seed(
+        &ctx,
+        super::super::repo::subscriptions::SUBSCRIPTIONS_TABLE,
+        "sub_unmigrated",
+        HashMap::from([
+            ("user_id".to_string(), serde_json::json!("user_3")),
+            ("status".to_string(), serde_json::json!("cancelled")),
+        ]),
+    )
+    .await;
+    let (msg, input) = get_msg("/b/products/subscription", "user_3");
+    assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::Internal).await);
 }
 
 /// The public catalog publishes `contracts::CatalogProductView`: a closed

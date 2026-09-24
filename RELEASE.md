@@ -602,6 +602,33 @@ any affected product drops out of the catalog and the storefront with no admin
 action; the only signal is the generic `schema drift; redeploy with
 --run-migrations to apply` warning each boot logs for the products block.
 
+### Products API: a canceled platform subscription reads `canceled` (migration 022) — upgrade with `--run-migrations`
+
+**Wire change.** `GET /b/products/subscription` publishes the caller's
+platform subscription, and a subscription ended by Stripe's
+`customer.subscription.deleted` reported its status in the British spelling:
+
+- before: `{"subscription": {"status": "cancelled", ...}}`
+- after: `{"subscription": {"status": "canceled", ...}}`
+
+`canceled` is Stripe's own spelling, and the one every other subscription
+status in the products block already used — including an order's
+`subscription_status`. No other value changes. The field is now described as an
+enum in the OpenAPI document (`""`, `incomplete`, `incomplete_expired`,
+`trialing`, `active`, `past_due`, `unpaid`, `paused`, `canceled`), so the
+generated TypeScript type narrows from `string` to that union. A client that
+compares against `"cancelled"` must compare against `"canceled"` instead.
+
+Migration `022_canonical_subscription_status` rewrites the stored rows, so a
+subscription canceled before the upgrade reads `canceled` too. **Upgrade with
+`--run-migrations`.** The code no longer accepts the old spelling: until 022
+runs, `GET /b/products/subscription` answers 500 for a user whose row still
+holds `cancelled`, and a `customer.subscription.updated` or
+`invoice.payment_failed` delivery for that subscription fails and is retried by
+Stripe rather than applied. The migration only rewrites that
+one value, so re-running it — the block replays its whole set whenever any of
+its migrations changes — is harmless.
+
 ### Products API: internally-owned columns are now refused
 
 The four product create/update endpoints (`POST`/`PATCH` under

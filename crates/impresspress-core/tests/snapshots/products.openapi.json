@@ -17575,6 +17575,17 @@
                       },
                       "status": {
                         "description": "Stripe subscription lifecycle state.",
+                        "enum": [
+                          "",
+                          "incomplete",
+                          "incomplete_expired",
+                          "trialing",
+                          "active",
+                          "past_due",
+                          "unpaid",
+                          "paused",
+                          "canceled"
+                        ],
                         "type": "string"
                       },
                       "stripe_subscription_id": {

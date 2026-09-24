@@ -48,19 +48,6 @@ pub(crate) const ADDON_TOTALS: [(&str, &str); 4] = [
     ("extra_d1_bytes", "addon_d1_bytes"),
 ];
 
-/// Every wire spelling a terminal `status` can hold — the states
-/// [`SubscriptionStatus::is_terminal`] calls final, because Stripe issues a
-/// new subscription id for a resubscription and the row can never go live
-/// again.
-///
-/// Two variants are terminal and one of them is stored under two spellings:
-/// [`cancel_and_reset_addons`] writes `cancelled`, while every Stripe-sourced
-/// write spells it `canceled`. Excluding a status by name needs all three,
-/// which is why this is a list of spellings rather than of variants.
-/// `subscription_terminal_spellings_match_the_type` pins it against the type.
-pub(crate) const TERMINAL_STATUS_SPELLINGS: [&str; 3] =
-    ["canceled", "cancelled", "incomplete_expired"];
-
 fn platform_update_data(
     stripe_customer_id: &str,
     stripe_subscription_id: &str,
@@ -274,15 +261,6 @@ pub(crate) async fn update_status_plan(
     for _ in 0..3 {
         let current_created = current.i64_field("stripe_event_created");
         let current_status: SubscriptionStatus = enum_column(&current, "status")?;
-        // The CAS compares the stored text, not the parsed variant
-        // re-serialised: a row holding `cancelled` parses as `Canceled`,
-        // whose spelling would never match it. An absent key reads as `""`,
-        // the same value `enum_column` above turns into `Unset`.
-        let stored_status = current
-            .data
-            .get("status")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!(""));
         let incoming_status = if status == SubscriptionStatus::Unset {
             current_status
         } else {
@@ -298,9 +276,7 @@ pub(crate) async fn update_status_plan(
         }
         let now = chrono::Utc::now().to_rfc3339();
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-        // Not rewritten from `current_status` when the event has none: the
-        // row may hold the `cancelled` spelling, which serialising the
-        // variant would silently change (see `cancel_and_reset_addons`).
+        // An event without a status leaves the column as it is.
         if status != SubscriptionStatus::Unset {
             data.insert("status".into(), serde_json::json!(status));
         }
@@ -329,7 +305,7 @@ pub(crate) async fn update_status_plan(
                 Filter {
                     field: "status".into(),
                     operator: FilterOp::Equal,
-                    value: stored_status,
+                    value: serde_json::json!(current_status),
                 },
             ],
             data,
@@ -377,12 +353,6 @@ pub(crate) async fn mark_past_due(
         }
         let now = chrono::Utc::now();
         let grace_end = (now + chrono::Duration::days(7)).to_rfc3339();
-        // The `status` filter below may stay typed where
-        // [`update_status_plan`]'s had to become the stored text: the only
-        // status whose stored spelling differs from the variant's is the
-        // terminal `cancelled`, and `subscription_transition_allowed` refuses
-        // terminal → `past_due` above, so a terminal row never reaches this
-        // write. Relaxing that rule would have to move this filter too.
         let now = now.to_rfc3339();
         let mut data: HashMap<String, serde_json::Value> = HashMap::new();
         data.insert(
@@ -479,19 +449,6 @@ pub(crate) async fn recover_from_paid_invoice(
 
 /// Cancel a subscription and reset every addon column to 0
 /// (`customer.subscription.deleted`). Returns rows affected.
-///
-/// **The written literal is deliberately still `cancelled`.** This table's
-/// `status` is published verbatim as `SubscriptionView.status`
-/// (`GET /b/products/subscription`), so writing
-/// [`SubscriptionStatus::Canceled`] — the canonical spelling every
-/// Stripe-sourced column uses — would change the value that endpoint
-/// returns for every subscription cancelled from this release on, while
-/// the rows already in the table kept returning the old one. That is a
-/// wire change on a published field, and it belongs with the decision to
-/// normalise the column, which has to move the stored rows too. Reads are
-/// already reconciled: [`SubscriptionStatus`]'s `cancelled` alias means
-/// every comparison in the block sees one variant whichever spelling a row
-/// holds.
 pub(crate) async fn cancel_and_reset_addons(
     ctx: &dyn Context,
     stripe_subscription_id: &str,
@@ -499,7 +456,10 @@ pub(crate) async fn cancel_and_reset_addons(
 ) -> Result<i64, WaferError> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut data: HashMap<String, serde_json::Value> = HashMap::new();
-    data.insert("status".into(), serde_json::json!("cancelled"));
+    data.insert(
+        "status".into(),
+        serde_json::json!(SubscriptionStatus::Canceled),
+    );
     for (_, column) in ADDON_TOTALS {
         data.insert(column.into(), serde_json::json!(0));
     }
@@ -577,11 +537,16 @@ pub(crate) async fn set_addon_totals(
             value: serde_json::json!(event_created),
         },
     ];
-    filters.extend(TERMINAL_STATUS_SPELLINGS.iter().map(|spelling| Filter {
-        field: "status".into(),
-        operator: FilterOp::NotEqual,
-        value: serde_json::json!(spelling),
-    }));
+    filters.extend(
+        SubscriptionStatus::ALL
+            .into_iter()
+            .filter(|status| status.is_terminal())
+            .map(|status| Filter {
+                field: "status".into(),
+                operator: FilterOp::NotEqual,
+                value: serde_json::json!(status),
+            }),
+    );
     db::update_by_filters_count(ctx, SUBSCRIPTIONS_TABLE, filters, data).await
 }
 
@@ -646,7 +611,7 @@ pub(crate) async fn active_plan_exists(
                 Filter {
                     field: "status".into(),
                     operator: FilterOp::Equal,
-                    value: serde_json::json!("active"),
+                    value: serde_json::json!(SubscriptionStatus::Active),
                 },
                 Filter {
                     field: "plan".into(),
@@ -689,7 +654,7 @@ pub(crate) async fn subscription_for_user(
     )
     .await
     {
-        Ok(record) => Ok(Some(SubscriptionView::from_record(&record))),
+        Ok(record) => SubscriptionView::from_record(&record).map(Some),
         Err(e) if e.code == ErrorCode::NotFound => Ok(None),
         Err(e) => Err(e),
     }
