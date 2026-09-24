@@ -136,7 +136,8 @@ listener; each is unset by default, which keeps the listener's own default.
 - `IMPRESSPRESS_SHUTDOWN_GRACE_SECS` — how long a stopping server lets open
   requests finish. Shutdown may now wait up to this long.
 
-A value the listener cannot use fails boot with a message naming the setting.
+A value the listener cannot use stops the server at boot, with a message naming
+the setting.
 
 ### Cloudflare: outbound redirects are followed, hop by hop
 
@@ -166,18 +167,21 @@ than rewriting it, and an index's tables are named after it
 give a table name longer than the 63 bytes PostgreSQL keeps.
 
 **Your data.** Nothing to run. Each time the vector block starts, it moves every
-index registered with an uppercase letter to its lowercase name — the index's
-tables, its entries and its keyword search, then its registry row
-(`vector.rename_index`, one transaction per index on native SQLite and in the
-browser). `Docs` becomes `docs` and answers under that name with everything
-it held. The move is logged at info level, and a start that finds nothing to
-move does nothing.
+index whose name has an uppercase letter to its lowercase name — the index's
+tables, its entries and its keyword search (`vector.rename_index`, one
+transaction per index on native SQLite and in the browser) — whether the
+registry names it or only the vector store does. `Docs` becomes `docs` and
+answers under that name with everything it held, and its registry row is
+renamed with it. The move is logged at info level, and a start that finds
+nothing to move does nothing.
 
-**Two indexes that differ only by case** (`Docs` beside `docs`) are never
-merged. The uppercase one is left as it is and named in an error log ("two
-vector indexes differ only by case"); it cannot be opened until you delete
-one of the two. Any other index that cannot be moved is named in an error log
-with the reason, and the rest of the vector block keeps working.
+**Two registry rows that differ only by case** (`Docs` beside `docs`) describe
+one index: SQLite compares table names without case, so both rows point at
+the same tables and the data exists once. The index is moved, the lowercase
+row is kept, the `Docs` row is removed, and the log says so. Delete nothing
+yourself. An index that cannot be moved is named in an error log with the
+reason and tried again on the next start; the rest of the vector block keeps
+working.
 
 **Until the move has run**, an index whose name has an uppercase letter makes
 the vector admin's index list answer an error and cannot be opened, queried
