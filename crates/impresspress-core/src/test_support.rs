@@ -1150,6 +1150,21 @@ impl TestContext {
     /// that cannot be written takes. Used to prove a save handler reports the
     /// failure instead of a success.
     pub fn refuse_config_writes(&mut self) {
+        self.refuse_config_op(
+            wafer_block::common::ServiceOp::CONFIG_SET,
+            WaferError::new(ErrorCode::Internal, "simulated config write failure"),
+        );
+    }
+
+    /// Make every `config.get` answer `error` while writes keep reaching the
+    /// registered config block — a config read the caller is refused. Used to
+    /// prove a handler sends the refusal through its classifier instead of
+    /// answering with a default or echoing the refusal's own text.
+    pub fn refuse_config_reads(&mut self, error: WaferError) {
+        self.refuse_config_op(wafer_block::common::ServiceOp::CONFIG_GET, error);
+    }
+
+    fn refuse_config_op(&mut self, op: &'static str, error: WaferError) {
         let inner = self
             .blocks
             .lock()
@@ -1157,7 +1172,10 @@ impl TestContext {
             .get("wafer-run/config")
             .cloned()
             .expect("every fixture registers a config block");
-        self.register_block("wafer-run/config", Arc::new(RefusingConfigWrites(inner)));
+        self.register_block(
+            "wafer-run/config",
+            Arc::new(RefusingConfigOp { inner, op, error }),
+        );
     }
 
     /// Replace the database backing this context with one whose mutating
@@ -2885,24 +2903,26 @@ impl TestContext {
     }
 }
 
-/// The config block behind [`TestContext::refuse_config_writes`]: every
-/// `config.set` fails, everything else reaches the wrapped block.
-struct RefusingConfigWrites(Arc<dyn Block>);
+/// The config block behind [`TestContext::refuse_config_writes`] and
+/// [`TestContext::refuse_config_reads`]: every `op` answers `error`,
+/// everything else reaches the wrapped block.
+struct RefusingConfigOp {
+    inner: Arc<dyn Block>,
+    op: &'static str,
+    error: WaferError,
+}
 
 #[wafer_block::wafer_async_trait]
-impl Block for RefusingConfigWrites {
+impl Block for RefusingConfigOp {
     fn info(&self) -> BlockInfo {
-        self.0.info()
+        self.inner.info()
     }
 
     async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
-        if msg.kind == wafer_block::common::ServiceOp::CONFIG_SET {
-            return OutputStream::error(WaferError::new(
-                ErrorCode::Internal,
-                "simulated config write failure",
-            ));
+        if msg.kind == self.op {
+            return OutputStream::error(self.error.clone());
         }
-        self.0.handle(ctx, msg, input).await
+        self.inner.handle(ctx, msg, input).await
     }
 }
 
