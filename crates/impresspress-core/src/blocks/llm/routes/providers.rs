@@ -601,10 +601,13 @@ mod tests {
     // which needs the concrete `ProviderLlmService` and so carries the same
     // gate.
     #[cfg(feature = "llm")]
-    use crate::blocks::llm::{providers::config::ProviderProtocol, EXAMPLE_KEY_VAR};
+    use crate::blocks::llm::EXAMPLE_KEY_VAR;
     use crate::{
-        blocks::llm::routes::test_support::{
-            admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
+        blocks::llm::{
+            providers::config::ProviderProtocol,
+            routes::test_support::{
+                admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
+            },
         },
         test_support::{output_json, TestContext},
     };
