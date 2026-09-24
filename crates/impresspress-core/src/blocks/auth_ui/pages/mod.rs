@@ -14,7 +14,10 @@ pub mod signup;
 use maud::{html, Markup};
 use wafer_run::context::Context;
 
-use crate::ui::{self, SiteConfig};
+use crate::{
+    blocks::auth_ui::OAUTH_REDIRECT_URI_KEY,
+    ui::{self, SiteConfig},
+};
 
 /// The auth pages' site config.
 ///
@@ -66,7 +69,7 @@ pub(super) async fn oauth_provider_configured(ctx: &dyn Context, provider: &str)
     if client_secret.is_empty() {
         return false;
     }
-    !config::get_default(ctx, "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI", "")
+    !config::get_default(ctx, OAUTH_REDIRECT_URI_KEY, "")
         .await
         .is_empty()
 }
@@ -327,14 +330,22 @@ document.addEventListener('submit',function(e){if(e.target&&e.target.id==='form'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::{
+        blocks::auth_ui::{
+            OAUTH_GITHUB_CLIENT_ID_KEY, OAUTH_GITHUB_CLIENT_SECRET_KEY, OAUTH_REDIRECT_URI_KEY,
+        },
+        config_vars::{
+            APP_NAME_KEY, AUTH_LOGO_URL_KEY, DEFAULT_APP_NAME, EMBEDDED_SCRIPTS_KEY, LOGO_URL_KEY,
+        },
+        test_support::TestContext,
+    };
 
     #[tokio::test]
     async fn site_config_reads_from_ctx_config_get_with_defaults() {
         let ctx = TestContext::new().await;
         let cfg = site_config(&ctx).await;
 
-        assert_eq!(cfg.app_name, "Impresspress");
+        assert_eq!(cfg.app_name, DEFAULT_APP_NAME);
         assert_eq!(cfg.logo_url, "", "no wordmark image by default");
         assert_eq!(cfg.logo_icon_url, crate::ui::assets::logo_icon_url());
         assert_eq!(cfg.favicon_url, crate::ui::assets::favicon_url());
@@ -344,11 +355,8 @@ mod tests {
     #[tokio::test]
     async fn site_config_picks_auth_logo_when_set() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config(
-            "WAFER_RUN_SHARED__AUTH_LOGO_URL",
-            "https://example.com/auth.png",
-        );
-        ctx.set_config("WAFER_RUN_SHARED__LOGO_URL", "https://example.com/main.png");
+        ctx.set_config(AUTH_LOGO_URL_KEY, "https://example.com/auth.png");
+        ctx.set_config(LOGO_URL_KEY, "https://example.com/main.png");
 
         let cfg = site_config(&ctx).await;
         assert_eq!(cfg.logo_url, "https://example.com/auth.png");
@@ -357,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn site_config_falls_back_to_logo_url_when_auth_logo_empty() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__LOGO_URL", "https://example.com/main.png");
+        ctx.set_config(LOGO_URL_KEY, "https://example.com/main.png");
 
         let cfg = site_config(&ctx).await;
         assert_eq!(cfg.logo_url, "https://example.com/main.png");
@@ -366,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn site_config_app_name_override() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
+        ctx.set_config(APP_NAME_KEY, "MyApp");
 
         let cfg = site_config(&ctx).await;
         assert_eq!(cfg.app_name, "MyApp");
@@ -376,7 +384,7 @@ mod tests {
     async fn site_config_embedded_scripts_splits_csv() {
         let mut ctx = TestContext::new().await;
         ctx.set_config(
-            "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS",
+            EMBEDDED_SCRIPTS_KEY,
             "https://a.example.com/a.js, https://b.example.com/b.js,",
         );
 
@@ -393,20 +401,14 @@ mod tests {
     #[tokio::test]
     async fn oauth_provider_configured_requires_all_three_keys() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_ID", "id");
-        ctx.set_config(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_SECRET",
-            "secret",
-        );
+        ctx.set_config(OAUTH_GITHUB_CLIENT_ID_KEY, "id");
+        ctx.set_config(OAUTH_GITHUB_CLIENT_SECRET_KEY, "secret");
         assert!(
             !oauth_provider_configured(&ctx, "github").await,
             "should be false without REDIRECT_URI"
         );
 
-        ctx.set_config(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI",
-            "https://example.com/cb",
-        );
+        ctx.set_config(OAUTH_REDIRECT_URI_KEY, "https://example.com/cb");
         assert!(
             oauth_provider_configured(&ctx, "github").await,
             "should be true once all three are set"

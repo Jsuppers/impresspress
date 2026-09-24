@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{
     blocks::auth_ui::redirect::is_safe_local_redirect,
+    config_vars::{ALLOW_SIGNUP_KEY, ENABLE_OAUTH_KEY},
     ui::{
         self,
         components::{alert, auth_panel, oauth_button, AlertVariant},
@@ -18,8 +19,7 @@ use crate::{
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx).await;
-    let allow_signup =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await;
+    let allow_signup = crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await;
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
     // Validate redirect — only allow relative paths (prevent open redirect)
     let redirect = if is_safe_local_redirect(&raw_redirect) {
@@ -48,8 +48,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // full credential triple (CLIENT_ID + CLIENT_SECRET + REDIRECT_URL) is
     // present in env. Avoids rendering a "Continue with GitHub" button that
     // would 4xx as soon as it's clicked.
-    let oauth_enabled =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", false).await;
+    let oauth_enabled = crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await;
     // A loop rather than `.filter()`: the predicate reads config through the
     // async client now, and an async predicate has no place in `Iterator`.
     let mut oauth_providers: Vec<&'static str> = Vec::new();
@@ -135,7 +134,13 @@ mod tests {
     use wafer_run::Message;
 
     use super::handle;
-    use crate::test_support::{output_html, TestContext};
+    use crate::{
+        blocks::auth_ui::{
+            OAUTH_GITHUB_CLIENT_ID_KEY, OAUTH_GITHUB_CLIENT_SECRET_KEY, OAUTH_REDIRECT_URI_KEY,
+        },
+        config_vars::{ALLOW_SIGNUP_KEY, ENABLE_OAUTH_KEY},
+        test_support::{output_html, TestContext},
+    };
 
     /// The page and the API must answer "is signup allowed?" the same way.
     ///
@@ -147,7 +152,7 @@ mod tests {
     async fn signup_link_and_signup_api_read_the_same_truth_table() {
         for enabled in ["1", "true", "YES", " on "] {
             let mut ctx = TestContext::new().await;
-            ctx.set_config("WAFER_RUN_SHARED__ALLOW_SIGNUP", enabled);
+            ctx.set_config(ALLOW_SIGNUP_KEY, enabled);
             let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
             assert!(
                 crate::blocks::auth::helpers::signup_allowed(&ctx).await,
@@ -160,7 +165,7 @@ mod tests {
         }
         for disabled in ["0", "false", "", "bogus"] {
             let mut ctx = TestContext::new().await;
-            ctx.set_config("WAFER_RUN_SHARED__ALLOW_SIGNUP", disabled);
+            ctx.set_config(ALLOW_SIGNUP_KEY, disabled);
             let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
             assert!(
                 !crate::blocks::auth::helpers::signup_allowed(&ctx).await,
@@ -178,16 +183,10 @@ mod tests {
     #[tokio::test]
     async fn oauth_buttons_follow_the_same_truth_table_as_the_oauth_start_handler() {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__ENABLE_OAUTH", "1");
-        ctx.set_config("IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_ID", "gh_id");
-        ctx.set_config(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_GITHUB_CLIENT_SECRET",
-            "gh_secret",
-        );
-        ctx.set_config(
-            "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI",
-            "https://app/cb",
-        );
+        ctx.set_config(ENABLE_OAUTH_KEY, "1");
+        ctx.set_config(OAUTH_GITHUB_CLIENT_ID_KEY, "gh_id");
+        ctx.set_config(OAUTH_GITHUB_CLIENT_SECRET_KEY, "gh_secret");
+        ctx.set_config(OAUTH_REDIRECT_URI_KEY, "https://app/cb");
         let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
         assert!(
             html.contains(r#"data-provider="github""#),

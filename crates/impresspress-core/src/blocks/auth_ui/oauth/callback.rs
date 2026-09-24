@@ -20,6 +20,7 @@ use crate::{
         crud,
         errors::{impresspress_error_code_to_wafer, ErrorCode},
     },
+    config_vars::{ENABLE_OAUTH_KEY, FRONTEND_URL_KEY, POST_LOGIN_REDIRECT_KEY},
     http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, ResponseBuilder},
 };
 
@@ -63,8 +64,7 @@ pub async fn handle(
     msg: &Message,
 ) -> OutputStream {
     // Check ENABLE_OAUTH flag
-    let enable_oauth =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", false).await;
+    let enable_oauth = crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await;
     if !enable_oauth {
         return err_forbidden("OAuth login is not enabled");
     }
@@ -232,12 +232,7 @@ pub async fn handle(
     };
 
     // Redirect to frontend — token is set via HttpOnly cookie only (not URL)
-    let frontend_url = config::get_default(
-        ctx,
-        "WAFER_RUN_SHARED__FRONTEND_URL",
-        "http://localhost:5173",
-    )
-    .await;
+    let frontend_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
     // [SEC-036] Validate FRONTEND_URL before plugging it into a Location
     // header — a misconfigured (or attacker-controlled) value here would
     // turn every OAuth callback into an open redirect.
@@ -248,8 +243,7 @@ pub async fn handle(
         );
         return err_internal_no_cause("Frontend URL is not configured correctly");
     }
-    let post_login_raw =
-        config::get_default(ctx, "WAFER_RUN_SHARED__POST_LOGIN_REDIRECT", "/b/admin/").await;
+    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
     let admin_default = if is_safe_local_redirect(&post_login_raw) {
         post_login_raw
     } else {
@@ -944,9 +938,13 @@ mod security_regression_tests {
     use super::handle;
     use crate::{
         blocks::{
-            auth::repo::{oauth_pkce, provider_links, sessions, users},
+            auth::{
+                config::BOOTSTRAP_ADMIN_EMAIL_KEY,
+                repo::{oauth_pkce, provider_links, sessions, users},
+            },
             rate_limit::UserRateLimiter,
         },
+        config_vars::ENABLE_OAUTH_KEY,
         test_support::TestContext,
     };
 
@@ -1250,7 +1248,7 @@ mod security_regression_tests {
                 service_blocks::config::{ConfigBlock, EnvConfigService},
             };
             let cfg_svc = EnvConfigService::new();
-            cfg_svc.set("WAFER_RUN_SHARED__ENABLE_OAUTH", "true");
+            cfg_svc.set(ENABLE_OAUTH_KEY, "true");
             let upper = self.provider.to_uppercase();
             cfg_svc.set(
                 &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{upper}_CLIENT_ID"),
@@ -1792,7 +1790,7 @@ mod security_regression_tests {
     async fn an_unasserted_provider_address_cannot_claim_the_bootstrap_admin_role() {
         let admin_email = "admin@example.com";
         let ctx = OauthFlow::microsoft(admin_email)
-            .config("WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL", admin_email)
+            .config(BOOTSTRAP_ADMIN_EMAIL_KEY, admin_email)
             .ctx()
             .await;
 
@@ -1834,7 +1832,7 @@ mod security_regression_tests {
         let account_email = "bob@example.com";
         // Google asserts `admin@example.com`, but the linked account is Bob's.
         let ctx = OauthFlow::google(admin_email)
-            .config("WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL", admin_email)
+            .config(BOOTSTRAP_ADMIN_EMAIL_KEY, admin_email)
             .ctx()
             .await;
 
@@ -2088,9 +2086,9 @@ mod security_regression_tests {
     /// way to drain that budget: no account, no password, no captcha — just a
     /// provider round trip per message.
     ///
-    /// `RATE_LIMIT_AUTH_EMAIL` is one per hour here, and the single token is
-    /// spent before the sign-in by another request from the same IP. The
-    /// callback must find the bucket empty and send nothing — not because of
+    /// The `auth_email` category's override is one per hour here, and the
+    /// single token is spent before the sign-in by another request from the
+    /// same IP. The callback must find the bucket empty and send nothing — not because of
     /// the resend cooldown (this account has never been mailed) but because
     /// the budget is the same budget.
     #[tokio::test]
@@ -2102,7 +2100,7 @@ mod security_regression_tests {
         let email = "budgeted@example.com";
         let (ctx, mail) = OauthFlow::microsoft(email)
             .require_verification()
-            .config("WAFER_RUN_SHARED__RATE_LIMIT_AUTH_EMAIL", "1/3600")
+            .config(&RateLimit::override_key("auth_email"), "1/3600")
             .ctx_and_mail()
             .await;
         let shared = limiter();
@@ -2390,7 +2388,7 @@ mod security_regression_tests {
     async fn oauth_login_admin_email_redirects_to_admin_home() {
         let email = "oauthadmin@example.com";
         let ctx = OauthFlow::google(email)
-            .config("WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL", email)
+            .config(BOOTSTRAP_ADMIN_EMAIL_KEY, email)
             .ctx()
             .await;
 

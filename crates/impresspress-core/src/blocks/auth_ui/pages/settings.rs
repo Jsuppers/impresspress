@@ -7,6 +7,7 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use crate::{
     blocks::{auth::config as auth_config, crud},
     config_vars,
+    config_vars::{ALLOW_SIGNUP_KEY, ENABLE_OAUTH_KEY, POST_LOGIN_REDIRECT_KEY},
     ui::{
         self, components, icons,
         settings_form::{self, SettingsSection},
@@ -28,15 +29,15 @@ fn sections() -> Sections {
     let identity = auth_config::auth_identity_config_vars();
     let oauth_creds = super::super::config_vars();
 
-    let mut oauth = vec![config_vars::shared_var("WAFER_RUN_SHARED__ENABLE_OAUTH")];
+    let mut oauth = vec![config_vars::shared_var(ENABLE_OAUTH_KEY)];
     oauth.extend(oauth_creds);
 
     Sections {
         registration: vec![
-            config_vars::shared_var("WAFER_RUN_SHARED__ALLOW_SIGNUP"),
+            config_vars::shared_var(ALLOW_SIGNUP_KEY),
             config_vars::var_in(&identity, auth_config::REQUIRE_VERIFICATION_KEY),
             config_vars::var_in(&identity, auth_config::ALLOWED_EMAIL_DOMAINS_KEY),
-            config_vars::shared_var("WAFER_RUN_SHARED__POST_LOGIN_REDIRECT"),
+            config_vars::shared_var(POST_LOGIN_REDIRECT_KEY),
         ],
         admin: vec![
             config_vars::shared_var(auth_config::BOOTSTRAP_ADMIN_EMAIL_KEY),

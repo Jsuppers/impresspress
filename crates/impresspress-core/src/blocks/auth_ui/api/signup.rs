@@ -25,6 +25,7 @@ use crate::{
         errors::{error_response, ErrorCode},
         rate_limit::UserRateLimiter,
     },
+    config_vars::POST_LOGIN_REDIRECT_KEY,
     http::{err_bad_request, err_internal, ResponseBuilder},
     util::{hex_encode, sha256_hex},
 };
@@ -233,8 +234,7 @@ pub async fn handle(
     // is (almost) never an admin, so this sends them to `/b/userportal/`
     // instead of the silent bounce to `/b/auth/login` the page used to do —
     // same single-sourced rule Fix 1 applies to login/OAuth/bootstrap.
-    let post_login_raw =
-        config::get_default(ctx, "WAFER_RUN_SHARED__POST_LOGIN_REDIRECT", "/b/admin/").await;
+    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
     let admin_default = if is_safe_local_redirect(&post_login_raw) {
         post_login_raw
     } else {
@@ -274,7 +274,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_support::{output_json, TestContext};
+    use crate::{
+        blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY,
+        test_support::{output_json, TestContext},
+    };
 
     async fn ctx_with_crypto() -> TestContext {
         let mut ctx = TestContext::with_auth().await;
@@ -324,10 +327,7 @@ mod tests {
     #[tokio::test]
     async fn admin_email_signup_defaults_to_admin_home() {
         let mut ctx = ctx_with_crypto().await;
-        ctx.set_config(
-            "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL",
-            "admin@example.com",
-        );
+        ctx.set_config(BOOTSTRAP_ADMIN_EMAIL_KEY, "admin@example.com");
 
         let resp = signup(&ctx, "admin@example.com", "correct-horse-battery").await;
 

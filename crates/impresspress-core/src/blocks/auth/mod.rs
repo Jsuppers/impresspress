@@ -525,6 +525,10 @@ mod auth_version_cache_tests {
 /// - `"bootstrap"` — bootstrap-token redemption (see [`bootstrap`]).
 pub(crate) mod helpers {
     use super::*;
+    use crate::{
+        blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY,
+        config_vars::{ALLOW_SIGNUP_KEY, ENVIRONMENT_KEY, FRONTEND_URL_KEY},
+    };
 
     /// Resolve `user_id`'s merged role set: the inline `users.role` (the
     /// bootstrap path) plus any rows in the legacy `user_roles::TABLE`
@@ -589,9 +593,7 @@ pub(crate) mod helpers {
         // common case in production is "unset" — early-return then,
         // skipping the second `db::create` path entirely. Authenticated
         // routes mint tokens often enough that the saved DB reads accumulate.
-        let admin_email =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL", "")
-                .await;
+        let admin_email = config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await;
 
         let mut roles = get_user_roles(ctx, user_id).await?;
 
@@ -633,7 +635,7 @@ pub(crate) mod helpers {
     /// brand-new-user branch — `WAFER_RUN_SHARED__AUTH__SIGNUP_ENABLED` was a
     /// dead duplicate with the opposite default and has been removed.
     pub(crate) async fn signup_allowed(ctx: &dyn wafer_run::context::Context) -> bool {
-        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await
+        crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await
     }
 
     /// Whether `email`'s domain is permitted to register.
@@ -867,12 +869,7 @@ pub(crate) mod helpers {
     /// means a token minted in dev (`http://localhost:5173`) won't validate
     /// against a production secret if one leaks between environments.
     pub(crate) async fn expected_issuer(ctx: &dyn wafer_run::context::Context) -> String {
-        config_client::get_default(
-            ctx,
-            "WAFER_RUN_SHARED__FRONTEND_URL",
-            "http://localhost:5173",
-        )
-        .await
+        config_client::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await
     }
 
     /// Persist a freshly minted refresh token.
@@ -916,8 +913,7 @@ pub(crate) mod helpers {
     pub(crate) async fn cookie_secure_attribute(
         ctx: &dyn wafer_run::context::Context,
     ) -> &'static str {
-        let env =
-            config_client::get_default(ctx, "WAFER_RUN_SHARED__ENVIRONMENT", "development").await;
+        let env = config_client::get_default(ctx, ENVIRONMENT_KEY, "development").await;
         if env.to_lowercase() == "development" {
             ""
         } else {

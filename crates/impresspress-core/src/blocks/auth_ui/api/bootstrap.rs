@@ -26,6 +26,7 @@ use crate::{
         crud,
         errors::error_response,
     },
+    config_vars::POST_LOGIN_REDIRECT_KEY,
     http::{
         err_bad_request, err_forbidden, err_internal_no_cause, err_unauthorized, ResponseBuilder,
     },
@@ -135,8 +136,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     //    right completion signal. Honor WAFER_RUN_SHARED__POST_LOGIN_REDIRECT
     //    (validated) like login/oauth, defaulting to the admin home — the old
     //    `/b/auth/dashboard` target is not a registered route (404).
-    let post_login_raw =
-        config::get_default(ctx, "WAFER_RUN_SHARED__POST_LOGIN_REDIRECT", "/b/admin/").await;
+    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
     let admin_default = if is_safe_local_redirect(&post_login_raw) {
         post_login_raw
     } else {
