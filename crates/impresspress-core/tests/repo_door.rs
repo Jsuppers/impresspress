@@ -622,6 +622,7 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
         &[
             "blocks/products/repo/subscriptions.rs",
             "blocks/products/tests/repo_tests.rs",
+            "blocks/products/migrations/mod.rs",
         ],
     ),
     (
