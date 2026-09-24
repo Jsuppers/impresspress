@@ -20,7 +20,7 @@ use super::{
     DevBlock,
 };
 use crate::test_support::{
-    admin_msg, output_json, FailingDbOpContext, FailingStorageOpContext, TestContext,
+    admin_msg, output_json, FailingDbOpContext, FailingServiceOpContext, TestContext,
 };
 
 /// The refusal WRAP answers a call its caller holds no grant for. Its text
@@ -45,8 +45,8 @@ fn denied(ctx: &TestContext, table: &'static str) -> FailingDbOpContext {
 }
 
 /// `op` on `wafer-run/storage`, refused the way WRAP refuses it.
-fn storage_denied(ctx: &TestContext, op: &'static str) -> FailingStorageOpContext {
-    FailingStorageOpContext::failing_with(ctx.clone(), vec![op], wrap_denial())
+fn storage_denied(ctx: &TestContext, op: &'static str) -> FailingServiceOpContext {
+    FailingServiceOpContext::failing_with(ctx.clone(), "wafer-run/storage", vec![op], wrap_denial())
 }
 
 /// A fresh sandbox whose compiled guests validate as `site/hello`.
@@ -147,7 +147,7 @@ async fn refused_workspace_storage_is_403_on_every_file_route() {
     };
 
     let sites: Vec<(
-        FailingStorageOpContext,
+        FailingServiceOpContext,
         (&str, &str, serde_json::Value),
         &str,
     )> = vec![

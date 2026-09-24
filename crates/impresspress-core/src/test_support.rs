@@ -2272,18 +2272,21 @@ impl Context for FailingDbOpContext {
     }
 }
 
-/// [`FailingDbOpContext`] for `"wafer-run/storage"`: wraps a [`TestContext`]
-/// and answers `error` to every storage call whose op ([`Message::action`],
-/// e.g. `"storage.put"` — see `wafer_block::common::ServiceOp`) is one of
-/// `failing`, while every other call passes through untouched.
+/// [`FailingDbOpContext`] for any other service block: wraps a
+/// [`TestContext`] and answers `error` to every call to `block` whose op
+/// ([`Message::action`], e.g. `"storage.put"` or `"crypto.compare_hash"` — see
+/// `wafer_block::common::ServiceOp`) is one of `failing`, while every other
+/// call passes through untouched.
 ///
 /// Matched on the op alone: a storage request names a folder the storage
-/// block rewrites into the caller's namespace, so the op is what a test can
-/// aim at. A handler that makes the same op twice (a manifest read, then a
-/// blob read) is isolated with [`Self::after_passing`].
+/// block rewrites into the caller's namespace, and a crypto request carries
+/// no resource at all, so the op is what a test can aim at. A handler that
+/// makes the same op twice (a manifest read, then a blob read) is isolated
+/// with [`Self::after_passing`].
 #[derive(Clone)]
-pub struct FailingStorageOpContext {
+pub struct FailingServiceOpContext {
     inner: TestContext,
+    block: &'static str,
     failing: Vec<&'static str>,
     error: WaferError,
     /// Matching calls still to let through; shared across clones, as in
@@ -2291,12 +2294,18 @@ pub struct FailingStorageOpContext {
     passes_before_failing: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl FailingStorageOpContext {
-    /// Wrap `inner`, answering `error` to every storage call whose op is in
+impl FailingServiceOpContext {
+    /// Wrap `inner`, answering `error` to every call to `block` whose op is in
     /// `failing`.
-    pub fn failing_with(inner: TestContext, failing: Vec<&'static str>, error: WaferError) -> Self {
+    pub fn failing_with(
+        inner: TestContext,
+        block: &'static str,
+        failing: Vec<&'static str>,
+        error: WaferError,
+    ) -> Self {
         Self {
             inner,
+            block,
             failing,
             error,
             passes_before_failing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2312,7 +2321,7 @@ impl FailingStorageOpContext {
 }
 
 #[async_trait::async_trait]
-impl Context for FailingStorageOpContext {
+impl Context for FailingServiceOpContext {
     fn check_resource_access(
         &self,
         resource: &str,
@@ -2335,7 +2344,7 @@ impl Context for FailingStorageOpContext {
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
         use std::sync::atomic::Ordering;
-        if name == "wafer-run/storage"
+        if name == self.block
             && self.failing.contains(&msg.action())
             && self
                 .passes_before_failing
@@ -2824,7 +2833,7 @@ impl TestContext {
     /// The fixture runs as `impresspress/auth-ui`, the block every session
     /// token is minted in: the crypto block signs under its caller's derived
     /// key and refuses a call with none.
-    async fn with_auth_and_crypto_service(svc: Arc<dyn CryptoService>) -> Self {
+    pub(crate) async fn with_auth_and_crypto_service(svc: Arc<dyn CryptoService>) -> Self {
         let mut ctx = Self::with_auth().await;
         let crypto_block: Arc<dyn wafer_run::Block> =
             Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
@@ -2833,7 +2842,7 @@ impl TestContext {
     }
 }
 
-fn real_crypto_service() -> wafer_block_crypto::service::Argon2JwtCryptoService {
+pub(crate) fn real_crypto_service() -> wafer_block_crypto::service::Argon2JwtCryptoService {
     wafer_block_crypto::service::Argon2JwtCryptoService::new(CRYPTO_BLOCK_JWT_SECRET.to_string())
         .expect("test secret is long enough")
 }
@@ -4584,4 +4593,138 @@ mod tests {
             .expect("call must succeed without with_wrap");
         assert_eq!(res.records.len(), 0);
     }
+}
+
+/// The events `tracing` emitted on this thread while a [`CapturedEvents`]
+/// was installed, for a test that asserts an operator-facing log line.
+///
+/// Installed as the thread's default subscriber (`tracing::subscriber::
+/// set_default`), so it sees only what the installing thread emits — which is
+/// what a `#[tokio::test]` handler call on the default current-thread runtime
+/// runs on — and never another test's events. Written against `tracing`'s own
+/// `Subscriber` trait because the crate has no `tracing-subscriber`
+/// dependency to borrow a layer from.
+#[cfg(test)]
+pub struct CapturedEvents {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+/// One event [`CapturedEvents`] saw: its level and every field it carried,
+/// the format string's rendering included under `"message"`.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct CapturedEvent {
+    pub level: tracing::Level,
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl CapturedEvents {
+    /// Start capturing; capture stops when the value is dropped.
+    pub fn install() -> Self {
+        // `tracing-core` caches each callsite's interest the first time the
+        // callsite is hit. While at most one dispatcher is registered it asks
+        // only the HITTING thread's default, so another test thread that hits
+        // a callsite first caches "never" for it — and this thread's
+        // recorder then never sees the event. A second dispatcher kept alive
+        // for the whole process makes every registration ask all of them;
+        // it answers "sometimes", which leaves the decision to each event's
+        // own thread.
+        static UNDECIDED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        UNDECIDED.get_or_init(|| tracing::Dispatch::new(Undecided));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(EventRecorder(Arc::clone(&events)));
+        Self {
+            events,
+            _guard: guard,
+        }
+    }
+
+    /// Every event captured so far, in emission order.
+    pub fn events(&self) -> Vec<CapturedEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(test)]
+struct EventRecorder(Arc<Mutex<Vec<CapturedEvent>>>);
+
+/// Records nothing, and answers every callsite "sometimes" (see
+/// [`CapturedEvents::install`]).
+#[cfg(test)]
+struct Undecided;
+
+#[cfg(test)]
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[cfg(test)]
+impl tracing::Subscriber for EventRecorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields<'a>(&'a mut std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        event.record(&mut Fields(&mut fields));
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(CapturedEvent {
+                level: *event.metadata().level(),
+                fields,
+            });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }
