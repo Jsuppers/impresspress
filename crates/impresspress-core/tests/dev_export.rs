@@ -33,6 +33,7 @@ use impresspress_core::{
         repo::generations::GenerationCause,
         seed::{self, SeedManifest},
         test_support::{dev_post, hello_info, FakeControl, FakeShell},
+        WAFER_GUEST_VERSION,
     },
     platform_state::variables,
     test_support::{
@@ -241,7 +242,7 @@ async fn shop_instance_with_shell(
                 "artifact_base64": b64(ARTIFACT),
                 "compiler_version": "t",
                 "diagnostics": [],
-                "wafer_guest_version": 1,
+                "wafer_guest_version": WAFER_GUEST_VERSION,
             }),
         )
         .await,
@@ -711,7 +712,7 @@ async fn a_recorded_source_digest_is_compared_against_the_workspace() {
                 "source_manifest_sha256": digest,
                 "compiler_version": "t",
                 "diagnostics": [],
-                "wafer_guest_version": 1,
+                "wafer_guest_version": WAFER_GUEST_VERSION,
             }),
         )
         .await,
