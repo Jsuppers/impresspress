@@ -16,7 +16,7 @@ use crate::{
     blocks::products::{
         contracts::{
             OfferDefinitionRequest, OfferSyncStatus, PaymentLinkCreateRequest,
-            PricingPreviewRequest, SubscriptionStatus,
+            PricingPreviewRequest,
         },
         offer_pricing, repo, stripe,
     },
