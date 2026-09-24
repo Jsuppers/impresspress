@@ -68,7 +68,8 @@ pub fn register_site_main(
 /// but a **bag** of them, and this function is not their only author:
 ///
 /// * `wafer-run/security-headers` — the browser sandbox declares
-///   `{"csp": "… worker-src 'self' blob:; frame-src 'self'", "frame_ancestors": "self"}`
+///   `{"csp": "… worker-src 'self'; frame-src 'self'", "frame_ancestors": "self",
+///   "allow_blob_workers": true}`
 ///   so the `/b/dev` page can spawn its compiler worker and frame its own
 ///   live preview. Replacing that with `{"csp": <shared directives>}` dropped
 ///   both — silently, visible only as a browser refusing to start a worker.
@@ -262,9 +263,9 @@ mod tests {
         vec![(
             SECURITY_HEADERS_BLOCK.to_string(),
             serde_json::json!({
-                "csp": "default-src 'self'; frame-ancestors 'none'; \
-                        worker-src 'self' blob:; frame-src 'self'",
+                "csp": "default-src 'self'; worker-src 'self'; frame-src 'self'",
                 "frame_ancestors": "self",
+                "allow_blob_workers": true,
                 "cross_origin_isolation": "credentialless",
             }),
         )]
@@ -303,7 +304,7 @@ mod tests {
 
         let csp = merged["csp"].as_str().expect("csp is a string");
         // The consumer's directives survive…
-        assert!(csp.contains("worker-src 'self' blob:"), "{csp}");
+        assert!(csp.contains("worker-src 'self'"), "{csp}");
         assert!(csp.contains("default-src 'self'"), "{csp}");
         // …the shared ones are added, a directive both name taking both
         // authors' sources…
@@ -324,6 +325,8 @@ mod tests {
         // security-headers block rewrites that directive from the
         // `frame_ancestors` key at request time, whatever `csp` says.
         assert_eq!(merged["frame_ancestors"], serde_json::json!("self"));
+        // …the knob that lets the compiler worker spawn blob-URL workers…
+        assert_eq!(merged["allow_blob_workers"], serde_json::json!(true));
         // …including the isolation posture the preview iframe depends on: a
         // COEP document only embeds documents that carry COEP themselves.
         assert_eq!(
