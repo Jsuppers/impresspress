@@ -725,6 +725,7 @@ pub(crate) mod helpers {
     /// verify instead of only at its natural expiry.
     pub(crate) async fn generate_tokens(
         ctx: &dyn wafer_run::context::Context,
+        lifetime: &SessionLifetime,
         user_id: &str,
         email: &str,
         roles: &[String],
@@ -851,12 +852,10 @@ pub(crate) mod helpers {
         // `type` is not `access` before it looks at a `jti` at all.
         refresh_claims.insert("jti".to_string(), serde_json::Value::String(refresh_jti));
 
-        let refresh_ttl = refresh_ttl_secs(ctx)
-            .await
-            .map_err(wafer_run::OutputStream::error)?;
-        let refresh_token = crypto::sign(ctx, &refresh_claims, Duration::from_secs(refresh_ttl))
-            .await
-            .map_err(wafer_run::OutputStream::error)?;
+        let refresh_token =
+            crypto::sign(ctx, &refresh_claims, Duration::from_secs(lifetime.ttl_secs))
+                .await
+                .map_err(wafer_run::OutputStream::error)?;
 
         Ok((access_token, refresh_token, family))
     }
@@ -891,13 +890,21 @@ pub(crate) mod helpers {
     /// has no live generation left to refresh from.
     pub(crate) async fn store_refresh_token(
         ctx: &dyn wafer_run::context::Context,
+        lifetime: &SessionLifetime,
         user_id: &str,
         token: &str,
         family: &str,
         generation: i64,
     ) -> Result<(), WaferError> {
-        let expires_at = refresh_expires_at(ctx).await?;
-        super::repo::tokens::insert(ctx, user_id, token, family, generation, &expires_at).await
+        super::repo::tokens::insert(
+            ctx,
+            user_id,
+            token,
+            family,
+            generation,
+            &lifetime.expires_at,
+        )
+        .await
     }
 
     /// The `; Secure` attribute, or nothing on a development deployment that
@@ -969,46 +976,72 @@ pub(crate) mod helpers {
         })
     }
 
-    /// [B12] The refresh-token TTL in seconds — the one value that decides
-    /// how long a login lasts.
+    /// [B12] How long a login lasts, resolved once per issuance — the one
+    /// value the refresh JWT's `exp`, the refresh row's `expires_at` and the
+    /// session row's `expires_at` are all taken from.
     ///
-    /// [`generate_tokens`] signs the refresh JWT with it,
-    /// [`store_refresh_token`] writes the row's `expires_at` from it, and
+    /// [`generate_tokens`] signs the refresh JWT with `ttl_secs`,
+    /// [`store_refresh_token`] writes the row's `expires_at`, and
     /// [`issue_tokens_and_cookie`] gives the session row the same expiry, so
     /// the device list cannot claim a session outlives its token. Derived
     /// from [`session_lifetime_days`] rather than a constant of its own: two
     /// constants for one lifetime is what let them disagree (30 days on the
     /// row, 7 on the token).
-    pub(crate) async fn refresh_ttl_secs(
-        ctx: &dyn wafer_run::context::Context,
-    ) -> Result<u64, WaferError> {
-        Ok(u64::from(session_lifetime_days(ctx).await?) * 86_400)
+    ///
+    /// Resolving it is the only step of issuance that reads configuration, and
+    /// it can fail. So every handler resolves it BEFORE it consumes anything
+    /// single-use — the refresh row's compare-and-set claim, a bootstrap token,
+    /// an OAuth state — and before signup creates the account: a
+    /// misconfigured lifetime then refuses the request and leaves the
+    /// credential it presented intact, instead of spending it on an issuance
+    /// that was always going to fail.
+    pub(crate) struct SessionLifetime {
+        ttl_secs: u64,
+        /// Now plus `ttl_secs`, in the `…Z` form every auth table uses.
+        expires_at: String,
     }
 
-    /// The RFC-3339-ish `expires_at` a refresh row and its session row share:
-    /// now plus [`refresh_ttl_secs`], in the `…Z` form every auth table uses.
-    ///
-    /// Checked addition: `+` on a `DateTime` panics past the last date chrono
-    /// can represent, and a panic aborts the native server. The bound on the
-    /// lifetime keeps this far from that edge; the check makes the edge an
-    /// error rather than a crash should the bound ever be raised past it.
-    async fn refresh_expires_at(
-        ctx: &dyn wafer_run::context::Context,
-    ) -> Result<String, WaferError> {
-        let ttl = refresh_ttl_secs(ctx).await?;
-        i64::try_from(ttl)
-            .ok()
-            .and_then(chrono::TimeDelta::try_seconds)
-            .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
-            .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-            .ok_or_else(|| {
-                WaferError::new(
-                    wafer_run::ErrorCode::Internal,
-                    format!(
-                        "refresh-token lifetime of {ttl}s is past the representable date range"
-                    ),
-                )
+    impl SessionLifetime {
+        /// Read and check the configured lifetime.
+        ///
+        /// Checked addition: `+` on a `DateTime` panics past the last date
+        /// chrono can represent, and a panic aborts the native server. The
+        /// bound on the lifetime keeps this far from that edge; the check
+        /// makes the edge an error rather than a crash should the bound ever be
+        /// raised past it.
+        pub(crate) async fn resolve(
+            ctx: &dyn wafer_run::context::Context,
+        ) -> Result<Self, WaferError> {
+            let ttl_secs = u64::from(session_lifetime_days(ctx).await?) * 86_400;
+            let expires_at = i64::try_from(ttl_secs)
+                .ok()
+                .and_then(chrono::TimeDelta::try_seconds)
+                .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
+                .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .ok_or_else(|| {
+                    WaferError::new(
+                        wafer_run::ErrorCode::Internal,
+                        format!(
+                            "refresh-token lifetime of {ttl_secs}s is past the representable \
+                             date range"
+                        ),
+                    )
+                })?;
+            Ok(Self {
+                ttl_secs,
+                expires_at,
             })
+        }
+
+        /// [`Self::resolve`] for a handler: a failure is the ready-to-return
+        /// 500.
+        pub(crate) async fn resolve_or_error(
+            ctx: &dyn wafer_run::context::Context,
+        ) -> Result<Self, wafer_run::OutputStream> {
+            Self::resolve(ctx)
+                .await
+                .map_err(wafer_run::OutputStream::error)
+        }
     }
 
     /// Outcome of [`issue_tokens_and_cookie`]: the freshly minted token pair,
@@ -1102,6 +1135,7 @@ pub(crate) mod helpers {
     /// why its failure returns an error and no tokens are handed out.
     pub(crate) async fn issue_tokens_and_cookie(
         ctx: &dyn wafer_run::context::Context,
+        lifetime: &SessionLifetime,
         user_id: &str,
         email: &str,
         roles: &[String],
@@ -1110,17 +1144,28 @@ pub(crate) mod helpers {
         generation: i64,
     ) -> std::result::Result<IssuedLogin, wafer_run::OutputStream> {
         let (access_token, refresh_token, issued_family) =
-            generate_tokens(ctx, user_id, email, roles, auth_method, family).await?;
+            generate_tokens(ctx, lifetime, user_id, email, roles, auth_method, family).await?;
 
-        store_refresh_token(ctx, user_id, &refresh_token, &issued_family, generation)
-            .await
-            .map_err(|e| {
-                crate::blocks::crud::db_error_internal(e, "Could not persist the refresh token")
-            })?;
-        let expires_at = refresh_expires_at(ctx)
-            .await
-            .map_err(wafer_run::OutputStream::error)?;
-        record_login_family(ctx, user_id, &issued_family, auth_method, &expires_at).await;
+        store_refresh_token(
+            ctx,
+            lifetime,
+            user_id,
+            &refresh_token,
+            &issued_family,
+            generation,
+        )
+        .await
+        .map_err(|e| {
+            crate::blocks::crud::db_error_internal(e, "Could not persist the refresh token")
+        })?;
+        record_login_family(
+            ctx,
+            user_id,
+            &issued_family,
+            auth_method,
+            &lifetime.expires_at,
+        )
+        .await;
 
         // [B12] Retention runs from here because it is the one path every
         // deployment exercises on its own — the Cloudflare Worker has no
@@ -1219,6 +1264,9 @@ pub(crate) mod helpers {
 
             let Ok((access_token, refresh_token, family)) = generate_tokens(
                 &ctx,
+                &SessionLifetime::resolve(&ctx)
+                    .await
+                    .expect("session lifetime"),
                 &uid,
                 "mint@example.com",
                 &["user".to_string()],
@@ -1259,6 +1307,9 @@ pub(crate) mod helpers {
 
             let Ok((access_token, refresh_token, _family)) = generate_tokens(
                 &ctx,
+                &SessionLifetime::resolve(&ctx)
+                    .await
+                    .expect("session lifetime"),
                 &uid,
                 "mint@example.com",
                 &["user".to_string()],
@@ -1302,6 +1353,9 @@ pub(crate) mod helpers {
 
             let Ok((access_token, _refresh_token, _family)) = generate_tokens(
                 &ctx,
+                &SessionLifetime::resolve(&ctx)
+                    .await
+                    .expect("session lifetime"),
                 &uid,
                 "mint@example.com",
                 &["user".to_string()],

@@ -6,7 +6,7 @@ use wafer_run::{context::Context, InputStream, OutputStream};
 use crate::{
     blocks::{
         auth::{
-            helpers::{ensure_admin_role, issue_tokens_and_cookie},
+            helpers::{ensure_admin_role, issue_tokens_and_cookie, SessionLifetime},
             repo::{local_credentials, users},
             timing_equalization_hash,
         },
@@ -112,13 +112,25 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     };
 
     // Mint tokens, persist the refresh + session rows, build the cookie.
-    let issued =
-        match issue_tokens_and_cookie(ctx, &user.id, &email_lower, &roles, "password", None, 0)
-            .await
-        {
-            Ok(i) => i,
-            Err(r) => return r,
-        };
+    let lifetime = match SessionLifetime::resolve_or_error(ctx).await {
+        Ok(lifetime) => lifetime,
+        Err(r) => return r,
+    };
+    let issued = match issue_tokens_and_cookie(
+        ctx,
+        &lifetime,
+        &user.id,
+        &email_lower,
+        &roles,
+        "password",
+        None,
+        0,
+    )
+    .await
+    {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
 
     // Update last login. Best-effort: the sign-in has already succeeded
     // and the tokens are already minted, so a failed bookkeeping write is

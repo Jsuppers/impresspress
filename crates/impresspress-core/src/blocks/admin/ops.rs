@@ -1955,6 +1955,89 @@ mod tests {
         );
     }
 
+    /// A refresh refused for a misconfigured session lifetime leaves the
+    /// presented refresh token live.
+    ///
+    /// The refresh handler claims the token row (compare-and-set revoke)
+    /// before it mints the successor. Reading the lifetime only inside
+    /// issuance meant the claim had already spent the token when the read
+    /// failed, so every session died at its next refresh even after the
+    /// operator fixed the value. Drives the real login and refresh handlers:
+    /// the same token must refresh once the value is corrected.
+    #[tokio::test]
+    async fn a_refresh_refused_for_a_bad_session_lifetime_keeps_the_token_live() {
+        use crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+
+        const EMAIL: &str = "refresh-lifetime@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        crate::blocks::auth::repo::local_credentials::insert(
+            &ctx,
+            &crate::test_support::seed_user(EMAIL).insert(&ctx).await.id,
+            &wafer_core::clients::crypto::hash(&ctx, PASSWORD)
+                .await
+                .expect("hash the password"),
+            false,
+        )
+        .await
+        .expect("store the credential");
+
+        let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
+        let login = crate::test_support::output_json(
+            crate::blocks::auth_ui::api::login::handle(
+                &ctx,
+                wafer_run::InputStream::from_bytes(body.into_bytes()),
+            )
+            .await,
+        )
+        .await;
+        let refresh_token = login["refresh_token"]
+            .as_str()
+            .expect("login returns a refresh token")
+            .to_string();
+        let refresh = || async {
+            let body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
+            crate::test_support::output_http_status(
+                crate::blocks::auth_ui::api::refresh::handle(
+                    &ctx,
+                    wafer_run::InputStream::from_bytes(body.into_bytes()),
+                )
+                .await,
+            )
+            .await
+        };
+
+        variables::seed_row_with_flag(&ctx, SESSION_LIFETIME_DAYS_KEY, "100000000", 0).await;
+        // The raw fixture insert skips the repo's generation bump.
+        crate::config_generation::note_config_write();
+        assert_eq!(
+            refresh().await,
+            500,
+            "the misconfigured lifetime refuses the refresh"
+        );
+
+        // The operator corrects it through the admin API.
+        expect_ok(
+            update_variable(
+                &ctx,
+                &admin_msg("update", "/admin/settings"),
+                SESSION_LIFETIME_DAYS_KEY,
+                VariableUpdate {
+                    value: Some("7"),
+                    description: None,
+                    sensitive: None,
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            refresh().await,
+            200,
+            "the refused refresh must not have spent the token"
+        );
+    }
+
     /// A PUT that CREATES an undeclared ad hoc key must protect it the same
     /// way a POST does.
     ///

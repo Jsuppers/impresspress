@@ -22,7 +22,7 @@ use wafer_run::{context::Context, ConfigVar, InputType};
 ///
 /// [B12] The single source for the refresh-token TTL. The refresh token's
 /// `exp`, its row's `expires_at` and the session row's `expires_at` are all
-/// derived from this one value ([`super::helpers::refresh_ttl_secs`]), so the
+/// derived from this one value ([`super::helpers::SessionLifetime`]), so the
 /// device list cannot say a session lives longer than the token that keeps it
 /// alive. It used to govern only the session row, while the refresh token
 /// carried a separate 7-day constant — which is why the list showed devices as

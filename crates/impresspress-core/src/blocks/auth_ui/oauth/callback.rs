@@ -12,7 +12,7 @@ use crate::{
             config::REQUIRE_VERIFICATION_KEY,
             helpers::{
                 email_domain_allowed, ensure_admin_role, get_user_roles, initial_role_for,
-                issue_tokens_and_cookie, signup_allowed,
+                issue_tokens_and_cookie, signup_allowed, SessionLifetime,
             },
             repo::{oauth_pkce, provider_links, users},
         },
@@ -93,6 +93,14 @@ pub async fn handle(
     // unfinished rather than concluded, and the cookie expires on its own
     // with the state it names.
     let clear_binding = super::state_binding::clear(ctx, state).await;
+
+    // Resolved before the state is taken: a misconfigured session lifetime is
+    // the deployment's failure, so it answers a 500 and leaves the single-use
+    // state (and its binding cookie) unspent (see `SessionLifetime`).
+    let lifetime = match SessionLifetime::resolve_or_error(ctx).await {
+        Ok(lifetime) => lifetime,
+        Err(r) => return r,
+    };
 
     // SEC-040: look up the server-side PKCE state by the opaque `state_id`
     // the provider echoed back. `take` is single-use (DELETE … RETURNING),
@@ -210,6 +218,7 @@ pub async fn handle(
     // that by construction.
     let issued = match issue_tokens_and_cookie(
         ctx,
+        &lifetime,
         &user_id,
         &email,
         &roles,
