@@ -26,12 +26,12 @@ use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, Message, OutputStream};
 
 use super::{logs::audit_log, ROLES_TABLE};
-/// SSRF URL validator for `InputType::Url` writes. The single implementation
-/// lives in [`crate::util::validate_url_value`]; re-exported here so the admin
-/// variable create/update paths and the generic settings form
-/// (`ui::settings_form::save_settings`) validate through the exact same impl and
-/// can't diverge on what a URL value is allowed to be.
-pub(super) use crate::util::validate_url_value;
+/// The config-value write rule. The single implementation lives in
+/// [`crate::util::validate_config_value`]; re-exported here so the admin
+/// variable create/update paths, the `config.set` writer and the generic
+/// settings form (`ui::settings_form::save_settings`) validate through the
+/// exact same impl and can't diverge on what a value is allowed to be.
+pub(super) use crate::util::validate_config_value;
 /// `MASKED_VALUE` / `is_sensitive_key`: the single source of truth lives in
 /// [`crate::util`] so the generic ConfigVar-driven settings form
 /// (`ui::settings_form`) can share it too — masking on a DB `sensitive` flag
@@ -975,9 +975,10 @@ pub(super) async fn delete_variable(
     Ok(())
 }
 
-/// Create a config variable, writing an audit-log row. Validates `_URL` keys
-/// against [`validate_url_value`] (SSRF). `key` must be non-empty, and must
-/// not name a key the runtime owns ([`reject_runtime_owned_key`]).
+/// Create a config variable, writing an audit-log row. Validates the value
+/// with [`validate_config_value`] (SSRF for `_URL` keys, bounded lifetimes).
+/// `key` must be non-empty, and must not name a key the runtime owns
+/// ([`reject_runtime_owned_key`]).
 ///
 /// `value` must also be non-empty for a key something MASKS — judged on the
 /// key alone, not on the `sensitive` argument, for the reason spelled out at
@@ -1024,11 +1025,9 @@ pub(super) async fn create_variable(
         )));
     }
 
-    // Validate URL-type keys (SSRF) on both surfaces.
-    if key.ends_with("_URL") {
-        if let Err(e) = validate_url_value(value) {
-            return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
-        }
+    // The per-key value rule (URL/SSRF, bounded lifetimes) on both surfaces.
+    if let Err(e) = validate_config_value(key, value) {
+        return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
     }
 
     let new = NewVariable {
@@ -1113,7 +1112,8 @@ async fn stored_sensitive_flag(ctx: &dyn Context, key: &str) -> Result<i64, Outp
 /// says, which is what covers Password-typed declared vars; the exception is a
 /// SPENT provisioning credential, which [`is_clearable_provisioning_credential`]
 /// names and which must stay clearable because nothing can delete it either)
-/// and the `_URL` SSRF validation on both surfaces.
+/// and the [`validate_config_value`] rule (`_URL` SSRF, bounded lifetimes) on
+/// both surfaces.
 ///
 /// Also refuses a value that is the mask a read path emitted rather than a
 /// value the caller means — see [`is_masked_submission`]. Both surfaces route
@@ -1202,11 +1202,9 @@ pub(super) async fn update_variable(
                 "Cannot set {key} to an empty value"
             )));
         }
-        // Validate URL-type keys (SSRF) on both surfaces.
-        if key.ends_with("_URL") {
-            if let Err(e) = validate_url_value(value) {
-                return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
-            }
+        // The per-key value rule (URL/SSRF, bounded lifetimes) on both surfaces.
+        if let Err(e) = validate_config_value(key, value) {
+            return Err(err_bad_request(&format!("Invalid value for {key}: {e}")));
         }
     } else if variables::get_by_key(ctx, key)
         .await

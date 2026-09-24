@@ -28,7 +28,7 @@ use crate::{
     blocks::admin::logs::audit_log,
     config_vars::is_truthy,
     http::{err_bad_request, err_internal, ok_json},
-    util::{is_sensitive_key, validate_url_value, MASKED_VALUE},
+    util::{is_sensitive_key, validate_config_value, validate_url_value, MASKED_VALUE},
 };
 
 /// One titled group of settings within a form (e.g. "Stripe", "OAuth Providers").
@@ -469,6 +469,12 @@ pub async fn save_settings(
             if let Err(e) = validate_url_value(value) {
                 return err_bad_request(&format!("{}: {e}", var.key));
             }
+        }
+        // The key's own rule, the one `config::set`'s writer runs — checked
+        // here too so a refusal cannot land mid-loop after earlier fields have
+        // already been written.
+        if let Err(e) = validate_config_value(&var.key, value) {
+            return err_bad_request(&format!("{}: {e}", var.key));
         }
         if value == MASKED_VALUE && current.get(&var.key) != Some(value) {
             // The remedy differs by field, so the message does too — the same

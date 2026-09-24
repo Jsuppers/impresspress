@@ -851,13 +851,12 @@ pub(crate) mod helpers {
         // `type` is not `access` before it looks at a `jti` at all.
         refresh_claims.insert("jti".to_string(), serde_json::Value::String(refresh_jti));
 
-        let refresh_token = crypto::sign(
-            ctx,
-            &refresh_claims,
-            Duration::from_secs(refresh_ttl_secs(ctx).await),
-        )
-        .await
-        .map_err(wafer_run::OutputStream::error)?;
+        let refresh_ttl = refresh_ttl_secs(ctx)
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
+        let refresh_token = crypto::sign(ctx, &refresh_claims, Duration::from_secs(refresh_ttl))
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
 
         Ok((access_token, refresh_token, family))
     }
@@ -897,7 +896,7 @@ pub(crate) mod helpers {
         family: &str,
         generation: i64,
     ) -> Result<(), WaferError> {
-        let expires_at = refresh_expires_at(ctx).await;
+        let expires_at = refresh_expires_at(ctx).await?;
         super::repo::tokens::insert(ctx, user_id, token, family, generation, &expires_at).await
     }
 
@@ -947,15 +946,27 @@ pub(crate) mod helpers {
     }
 
     /// Resolve the configured login lifetime in days
-    /// (`WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS`). Falls back to the
-    /// declared default if unset or unparseable.
-    pub(crate) async fn session_lifetime_days(ctx: &dyn wafer_run::context::Context) -> u32 {
-        use super::config::{SESSION_LIFETIME_DAYS_DEFAULT, SESSION_LIFETIME_DAYS_KEY};
+    /// (`WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS`) through
+    /// [`config::parse_session_lifetime_days`]: the declared default when
+    /// unset, and an `Internal` error when the stored value is not one a login
+    /// can use.
+    ///
+    /// An error, not the default and not a clamp. The write surfaces refuse
+    /// such a value, so one that is stored arrived around them (the process
+    /// environment, a data import, a row older than the bound), and quietly
+    /// issuing a lifetime other than the one configured would hide that.
+    /// Every login fails with a 500 naming the key until it is corrected.
+    pub(crate) async fn session_lifetime_days(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<u32, WaferError> {
+        use super::config::{parse_session_lifetime_days, SESSION_LIFETIME_DAYS_KEY};
         let raw = config_client::get_default(ctx, SESSION_LIFETIME_DAYS_KEY, "").await;
-        raw.parse::<u32>()
-            .ok()
-            .filter(|n| *n > 0)
-            .unwrap_or(SESSION_LIFETIME_DAYS_DEFAULT)
+        parse_session_lifetime_days(&raw).map_err(|e| {
+            WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                format!("{SESSION_LIFETIME_DAYS_KEY} is misconfigured: {e}"),
+            )
+        })
     }
 
     /// [B12] The refresh-token TTL in seconds — the one value that decides
@@ -968,17 +979,36 @@ pub(crate) mod helpers {
     /// from [`session_lifetime_days`] rather than a constant of its own: two
     /// constants for one lifetime is what let them disagree (30 days on the
     /// row, 7 on the token).
-    pub(crate) async fn refresh_ttl_secs(ctx: &dyn wafer_run::context::Context) -> u64 {
-        u64::from(session_lifetime_days(ctx).await) * 86_400
+    pub(crate) async fn refresh_ttl_secs(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<u64, WaferError> {
+        Ok(u64::from(session_lifetime_days(ctx).await?) * 86_400)
     }
 
     /// The RFC-3339-ish `expires_at` a refresh row and its session row share:
     /// now plus [`refresh_ttl_secs`], in the `…Z` form every auth table uses.
-    async fn refresh_expires_at(ctx: &dyn wafer_run::context::Context) -> String {
-        let ttl = refresh_ttl_secs(ctx).await;
-        (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
+    ///
+    /// Checked addition: `+` on a `DateTime` panics past the last date chrono
+    /// can represent, and a panic aborts the native server. The bound on the
+    /// lifetime keeps this far from that edge; the check makes the edge an
+    /// error rather than a crash should the bound ever be raised past it.
+    async fn refresh_expires_at(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<String, WaferError> {
+        let ttl = refresh_ttl_secs(ctx).await?;
+        i64::try_from(ttl)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
+            .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .ok_or_else(|| {
+                WaferError::new(
+                    wafer_run::ErrorCode::Internal,
+                    format!(
+                        "refresh-token lifetime of {ttl}s is past the representable date range"
+                    ),
+                )
+            })
     }
 
     /// Outcome of [`issue_tokens_and_cookie`]: the freshly minted token pair,
@@ -1087,14 +1117,10 @@ pub(crate) mod helpers {
             .map_err(|e| {
                 crate::blocks::crud::db_error_internal(e, "Could not persist the refresh token")
             })?;
-        record_login_family(
-            ctx,
-            user_id,
-            &issued_family,
-            auth_method,
-            &refresh_expires_at(ctx).await,
-        )
-        .await;
+        let expires_at = refresh_expires_at(ctx)
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
+        record_login_family(ctx, user_id, &issued_family, auth_method, &expires_at).await;
 
         // [B12] Retention runs from here because it is the one path every
         // deployment exercises on its own — the Cloudflare Worker has no

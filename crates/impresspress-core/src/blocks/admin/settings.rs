@@ -1111,6 +1111,74 @@ mod tests {
         );
     }
 
+    /// The admin API refuses a session lifetime past its bound, on create and
+    /// on update, and leaves what is stored alone.
+    ///
+    /// `100000000` days put the refresh expiry past the last date chrono can
+    /// represent, where the addition panicked and aborted the native server on
+    /// every login. Drives the two real handlers.
+    #[tokio::test]
+    async fn an_out_of_range_session_lifetime_is_refused_by_the_settings_api() {
+        use crate::test_support::{admin_msg, output_http_status};
+
+        let ctx = TestContext::new().await;
+        crate::blocks::admin::migrations::apply(&ctx)
+            .await
+            .expect("apply admin migrations");
+        let key = crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+
+        let post = crate::blocks::admin::test_support::routed(admin_msg(
+            "create",
+            "/b/admin/api/settings",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "key": key,
+            "value": "100000000",
+            "sensitive": false,
+        }))
+        .expect("serialize request body");
+        let status =
+            output_http_status(handle_create(&ctx, &post, InputStream::from_bytes(body)).await)
+                .await;
+        assert_eq!(status, 400, "create must refuse an out-of-range lifetime");
+        assert!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .is_none(),
+            "a refused create must not leave a row behind"
+        );
+
+        seed_var(&ctx, key, "7", false).await;
+        let put = crate::blocks::admin::test_support::routed(admin_msg(
+            "update",
+            &format!("/b/admin/api/settings/{key}"),
+        ));
+        for refused in ["100000000", "0", "3651"] {
+            let body = serde_json::to_vec(&serde_json::json!({ "value": refused }))
+                .expect("serialize request body");
+            let status =
+                output_http_status(handle_set(&ctx, &put, InputStream::from_bytes(body)).await)
+                    .await;
+            assert_eq!(status, 400, "update must refuse {refused:?}");
+        }
+        assert_eq!(
+            variables::get_by_key(&ctx, key)
+                .await
+                .expect("read back")
+                .expect("the row is still there")
+                .value,
+            "7",
+            "a refused update must leave the stored lifetime alone"
+        );
+
+        let body = serde_json::to_vec(&serde_json::json!({ "value": "30" }))
+            .expect("serialize request body");
+        let status =
+            output_http_status(handle_set(&ctx, &put, InputStream::from_bytes(body)).await).await;
+        assert_eq!(status, 200, "an in-range lifetime is accepted");
+    }
+
     /// The remedy the refusal names has to exist: a `PATCH` that leaves `value`
     /// out changes only the fields it carries.
     ///

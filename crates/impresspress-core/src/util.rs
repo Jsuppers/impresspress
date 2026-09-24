@@ -637,6 +637,32 @@ pub(crate) fn validate_url_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The write rule for a config value, keyed by its key: the single check
+/// every config-value write surface runs before storing anything — the admin
+/// variables create/update paths (`blocks::admin::ops`), the `config.set`
+/// writer (`blocks::config`) and the settings-form pre-pass
+/// (`ui::settings_form::save_settings`) — so a value one surface refuses
+/// cannot be stored through another.
+///
+/// - A `_URL` key runs [`validate_url_value`].
+/// - [`SESSION_LIFETIME_DAYS_KEY`] runs the parser its reader uses,
+///   [`parse_session_lifetime_days`], so the write accepts exactly the values
+///   a login can use: a lifetime past its bound would otherwise fail every
+///   login.
+///
+/// [`SESSION_LIFETIME_DAYS_KEY`]: crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY
+/// [`parse_session_lifetime_days`]: crate::blocks::auth::config::parse_session_lifetime_days
+pub(crate) fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
+    use crate::blocks::auth::config::{parse_session_lifetime_days, SESSION_LIFETIME_DAYS_KEY};
+    if key.ends_with("_URL") {
+        validate_url_value(value)?;
+    }
+    if key == SESSION_LIFETIME_DAYS_KEY {
+        parse_session_lifetime_days(value)?;
+    }
+    Ok(())
+}
+
 /// Masked placeholder shown in place of a sensitive value.
 pub(crate) const MASKED_VALUE: &str = "********";
 
