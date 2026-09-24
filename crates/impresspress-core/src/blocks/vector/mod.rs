@@ -2,6 +2,7 @@ pub mod contracts;
 #[cfg(test)]
 mod error_mapping_tests;
 pub mod ingestion;
+mod legacy_names;
 pub(crate) mod migrations;
 pub mod pages;
 pub mod pages_ui;
@@ -240,7 +241,11 @@ crate::impresspress_feature_block! {
             migrations::SQLITE_MIGRATIONS,
             migrations::POSTGRES_MIGRATIONS,
         )
-        .await
+        .await?;
+        if matches!(event.event_type, wafer_run::LifecycleType::Init) {
+            legacy_names::rename_legacy_indexes(ctx).await?;
+        }
+        Ok(())
     },
 }
 
