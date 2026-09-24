@@ -1146,6 +1146,32 @@ mod contract_tests {
         }
     }
 
+    /// An index whose tables the database layer would refuse is refused at
+    /// the route, before the backend is asked to create anything: uppercase,
+    /// a hyphen, or a name long enough that a table name passes 63 bytes.
+    #[tokio::test]
+    async fn create_index_refuses_a_name_its_tables_cannot_have() {
+        let too_long = "a".repeat(service::MAX_INDEX_NAME_LEN + 1);
+        for name in ["Docs", "my-docs", too_long.as_str()] {
+            let ctx = ctx_with(StubVectorBlock::default()).await;
+
+            let out = create_index(
+                &ctx,
+                &create_msg(),
+                json_input(serde_json::json!({ "name": name })),
+            )
+            .await;
+
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::InvalidArgument, "{name}");
+                    assert!(e.message.contains("[a-z0-9_]"), "{name}: {}", e.message);
+                }
+                other => panic!("{name}: expected InvalidArgument, got {other:?}"),
+            }
+        }
+    }
+
     /// `metric` is the backend's `DistanceMetric` enum: a value outside it is
     /// refused rather than silently falling back to cosine.
     #[tokio::test]

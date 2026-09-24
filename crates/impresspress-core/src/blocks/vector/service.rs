@@ -78,22 +78,28 @@ pub fn vector_backend_available(ctx: &dyn Context) -> bool {
         .any(|b| b.name == "wafer-run/vector")
 }
 
-/// Validate that an index name only contains characters that are safe
-/// to interpolate into SQL identifiers (alphanumeric + underscore).
+/// The longest suffix any backend appends to an index's prefixed name to
+/// form one of its tables: `_vectors` (the browser backend's
+/// `{name}_vectors`; the native sqlite-vec builders use `_vec`, `_meta` and
+/// `_fts`).
+const LONGEST_TABLE_SUFFIX: &str = "_vectors";
+
+/// The longest index name whose every table is still a plain identifier.
+pub const MAX_INDEX_NAME_LEN: usize =
+    wafer_block::db::MAX_IDENT_LEN - TABLE_PREFIX.len() - LONGEST_TABLE_SUFFIX.len();
+
+/// Validate a user-facing index name: 1 to [`MAX_INDEX_NAME_LEN`] bytes of
+/// `[a-z0-9_]`.
 ///
-/// Index names flow through [`prefixed_index_name`] into SQL via
-/// `format!` interpolation in several hot paths (e.g. the re-ingest
-/// cleanup query in `handle_ingest`). Relying on the driver to reject
-/// multi-statement input is not defense-in-depth; validating the name
-/// at the route boundary protects every downstream SQL consumer uniformly.
-///
-/// The allowed set must match what `wafer_sql_utils::ident::sanitize_ident`
-/// keeps. `sanitize_ident` strips everything non-alphanumeric except `_`,
-/// so allowing hyphens here would diverge the registry name from the
-/// actual SQL table name (e.g. `foo-bar` registered, but the SQL table
-/// is `foobar_meta`) and break any `format!`-built query that reuses the
-/// original name — like the re-ingest cleanup which would emit
-/// `impresspress__vector__foo-bar_meta` (invalid SQL).
+/// Every table an index owns is named `{TABLE_PREFIX}{name}{suffix}`, and the
+/// database layer admits only plain identifiers — lowercase `[a-z0-9_]`, at
+/// most `wafer_block::db::MAX_IDENT_LEN` bytes
+/// (`wafer_block::db::is_plain_ident`) — refusing anything else rather than
+/// rewriting it. So a name is valid exactly when its longest table name is a
+/// plain identifier, which is the check below: an uppercase or hyphenated
+/// name, or one long enough that PostgreSQL would truncate a table name, is
+/// refused here at the route boundary instead of failing inside the backend
+/// halfway through creating the index.
 ///
 /// Returns the name on success so callers can chain it at the use site.
 pub fn validate_index_name(name: &str) -> Result<&str, WaferError> {
@@ -104,10 +110,14 @@ pub fn validate_index_name(name: &str) -> Result<&str, WaferError> {
             meta: vec![],
         });
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    let longest_table = format!("{TABLE_PREFIX}{name}{LONGEST_TABLE_SUFFIX}");
+    if !wafer_block::db::is_plain_ident(&longest_table) {
         return Err(WaferError {
             code: ErrorCode::InvalidArgument,
-            message: format!("invalid index name '{name}': only [A-Za-z0-9_] allowed"),
+            message: format!(
+                "invalid index name '{name}': only [a-z0-9_] allowed, at most \
+                 {MAX_INDEX_NAME_LEN} characters"
+            ),
             meta: vec![],
         });
     }
@@ -265,8 +275,28 @@ mod tests_validate {
         assert!(validate_index_name("my.index").is_err());
         assert!(
             validate_index_name("index-42").is_err(),
-            "hyphens no longer allowed — sanitize_ident strips them, \
-             so the registry name and SQL table name would diverge"
+            "the database layer refuses a hyphenated table name"
         );
+    }
+
+    /// The database layer refuses uppercase table names, so an index whose
+    /// name has any would be accepted here and refused by the backend.
+    #[test]
+    fn rejects_uppercase() {
+        assert!(validate_index_name("Docs").is_err());
+        assert!(validate_index_name("DOCS").is_err());
+    }
+
+    /// The longest admitted name still gives plain identifiers for every
+    /// table any backend creates; one byte more does not.
+    #[test]
+    fn the_length_cap_keeps_every_table_name_a_plain_identifier() {
+        let longest = "a".repeat(MAX_INDEX_NAME_LEN);
+        assert!(validate_index_name(&longest).is_ok());
+        for suffix in ["_vec", "_meta", "_fts", "_vectors"] {
+            let table = format!("{}{suffix}", prefixed_index_name(&longest));
+            assert!(wafer_block::db::is_plain_ident(&table), "{table}");
+        }
+        assert!(validate_index_name(&"a".repeat(MAX_INDEX_NAME_LEN + 1)).is_err());
     }
 }
