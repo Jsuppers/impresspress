@@ -845,4 +845,93 @@ mod tests {
         block_keys.sort_unstable();
         assert_eq!(block_keys, vec!["block", "error", "ok"]);
     }
+
+    /// A block whose `Init` failed once, at boot, with a transient error.
+    struct FlakyInitBlock {
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for FlakyInitBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/flaky", "0.1.0", "test/init@v1", "test")
+        }
+
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn wafer_block::context::Context,
+            event: LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            if event.event_type == LifecycleType::Init {
+                let mut attempts = self.attempts.lock().unwrap_or_else(|p| p.into_inner());
+                *attempts += 1;
+                if *attempts == 1 {
+                    return Err(WaferError::new(
+                        ErrorCode::Unavailable,
+                        "database is locked",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn wafer_block::context::Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            OutputStream::respond(b"served".to_vec())
+        }
+    }
+
+    /// A block whose `Init` hits a transient fault during a tolerant boot is
+    /// not wedged: the boot reports the failure and serves on, and the
+    /// block's first request after the runtime's backoff runs `Init` again
+    /// and is served. A permanent failure would leave it refusing every
+    /// request until the process restarted.
+    #[tokio::test]
+    async fn a_transient_init_failure_at_boot_is_retried_by_the_first_request() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut wafer = wafer_with_probes(&order, None);
+        let attempts = Arc::new(Mutex::new(0));
+        wafer
+            .register_block(
+                "test/flaky",
+                Arc::new(FlakyInitBlock {
+                    attempts: attempts.clone(),
+                }),
+            )
+            .unwrap();
+
+        let report = boot(
+            &mut wafer,
+            &ProbeHooks { order, fail: false },
+            GrantSource::PreInstalled("test fixture declares none"),
+            InitPolicy::Tolerant,
+        )
+        .await
+        .expect("a tolerant boot serves on");
+        assert!(
+            report
+                .blocks
+                .iter()
+                .any(|b| b.block == "test/flaky" && !b.ok),
+            "the boot reports the failed Init: {report:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let served = wafer
+            .run_block("test/flaky", Message::new("probe"), InputStream::empty())
+            .await
+            .collect_buffered()
+            .await
+            .expect("the block is served once its Init succeeds");
+        assert_eq!(served.body, b"served");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            2,
+            "Init ran again on the request"
+        );
+    }
 }
