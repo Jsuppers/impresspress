@@ -208,7 +208,10 @@ fn merged(
 
 /// Two `;`-separated CSP directive lists as one: `before`'s directives in
 /// order, then `after`'s that `before` does not name. A directive both name
-/// keeps `before`'s sources and gains `after`'s it lacks. Names compare
+/// keeps `before`'s sources and gains `after`'s it lacks. `'none'` is the
+/// empty source list, not a source: it cannot stand beside another, so a
+/// directive that is `'none'` on one side takes the other side's sources, and
+/// stays `'none'` only when both sides say so. Names compare
 /// ASCII-case-insensitively, as a browser compares them; each is written as
 /// `before` (or, for a new one, `after`) spelled it.
 fn combine_csp(before: &str, after: &str) -> String {
@@ -229,6 +232,12 @@ fn combine_csp(before: &str, after: &str) -> String {
             .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
         {
             Some((_, existing)) => {
+                if is_none(&sources) {
+                    continue;
+                }
+                if is_none(existing) {
+                    existing.clear();
+                }
                 for source in sources {
                     if !existing.contains(&source) {
                         existing.push(source);
@@ -249,6 +258,11 @@ fn combine_csp(before: &str, after: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// A source list that is exactly `'none'`.
+fn is_none(sources: &[String]) -> bool {
+    matches!(sources, [only] if only.eq_ignore_ascii_case("'none'"))
 }
 
 #[cfg(test)]
@@ -502,6 +516,23 @@ mod tests {
             served.policy.contains("https://js.stripe.com"),
             "{}",
             served.policy
+        );
+    }
+
+    /// `'none'` never ends up beside a source: the side that names sources
+    /// wins whichever side said `'none'`, and two `'none'`s stay `'none'`.
+    #[test]
+    fn none_on_either_side_yields_to_the_other_sides_sources() {
+        assert_eq!(
+            combine_csp(
+                "frame-src 'none'; object-src 'none'",
+                "frame-src https://js.stripe.com; object-src 'none'"
+            ),
+            "frame-src https://js.stripe.com; object-src 'none'"
+        );
+        assert_eq!(
+            combine_csp("frame-src 'self'", "frame-src 'NONE'"),
+            "frame-src 'self'"
         );
     }
 
