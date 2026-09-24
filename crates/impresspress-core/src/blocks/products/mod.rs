@@ -96,15 +96,16 @@ use crate::{
 pub const RUNTIME_KIND_CONFIG_KEY: &str = "__IMPRESSPRESS_RUNTIME_KIND__";
 
 /// Whether this runtime may hold Stripe secrets: every runtime but the
-/// browser. A failed read is returned, never taken for the server default —
-/// that would hand secret-key operations to a public browser runtime.
-pub(crate) async fn stripe_secret_operations_allowed(
-    ctx: &dyn wafer_run::context::Context,
-) -> Result<bool, wafer_run::WaferError> {
-    Ok(
-        wafer_core::clients::config::get_default(ctx, RUNTIME_KIND_CONFIG_KEY, "server").await?
-            != "browser",
-    )
+/// browser.
+///
+/// Read off the synchronous `config_get` snapshot, where the browser adapter
+/// publishes it (`RuntimeConfig::both` puts it on both surfaces), and never
+/// through the config client: the key is runtime-owned and belongs to no
+/// block's namespace, so WRAP refuses `impresspress/products` a client read
+/// of it — and a refused read answered as the server default is exactly the
+/// browser runtime taking on secret-key operations.
+pub(crate) fn stripe_secret_operations_allowed(ctx: &dyn wafer_run::context::Context) -> bool {
+    ctx.config_get(RUNTIME_KIND_CONFIG_KEY) != Some("browser")
 }
 
 /// The products block's own declared config vars. Single source of truth for

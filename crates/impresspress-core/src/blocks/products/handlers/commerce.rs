@@ -47,7 +47,7 @@ pub(crate) async fn handle_storefront_config(ctx: &dyn Context) -> OutputStream 
         Ok::<_, wafer_run::WaferError>((
             config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await?,
             config::get_default(ctx, STRIPE_SECRET_KEY, "").await?,
-            stripe_secret_operations_allowed(ctx).await?,
+            stripe_secret_operations_allowed(ctx),
         ))
     };
     let (key, secret, secret_operations_allowed) = match settings.await {

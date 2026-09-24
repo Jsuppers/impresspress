@@ -390,13 +390,17 @@ fn stripe_webhook_is_never_an_agent_tool() {
     );
 }
 
-/// Whether this runtime may hold Stripe secrets is read from config
-/// (`RUNTIME_KIND_CONFIG_KEY`). Taking a refused read for the unset key would
-/// answer the server default, which offers secret-key checkout on a browser
-/// runtime; the refusal is the answer instead.
+/// The storefront config answers under the WRAP checks production runs.
+///
+/// Whether this runtime may hold Stripe secrets is the runtime-owned
+/// `RUNTIME_KIND_CONFIG_KEY`, which belongs to no block's namespace: a
+/// config-client read of it is refused for `impresspress/products`, so the
+/// endpoint must take it off the `config_get` snapshot the adapter publishes.
+/// Driven as the products block with its own declared allowlist and the
+/// deployment's grants.
 #[tokio::test]
-async fn an_unreadable_runtime_kind_is_not_the_server_default() {
-    let mut ctx = ctx_with(&[
+async fn the_storefront_config_answers_under_wrap() {
+    let ctx = ctx_with(&[
         (
             "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
             "sk_test_server_only",
@@ -406,12 +410,17 @@ async fn an_unreadable_runtime_kind_is_not_the_server_default() {
             "pk_test_browser_safe",
         ),
     ])
-    .await;
-    ctx.refuse_config_reads_of(crate::blocks::products::RUNTIME_KIND_CONFIG_KEY);
-    let (msg, input) = get_msg("/b/products/storefront/config", "");
-    assert!(
-        crate::test_support::output_is_error(dispatch(&ctx, msg, input).await, "PermissionDenied")
-            .await,
-        "a refused read must not be served as a storefront config"
+    .await
+    .with_wrap(
+        "impresspress/products",
+        ProductsBlock::new()
+            .info()
+            .call_allowlist()
+            .unwrap_or_default(),
+        crate::blocks::admin::AdminBlock::new().info().grants,
+        crate::blocks::admin::ADMIN_BLOCK_ID,
     );
+    let (msg, input) = get_msg("/b/products/storefront/config", "");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(body["embedded_checkout_available"], true, "{body}");
 }

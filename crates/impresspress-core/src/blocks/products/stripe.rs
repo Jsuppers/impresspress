@@ -474,7 +474,7 @@ pub(crate) async fn replay_webhook_event(
     ctx: &dyn Context,
     event_id: &str,
 ) -> Result<OutputStream, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe webhook replay is disabled in the browser runtime",
@@ -584,7 +584,7 @@ pub(crate) async fn replay_webhook_event(
 pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let settings = async {
         Ok::<_, WaferError>((
-            stripe_secret_operations_allowed(ctx).await?,
+            stripe_secret_operations_allowed(ctx),
             config::get_optional(ctx, STRIPE_SECRET_KEY).await?,
             config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_STRIPE_API_VERSION).await?,
         ))
@@ -1850,7 +1850,7 @@ pub(crate) async fn sync_offer_catalog(
     product_id: &str,
     offer_id: &str,
 ) -> Result<ManagedOffer, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe catalog synchronization is disabled in the browser runtime",
@@ -1933,7 +1933,7 @@ pub(crate) async fn archive_offer_catalog(
     if synced_components.is_empty() {
         return repo::offers::archive(ctx, product_id, offer_id).await;
     }
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe catalog archival is disabled in the browser runtime",
@@ -2172,7 +2172,7 @@ pub(crate) async fn create_payment_link(
     offer_id: &str,
     request: &PaymentLinkCreateRequest,
 ) -> Result<ManagedPaymentLink, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe Payment Link creation is disabled in the browser runtime",
@@ -2454,7 +2454,7 @@ async fn retire_payment_link_for_archival(
     let Err(error) = deactivate_payment_link(ctx, offer_id, link_id).await else {
         return Ok(());
     };
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         // Queuing buys nothing in a runtime that cannot reach Stripe at all,
         // and the refusal is the honest answer to "archive this".
         return Err(error);
@@ -2487,7 +2487,7 @@ pub(crate) async fn deactivate_payment_link(
         // locally.
         return repo::payment_links::deactivate_local(ctx, offer_id, link_id).await;
     }
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe Payment Link deactivation is disabled in the browser runtime",
@@ -2640,7 +2640,7 @@ pub(crate) async fn take_down_payment_link(
     ctx: &dyn Context,
     link_id: &str,
 ) -> Result<PaymentLinkTakedown, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe Payment Link deactivation is disabled in the browser runtime",
@@ -3279,7 +3279,7 @@ fn bounded_provider_diagnostic(value: Option<&serde_json::Value>, limit: usize) 
 pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let settings = async {
         Ok::<_, WaferError>((
-            stripe_secret_operations_allowed(ctx).await?,
+            stripe_secret_operations_allowed(ctx),
             config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await?,
         ))
     };

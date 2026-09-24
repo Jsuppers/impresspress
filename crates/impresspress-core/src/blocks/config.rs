@@ -1076,11 +1076,12 @@ mod boot_owned_key_tests {
     /// `products::RUNTIME_KIND_CONFIG_KEY` is documented as set by the browser
     /// adapter "after loading persisted variables, so an admin database value
     /// cannot accidentally turn a public browser runtime into a trusted
-    /// secret holder", and `products::stripe_secret_operations_allowed` reads
-    /// it through the config client. When this block started answering
-    /// table-first, a row holding `server` under that key would have switched
-    /// Stripe secret-key operations on inside a visitor's browser — a row that
-    /// the admin variables API accepts for any key, and that a dev-sandbox data
+    /// secret holder". `products::stripe_secret_operations_allowed` reads it
+    /// off the `config_get` snapshot, but this block serves it too, so a
+    /// config-client read must not answer a table row either: answered
+    /// table-first, a row holding `server` under that key would tell any such
+    /// reader it runs on a server inside a visitor's browser — a row that the
+    /// admin variables API accepts for any key, and that a dev-sandbox data
     /// import can carry.
     #[cfg(feature = "block-products")]
     #[tokio::test]

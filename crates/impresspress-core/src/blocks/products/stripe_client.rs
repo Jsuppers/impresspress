@@ -27,7 +27,7 @@ pub(crate) struct StripeClient {
 
 impl StripeClient {
     pub(crate) async fn load(ctx: &dyn Context) -> Result<Self, WaferError> {
-        if !stripe_secret_operations_allowed(ctx).await? {
+        if !stripe_secret_operations_allowed(ctx) {
             return Err(WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "Stripe secret-key operations are disabled in the browser runtime; configure a trusted remote commerce API instead",

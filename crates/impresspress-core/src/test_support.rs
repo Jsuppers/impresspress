@@ -1150,18 +1150,6 @@ impl TestContext {
     /// that cannot be written takes. Used to prove a save handler reports the
     /// failure instead of a success.
     pub fn refuse_config_writes(&mut self) {
-        self.refuse_config(RefusedConfigOp::Writes);
-    }
-
-    /// Make every `config.get` of `key` fail with `PermissionDenied`, the way
-    /// WRAP refuses a read, while every other key and op keeps answering.
-    /// Used to prove a reader of that key fails closed instead of taking the
-    /// refusal for an unset key.
-    pub fn refuse_config_reads_of(&mut self, key: &str) {
-        self.refuse_config(RefusedConfigOp::ReadsOf(key.to_string()));
-    }
-
-    fn refuse_config(&mut self, refused: RefusedConfigOp) {
         let inner = self
             .blocks
             .lock()
@@ -1169,10 +1157,7 @@ impl TestContext {
             .get("wafer-run/config")
             .cloned()
             .expect("every fixture registers a config block");
-        self.register_block(
-            "wafer-run/config",
-            Arc::new(RefusingConfigOp { inner, refused }),
-        );
+        self.register_block("wafer-run/config", Arc::new(RefusingConfigWrites(inner)));
     }
 
     /// Replace the database backing this context with one whose mutating
@@ -2900,59 +2885,24 @@ impl TestContext {
     }
 }
 
-/// What [`RefusingConfigOp`] refuses.
-enum RefusedConfigOp {
-    /// Every `config.set`, as an `Internal` failure.
-    Writes,
-    /// Every `config.get` of this key, as `PermissionDenied`.
-    ReadsOf(String),
-}
-
-/// The config block behind [`TestContext::refuse_config_writes`] and
-/// [`TestContext::refuse_config_reads_of`]: the refused op fails, everything
-/// else reaches `inner`.
-struct RefusingConfigOp {
-    inner: Arc<dyn Block>,
-    refused: RefusedConfigOp,
-}
+/// The config block behind [`TestContext::refuse_config_writes`]: every
+/// `config.set` fails, everything else reaches the wrapped block.
+struct RefusingConfigWrites(Arc<dyn Block>);
 
 #[wafer_block::wafer_async_trait]
-impl Block for RefusingConfigOp {
+impl Block for RefusingConfigWrites {
     fn info(&self) -> BlockInfo {
-        self.inner.info()
+        self.0.info()
     }
 
     async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
-        match &self.refused {
-            RefusedConfigOp::Writes if msg.kind == wafer_block::common::ServiceOp::CONFIG_SET => {
-                OutputStream::error(WaferError::new(
-                    ErrorCode::Internal,
-                    "simulated config write failure",
-                ))
-            }
-            RefusedConfigOp::ReadsOf(key)
-                if msg.kind == wafer_block::common::ServiceOp::CONFIG_GET =>
-            {
-                let body = match input.collect_to_bytes().await {
-                    Ok(body) => body,
-                    Err(e) => return OutputStream::error(e),
-                };
-                let asked =
-                    wafer_block::codec::decode::<wafer_block::wire::config::GetRequest>(&body)
-                        .map(|req| req.key)
-                        .unwrap_or_default();
-                if asked == *key {
-                    return OutputStream::error(WaferError::new(
-                        ErrorCode::PermissionDenied,
-                        format!("simulated refusal of {key}"),
-                    ));
-                }
-                self.inner
-                    .handle(ctx, msg, InputStream::from_bytes(body))
-                    .await
-            }
-            _ => self.inner.handle(ctx, msg, input).await,
+        if msg.kind == wafer_block::common::ServiceOp::CONFIG_SET {
+            return OutputStream::error(WaferError::new(
+                ErrorCode::Internal,
+                "simulated config write failure",
+            ));
         }
+        self.0.handle(ctx, msg, input).await
     }
 }
 

@@ -138,7 +138,7 @@ pub(crate) async fn connection_status(
     let secret = config::get_default(ctx, STRIPE_SECRET_KEY, "").await?;
     let (publishable, publishable_configured, webhook_configured, api_version) =
         connection_base(ctx).await?;
-    if !stripe_secret_operations_allowed(ctx).await? {
+    if !stripe_secret_operations_allowed(ctx) {
         return Ok(connection_error(
             !secret.trim().is_empty(),
             false,

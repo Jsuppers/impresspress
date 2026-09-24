@@ -3244,7 +3244,7 @@ pub async fn my_purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// may be edited here.
 async fn settings_vars(ctx: &dyn Context) -> Result<SettingsVars, wafer_run::WaferError> {
     let own = super::config_vars();
-    let trusted_server = super::stripe_secret_operations_allowed(ctx).await?;
+    let trusted_server = super::stripe_secret_operations_allowed(ctx);
     let mut stripe = vec![config_vars::var_in(&own, STRIPE_PUBLISHABLE_KEY)];
     let mut stripe_advanced = vec![config_vars::var_in(&own, STRIPE_API_VERSION)];
     let mut webhooks = vec![config_vars::shared_var(FRONTEND_URL_KEY)];
@@ -3311,7 +3311,7 @@ impl SettingsVars {
 pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let settings = async {
         Ok::<_, wafer_run::WaferError>((
-            super::stripe_secret_operations_allowed(ctx).await?,
+            super::stripe_secret_operations_allowed(ctx),
             settings_vars(ctx).await?,
         ))
     };
