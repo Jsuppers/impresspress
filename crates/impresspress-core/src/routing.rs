@@ -8,7 +8,7 @@ use wafer_run::{
     context::Context, AuthLevel, BlockEndpoint, BlockInfo, InputStream, Message, OutputStream,
 };
 
-use crate::{endpoint_match, features::FeatureConfig};
+use crate::{config_vars::HAS_LANDING_PAGE_KEY, endpoint_match, features::FeatureConfig};
 
 /// URL prefix for embedded static assets, served by `impresspress/system`.
 ///
@@ -679,12 +679,7 @@ pub async fn route_to_block(
         // config-write generation, so this is one query per write, not one
         // per request to `/`.
         let has_landing_page = crate::config_vars::is_truthy(
-            &wafer_core::clients::config::get_default(
-                ctx,
-                "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
-                "false",
-            )
-            .await,
+            &wafer_core::clients::config::get_default(ctx, HAS_LANDING_PAGE_KEY, "false").await,
         );
         if has_landing_page {
             return ctx.call_block("wafer-run/web", msg, input).await;

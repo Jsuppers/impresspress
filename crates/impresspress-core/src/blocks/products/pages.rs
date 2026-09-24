@@ -6,6 +6,13 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use super::{
     assets,
+    config::{
+        AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, DEFAULT_CURRENCY, PLATFORM_COUNTRY,
+        SELLER_ALLOWED_CATEGORIES, SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES,
+        SELLER_APPLICATION_FEE_BPS, SELLER_MAX_PRODUCTS, SELLER_MODERATION_REQUIRED,
+        STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY,
+        STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
+    },
     contracts::{
         AmountRule, ApprovalStatus, CommerceAnalytics, ManagedOffer, OfferStatus, OfferSyncStatus,
         ProductStatus, SellerAccount, SellerFailureSummary, SellerStatus, StripeConnectionState,
@@ -13,7 +20,10 @@ use super::{
     },
     money, repo, stripe_provider,
 };
-use crate::blocks::crud;
+use crate::{
+    blocks::crud,
+    config_vars::{ALLOW_USER_PRODUCTS_KEY, FRONTEND_URL_KEY},
+};
 
 fn display_money(amount_minor: i64, currency: &str) -> String {
     let currency = money::normalize_currency(currency).unwrap_or_else(|_| currency.to_uppercase());
@@ -955,12 +965,8 @@ pub async fn admin_seller_detail(
 // ---------------------------------------------------------------------------
 
 pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> OutputStream {
-    let configured_currency = wafer_core::clients::config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__DEFAULT_CURRENCY",
-        "USD",
-    )
-    .await;
+    let configured_currency =
+        wafer_core::clients::config::get_default(ctx, DEFAULT_CURRENCY, "USD").await;
     let mut default_currency = super::money::normalize_currency(&configured_currency)
         .unwrap_or_else(|_| "USD".to_string());
     let template_definitions = [
@@ -3181,54 +3187,40 @@ pub async fn my_purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
 async fn settings_vars(ctx: &dyn Context) -> SettingsVars {
     let own = super::config_vars();
     let trusted_server = super::stripe_secret_operations_allowed(ctx).await;
-    let mut stripe = vec![config_vars::var_in(
-        &own,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY",
-    )];
-    let mut stripe_advanced = vec![config_vars::var_in(
-        &own,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-    )];
-    let mut webhooks = vec![config_vars::shared_var("WAFER_RUN_SHARED__FRONTEND_URL")];
+    let mut stripe = vec![config_vars::var_in(&own, STRIPE_PUBLISHABLE_KEY)];
+    let mut stripe_advanced = vec![config_vars::var_in(&own, STRIPE_API_VERSION)];
+    let mut webhooks = vec![config_vars::shared_var(FRONTEND_URL_KEY)];
     if trusted_server {
         stripe.splice(
             0..0,
             [
-                config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY"),
-                config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET"),
+                config_vars::var_in(&own, STRIPE_SECRET_KEY),
+                config_vars::var_in(&own, STRIPE_WEBHOOK_SECRET),
             ],
         );
-        stripe_advanced.insert(
-            0,
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL"),
-        );
+        stripe_advanced.insert(0, config_vars::var_in(&own, STRIPE_API_URL));
         webhooks.extend([
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__WEBHOOK_URL"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET"),
+            config_vars::var_in(&own, WEBHOOK_URL),
+            config_vars::var_in(&own, WEBHOOK_SECRET),
         ]);
     }
     SettingsVars {
-        features: vec![config_vars::shared_var(
-            "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS",
-        )],
+        features: vec![config_vars::shared_var(ALLOW_USER_PRODUCTS_KEY)],
         stripe,
         stripe_advanced,
         checkout: vec![
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__DEFAULT_CURRENCY"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX"),
+            config_vars::var_in(&own, DEFAULT_CURRENCY),
+            config_vars::var_in(&own, PLATFORM_COUNTRY),
+            config_vars::var_in(&own, AUTOMATIC_TAX),
         ],
-        checkout_advanced: vec![config_vars::var_in(
-            &own,
-            "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS",
-        )],
+        checkout_advanced: vec![config_vars::var_in(&own, CHECKOUT_ALLOWED_ORIGINS)],
         sellers: vec![
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__SELLER_APPLICATION_FEE_BPS"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__SELLER_MODERATION_REQUIRED"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_TEMPLATES"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CURRENCIES"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CATEGORIES"),
-            config_vars::var_in(&own, "IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS"),
+            config_vars::var_in(&own, SELLER_APPLICATION_FEE_BPS),
+            config_vars::var_in(&own, SELLER_MODERATION_REQUIRED),
+            config_vars::var_in(&own, SELLER_ALLOWED_TEMPLATES),
+            config_vars::var_in(&own, SELLER_ALLOWED_CURRENCIES),
+            config_vars::var_in(&own, SELLER_ALLOWED_CATEGORIES),
+            config_vars::var_in(&own, SELLER_MAX_PRODUCTS),
         ],
         webhooks,
     }

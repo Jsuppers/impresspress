@@ -14,7 +14,10 @@ use wafer_core::clients::{
 use wafer_run::{context::Context, InputStream, Message, OutputStream, WaferError};
 
 use super::{
-    config::{platform_country, seller_fee_bps, CountryCode},
+    config::{
+        platform_country, seller_fee_bps, CountryCode, AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS,
+        STRIPE_API_VERSION, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
+    },
     contracts::{
         self, AmountRule, CheckoutPresentation, CheckoutRequest, CheckoutResponse, EventStatus,
         ManagedOffer, ManagedPaymentLink, Offer, OfferMode, OfferStatus, OrderStatus,
@@ -28,6 +31,7 @@ use super::{
 };
 use crate::{
     blocks::crud,
+    config_vars::FRONTEND_URL_KEY,
     http::{
         err_bad_request, err_forbidden, err_internal, err_internal_no_cause, err_not_found,
         err_unauthorized, err_unavailable, ok_json,
@@ -476,8 +480,7 @@ pub(crate) async fn replay_webhook_event(
             "Stripe webhook replay is disabled in the browser runtime",
         ));
     }
-    let secret =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", "").await;
+    let secret = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await;
     if secret.is_empty() {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
@@ -584,18 +587,14 @@ pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStrea
             "Stripe secret-key checkout is disabled in the browser runtime; use a trusted remote commerce API or a pre-created Payment Link",
         );
     }
-    let Ok(stripe_key) = config::get(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY").await else {
+    let Ok(stripe_key) = config::get(ctx, STRIPE_SECRET_KEY).await else {
         return err_unavailable("Stripe is not configured");
     };
     if stripe_key.trim().is_empty() {
         return err_unavailable("Stripe is not configured");
     }
-    let stripe_api_version = config::get_default(
-        ctx,
-        "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
-        DEFAULT_STRIPE_API_VERSION,
-    )
-    .await;
+    let stripe_api_version =
+        config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_STRIPE_API_VERSION).await;
     if !is_stable_stripe_api_version(&stripe_api_version) {
         return err_internal_no_cause(
             "Stripe API version must be a stable YYYY-MM-DD.release value",
@@ -625,7 +624,7 @@ pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStrea
 /// `"true"` — so `=1` turned tax on at checkout while the wizard drew the
 /// toggle off.
 pub(in crate::blocks::products) async fn automatic_tax_enabled(ctx: &dyn Context) -> bool {
-    crate::config_vars::get_bool(ctx, "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX", false).await
+    crate::config_vars::get_bool(ctx, AUTOMATIC_TAX, false).await
 }
 
 async fn issue_receipt_token(ctx: &dyn Context) -> Result<(String, String, String), WaferError> {
@@ -1184,12 +1183,7 @@ async fn handle_offer_checkout(
         }
     }
 
-    let base_url = config::get_default(
-        ctx,
-        "WAFER_RUN_SHARED__FRONTEND_URL",
-        "http://localhost:5173",
-    )
-    .await;
+    let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
     let success_url = request.success_url.clone().unwrap_or_else(|| {
         format!("{base_url}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}")
     });
@@ -1197,8 +1191,7 @@ async fn handle_offer_checkout(
         .cancel_url
         .clone()
         .unwrap_or_else(|| format!("{base_url}/checkout/cancel"));
-    let allowed_origins =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS", "").await;
+    let allowed_origins = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await;
     if !is_allowed_checkout_url(&success_url, &base_url, &allowed_origins)
         || !is_allowed_checkout_url(&cancel_url, &base_url, &allowed_origins)
     {
@@ -2195,14 +2188,8 @@ pub(crate) async fn create_payment_link(
         .map_err(|error| WaferError::new(wafer_run::ErrorCode::InvalidArgument, error))?;
     let after_completion_url = request.after_completion_url.as_deref();
     if let Some(url) = after_completion_url {
-        let base_url = config::get_default(
-            ctx,
-            "WAFER_RUN_SHARED__FRONTEND_URL",
-            "http://localhost:5173",
-        )
-        .await;
-        let allowed =
-            config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS", "").await;
+        let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
+        let allowed = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await;
         if !is_allowed_checkout_url(url, &base_url, &allowed) {
             return Err(WaferError::new(
                 wafer_run::ErrorCode::InvalidArgument,
@@ -3266,8 +3253,7 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
         return err_forbidden("Stripe webhooks are disabled in the browser runtime");
     }
     // Verify Stripe webhook signature - REQUIRED
-    let webhook_secret =
-        config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", "").await;
+    let webhook_secret = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await;
     if webhook_secret.is_empty() {
         return err_unavailable(
             "STRIPE_WEBHOOK_SECRET not configured — webhook processing disabled for security",
@@ -4519,8 +4505,8 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
 /// Best-effort — if PRODUCTS_WEBHOOK_URL is not configured, this is a no-op.
 /// The webhook is signed with HMAC-SHA256 using PRODUCTS_WEBHOOK_SECRET.
 async fn fire_products_webhook(ctx: &dyn Context, event: &str, data: &serde_json::Value) {
-    let url = config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__WEBHOOK_URL", "").await;
-    let secret = config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET", "").await;
+    let url = config::get_default(ctx, WEBHOOK_URL, "").await;
+    let secret = config::get_default(ctx, WEBHOOK_SECRET, "").await;
     if url.is_empty() {
         return;
     }
@@ -4798,6 +4784,7 @@ async fn sync_addon_totals_from_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::products::config::STRIPE_WEBHOOK_SECRET;
 
     // constant_time_eq / hmac_sha256 behavior is tested in
     // `wafer_block_crypto::primitives` — only the Stripe-specific signature
@@ -5231,7 +5218,7 @@ mod tests {
     async fn handle_webhook_is_idempotent_on_replayed_event_id() {
         let mut ctx = TestContext::with_products().await;
         let secret = "whsec_test_idempotency";
-        ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
+        ctx.set_config(STRIPE_WEBHOOK_SECRET, secret);
 
         // `charge.refunded` with no matching purchase: the event-type match
         // arm runs (purchase lookup misses, so no further side effect) — this
@@ -5281,7 +5268,7 @@ mod tests {
     async fn handle_webhook_processes_distinct_event_ids_independently() {
         let mut ctx = TestContext::with_products().await;
         let secret = "whsec_test_idempotency_2";
-        ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
+        ctx.set_config(STRIPE_WEBHOOK_SECRET, secret);
 
         for id in ["evt_distinct_1", "evt_distinct_2"] {
             let body = serde_json::json!({
@@ -5307,7 +5294,7 @@ mod tests {
     async fn handle_webhook_processes_event_with_no_id_without_erroring() {
         let mut ctx = TestContext::with_products().await;
         let secret = "whsec_test_idempotency_3";
-        ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
+        ctx.set_config(STRIPE_WEBHOOK_SECRET, secret);
 
         let body = serde_json::json!({ "type": "charge.refunded", "data": {} });
         let (msg, input) = signed_webhook_request(&body, secret);
@@ -5354,7 +5341,7 @@ mod tests {
     async fn handle_webhook_reprocesses_a_previously_pending_event() {
         let mut ctx = TestContext::with_products().await;
         let secret = "whsec_test_pending_retry";
-        ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
+        ctx.set_config(STRIPE_WEBHOOK_SECRET, secret);
 
         seed_stripe_event_row(&ctx, "evt_pending_retry", EventStatus::Pending).await;
 
@@ -5399,7 +5386,7 @@ mod tests {
     async fn handle_webhook_skips_an_already_processed_event() {
         let mut ctx = TestContext::with_products().await;
         let secret = "whsec_test_already_processed";
-        ctx.set_config("IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET", secret);
+        ctx.set_config(STRIPE_WEBHOOK_SECRET, secret);
 
         seed_stripe_event_row(&ctx, "evt_already_processed", EventStatus::Processed).await;
 
@@ -5717,10 +5704,7 @@ mod tests {
     #[tokio::test]
     async fn dead_letter_replay_checks_integrity_and_uses_normal_webhook_processing() {
         let mut ctx = TestContext::with_products().await;
-        ctx.set_config(
-            "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
-            "whsec_manual_replay",
-        );
+        ctx.set_config(STRIPE_WEBHOOK_SECRET, "whsec_manual_replay");
         let payload = r#"{"id":"evt_manual_replay","type":"charge.refunded","livemode":false,"data":{"object":{"payment_intent":"pi_missing","livemode":false}}}"#;
         db::create(
             &ctx,

@@ -72,6 +72,12 @@ pub(crate) use repo::{
 };
 use wafer_run::{BlockInfo, ConfigVar, InputType, InstanceMode};
 
+use self::config::{
+    AUTOMATIC_TAX, CHECKOUT_ALLOWED_ORIGINS, DEFAULT_CURRENCY, SELLER_ALLOWED_CATEGORIES,
+    SELLER_ALLOWED_CURRENCIES, SELLER_ALLOWED_TEMPLATES, SELLER_MAX_PRODUCTS,
+    SELLER_MODERATION_REQUIRED, STRIPE_API_URL, STRIPE_API_VERSION, STRIPE_PUBLISHABLE_KEY,
+    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, WEBHOOK_SECRET, WEBHOOK_URL,
+};
 use super::rate_limit::{apply_route_limit, UserRateLimiter};
 use crate::{
     blocks::crud,
@@ -183,7 +189,7 @@ const COUNTRY_OPTIONS: &[(&str, &str)] = &[
 pub(crate) fn config_vars() -> Vec<ConfigVar> {
     vec![
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            STRIPE_SECRET_KEY,
             "Stripe API secret key",
             "",
         )
@@ -191,7 +197,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Password)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY",
+            STRIPE_PUBLISHABLE_KEY,
             "Stripe publishable key used by embedded Checkout and static storefronts. This key is safe to send to browsers, but is masked in admin storage and pages to prevent accidental configuration disclosure.",
             "",
         )
@@ -199,7 +205,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Password)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET",
+            STRIPE_WEBHOOK_SECRET,
             "Stripe webhook signing secret",
             "",
         )
@@ -207,21 +213,21 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Password)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL",
+            STRIPE_API_URL,
             "Stripe API base URL",
             "https://api.stripe.com",
         )
         .name("Stripe API URL")
         .input_type(InputType::Url),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION",
+            STRIPE_API_VERSION,
             "Stripe API version sent with every provider request and expected by the webhook destination",
             "2026-02-25.clover",
         )
         .name("Stripe API Version")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__DEFAULT_CURRENCY",
+            DEFAULT_CURRENCY,
             "Currency preselected for new products and offers",
             "USD",
         )
@@ -238,14 +244,14 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .options(COUNTRY_OPTIONS)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX",
+            AUTOMATIC_TAX,
             "Enable Stripe automatic tax by default for new offers",
             "false",
         )
         .name("Automatic Tax")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS",
+            CHECKOUT_ALLOWED_ORIGINS,
             "Comma-separated HTTPS origins allowed for Checkout return and cancel URLs; localhost HTTP origins are accepted in development",
             "",
         )
@@ -260,14 +266,14 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .name("Seller Application Fee (bps)")
         .input_type(InputType::Number),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__SELLER_MODERATION_REQUIRED",
+            SELLER_MODERATION_REQUIRED,
             "Require admin approval before a user-owned product can be published",
             "true",
         )
         .name("Moderate Seller Products")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_TEMPLATES",
+            SELLER_ALLOWED_TEMPLATES,
             "Optional comma-separated product template IDs sellers may use; blank allows every template",
             "",
         )
@@ -275,7 +281,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Text)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CURRENCIES",
+            SELLER_ALLOWED_CURRENCIES,
             "Optional comma-separated ISO currency codes sellers may use; blank allows every valid currency",
             "",
         )
@@ -283,7 +289,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Text)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CATEGORIES",
+            SELLER_ALLOWED_CATEGORIES,
             "Optional comma-separated product categories sellers may use; blank allows every category",
             "",
         )
@@ -291,14 +297,14 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Text)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS",
+            SELLER_MAX_PRODUCTS,
             "Maximum non-deleted products per seller; 0 means unlimited",
             "0",
         )
         .name("Seller Product Limit")
         .input_type(InputType::Number),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__WEBHOOK_URL",
+            WEBHOOK_URL,
             "Webhook URL for billing events",
             "",
         )
@@ -306,7 +312,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Url)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET",
+            WEBHOOK_SECRET,
             "Webhook signing secret",
             "",
         )

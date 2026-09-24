@@ -483,17 +483,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::{
+        blocks::email::{RATE_LIMIT_PER_RECIPIENT_MAX, RATE_LIMIT_WINDOW_SECS},
+        test_support::TestContext,
+    };
 
     /// A context with the REAL email block registered, configured to admit
     /// `per_recipient` messages to any one address per window.
     async fn ctx_with_email(per_recipient: &str) -> TestContext {
         let mut ctx = TestContext::new().await;
-        ctx.set_config(
-            "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
-            per_recipient,
-        );
-        ctx.set_config("IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS", "60");
+        ctx.set_config(RATE_LIMIT_PER_RECIPIENT_MAX, per_recipient);
+        ctx.set_config(RATE_LIMIT_WINDOW_SECS, "60");
         ctx.register_block(
             "impresspress/email",
             Arc::new(crate::blocks::email::EmailBlock::new()),

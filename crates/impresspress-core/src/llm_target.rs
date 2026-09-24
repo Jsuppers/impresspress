@@ -18,6 +18,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The llm block's config key for the output-token budget it publishes as
+/// [`DefaultTarget::max_tokens`].
+///
+/// Declared here rather than in `blocks::llm` for the reason this module
+/// exists: the vector block names it when the budget it receives is
+/// unusable, and it cannot reach `blocks::llm` through a Rust path.
+pub const DEFAULT_MAX_TOKENS_VAR: &str = "IMPRESSPRESS__LLM__DEFAULT_MAX_TOKENS";
+
 /// The default LLM target as it travels between blocks.
 ///
 /// Every field is optional on the wire because "nothing is configured" is a

@@ -21,6 +21,11 @@ pub mod templates;
 #[cfg(test)]
 mod test_support;
 
+use crate::config_vars::{
+    APP_NAME_KEY, AUTH_HEADLINE_KEY, AUTH_LOGO_URL_KEY, AUTH_TAGLINE_KEY, DEFAULT_APP_NAME,
+    EMBEDDED_SCRIPTS_KEY, FAVICON_URL_KEY, LOGO_ICON_URL_KEY, PRIMARY_COLOR_KEY,
+};
+
 /// Branding/site config loaded from environment variables.
 /// Passed through to layout and sidebar so every page renders consistently.
 pub struct SiteConfig {
@@ -51,26 +56,17 @@ impl SiteConfig {
     /// Load site config from the WAFER config system (env vars / variables table).
     pub async fn load(ctx: &dyn wafer_run::context::Context) -> Self {
         use wafer_core::clients::config;
-        let scripts_raw = config::get_default(ctx, "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS", "").await;
+        let scripts_raw = config::get_default(ctx, EMBEDDED_SCRIPTS_KEY, "").await;
         Self {
-            app_name: config::get_default(ctx, "WAFER_RUN_SHARED__APP_NAME", "Impresspress").await,
+            app_name: config::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await,
             // Blank = no wordmark image: templates render the app name as
             // text next to the (pixel-art) icon. Set to white-label with a
             // wordmark of your own.
             logo_url: config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await,
-            logo_icon_url: config::get_default(
-                ctx,
-                "WAFER_RUN_SHARED__LOGO_ICON_URL",
-                &assets::logo_icon_url(),
-            )
-            .await,
-            favicon_url: config::get_default(
-                ctx,
-                "WAFER_RUN_SHARED__FAVICON_URL",
-                &assets::favicon_url(),
-            )
-            .await,
-            primary_color: config::get_default(ctx, "WAFER_RUN_SHARED__PRIMARY_COLOR", "").await,
+            logo_icon_url: config::get_default(ctx, LOGO_ICON_URL_KEY, &assets::logo_icon_url())
+                .await,
+            favicon_url: config::get_default(ctx, FAVICON_URL_KEY, &assets::favicon_url()).await,
+            primary_color: config::get_default(ctx, PRIMARY_COLOR_KEY, "").await,
             embedded_scripts: scripts_raw
                 .split(',')
                 .map(str::trim)
@@ -79,13 +75,13 @@ impl SiteConfig {
                 .collect(),
             auth_headline: config::get_default(
                 ctx,
-                "WAFER_RUN_SHARED__AUTH_HEADLINE",
+                AUTH_HEADLINE_KEY,
                 crate::config_vars::DEFAULT_AUTH_HEADLINE,
             )
             .await,
             auth_tagline: config::get_default(
                 ctx,
-                "WAFER_RUN_SHARED__AUTH_TAGLINE",
+                AUTH_TAGLINE_KEY,
                 crate::config_vars::DEFAULT_AUTH_TAGLINE,
             )
             .await,
@@ -107,7 +103,7 @@ impl SiteConfig {
     pub async fn load_for_auth(ctx: &dyn wafer_run::context::Context) -> Self {
         use wafer_core::clients::config;
         let mut config = Self::load(ctx).await;
-        let auth_logo = config::get_default(ctx, "WAFER_RUN_SHARED__AUTH_LOGO_URL", "").await;
+        let auth_logo = config::get_default(ctx, AUTH_LOGO_URL_KEY, "").await;
         if !auth_logo.is_empty() {
             config.logo_url = auth_logo;
         }
@@ -395,7 +391,7 @@ pub async fn shell_document(
 /// branding + no embedded scripts is the right shape.
 fn minimal_config() -> SiteConfig {
     SiteConfig {
-        app_name: "Impresspress".to_string(),
+        app_name: DEFAULT_APP_NAME.to_string(),
         logo_url: String::new(),
         logo_icon_url: String::new(),
         favicon_url: assets::favicon_url(),
@@ -719,7 +715,10 @@ mod tests {
         test_support::{collect_css_classes, mask_rust_comments, strip_css_comments},
         *,
     };
-    use crate::ui::shell::{Crumb, Topbar};
+    use crate::{
+        config_vars::{AUTH_HEADLINE_KEY, AUTH_TAGLINE_KEY},
+        ui::shell::{Crumb, Topbar},
+    };
 
     fn site_config() -> SiteConfig {
         SiteConfig {
@@ -757,8 +756,8 @@ mod tests {
     #[tokio::test]
     async fn site_config_load_honors_auth_headline_and_tagline_overrides() {
         let mut ctx = crate::test_support::TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__AUTH_HEADLINE", "Acme Cloud");
-        ctx.set_config("WAFER_RUN_SHARED__AUTH_TAGLINE", "Built for Acme.");
+        ctx.set_config(AUTH_HEADLINE_KEY, "Acme Cloud");
+        ctx.set_config(AUTH_TAGLINE_KEY, "Built for Acme.");
         let config = SiteConfig::load(&ctx).await;
         assert_eq!(config.auth_headline, "Acme Cloud");
         assert_eq!(config.auth_tagline, "Built for Acme.");

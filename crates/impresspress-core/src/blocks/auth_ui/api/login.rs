@@ -17,6 +17,7 @@ use crate::{
         crud,
         errors::{error_response, ErrorCode},
     },
+    config_vars::POST_LOGIN_REDIRECT_KEY,
     http::{err_bad_request, ResponseBuilder},
 };
 
@@ -96,8 +97,12 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     // Check email verification if required
-    let require_verification =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN__AUTH__REQUIRE_VERIFICATION", false).await;
+    let require_verification = crate::config_vars::get_bool(
+        ctx,
+        crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
+        false,
+    )
+    .await;
     if require_verification && !user.email_verified {
         return error_response(ErrorCode::EmailNotVerified, "Please verify your email before logging in. Check your inbox for the verification link.");
     }
@@ -145,8 +150,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // single-sourced default (`redirect::default_post_login_redirect`) gets
     // applied. The client only falls back to this when it has no explicit,
     // already-validated `next`/`redirect` param of its own.
-    let post_login_raw =
-        config::get_default(ctx, "WAFER_RUN_SHARED__POST_LOGIN_REDIRECT", "/b/admin/").await;
+    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
     let admin_default = if is_safe_local_redirect(&post_login_raw) {
         post_login_raw
     } else {
@@ -184,7 +188,11 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 mod tests {
     use super::*;
     use crate::{
-        blocks::{auth::TIMING_EQUALIZATION_PASSWORD, auth_ui::api::signup},
+        blocks::{
+            auth::{config::BOOTSTRAP_ADMIN_EMAIL_KEY, TIMING_EQUALIZATION_PASSWORD},
+            auth_ui::api::signup,
+        },
+        config_vars::POST_LOGIN_REDIRECT_KEY,
         test_support::{collect_or_panic, output_http_status, output_json, TestContext},
     };
 
@@ -242,10 +250,7 @@ mod tests {
         let mut ctx = ctx_with_crypto().await;
         // Matches the signup-time `initial_role_for` rule, so the seeded user
         // is created with role "admin" directly.
-        ctx.set_config(
-            "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL",
-            "admin@example.com",
-        );
+        ctx.set_config(BOOTSTRAP_ADMIN_EMAIL_KEY, "admin@example.com");
         signup_user(&ctx, "admin@example.com", "correct-horse-battery").await;
 
         let resp = login(&ctx, "admin@example.com", "correct-horse-battery").await;
@@ -264,11 +269,8 @@ mod tests {
     #[tokio::test]
     async fn admin_login_honors_custom_configured_admin_default() {
         let mut ctx = ctx_with_crypto().await;
-        ctx.set_config(
-            "WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL",
-            "admin@example.com",
-        );
-        ctx.set_config("WAFER_RUN_SHARED__POST_LOGIN_REDIRECT", "/b/admin/reports");
+        ctx.set_config(BOOTSTRAP_ADMIN_EMAIL_KEY, "admin@example.com");
+        ctx.set_config(POST_LOGIN_REDIRECT_KEY, "/b/admin/reports");
         signup_user(&ctx, "admin@example.com", "correct-horse-battery").await;
 
         let resp = login(&ctx, "admin@example.com", "correct-horse-battery").await;

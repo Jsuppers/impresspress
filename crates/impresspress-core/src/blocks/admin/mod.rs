@@ -1545,7 +1545,7 @@ mod table_tests {
     use wafer_run::{AuthLevel, Block as _, Message};
 
     use super::*;
-    use crate::{endpoint_match::endpoint_auth, test_support::anon_msg};
+    use crate::{config_vars::APP_NAME_KEY, endpoint_match::endpoint_auth, test_support::anon_msg};
 
     /// `info().endpoints` is generated from `ROUTES`; nothing else declares
     /// an endpoint for this block.
@@ -1702,13 +1702,13 @@ mod table_tests {
                 "retrieve",
                 "/b/admin/api/settings/WAFER_RUN_SHARED__APP_NAME",
                 Route::GetSettingApi,
-                &[("key", "WAFER_RUN_SHARED__APP_NAME")],
+                &[("key", APP_NAME_KEY)],
             ),
             (
                 "update",
                 "/b/admin/api/settings/WAFER_RUN_SHARED__APP_NAME",
                 Route::SetSettingApi,
-                &[("key", "WAFER_RUN_SHARED__APP_NAME")],
+                &[("key", APP_NAME_KEY)],
             ),
             (
                 "create",
@@ -1820,7 +1820,7 @@ mod table_tests {
                 "retrieve",
                 "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME/edit",
                 Route::EditVariableForm,
-                &[("key", "WAFER_RUN_SHARED__APP_NAME")],
+                &[("key", APP_NAME_KEY)],
             ),
             (
                 "delete",
@@ -1832,7 +1832,7 @@ mod table_tests {
                 "create",
                 "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME/reset-to-environment",
                 Route::ResetVariableToEnvironment,
-                &[("key", "WAFER_RUN_SHARED__APP_NAME")],
+                &[("key", APP_NAME_KEY)],
             ),
             // The bulk sibling. Its literal segment sits exactly where the
             // rows above carry `{key}`, so this case is also what proves it is
@@ -1848,7 +1848,7 @@ mod table_tests {
                 "update",
                 "/b/admin/variables/WAFER_RUN_SHARED__APP_NAME",
                 Route::UpdateVariable,
-                &[("key", "WAFER_RUN_SHARED__APP_NAME")],
+                &[("key", APP_NAME_KEY)],
             ),
             (
                 "retrieve",
@@ -2081,7 +2081,7 @@ pub(crate) mod page_link_tests {
     /// runtime-owned guard — so the control only renders for a key the
     /// environment can actually set. An ad hoc fixture would have proved the
     /// control exists on a row where pressing it does nothing.
-    const PINNED_VARIABLE: &str = "WAFER_RUN_SHARED__APP_NAME";
+    const PINNED_VARIABLE: &str = crate::config_vars::APP_NAME_KEY;
 
     /// A variables row the one-time upgrade transition pinned, so the Variables
     /// page renders the BULK "Reset all keys pinned at upgrade" control.
@@ -2091,7 +2091,7 @@ pub(crate) mod page_link_tests {
     /// have let the markup be deleted without a failure here. Declared and
     /// shared for the same reason [`PINNED_VARIABLE`] is — the bulk selection
     /// applies `variables::key_can_be_seeded_from_env` too.
-    const UPGRADE_PINNED_VARIABLE: &str = "WAFER_RUN_SHARED__AUTH_HEADLINE";
+    const UPGRADE_PINNED_VARIABLE: &str = crate::config_vars::AUTH_HEADLINE_KEY;
 
     /// The two blocks an admin page may link to, by the router prefix each
     /// owns (`routing.rs`); a link anywhere else is a new decision.

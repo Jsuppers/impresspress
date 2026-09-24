@@ -550,7 +550,10 @@ mod tests {
     async fn fixture_for(
         fake: &crate::blocks::llm::providers::fake_provider::FakeProvider,
     ) -> (crate::test_support::TestContext, String) {
-        use crate::blocks::llm::{DEFAULT_MAX_TOKENS_VAR, DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR};
+        use crate::{
+            blocks::llm::{DEFAULT_MODEL_VAR, DEFAULT_PROVIDER_VAR},
+            llm_target::DEFAULT_MAX_TOKENS_VAR,
+        };
 
         let mut ctx = crate::test_support::TestContext::with_llm().await;
         register_messages_block(&mut ctx).await;

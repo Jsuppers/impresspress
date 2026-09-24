@@ -2,7 +2,12 @@ use maud::Markup;
 use wafer_run::{context::Context, ConfigVar, InputStream, Message, OutputStream, WaferError};
 
 use crate::{
-    blocks::email,
+    blocks::{
+        email,
+        email::{
+            MAILGUN_API_KEY, MAILGUN_BASE_URL, MAILGUN_DOMAIN, MAILGUN_FROM, MAILGUN_REPLY_TO,
+        },
+    },
     config_vars,
     ui::{
         icons,
@@ -19,11 +24,11 @@ use crate::{
 /// source of truth, shared with `BlockInfo::config_keys` and the admin
 /// Variables page.
 const MAILGUN_KEYS: &[&str] = &[
-    "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY",
-    "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN",
-    "IMPRESSPRESS__EMAIL__MAILGUN_FROM",
-    "IMPRESSPRESS__EMAIL__MAILGUN_REPLY_TO",
-    "IMPRESSPRESS__EMAIL__MAILGUN_BASE_URL",
+    MAILGUN_API_KEY,
+    MAILGUN_DOMAIN,
+    MAILGUN_FROM,
+    MAILGUN_REPLY_TO,
+    MAILGUN_BASE_URL,
 ];
 
 fn mailgun_vars() -> Vec<ConfigVar> {
@@ -63,15 +68,18 @@ mod tests {
 
     use super::*;
     use crate::{
-        blocks::admin::{test_support::routed, AdminBlock},
+        blocks::{
+            admin::{test_support::routed, AdminBlock},
+            email::{MAILGUN_API_KEY, MAILGUN_DOMAIN},
+        },
         test_support::{admin_msg, anon_msg, audit_rows, output_json, TestContext},
         util::RecordExt,
     };
 
     fn email_body() -> serde_json::Value {
         serde_json::json!({
-            "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY": "key-123",
-            "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN": "mg.example.com",
+            MAILGUN_API_KEY: "key-123",
+            MAILGUN_DOMAIN: "mg.example.com",
         })
     }
 
@@ -105,7 +113,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         // Registers a real `wafer-run/config` service block so `config::set`
         // succeeds (see `TestContext::set_config`).
-        ctx.set_config("IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "");
+        ctx.set_config(MAILGUN_API_KEY, "");
         let msg = anon_msg("create", "/b/admin/email");
         let input = InputStream::from_bytes(serde_json::to_vec(&email_body()).unwrap());
 
@@ -121,7 +129,7 @@ mod tests {
         assert_eq!(body["message"], "Settings saved");
 
         // The value was actually persisted, not just reported as saved.
-        let stored = config::get_default(&ctx, "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "").await;
+        let stored = config::get_default(&ctx, MAILGUN_API_KEY, "").await;
         assert_eq!(stored, "key-123");
     }
 
@@ -169,7 +177,7 @@ mod tests {
         // `settings_form.rs`'s own `password_field_is_masked_with_eye_toggle_
         // and_never_echoes_the_raw_value` test for the same contract).
         let mut ctx = TestContext::with_admin().await;
-        ctx.set_config("IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "super-secret-value");
+        ctx.set_config(MAILGUN_API_KEY, "super-secret-value");
         let msg = anon_msg("retrieve", "/b/admin/settings/email");
 
         let html = settings_body(&ctx, &msg)

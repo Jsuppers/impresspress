@@ -314,6 +314,13 @@ pub fn variable_is_exportable(row: &serde_json::Map<String, Value>) -> bool {
 #[cfg(test)]
 mod variable_is_exportable_tests {
     use super::*;
+    use crate::{
+        blocks::{
+            email::MAILGUN_DOMAIN,
+            products::config::{CHECKOUT_ALLOWED_ORIGINS, PLATFORM_COUNTRY},
+        },
+        config_vars::{APP_NAME_KEY, REQUEST_LOG_CONFIG_KEY},
+    };
 
     fn row(fields: serde_json::Value) -> serde_json::Map<String, Value> {
         match fields {
@@ -325,11 +332,11 @@ mod variable_is_exportable_tests {
     #[test]
     fn a_clean_non_sensitive_row_exports() {
         assert!(variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": false,
         }))));
         assert!(variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": 0,
         }))));
     }
@@ -337,11 +344,11 @@ mod variable_is_exportable_tests {
     #[test]
     fn an_explicitly_sensitive_row_never_exports() {
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": true,
         }))));
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": 1,
         }))));
     }
@@ -381,7 +388,7 @@ mod variable_is_exportable_tests {
     #[test]
     fn an_impresspress_prefixed_key_never_exports_even_when_the_flag_is_clear() {
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "IMPRESSPRESS_INTERNAL_FLAG",
+            "key": REQUEST_LOG_CONFIG_KEY,
             "sensitive": false,
         }))));
     }
@@ -396,9 +403,9 @@ mod variable_is_exportable_tests {
     #[test]
     fn block_scoped_config_stays_with_the_instance_that_configured_it() {
         for key in [
-            "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS",
-            "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY",
-            "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN",
+            CHECKOUT_ALLOWED_ORIGINS,
+            PLATFORM_COUNTRY,
+            MAILGUN_DOMAIN,
             crate::blocks::dev::seed::SEED_ERROR_KEY,
         ] {
             assert!(
@@ -442,7 +449,7 @@ mod variable_is_exportable_tests {
     #[test]
     fn shared_config_travels() {
         assert!(variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": false,
         }))));
     }
@@ -451,19 +458,19 @@ mod variable_is_exportable_tests {
     fn odd_shapes_fail_closed_rather_than_defaulting_to_exportable() {
         // Missing `sensitive` entirely.
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
         }))));
         // `sensitive` present but not a clean 0/false shape.
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": "0",
         }))));
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": 0.5,
         }))));
         assert!(!variable_is_exportable(&row(serde_json::json!({
-            "key": "WAFER_RUN_SHARED__APP_NAME",
+            "key": APP_NAME_KEY,
             "sensitive": null,
         }))));
         // Missing `key` entirely, or `key` not a plain string.

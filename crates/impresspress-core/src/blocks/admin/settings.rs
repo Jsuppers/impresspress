@@ -557,7 +557,10 @@ mod tests {
     use wafer_run::InputType;
 
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::{
+        config_vars::{FAVICON_URL_KEY, LOGO_ICON_URL_KEY},
+        test_support::TestContext,
+    };
 
     /// Seed one `variables` row with an explicit `sensitive` flag.
     async fn seed_var(ctx: &dyn Context, key: &str, value: &str, sensitive: bool) {
@@ -1676,14 +1679,14 @@ mod tests {
         // the right route, a hash this build no longer serves.
         seed_var(
             &ctx,
-            "WAFER_RUN_SHARED__LOGO_ICON_URL",
+            LOGO_ICON_URL_KEY,
             "/b/static/impresspress-logo-5e884a3a.png",
             false,
         )
         .await;
         seed_var(
             &ctx,
-            "WAFER_RUN_SHARED__FAVICON_URL",
+            FAVICON_URL_KEY,
             "/b/static/favicon-2845a6ac.ico",
             false,
         )
@@ -1692,16 +1695,12 @@ mod tests {
         seed_defaults(&ctx).await;
 
         assert_eq!(
-            stored_value(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL")
-                .await
-                .as_deref(),
+            stored_value(&ctx, LOGO_ICON_URL_KEY).await.as_deref(),
             Some(crate::ui::assets::logo_icon_url().as_str()),
             "a stale built-in logo URL must be repaired to the current asset"
         );
         assert_eq!(
-            stored_value(&ctx, "WAFER_RUN_SHARED__FAVICON_URL")
-                .await
-                .as_deref(),
+            stored_value(&ctx, FAVICON_URL_KEY).await.as_deref(),
             Some(crate::ui::assets::favicon_url().as_str()),
             "a stale built-in favicon URL must be repaired to the current asset"
         );
@@ -1717,14 +1716,12 @@ mod tests {
             .expect("apply admin migrations");
 
         let current = crate::ui::assets::logo_icon_url();
-        seed_var(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL", &current, false).await;
+        seed_var(&ctx, LOGO_ICON_URL_KEY, &current, false).await;
 
         seed_defaults(&ctx).await;
 
         assert_eq!(
-            stored_value(&ctx, "WAFER_RUN_SHARED__LOGO_ICON_URL")
-                .await
-                .as_deref(),
+            stored_value(&ctx, LOGO_ICON_URL_KEY).await.as_deref(),
             Some(current.as_str()),
         );
     }
@@ -1882,7 +1879,7 @@ mod config_store_reproduction {
     /// same database made the page render the new colour.
     #[tokio::test]
     async fn patch_settings_reaches_config_readers_without_a_restart() {
-        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
         let mut ctx = TestContext::new().await;
         crate::blocks::admin::migrations::apply(&ctx)

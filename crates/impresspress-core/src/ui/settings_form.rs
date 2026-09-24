@@ -575,6 +575,10 @@ pub async fn save_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        blocks::email::MAILGUN_API_KEY,
+        config_vars::{APP_NAME_KEY, LOGO_URL_KEY},
+    };
 
     fn var(key: &str, name: &str, input_type: InputType) -> ConfigVar {
         ConfigVar::new(key, "desc text", "def")
@@ -631,9 +635,9 @@ mod tests {
 
     #[test]
     fn text_field_renders_text_input_with_label_and_help() {
-        let v = var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text);
+        let v = var(APP_NAME_KEY, "App Name", InputType::Text);
         let s = render_field(&v, "MyApp").into_string();
-        assert!(s.contains(r#"name="WAFER_RUN_SHARED__APP_NAME""#));
+        assert!(s.contains(&format!(r#"name="{APP_NAME_KEY}""#)));
         assert!(s.contains(r#"type="text""#));
         assert!(s.contains(r#"value="MyApp""#));
         assert!(s.contains(">App Name<"));
@@ -766,15 +770,11 @@ mod tests {
     #[tokio::test]
     async fn save_settings_rejects_ssrf_url_for_url_typed_var() {
         let ctx = TestContext::new().await;
-        let allowed = [var(
-            "WAFER_RUN_SHARED__BRANDING__LOGO_URL",
-            "Logo",
-            InputType::Url,
-        )];
+        let allowed = [var(LOGO_URL_KEY, "Logo", InputType::Url)];
         let out = run_save(
             &ctx,
             &allowed,
-            serde_json::json!({"WAFER_RUN_SHARED__BRANDING__LOGO_URL": "https://10.0.0.1/logo.png"}),
+            serde_json::json!({LOGO_URL_KEY: "https://10.0.0.1/logo.png"}),
         )
         .await;
         assert!(
@@ -791,13 +791,8 @@ mod tests {
         // No `wafer-run/config` block registered → config::set fails. Before the
         // fix the loop swallowed the error and reported success anyway.
         let ctx = TestContext::new().await;
-        let allowed = [var("WAFER_RUN_SHARED__APP_NAME", "App", InputType::Text)];
-        let out = run_save(
-            &ctx,
-            &allowed,
-            serde_json::json!({"WAFER_RUN_SHARED__APP_NAME": "MyApp"}),
-        )
-        .await;
+        let allowed = [var(APP_NAME_KEY, "App", InputType::Text)];
+        let out = run_save(&ctx, &allowed, serde_json::json!({APP_NAME_KEY: "MyApp"})).await;
         assert!(
             matches!(
                 out.collect_buffered().await,
@@ -812,15 +807,8 @@ mod tests {
     #[tokio::test]
     async fn render_sections_never_leaks_a_stored_secret_into_the_html() {
         let mut ctx = TestContext::with_admin().await;
-        ctx.set_config(
-            "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY",
-            "key-abcdef0123456789",
-        );
-        let v = var(
-            "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY",
-            "Mailgun API Key",
-            InputType::Password,
-        );
+        ctx.set_config(MAILGUN_API_KEY, "key-abcdef0123456789");
+        let v = var(MAILGUN_API_KEY, "Mailgun API Key", InputType::Password);
         let sections = [SettingsSection::new(
             "Email",
             html! {},
@@ -923,12 +911,12 @@ mod tests {
     #[tokio::test]
     async fn a_refused_mask_writes_nothing_at_all() {
         let mut ctx = TestContext::with_admin().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
+        ctx.set_config(APP_NAME_KEY, "MyApp");
         ctx.set_config("X__API_SECRET", "original-secret");
         // App name first, so it would already be written by the time the mask
         // is reached if the check lived in the write loop.
         let allowed = [
-            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var(APP_NAME_KEY, "App Name", InputType::Text),
             var("X__API_SECRET", "API Secret", InputType::Password),
         ];
 
@@ -936,14 +924,14 @@ mod tests {
             &ctx,
             &allowed,
             serde_json::json!({
-                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                APP_NAME_KEY: "Renamed",
                 "X__API_SECRET": MASKED_VALUE,
             }),
         )
         .await;
         assert_eq!(crate::test_support::output_http_status(out).await, 400);
         assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "").await,
             "MyApp",
             "a refused save must not have written the fields before the refusal"
         );
@@ -979,7 +967,7 @@ mod tests {
         variables::insert(
             &ctx,
             NewVariable {
-                key: "WAFER_RUN_SHARED__APP_NAME".to_string(),
+                key: APP_NAME_KEY.to_string(),
                 value: "MyApp".to_string(),
                 name: String::new(),
                 description: String::new(),
@@ -1010,14 +998,14 @@ mod tests {
         .expect("seed the flagged note");
 
         let allowed = [
-            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var(APP_NAME_KEY, "App Name", InputType::Text),
             var("X__PLAIN_NOTE", "Note", InputType::Text),
         ];
         let out = run_save(
             &ctx,
             &allowed,
             serde_json::json!({
-                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                APP_NAME_KEY: "Renamed",
                 "X__PLAIN_NOTE": MASKED_VALUE,
             }),
         )
@@ -1029,7 +1017,7 @@ mod tests {
             "the refusal is a bad request that names the remedy, not a 500"
         );
         assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "").await,
             "MyApp",
             "and nothing ahead of it in the allowlist may have been written"
         );
@@ -1090,14 +1078,14 @@ mod tests {
         .expect("seed the flagged note");
 
         let allowed = [
-            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var(APP_NAME_KEY, "App Name", InputType::Text),
             var("X__PLAIN_NOTE", "Note", InputType::Text),
         ];
         let out = run_save(
             &ctx,
             &allowed,
             serde_json::json!({
-                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                APP_NAME_KEY: "Renamed",
                 "X__PLAIN_NOTE": "",
             }),
         )
@@ -1108,7 +1096,7 @@ mod tests {
             "precondition: the writer refuses the second var mid-loop"
         );
         assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "").await,
             "Renamed",
             "precondition: the first var was written before the refusal"
         );
@@ -1154,7 +1142,7 @@ mod tests {
         variables::insert(
             &ctx,
             NewVariable {
-                key: "WAFER_RUN_SHARED__APP_NAME".to_string(),
+                key: APP_NAME_KEY.to_string(),
                 value: "MyApp".to_string(),
                 name: String::new(),
                 description: String::new(),
@@ -1181,14 +1169,14 @@ mod tests {
         );
 
         let allowed = [
-            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var(APP_NAME_KEY, "App Name", InputType::Text),
             var(BOOT_ONLY, "Thing Secret", InputType::Password),
         ];
         let out = run_save(
             &ctx,
             &allowed,
             serde_json::json!({
-                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                APP_NAME_KEY: "Renamed",
                 BOOT_ONLY: MASKED_VALUE,
             }),
         )
@@ -1200,10 +1188,7 @@ mod tests {
             "submitting the value the form was shown must not be refused by the writer \
              after the pre-pass allowed it"
         );
-        assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
-            "Renamed",
-        );
+        assert_eq!(config::get_default(&ctx, APP_NAME_KEY, "").await, "Renamed",);
         assert_eq!(config::get_default(&ctx, BOOT_ONLY, "").await, MASKED_VALUE);
     }
 
@@ -1287,10 +1272,7 @@ mod tests {
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
 
-        for (key, value) in [
-            ("WAFER_RUN_SHARED__APP_NAME", "MyApp"),
-            ("X__NOTE", MASKED_VALUE),
-        ] {
+        for (key, value) in [(APP_NAME_KEY, "MyApp"), ("X__NOTE", MASKED_VALUE)] {
             variables::insert(
                 &ctx,
                 NewVariable {
@@ -1309,7 +1291,7 @@ mod tests {
         }
 
         let allowed = [
-            var("WAFER_RUN_SHARED__APP_NAME", "App Name", InputType::Text),
+            var(APP_NAME_KEY, "App Name", InputType::Text),
             var("X__NOTE", "Note", InputType::Text),
         ];
         // The page really does hand the mask back to the browser: this is what
@@ -1329,7 +1311,7 @@ mod tests {
             &ctx,
             &allowed,
             serde_json::json!({
-                "WAFER_RUN_SHARED__APP_NAME": "Renamed",
+                APP_NAME_KEY: "Renamed",
                 "X__NOTE": MASKED_VALUE,
             }),
         )
@@ -1341,7 +1323,7 @@ mod tests {
             "saving the page unedited must not be refused"
         );
         assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "").await,
             "Renamed",
             "and the edit the operator actually made must land"
         );
@@ -1372,24 +1354,17 @@ mod tests {
     #[tokio::test]
     async fn save_settings_refuses_the_mask_even_for_a_plain_field() {
         let mut ctx = TestContext::with_admin().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
-        let allowed = [var(
-            "WAFER_RUN_SHARED__APP_NAME",
-            "App Name",
-            InputType::Text,
-        )];
+        ctx.set_config(APP_NAME_KEY, "MyApp");
+        let allowed = [var(APP_NAME_KEY, "App Name", InputType::Text)];
 
         let out = run_save(
             &ctx,
             &allowed,
-            serde_json::json!({"WAFER_RUN_SHARED__APP_NAME": MASKED_VALUE}),
+            serde_json::json!({APP_NAME_KEY: MASKED_VALUE}),
         )
         .await;
         assert_eq!(crate::test_support::output_http_status(out).await, 400);
-        assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
-            "MyApp",
-        );
+        assert_eq!(config::get_default(&ctx, APP_NAME_KEY, "").await, "MyApp",);
     }
 
     #[tokio::test]
@@ -1397,23 +1372,14 @@ mod tests {
         // Non-sensitive fields keep the pre-existing behavior: an empty
         // submit is a real write (clears the stored value), not "unchanged".
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "MyApp");
-        let allowed = [var(
-            "WAFER_RUN_SHARED__APP_NAME",
-            "App Name",
-            InputType::Text,
-        )];
+        ctx.set_config(APP_NAME_KEY, "MyApp");
+        let allowed = [var(APP_NAME_KEY, "App Name", InputType::Text)];
 
-        let out = run_save(
-            &ctx,
-            &allowed,
-            serde_json::json!({"WAFER_RUN_SHARED__APP_NAME": ""}),
-        )
-        .await;
+        let out = run_save(&ctx, &allowed, serde_json::json!({APP_NAME_KEY: ""})).await;
         let body = output_json(out).await;
         assert_eq!(body["message"], "Settings saved");
         assert_eq!(
-            config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "").await,
             "",
             "a non-sensitive field's empty submit is a real write, unlike a sensitive field's"
         );
@@ -1442,7 +1408,7 @@ mod config_store_reproduction {
     /// process does.
     #[tokio::test]
     async fn settings_form_save_survives_a_restart() {
-        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
         let mut ctx = TestContext::new().await;
         crate::blocks::admin::migrations::apply(&ctx)

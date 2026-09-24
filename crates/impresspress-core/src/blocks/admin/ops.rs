@@ -1291,6 +1291,7 @@ mod tests {
     use wafer_block::db::{Filter, FilterOp};
 
     use super::*;
+    use crate::config_vars::{APP_NAME_KEY, EMBEDDED_SCRIPTS_KEY};
     // `is_sensitive_key_honors_flag_and_suffix` lives in `crate::util`'s test
     // module now, alongside the function it tests (moved when
     // `is_sensitive_key`/`MASKED_VALUE` were promoted to the shared
@@ -1395,7 +1396,7 @@ mod tests {
     async fn deleting_a_declared_shared_variable_is_refused() {
         let ctx = admin_ctx().await;
         let msg = admin_msg("create", "/admin/settings");
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         create_variable(&ctx, &msg, key, "Shop", None, None, false)
             .await
             .map_err(|_| "seed")
@@ -1416,23 +1417,23 @@ mod tests {
     async fn deleting_an_undeclared_shared_variable_is_allowed() {
         let ctx = admin_ctx().await;
         let msg = admin_msg("create", "/admin/settings");
-        let key = "WAFER_RUN_SHARED__RETIRED_SETTING";
+        const RETIRED: &str = "WAFER_RUN_SHARED__RETIRED_SETTING";
         assert!(
             !crate::config_vars::shared_config_vars()
                 .iter()
-                .any(|v| v.key == key),
+                .any(|v| v.key == RETIRED),
             "fixture must name a key the shared list does not declare",
         );
-        create_variable(&ctx, &msg, key, "x", None, None, false)
+        create_variable(&ctx, &msg, RETIRED, "x", None, None, false)
             .await
             .map_err(|_| "seed")
             .expect("seed the stale row");
 
-        delete_variable(&ctx, &msg, key)
+        delete_variable(&ctx, &msg, RETIRED)
             .await
             .map_err(|_| "delete")
             .expect("a stale shared row must be removable");
-        assert!(variables::get_by_key(&ctx, key)
+        assert!(variables::get_by_key(&ctx, RETIRED)
             .await
             .expect("read back")
             .is_none());
@@ -2087,7 +2088,7 @@ mod tests {
             update_variable(
                 &ctx,
                 &msg,
-                "WAFER_RUN_SHARED__APP_NAME",
+                APP_NAME_KEY,
                 VariableUpdate {
                     value: Some("Acme"),
                     description: None,
@@ -2097,7 +2098,7 @@ mod tests {
             .await,
         );
         assert!(
-            !variables::get_by_key(&ctx, "WAFER_RUN_SHARED__APP_NAME")
+            !variables::get_by_key(&ctx, APP_NAME_KEY)
                 .await
                 .expect("get")
                 .expect("row")
@@ -2121,7 +2122,7 @@ mod tests {
         let msg = admin_msg("update", "/admin/settings");
 
         // Mis-flagged by the Add Variable modal's default tick.
-        let key = "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS";
+        let key = EMBEDDED_SCRIPTS_KEY;
         expect_ok(create_variable(&ctx, &msg, key, "/analytics.js", None, None, true).await);
         expect_ok(
             update_variable(
@@ -2303,7 +2304,7 @@ mod tests {
     async fn reset_to_environment_is_the_only_route_out_of_a_pinned_key() {
         let ctx = admin_ctx().await;
         let msg = admin_msg("update", "/admin/settings");
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
 
         expect_ok(create_variable(&ctx, &msg, key, "AdminChoice", None, None, false).await);
         assert!(
@@ -2693,7 +2694,10 @@ mod tests {
 #[cfg(test)]
 mod runtime_key_guard_tests {
     use super::*;
-    use crate::test_support::{admin_msg, TestContext};
+    use crate::{
+        config_vars::APP_NAME_KEY,
+        test_support::{admin_msg, TestContext},
+    };
 
     async fn admin_ctx() -> TestContext {
         let ctx = TestContext::new().await;
@@ -2776,7 +2780,7 @@ mod runtime_key_guard_tests {
         let row = update_variable(
             &ctx,
             &msg,
-            "WAFER_RUN_SHARED__APP_NAME",
+            APP_NAME_KEY,
             VariableUpdate {
                 value: Some("Acme"),
                 description: None,

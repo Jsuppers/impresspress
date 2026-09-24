@@ -9,6 +9,7 @@ use crate::{
     blocks::{
         crud,
         products::{
+            config::{STRIPE_PUBLISHABLE_KEY, STRIPE_SECRET_KEY},
             contracts::{
                 ApprovalStatus, FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus,
                 PricingPreviewRequest, ProductStatus, ReconciliationStatus, StorefrontConfig,
@@ -42,8 +43,8 @@ fn validated_publishable_key(value: &str) -> Option<(String, StripeMode)> {
 }
 
 pub(crate) async fn handle_storefront_config(ctx: &dyn Context) -> OutputStream {
-    let key = config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY", "").await;
-    let secret = config::get_default(ctx, "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY", "").await;
+    let key = config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await;
+    let secret = config::get_default(ctx, STRIPE_SECRET_KEY, "").await;
     let validated = validated_publishable_key(&key);
     let matching_secret = validated.as_ref().is_some_and(|(key, _)| {
         super::super::stripe_client::publishable_livemode(key)

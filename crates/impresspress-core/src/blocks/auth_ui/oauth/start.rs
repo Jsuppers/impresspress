@@ -25,8 +25,10 @@ use wafer_run::{context::Context, Message, OutputStream};
 use crate::{
     blocks::{
         auth::repo::oauth_pkce::{self, NewPkceState},
+        auth_ui::OAUTH_REDIRECT_URI_KEY,
         crud,
     },
+    config_vars::ENABLE_OAUTH_KEY,
     http::{err_bad_request, err_forbidden, err_internal, ResponseBuilder},
     util::urlencode,
 };
@@ -59,8 +61,7 @@ fn generate_state_id() -> Result<String, String> {
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Check ENABLE_OAUTH flag
-    let enable_oauth =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ENABLE_OAUTH", false).await;
+    let enable_oauth = crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await;
     if !enable_oauth {
         return err_forbidden("OAuth login is not enabled");
     }
@@ -80,7 +81,7 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
     let redirect_uri = config::get_default(
         ctx,
-        "IMPRESSPRESS__AUTH_UI__OAUTH_REDIRECT_URI",
+        OAUTH_REDIRECT_URI_KEY,
         "http://localhost:8090/b/auth/oauth/callback",
     )
     .await;

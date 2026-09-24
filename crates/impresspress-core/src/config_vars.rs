@@ -72,6 +72,49 @@ pub const APP_NAME_KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
 /// lives here rather than in each block that shows it.
 pub const DEFAULT_APP_NAME: &str = "Impresspress";
 
+/// Shared config key: whether new users may sign up.
+pub const ALLOW_SIGNUP_KEY: &str = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
+
+/// Shared config key: where a user lands after signing in.
+pub const POST_LOGIN_REDIRECT_KEY: &str = "WAFER_RUN_SHARED__POST_LOGIN_REDIRECT";
+
+/// Shared config key: the frontend origin checkout redirects return to.
+pub const FRONTEND_URL_KEY: &str = "WAFER_RUN_SHARED__FRONTEND_URL";
+
+/// Shared config key: the brand accent colour; blank keeps the default.
+pub const PRIMARY_COLOR_KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+
+/// Shared config key: the small icon logo — the sidebar brand mark.
+pub const LOGO_ICON_URL_KEY: &str = "WAFER_RUN_SHARED__LOGO_ICON_URL";
+
+/// Shared config key: the logo on the auth pages; falls back to
+/// [`LOGO_URL_KEY`].
+pub const AUTH_LOGO_URL_KEY: &str = "WAFER_RUN_SHARED__AUTH_LOGO_URL";
+
+/// Shared config key: the headline on the auth pages' brand panel.
+pub const AUTH_HEADLINE_KEY: &str = "WAFER_RUN_SHARED__AUTH_HEADLINE";
+
+/// Shared config key: the sub-line under [`AUTH_HEADLINE_KEY`].
+pub const AUTH_TAGLINE_KEY: &str = "WAFER_RUN_SHARED__AUTH_TAGLINE";
+
+/// Shared config key: the browser tab icon.
+pub const FAVICON_URL_KEY: &str = "WAFER_RUN_SHARED__FAVICON_URL";
+
+/// Shared config key: the runtime environment, `development` or
+/// `production`.
+pub const ENVIRONMENT_KEY: &str = "WAFER_RUN_SHARED__ENVIRONMENT";
+
+/// Shared config key: whether this project has a dispatcher service binding.
+pub const HAS_DISPATCHER_BINDING_KEY: &str = "WAFER_RUN_SHARED__HAS_DISPATCHER_BINDING";
+
+/// Shared config key: whether `/` serves a static landing page instead of
+/// redirecting anonymous visitors to the login page.
+pub const HAS_LANDING_PAGE_KEY: &str = "WAFER_RUN_SHARED__HAS_LANDING_PAGE";
+
+/// Shared config key: comma-separated module-script URLs injected into every
+/// server-rendered page.
+pub const EMBEDDED_SCRIPTS_KEY: &str = "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS";
+
 /// Shared config key: whether signed-in users may create and sell their own
 /// products, not only the site admin.
 pub const ALLOW_USER_PRODUCTS_KEY: &str = "WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS";
@@ -107,12 +150,12 @@ pub const DEFAULT_CSP_DIRECTIVES: &str = "script-src https://js.stripe.com; \
 
 /// Default headline for the auth-split brand panel (login/signup/reset/etc.
 /// left-hand navy column) — see [`crate::ui::components::auth_panel`].
-/// White-label deployments override via `WAFER_RUN_SHARED__AUTH_HEADLINE`.
+/// White-label deployments override via [`AUTH_HEADLINE_KEY`].
 pub const DEFAULT_AUTH_HEADLINE: &str = "The backend that lifts its own weight.";
 
 /// Default sub-line under [`DEFAULT_AUTH_HEADLINE`] on the login page (the
 /// only auth-split page that doesn't already pass its own page-specific
-/// tagline). Overridable via `WAFER_RUN_SHARED__AUTH_TAGLINE`; blank hides
+/// tagline). Overridable via [`AUTH_TAGLINE_KEY`]; blank hides
 /// the tagline entirely.
 pub const DEFAULT_AUTH_TAGLINE: &str = "One binary. Batteries included. No lock-in.";
 
@@ -130,7 +173,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("App Name")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__ALLOW_SIGNUP",
+            ALLOW_SIGNUP_KEY,
             "Allow new user registration",
             "true",
         )
@@ -144,14 +187,14 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Enable OAuth")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__POST_LOGIN_REDIRECT",
+            POST_LOGIN_REDIRECT_KEY,
             "URL to redirect to after login",
             "/b/admin/",
         )
         .name("Post-Login Redirect")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__FRONTEND_URL",
+            FRONTEND_URL_KEY,
             "Frontend URL for checkout redirects",
             "http://localhost:5173",
         )
@@ -165,35 +208,35 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Logo URL")
         .input_type(InputType::Url),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__PRIMARY_COLOR",
+            PRIMARY_COLOR_KEY,
             "Brand accent (CSS color) for buttons, links, and highlights; blank keeps the default",
             "",
         )
         .name("Primary Color")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__LOGO_ICON_URL",
+            LOGO_ICON_URL_KEY,
             "Small icon logo (sidebar brand mark; the only mark shown when the sidebar is collapsed)",
             &crate::ui::assets::logo_icon_url(),
         )
         .name("Logo Icon URL")
         .input_type(InputType::Url),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__AUTH_LOGO_URL",
+            AUTH_LOGO_URL_KEY,
             "Logo on login/signup pages (falls back to Logo URL)",
             "",
         )
         .name("Auth Logo URL")
         .input_type(InputType::Url),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__AUTH_HEADLINE",
+            AUTH_HEADLINE_KEY,
             "Headline on the login/signup/etc. left-hand brand panel",
             DEFAULT_AUTH_HEADLINE,
         )
         .name("Auth Headline")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__AUTH_TAGLINE",
+            AUTH_TAGLINE_KEY,
             "Sub-line under the brand panel headline, shown on the login page \
              (other auth pages default to their own page-specific line); \
              blank hides it",
@@ -202,7 +245,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Auth Tagline")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__FAVICON_URL",
+            FAVICON_URL_KEY,
             "Browser tab icon",
             &crate::ui::assets::favicon_url(),
         )
@@ -216,21 +259,21 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("User Products")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__ENVIRONMENT",
+            ENVIRONMENT_KEY,
             "Runtime environment (development/production)",
             "development",
         )
         .name("Environment")
         .input_type(InputType::Text),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__HAS_DISPATCHER_BINDING",
+            HAS_DISPATCHER_BINDING_KEY,
             "Whether this project has a dispatcher service binding",
             "false",
         )
         .name("Dispatcher Binding")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__HAS_LANDING_PAGE",
+            HAS_LANDING_PAGE_KEY,
             "Serve a static landing page (wafer-run/web) at `/` instead of \
              redirecting anonymous visitors to the login page",
             "false",
@@ -238,7 +281,7 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
         .name("Has Landing Page")
         .input_type(InputType::Toggle),
         ConfigVar::new(
-            "WAFER_RUN_SHARED__EMBEDDED_SCRIPTS",
+            EMBEDDED_SCRIPTS_KEY,
             "Comma-separated module-script URLs injected into every SSR page \
              (e.g. /webllm-engine.js for browser WebLLM). Native deployments \
              leave this empty.",
@@ -851,13 +894,15 @@ mod truth_table_tests {
 
     #[tokio::test]
     async fn get_bool_reads_the_config_client_and_falls_back_to_the_default() {
+        const UNSET_FLAG: &str = "WAFER_RUN_SHARED__UNSET_FLAG";
+        const FLAG: &str = "WAFER_RUN_SHARED__FLAG";
         let mut ctx = TestContext::new().await;
-        assert!(get_bool(&ctx, "WAFER_RUN_SHARED__UNSET_FLAG", true).await);
-        assert!(!get_bool(&ctx, "WAFER_RUN_SHARED__UNSET_FLAG", false).await);
-        ctx.set_config("WAFER_RUN_SHARED__FLAG", "1");
-        assert!(get_bool(&ctx, "WAFER_RUN_SHARED__FLAG", false).await);
-        ctx.set_config("WAFER_RUN_SHARED__FLAG", "no");
-        assert!(!get_bool(&ctx, "WAFER_RUN_SHARED__FLAG", true).await);
+        assert!(get_bool(&ctx, UNSET_FLAG, true).await);
+        assert!(!get_bool(&ctx, UNSET_FLAG, false).await);
+        ctx.set_config(FLAG, "1");
+        assert!(get_bool(&ctx, FLAG, false).await);
+        ctx.set_config(FLAG, "no");
+        assert!(!get_bool(&ctx, FLAG, true).await);
     }
 
     /// An HTML checkbox posts `on`, and an absent field means unchecked.
@@ -877,7 +922,7 @@ mod truth_table_tests {
 
 #[cfg(test)]
 mod sensitivity_tests {
-    use super::{has_sensitive_suffix, is_sensitive_for_storage, shared_config_vars};
+    use super::{has_sensitive_suffix, is_sensitive_for_storage, shared_config_vars, APP_NAME_KEY};
 
     /// The declaration is what knows a suffix-less key holds a password, and
     /// the suffix rule still catches an undeclared ad hoc key. Both halves,
@@ -899,7 +944,7 @@ mod sensitivity_tests {
         assert!(is_sensitive_for_storage("X__Y__MAILGUN_API_KEY"));
 
         // Declared and plainly not a secret.
-        assert!(!is_sensitive_for_storage("WAFER_RUN_SHARED__APP_NAME"));
+        assert!(!is_sensitive_for_storage(APP_NAME_KEY));
         // Undeclared and not a secret.
         assert!(!is_sensitive_for_storage("SITE_TAGLINE"));
     }
@@ -966,7 +1011,8 @@ mod sensitivity_tests {
 
 #[cfg(test)]
 mod screaming_block_tests {
-    use super::{key_block_prefix, screaming_block};
+    use super::{key_block_prefix, screaming_block, ALLOW_SIGNUP_KEY};
+    use crate::blocks::email::MAILGUN_API_KEY;
 
     #[test]
     fn two_segment_name() {
@@ -983,19 +1029,16 @@ mod screaming_block_tests {
     fn key_block_prefix_two_segments() {
         // Block-scoped key → first two `__`-segments, matching migration 002.
         assert_eq!(
-            key_block_prefix("WAFER_RUN__AUTH__JWT_SECRET"),
+            key_block_prefix(crate::blocks::auth::JWT_SECRET_KEY),
             "WAFER_RUN__AUTH"
         );
-        assert_eq!(
-            key_block_prefix("IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET"),
-            "IMPRESSPRESS__PRODUCTS"
-        );
+        assert_eq!(key_block_prefix(MAILGUN_API_KEY), "IMPRESSPRESS__EMAIL");
     }
 
     #[test]
     fn key_block_prefix_shared_and_legacy_are_null() {
         // One `__` (shared var) → NULL/empty.
-        assert_eq!(key_block_prefix("WAFER_RUN_SHARED__ALLOW_SIGNUP"), "");
+        assert_eq!(key_block_prefix(ALLOW_SIGNUP_KEY), "");
         // No `__` → NULL/empty.
         assert_eq!(key_block_prefix("LEGACY_KEY"), "");
     }
@@ -1006,7 +1049,7 @@ mod screaming_block_tests {
         // prefix derived from the block name, so the seeder and the migration
         // backfill agree.
         assert_eq!(
-            key_block_prefix("WAFER_RUN__AUTH__JWT_SECRET"),
+            key_block_prefix(crate::blocks::auth::JWT_SECRET_KEY),
             screaming_block("wafer-run/auth")
         );
     }

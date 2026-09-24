@@ -1206,7 +1206,10 @@ pub async fn handle_delete_variable(ctx: &dyn Context, msg: &Message) -> OutputS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{admin_msg, output_html, TestContext};
+    use crate::{
+        config_vars::{APP_NAME_KEY, AUTH_HEADLINE_KEY},
+        test_support::{admin_msg, output_html, TestContext},
+    };
 
     /// Both tabs answer a failed read with the error page, instead of the
     /// "By Block" tab listing every declared var at its default, unpinned —
@@ -1231,7 +1234,7 @@ mod tests {
             let html = String::from_utf8_lossy(&parts.body);
             assert_eq!(parts.status, 500, "tab {tab:?}: {html}");
             assert!(
-                !html.contains("WAFER_RUN_SHARED__APP_NAME"),
+                !html.contains(APP_NAME_KEY),
                 "tab {tab:?}: a declared var rendered from its default: {html}"
             );
         }
@@ -1496,7 +1499,7 @@ mod tests {
     /// `WAFER_RUN_SHARED__*` row is shown.
     #[tokio::test]
     async fn the_variables_page_offers_the_reset_control_for_a_pinned_key() {
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         let ctx = ctx_with_a_pinned_key(key, true).await;
 
         for tab in ["", "all"] {
@@ -1524,11 +1527,11 @@ mod tests {
     async fn an_unpinned_row_offers_no_reset_control() {
         let mut ctx = TestContext::with_admin().await;
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
-        variables::seed_row_with_flag(&ctx, "WAFER_RUN_SHARED__APP_NAME", "Seeded", 0).await;
+        variables::seed_row_with_flag(&ctx, APP_NAME_KEY, "Seeded", 0).await;
 
         let html = variables_page_html(&ctx, "all").await;
         assert!(
-            html.contains("WAFER_RUN_SHARED__APP_NAME"),
+            html.contains(APP_NAME_KEY),
             "the row must be on the page: {html}"
         );
         assert!(
@@ -1547,7 +1550,7 @@ mod tests {
     /// default is the safe side.
     #[tokio::test]
     async fn a_target_without_a_process_environment_offers_no_reset_control() {
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         let ctx = ctx_with_a_pinned_key(key, false).await;
 
         for tab in ["", "all"] {
@@ -1609,7 +1612,7 @@ mod tests {
     async fn the_page_distinguishes_an_admin_edit_from_an_upgrade_pin() {
         let mut ctx = TestContext::with_admin().await;
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
-        let key = "WAFER_RUN_SHARED__APP_NAME";
+        let key = APP_NAME_KEY;
         variables::seed_row_with_owner(&ctx, key, "KeptAtUpgrade", variables::PRE_UPGRADE_SENTINEL)
             .await;
 
@@ -1630,7 +1633,7 @@ mod tests {
     #[test]
     fn var_row_edit_button_carries_accessible_name() {
         let cells = var_row(&VarRow {
-            key: "WAFER_RUN_SHARED__APP_NAME",
+            key: APP_NAME_KEY,
             name: None,
             value: ValueState::Plain("Impresspress".to_string()),
             default: None,
@@ -1911,7 +1914,7 @@ mod tests {
     /// could only fail.
     #[test]
     fn a_non_deletable_row_offers_no_delete_control() {
-        let s = row_html("WAFER_RUN_SHARED__APP_NAME", false);
+        let s = row_html(APP_NAME_KEY, false);
         assert!(
             !s.contains("hx-delete"),
             "a non-deletable row must render no delete control: {s}"
@@ -1927,12 +1930,9 @@ mod tests {
     /// pinned by the upgrade transition (released), pinned by an admin edit
     /// (never touched), and claimed by nobody (already follows the
     /// environment, so nothing to release).
-    const UPGRADE_PINNED: [&str; 2] = [
-        "WAFER_RUN_SHARED__APP_NAME",
-        "WAFER_RUN_SHARED__AUTH_HEADLINE",
-    ];
-    const ADMIN_EDITED: &str = "WAFER_RUN_SHARED__ALLOW_SIGNUP";
-    const UNCLAIMED: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+    const UPGRADE_PINNED: [&str; 2] = [APP_NAME_KEY, AUTH_HEADLINE_KEY];
+    const ADMIN_EDITED: &str = crate::config_vars::ALLOW_SIGNUP_KEY;
+    const UNCLAIMED: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
     /// An admin context holding one row in each pin state.
     ///

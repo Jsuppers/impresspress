@@ -697,6 +697,7 @@ pub fn register_with(
 mod tests {
     use super::*;
     use crate::{
+        config_vars::APP_NAME_KEY,
         platform_state::variables::VariablePatch,
         test_support::{unique_config_value, TestContext},
     };
@@ -709,18 +710,15 @@ mod tests {
         let mut ctx = TestContext::with_admin().await;
         ctx.set_config("X__BOOT_ONLY", "from-boot");
         let stored = unique_config_value();
-        wafer_core::clients::config::set(&ctx, "WAFER_RUN_SHARED__APP_NAME", &stored)
+        wafer_core::clients::config::set(&ctx, APP_NAME_KEY, &stored)
             .await
             .expect("store a row");
 
-        let values = get_many(
-            &ctx,
-            &["WAFER_RUN_SHARED__APP_NAME", "X__BOOT_ONLY", "X__UNSET"],
-        )
-        .await
-        .expect("a healthy read");
+        let values = get_many(&ctx, &[APP_NAME_KEY, "X__BOOT_ONLY", "X__UNSET"])
+            .await
+            .expect("a healthy read");
 
-        assert_eq!(values.get("WAFER_RUN_SHARED__APP_NAME"), Some(&stored));
+        assert_eq!(values.get(APP_NAME_KEY), Some(&stored));
         assert_eq!(
             values.get("X__BOOT_ONLY").map(String::as_str),
             Some("from-boot")
@@ -734,19 +732,17 @@ mod tests {
     #[tokio::test]
     async fn get_many_fails_where_config_get_falls_back() {
         let mut ctx = TestContext::with_admin().await;
-        ctx.set_config("WAFER_RUN_SHARED__APP_NAME", "from-boot");
-        wafer_core::clients::config::set(&ctx, "WAFER_RUN_SHARED__APP_NAME", "stored")
+        ctx.set_config(APP_NAME_KEY, "from-boot");
+        wafer_core::clients::config::set(&ctx, APP_NAME_KEY, "stored")
             .await
             .expect("store a row");
         let ctx = ctx.break_reads();
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, "WAFER_RUN_SHARED__APP_NAME", "").await,
+            wafer_core::clients::config::get_default(&ctx, APP_NAME_KEY, "").await,
             "from-boot"
         );
-        assert!(get_many(&ctx, &["WAFER_RUN_SHARED__APP_NAME"])
-            .await
-            .is_err());
+        assert!(get_many(&ctx, &[APP_NAME_KEY]).await.is_err());
     }
 
     /// An admin write must be visible to a reader whose snapshot is ALREADY
@@ -765,7 +761,7 @@ mod tests {
     /// where the `variables` repo has to supply it.
     #[tokio::test]
     async fn an_admin_write_invalidates_an_already_warm_snapshot() {
-        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
         let mut ctx = TestContext::new().await;
         crate::blocks::admin::migrations::apply(&ctx)
@@ -843,7 +839,7 @@ mod tests {
     /// thread-locally, whichever worker the reader resumes on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_admin_write_on_another_worker_reaches_a_warm_snapshot() {
-        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
         let mut ctx = TestContext::new().await;
         crate::blocks::admin::migrations::apply(&ctx)
@@ -916,7 +912,7 @@ mod tests {
     /// every one of them.
     #[tokio::test]
     async fn the_auth_pages_show_branding_saved_after_boot() {
-        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
         let mut ctx = TestContext::new().await;
         crate::blocks::admin::migrations::apply(&ctx)
@@ -961,7 +957,7 @@ mod tests {
     /// `wafer-run/crypto` call it had not declared. This test opts in.
     #[tokio::test]
     async fn the_config_block_reads_the_variables_table_under_wrap() {
-        const KEY: &str = "WAFER_RUN_SHARED__PRIMARY_COLOR";
+        const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
         let mut ctx = TestContext::new().await;
         crate::blocks::admin::migrations::apply(&ctx)
@@ -1005,6 +1001,10 @@ mod tests {
 mod boot_owned_key_tests {
     use super::*;
     use crate::{platform_state::variables::NewVariable, test_support::TestContext};
+
+    /// A key whose `_SECRET` suffix makes it sensitive, and which no block
+    /// declares.
+    const SENSITIVE_UNDECLARED_KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
 
     async fn booted_with(adapter_values: &[(&str, &str)]) -> TestContext {
         let mut ctx = TestContext::new().await;
@@ -1135,7 +1135,7 @@ mod boot_owned_key_tests {
     /// invariant that breaks silently the day a block adds a call.
     #[tokio::test]
     async fn config_set_refuses_the_mask_for_a_sensitive_key() {
-        const KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
+        const KEY: &str = SENSITIVE_UNDECLARED_KEY;
         let ctx = booted_with(&[]).await;
         store_row(&ctx, KEY, "real-client-secret").await;
 
@@ -1162,7 +1162,7 @@ mod boot_owned_key_tests {
     /// value, would do it mid-loop with part of the page already saved.
     #[tokio::test]
     async fn config_set_allows_the_mask_when_it_replaces_nothing() {
-        const KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
+        const KEY: &str = SENSITIVE_UNDECLARED_KEY;
         let ctx = booted_with(&[]).await;
         store_row(&ctx, KEY, crate::util::MASKED_VALUE).await;
 
@@ -1215,7 +1215,7 @@ mod boot_owned_key_tests {
     /// stays readable in the settings API and exportable in a seed bundle.
     #[tokio::test]
     async fn config_set_creating_a_declared_plain_key_stores_it_unflagged() {
-        const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+        const KEY: &str = crate::config_vars::APP_NAME_KEY;
         let ctx = booted_with(&[]).await;
 
         wafer_core::clients::config::set(&ctx, KEY, "Acme")
@@ -1235,7 +1235,7 @@ mod boot_owned_key_tests {
     /// Ordinary shared keys are unaffected: the table still wins.
     #[tokio::test]
     async fn a_shared_key_is_still_served_from_the_table() {
-        const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
+        const KEY: &str = crate::config_vars::APP_NAME_KEY;
         let ctx = booted_with(&[(KEY, "boot-value")]).await;
         let saved = crate::test_support::unique_config_value();
         store_row(&ctx, KEY, &saved).await;

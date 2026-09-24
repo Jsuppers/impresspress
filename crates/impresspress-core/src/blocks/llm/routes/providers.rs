@@ -552,7 +552,7 @@ mod tests {
     // which needs the concrete `ProviderLlmService` and so carries the same
     // gate.
     #[cfg(feature = "llm")]
-    use crate::blocks::llm::providers::config::ProviderProtocol;
+    use crate::blocks::llm::{providers::config::ProviderProtocol, EXAMPLE_KEY_VAR};
     use crate::{
         blocks::llm::routes::test_support::{
             admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
@@ -1452,6 +1452,8 @@ mod tests {
             interfaces::config::service::ConfigService,
             service_blocks::config::{ConfigBlock, EnvConfigService},
         };
+        /// A key variable nothing sets.
+        const MISSING_KEY_VAR: &str = "IMPRESSPRESS__LLM__TEST_MISSING_KEY";
 
         let mut ctx = TestContext::with_admin().await;
         {
@@ -1471,7 +1473,7 @@ mod tests {
         }
 
         let config_svc = Arc::new(EnvConfigService::new());
-        config_svc.set("IMPRESSPRESS__LLM__OPENAI_KEY", "sk-resolved");
+        config_svc.set(EXAMPLE_KEY_VAR, "sk-resolved");
         ctx.register_block("wafer-run/config", Arc::new(ConfigBlock::new(config_svc)));
 
         for cfg in [
@@ -1480,7 +1482,7 @@ mod tests {
                 ProviderProtocol::OpenAi,
                 "https://api.openai.com/v1",
             )
-            .with_key_var("IMPRESSPRESS__LLM__OPENAI_KEY"),
+            .with_key_var(EXAMPLE_KEY_VAR),
             ProviderConfig::new(
                 "no-key-var",
                 ProviderProtocol::OpenAiCompatible,
@@ -1491,7 +1493,7 @@ mod tests {
                 ProviderProtocol::OpenAi,
                 "https://api.openai.com/v1",
             )
-            .with_key_var("IMPRESSPRESS__LLM__TEST_MISSING_KEY"),
+            .with_key_var(MISSING_KEY_VAR),
         ] {
             let mut data = config_to_row(&cfg);
             crate::util::stamp_created(&mut data);
@@ -1888,7 +1890,7 @@ mod form_body_tests {
 
     use super::*;
     use crate::{
-        blocks::llm::{routes::test_support::admin_msg, LlmBlock},
+        blocks::llm::{routes::test_support::admin_msg, LlmBlock, EXAMPLE_KEY_VAR},
         test_support::{output_json, TestContext},
     };
 
@@ -1943,7 +1945,7 @@ mod form_body_tests {
             created["endpoint"], "https://api.openai.com/v1",
             "the endpoint must be form-decoded"
         );
-        assert_eq!(created["key_var"], "IMPRESSPRESS__LLM__OPENAI_KEY");
+        assert_eq!(created["key_var"], EXAMPLE_KEY_VAR);
         assert_eq!(
             created["models"],
             serde_json::json!(["gpt-4o", "gpt-4o-mini"]),

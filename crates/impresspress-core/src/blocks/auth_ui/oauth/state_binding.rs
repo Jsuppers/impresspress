@@ -123,7 +123,7 @@ pub(super) async fn matches(ctx: &dyn Context, msg: &Message, state_id: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestContext;
+    use crate::{config_vars::ENVIRONMENT_KEY, test_support::TestContext};
 
     /// The `Cookie` header a browser sends for a `Set-Cookie` value: the
     /// name/value pair without the attributes.
@@ -145,7 +145,7 @@ mod tests {
     /// anything but `development`.
     async fn prod_ctx() -> TestContext {
         let mut ctx = TestContext::new().await;
-        ctx.set_config("WAFER_RUN_SHARED__ENVIRONMENT", "production");
+        ctx.set_config(ENVIRONMENT_KEY, "production");
         ctx
     }
 

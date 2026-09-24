@@ -6,13 +6,13 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::{pw_field, signup_script, site_config};
 use crate::{
     blocks::auth_ui::redirect::is_safe_local_redirect,
+    config_vars::ALLOW_SIGNUP_KEY,
     ui::{self, components::auth_panel, templates::auth_split},
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let config = site_config(ctx).await;
-    let allow_signup =
-        crate::config_vars::get_bool(ctx, "WAFER_RUN_SHARED__ALLOW_SIGNUP", true).await;
+    let allow_signup = crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await;
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
     // Validate redirect — only allow relative paths (prevent open redirect)
     let redirect = if is_safe_local_redirect(&raw_redirect) {

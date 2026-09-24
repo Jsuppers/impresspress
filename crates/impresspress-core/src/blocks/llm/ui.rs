@@ -21,7 +21,7 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::{
     providers::config::ProviderConfig,
     schema::{row_to_config, TABLE as PROVIDERS_TABLE},
-    LlmBlock,
+    LlmBlock, EXAMPLE_KEY_VAR,
 };
 use crate::{
     blocks::crud,
@@ -196,7 +196,7 @@ fn add_provider_form() -> Markup {
                         type="text"
                         name="key_var"
                         id="new-key-var"
-                        placeholder="IMPRESSPRESS__LLM__OPENAI_KEY";
+                        placeholder=(EXAMPLE_KEY_VAR);
                     p .form-hint {
                         "Admin variable name holding the API key. Leave empty for providers that don't need auth."
                     }
@@ -656,7 +656,7 @@ mod tests {
                     ProviderProtocol::OpenAi,
                     "https://api.openai.com/v1",
                 )
-                .with_key_var("IMPRESSPRESS__LLM__OPENAI_KEY")
+                .with_key_var(EXAMPLE_KEY_VAR)
                 .with_models(vec!["gpt-4o".into(), "gpt-4o-mini".into()]),
             ),
             (
@@ -688,7 +688,7 @@ mod tests {
         assert!(m.contains("/discover-models"), "discover action missing");
 
         // Key-var column renders verbatim, no masking/translation.
-        assert!(m.contains("IMPRESSPRESS__LLM__OPENAI_KEY"));
+        assert!(m.contains(EXAMPLE_KEY_VAR));
 
         // Model-count badge for the multi-model row.
         assert!(m.contains("gpt-4o"));

@@ -32,6 +32,59 @@ pub(crate) const SELLER_APPLICATION_FEE_BPS: &str =
 /// and blank means "not configured", never a country.
 pub(crate) const PLATFORM_COUNTRY: &str = "IMPRESSPRESS__PRODUCTS__PLATFORM_COUNTRY";
 
+/// Config key: the platform's Stripe API secret key.
+pub(crate) const STRIPE_SECRET_KEY: &str = "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY";
+
+/// Config key: the Stripe publishable key embedded Checkout sends to
+/// browsers.
+pub(crate) const STRIPE_PUBLISHABLE_KEY: &str = "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY";
+
+/// Config key: the Stripe webhook signing secret.
+pub(crate) const STRIPE_WEBHOOK_SECRET: &str = "IMPRESSPRESS__PRODUCTS__STRIPE_WEBHOOK_SECRET";
+
+/// Config key: the Stripe API base URL.
+pub(crate) const STRIPE_API_URL: &str = "IMPRESSPRESS__PRODUCTS__STRIPE_API_URL";
+
+/// Config key: the Stripe API version every provider request sends.
+pub(crate) const STRIPE_API_VERSION: &str = "IMPRESSPRESS__PRODUCTS__STRIPE_API_VERSION";
+
+/// Config key: the currency preselected for new products and offers.
+pub(crate) const DEFAULT_CURRENCY: &str = "IMPRESSPRESS__PRODUCTS__DEFAULT_CURRENCY";
+
+/// Config key: whether new offers default to Stripe automatic tax.
+pub(crate) const AUTOMATIC_TAX: &str = "IMPRESSPRESS__PRODUCTS__AUTOMATIC_TAX";
+
+/// Config key: the origins Checkout return and cancel URLs may point at.
+pub(crate) const CHECKOUT_ALLOWED_ORIGINS: &str =
+    "IMPRESSPRESS__PRODUCTS__CHECKOUT_ALLOWED_ORIGINS";
+
+/// Config key: whether a user-owned product needs admin approval before it
+/// is published.
+pub(crate) const SELLER_MODERATION_REQUIRED: &str =
+    "IMPRESSPRESS__PRODUCTS__SELLER_MODERATION_REQUIRED";
+
+/// Config key: the product templates sellers may use; blank allows all.
+pub(crate) const SELLER_ALLOWED_TEMPLATES: &str =
+    "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_TEMPLATES";
+
+/// Config key: the currencies sellers may use; blank allows all.
+pub(crate) const SELLER_ALLOWED_CURRENCIES: &str =
+    "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CURRENCIES";
+
+/// Config key: the product categories sellers may use; blank allows all.
+pub(crate) const SELLER_ALLOWED_CATEGORIES: &str =
+    "IMPRESSPRESS__PRODUCTS__SELLER_ALLOWED_CATEGORIES";
+
+/// Config key: the most non-deleted products one seller may hold; 0 means
+/// unlimited.
+pub(crate) const SELLER_MAX_PRODUCTS: &str = "IMPRESSPRESS__PRODUCTS__SELLER_MAX_PRODUCTS";
+
+/// Config key: where billing events are posted.
+pub(crate) const WEBHOOK_URL: &str = "IMPRESSPRESS__PRODUCTS__WEBHOOK_URL";
+
+/// Config key: the secret billing-event posts are signed with.
+pub(crate) const WEBHOOK_SECRET: &str = "IMPRESSPRESS__PRODUCTS__WEBHOOK_SECRET";
+
 /// The largest legal application fee: 100%, expressed in basis points.
 const MAX_FEE_BASIS_POINTS: u16 = 10_000;
 

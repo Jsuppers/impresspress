@@ -19,9 +19,35 @@ use wafer_run::{
 
 use super::rate_limit::{RateLimit, UserRateLimiter};
 use crate::{
+    config_vars::{FRONTEND_URL_KEY, PRIMARY_COLOR_KEY},
     http::{err_bad_request, err_not_found, ok_json},
     util::urlencode,
 };
+
+/// Config key: the Mailgun account API key.
+pub(crate) const MAILGUN_API_KEY: &str = "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY";
+/// Config key: the sending domain configured in Mailgun.
+pub(crate) const MAILGUN_DOMAIN: &str = "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN";
+/// Config key: the sender address; blank sends from `noreply@<domain>`.
+pub(crate) const MAILGUN_FROM: &str = "IMPRESSPRESS__EMAIL__MAILGUN_FROM";
+/// Config key: the reply-to address; blank omits the header.
+pub(crate) const MAILGUN_REPLY_TO: &str = "IMPRESSPRESS__EMAIL__MAILGUN_REPLY_TO";
+/// Config key: the Mailgun API base URL, defaulting to
+/// [`DEFAULT_MAILGUN_BASE_URL`].
+pub(crate) const MAILGUN_BASE_URL: &str = "IMPRESSPRESS__EMAIL__MAILGUN_BASE_URL";
+/// Config key: the per-caller ceiling, defaulting to
+/// [`DEFAULT_RATE_LIMIT_MAX`].
+pub(crate) const RATE_LIMIT_MAX: &str = "IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX";
+/// Config key: the per-recipient limit, defaulting to
+/// [`DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX`].
+pub(crate) const RATE_LIMIT_PER_RECIPIENT_MAX: &str =
+    "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX";
+/// Config key: the window both limits count over, defaulting to
+/// [`DEFAULT_RATE_LIMIT_WINDOW_SECS`].
+pub(crate) const RATE_LIMIT_WINDOW_SECS: &str = "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS";
+/// Config key: the comma-separated recipient allow-list.
+pub(crate) const ALLOWED_RECIPIENT_PATTERNS: &str =
+    "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS";
 
 /// Default per-caller rate limit: 100 emails per hour. A ceiling on what one
 /// calling block can spend, not a per-recipient limit — see
@@ -66,23 +92,19 @@ pub(crate) fn resolve_base_url(configured: &str) -> &str {
 /// via `config_vars::var_in` rather than re-declaring these).
 pub(crate) fn config_vars() -> Vec<ConfigVar> {
     vec![
+        ConfigVar::new(MAILGUN_API_KEY, "API key from your Mailgun account.", "")
+            .name("Mailgun API Key")
+            .input_type(InputType::Password)
+            .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY",
-            "API key from your Mailgun account.",
-            "",
-        )
-        .name("Mailgun API Key")
-        .input_type(InputType::Password)
-        .optional(),
-        ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN",
+            MAILGUN_DOMAIN,
             "Sending domain configured in Mailgun (e.g. mg.example.com).",
             "",
         )
         .name("Mailgun Domain")
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__MAILGUN_FROM",
+            MAILGUN_FROM,
             "Sender address for emails. Leave empty to send from \
              noreply@<Mailgun domain> under the App Name.",
             "",
@@ -90,14 +112,14 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .name("From Address")
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__MAILGUN_REPLY_TO",
+            MAILGUN_REPLY_TO,
             "Reply-to address for emails. Leave empty to omit.",
             "",
         )
         .name("Reply-To Address")
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__MAILGUN_BASE_URL",
+            MAILGUN_BASE_URL,
             "Mailgun API base URL (US: https://api.mailgun.net, EU: https://api.eu.mailgun.net)",
             DEFAULT_MAILGUN_BASE_URL,
         )
@@ -109,7 +131,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Url)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX",
+            RATE_LIMIT_MAX,
             "Ceiling on emails one calling block may send per window, across \
              all recipients (0 disables this ceiling)",
             &DEFAULT_RATE_LIMIT_MAX.to_string(),
@@ -118,7 +140,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
+            RATE_LIMIT_PER_RECIPIENT_MAX,
             "Maximum emails to any one recipient address per window (0 \
              disables the per-recipient limit). Keep it well below the \
              per-caller ceiling: it is what stops one address from spending \
@@ -129,7 +151,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS",
+            RATE_LIMIT_WINDOW_SECS,
             "Rate limit window in seconds, shared by both limits above",
             &DEFAULT_RATE_LIMIT_WINDOW_SECS.to_string(),
         )
@@ -137,7 +159,7 @@ pub(crate) fn config_vars() -> Vec<ConfigVar> {
         .input_type(InputType::Number)
         .optional(),
         ConfigVar::new(
-            "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS",
+            ALLOWED_RECIPIENT_PATTERNS,
             "Comma-separated allow-list of recipient glob patterns (e.g. \
              `*@example.com,admin@*`). Empty = allow all (with startup warning).",
             "",
@@ -173,7 +195,7 @@ crate::impresspress_feature_block! {
         // `migration_helper::lifecycle_init`).
         if event.event_type == LifecycleType::Init {
             let patterns =
-                config::get_default(ctx, "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS", "").await;
+                config::get_default(ctx, ALLOWED_RECIPIENT_PATTERNS, "").await;
             if patterns.trim().is_empty() {
                 tracing::warn!(
                     "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS is unset — email block \
@@ -261,19 +283,14 @@ async fn handle_send_template(
         return e;
     }
 
-    let base_url = config::get_default(
-        ctx,
-        "WAFER_RUN_SHARED__FRONTEND_URL",
-        "http://localhost:5173",
-    )
-    .await;
+    let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
     let app_name = app_name(ctx).await;
     // Brand accent for CTA buttons and links. Same contract as the admin
     // chrome: a configured PRIMARY_COLOR wins, blank means the built-in
     // brand accent. (The old hardcoded `#0ea5e9` sky-blue predated the
     // rebrand and clashed with every other surface.)
     let accent = {
-        let c = config::get_default(ctx, "WAFER_RUN_SHARED__PRIMARY_COLOR", "").await;
+        let c = config::get_default(ctx, PRIMARY_COLOR_KEY, "").await;
         if c.trim().is_empty() {
             crate::ui::assets::BRAND_ACCENT_HEX.to_string()
         } else {
@@ -386,8 +403,8 @@ async fn send_email(
     html: &str,
     text: Option<&str>,
 ) -> bool {
-    let api_key = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "").await;
-    let domain = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN", "").await;
+    let api_key = config::get_default(ctx, MAILGUN_API_KEY, "").await;
+    let domain = config::get_default(ctx, MAILGUN_DOMAIN, "").await;
     if api_key.is_empty() || domain.is_empty() {
         // Email not configured — don't fail the caller, but make the
         // resulting {"sent": false} diagnosable from the logs.
@@ -400,7 +417,7 @@ async fn send_email(
     }
 
     let from = {
-        let f = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_FROM", "").await;
+        let f = config::get_default(ctx, MAILGUN_FROM, "").await;
         if f.is_empty() {
             default_from(&app_name(ctx).await, &domain)
         } else {
@@ -415,7 +432,7 @@ async fn send_email(
         format!("subject={}", urlencode(subject)),
         format!("html={}", urlencode(html)),
     ];
-    let reply_to = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_REPLY_TO", "").await;
+    let reply_to = config::get_default(ctx, MAILGUN_REPLY_TO, "").await;
     if !reply_to.is_empty() {
         parts.push(format!("h:Reply-To={}", urlencode(&reply_to)));
     }
@@ -431,7 +448,7 @@ async fn send_email(
     // Call network block via the typed client. The buffered helper consumes
     // the two-frame response (header + body) and returns a typed
     // `NetworkResponse` whose `status_code` we use to decide success.
-    let configured = config::get_default(ctx, "IMPRESSPRESS__EMAIL__MAILGUN_BASE_URL", "").await;
+    let configured = config::get_default(ctx, MAILGUN_BASE_URL, "").await;
     let base = resolve_base_url(&configured);
     let url = format!("{base}/v3/{domain}/messages");
     let mut headers = HashMap::new();
@@ -606,8 +623,7 @@ fn glob_match_inner(pat: &[u8], val: &[u8]) -> bool {
 /// Empty/unset = allow (startup warning already emitted in lifecycle). A
 /// recipient no pattern admits is the caller's `InvalidArgument`, a 400.
 async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), WaferError> {
-    let patterns =
-        config::get_default(ctx, "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS", "").await;
+    let patterns = config::get_default(ctx, ALLOWED_RECIPIENT_PATTERNS, "").await;
     let patterns = patterns.trim();
     if patterns.is_empty() {
         return Ok(());
@@ -686,17 +702,12 @@ async fn check_send_rate_limits(
     to: &str,
 ) -> Result<(), OutputStream> {
     let window = Duration::from_secs(
-        numeric_config(
-            ctx,
-            "IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS",
-            DEFAULT_RATE_LIMIT_WINDOW_SECS,
-        )
-        .await,
+        numeric_config(ctx, RATE_LIMIT_WINDOW_SECS, DEFAULT_RATE_LIMIT_WINDOW_SECS).await,
     );
 
     let per_recipient_max = numeric_config(
         ctx,
-        "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
+        RATE_LIMIT_PER_RECIPIENT_MAX,
         DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX,
     )
     .await;
@@ -720,12 +731,7 @@ async fn check_send_rate_limits(
         }
     }
 
-    let caller_max = numeric_config(
-        ctx,
-        "IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX",
-        DEFAULT_RATE_LIMIT_MAX,
-    )
-    .await;
+    let caller_max = numeric_config(ctx, RATE_LIMIT_MAX, DEFAULT_RATE_LIMIT_MAX).await;
     if caller_max > 0 {
         let caller = ctx.caller_id().unwrap_or("unknown");
         let key = UserRateLimiter::key(caller, CALLER_LIMIT_CATEGORY);
@@ -802,8 +808,8 @@ mod tests {
                     },
                 )),
             ));
-            ctx.set("IMPRESSPRESS__EMAIL__MAILGUN_API_KEY", "key-test");
-            ctx.set("IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN", "mg.example.com");
+            ctx.set(MAILGUN_API_KEY, "key-test");
+            ctx.set(MAILGUN_DOMAIN, "mg.example.com");
             (ctx, requests)
         }
         fn set(&self, k: &str, v: &str) {
@@ -1077,10 +1083,7 @@ mod tests {
     async fn a_configured_from_address_wins() {
         let (ctx, requests) = ConfigCtx::with_mailgun();
         ctx.set(crate::config_vars::APP_NAME_KEY, "Acme Mail");
-        ctx.set(
-            "IMPRESSPRESS__EMAIL__MAILGUN_FROM",
-            "Support <help@acme.test>",
-        );
+        ctx.set(MAILGUN_FROM, "Support <help@acme.test>");
         send_template(
             &ctx,
             serde_json::json!({"template": "verification", "to": "a@example.com", "token": "t"}),
@@ -1278,10 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn allow_list_blocks_unmatched_recipient() {
         let ctx = ConfigCtx::new();
-        ctx.set(
-            "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS",
-            "*@example.com, admin@*",
-        );
+        ctx.set(ALLOWED_RECIPIENT_PATTERNS, "*@example.com, admin@*");
         let refusal = check_recipient_allowed(&ctx, "intruder@other.io")
             .await
             .expect_err("an unmatched recipient is refused");
@@ -1295,10 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn allow_list_permits_matched_recipient() {
         let ctx = ConfigCtx::new();
-        ctx.set(
-            "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS",
-            "*@example.com, admin@*",
-        );
+        ctx.set(ALLOWED_RECIPIENT_PATTERNS, "*@example.com, admin@*");
         assert!(check_recipient_allowed(&ctx, "alice@example.com")
             .await
             .is_ok());
@@ -1336,12 +1333,9 @@ mod tests {
 
     fn limited_ctx(per_recipient: &str, per_caller: &str) -> ConfigCtx {
         let ctx = ConfigCtx::new();
-        ctx.set(
-            "IMPRESSPRESS__EMAIL__RATE_LIMIT_PER_RECIPIENT_MAX",
-            per_recipient,
-        );
-        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_MAX", per_caller);
-        ctx.set("IMPRESSPRESS__EMAIL__RATE_LIMIT_WINDOW_SECS", "60");
+        ctx.set(RATE_LIMIT_PER_RECIPIENT_MAX, per_recipient);
+        ctx.set(RATE_LIMIT_MAX, per_caller);
+        ctx.set(RATE_LIMIT_WINDOW_SECS, "60");
         ctx
     }
 

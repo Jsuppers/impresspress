@@ -21,6 +21,15 @@ use super::wrangler::{self, CloudflareConfig, D1Config, R2Config};
 /// previous hardcoded behavior for existing consumers.
 const DEFAULT_HEAD_SAMPLING_RATE: f64 = 1.0;
 
+/// Environment variables that override the matching `impresspress.toml`
+/// `[cloudflare]` field.
+const WORKER_NAME_VAR: &str = "IMPRESSPRESS_CLOUDFLARE_WORKER_NAME";
+const COMPATIBILITY_DATE_VAR: &str = "IMPRESSPRESS_CLOUDFLARE_COMPATIBILITY_DATE";
+const D1_DATABASE_NAME_VAR: &str = "IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_NAME";
+const D1_DATABASE_ID_VAR: &str = "IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID";
+const R2_BUCKET_NAME_VAR: &str = "IMPRESSPRESS_CLOUDFLARE_R2_BUCKET_NAME";
+const HEAD_SAMPLING_RATE_VAR: &str = "IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE";
+
 /// Safe application-agnostic deploy smoke path for consumers that have not
 /// opted into representative dynamic routes.
 const DEFAULT_DEPLOY_SMOKE_PATH: &str = "/health";
@@ -111,34 +120,34 @@ impl RawCloudflareConfig {
             "CLOUDFLARE_ACCOUNT_ID",
         )?;
         let worker_name = pick(
-            env("IMPRESSPRESS_CLOUDFLARE_WORKER_NAME"),
+            env(WORKER_NAME_VAR),
             self.worker_name,
             "worker_name",
-            "IMPRESSPRESS_CLOUDFLARE_WORKER_NAME",
+            WORKER_NAME_VAR,
         )?;
         let compatibility_date = pick(
-            env("IMPRESSPRESS_CLOUDFLARE_COMPATIBILITY_DATE"),
+            env(COMPATIBILITY_DATE_VAR),
             self.compatibility_date,
             "compatibility_date",
-            "IMPRESSPRESS_CLOUDFLARE_COMPATIBILITY_DATE",
+            COMPATIBILITY_DATE_VAR,
         )?;
         let d1_database_name = pick(
-            env("IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_NAME"),
+            env(D1_DATABASE_NAME_VAR),
             self.d1.database_name,
             "d1.database_name",
-            "IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_NAME",
+            D1_DATABASE_NAME_VAR,
         )?;
         let d1_database_id = pick(
-            env("IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID"),
+            env(D1_DATABASE_ID_VAR),
             self.d1.database_id,
             "d1.database_id",
-            "IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID",
+            D1_DATABASE_ID_VAR,
         )?;
         let r2_bucket_name = pick(
-            env("IMPRESSPRESS_CLOUDFLARE_R2_BUCKET_NAME"),
+            env(R2_BUCKET_NAME_VAR),
             self.r2.bucket_name,
             "r2.bucket_name",
-            "IMPRESSPRESS_CLOUDFLARE_R2_BUCKET_NAME",
+            R2_BUCKET_NAME_VAR,
         )?;
         let release_assets_dir = self.r2.release_assets_dir;
         let release_assets_prefix = self.r2.release_assets_prefix.unwrap_or_default();
@@ -166,10 +175,8 @@ impl RawCloudflareConfig {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let head_sampling_rate = resolve_head_sampling_rate(
-            env("IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE"),
-            self.head_sampling_rate,
-        )?;
+        let head_sampling_rate =
+            resolve_head_sampling_rate(env(HEAD_SAMPLING_RATE_VAR), self.head_sampling_rate)?;
         let crons = resolve_crons(self.crons)?;
         let deploy_smoke_paths = resolve_deploy_smoke_paths(self.deploy_smoke_paths)?;
         Ok(CloudflareConfig {
@@ -219,10 +226,7 @@ fn validate_relative_path(path: &Path, key: &str, allow_empty: bool) -> Result<(
 fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) -> Result<f64> {
     let rate = match env_val {
         Some(s) => s.trim().parse::<f64>().map_err(|_| {
-            anyhow!(
-                "IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE={s:?} is not a valid \
-                 number (expected 0.0-1.0)"
-            )
+            anyhow!("{HEAD_SAMPLING_RATE_VAR}={s:?} is not a valid number (expected 0.0-1.0)")
         })?,
         None => toml_val.unwrap_or(DEFAULT_HEAD_SAMPLING_RATE),
     };
