@@ -173,8 +173,7 @@ fn build_scaffolded(template: Template, name: &str) -> Vec<u8> {
             .strip_prefix(&block_dir)
             .unwrap_or_else(|| panic!("{path} is outside {block_dir}"));
         let target = out.path().join(relative);
-        std::fs::create_dir_all(target.parent().expect("a parent"))
-            .expect("create the directory");
+        std::fs::create_dir_all(target.parent().expect("a parent")).expect("create the directory");
         std::fs::write(&target, content).expect("write the scaffolded file");
     }
     build_crate(name, out.path())
@@ -182,9 +181,8 @@ fn build_scaffolded(template: Template, name: &str) -> Vec<u8> {
 
 /// Build the crate at `dir` for `wasm32-wasip1` and return the module.
 fn build_crate(name: &str, dir: &Path) -> Vec<u8> {
-    let package = package_name(
-        &std::fs::read_to_string(dir.join("Cargo.toml")).expect("read Cargo.toml"),
-    );
+    let package =
+        package_name(&std::fs::read_to_string(dir.join("Cargo.toml")).expect("read Cargo.toml"));
     // `--offline` is the assertion, not an optimization: a template with a
     // single dependency would fail here rather than quietly working on a
     // machine with a warm registry cache. `--target-dir` is explicit so an
@@ -509,7 +507,11 @@ async fn subscribe(wafer: &Wafer, name: &str, email: &str) -> u16 {
     let out = wafer
         .run_block(
             &format!("site/{name}"),
-            http_msg("POST", &format!("/b/{name}/subscribe"), &[("auth.user_id", "")]),
+            http_msg(
+                "POST",
+                &format!("/b/{name}/subscribe"),
+                &[("auth.user_id", "")],
+            ),
             InputStream::from_bytes(format!(r#"{{"email":"{email}"}}"#).into_bytes()),
         )
         .await
@@ -556,7 +558,7 @@ fn register_scaffolded(wafer: &mut Wafer, name: &str) {
     let (block, spec) = load_as_the_sandbox_does(name, &wasm);
     assert_eq!(spec.name, format!("site/{name}"));
     wafer
-        .register_block(&format!("site/{name}"), Arc::new(block))
+        .register_block(format!("site/{name}"), Arc::new(block))
         .unwrap_or_else(|e| panic!("register site/{name}: {e}"));
 }
 

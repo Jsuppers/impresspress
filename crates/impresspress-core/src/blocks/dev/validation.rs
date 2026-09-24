@@ -820,7 +820,10 @@ fn check_capabilities(
     // name that was authorized, byte for byte, and only a plain identifier
     // survives the database's identifier handling unchanged.
     if let Allowlist::Only(entries) = collections {
-        for entry in entries.iter().filter(|entry| !is_plain_collection_name(entry)) {
+        for entry in entries
+            .iter()
+            .filter(|entry| !is_plain_collection_name(entry))
+        {
             found.push(Diagnostic::error(
                 CAP_COLLECTION,
                 format!(
