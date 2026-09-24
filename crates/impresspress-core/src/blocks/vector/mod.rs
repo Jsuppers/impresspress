@@ -275,7 +275,7 @@ mod table_tests {
 /// `seal()` refuses a block whose `requires` names a block that is not
 /// registered. The vector block runs without the runtime vector service (a
 /// build with no embedding backend) and without an llm backend, so it must
-/// boot beside nothing but the database.
+/// boot beside nothing but the database and config blocks.
 #[cfg(test)]
 mod seal_tests {
     use std::sync::Arc;
@@ -295,6 +295,11 @@ mod seal_tests {
         );
         wafer_core::service_blocks::database::register_with(&mut wafer, db)
             .expect("register the database block");
+        wafer_core::service_blocks::config::register_with(
+            &mut wafer,
+            Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+        )
+        .expect("register the config block");
         wafer
             .register_block("impresspress/vector", Arc::new(VectorBlock::new()))
             .expect("register the vector block");
