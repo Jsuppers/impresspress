@@ -43,14 +43,25 @@ fn validated_publishable_key(value: &str) -> Option<(String, StripeMode)> {
 }
 
 pub(crate) async fn handle_storefront_config(ctx: &dyn Context) -> OutputStream {
-    let key = config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await;
-    let secret = config::get_default(ctx, STRIPE_SECRET_KEY, "").await;
+    let settings = async {
+        Ok::<_, wafer_run::WaferError>((
+            config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await?,
+            config::get_default(ctx, STRIPE_SECRET_KEY, "").await?,
+            stripe_secret_operations_allowed(ctx).await?,
+        ))
+    };
+    let (key, secret, secret_operations_allowed) = match settings.await {
+        Ok(settings) => settings,
+        Err(e) => {
+            return crate::blocks::crud::db_error_internal(e, "Could not read the Stripe settings")
+        }
+    };
     let validated = validated_publishable_key(&key);
     let matching_secret = validated.as_ref().is_some_and(|(key, _)| {
         super::super::stripe_client::publishable_livemode(key)
             .zip(super::super::stripe_client::secret_livemode(secret.trim()))
             .is_some_and(|(publishable, secret)| publishable == secret)
-    }) && stripe_secret_operations_allowed(ctx).await;
+    }) && secret_operations_allowed;
     let response = StorefrontConfig {
         schema_version: COMMERCE_SCHEMA_VERSION,
         embedded_checkout_available: matching_secret,
@@ -264,7 +275,10 @@ pub(crate) async fn handle_storefront_product(ctx: &dyn Context, msg: &Message) 
 /// offer definition or a trusted total; every amount comes from server-owned
 /// versioned rows.
 pub(crate) async fn handle_preview(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let request: PricingPreviewRequest = match serde_json::from_slice(&raw) {
         Ok(request) => request,
         Err(error) => return err_bad_request(&format!("Invalid body: {error}")),

@@ -176,7 +176,7 @@ impl FastembedBlock {
 impl Block for FastembedBlock {
     fn info(&self) -> BlockInfo {
         BlockInfo::new(
-            "impresspress/fastembed",
+            Self::BLOCK_NAME,
             "0.0.1",
             "embedding@v1",
             "Native ONNX text embedding via fastembed-rs",
@@ -187,10 +187,16 @@ impl Block for FastembedBlock {
         // Kept deliberately in lockstep with `TransformersEmbedBlock`.
         .instance_mode(InstanceMode::Singleton)
         .category(wafer_run::BlockCategory::Service)
+        // Declared here rather than from the service: the service loads
+        // lazily on the first call, after `info()` has been read.
+        .grants(vec![super::embedding_grant(Self::BLOCK_NAME)])
     }
 
-    async fn handle(&self, _ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
-        let body = input.collect_to_bytes().await;
+    async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
+        let body = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let svc = match self.get_service().await {
             Ok(s) => s,
             Err(e) => return err_internal("fastembed service unavailable", e),
@@ -199,7 +205,7 @@ impl Block for FastembedBlock {
         // `Unimplemented` terminal for anything else) lives in
         // `handle_embedding_message`. Both embedding wrappers delegate the
         // whole message here — neither carries its own `ServiceOp` check.
-        handle_embedding_message(svc, &msg, &body).await
+        handle_embedding_message(svc, ctx, Self::BLOCK_NAME, &msg, &body).await
     }
 }
 

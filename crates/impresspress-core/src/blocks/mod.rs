@@ -270,6 +270,19 @@ fn enabled_defaults_from(infos: &[wafer_run::BlockInfo]) -> Vec<(String, bool)> 
         .collect()
 }
 
+/// The grant an embedding block (`impresspress/fastembed`,
+/// `impresspress/transformers-embed`) declares so `impresspress/vector` may
+/// call its `embedding.embed` and `embedding.count_tokens`. The embedding
+/// handler authorizes each op as a resource in the serving block's own
+/// namespace, which only that block can grant.
+pub(crate) fn embedding_grant(serving_block: &str) -> wafer_run::ResourceGrant {
+    wafer_run::ResourceGrant::read(
+        "impresspress/vector",
+        &format!("{}*", wafer_block::wrap::resource_prefix(serving_block)),
+    )
+    .typed(wafer_run::ResourceType::Embedding)
+}
+
 /// Register the admin feature block with the WAFER runtime.
 ///
 /// `AdminBlock` is not in the feature-block manifest because its production

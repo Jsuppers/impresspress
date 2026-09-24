@@ -18,7 +18,12 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     // Through the async loader, not `ctx.config_get`: that snapshot is frozen
     // at boot, so an admin's saved branding never reached this page without a
     // restart, and on Cloudflare never reached it at all.
-    let site = ui::SiteConfig::load_for_auth(ctx).await;
+    let site = match ui::SiteConfig::load_for_auth(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
     let logo_url = site.logo_url.clone();
     let app_name = site.app_name.clone();
     let auth_headline = site.auth_headline.clone();
@@ -34,7 +39,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
             struct Req {
                 token: String,
             }
-            let raw = input.collect_to_bytes().await;
+            let raw = match input.collect_to_bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => return OutputStream::error(e),
+            };
             match serde_json::from_slice::<Req>(&raw) {
                 Ok(r) => r.token,
                 Err(_) => return err_bad_request("Missing verification token"),
@@ -120,7 +128,10 @@ pub async fn handle_resend(
     struct Req {
         email: String,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

@@ -154,12 +154,18 @@ impl RateLimit {
     ///
     /// Looks up [`Self::override_key`] in config. Format: `requests/seconds` (e.g. `50/60`).
     /// Set to `0` to disable rate limiting for this category.
-    /// Returns `None` if disabled, otherwise the resolved limit.
-    pub async fn resolve(self, ctx: &dyn Context, name: &str) -> Option<Self> {
+    /// Returns `None` if disabled, otherwise the resolved limit. A failed
+    /// read is returned: a limit nobody could read is neither the default nor
+    /// off.
+    pub async fn resolve(self, ctx: &dyn Context, name: &str) -> Result<Option<Self>, WaferError> {
         let key = Self::override_key(name);
         let default = format!("{}/{}", self.max_requests, self.window.as_secs());
-        let value = config::get_default(ctx, &key, &default).await;
+        let value = config::get_default(ctx, &key, &default).await?;
+        Ok(self.parse_override(&value))
+    }
 
+    /// [`Self::resolve`] once the override is read.
+    fn parse_override(self, value: &str) -> Option<Self> {
         // "0" disables this category
         if value.trim() == "0" {
             return None;
@@ -401,7 +407,8 @@ pub enum RateLimitOutcome {
     Allowed(RateLimitHeaders),
     /// Disabled — no rate limiting applied for this category.
     Disabled,
-    /// Rate-limited — caller should return this `OutputStream` immediately.
+    /// Rate-limited, or the limit could not be read — caller should return
+    /// this `OutputStream` immediately.
     Limited(OutputStream),
 }
 
@@ -414,8 +421,15 @@ pub async fn check_rate_limit(
     category: &str,
     default: RateLimit,
 ) -> RateLimitOutcome {
-    let Some(limit) = default.resolve(ctx, category).await else {
-        return RateLimitOutcome::Disabled;
+    let limit = match default.resolve(ctx, category).await {
+        Ok(Some(limit)) => limit,
+        Ok(None) => return RateLimitOutcome::Disabled,
+        Err(e) => {
+            return RateLimitOutcome::Limited(super::crud::db_error_internal(
+                e,
+                "Could not read the rate limit",
+            ))
+        }
     };
     let key = UserRateLimiter::key(identity, category);
     match limiter.check(ctx, &key, limit).await {
@@ -563,10 +577,18 @@ mod tests {
     impl Context for TestCtx {
         async fn call_block(
             &self,
-            _block_name: &str,
+            block_name: &str,
             _msg: Message,
             _input: InputStream,
         ) -> OutputStream {
+            // No override is configured: the config block answers an unset
+            // key with `NotFound`, which the limit reads as its default.
+            if block_name == "wafer-run/config" {
+                return OutputStream::error(WaferError::new(
+                    wafer_run::ErrorCode::NotFound,
+                    "config key not set",
+                ));
+            }
             OutputStream::respond(vec![])
         }
         /// Admits nothing, as the fail-closed `check_resource_access` default

@@ -61,7 +61,10 @@ pub async fn handle_update(ctx: &dyn Context, msg: &Message, input: InputStream)
         return error_response(ErrorCode::NotAuthenticated, "Not authenticated");
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: UpdateMeRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

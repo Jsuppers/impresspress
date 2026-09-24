@@ -86,7 +86,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         current_password: String,
         new_password: String,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     // Two callers, two wire formats: the portal's Security page is an htmx
     // form, so it sends `application/x-www-form-urlencoded`, while
     // `/b/auth/change-password` and programmatic clients send JSON.
@@ -101,10 +104,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
-    if let Err((code, reason)) =
-        super::password_policy::validate_new_password(ctx, &body.new_password).await
-    {
-        return refused(msg, code, &reason);
+    match super::password_policy::validate_new_password(ctx, &body.new_password).await {
+        Ok(Ok(())) => {}
+        Ok(Err((code, reason))) => return refused(msg, code, &reason),
+        Err(response) => return response,
     }
 
     // Verify user exists. The credential lookup four lines below has always

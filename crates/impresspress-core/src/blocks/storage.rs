@@ -100,23 +100,28 @@ fn log_path(ctx: &dyn Context, op: &str, request: &[u8]) -> String {
 ///
 /// `storage.put_streaming` is framed as a header chunk followed by the body
 /// chunks, so only the header is read and the body is chained back behind it,
-/// keeping the caller's cancellation token. Every other op is one buffered
+/// keeping the caller's cancellation token, and a body frame that fails
+/// reaches the backend as the failure it is. Every other op is one buffered
 /// request the handler collects whole anyway.
-async fn peek_request(op: &str, input: InputStream) -> (Vec<u8>, InputStream) {
+///
+/// `Err` is a request that failed before its header (or its whole buffered
+/// body) arrived; nothing reaches the backend.
+async fn peek_request(op: &str, input: InputStream) -> Result<(Vec<u8>, InputStream), WaferError> {
     if op == ServiceOp::STORAGE_PUT_STREAMING {
         let cancel = input.cancel_token().clone();
         let mut input = input;
-        let Some(header) = input.next().await else {
-            return (Vec::new(), InputStream::empty());
+        let header = match input.next().await {
+            Some(header) => header?,
+            None => return Ok((Vec::new(), InputStream::empty())),
         };
-        let forwarded = futures::stream::iter([header.clone()]).chain(input);
-        (
+        let forwarded = futures::stream::iter([Ok(header.clone())]).chain(input);
+        Ok((
             header,
             InputStream::from_stream_with_cancel(forwarded, cancel),
-        )
+        ))
     } else {
-        let body = input.collect_to_bytes().await;
-        (body.clone(), InputStream::from_bytes(body))
+        let body = input.collect_to_bytes().await?;
+        Ok((body.clone(), InputStream::from_bytes(body)))
     }
 }
 
@@ -128,7 +133,16 @@ impl Block for ImpresspressStorageBlock {
 
     async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
         let caller = ctx.caller_id().unwrap_or("unknown").to_string();
-        let (request, input) = peek_request(&msg.kind, input).await;
+        let (request, input) = match peek_request(&msg.kind, input).await {
+            Ok(peeked) => peeked,
+            Err(e) => {
+                // No request to name a path from: the row records the op and
+                // the failure, so the refusal is still attributable.
+                let status = format!("ERROR: {}", e.message);
+                let _ = log_storage_access(ctx, &caller, &msg.kind, "", status).await;
+                return OutputStream::error(e);
+            }
+        };
         let path = log_path(ctx, &msg.kind, &request);
         drop(request);
 
@@ -464,7 +478,11 @@ mod tests {
             data: InputStream,
             content_type: &str,
         ) -> Result<(), StorageError> {
-            let chunks: Vec<Vec<u8>> = data.collect().await;
+            let mut data = data;
+            let mut chunks = Vec::new();
+            while let Some(chunk) = data.next().await {
+                chunks.push(chunk.map_err(StorageError::Body)?);
+            }
             self.streamed.lock().expect("streamed mutex").push((
                 folder.to_string(),
                 key.to_string(),
@@ -521,9 +539,9 @@ mod tests {
         ctx.register_block("wafer-run/storage", create(service.clone()));
 
         let body = InputStream::from_stream(futures::stream::iter([
-            b"one ".to_vec(),
-            b"two ".to_vec(),
-            b"three".to_vec(),
+            Ok(b"one ".to_vec()),
+            Ok(b"two ".to_vec()),
+            Ok(b"three".to_vec()),
         ]));
         wafer_core::clients::storage::put_stream(&ctx, "uploads", "big.bin", "text/plain", body)
             .await
@@ -548,6 +566,37 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, "impresspress/files/uploads/big.bin");
         assert!(rows[0].1.starts_with("OK ("), "{rows:?}");
+    }
+
+    /// A streaming upload whose header frame fails — the connection dropped
+    /// before it arrived whole — reaches no backend. It answers the
+    /// transport's own error rather than a decode failure of an empty header,
+    /// and the refusal is still logged.
+    #[tokio::test]
+    async fn a_streaming_upload_whose_header_fails_reaches_no_backend() {
+        let ctx = ctx_as("impresspress/files", Vec::new()).await;
+        let service = Arc::new(ChunkCounting {
+            inner: InMemoryStorageService::new(),
+            streamed: Mutex::new(Vec::new()),
+        });
+        let block = create(service.clone());
+
+        let body = InputStream::from_stream(futures::stream::iter([Err(
+            wafer_run::WaferError::new(ErrorCode::DeadlineExceeded, "request body read timed out"),
+        )]));
+        let out = block
+            .handle(&ctx, Message::new(ServiceOp::STORAGE_PUT_STREAMING), body)
+            .await;
+
+        let err = chunks(out).await.expect_err("the upload must fail");
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+        assert!(
+            service.streamed.lock().expect("streamed mutex").is_empty(),
+            "nothing may reach the backend"
+        );
+        let rows = audit_rows(&ctx).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].1.starts_with("ERROR: "), "{rows:?}");
     }
 
     /// Every op the upstream client can emit reaches the handler's own arm:

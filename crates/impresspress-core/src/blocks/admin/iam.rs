@@ -52,7 +52,10 @@ pub(super) async fn handle_create_role(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: CreateRoleRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -89,7 +92,10 @@ pub(super) async fn handle_update_role(
         Err(response) => return response,
     };
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     // Typed rather than a `HashMap` peek plus a per-branch key whitelist: the
     // published schema names exactly these three fields, and a `permissions`
     // that is not an array of strings is refused here instead of being
@@ -398,7 +404,10 @@ pub(super) async fn handle_create_permission(
         resource: String,
         actions: Vec<String>,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -557,7 +566,10 @@ pub(super) async fn handle_assign_role(
         user_id: String,
         role: String,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

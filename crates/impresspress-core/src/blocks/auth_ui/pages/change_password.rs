@@ -6,8 +6,13 @@ use wafer_run::{context::Context, Message, OutputStream};
 use super::{pw_field, site_config};
 use crate::ui::{self, components::auth_panel, templates::auth_split};
 
-pub async fn handle(ctx: &dyn Context, _msg: &Message) -> OutputStream {
-    let config = site_config(ctx).await;
+pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
+    let config = match site_config(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
 
     let markup = ui::layout::page(
         "Change Password",

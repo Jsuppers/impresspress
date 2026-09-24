@@ -53,7 +53,9 @@ pub(crate) mod test_wrap {
     /// files-block tests use — so a new test is on the gate by construction
     /// and cannot certify a `call_block` production refuses.
     pub(crate) fn as_files_block(ctx: TestContext) -> TestContext {
-        let requires = wafer_run::Block::info(&super::FilesBlock::new()).requires;
+        let requires = wafer_run::Block::info(&super::FilesBlock::new())
+            .call_allowlist()
+            .unwrap_or_default();
         ctx.with_wrap(
             super::FilesBlock::BLOCK_NAME,
             requires,

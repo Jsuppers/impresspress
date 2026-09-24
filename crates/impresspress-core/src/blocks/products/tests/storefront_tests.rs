@@ -389,3 +389,29 @@ fn stripe_webhook_is_never_an_agent_tool() {
          authenticated by HMAC — never an agent tool"
     );
 }
+
+/// Whether this runtime may hold Stripe secrets is read from config
+/// (`RUNTIME_KIND_CONFIG_KEY`). Taking a refused read for the unset key would
+/// answer the server default, which offers secret-key checkout on a browser
+/// runtime; the refusal is the answer instead.
+#[tokio::test]
+async fn an_unreadable_runtime_kind_is_not_the_server_default() {
+    let mut ctx = ctx_with(&[
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            "sk_test_server_only",
+        ),
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY",
+            "pk_test_browser_safe",
+        ),
+    ])
+    .await;
+    ctx.refuse_config_reads_of(crate::blocks::products::RUNTIME_KIND_CONFIG_KEY);
+    let (msg, input) = get_msg("/b/products/storefront/config", "");
+    assert!(
+        crate::test_support::output_is_error(dispatch(&ctx, msg, input).await, "PermissionDenied")
+            .await,
+        "a refused read must not be served as a storefront config"
+    );
+}

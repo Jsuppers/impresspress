@@ -230,11 +230,19 @@ impl LegalPagesBlock {
     async fn handle_get_public(&self, ctx: &dyn Context, doc_type: DocumentType) -> OutputStream {
         use wafer_core::clients::config;
 
-        let site = SiteConfig::load(ctx).await;
-        let bg_color = config::get_default(ctx, BG_COLOR_KEY, "").await;
-        let back_url = config::get_default(ctx, BACK_URL_KEY, "/").await;
-        let custom_footer = config::get_default(ctx, FOOTER_KEY, "").await;
-        let primary_color = config::get_default(ctx, PRIMARY_COLOR_KEY, "").await;
+        let chrome = async {
+            Ok::<_, wafer_run::WaferError>((
+                SiteConfig::load(ctx).await?,
+                config::get_default(ctx, BG_COLOR_KEY, "").await?,
+                config::get_default(ctx, BACK_URL_KEY, "/").await?,
+                config::get_default(ctx, FOOTER_KEY, "").await?,
+                config::get_default(ctx, PRIMARY_COLOR_KEY, "").await?,
+            ))
+        };
+        let (site, bg_color, back_url, custom_footer, primary_color) = match chrome.await {
+            Ok(chrome) => chrome,
+            Err(e) => return crud::db_error_internal(e, "legalpages: page config read failed"),
+        };
 
         let type_label = doc_type.title();
 
@@ -319,7 +327,10 @@ impl LegalPagesBlock {
             title: String,
             content: String,
         }
-        let raw = input.collect_to_bytes().await;
+        let raw = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let body: CreateDoc = match serde_json::from_slice(&raw) {
             Ok(b) => b,
             Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -663,11 +674,9 @@ crate::impresspress_feature_block! {
             .instance_mode(InstanceMode::Singleton)
             // `wafer-run/config`: `handle_get_public` reads this block's three
             // theming keys plus `WAFER_RUN_SHARED__PRIMARY_COLOR`, and
-            // `SiteConfig::load` reads the shared site keys. The entry was
-            // missing, so the runtime refused every one of those calls;
-            // `config::get_default` swallows the refusal and answers with its
-            // fallback, so the public page rendered unthemed with no error
-            // anywhere. (Found by the requires sweep, not by a report.)
+            // `SiteConfig::load` reads the shared site keys; without the
+            // entry the runtime refuses every one of those calls and the
+            // public page answers the refusal.
             .requires(vec!["wafer-run/database".into(), "wafer-run/config".into()])
             .category(wafer_run::BlockCategory::Feature)
             .description("Legal document management with versioning and publishing. Create and manage terms of service, privacy policies, and other legal documents. Supports draft/published workflow with version tracking.")
@@ -1274,9 +1283,9 @@ mod write_loss_tests {
     /// `wafer-run/crypto` undeclared) prompted: this block reads four config
     /// keys in `handle_get_public` while `info().requires` named only
     /// `wafer-run/database`, so the runtime refused every one of those calls
-    /// at the `call_block` boundary. `config::get_default` swallows the
-    /// error and answers with its fallback, so the page rendered — silently
-    /// unthemed, with no 500 and nothing in the logs to point at.
+    /// at the `call_block` boundary and the page rendered unthemed. A refused
+    /// read now fails the page instead, so without the entry this test sees
+    /// an error rather than an unthemed page.
     ///
     /// The fixture must enforce `requires` (`with_wrap`) or the bug is
     /// invisible here exactly as it was invisible in CI: an empty
@@ -1289,7 +1298,9 @@ mod write_loss_tests {
         ctx.set_config(BG_COLOR_KEY, "#123456");
         let ctx = ctx.with_wrap(
             LegalPagesBlock::BLOCK_NAME,
-            wafer_run::Block::info(&LegalPagesBlock::new()).requires,
+            wafer_run::Block::info(&LegalPagesBlock::new())
+                .call_allowlist()
+                .unwrap_or_default(),
             wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants,
             crate::blocks::admin::ADMIN_BLOCK_ID,
         );

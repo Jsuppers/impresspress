@@ -385,7 +385,10 @@ impl StorageService for BrowserStorageService {
     /// linear memory with the runtime.
     ///
     /// The OPFS writable holds an exclusive lock on the file, so every path
-    /// out of a started write ends in a `finish` or an abort.
+    /// out of a started write ends in a `finish` or an abort. A body that
+    /// fails part-way (an `Err` item) is one of those paths: it is aborted and
+    /// answered [`StorageError::Body`], never finished as the prefix that
+    /// arrived.
     ///
     /// What an interrupted upload leaves behind, precisely — OPFS has no
     /// multi-file transaction, so this is a statement about two files, not one:
@@ -429,6 +432,13 @@ impl StorageService for BrowserStorageService {
 
         let mut data = Box::pin(data);
         while let Some(chunk) = data.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    bridge::storage_put_stream_abort(&id).await;
+                    return Err(StorageError::Body(e));
+                }
+            };
             if let Err(e) = bridge::storage_put_stream_chunk(&id, &chunk).await {
                 bridge::storage_put_stream_abort(&id).await;
                 return Err(map_rejection(e));

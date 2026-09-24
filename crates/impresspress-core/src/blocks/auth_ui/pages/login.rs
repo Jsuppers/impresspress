@@ -18,8 +18,18 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = site_config(ctx).await;
-    let allow_signup = crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await;
+    let config = match site_config(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
+    let allow_signup = match crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "Could not read the signup switch")
+        }
+    };
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
     // Validate redirect — only allow relative paths (prevent open redirect)
     let redirect = if is_safe_local_redirect(&raw_redirect) {
@@ -48,14 +58,27 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // full credential triple (CLIENT_ID + CLIENT_SECRET + REDIRECT_URL) is
     // present in env. Avoids rendering a "Continue with GitHub" button that
     // would 4xx as soon as it's clicked.
-    let oauth_enabled = crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await;
+    let oauth_enabled = match crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "Could not read the OAuth switch")
+        }
+    };
     // A loop rather than `.filter()`: the predicate reads config through the
     // async client now, and an async predicate has no place in `Iterator`.
     let mut oauth_providers: Vec<&'static str> = Vec::new();
     if oauth_enabled {
         for provider in ["github", "google", "microsoft"] {
-            if oauth_provider_configured(ctx, provider).await {
-                oauth_providers.push(provider);
+            match oauth_provider_configured(ctx, provider).await {
+                Ok(true) => oauth_providers.push(provider),
+                Ok(false) => {}
+                Err(e) => {
+                    return crate::blocks::crud::db_error_page(
+                        msg,
+                        e,
+                        "Could not read the OAuth provider config",
+                    )
+                }
             }
         }
     }
@@ -155,7 +178,9 @@ mod tests {
             ctx.set_config(ALLOW_SIGNUP_KEY, enabled);
             let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
             assert!(
-                crate::blocks::auth::helpers::signup_allowed(&ctx).await,
+                crate::blocks::auth::helpers::signup_allowed(&ctx)
+                    .await
+                    .expect("config read"),
                 "the signup API must accept {enabled:?}"
             );
             assert!(
@@ -168,7 +193,9 @@ mod tests {
             ctx.set_config(ALLOW_SIGNUP_KEY, disabled);
             let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
             assert!(
-                !crate::blocks::auth::helpers::signup_allowed(&ctx).await,
+                !crate::blocks::auth::helpers::signup_allowed(&ctx)
+                    .await
+                    .expect("config read"),
                 "the signup API must refuse {disabled:?}"
             );
             assert!(

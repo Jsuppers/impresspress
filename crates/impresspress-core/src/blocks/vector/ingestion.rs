@@ -354,7 +354,9 @@ mod contextual_retrieval_tests {
     async fn vector_ctx() -> TestContext {
         TestContext::with_vector().await.with_wrap(
             "impresspress/vector",
-            wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new()).requires,
+            wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new())
+                .call_allowlist()
+                .unwrap_or_default(),
             Vec::new(),
             "impresspress/admin",
         )
@@ -639,7 +641,9 @@ mod contextual_retrieval_tests {
     /// refused when they are *present*.
     #[test]
     fn the_block_declares_every_target_contextual_retrieval_reaches() {
-        let requires = wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new()).requires;
+        let requires = wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new())
+            .call_allowlist()
+            .unwrap_or_default();
         for target in ["impresspress/llm", "wafer-run/llm"] {
             assert!(
                 requires.iter().any(|r| r == target),

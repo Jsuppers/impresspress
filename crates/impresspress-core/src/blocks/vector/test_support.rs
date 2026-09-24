@@ -57,7 +57,10 @@ impl Block for StubVectorBlock {
                 OutputStream::respond(wafer_block::codec::encode(&resp).expect("encode"))
             }
             ServiceOp::VECTOR_COUNT => {
-                let bytes = input.collect_to_bytes().await;
+                let bytes = match input.collect_to_bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return OutputStream::error(e),
+                };
                 let req: CountRequest = wafer_block::codec::decode(&bytes).expect("count request");
                 let resp = CountResponse {
                     count: self.counts.get(&req.index).copied().unwrap_or(0),
@@ -65,7 +68,10 @@ impl Block for StubVectorBlock {
                 OutputStream::respond(wafer_block::codec::encode(&resp).expect("encode"))
             }
             ServiceOp::VECTOR_DESCRIBE_INDEX => {
-                let bytes = input.collect_to_bytes().await;
+                let bytes = match input.collect_to_bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return OutputStream::error(e),
+                };
                 let req: DescribeIndexRequest =
                     wafer_block::codec::decode(&bytes).expect("describe request");
                 let resp = DescribeIndexResponse {
@@ -131,7 +137,10 @@ impl Block for StubEmbeddingBlock {
     async fn handle(&self, _ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
         match msg.kind.as_str() {
             ServiceOp::EMBEDDING_EMBED => {
-                let bytes = input.collect_to_bytes().await;
+                let bytes = match input.collect_to_bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return OutputStream::error(e),
+                };
                 let req: EmbedRequest = wafer_block::codec::decode(&bytes).expect("embed request");
                 let resp = EmbedResponse {
                     model: self.model.to_string(),

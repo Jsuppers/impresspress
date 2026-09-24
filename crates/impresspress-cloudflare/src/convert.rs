@@ -12,9 +12,8 @@ use futures::StreamExt;
 use impresspress_core::streaming::{self, CappedCollect};
 use wafer_block::{
     http_codec::{self, HttpResponseParts, ResponseMetaPart},
-    meta::META_RESP_CONTENT_TYPE,
     stream::StreamEvent,
-    MetaEntry, MetaGet,
+    MetaEntry,
 };
 use wafer_run::{InputStream, Message, OutputStream};
 use worker::{Headers, Request, Response, ResponseBuilder, Result};
@@ -159,8 +158,8 @@ pub async fn output_to_response(mut output: OutputStream) -> Result<Response> {
 /// are resolved separately (`http_codec::resolve_status`) and skipped here.
 /// Only the canonical `resp.*` meta keys are honored (the `resp.stream`
 /// streaming marker is not a header and is ignored by `classify_response_meta`).
-fn apply_meta_to_headers(headers: &Headers, meta: &[MetaEntry]) -> Result<()> {
-    for part in http_codec::response_meta_parts(meta) {
+fn apply_parts_to_headers(headers: &Headers, parts: &[ResponseMetaPart<'_>]) -> Result<()> {
+    for part in parts {
         match part {
             ResponseMetaPart::Status(_) => {}
             ResponseMetaPart::Header { name, value } => headers.set(name, value)?,
@@ -176,15 +175,26 @@ fn apply_meta_to_headers(headers: &Headers, meta: &[MetaEntry]) -> Result<()> {
 /// Worker's native `ReadableStream`. A body-read `Error` terminal surfaces as a
 /// stream error (aborting the response body) rather than a silent truncation —
 /// the HTTP status is already committed, so it cannot be downgraded to 413.
+///
+/// For the same reason, leading meta no transport can send is answered with
+/// the codec's `unsendable_response` here, before a status or a byte is
+/// committed.
 fn build_streaming_response(
     leading_meta: Vec<MetaEntry>,
     first_chunk: Vec<u8>,
     rest: OutputStream,
 ) -> Result<Response> {
+    let parts = match http_codec::response_meta_parts(&leading_meta) {
+        Ok(parts) => parts,
+        Err(invalid) => return parts_to_response(http_codec::unsendable_response(&invalid)),
+    };
     let status = http_codec::resolve_status(&leading_meta, 200);
     let headers = Headers::new();
-    apply_meta_to_headers(&headers, &leading_meta)?;
-    if !MetaGet::contains_key(&leading_meta, META_RESP_CONTENT_TYPE) {
+    apply_parts_to_headers(&headers, &parts)?;
+    if !parts
+        .iter()
+        .any(|part| matches!(part, ResponseMetaPart::ContentType(_)))
+    {
         // Streaming bodies without an explicit content-type fall back to
         // octet-stream (not the JSON default the buffered path uses).
         headers.set("Content-Type", "application/octet-stream")?;
@@ -253,7 +263,6 @@ fn parts_to_response(parts: HttpResponseParts) -> Result<Response> {
 /// `tests/oversized_body_flow.rs` on the host.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod request_tests {
-    use futures::StreamExt;
     use impresspress_core::streaming::{
         body_too_large, BODY_TOO_LARGE_VALUE, MAX_REQUEST_BODY_BYTES, META_REQ_BODY_TOO_LARGE,
     };
@@ -280,11 +289,9 @@ mod request_tests {
     /// Bytes the returned `InputStream` carries.
     async fn drain(input: InputStream) -> Vec<u8> {
         input
-            .fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend_from_slice(&chunk);
-                acc
-            })
+            .collect_to_bytes()
             .await
+            .expect("an in-memory body does not fail")
     }
 
     /// **Fails on the pre-fix tree**, where an over-cap body returned
@@ -354,10 +361,51 @@ mod request_tests {
 /// `parts_to_response` glue together.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod response_tests {
-    use impresspress_core::blocks::errors::{error_response, ErrorCode};
+    use impresspress_core::{
+        blocks::errors::{error_response, ErrorCode},
+        streaming::{META_RESP_STREAM, STREAM_MARKER_VALUE},
+    };
+    use wafer_block::{meta::META_RESP_CONTENT_TYPE, MetaEntry};
+    use wafer_run::OutputStream;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::output_to_response;
+
+    /// A streamed response whose leading meta holds a header value no
+    /// transport can send (a CR/LF, here) is answered with the codec's 500
+    /// before a status or a byte goes out — never streamed without the entry,
+    /// and never with it. Once the body streams, a failure can only abort it.
+    #[wasm_bindgen_test]
+    async fn a_stream_with_an_unsendable_header_is_a_500_before_it_starts() {
+        let stream = OutputStream::from_producer(|sink, _cancel| async move {
+            for (key, value) in [
+                (META_RESP_STREAM, STREAM_MARKER_VALUE),
+                (META_RESP_CONTENT_TYPE, "application/pdf"),
+                ("resp.header.Content-Disposition", "inline\r\nX-Injected: 1"),
+            ] {
+                let _ = sink
+                    .send_meta(MetaEntry {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    })
+                    .await;
+            }
+            let _ = sink.send_chunk(b"%PDF-1.7".to_vec()).await;
+            let _ = sink.complete(Vec::new()).await;
+        });
+
+        let mut resp = output_to_response(stream).await.expect("build response");
+
+        assert_eq!(resp.status_code(), 500);
+        assert_eq!(
+            resp.headers().get("content-disposition").expect("headers"),
+            None,
+            "none of the refused terminal's headers are sent"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.text().await.expect("read body")).expect("a JSON body");
+        assert_eq!(body["error"], "Internal");
+    }
 
     /// **Fails before wafer-run 9a080676**, whose codec rendered an error as
     /// `{"error", "message"}` only: an `errors::error_response` attaches its

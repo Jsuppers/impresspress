@@ -211,7 +211,9 @@ mod tests {
         // same backing store.
         let files_block = ctx.clone().with_wrap(
             "impresspress/files",
-            wafer_run::Block::info(&crate::blocks::files::FilesBlock::new()).requires,
+            wafer_run::Block::info(&crate::blocks::files::FilesBlock::new())
+                .call_allowlist()
+                .unwrap_or_default(),
             Vec::new(),
             "impresspress/admin",
         );

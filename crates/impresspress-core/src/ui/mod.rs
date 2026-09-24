@@ -54,19 +54,24 @@ pub struct SiteConfig {
 
 impl SiteConfig {
     /// Load site config from the WAFER config system (env vars / variables table).
-    pub async fn load(ctx: &dyn wafer_run::context::Context) -> Self {
+    ///
+    /// A failed read is returned: a page drawn with a default brand because
+    /// the config block refused the read would pass for an unbranded site.
+    pub async fn load(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<Self, wafer_run::WaferError> {
         use wafer_core::clients::config;
-        let scripts_raw = config::get_default(ctx, EMBEDDED_SCRIPTS_KEY, "").await;
-        Self {
-            app_name: config::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await,
+        let scripts_raw = config::get_default(ctx, EMBEDDED_SCRIPTS_KEY, "").await?;
+        Ok(Self {
+            app_name: config::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await?,
             // Blank = no wordmark image: templates render the app name as
             // text next to the (pixel-art) icon. Set to white-label with a
             // wordmark of your own.
-            logo_url: config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await,
+            logo_url: config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await?,
             logo_icon_url: config::get_default(ctx, LOGO_ICON_URL_KEY, &assets::logo_icon_url())
-                .await,
-            favicon_url: config::get_default(ctx, FAVICON_URL_KEY, &assets::favicon_url()).await,
-            primary_color: config::get_default(ctx, PRIMARY_COLOR_KEY, "").await,
+                .await?,
+            favicon_url: config::get_default(ctx, FAVICON_URL_KEY, &assets::favicon_url()).await?,
+            primary_color: config::get_default(ctx, PRIMARY_COLOR_KEY, "").await?,
             embedded_scripts: scripts_raw
                 .split(',')
                 .map(str::trim)
@@ -78,14 +83,14 @@ impl SiteConfig {
                 AUTH_HEADLINE_KEY,
                 crate::config_vars::DEFAULT_AUTH_HEADLINE,
             )
-            .await,
+            .await?,
             auth_tagline: config::get_default(
                 ctx,
                 AUTH_TAGLINE_KEY,
                 crate::config_vars::DEFAULT_AUTH_TAGLINE,
             )
-            .await,
-        }
+            .await?,
+        })
     }
 
     /// [`Self::load`] with the auth pages' one difference: they prefer
@@ -100,14 +105,16 @@ impl SiteConfig {
     /// and on Cloudflare it never arrived at all, because no D1 variables row
     /// reaches that surface. One async loader means the auth pages cannot
     /// drift from the rest of the site again.
-    pub async fn load_for_auth(ctx: &dyn wafer_run::context::Context) -> Self {
+    pub async fn load_for_auth(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<Self, wafer_run::WaferError> {
         use wafer_core::clients::config;
-        let mut config = Self::load(ctx).await;
-        let auth_logo = config::get_default(ctx, AUTH_LOGO_URL_KEY, "").await;
+        let mut config = Self::load(ctx).await?;
+        let auth_logo = config::get_default(ctx, AUTH_LOGO_URL_KEY, "").await?;
         if !auth_logo.is_empty() {
             config.logo_url = auth_logo;
         }
-        config
+        Ok(config)
     }
 }
 
@@ -323,7 +330,12 @@ pub async fn shell_page(
     shell: Shell<'_>,
     body: maud::Markup,
 ) -> wafer_run::OutputStream {
-    html_response(shell_document(ctx, msg, shell, body).await)
+    match shell_document(ctx, msg, shell, body).await {
+        Ok(document) => html_response(document),
+        Err(e) => {
+            crate::blocks::crud::db_error_page(msg, e, "page chrome: site config read failed")
+        }
+    }
 }
 
 /// [`shell_page`]'s markup, before it becomes a response.
@@ -334,14 +346,15 @@ pub async fn shell_page(
 /// isolation, without which the in-browser compiler has no `SharedArrayBuffer`)
 /// and `Cache-Control: no-store`, and an `OutputStream`'s meta is fixed when
 /// the stream is built — so the headers have to be on the response as it is
-/// constructed, not bolted onto one that already exists.
+/// constructed, not bolted onto one that already exists. For the same
+/// reason a failed site-config read is returned for the caller to answer.
 pub async fn shell_document(
     ctx: &dyn wafer_run::context::Context,
     msg: &wafer_run::Message,
     shell: Shell<'_>,
     body: maud::Markup,
-) -> maud::Markup {
-    let config = SiteConfig::load(ctx).await;
+) -> Result<maud::Markup, wafer_run::WaferError> {
+    let config = SiteConfig::load(ctx).await?;
     let user = UserInfo::from_message(msg);
     let mut groups = shell.nav.groups();
     // Hide nav items whose backing block won't serve on this target: either
@@ -369,7 +382,7 @@ pub async fn shell_document(
     let features = crate::routing::gate_from_request(ctx, msg);
     nav_groups::retain_reachable(&mut groups, &registered, &features);
     let path = msg.path().to_string();
-    Page {
+    Ok(Page {
         config: &config,
         title: shell.title,
         nav: &groups,
@@ -383,7 +396,7 @@ pub async fn shell_document(
         },
         body,
     }
-    .document(msg)
+    .document(msg))
 }
 
 /// Minimal `SiteConfig` used by the status-page helpers. They render
@@ -622,25 +635,49 @@ pub fn swap_notice_response(message: &str) -> wafer_run::OutputStream {
     html_response_with_toast(markup, message, "error")
 }
 
+/// `value` as JSON that an HTTP header can carry: every character outside
+/// ASCII is written as a `\uXXXX` escape (a surrogate pair above the BMP).
+///
+/// `serde_json` escapes control characters but leaves the rest of Unicode as
+/// it is, and the HTTP codec answers a header value holding a non-ASCII
+/// character with a 500 rather than send it. Non-ASCII can only appear inside
+/// a JSON string, where the escape is equivalent, so htmx parses the same
+/// value.
+fn header_json(value: &serde_json::Value) -> String {
+    let json = value.to_string();
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
 /// Respond with HTML + an HX-Trigger header for toast notifications.
 ///
 /// The trigger payload lands in an HTTP response header and is parsed by
 /// htmx as JSON. Building it with `format!` would let a toast message
 /// containing `"` or `\` produce malformed JSON (and a possible header-
 /// injection vector via embedded `\r\n`). Route through `serde_json` so
-/// the message text is properly escaped.
+/// the message text is properly escaped, and through [`header_json`] so a
+/// message outside ASCII (an em dash, an accented name) stays sendable.
 pub fn html_response_with_toast(
     markup: maud::Markup,
     toast_message: &str,
     toast_type: &str,
 ) -> wafer_run::OutputStream {
-    let trigger = serde_json::json!({
+    let trigger = header_json(&serde_json::json!({
         "showToast": {
             "message": toast_message,
             "type": toast_type,
         }
-    })
-    .to_string();
+    }));
     crate::http::ResponseBuilder::new()
         .set_header("HX-Trigger", &trigger)
         .body(
@@ -691,13 +728,13 @@ pub fn script_json_escape(json: &str) -> String {
 ///
 /// *After-swap* rather than plain `HX-Trigger` because the overlay is already
 /// in the page and opening it before its contents arrive shows an empty box.
-/// As in [`html_response_with_toast`], the payload goes through `serde_json`
-/// so an id can neither malform the JSON nor inject a header.
+/// As in [`html_response_with_toast`], the payload goes through
+/// [`header_json`] so an id can neither malform the JSON nor inject a header.
 pub fn html_response_opening_modal(
     markup: maud::Markup,
     modal_id: &str,
 ) -> wafer_run::OutputStream {
-    let trigger = serde_json::json!({ "openModal": { "id": modal_id } }).to_string();
+    let trigger = header_json(&serde_json::json!({ "openModal": { "id": modal_id } }));
     crate::http::ResponseBuilder::new()
         .set_header("HX-Trigger-After-Swap", &trigger)
         .body(
@@ -733,12 +770,38 @@ mod tests {
         }
     }
 
+    /// A toast travels in the `HX-Trigger` header, and the HTTP codec answers
+    /// a header value holding a character outside ASCII with a 500 instead of
+    /// sending it. The admin's bulk release toast carries an em dash, so the
+    /// action itself answered 500. The escaped JSON is sent, and parses back
+    /// to the same message.
+    #[tokio::test]
+    async fn a_toast_outside_ascii_is_sent_and_parses_back() {
+        let message = "Handed 2 keys back \u{2014} caf\u{e9} \u{1f600}";
+        let parts = wafer_block::http_codec::collect_http_response(html_response_with_toast(
+            maud::html! {},
+            message,
+            "success",
+        ))
+        .await;
+        assert_eq!(parts.status, 200, "the toast response must be sendable");
+        let trigger = parts
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("hx-trigger"))
+            .map(|(_, value)| value.clone())
+            .expect("an HX-Trigger header");
+        assert!(trigger.is_ascii(), "{trigger}");
+        let parsed: serde_json::Value = serde_json::from_str(&trigger).expect("valid JSON");
+        assert_eq!(parsed["showToast"]["message"], message);
+    }
+
     /// `SiteConfig::load` defaults the auth-panel headline/tagline to the
     /// requested marketing copy when no config var is set.
     #[tokio::test]
     async fn site_config_load_defaults_auth_headline_and_tagline() {
         let ctx = crate::test_support::TestContext::new().await;
-        let config = SiteConfig::load(&ctx).await;
+        let config = SiteConfig::load(&ctx).await.expect("site config");
         assert_eq!(
             config.auth_headline,
             crate::config_vars::DEFAULT_AUTH_HEADLINE
@@ -758,7 +821,7 @@ mod tests {
         let mut ctx = crate::test_support::TestContext::new().await;
         ctx.set_config(AUTH_HEADLINE_KEY, "Acme Cloud");
         ctx.set_config(AUTH_TAGLINE_KEY, "Built for Acme.");
-        let config = SiteConfig::load(&ctx).await;
+        let config = SiteConfig::load(&ctx).await.expect("site config");
         assert_eq!(config.auth_headline, "Acme Cloud");
         assert_eq!(config.auth_tagline, "Built for Acme.");
     }

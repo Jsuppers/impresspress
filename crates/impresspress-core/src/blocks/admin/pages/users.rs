@@ -347,7 +347,10 @@ pub async fn handle_create_role(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let bytes = input.collect_to_bytes().await;
+    let bytes = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body = parse_form_body(&bytes);
 
     let name = body.get("name").map(|s| s.as_str()).unwrap_or("");

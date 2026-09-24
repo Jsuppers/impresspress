@@ -13,7 +13,12 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Through the async loader, not `ctx.config_get`: that snapshot is frozen
     // at boot, so an admin's saved branding never reached this page without a
     // restart, and on Cloudflare never reached it at all.
-    let site = ui::SiteConfig::load_for_auth(ctx).await;
+    let site = match ui::SiteConfig::load_for_auth(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
     let logo_url = site.logo_url.clone();
     let app_name = site.app_name.clone();
     let auth_headline = site.auth_headline.clone();

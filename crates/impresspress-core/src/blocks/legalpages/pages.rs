@@ -469,7 +469,10 @@ struct SaveRequest {
 /// Save a draft document. If the current doc is published, creates a new draft
 /// so the live version stays untouched until the admin explicitly publishes.
 pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: SaveRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         // Previously returned 200 OK with an `error` key — htmx clients
@@ -528,7 +531,10 @@ pub async fn handle_save(ctx: &dyn Context, msg: &Message, input: InputStream) -
 /// of the same type (publish-then-archive ordering lives in
 /// `service::publish_document`).
 pub async fn handle_publish(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: SaveRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         // Previously returned 200 OK with an `error` key — clients would
@@ -659,7 +665,10 @@ pub(super) fn render_preview_fragment(markdown: &str) -> String {
 /// Returns the rendered HTML fragment for direct htmx swap into the
 /// preview pane.
 pub async fn handle_render_preview(_ctx: &dyn Context, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: PreviewRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid request: {e}")),

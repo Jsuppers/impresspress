@@ -1,6 +1,5 @@
 //! POST /b/auth/api/login — relocated from auth/login.rs in Task 5.
 
-use wafer_core::clients::config;
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
@@ -13,17 +12,19 @@ use crate::{
         },
         auth_ui::{
             contracts::{AuthenticatedUser, LoginRequest, LoginResponse, TokenType},
-            redirect::{default_post_login_redirect, is_safe_local_redirect},
+            redirect::{configured_admin_default, default_post_login_redirect},
         },
         crud,
         errors::{error_response, ErrorCode},
     },
-    config_vars::POST_LOGIN_REDIRECT_KEY,
     http::{err_bad_request, ResponseBuilder},
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: LoginRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -127,12 +128,16 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     // Check email verification if required
-    let require_verification = crate::config_vars::get_bool(
+    let require_verification = match crate::config_vars::get_bool(
         ctx,
         crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
         false,
     )
-    .await;
+    .await
+    {
+        Ok(required) => required,
+        Err(e) => return crud::db_error_internal(e, "Could not read the verification policy"),
+    };
     if require_verification && !user.email_verified {
         return error_response(ErrorCode::EmailNotVerified, "Please verify your email before logging in. Check your inbox for the verification link.");
     }
@@ -180,11 +185,9 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // single-sourced default (`redirect::default_post_login_redirect`) gets
     // applied. The client only falls back to this when it has no explicit,
     // already-validated `next`/`redirect` param of its own.
-    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
-    let admin_default = if is_safe_local_redirect(&post_login_raw) {
-        post_login_raw
-    } else {
-        "/b/admin/".to_string()
+    let admin_default = match configured_admin_default(ctx).await {
+        Ok(admin_default) => admin_default,
+        Err(e) => return crud::db_error_internal(e, "Could not read the post-login redirect"),
     };
     let is_admin = roles.iter().any(|r| r == "admin");
     let default_redirect = default_post_login_redirect(is_admin, &admin_default);

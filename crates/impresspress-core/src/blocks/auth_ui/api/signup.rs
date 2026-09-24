@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use wafer_core::clients::{config, crypto};
+use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
@@ -19,13 +19,12 @@ use crate::{
                 AuthenticatedUser, EmailVerified, PendingSignupUser, SignupRequest, SignupResponse,
                 TokenType,
             },
-            redirect::{default_post_login_redirect, is_safe_local_redirect},
+            redirect::{configured_admin_default, default_post_login_redirect},
         },
         crud,
         errors::{error_response, ErrorCode},
         rate_limit::UserRateLimiter,
     },
-    config_vars::POST_LOGIN_REDIRECT_KEY,
     http::{err_bad_request, err_internal, ResponseBuilder},
     util::{hex_encode, sha256_hex},
 };
@@ -57,11 +56,18 @@ pub async fn handle(
     input: InputStream,
 ) -> OutputStream {
     // Enforce ALLOW_SIGNUP on the API (not just the page)
-    if !signup_allowed(ctx).await {
+    let signup_allowed = match signup_allowed(ctx).await {
+        Ok(allowed) => allowed,
+        Err(e) => return crud::db_error_internal(e, "Could not read the signup switch"),
+    };
+    if !signup_allowed {
         return error_response(ErrorCode::Forbidden, "Signups are currently disabled");
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: SignupRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -74,17 +80,23 @@ pub async fn handle(
     }
 
     // Check allowed email domains (if configured)
-    if !email_domain_allowed(ctx, &email_lower).await {
+    let domain_allowed = match email_domain_allowed(ctx, &email_lower).await {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            return crud::db_error_internal(e, "Could not read the allowed email domains");
+        }
+    };
+    if !domain_allowed {
         return error_response(
             ErrorCode::InvalidEmail,
             "Signups from this email domain are not allowed",
         );
     }
 
-    if let Err((code, msg)) =
-        super::password_policy::validate_new_password(ctx, &body.password).await
-    {
-        return error_response(code, &msg);
+    match super::password_policy::validate_new_password(ctx, &body.password).await {
+        Ok(Ok(())) => {}
+        Ok(Err((code, msg))) => return error_response(code, &msg),
+        Err(response) => return response,
     }
     if email_lower.len() > 255 {
         return error_response(
@@ -114,12 +126,16 @@ pub async fn handle(
         Err(e) => return err_internal("Failed to hash password", e),
     };
 
-    let require_verification = crate::config_vars::get_bool(
+    let require_verification = match crate::config_vars::get_bool(
         ctx,
         crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
         false,
     )
-    .await;
+    .await
+    {
+        Ok(required) => required,
+        Err(e) => return crud::db_error_internal(e, "Could not read the verification policy"),
+    };
 
     let verification_token = if require_verification {
         match crypto::random_bytes(ctx, 32).await {
@@ -132,7 +148,10 @@ pub async fn handle(
 
     // Determine the role: admin if the email matches the configured bootstrap
     // admin email (re-uses the same key as bootstrap for consistency).
-    let role = initial_role_for(ctx, &email_lower).await;
+    let role = match initial_role_for(ctx, &email_lower).await {
+        Ok(role) => role,
+        Err(e) => return crud::db_error_internal(e, "Could not read the bootstrap admin email"),
+    };
 
     // The account row and its `local_credentials` row in one atomic write —
     // as two, a failure between them left an account with no password whose
@@ -238,11 +257,9 @@ pub async fn handle(
     // is (almost) never an admin, so this sends them to `/b/userportal/`
     // instead of the silent bounce to `/b/auth/login` the page used to do —
     // same single-sourced rule Fix 1 applies to login/OAuth/bootstrap.
-    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
-    let admin_default = if is_safe_local_redirect(&post_login_raw) {
-        post_login_raw
-    } else {
-        "/b/admin/".to_string()
+    let admin_default = match configured_admin_default(ctx).await {
+        Ok(admin_default) => admin_default,
+        Err(e) => return crud::db_error_internal(e, "Could not read the post-login redirect"),
     };
     let is_admin = roles.iter().any(|r| r == "admin");
     let default_redirect = default_post_login_redirect(is_admin, &admin_default);

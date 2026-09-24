@@ -71,15 +71,18 @@ pub const DATABASE_BACKEND_KEY: &str = "WAFER_RUN_SHARED__DATABASE__BACKEND";
 /// Cheap to call per request: the value comes from the in-memory config
 /// snapshot via `config::get_default` (no DB hop), so call sites read it
 /// inline rather than threading a cached `Backend` through every signature.
-pub async fn db_backend(ctx: &dyn Context) -> Backend {
+///
+/// A failed read is returned: rendering the other dialect's SQL against the
+/// database would fail anyway, further from the cause.
+pub async fn db_backend(ctx: &dyn Context) -> Result<Backend, WaferError> {
     let backend = config::get_default(ctx, DATABASE_BACKEND_KEY, "sqlite")
-        .await
+        .await?
         .to_ascii_lowercase();
-    if backend == "postgres" {
+    Ok(if backend == "postgres" {
         Backend::Postgres
     } else {
         Backend::Sqlite
-    }
+    })
 }
 
 /// Read `WAFER_RUN_SHARED__DATABASE__BACKEND` from the config snapshot,
@@ -112,7 +115,10 @@ pub async fn apply_migrations(
     sqlite_files: &[&str],
     postgres_files: &[&str],
 ) -> Result<(), String> {
-    let files = match db_backend(ctx).await {
+    let backend = db_backend(ctx)
+        .await
+        .map_err(|e| format!("{block_name}: read the database backend: {e}"))?;
+    let files = match backend {
         Backend::Postgres => postgres_files,
         Backend::Sqlite => sqlite_files,
     };

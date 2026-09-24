@@ -126,7 +126,7 @@ impl CountryCode {
 /// because the alternative the two money paths used to pick — treat it as
 /// zero — is the one outcome that loses money without telling anyone.
 pub(crate) async fn seller_fee_bps(ctx: &dyn Context) -> Result<u16, WaferError> {
-    let raw = config::get_default(ctx, SELLER_APPLICATION_FEE_BPS, "0").await;
+    let raw = config::get_default(ctx, SELLER_APPLICATION_FEE_BPS, "0").await?;
     raw.trim()
         .parse::<u16>()
         .ok()
@@ -149,7 +149,7 @@ pub(crate) async fn seller_fee_bps(ctx: &dyn Context) -> Result<u16, WaferError>
 /// code is a `FailedPrecondition`; it is a typo in the settings form, not a
 /// reason to ship to a country nobody chose.
 pub(crate) async fn platform_country(ctx: &dyn Context) -> Result<Option<CountryCode>, WaferError> {
-    let raw = config::get_default(ctx, PLATFORM_COUNTRY, "").await;
+    let raw = config::get_default(ctx, PLATFORM_COUNTRY, "").await?;
     if raw.trim().is_empty() {
         return Ok(None);
     }

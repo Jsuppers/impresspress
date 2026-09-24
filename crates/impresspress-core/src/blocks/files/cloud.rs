@@ -54,18 +54,16 @@ pub const DEFAULT_MAX_SHARE_EXPIRY_HOURS: i64 = 24 * 365;
 /// 0.4.44), so a value this handler cannot honour falls back to the default
 /// the `ConfigVar` declares rather than being obeyed.
 async fn max_share_expiry_hours(ctx: &dyn Context) -> Result<i64, WaferError> {
-    // `get`, not `get_default`: the two ways of not having a value are not
-    // the same event. An unset key is the declared default, by design. A
-    // lookup that FAILED is not an answer at all: a deployment that lowered
-    // this ceiling would be handing out the longer default while the config
-    // store is unreachable, so the share is refused instead, the way the
-    // upload refuses when its quota cannot be read.
-    let raw = match wafer_core::clients::config::get(ctx, MAX_SHARE_EXPIRY_HOURS_KEY).await {
-        Ok(value) => value,
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
-            return Ok(DEFAULT_MAX_SHARE_EXPIRY_HOURS)
-        }
-        Err(e) => return Err(e),
+    // The two ways of not having a value are not the same event. An unset
+    // key is the declared default, by design. A lookup that FAILED is not an
+    // answer at all: a deployment that lowered this ceiling would be handing
+    // out the longer default while the config store is unreachable, so the
+    // share is refused instead, the way the upload refuses when its quota
+    // cannot be read.
+    let Some(raw) =
+        wafer_core::clients::config::get_optional(ctx, MAX_SHARE_EXPIRY_HOURS_KEY).await?
+    else {
+        return Ok(DEFAULT_MAX_SHARE_EXPIRY_HOURS);
     };
     match raw.trim().parse::<i64>() {
         Ok(hours) if hours > 0 && chrono::Duration::try_hours(hours).is_some() => Ok(hours),
@@ -98,7 +96,10 @@ pub(super) async fn handle_create_share(
         expires_in_hours: Option<i64>,
         max_access_count: Option<i64>,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -274,7 +275,10 @@ pub(super) async fn handle_update_quota(
         Err(response) => return response,
     };
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: HashMap<String, serde_json::Value> = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

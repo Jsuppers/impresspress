@@ -6,8 +6,8 @@
 //! contract (`exec_raw` / `query_raw`) the block uses at runtime.
 //!
 //! `config::get_default(ctx, "WAFER_RUN_SHARED__DATABASE__BACKEND", "sqlite")`
-//! falls back to `"sqlite"` because we intentionally don't register
-//! `wafer-run/config` — the fallback keeps the test self-contained.
+//! falls back to `"sqlite"` because the fixture's config block holds no key —
+//! the unset default keeps the test self-contained.
 
 use impresspress_core::blocks::auth::migrations;
 use wafer_core::clients::database as db;

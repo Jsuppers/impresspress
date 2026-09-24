@@ -318,7 +318,15 @@ pub async fn handle_request(
             // so JWTs minted under a different deployment's FRONTEND_URL get
             // rejected even if their HMAC secret matches. [SEC-042] also
             // consults the JWT blocklist via the ctx-aware extractor.
-            let expected_iss = crate::blocks::auth::helpers::expected_issuer(ctx).await;
+            let expected_iss = match crate::blocks::auth::helpers::expected_issuer(ctx).await {
+                Ok(expected_iss) => expected_iss,
+                Err(e) => {
+                    return crate::blocks::crud::db_error_internal(
+                        e,
+                        "pipeline: token issuer read failed",
+                    )
+                }
+            };
             crate::crypto::extract_auth_meta(ctx, header, jwt_secret, &expected_iss, &mut msg).await
         } else if let Some(api_key) = header.strip_prefix("ApiKey ") {
             crate::blocks::auth::authenticate_api_key(ctx, api_key, &mut msg).await
@@ -361,7 +369,14 @@ pub async fn handle_request(
         // `blocks/email.rs`, `ui/mod.rs`), so discovery documents reuse it
         // instead of inventing a second name knob; it falls back to
         // `DEFAULT_APP_NAME`, never to the host.
-        let project_name = config_client::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await;
+        let project_name = match config_client::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME)
+            .await
+        {
+            Ok(name) => name,
+            Err(e) => {
+                return crate::blocks::crud::db_error_internal(e, "discovery: app name read failed")
+            }
+        };
 
         // Same ceiling and the same resolver as the manifest below, so the
         // three projections of one declaration agree on who is told about
@@ -388,7 +403,16 @@ pub async fn handle_request(
         // omit the header; non-browser clients (curl, the agent runtime,
         // server-side fetchers) don't care about CORS so they still see the
         // body.
-        let environment = config_client::get_default(ctx, ENVIRONMENT_KEY, "development").await;
+        let environment =
+            match config_client::get_default(ctx, ENVIRONMENT_KEY, "development").await {
+                Ok(environment) => environment,
+                Err(e) => {
+                    return crate::blocks::crud::db_error_internal(
+                        e,
+                        "discovery: environment read failed",
+                    )
+                }
+            };
         let is_dev = environment.eq_ignore_ascii_case("development");
 
         // Per-caller by construction, like the manifest: a shared cache
@@ -3070,11 +3094,11 @@ mod secret_path_redaction_tests {
         // Pinned, not asserted in prose: this path IS declared, so it resolves
         // and then dies in dispatch because the harness registers no block
         // instance. It never reached the share handler either way. The row
-        // records 404 because "block not registered" is `ErrorCode::NotFound`
-        // and the audit tail now takes the error's own status — the code the
-        // client was served all along, see the `TerminalNotResponse::Error`
-        // arm of `handle_request`.
-        assert_eq!(*status, 404, "{rows:?}");
+        // records 501 because "block not registered" is
+        // `ErrorCode::Unimplemented`, as the runtime answers it, and the audit
+        // tail takes the error's own status — the code the client was served,
+        // see the `TerminalNotResponse::Error` arm of `handle_request`.
+        assert_eq!(*status, 501, "{rows:?}");
     }
 
     /// A URL that *nearly* names the share route still carries a live token,

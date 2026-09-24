@@ -26,9 +26,24 @@ use crate::{
     http::{err_bad_request, err_conflict, err_not_found, ok_json},
 };
 
+/// Why [`collect_with_cap`] produced no body.
+#[derive(Debug)]
+enum CappedBodyError {
+    /// The running total passed the cap.
+    TooLarge,
+    /// The body did not arrive whole — the connection dropped, the transport
+    /// hit its own cap or deadline. Carries the transport's error, whose code
+    /// says which.
+    Body(wafer_run::WaferError),
+}
+
 /// Collect an `InputStream` into `Vec<u8>` with a hard size cap. Errors out
 /// as soon as the running total exceeds `cap_bytes`, so the copy this makes is
-/// never larger than the cap. Returns `Err(())` when the cap is exceeded.
+/// never larger than the cap.
+///
+/// A body that fails part-way is [`CappedBodyError::Body`], never the prefix
+/// that arrived: storing that prefix would commit a truncated upload as the
+/// user's file.
 ///
 /// The transport-level ceiling on a request body is
 /// [`crate::streaming::MAX_REQUEST_BODY_BYTES`], enforced before dispatch;
@@ -38,7 +53,7 @@ use crate::{
 async fn collect_with_cap(
     mut input: wafer_run::InputStream,
     cap_bytes: i64,
-) -> Result<Vec<u8>, ()> {
+) -> Result<Vec<u8>, CappedBodyError> {
     use futures::StreamExt;
     let cap = if cap_bytes <= 0 {
         usize::MAX
@@ -47,8 +62,9 @@ async fn collect_with_cap(
     };
     let mut out = Vec::new();
     while let Some(chunk) = input.next().await {
+        let chunk = chunk.map_err(CappedBodyError::Body)?;
         if out.len().saturating_add(chunk.len()) > cap {
-            return Err(());
+            return Err(CappedBodyError::TooLarge);
         }
         out.extend_from_slice(&chunk);
     }
@@ -241,11 +257,15 @@ pub(in crate::blocks::files) async fn handle_upload_object(
         // outage would admit a file an admin-lowered override forbids.
         Err(e) => return crud::db_error_internal(e, "Quota lookup failed"),
     };
-    let Ok(body_bytes) = collect_with_cap(input, quota.max_file_size_bytes).await else {
-        return err_bad_request(&format!(
-            "File exceeds maximum size of {} bytes",
-            quota.max_file_size_bytes
-        ));
+    let body_bytes = match collect_with_cap(input, quota.max_file_size_bytes).await {
+        Ok(body_bytes) => body_bytes,
+        Err(CappedBodyError::TooLarge) => {
+            return err_bad_request(&format!(
+                "File exceeds maximum size of {} bytes",
+                quota.max_file_size_bytes
+            ));
+        }
+        Err(CappedBodyError::Body(e)) => return OutputStream::error(e),
     };
 
     // Browser uploads (`FormData` + fetch) arrive as `multipart/form-data`:
@@ -894,6 +914,40 @@ mod integration_tests {
         assert_eq!(size, body.len() as i64);
         assert_eq!(content_type, "text/plain");
         assert_eq!(status, ObjectStatus::Complete);
+    }
+
+    /// A body that fails part-way — the connection dropped, the transport hit
+    /// its deadline — is not the file. The upload answers the transport's own
+    /// error and stores neither the prefix that arrived nor an object row.
+    #[tokio::test]
+    async fn an_upload_whose_body_fails_stores_nothing() {
+        let ctx = ctx_with_storage().await;
+        seed_bucket(&ctx, "raw-bucket", "alice").await;
+
+        let body = InputStream::from_stream(futures::stream::iter([
+            Ok(b"the first half of the file".to_vec()),
+            Err(wafer_run::WaferError::new(
+                wafer_run::ErrorCode::DeadlineExceeded,
+                "request body read timed out",
+            )),
+        ]));
+        let msg = upload_msg("raw-bucket", "notes.txt", "text/plain");
+        let out = handle_upload_object(&ctx, &msg, body).await;
+
+        assert!(
+            crate::test_support::output_is_error(out, "DeadlineExceeded").await,
+            "the transport's error must be the answer"
+        );
+        assert!(
+            stored_object(&ctx, "raw-bucket", "notes.txt")
+                .await
+                .is_err(),
+            "the prefix must not be stored"
+        );
+        let rows = repo::objects::list_all(&ctx)
+            .await
+            .expect("list object rows");
+        assert!(rows.is_empty(), "no object row may be written");
     }
 
     /// Build the message the router produces for

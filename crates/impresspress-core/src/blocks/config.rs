@@ -39,8 +39,8 @@
 //! 3. Otherwise the boot map answers. It carries what the table cannot —
 //!    worker/env bindings, builder-time vars (CORS, CSP, STRICT_SCHEMA) and
 //!    the synthetic block-settings JSON.
-//! 4. Otherwise `NotFound`, exactly as wafer-core's block reports it, so
-//!    `config::get_default`'s fallback-to-default behaviour is unchanged.
+//! 4. Otherwise `NotFound`, exactly as wafer-core's block reports it: the
+//!    one answer `config::get_default` / `get_optional` take as "unset".
 //!
 //! A `CONFIG_GET` that cannot read the table answers from the boot map, so a
 //! database blip does not blank every page's branding. That is wrong for a
@@ -173,10 +173,10 @@ struct GetManyResponse {
 /// The current value of each of `keys` that has one, or an error when the
 /// `variables` table could not be read (or the caller may not read a key).
 ///
-/// For a form. [`wafer_core::clients::config::get_default`] never fails: an
-/// unreadable table answers from the boot map and a missing boot value from
-/// the caller's default, which is right for page chrome and wrong for a form
-/// whose Save posts every field back.
+/// For a form. A `config.get` that cannot read the table answers from the
+/// boot map, and [`wafer_core::clients::config::get_default`] turns a key
+/// missing there into the caller's default — right for page chrome and wrong
+/// for a form whose Save posts every field back.
 pub async fn get_many(
     ctx: &dyn Context,
     keys: &[&str],
@@ -253,22 +253,18 @@ impl VariablesConfigBlock {
         }
     }
 
-    /// The key a `CONFIG_GET` is asking for: a codec-encoded `GetRequest`
-    /// body, or the `key` meta fallback wafer-core's handler also accepts.
-    fn get_key(msg: &Message, body: &[u8]) -> Result<String, OutputStream> {
-        match codec::decode::<wire::GetRequest>(body) {
-            Ok(req) => Ok(req.key),
-            Err(_) => {
-                let meta_key = msg.get_meta("key");
-                if meta_key.is_empty() {
-                    return Err(OutputStream::error(WaferError::new(
-                        ErrorCode::InvalidArgument,
-                        "config.get requires a 'key' in data or meta",
-                    )));
-                }
-                Ok(meta_key.to_string())
-            }
-        }
+    /// The key a `CONFIG_GET` is asking for: the codec-encoded `GetRequest`
+    /// body, as wafer-core's config handler reads it. A body that does not
+    /// decode is `InvalidArgument` whatever meta the message carries.
+    fn get_key(body: &[u8]) -> Result<String, OutputStream> {
+        codec::decode::<wire::GetRequest>(body)
+            .map(|req| req.key)
+            .map_err(|e| {
+                OutputStream::error(WaferError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("config.get: {}", e.message),
+                ))
+            })
     }
 
     /// The whole `variables` table as a key/value map, fetched at most once
@@ -340,7 +336,10 @@ impl VariablesConfigBlock {
     /// [`CONFIG_GET_MANY`]: every requested key the caller may read, resolved
     /// like `CONFIG_GET`, except that an unreadable table is an error.
     async fn get_many_op(&self, ctx: &dyn Context, input: InputStream) -> OutputStream {
-        let body = input.collect_to_bytes().await;
+        let body = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let req = match codec::decode::<GetManyRequest>(&body) {
             Ok(req) => req,
             Err(e) => {
@@ -594,8 +593,11 @@ impl Block for VariablesConfigBlock {
     async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
         match msg.kind.as_str() {
             ServiceOp::CONFIG_GET => {
-                let body = input.collect_to_bytes().await;
-                let key = match Self::get_key(&msg, &body) {
+                let body = match input.collect_to_bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return OutputStream::error(e),
+                };
+                let key = match Self::get_key(&body) {
                     Ok(key) => key,
                     Err(out) => return out,
                 };
@@ -637,7 +639,10 @@ impl Block for VariablesConfigBlock {
             }
             CONFIG_GET_MANY => self.get_many_op(ctx, input).await,
             ServiceOp::CONFIG_SET => {
-                let body = input.collect_to_bytes().await;
+                let body = match input.collect_to_bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return OutputStream::error(e),
+                };
                 let req = match codec::decode::<wire::SetRequest>(&body) {
                     Ok(req) => req,
                     Err(e) => {
@@ -726,6 +731,25 @@ mod tests {
         assert!(!values.contains_key("X__UNSET"), "{values:?}");
     }
 
+    /// `config.get` takes its key from the body only, as wafer-core's config
+    /// handler does. A `key` meta beside a body that does not decode used to
+    /// be served — a second request shape the typed client never sends, and
+    /// one wafer-core dropped — so it is refused here too.
+    #[tokio::test]
+    async fn a_get_whose_body_does_not_decode_is_refused_whatever_its_meta() {
+        let mut ctx = TestContext::with_admin().await;
+        ctx.set_config(APP_NAME_KEY, "from-boot");
+        let mut msg = Message::new(ServiceOp::CONFIG_GET);
+        msg.set_meta("key", APP_NAME_KEY);
+        let out = ctx
+            .call_block(CONFIG_BLOCK, msg, InputStream::empty())
+            .await;
+        assert!(
+            crate::test_support::output_is_error(out, "InvalidArgument").await,
+            "an undecodable config.get must be InvalidArgument"
+        );
+    }
+
     /// Where `CONFIG_GET` falls back to the boot map on an unreadable table,
     /// `CONFIG_GET_MANY` fails: a form must not be filled from the fallback.
     /// The `CONFIG_GET` half is a guard on the fallback this keeps.
@@ -739,7 +763,9 @@ mod tests {
         let ctx = ctx.break_reads();
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, APP_NAME_KEY, "").await,
+            wafer_core::clients::config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
             "from-boot"
         );
         assert!(get_many(&ctx, &[APP_NAME_KEY]).await.is_err());
@@ -782,7 +808,9 @@ mod tests {
         .await
         .expect("seed the first value");
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+                .await
+                .expect("config read"),
             first,
             "precondition: the first read populates the snapshot"
         );
@@ -805,7 +833,9 @@ mod tests {
         .expect("the admin write lands in the table");
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+                .await
+                .expect("config read"),
             second,
             "an admin write must invalidate a warm config snapshot, or the \
              change stays invisible for the life of the process"
@@ -864,14 +894,18 @@ mod tests {
         let reader_ctx = ctx.clone();
         let first_expected = first.clone();
         let reader = tokio::spawn(async move {
-            let warm = wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset").await;
+            let warm = wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset")
+                .await
+                .expect("config read");
             assert_eq!(
                 warm, first_expected,
                 "precondition: this read fills the shared snapshot on a worker thread"
             );
             warmed_tx.send(()).expect("the test is waiting for this");
             written_rx.await.expect("the admin write happens");
-            wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset").await
+            wafer_core::clients::config::get_default(&reader_ctx, KEY, "unset")
+                .await
+                .expect("config read")
         });
         warmed_rx.await.expect("the reader warmed the snapshot");
 
@@ -933,7 +967,9 @@ mod tests {
         .await
         .expect("the admin write lands in the table");
 
-        let site = crate::ui::SiteConfig::load_for_auth(&ctx).await;
+        let site = crate::ui::SiteConfig::load_for_auth(&ctx)
+            .await
+            .expect("site config");
         assert_eq!(
             site.primary_color, saved,
             "the auth pages must render the brand colour an admin saved, not \
@@ -987,7 +1023,9 @@ mod tests {
         );
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+                .await
+                .expect("config read"),
             saved,
             "the config block must read the variables table under WRAP; if it \
              cannot it falls back to the boot map and every page serves the \
@@ -1052,7 +1090,7 @@ mod boot_owned_key_tests {
         store_row(&ctx, key, "server").await;
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, key, "server").await,
+            wafer_core::clients::config::get_default(&ctx, key, "server").await.expect("config read"),
             "browser",
             "an adapter-injected internal key must come from the boot map, never the variables table"
         );
@@ -1068,7 +1106,9 @@ mod boot_owned_key_tests {
         store_row(&ctx, key, "0").await;
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, key, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, key, "unset")
+                .await
+                .expect("config read"),
             "1",
             "an infrastructure key must come from the boot map, never the variables table"
         );
@@ -1241,7 +1281,9 @@ mod boot_owned_key_tests {
         store_row(&ctx, KEY, &saved).await;
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+                .await
+                .expect("config read"),
             saved,
             "an admin-editable shared key must still come from the variables table"
         );

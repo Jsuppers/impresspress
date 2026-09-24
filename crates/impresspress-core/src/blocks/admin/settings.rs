@@ -149,7 +149,10 @@ pub(super) async fn handle_set(
         #[serde(default)]
         sensitive: Option<bool>,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -240,7 +243,10 @@ pub(super) async fn handle_create(
         description: Option<String>,
         sensitive: Option<bool>,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -1911,7 +1917,9 @@ mod config_store_reproduction {
 
         // The half that decides what a visitor sees. `ui/mod.rs:73` reads
         // this key through the async client.
-        let seen = wafer_core::clients::config::get_default(&ctx, KEY, "unset").await;
+        let seen = wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+            .await
+            .expect("config read");
         assert_eq!(
             seen, saved,
             "a saved admin setting must be visible to async config readers without a restart"

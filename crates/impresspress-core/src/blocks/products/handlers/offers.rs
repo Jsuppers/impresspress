@@ -121,7 +121,10 @@ pub(super) fn domain_error(error: WaferError) -> OutputStream {
 }
 
 async fn definition(input: InputStream) -> Result<OfferDefinitionRequest, OutputStream> {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     serde_json::from_slice(&raw).map_err(|error| err_bad_request(&format!("Invalid body: {error}")))
 }
 
@@ -178,7 +181,10 @@ pub(super) async fn handle_preview(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let mut request: PricingPreviewRequest = match serde_json::from_slice(&raw) {
         Ok(request) => request,
         Err(error) => return err_bad_request(&format!("Invalid body: {error}")),

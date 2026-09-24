@@ -84,7 +84,10 @@ pub async fn list_contexts(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// row back as HTML — a JSON body would be swapped into the list as markup
 /// and render as its own source text.
 pub async fn create_context(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let parsed = match parse_body_value(&raw) {
         Ok(value) => value,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -123,7 +126,10 @@ pub async fn update_context(ctx: &dyn Context, msg: &Message, input: InputStream
         Ok(record) => record.id,
         Err(resp) => return resp,
     };
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: UpdateContextRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -185,7 +191,10 @@ pub async fn add_entry(ctx: &dyn Context, msg: &Message, input: InputStream) -> 
         Ok(record) => record.id,
         Err(resp) => return resp,
     };
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let parsed = match parse_body_value(&raw) {
         Ok(value) => value,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

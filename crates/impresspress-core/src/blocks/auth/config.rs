@@ -243,20 +243,22 @@ impl AuthConfig {
     ///
     /// Called once at `Init` time from `AuthBlock::lifecycle`. Each key is
     /// fetched with its declared default via `config_client::get_default` so
-    /// the behaviour matches the `BlockInfo::config_keys` declarations above.
-    pub async fn from_ctx(ctx: &dyn Context) -> Self {
+    /// the behaviour matches the `BlockInfo::config_keys` declarations above;
+    /// a failed read fails `Init` rather than booting without the bootstrap
+    /// admin the deployment configured.
+    pub async fn from_ctx(ctx: &dyn Context) -> Result<Self, wafer_run::WaferError> {
         let mut env = HashMap::new();
         for key in &[
             BOOTSTRAP_ADMIN_EMAIL_KEY,
             BOOTSTRAP_ADMIN_PASSWORD_KEY,
             BOOTSTRAP_ADMIN_TOKEN_KEY,
         ] {
-            let val = config_client::get_default(ctx, key, "").await;
+            let val = config_client::get_default(ctx, key, "").await?;
             if !val.is_empty() {
                 env.insert(key.to_string(), val);
             }
         }
-        Self::from_map(&env)
+        Ok(Self::from_map(&env))
     }
 
     /// Test helper: build an [`AuthConfig`] from a slice of `(key, value)`

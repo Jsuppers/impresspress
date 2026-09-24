@@ -740,7 +740,7 @@ pub(crate) mod helpers {
         // common case in production is "unset" — early-return then,
         // skipping the second `db::create` path entirely. Authenticated
         // routes mint tokens often enough that the saved DB reads accumulate.
-        let admin_email = config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await;
+        let admin_email = config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await?;
 
         let mut roles = get_user_roles(ctx, user_id).await?;
 
@@ -781,7 +781,9 @@ pub(crate) mod helpers {
     /// across the JSON signup endpoint and the OAuth callback's
     /// brand-new-user branch — `WAFER_RUN_SHARED__AUTH__SIGNUP_ENABLED` was a
     /// dead duplicate with the opposite default and has been removed.
-    pub(crate) async fn signup_allowed(ctx: &dyn wafer_run::context::Context) -> bool {
+    pub(crate) async fn signup_allowed(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<bool, WaferError> {
         crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await
     }
 
@@ -795,13 +797,13 @@ pub(crate) mod helpers {
     pub(crate) async fn email_domain_allowed(
         ctx: &dyn wafer_run::context::Context,
         email: &str,
-    ) -> bool {
-        let allowed = config_client::get_default(ctx, ALLOWED_EMAIL_DOMAINS_KEY, "").await;
+    ) -> Result<bool, WaferError> {
+        let allowed = config_client::get_default(ctx, ALLOWED_EMAIL_DOMAINS_KEY, "").await?;
         if allowed.is_empty() {
-            return true;
+            return Ok(true);
         }
         let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
-        allowed.split(',').any(|d| d.trim() == domain)
+        Ok(allowed.split(',').any(|d| d.trim() == domain))
     }
 
     /// The role a newly registered user should receive: `"admin"` when `email`
@@ -811,32 +813,37 @@ pub(crate) mod helpers {
     pub(crate) async fn initial_role_for(
         ctx: &dyn wafer_run::context::Context,
         email: &str,
-    ) -> &'static str {
+    ) -> Result<&'static str, WaferError> {
         use super::config::BOOTSTRAP_ADMIN_EMAIL_KEY;
-        let admin_email = config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await;
-        if !admin_email.is_empty() && email.eq_ignore_ascii_case(&admin_email) {
-            "admin"
-        } else {
-            "user"
-        }
+        let admin_email = config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await?;
+        Ok(
+            if !admin_email.is_empty() && email.eq_ignore_ascii_case(&admin_email) {
+                "admin"
+            } else {
+                "user"
+            },
+        )
     }
 
     /// Resolve the configured access-token lifetime (SEC-042). Reads
     /// `WAFER_RUN__AUTH__ACCESS_TOKEN_LIFETIME_SECS`; falls back to the
     /// declared default (30 min) if unset or unparseable, and is always
     /// clamped to [`config::ACCESS_TOKEN_LIFETIME_SECS_MAX`] (P2c) — an admin
-    /// cannot configure this past the hard cap.
-    pub(crate) async fn access_token_lifetime_secs(ctx: &dyn wafer_run::context::Context) -> u64 {
+    /// cannot configure this past the hard cap. A failed read is returned.
+    pub(crate) async fn access_token_lifetime_secs(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<u64, WaferError> {
         use super::config::{
             ACCESS_TOKEN_LIFETIME_SECS_DEFAULT, ACCESS_TOKEN_LIFETIME_SECS_KEY,
             ACCESS_TOKEN_LIFETIME_SECS_MAX,
         };
-        let raw = config_client::get_default(ctx, ACCESS_TOKEN_LIFETIME_SECS_KEY, "").await;
-        raw.parse::<u64>()
+        let raw = config_client::get_default(ctx, ACCESS_TOKEN_LIFETIME_SECS_KEY, "").await?;
+        Ok(raw
+            .parse::<u64>()
             .ok()
             .filter(|n| *n > 0)
             .unwrap_or(ACCESS_TOKEN_LIFETIME_SECS_DEFAULT)
-            .min(ACCESS_TOKEN_LIFETIME_SECS_MAX)
+            .min(ACCESS_TOKEN_LIFETIME_SECS_MAX))
     }
 
     /// Returns (access_token, refresh_token, family).
@@ -906,13 +913,17 @@ pub(crate) mod helpers {
             ),
         };
 
-        let access_lifetime_secs = access_token_lifetime_secs(ctx).await;
+        let access_lifetime_secs = access_token_lifetime_secs(ctx)
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
 
         // [SEC-038] Stamp `iss` on every token we mint so the read side can
         // reject tokens minted by a different deployment (e.g. a sibling
         // env's leaked secret) instead of trusting any signature with the
         // same HMAC key.
-        let issuer = expected_issuer(ctx).await;
+        let issuer = expected_issuer(ctx)
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
 
         // [P2c] Embed the user's *current* auth_version so a subsequent
         // password-change/disable/role-change bump (`bump_auth_version`)
@@ -1014,7 +1025,9 @@ pub(crate) mod helpers {
     /// per-deployment URL admins reliably set, and treating it as the issuer
     /// means a token minted in dev (`http://localhost:5173`) won't validate
     /// against a production secret if one leaks between environments.
-    pub(crate) async fn expected_issuer(ctx: &dyn wafer_run::context::Context) -> String {
+    pub(crate) async fn expected_issuer(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<String, WaferError> {
         config_client::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await
     }
 
@@ -1058,40 +1071,44 @@ pub(crate) mod helpers {
     /// rather than re-derived from `WAFER_RUN_SHARED__ENVIRONMENT` per cookie.
     pub(crate) async fn cookie_secure_attribute(
         ctx: &dyn wafer_run::context::Context,
-    ) -> &'static str {
-        let env = config_client::get_default(ctx, ENVIRONMENT_KEY, "development").await;
-        if env.to_lowercase() == "development" {
+    ) -> Result<&'static str, WaferError> {
+        let env = config_client::get_default(ctx, ENVIRONMENT_KEY, "development").await?;
+        Ok(if env.to_lowercase() == "development" {
             ""
         } else {
             "; Secure"
-        }
+        })
     }
 
     pub(crate) async fn build_auth_cookie(
         token: &str,
         max_age: u64,
         ctx: &dyn wafer_run::context::Context,
-    ) -> String {
-        format!(
+    ) -> Result<String, WaferError> {
+        Ok(format!(
             "auth_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
             token,
             max_age,
-            cookie_secure_attribute(ctx).await
-        )
+            cookie_secure_attribute(ctx).await?
+        ))
     }
 
     /// Resolve the configured minimum signup password length
     /// (`WAFER_RUN_SHARED__AUTH__PASSWORD_MIN_LENGTH`). Falls back to the
-    /// declared default (8) if unset or unparseable. Read by the signup
+    /// declared default (8) if unset or unparseable; a failed read is
+    /// returned. Read by the signup
     /// handler so the admin-visible config var is actually enforced instead of
     /// a hardcoded literal.
-    pub(crate) async fn password_min_length(ctx: &dyn wafer_run::context::Context) -> usize {
+    pub(crate) async fn password_min_length(
+        ctx: &dyn wafer_run::context::Context,
+    ) -> Result<usize, WaferError> {
         use super::config::{PASSWORD_MIN_LENGTH_DEFAULT, PASSWORD_MIN_LENGTH_KEY};
-        let raw = config_client::get_default(ctx, PASSWORD_MIN_LENGTH_KEY, "").await;
-        raw.parse::<usize>()
+        let raw = config_client::get_default(ctx, PASSWORD_MIN_LENGTH_KEY, "").await?;
+        Ok(raw
+            .parse::<usize>()
             .ok()
             .filter(|n| *n > 0)
-            .unwrap_or(PASSWORD_MIN_LENGTH_DEFAULT as usize)
+            .unwrap_or(PASSWORD_MIN_LENGTH_DEFAULT as usize))
     }
 
     /// Resolve the configured login lifetime in days
@@ -1109,7 +1126,7 @@ pub(crate) mod helpers {
         ctx: &dyn wafer_run::context::Context,
     ) -> Result<u32, WaferError> {
         use super::config::{parse_session_lifetime_days, SESSION_LIFETIME_DAYS_KEY};
-        let raw = config_client::get_default(ctx, SESSION_LIFETIME_DAYS_KEY, "").await;
+        let raw = config_client::get_default(ctx, SESSION_LIFETIME_DAYS_KEY, "").await?;
         parse_session_lifetime_days(&raw).map_err(|e| {
             WaferError::new(
                 wafer_run::ErrorCode::Internal,
@@ -1327,8 +1344,12 @@ pub(crate) mod helpers {
         // storm costs one sweep.
         super::maintenance::sweep_if_due(ctx).await;
 
-        let access_lifetime = access_token_lifetime_secs(ctx).await;
-        let cookie = build_auth_cookie(&access_token, access_lifetime, ctx).await;
+        let access_lifetime = access_token_lifetime_secs(ctx)
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
+        let cookie = build_auth_cookie(&access_token, access_lifetime, ctx)
+            .await
+            .map_err(wafer_run::OutputStream::error)?;
 
         Ok(IssuedLogin {
             access_token,
@@ -1349,7 +1370,7 @@ pub(crate) mod helpers {
         async fn unset_falls_back_to_default() {
             let ctx = TestContext::new().await;
             assert_eq!(
-                access_token_lifetime_secs(&ctx).await,
+                access_token_lifetime_secs(&ctx).await.expect("config read"),
                 config::ACCESS_TOKEN_LIFETIME_SECS_DEFAULT
             );
         }
@@ -1358,7 +1379,10 @@ pub(crate) mod helpers {
         async fn honors_a_value_under_the_cap() {
             let mut ctx = TestContext::new().await;
             ctx.set_config(ACCESS_TOKEN_LIFETIME_SECS_KEY, "60");
-            assert_eq!(access_token_lifetime_secs(&ctx).await, 60);
+            assert_eq!(
+                access_token_lifetime_secs(&ctx).await.expect("config read"),
+                60
+            );
         }
 
         #[tokio::test]
@@ -1372,7 +1396,7 @@ pub(crate) mod helpers {
                 &(config::ACCESS_TOKEN_LIFETIME_SECS_MAX * 10).to_string(),
             );
             assert_eq!(
-                access_token_lifetime_secs(&ctx).await,
+                access_token_lifetime_secs(&ctx).await.expect("config read"),
                 config::ACCESS_TOKEN_LIFETIME_SECS_MAX
             );
         }

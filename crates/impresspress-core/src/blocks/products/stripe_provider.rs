@@ -87,16 +87,16 @@ fn capabilities(value: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn connection_base(ctx: &dyn Context) -> (String, bool, bool, String) {
-    let publishable = config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await;
-    let webhook = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await;
-    let api_version = config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_API_VERSION).await;
-    (
+async fn connection_base(ctx: &dyn Context) -> Result<(String, bool, bool, String), WaferError> {
+    let publishable = config::get_default(ctx, STRIPE_PUBLISHABLE_KEY, "").await?;
+    let webhook = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await?;
+    let api_version = config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_API_VERSION).await?;
+    Ok((
         publishable.clone(),
         !publishable.trim().is_empty(),
         !webhook.trim().is_empty(),
         api_version,
-    )
+    ))
 }
 
 fn connection_error(
@@ -130,61 +130,65 @@ fn connection_error(
     }
 }
 
-pub(crate) async fn connection_status(ctx: &dyn Context) -> StripeConnectionStatus {
-    let secret = config::get_default(ctx, STRIPE_SECRET_KEY, "").await;
+/// The Stripe connection as the admin sees it. A failed settings read is
+/// returned rather than drawn as "not configured".
+pub(crate) async fn connection_status(
+    ctx: &dyn Context,
+) -> Result<StripeConnectionStatus, WaferError> {
+    let secret = config::get_default(ctx, STRIPE_SECRET_KEY, "").await?;
     let (publishable, publishable_configured, webhook_configured, api_version) =
-        connection_base(ctx).await;
-    if !stripe_secret_operations_allowed(ctx).await {
-        return connection_error(
+        connection_base(ctx).await?;
+    if !stripe_secret_operations_allowed(ctx).await? {
+        return Ok(connection_error(
             !secret.trim().is_empty(),
             false,
             publishable_configured,
             false,
             api_version,
             "Stripe secret-key operations are disabled in the browser runtime; use a trusted remote commerce API or pre-created Payment Links",
-        );
+        ));
     }
     if secret.trim().is_empty() {
-        return connection_error(
+        return Ok(connection_error(
             false,
             false,
             publishable_configured,
             webhook_configured,
             api_version,
             "Stripe secret key is not configured",
-        );
+        ));
     }
     let Some(livemode) = secret_livemode(&secret) else {
-        return connection_error(
+        return Ok(connection_error(
             true,
             false,
             publishable_configured,
             webhook_configured,
             api_version,
             "Stripe secret key format is invalid",
-        );
+        ));
     };
     if publishable_configured && publishable_livemode(&publishable) != Some(livemode) {
-        return connection_error(
+        return Ok(connection_error(
             true,
             livemode,
             publishable_configured,
             webhook_configured,
             api_version,
             "Stripe secret and publishable keys are from different modes",
-        );
+        ));
     }
     let client = match StripeClient::load(ctx).await {
         Ok(client) => client,
         Err(error) => {
-            return connection_error(
+            return Ok(connection_error(
                 true,
                 livemode,
                 publishable_configured,
                 webhook_configured,
                 api_version,
                 error.message,
-            )
+            ))
         }
     };
     let account = match client
@@ -193,28 +197,28 @@ pub(crate) async fn connection_status(ctx: &dyn Context) -> StripeConnectionStat
     {
         Ok(account) => account,
         Err(error) => {
-            return connection_error(
+            return Ok(connection_error(
                 true,
                 livemode,
                 publishable_configured,
                 webhook_configured,
                 api_version,
                 error.message,
-            )
+            ))
         }
     };
     let account_id = string_at(&account, "/id");
     if !account_id.starts_with("acct_") {
-        return connection_error(
+        return Ok(connection_error(
             true,
             livemode,
             publishable_configured,
             webhook_configured,
             api_version,
             "Stripe credential check returned an incomplete account",
-        );
+        ));
     }
-    StripeConnectionStatus {
+    Ok(StripeConnectionStatus {
         state: if livemode {
             StripeConnectionState::ConnectedLive
         } else {
@@ -234,12 +238,12 @@ pub(crate) async fn connection_status(ctx: &dyn Context) -> StripeConnectionStat
         webhook_secret_configured: webhook_configured,
         api_version,
         error: String::new(),
-    }
+    })
 }
 
 async fn validate_redirect(ctx: &dyn Context, url: &str) -> Result<(), WaferError> {
-    let frontend = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
-    let allowed = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await;
+    let frontend = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await?;
+    let allowed = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await?;
     if url.trim().is_empty() || !super::stripe::is_allowed_checkout_url(url, &frontend, &allowed) {
         return Err(WaferError::new(
             ErrorCode::InvalidArgument,

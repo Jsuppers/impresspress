@@ -379,7 +379,8 @@ async fn assemble(ctx: &dyn Context, shared: &DevShared) -> Result<Assembled, Re
             source_verdicts: &source_verdicts,
         },
     )
-    .await;
+    .await
+    .map_err(Refusal::Internal)?;
 
     let mut entries = Vec::with_capacity(shell.len() + seed_entries.len() + 3);
     entries.push(Entry {
@@ -537,7 +538,7 @@ fn short_id(generation_id: &str) -> String {
 /// exact thing `two_exports_of_the_same_generation_are_identical` exists to
 /// deny. The generation's own creation time is also the more useful fact: it
 /// is when the site being exported came to be.
-async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
+async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> Result<String, WaferError> {
     use wafer_core::clients::config;
 
     // Through the config client, not `ctx.config_get`: that snapshot is
@@ -546,7 +547,7 @@ async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
     // the name was. The literal is spelled as every other reader spells it
     // (`ui::SiteConfig`, `pipeline`): `config_vars` declares it in
     // `shared_config_vars()` without exporting a constant for the key.
-    let title = config::get_default(ctx, APP_NAME_KEY, "").await;
+    let title = config::get_default(ctx, APP_NAME_KEY, "").await?;
     let title = if title.is_empty() {
         "Your ImpressPress site".to_string()
     } else {
@@ -557,7 +558,7 @@ async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
         crate::blocks::auth::config::BOOTSTRAP_ADMIN_EMAIL_KEY,
         "",
     )
-    .await;
+    .await?;
     let admin_email = if admin_email.is_empty() {
         "the account you signed in with".to_string()
     } else {
@@ -568,7 +569,7 @@ async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
     // number or a short string this function produced, and
     // `export_zip_contains_shell_seed_sources_and_data_with_dev_off` asserts
     // no `{{` survives.
-    README_TEMPLATE
+    Ok(README_TEMPLATE
         .replace("{{TITLE}}", &title)
         .replace("{{DATE}}", facts.created_at)
         .replace("{{GENERATION_ID}}", facts.generation_id)
@@ -580,7 +581,7 @@ async fn render_readme(ctx: &dyn Context, facts: &ReadmeFacts<'_>) -> String {
         .replace(
             "{{BLOCK_SOURCES}}",
             &render_source_verdicts(facts.source_verdicts),
-        )
+        ))
 }
 
 /// Whether the sources an export ships for one block are the ones its

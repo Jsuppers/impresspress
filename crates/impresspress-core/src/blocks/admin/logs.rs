@@ -323,6 +323,18 @@ mod tests {
             Vec::new(),
         )
         .expect("register the database block");
+        // The admin block `requires` both, and seal refuses a block whose
+        // requires names an unregistered one; every target registers them.
+        wafer_core::service_blocks::config::register_with(
+            &mut wafer,
+            std::sync::Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+        )
+        .expect("register the config block");
+        wafer_core::service_blocks::crypto::register_with(
+            &mut wafer,
+            std::sync::Arc::new(crate::test_support::real_crypto_service()),
+        )
+        .expect("register the crypto block");
         wafer
             .register_block(
                 crate::blocks::admin::ADMIN_BLOCK_ID,

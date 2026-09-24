@@ -17,7 +17,10 @@ use wafer_run::{
     LifecycleType, OutputStream, WaferError,
 };
 
-use super::rate_limit::{RateLimit, UserRateLimiter};
+use super::{
+    crud,
+    rate_limit::{RateLimit, UserRateLimiter},
+};
 use crate::{
     config_vars::{FRONTEND_URL_KEY, PRIMARY_COLOR_KEY},
     http::{err_bad_request, err_not_found, ok_json},
@@ -194,8 +197,7 @@ crate::impresspress_feature_block! {
         // config sanity warning (no migrations, so this does NOT go through
         // `migration_helper::lifecycle_init`).
         if event.event_type == LifecycleType::Init {
-            let patterns =
-                config::get_default(ctx, ALLOWED_RECIPIENT_PATTERNS, "").await;
+            let patterns = allowed_recipient_patterns(ctx).await?;
             if patterns.trim().is_empty() {
                 tracing::warn!(
                     "IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS is unset — email block \
@@ -230,7 +232,10 @@ async fn handle_send(
     ctx: &dyn Context,
     input: InputStream,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let req: SendReq = match serde_json::from_slice(&raw) {
         Ok(r) => r,
         Err(e) => return err_bad_request(&format!("invalid email.send: {e}")),
@@ -239,15 +244,17 @@ async fn handle_send(
     if let Err(e) = validate_recipient(&req.to) {
         return err_bad_request(&e);
     }
-    if let Err(e) = check_recipient_allowed(ctx, &req.to).await {
-        return OutputStream::error(e);
+    if let Err(response) = check_recipient_allowed(ctx, &req.to).await {
+        return response;
     }
     if let Err(e) = check_send_rate_limits(limiter, ctx, &req.to).await {
         return e;
     }
 
-    let sent = send_email(ctx, &req.to, &req.subject, &req.html, req.text.as_deref()).await;
-    ok_json(&SendResp { sent })
+    match send_email(ctx, &req.to, &req.subject, &req.html, req.text.as_deref()).await {
+        Ok(sent) => ok_json(&SendResp { sent }),
+        Err(e) => crud::db_error_internal(e, "Could not read the mail settings"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +274,10 @@ async fn handle_send_template(
     ctx: &dyn Context,
     input: InputStream,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let req: TemplateReq = match serde_json::from_slice(&raw) {
         Ok(r) => r,
         Err(e) => return err_bad_request(&format!("invalid email.send_template: {e}")),
@@ -276,21 +286,30 @@ async fn handle_send_template(
     if let Err(e) = validate_recipient(&req.to) {
         return err_bad_request(&e);
     }
-    if let Err(e) = check_recipient_allowed(ctx, &req.to).await {
-        return OutputStream::error(e);
+    if let Err(response) = check_recipient_allowed(ctx, &req.to).await {
+        return response;
     }
     if let Err(e) = check_send_rate_limits(limiter, ctx, &req.to).await {
         return e;
     }
 
-    let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
-    let app_name = app_name(ctx).await;
+    let base_url = match config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await {
+        Ok(base_url) => base_url,
+        Err(e) => return crud::db_error_internal(e, "Could not read the frontend URL"),
+    };
+    let app_name = match app_name(ctx).await {
+        Ok(app_name) => app_name,
+        Err(e) => return crud::db_error_internal(e, "Could not read the app name"),
+    };
     // Brand accent for CTA buttons and links. Same contract as the admin
     // chrome: a configured PRIMARY_COLOR wins, blank means the built-in
     // brand accent. (The old hardcoded `#0ea5e9` sky-blue predated the
     // rebrand and clashed with every other surface.)
     let accent = {
-        let c = config::get_default(ctx, PRIMARY_COLOR_KEY, "").await;
+        let c = match config::get_default(ctx, PRIMARY_COLOR_KEY, "").await {
+            Ok(c) => c,
+            Err(e) => return crud::db_error_internal(e, "Could not read the brand colour"),
+        };
         if c.trim().is_empty() {
             crate::ui::assets::BRAND_ACCENT_HEX.to_string()
         } else {
@@ -338,24 +357,27 @@ async fn handle_send_template(
         }
     };
 
-    let sent = send_email(ctx, &req.to, &subject, &html, Some(&text)).await;
-    ok_json(&SendResp { sent })
+    match send_email(ctx, &req.to, &subject, &html, Some(&text)).await {
+        Ok(sent) => ok_json(&SendResp { sent }),
+        Err(e) => crud::db_error_internal(e, "Could not read the mail settings"),
+    }
 }
 
 /// The configured display name, or the declared default when the row is
-/// missing or blank — the same answer the admin settings page shows.
-async fn app_name(ctx: &dyn Context) -> String {
+/// missing or blank — the same answer the admin settings page shows. A
+/// failed read is returned.
+async fn app_name(ctx: &dyn Context) -> Result<String, WaferError> {
     let name = config::get_default(
         ctx,
         crate::config_vars::APP_NAME_KEY,
         crate::config_vars::DEFAULT_APP_NAME,
     )
-    .await;
-    if name.trim().is_empty() {
+    .await?;
+    Ok(if name.trim().is_empty() {
         crate::config_vars::DEFAULT_APP_NAME.to_string()
     } else {
         name
-    }
+    })
 }
 
 /// Shared HTML wrapper for the templated emails: the outer card `div`
@@ -402,9 +424,9 @@ async fn send_email(
     subject: &str,
     html: &str,
     text: Option<&str>,
-) -> bool {
-    let api_key = config::get_default(ctx, MAILGUN_API_KEY, "").await;
-    let domain = config::get_default(ctx, MAILGUN_DOMAIN, "").await;
+) -> Result<bool, WaferError> {
+    let api_key = config::get_default(ctx, MAILGUN_API_KEY, "").await?;
+    let domain = config::get_default(ctx, MAILGUN_DOMAIN, "").await?;
     if api_key.is_empty() || domain.is_empty() {
         // Email not configured — don't fail the caller, but make the
         // resulting {"sent": false} diagnosable from the logs.
@@ -413,13 +435,13 @@ async fn send_email(
             "email not sent: Mailgun is not configured (IMPRESSPRESS__EMAIL__MAILGUN_API_KEY \
              and/or IMPRESSPRESS__EMAIL__MAILGUN_DOMAIN unset)"
         );
-        return false;
+        return Ok(false);
     }
 
     let from = {
-        let f = config::get_default(ctx, MAILGUN_FROM, "").await;
+        let f = config::get_default(ctx, MAILGUN_FROM, "").await?;
         if f.is_empty() {
-            default_from(&app_name(ctx).await, &domain)
+            default_from(&app_name(ctx).await?, &domain)
         } else {
             f
         }
@@ -432,7 +454,7 @@ async fn send_email(
         format!("subject={}", urlencode(subject)),
         format!("html={}", urlencode(html)),
     ];
-    let reply_to = config::get_default(ctx, MAILGUN_REPLY_TO, "").await;
+    let reply_to = config::get_default(ctx, MAILGUN_REPLY_TO, "").await?;
     if !reply_to.is_empty() {
         parts.push(format!("h:Reply-To={}", urlencode(&reply_to)));
     }
@@ -448,7 +470,7 @@ async fn send_email(
     // Call network block via the typed client. The buffered helper consumes
     // the two-frame response (header + body) and returns a typed
     // `NetworkResponse` whose `status_code` we use to decide success.
-    let configured = config::get_default(ctx, MAILGUN_BASE_URL, "").await;
+    let configured = config::get_default(ctx, MAILGUN_BASE_URL, "").await?;
     let base = resolve_base_url(&configured);
     let url = format!("{base}/v3/{domain}/messages");
     let mut headers = HashMap::new();
@@ -468,11 +490,11 @@ async fn send_email(
                     "email not sent: Mailgun returned non-2xx status"
                 );
             }
-            sent
+            Ok(sent)
         }
         Err(e) => {
             tracing::warn!(error = %e, to = %to, "email not sent: Mailgun request failed");
-            false
+            Ok(false)
         }
     }
 }
@@ -619,11 +641,24 @@ fn glob_match_inner(pat: &[u8], val: &[u8]) -> bool {
     glob_match_inner(&pat[1..], &val[1..])
 }
 
-/// Check the recipient against `IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS`.
-/// Empty/unset = allow (startup warning already emitted in lifecycle). A
-/// recipient no pattern admits is the caller's `InvalidArgument`, a 400.
-async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), WaferError> {
-    let patterns = config::get_default(ctx, ALLOWED_RECIPIENT_PATTERNS, "").await;
+/// `IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS`, empty when unset.
+async fn allowed_recipient_patterns(ctx: &dyn Context) -> Result<String, WaferError> {
+    config::get_default(ctx, ALLOWED_RECIPIENT_PATTERNS, "").await
+}
+
+/// Check the recipient against `IMPRESSPRESS__EMAIL__ALLOWED_RECIPIENT_PATTERNS`,
+/// answering the response when it is refused or the patterns cannot be read.
+async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), OutputStream> {
+    let patterns = allowed_recipient_patterns(ctx)
+        .await
+        .map_err(|e| crud::db_error_internal(e, "Could not read the allowed recipients"))?;
+    recipient_allowed(&patterns, to).map_err(OutputStream::error)
+}
+
+/// Whether `patterns` admit `to`. Empty = allow (startup warning already
+/// emitted in lifecycle). A recipient no pattern admits is the caller's
+/// `InvalidArgument`, a 400.
+fn recipient_allowed(patterns: &str, to: &str) -> Result<(), WaferError> {
     let patterns = patterns.trim();
     if patterns.is_empty() {
         return Ok(());
@@ -644,16 +679,16 @@ async fn check_recipient_allowed(ctx: &dyn Context, to: &str) -> Result<(), Wafe
 }
 
 /// Read a numeric config value, falling back to `default` when unset or
-/// unparseable.
-async fn numeric_config<T>(ctx: &dyn Context, key: &str, default: T) -> T
+/// unparseable. A failed read is returned.
+async fn numeric_config<T>(ctx: &dyn Context, key: &str, default: T) -> Result<T, WaferError>
 where
     T: std::str::FromStr + std::fmt::Display + Copy,
 {
-    config::get_default(ctx, key, &default.to_string())
-        .await
+    Ok(config::get_default(ctx, key, &default.to_string())
+        .await?
         .trim()
         .parse::<T>()
-        .unwrap_or(default)
+        .unwrap_or(default))
 }
 
 /// The rate-limit bucket identity for a recipient: the address trimmed,
@@ -701,8 +736,11 @@ async fn check_send_rate_limits(
     ctx: &dyn Context,
     to: &str,
 ) -> Result<(), OutputStream> {
+    let unreadable = |e| crud::db_error_internal(e, "Could not read the mail rate limits");
     let window = Duration::from_secs(
-        numeric_config(ctx, RATE_LIMIT_WINDOW_SECS, DEFAULT_RATE_LIMIT_WINDOW_SECS).await,
+        numeric_config(ctx, RATE_LIMIT_WINDOW_SECS, DEFAULT_RATE_LIMIT_WINDOW_SECS)
+            .await
+            .map_err(unreadable)?,
     );
 
     let per_recipient_max = numeric_config(
@@ -710,7 +748,8 @@ async fn check_send_rate_limits(
         RATE_LIMIT_PER_RECIPIENT_MAX,
         DEFAULT_RATE_LIMIT_PER_RECIPIENT_MAX,
     )
-    .await;
+    .await
+    .map_err(unreadable)?;
     if per_recipient_max > 0 {
         let key = UserRateLimiter::key(&recipient_bucket_key(to), RECIPIENT_LIMIT_CATEGORY);
         let limit = RateLimit {
@@ -731,7 +770,9 @@ async fn check_send_rate_limits(
         }
     }
 
-    let caller_max = numeric_config(ctx, RATE_LIMIT_MAX, DEFAULT_RATE_LIMIT_MAX).await;
+    let caller_max = numeric_config(ctx, RATE_LIMIT_MAX, DEFAULT_RATE_LIMIT_MAX)
+        .await
+        .map_err(unreadable)?;
     if caller_max > 0 {
         let caller = ctx.caller_id().unwrap_or("unknown");
         let key = UserRateLimiter::key(caller, CALLER_LIMIT_CATEGORY);
@@ -839,7 +880,10 @@ mod tests {
             input: InputStream,
         ) -> OutputStream {
             if block_name == "wafer-run/config" && msg.kind == "config.get" {
-                let data = input.collect_to_bytes().await;
+                let data = match input.collect_to_bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return OutputStream::error(e),
+                };
                 let req: cfg_wire::GetRequest = match codec::decode(&data) {
                     Ok(r) => r,
                     Err(e) => {
@@ -870,7 +914,7 @@ mod tests {
                 }
             }
             OutputStream::error(wafer_run::WaferError::new(
-                ErrorCode::NotFound,
+                ErrorCode::Unimplemented,
                 format!("unhandled call: {block_name}/{}", msg.kind),
             ))
         }
@@ -1273,17 +1317,16 @@ mod tests {
     async fn allow_list_empty_allows_all() {
         let ctx = ConfigCtx::new();
         // No pattern set → allow.
-        assert!(check_recipient_allowed(&ctx, "anyone@anywhere.io")
-            .await
-            .is_ok());
+        let patterns = allowed_recipient_patterns(&ctx).await.expect("read");
+        assert!(recipient_allowed(&patterns, "anyone@anywhere.io").is_ok());
     }
 
     #[tokio::test]
     async fn allow_list_blocks_unmatched_recipient() {
         let ctx = ConfigCtx::new();
         ctx.set(ALLOWED_RECIPIENT_PATTERNS, "*@example.com, admin@*");
-        let refusal = check_recipient_allowed(&ctx, "intruder@other.io")
-            .await
+        let patterns = allowed_recipient_patterns(&ctx).await.expect("read");
+        let refusal = recipient_allowed(&patterns, "intruder@other.io")
             .expect_err("an unmatched recipient is refused");
         assert_eq!(
             refusal.code,
@@ -1296,12 +1339,9 @@ mod tests {
     async fn allow_list_permits_matched_recipient() {
         let ctx = ConfigCtx::new();
         ctx.set(ALLOWED_RECIPIENT_PATTERNS, "*@example.com, admin@*");
-        assert!(check_recipient_allowed(&ctx, "alice@example.com")
-            .await
-            .is_ok());
-        assert!(check_recipient_allowed(&ctx, "admin@anywhere.io")
-            .await
-            .is_ok());
+        let patterns = allowed_recipient_patterns(&ctx).await.expect("read");
+        assert!(recipient_allowed(&patterns, "alice@example.com").is_ok());
+        assert!(recipient_allowed(&patterns, "admin@anywhere.io").is_ok());
     }
 
     // ---- rate limits, driven through the real `email.send_template` op ----

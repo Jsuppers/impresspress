@@ -222,7 +222,9 @@ async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthEr
         .config_get(super::JWT_SECRET_KEY)
         .unwrap_or("")
         .to_string();
-    let expected_iss = super::helpers::expected_issuer(ctx).await;
+    let expected_iss = super::helpers::expected_issuer(ctx)
+        .await
+        .map_err(|e| backend_error(e, "auth: read the token issuer"))?;
     // A check that could not be completed is already classified for the
     // client (`credential_check_failed`), so it is passed on as it stands
     // rather than through `backend_error`, which would classify it twice.
@@ -413,7 +415,9 @@ impl AuthService for AuthServiceImpl {
         )
         .await
         .map_err(|e| AuthError::Internal(format!("auth migrations: {e}")))?;
-        let cfg = super::config::AuthConfig::from_ctx(ctx).await;
+        let cfg = super::config::AuthConfig::from_ctx(ctx)
+            .await
+            .map_err(|e| backend_error(e, "auth init: config"))?;
         super::bootstrap::run(ctx, &cfg)
             .await
             .map_err(|e| backend_error(e, "auth init: bootstrap admin"))?;

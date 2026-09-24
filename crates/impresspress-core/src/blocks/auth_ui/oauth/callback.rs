@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use wafer_core::clients::{config, network};
-use wafer_run::{context::Context, Message, MetaEntry, OutputStream, WaferError};
+use wafer_run::{context::Context, Message, OutputStream, WaferError};
 
 use crate::{
     blocks::{
@@ -16,11 +16,11 @@ use crate::{
             },
             repo::{oauth_pkce, provider_links, users},
         },
-        auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        auth_ui::redirect::{configured_admin_default, default_post_login_redirect},
         crud,
         errors::{impresspress_error_code_to_wafer, ErrorCode},
     },
-    config_vars::{ENABLE_OAUTH_KEY, FRONTEND_URL_KEY, POST_LOGIN_REDIRECT_KEY},
+    config_vars::{ENABLE_OAUTH_KEY, FRONTEND_URL_KEY},
     http::{err_bad_request, err_forbidden, err_internal, err_internal_no_cause, ResponseBuilder},
 };
 
@@ -37,10 +37,8 @@ use crate::{
 fn refuse(code: ErrorCode, message: &str, clear_binding: &str) -> OutputStream {
     let mut err = WaferError::new(impresspress_error_code_to_wafer(code), message.to_string())
         .with_detail_code(code.as_str());
-    err.meta.push(MetaEntry {
-        key: format!("{}0", wafer_block::meta::META_RESP_COOKIE_PREFIX),
-        value: clear_binding.to_string(),
-    });
+    err.meta
+        .push(wafer_block::response::cookie_meta(clear_binding));
     OutputStream::error(err)
 }
 
@@ -64,7 +62,10 @@ pub async fn handle(
     msg: &Message,
 ) -> OutputStream {
     // Check ENABLE_OAUTH flag
-    let enable_oauth = crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await;
+    let enable_oauth = match crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await {
+        Ok(enabled) => enabled,
+        Err(e) => return crud::db_error_internal(e, "Could not read the OAuth switch"),
+    };
     if !enable_oauth {
         return err_forbidden("OAuth login is not enabled");
     }
@@ -81,7 +82,11 @@ pub async fn handle(
     // forged callback cannot burn someone else's single-use state either —
     // and without clearing any cookie, since the binding it failed to present
     // belongs to a flow that may still be in flight in another tab.
-    if !super::state_binding::matches(ctx, msg, state).await {
+    let bound = match super::state_binding::matches(ctx, msg, state).await {
+        Ok(bound) => bound,
+        Err(e) => return crud::db_error_internal(e, "Could not check the OAuth state binding"),
+    };
+    if !bound {
         return err_bad_request("OAuth state does not belong to this browser");
     }
 
@@ -92,7 +97,10 @@ pub async fn handle(
     // for a database call WRAP refused or a quota stopped: the flow is
     // unfinished rather than concluded, and the cookie expires on its own
     // with the state it names.
-    let clear_binding = super::state_binding::clear(ctx, state).await;
+    let clear_binding = match super::state_binding::clear(ctx, state).await {
+        Ok(clear_binding) => clear_binding,
+        Err(e) => return crud::db_error_internal(e, "Could not build the OAuth binding cookie"),
+    };
 
     // Resolved before the state is taken: a misconfigured session lifetime is
     // the deployment's failure, so it answers a 500 and leaves the single-use
@@ -136,6 +144,10 @@ pub async fn handle(
         "",
     )
     .await;
+    let client_id = match client_id {
+        Ok(client_id) => client_id,
+        Err(e) => return crud::db_error_internal(e, "Could not read the OAuth client id"),
+    };
     let client_secret = config::get_default(
         ctx,
         &format!(
@@ -145,6 +157,10 @@ pub async fn handle(
         "",
     )
     .await;
+    let client_secret = match client_secret {
+        Ok(client_secret) => client_secret,
+        Err(e) => return crud::db_error_internal(e, "Could not read the OAuth client secret"),
+    };
 
     if client_id.is_empty() || client_secret.is_empty() {
         return err_internal_no_cause("OAuth provider not fully configured");
@@ -232,7 +248,11 @@ pub async fn handle(
     };
 
     // Redirect to frontend — token is set via HttpOnly cookie only (not URL)
-    let frontend_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
+    let frontend_url =
+        match config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await {
+            Ok(frontend_url) => frontend_url,
+            Err(e) => return crud::db_error_internal(e, "Could not read the frontend URL"),
+        };
     // [SEC-036] Validate FRONTEND_URL before plugging it into a Location
     // header — a misconfigured (or attacker-controlled) value here would
     // turn every OAuth callback into an open redirect.
@@ -243,11 +263,9 @@ pub async fn handle(
         );
         return err_internal_no_cause("Frontend URL is not configured correctly");
     }
-    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
-    let admin_default = if is_safe_local_redirect(&post_login_raw) {
-        post_login_raw
-    } else {
-        "/b/admin/".to_string()
+    let admin_default = match configured_admin_default(ctx).await {
+        Ok(admin_default) => admin_default,
+        Err(e) => return crud::db_error_internal(e, "Could not read the post-login redirect"),
     };
     // Role-aware default (#1 onboarding bug fix): a non-admin OAuth login
     // must never default into the admin-only destination above — see
@@ -579,7 +597,10 @@ async fn resolve_user(
                 // Brand-new user — enforce signup gates. Shared with the JSON
                 // signup handler so the ALLOW_SIGNUP / ALLOWED_EMAIL_DOMAINS /
                 // bootstrap-admin rules can't drift between the two flows.
-                if !signup_allowed(ctx).await {
+                let signup_allowed = signup_allowed(ctx)
+                    .await
+                    .map_err(|e| crud::db_error_internal(e, "Could not read the signup switch"))?;
+                if !signup_allowed {
                     return Err(refuse(
                         ErrorCode::Forbidden,
                         "Signups are currently disabled",
@@ -587,7 +608,10 @@ async fn resolve_user(
                     ));
                 }
 
-                if !email_domain_allowed(ctx, &info.email).await {
+                let domain_allowed = email_domain_allowed(ctx, &info.email).await.map_err(|e| {
+                    crud::db_error_internal(e, "Could not read the allowed email domains")
+                })?;
+                if !domain_allowed {
                     return Err(refuse(
                         ErrorCode::Forbidden,
                         "Signups from this email domain are not allowed",
@@ -601,11 +625,19 @@ async fn resolve_user(
                 // type the admin's address at a provider that never checks
                 // one" — an admin account for the asking.
                 let role = if info.email_verified {
-                    initial_role_for(ctx, &info.email).await
+                    initial_role_for(ctx, &info.email).await.map_err(|e| {
+                        crud::db_error_internal(e, "Could not read the bootstrap admin email")
+                    })?
                 } else {
                     "user"
                 };
 
+                let require_verification =
+                    crate::config_vars::get_bool(ctx, REQUIRE_VERIFICATION_KEY, false)
+                        .await
+                        .map_err(|e| {
+                            crud::db_error_internal(e, "Could not read the verification policy")
+                        })?;
                 let display_name = if info.name.is_empty() {
                     info.email.clone()
                 } else {
@@ -627,9 +659,7 @@ async fn resolve_user(
                     // that anyone proved anything — that is recorded
                     // separately, below, and only when a provider asserted
                     // it.
-                    email_verified: info.email_verified
-                        || !crate::config_vars::get_bool(ctx, REQUIRE_VERIFICATION_KEY, false)
-                            .await,
+                    email_verified: info.email_verified || !require_verification,
                     verification_token_hash: None,
                 };
                 // The initial role is the inline `users.role` that
@@ -752,7 +782,15 @@ async fn resolve_user(
     // not a lenient sign-in; it is a sign-in that logs the user back out
     // minutes later, every time, with no way out of the loop.
     let require_verification =
-        crate::config_vars::get_bool(ctx, REQUIRE_VERIFICATION_KEY, false).await;
+        match crate::config_vars::get_bool(ctx, REQUIRE_VERIFICATION_KEY, false).await {
+            Ok(required) => required,
+            Err(e) => {
+                return Err(crud::db_error_internal(
+                    e,
+                    "Could not read the verification policy",
+                ))
+            }
+        };
     if require_verification && !verified_now {
         // Refusing is not enough on its own. This account may have been
         // created moments ago by a provider that asserts nothing, so it has
@@ -1106,7 +1144,10 @@ mod security_regression_tests {
             _msg: Message,
             input: InputStream,
         ) -> wafer_run::OutputStream {
-            let raw = input.collect_to_bytes().await;
+            let raw = match input.collect_to_bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => return wafer_run::OutputStream::error(e),
+            };
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
                 self.log.0.lock().expect("mail log").push(SentMail {
                     template: v["template"].as_str().unwrap_or_default().to_string(),
@@ -1319,8 +1360,9 @@ mod security_regression_tests {
     /// provider: `code` + `state` query params, plus the binding cookie the
     /// start endpoint set for `state_id`.
     async fn callback_msg(ctx: &TestContext) -> Message {
-        let set_cookie =
-            crate::blocks::auth_ui::oauth::state_binding::issue(ctx, STATE_ID, 600).await;
+        let set_cookie = crate::blocks::auth_ui::oauth::state_binding::issue(ctx, STATE_ID, 600)
+            .await
+            .expect("binding cookie");
         let mut msg = callback_msg_unbound();
         msg.set_meta("http.header.cookie", cookie_header_for(&set_cookie));
         msg
@@ -1531,7 +1573,8 @@ mod security_regression_tests {
 
         let foreign =
             crate::blocks::auth_ui::oauth::state_binding::issue(&ctx, "some-other-state", 600)
-                .await;
+                .await
+                .expect("binding cookie");
         let mut msg = callback_msg_unbound();
         msg.set_meta("http.header.cookie", cookie_header_for(&foreign));
 
@@ -1542,6 +1585,32 @@ mod security_regression_tests {
             )
             .await,
             "a binding cookie minted for another state must not redeem this one"
+        );
+    }
+
+    /// The refusal's cookie is keyed by the cookie it sets
+    /// (`resp.set_cookie.{name}`), the key `wafer-run`'s flow merge identifies
+    /// cookies by. A positional `resp.set_cookie.0` collides with any other
+    /// producer's first cookie when metas merge, and one of the two is lost.
+    #[tokio::test]
+    async fn a_refusal_keys_its_cookie_by_name() {
+        let clear = "__Host-oauth_state_abc=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0; Secure";
+        let out = super::refuse(crate::blocks::errors::ErrorCode::Forbidden, "no", clear);
+        let err = match out.collect_buffered().await {
+            Err(wafer_run::streams::output::TerminalNotResponse::Error(err)) => err,
+            other => panic!("a refusal is an error terminal: {other:?}"),
+        };
+        let cookie_keys: Vec<&str> = err
+            .meta
+            .iter()
+            .map(|e| e.key.as_str())
+            .filter(|key| key.starts_with("resp.set_cookie."))
+            .collect();
+        assert_eq!(
+            cookie_keys,
+            ["resp.set_cookie.__Host-oauth_state_abc;Path=/"],
+            "{:?}",
+            err.meta
         );
     }
 

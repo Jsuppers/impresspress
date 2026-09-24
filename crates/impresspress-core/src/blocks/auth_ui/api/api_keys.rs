@@ -101,7 +101,10 @@ pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream)
         );
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let parsed = match crate::util::parse_body_value(&raw) {
         Ok(value) => value,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

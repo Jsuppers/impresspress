@@ -613,9 +613,12 @@ struct BootContext {
 #[wafer_block::wafer_async_trait]
 impl Context for BootContext {
     async fn call_block(&self, block_name: &str, msg: Message, input: InputStream) -> OutputStream {
+        // The runtime's answer for nothing to dispatch to. `NotFound` is a
+        // service saying the thing a request names does not exist, which a
+        // client such as the config reader takes for "unset".
         let Some(block) = self.wafer.lookup_block(block_name).map(|(_, block)| block) else {
             return OutputStream::error(WaferError::new(
-                ErrorCode::NotFound,
+                ErrorCode::Unimplemented,
                 format!("block not found: {block_name}"),
             ));
         };

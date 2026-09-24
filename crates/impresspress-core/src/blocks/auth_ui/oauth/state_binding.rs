@@ -47,7 +47,7 @@
 //! Safari blocks outright and Firefox partitions, so the callback would never
 //! find the binding.
 
-use wafer_run::{context::Context, Message};
+use wafer_run::{context::Context, Message, WaferError};
 
 use crate::{blocks::auth::helpers::cookie_secure_attribute, util::sha256_hex};
 
@@ -82,26 +82,30 @@ fn cookie_name(hash: &str, secure_attribute: &str) -> String {
 /// `Set-Cookie` value binding `state_id` to this browser for `max_age_secs`,
 /// which the caller keeps equal to the PKCE state's own TTL so the two halves
 /// of a flow expire together.
-pub(super) async fn issue(ctx: &dyn Context, state_id: &str, max_age_secs: i64) -> String {
-    let secure = cookie_secure_attribute(ctx).await;
+pub(super) async fn issue(
+    ctx: &dyn Context,
+    state_id: &str,
+    max_age_secs: i64,
+) -> Result<String, WaferError> {
+    let secure = cookie_secure_attribute(ctx).await?;
     let hash = binding_hash(state_id);
-    format!(
+    Ok(format!(
         "{}={hash}; HttpOnly; Path=/; SameSite=Lax; Max-Age={max_age_secs}{secure}",
         cookie_name(&hash, secure),
-    )
+    ))
 }
 
 /// `Set-Cookie` value that removes this flow's binding cookie. Emitted on
 /// every answer a callback gives once it has matched a binding — the flow is
 /// over whether it succeeded or was refused, and a binding that outlives its
 /// single-use state is a cookie the browser keeps offering for nothing.
-pub(super) async fn clear(ctx: &dyn Context, state_id: &str) -> String {
-    let secure = cookie_secure_attribute(ctx).await;
+pub(super) async fn clear(ctx: &dyn Context, state_id: &str) -> Result<String, WaferError> {
+    let secure = cookie_secure_attribute(ctx).await?;
     let hash = binding_hash(state_id);
-    format!(
+    Ok(format!(
         "{}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{secure}",
         cookie_name(&hash, secure),
-    )
+    ))
 }
 
 /// Whether `msg` carries this flow's binding cookie.
@@ -113,11 +117,15 @@ pub(super) async fn clear(ctx: &dyn Context, state_id: &str) -> String {
 /// derived from `state_id`, which the caller supplied in the URL and the
 /// provider echoes in the clear; there is no secret here whose bytes a timing
 /// side channel could recover, only a value the attacker already has.
-pub(super) async fn matches(ctx: &dyn Context, msg: &Message, state_id: &str) -> bool {
-    let secure = cookie_secure_attribute(ctx).await;
+pub(super) async fn matches(
+    ctx: &dyn Context,
+    msg: &Message,
+    state_id: &str,
+) -> Result<bool, WaferError> {
+    let secure = cookie_secure_attribute(ctx).await?;
     let hash = binding_hash(state_id);
     let presented = msg.cookie(&cookie_name(&hash, secure));
-    !presented.is_empty() && presented == hash
+    Ok(!presented.is_empty() && presented == hash)
 }
 
 #[cfg(test)]
@@ -153,24 +161,46 @@ mod tests {
     async fn matches_only_the_hash_of_the_state_id() {
         let ctx = dev_ctx().await;
         let state = "abc123";
-        let issued = issue(&ctx, state, 600).await;
-        assert!(matches(&ctx, &msg_with_cookie(cookie_header_for(&issued)), state).await);
+        let issued = issue(&ctx, state, 600).await.expect("binding cookie");
+        assert!(
+            matches(&ctx, &msg_with_cookie(cookie_header_for(&issued)), state)
+                .await
+                .expect("binding read")
+        );
 
         // The raw state id is NOT the cookie value — a caller that echoed the
         // URL parameter into the cookie would not satisfy the binding.
         let name = cookie_name(&binding_hash(state), "");
-        assert!(!matches(&ctx, &msg_with_cookie(&format!("{name}={state}")), state).await);
+        assert!(
+            !matches(&ctx, &msg_with_cookie(&format!("{name}={state}")), state)
+                .await
+                .expect("binding read")
+        );
 
-        let other = issue(&ctx, "some-other-state", 600).await;
-        assert!(!matches(&ctx, &msg_with_cookie(cookie_header_for(&other)), state).await);
+        let other = issue(&ctx, "some-other-state", 600)
+            .await
+            .expect("binding cookie");
+        assert!(
+            !matches(&ctx, &msg_with_cookie(cookie_header_for(&other)), state)
+                .await
+                .expect("binding read")
+        );
     }
 
     #[tokio::test]
     async fn a_message_without_the_cookie_never_matches() {
         let ctx = dev_ctx().await;
-        assert!(!matches(&ctx, &Message::new("auth.oauth.callback"), "abc123").await);
+        assert!(
+            !matches(&ctx, &Message::new("auth.oauth.callback"), "abc123")
+                .await
+                .expect("binding read")
+        );
         let name = cookie_name(&binding_hash("abc123"), "");
-        assert!(!matches(&ctx, &msg_with_cookie(&format!("{name}=")), "abc123").await);
+        assert!(
+            !matches(&ctx, &msg_with_cookie(&format!("{name}=")), "abc123")
+                .await
+                .expect("binding read")
+        );
     }
 
     /// Two flows in flight at once — a second tab, or a change of provider —
@@ -178,8 +208,8 @@ mod tests {
     #[tokio::test]
     async fn two_pending_flows_do_not_evict_each_other() {
         let ctx = dev_ctx().await;
-        let first = issue(&ctx, "state-one", 600).await;
-        let second = issue(&ctx, "state-two", 600).await;
+        let first = issue(&ctx, "state-one", 600).await.expect("binding cookie");
+        let second = issue(&ctx, "state-two", 600).await.expect("binding cookie");
         assert_ne!(
             cookie_header_for(&first).split('=').next(),
             cookie_header_for(&second).split('=').next(),
@@ -193,14 +223,18 @@ mod tests {
             cookie_header_for(&first),
             cookie_header_for(&second)
         );
-        assert!(matches(&ctx, &msg_with_cookie(&both), "state-one").await);
-        assert!(matches(&ctx, &msg_with_cookie(&both), "state-two").await);
+        assert!(matches(&ctx, &msg_with_cookie(&both), "state-one")
+            .await
+            .expect("binding read"));
+        assert!(matches(&ctx, &msg_with_cookie(&both), "state-two")
+            .await
+            .expect("binding read"));
     }
 
     #[tokio::test]
     async fn issued_cookie_carries_the_hash_and_the_lax_http_only_attributes() {
         let ctx = dev_ctx().await;
-        let cookie = issue(&ctx, "abc123", 600).await;
+        let cookie = issue(&ctx, "abc123", 600).await.expect("binding cookie");
         assert!(
             cookie.contains(&format!("={}", binding_hash("abc123"))),
             "cookie must carry the hash, not the state id: {cookie}"
@@ -222,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn the_host_prefix_tracks_the_secure_attribute() {
         let prod = prod_ctx().await;
-        let secure_cookie = issue(&prod, "abc123", 600).await;
+        let secure_cookie = issue(&prod, "abc123", 600).await.expect("binding cookie");
         assert!(
             secure_cookie.starts_with("__Host-"),
             "a Secure cookie must carry the __Host- prefix: {secure_cookie}"
@@ -234,12 +268,13 @@ mod tests {
                 &msg_with_cookie(cookie_header_for(&secure_cookie)),
                 "abc123"
             )
-            .await,
+            .await
+            .expect("binding read"),
             "the callback must look for the same name the start endpoint set"
         );
 
         let dev = dev_ctx().await;
-        let dev_cookie = issue(&dev, "abc123", 600).await;
+        let dev_cookie = issue(&dev, "abc123", 600).await.expect("binding cookie");
         assert!(
             !dev_cookie.contains("__Host-"),
             "a non-Secure cookie must not claim __Host-, browsers drop it: {dev_cookie}"
@@ -250,8 +285,8 @@ mod tests {
     #[tokio::test]
     async fn clear_expires_the_cookie_the_flow_was_issued() {
         let ctx = dev_ctx().await;
-        let issued = issue(&ctx, "abc123", 600).await;
-        let cleared = clear(&ctx, "abc123").await;
+        let issued = issue(&ctx, "abc123", 600).await.expect("binding cookie");
+        let cleared = clear(&ctx, "abc123").await.expect("binding cookie");
         let issued_name = cookie_header_for(&issued).split('=').next().unwrap();
         assert!(
             cleared.starts_with(&format!("{issued_name}=;")),

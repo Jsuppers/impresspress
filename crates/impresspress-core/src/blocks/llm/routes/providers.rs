@@ -310,7 +310,10 @@ pub(in crate::blocks::llm) async fn create_provider(
         return refusal;
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: CreateProviderRequest = match parse_create_provider_body(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&e),
@@ -318,8 +321,8 @@ pub(in crate::blocks::llm) async fn create_provider(
 
     // Presence is enforced by the type; emptiness still has to be, because
     // `""` is a valid JSON string and neither a usable name nor a URL.
-    if body.name.is_empty() {
-        return err_bad_request("`name` is required");
+    if let Err(e) = crate::blocks::llm::schema::validate_provider_name(&body.name) {
+        return err_bad_request(&e);
     }
     if body.endpoint.is_empty() {
         return err_bad_request("`endpoint` is required");
@@ -377,11 +380,20 @@ pub(in crate::blocks::llm) async fn update_provider(
         Err(response) => return response,
     };
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: UpdateProviderRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
+    // Refused before any row is read, like the protocol.
+    if let Some(name) = body.name.as_deref().filter(|s| !s.is_empty()) {
+        if let Err(e) = crate::blocks::llm::schema::validate_provider_name(name) {
+            return err_bad_request(&e);
+        }
+    }
 
     // Load existing record so we can apply the patch on top of stored values.
     let existing = match db::get(ctx, PROVIDERS_TABLE, &id).await {
@@ -646,6 +658,42 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// A provider's name is its `backend_id` on the llm router, which the llm
+    /// handler refuses on every call when it holds a `/` (the model resource
+    /// `{backend}/{model}` would be ambiguous). So the name is refused where
+    /// the admin can still choose another, on create and on rename, before
+    /// the store is touched (`PanicCtx`).
+    #[tokio::test]
+    async fn a_provider_name_with_a_slash_is_refused() {
+        let block = stub_block();
+        let create = create_provider(
+            &block,
+            &PanicCtx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            InputStream::from_bytes(
+                br#"{"name":"openai/x","protocol":"open_ai","endpoint":"https://x.example"}"#
+                    .to_vec(),
+            ),
+        )
+        .await;
+        let rename = update_provider(
+            &block,
+            &PanicCtx,
+            &routed(admin_msg("update", "/b/llm/api/providers/row-1")),
+            InputStream::from_bytes(br#"{"name":"openai/x"}"#.to_vec()),
+        )
+        .await;
+        for (what, out) in [("create", create), ("rename", rename)] {
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::InvalidArgument, "{what}");
+                    assert!(e.message.contains('/'), "{what}: {}", e.message);
+                }
+                other => panic!("{what}: expected InvalidArgument, got {other:?}"),
+            }
         }
     }
 

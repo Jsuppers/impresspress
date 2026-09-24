@@ -419,6 +419,9 @@ impl From<&wafer_run::ResourceGrant> for PreparedResourceGrant {
                 wafer_run::ResourceType::Network => PreparedResourceType::Network,
                 wafer_run::ResourceType::Vector => PreparedResourceType::Vector,
                 wafer_run::ResourceType::Auth => PreparedResourceType::Auth,
+                wafer_run::ResourceType::Llm => PreparedResourceType::Llm,
+                wafer_run::ResourceType::Image => PreparedResourceType::Image,
+                wafer_run::ResourceType::Embedding => PreparedResourceType::Embedding,
             }),
         }
     }
@@ -442,6 +445,9 @@ impl From<PreparedResourceGrant> for wafer_run::ResourceGrant {
                 PreparedResourceType::Network => wafer_run::ResourceType::Network,
                 PreparedResourceType::Vector => wafer_run::ResourceType::Vector,
                 PreparedResourceType::Auth => wafer_run::ResourceType::Auth,
+                PreparedResourceType::Llm => wafer_run::ResourceType::Llm,
+                PreparedResourceType::Image => wafer_run::ResourceType::Image,
+                PreparedResourceType::Embedding => wafer_run::ResourceType::Embedding,
             }),
         }
     }

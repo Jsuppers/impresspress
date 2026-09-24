@@ -11,8 +11,18 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let config = site_config(ctx).await;
-    let allow_signup = crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await;
+    let config = match site_config(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
+    let allow_signup = match crate::config_vars::get_bool(ctx, ALLOW_SIGNUP_KEY, true).await {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "Could not read the signup switch")
+        }
+    };
     let raw_redirect = msg.get_meta("req.query.redirect").to_string();
     // Validate redirect — only allow relative paths (prevent open redirect)
     let redirect = if is_safe_local_redirect(&raw_redirect) {

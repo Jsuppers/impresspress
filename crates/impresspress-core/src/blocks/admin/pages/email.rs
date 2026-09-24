@@ -85,15 +85,13 @@ mod tests {
 
     #[tokio::test]
     async fn save_email_settings_reports_failure_when_config_set_fails() {
-        // No `wafer-run/config` block registered on this TestContext, so every
-        // `config::set` call fails with NotFound (mirrors
-        // `save_settings_surfaces_config_set_failure` in `ui/settings_form.rs`,
-        // the established way this test infra exercises a config::set
-        // failure). Before the SB-1 fix, the save loop swallowed the error via
-        // `let _ = config::set(...)` and returned success anyway; the shared
-        // `settings_form::save_settings` helper this now delegates to carries
-        // the same fix.
-        let ctx = TestContext::new().await;
+        // Every `config::set` fails (mirrors
+        // `save_settings_surfaces_config_set_failure` in `ui/settings_form.rs`).
+        // A save loop that swallowed the error via `let _ = config::set(...)`
+        // would return success anyway; the shared `settings_form::save_settings`
+        // helper this delegates to must not.
+        let mut ctx = TestContext::new().await;
+        ctx.refuse_config_writes();
         let msg = anon_msg("create", "/b/admin/email");
         let input = InputStream::from_bytes(serde_json::to_vec(&email_body()).unwrap());
 
@@ -129,7 +127,9 @@ mod tests {
         assert_eq!(body["message"], "Settings saved");
 
         // The value was actually persisted, not just reported as saved.
-        let stored = config::get_default(&ctx, MAILGUN_API_KEY, "").await;
+        let stored = config::get_default(&ctx, MAILGUN_API_KEY, "")
+            .await
+            .expect("config read");
         assert_eq!(stored, "key-123");
     }
 

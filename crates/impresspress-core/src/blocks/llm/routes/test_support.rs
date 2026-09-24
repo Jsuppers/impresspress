@@ -78,7 +78,8 @@ pub(in crate::blocks::llm) struct RecordedCall {
 }
 
 /// Context that records every `call_block` invocation (block name, message,
-/// drained input body) and answers with a canned OK JSON body. `clone_arc`
+/// drained input body) but config reads, and answers with a canned OK JSON
+/// body; a config read answers as for an unset key. `clone_arc`
 /// hands out a handle sharing the same call log, so a test can inspect calls
 /// made through the cloned Arc.
 ///
@@ -135,7 +136,19 @@ impl RecordingCtx {
 #[async_trait::async_trait]
 impl Context for RecordingCtx {
     async fn call_block(&self, block_name: &str, msg: Message, input: InputStream) -> OutputStream {
-        let body = input.collect_to_bytes().await;
+        // No config key is set here: the config block's answer for an unset
+        // key is `NotFound`, which a read takes as "use the default". Config
+        // reads are not recorded — they are not the hops these tests count.
+        if block_name == "wafer-run/config" {
+            return OutputStream::error(wafer_run::WaferError::new(
+                wafer_run::ErrorCode::NotFound,
+                "config key not set",
+            ));
+        }
+        let body = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let scripted = self.scripted(msg.path());
         self.calls().push(RecordedCall {
             block_name: block_name.to_string(),

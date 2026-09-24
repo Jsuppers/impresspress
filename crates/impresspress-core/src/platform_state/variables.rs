@@ -511,9 +511,12 @@ pub const HAS_PROCESS_ENV_CONFIG_KEY: &str = "__IMPRESSPRESS_HAS_PROCESS_ENV__";
 /// Whether this deployment boots from a process environment, and so whether
 /// handing a key back to one means anything here.
 ///
-/// See [`HAS_PROCESS_ENV_CONFIG_KEY`] for why absent means "no".
-pub async fn deployment_seeds_from_process_env(ctx: &dyn Context) -> bool {
-    wafer_core::clients::config::get_default(ctx, HAS_PROCESS_ENV_CONFIG_KEY, "").await == "1"
+/// See [`HAS_PROCESS_ENV_CONFIG_KEY`] for why absent means "no". A failed
+/// read is returned.
+pub async fn deployment_seeds_from_process_env(
+    ctx: &dyn Context,
+) -> Result<bool, wafer_run::WaferError> {
+    Ok(wafer_core::clients::config::get_default(ctx, HAS_PROCESS_ENV_CONFIG_KEY, "").await? == "1")
 }
 
 /// Why a stored row outranks the process environment, when it does.

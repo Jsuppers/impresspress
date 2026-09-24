@@ -59,10 +59,18 @@ async fn runtime_kind_is_adapter_injected_not_shared_config() {
     );
 
     let legacy = ctx_with(&[("WAFER_RUN_SHARED__RUNTIME__KIND", "browser")]).await;
-    assert!(crate::blocks::products::stripe_secret_operations_allowed(&legacy).await);
+    assert!(
+        crate::blocks::products::stripe_secret_operations_allowed(&legacy)
+            .await
+            .expect("config read")
+    );
 
     let browser = ctx_with(&[(crate::blocks::products::RUNTIME_KIND_CONFIG_KEY, "browser")]).await;
-    assert!(!crate::blocks::products::stripe_secret_operations_allowed(&browser).await);
+    assert!(
+        !crate::blocks::products::stripe_secret_operations_allowed(&browser)
+            .await
+            .expect("config read")
+    );
 }
 
 #[test]

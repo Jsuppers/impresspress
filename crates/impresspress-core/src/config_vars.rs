@@ -135,7 +135,8 @@ pub const CORS_ALLOWED_ORIGINS_KEY: &str = "WAFER_RUN_SHARED__CORS_ALLOWED_ORIGI
 /// Defaults to [`DEFAULT_CSP_DIRECTIVES`] so embedded Stripe Checkout works
 /// out of the box on first-party pages. Operators extend this to allow
 /// additional embeds; the baseline `default-src`/`script-src` guarantees
-/// survive regardless of what is set here.
+/// survive regardless of what is set here, and a value the merge would refuse
+/// in part is refused whole on write (`check_csp_directives`).
 pub const CSP_DIRECTIVES_KEY: &str = "WAFER_RUN_SHARED__CSP_DIRECTIVES";
 
 /// Default value for [`CSP_DIRECTIVES_KEY`] — the Stripe origins that
@@ -303,7 +304,10 @@ pub fn shared_config_vars() -> Vec<ConfigVar> {
             CSP_DIRECTIVES_KEY,
             "Extra Content-Security-Policy directives, merged over a hard \
              baseline that can only be widened. Defaults to the Stripe origins \
-             embedded Checkout requires; extend to allow additional embeds.",
+             embedded Checkout requires; extend to allow additional embeds. \
+             Visible ASCII only; script directives take exact https:// hosts \
+             (no wildcards), report-uri only a path on this site, and \
+             frame-ancestors is not settable here.",
             DEFAULT_CSP_DIRECTIVES,
         )
         .name("CSP Directives")
@@ -331,9 +335,41 @@ pub struct ConfigValueRule {
     pub check: fn(&str) -> Result<(), String>,
 }
 
-/// Every declared [`ConfigValueRule`], gathered from the blocks that own them.
+/// Every declared [`ConfigValueRule`], gathered from the blocks that own them
+/// and the shared ones this module declares.
 pub fn config_value_rules() -> Vec<ConfigValueRule> {
-    crate::blocks::auth::config::config_value_rules()
+    let mut rules = vec![ConfigValueRule {
+        key: CSP_DIRECTIVES_KEY,
+        check: check_csp_directives,
+    }];
+    rules.extend(crate::blocks::auth::config::config_value_rules());
+    rules
+}
+
+/// [`CSP_DIRECTIVES_KEY`]'s rule: a policy `wafer-run/security-headers`
+/// takes whole.
+///
+/// The block merges this value over its baseline at Init. A character no
+/// header can carry (a pasted smart quote, an NBSP) fails that Init, so the
+/// runtime does not boot; anything else the merge refuses — a host wildcard
+/// or an `http://` host in a script directive, an off-origin `report-uri`,
+/// `frame-ancestors`, a repeated directive — is left out of the header with
+/// only a log line to say so. Refusing both here, where the admin (or the
+/// environment seeder) can still correct the value, is what keeps a saved
+/// value and the header sent from disagreeing. The merge is run against an
+/// empty baseline, so the one refusal that depends on the block's own
+/// baseline — widening its `base-uri` / `form-action` — is still only
+/// logged.
+fn check_csp_directives(value: &str) -> Result<(), String> {
+    let refused = wafer_block_security_headers::merge_csp("", value).refused;
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let reasons: Vec<String> = refused.iter().map(ToString::to_string).collect();
+    Err(format!(
+        "the Content-Security-Policy would leave out {}",
+        reasons.join("; ")
+    ))
 }
 
 /// Run `key`'s declared [`ConfigValueRule`] on `value`; `Ok` for a key that
@@ -416,15 +452,18 @@ pub fn is_truthy(value: &str) -> bool {
 /// `bool` rather than a string so a call site cannot spell a default that
 /// the truth table then reads the other way.
 ///
-/// `config::get_default` swallows every read failure into the default,
-/// including a WRAP denial; that is upstream behaviour (`wafer_core::
-/// clients::config`), and it is why a flag's default is chosen to be the
-/// safe answer at every call site rather than merely the common one.
-pub async fn get_bool(ctx: &dyn wafer_run::context::Context, key: &str, default: bool) -> bool {
-    is_truthy(
-        &wafer_core::clients::config::get_default(ctx, key, if default { "true" } else { "false" })
-            .await,
-    )
+/// Only an unset key reads as `default`. A failed read — a WRAP denial, a
+/// transport or decode failure, an absent config block — is returned, so a
+/// flag the caller may not read is never mistaken for its default.
+pub async fn get_bool(
+    ctx: &dyn wafer_run::context::Context,
+    key: &str,
+    default: bool,
+) -> Result<bool, wafer_run::WaferError> {
+    let value =
+        wafer_core::clients::config::get_default(ctx, key, if default { "true" } else { "false" })
+            .await?;
+    Ok(is_truthy(&value))
 }
 
 /// Read a posted form field through [`is_truthy`]. An absent field is
@@ -874,6 +913,66 @@ mod shared_vars_tests {
 }
 
 #[cfg(test)]
+mod csp_rule_tests {
+    use super::{check_config_value, CSP_DIRECTIVES_KEY, DEFAULT_CSP_DIRECTIVES};
+    use crate::test_support::TestContext;
+
+    /// The shipped default is a policy the security-headers merge takes whole.
+    #[test]
+    fn the_default_policy_passes_its_own_rule() {
+        assert_eq!(
+            check_config_value(CSP_DIRECTIVES_KEY, DEFAULT_CSP_DIRECTIVES),
+            Ok(())
+        );
+        assert_eq!(check_config_value(CSP_DIRECTIVES_KEY, ""), Ok(()));
+    }
+
+    /// Each of these makes `wafer-run/security-headers` fail its Init (the
+    /// smart quote) or leave part of the policy out of the header. A saved
+    /// value must be the policy that is sent, and never one that stops the
+    /// runtime from booting.
+    #[test]
+    fn a_policy_the_merge_would_cut_is_refused() {
+        for bad in [
+            "script-src \u{2018}self\u{2019}",
+            "script-src\u{a0}https://cdn.example.com",
+            "script-src https://*.example.com",
+            "script-src http://cdn.example.com",
+            "report-uri https://collector.example/r",
+            "frame-ancestors *",
+            "img-src https:; IMG-SRC data:",
+        ] {
+            assert!(
+                check_config_value(CSP_DIRECTIVES_KEY, bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The rule runs where an admin writes the key: `config.set` refuses the
+    /// value and stores nothing, so the next boot still reads the old one.
+    #[tokio::test]
+    async fn config_set_refuses_a_policy_that_would_break_boot() {
+        let ctx = TestContext::with_admin().await;
+        let err = wafer_core::clients::config::set(
+            &ctx,
+            CSP_DIRECTIVES_KEY,
+            "script-src \u{2018}self\u{2019}",
+        )
+        .await
+        .expect_err("a smart-quoted policy must not be stored");
+        assert_eq!(err.code, wafer_run::ErrorCode::InvalidArgument);
+        assert_eq!(
+            wafer_core::clients::config::get_optional(&ctx, CSP_DIRECTIVES_KEY)
+                .await
+                .expect("config read"),
+            None,
+            "nothing may be stored"
+        );
+    }
+}
+
+#[cfg(test)]
 mod truth_table_tests {
     use std::collections::HashMap;
 
@@ -897,12 +996,32 @@ mod truth_table_tests {
         const UNSET_FLAG: &str = "WAFER_RUN_SHARED__UNSET_FLAG";
         const FLAG: &str = "WAFER_RUN_SHARED__FLAG";
         let mut ctx = TestContext::new().await;
-        assert!(get_bool(&ctx, UNSET_FLAG, true).await);
-        assert!(!get_bool(&ctx, UNSET_FLAG, false).await);
+        assert!(get_bool(&ctx, UNSET_FLAG, true).await.expect("read"));
+        assert!(!get_bool(&ctx, UNSET_FLAG, false).await.expect("read"));
         ctx.set_config(FLAG, "1");
-        assert!(get_bool(&ctx, FLAG, false).await);
+        assert!(get_bool(&ctx, FLAG, false).await.expect("read"));
         ctx.set_config(FLAG, "no");
-        assert!(!get_bool(&ctx, FLAG, true).await);
+        assert!(!get_bool(&ctx, FLAG, true).await.expect("read"));
+    }
+
+    /// A read the caller is refused is an error, not the flag's default: a
+    /// flag nobody may read must not quietly turn a feature on or off.
+    #[tokio::test]
+    async fn get_bool_returns_a_refused_read_instead_of_the_default() {
+        // Block-scoped to `acme/widget`, so another block needs a grant.
+        const FOREIGN_FLAG: &str = "ACME__WIDGET__FLAG";
+        let mut ctx = TestContext::new().await;
+        ctx.set_config(FOREIGN_FLAG, "1");
+        let ctx = ctx.with_wrap(
+            "impresspress/tickets",
+            Vec::new(),
+            Vec::new(),
+            "impresspress/admin",
+        );
+        let err = get_bool(&ctx, FOREIGN_FLAG, true)
+            .await
+            .expect_err("a refused read must not answer the default");
+        assert_eq!(err.code, wafer_run::ErrorCode::PermissionDenied);
     }
 
     /// An HTML checkbox posts `on`, and an absent field means unchecked.

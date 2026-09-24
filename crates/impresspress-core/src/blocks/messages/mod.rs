@@ -237,7 +237,12 @@ crate::impresspress_feature_block! {
             "Unified message and context system",
         )
         .instance_mode(InstanceMode::Singleton)
-        .requires(vec!["wafer-run/database".into()])
+        .requires(vec![
+            "wafer-run/database".into(),
+            // `migration_helper::db_backend` reads the database backend through
+            // the config client when the block's migrations run at Init.
+            "wafer-run/config".into(),
+        ])
         // No `grants(..)`. The two `ResourceGrant::read("impresspress/llm", ..)`
         // entries that used to be here existed only because the chat UI read
         // this block's tables directly with `db::list`. It reaches them

@@ -457,7 +457,10 @@ mod integration_tests {
         ) -> OutputStream {
             match msg.kind.as_str() {
                 "vector.count" => {
-                    let body = input.collect_to_bytes().await;
+                    let body = match input.collect_to_bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(e) => return OutputStream::error(e),
+                    };
                     let req: wafer_block::wire::vector::CountRequest =
                         wafer_block::codec::decode(&body).expect("decode count request");
                     let count = db::count(ctx, &format!("{}_meta", req.index), &[])

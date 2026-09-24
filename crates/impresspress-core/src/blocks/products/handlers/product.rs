@@ -309,7 +309,10 @@ async fn create_product_row(
 async fn read_write_body<T: serde::de::DeserializeOwned>(
     input: InputStream,
 ) -> Result<T, OutputStream> {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     let named: HashMap<String, serde_json::Value> =
         serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
     reject_unsettable_fields(&named)?;
@@ -772,7 +775,10 @@ async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -
         serde_json::Value::String(msg.user_id().to_string()),
     );
     if owner_only {
-        let moderation_required = seller_moderation_required(ctx).await;
+        let moderation_required = match seller_moderation_required(ctx).await {
+            Ok(required) => required,
+            Err(e) => return crud::db_error_internal(e, "Could not read the moderation policy"),
+        };
         data.insert(
             "owner_kind".to_string(),
             serde_json::Value::String("user".to_string()),
@@ -852,7 +858,7 @@ pub(super) async fn handle_duplicate_product(ctx: &dyn Context, msg: &Message) -
 
 // --- User's own products ---
 
-async fn seller_moderation_required(ctx: &dyn Context) -> bool {
+async fn seller_moderation_required(ctx: &dyn Context) -> Result<bool, wafer_run::WaferError> {
     crate::config_vars::get_bool(ctx, SELLER_MODERATION_REQUIRED, true).await
 }
 
@@ -922,7 +928,10 @@ pub(super) async fn handle_user_create_product(
     }
 
     let mut data = request.into_columns();
-    let moderation_required = seller_moderation_required(ctx).await;
+    let moderation_required = match seller_moderation_required(ctx).await {
+        Ok(required) => required,
+        Err(e) => return crud::db_error_internal(e, "Could not read the moderation policy"),
+    };
     data.insert(
         "status".to_string(),
         serde_json::json!(ProductStatus::Draft),
@@ -948,10 +957,11 @@ pub(super) async fn handle_user_create_product(
         .get("currency")
         .is_none_or(|value| value.as_str().is_some_and(str::is_empty))
     {
-        data.insert(
-            "currency".to_string(),
-            serde_json::json!(config::get_default(ctx, DEFAULT_CURRENCY, "USD").await),
-        );
+        let currency = match config::get_default(ctx, DEFAULT_CURRENCY, "USD").await {
+            Ok(currency) => currency,
+            Err(e) => return crud::db_error_internal(e, "Could not read the default currency"),
+        };
+        data.insert("currency".to_string(), serde_json::json!(currency));
     }
     stamp_created(&mut data);
     // Default product_template_id to the seeded "default" template's real
@@ -1038,7 +1048,13 @@ pub(super) async fn handle_user_update_product(
             if approval == ApprovalStatus::Suspended {
                 return err_forbidden("Suspended products cannot be published");
             }
-            if seller_moderation_required(ctx).await && approval != ApprovalStatus::Approved {
+            let moderation_required = match seller_moderation_required(ctx).await {
+                Ok(required) => required,
+                Err(e) => {
+                    return crud::db_error_internal(e, "Could not read the moderation policy")
+                }
+            };
+            if moderation_required && approval != ApprovalStatus::Approved {
                 // The two columns a seller submission moves, to two different
                 // values: `status` is the publication state a buyer sees and
                 // `approval_status` is the moderation state an administrator

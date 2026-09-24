@@ -166,6 +166,9 @@ impl ImpresspressBuilder {
         //     `claims_backend` returns false for all ids and produces clean
         //     `unknown backend_id` errors via the standard router dispatch.
         let mut llm_router = wafer_core::interfaces::llm::router::MultiBackendLlmService::new();
+        for grant in llm_router_grants() {
+            llm_router.grant(grant);
+        }
 
         #[cfg(feature = "llm")]
         let provider_llm_svc = {
@@ -200,9 +203,9 @@ impl ImpresspressBuilder {
         wafer_core::service_blocks::image::register_with(&mut wafer, Arc::new(image_router))?;
 
         // 4b. Register the `wafer-run/vector` runtime block when the
-        // `native-embedding` feature is on. `impresspress/vector` declares
-        // `requires=["wafer-run/vector"]`, so without this registration
-        // dependency resolution fails at startup.
+        // `native-embedding` feature is on. `impresspress/vector` lists it
+        // under `optional_requires`: without this registration the runtime
+        // still boots, and the block's calls to it answer `Unimplemented`.
         #[cfg(feature = "native-embedding")]
         register_vector_block(&mut wafer, self.sqlite_db_path.as_deref())?;
 
@@ -576,6 +579,115 @@ pub fn register_discovered_blocks(
         }
     }
     Ok(())
+}
+
+/// Who may use `wafer-run/llm`, declared on its router.
+///
+/// The llm handler authorizes every op against a model resource in
+/// `wafer-run/llm`'s own namespace, and only that block can grant one.
+/// `impresspress/llm` serves the model admin pages, which load and unload
+/// models (Write); `impresspress/vector` only chats (Read).
+fn llm_router_grants() -> Vec<wafer_run::ResourceGrant> {
+    let models = format!(
+        "{}*",
+        wafer_block::wrap::resource_prefix(wafer_core::service_blocks::llm::LlmBlock::NAME)
+    );
+    vec![
+        wafer_run::ResourceGrant::read_write("impresspress/llm", &models)
+            .typed(wafer_run::ResourceType::Llm),
+        #[cfg(feature = "block-vector")]
+        wafer_run::ResourceGrant::read("impresspress/vector", &models)
+            .typed(wafer_run::ResourceType::Llm),
+    ]
+}
+
+/// The router grants, checked by the real `wafer-run/llm` handler behind a
+/// fixture that enforces WRAP: without them every call from the two blocks
+/// that use the router is refused.
+#[cfg(all(test, feature = "llm", feature = "block-vector"))]
+mod llm_router_grant_tests {
+    use std::sync::Arc;
+
+    use wafer_core::clients::llm::{self, StatusRequest, UnloadModelRequest};
+    use wafer_run::ErrorCode;
+
+    use super::llm_router_grants;
+    use crate::{
+        blocks::llm::{
+            provider_admin::ProviderAdmin,
+            providers::{
+                config::{ProviderConfig, ProviderProtocol},
+                ProviderLlmService,
+            },
+        },
+        test_support::TestContext,
+    };
+
+    async fn as_caller(caller: &str) -> TestContext {
+        let svc = Arc::new(ProviderLlmService::try_new().expect("provider service"));
+        svc.configure(vec![ProviderConfig::new(
+            "local",
+            ProviderProtocol::OpenAiCompatible,
+            "https://llm.example",
+        )
+        .with_models(vec!["m".to_string()])])
+            .expect("configure");
+        let mut router = wafer_core::interfaces::llm::router::MultiBackendLlmService::new();
+        router.register("provider", svc);
+        for grant in llm_router_grants() {
+            router.grant(grant);
+        }
+        let block: Arc<dyn wafer_run::Block> = Arc::new(
+            wafer_core::service_blocks::llm::LlmBlock::new(Arc::new(router)),
+        );
+        let grants = block.info().grants;
+        let mut ctx = TestContext::new().await;
+        ctx.register_block("wafer-run/llm", block);
+        ctx.with_wrap(caller, Vec::new(), grants, "impresspress/admin")
+    }
+
+    fn status_req() -> StatusRequest {
+        StatusRequest {
+            backend_id: "local".into(),
+            model_id: "m".into(),
+        }
+    }
+
+    fn unload_req() -> UnloadModelRequest {
+        UnloadModelRequest {
+            backend_id: "local".into(),
+            model_id: "m".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_llm_and_vector_blocks_reach_the_router_and_nothing_else_does() {
+        let vector = as_caller("impresspress/vector").await;
+        assert!(
+            llm::status(&vector, &status_req()).await.is_ok(),
+            "vector reads"
+        );
+        let refused = llm::unload_model(&vector, &unload_req())
+            .await
+            .expect_err("vector may not unload");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied);
+
+        let admin_pages = as_caller("impresspress/llm").await;
+        assert!(llm::status(&admin_pages, &status_req()).await.is_ok());
+        if let Err(e) = llm::unload_model(&admin_pages, &unload_req()).await {
+            assert_ne!(
+                e.code,
+                ErrorCode::PermissionDenied,
+                "impresspress/llm writes: {e:?}"
+            );
+        }
+
+        let other = as_caller("impresspress/files").await;
+        let refused = llm::status(&other, &status_req())
+            .await
+            .expect_err("an ungranted block is refused");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    }
 }
 
 #[cfg(test)]

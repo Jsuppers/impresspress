@@ -95,11 +95,16 @@ use crate::{
 /// admin-writable `WAFER_RUN_SHARED__` prefix.
 pub const RUNTIME_KIND_CONFIG_KEY: &str = "__IMPRESSPRESS_RUNTIME_KIND__";
 
+/// Whether this runtime may hold Stripe secrets: every runtime but the
+/// browser. A failed read is returned, never taken for the server default —
+/// that would hand secret-key operations to a public browser runtime.
 pub(crate) async fn stripe_secret_operations_allowed(
     ctx: &dyn wafer_run::context::Context,
-) -> bool {
-    wafer_core::clients::config::get_default(ctx, RUNTIME_KIND_CONFIG_KEY, "server").await
-        != "browser"
+) -> Result<bool, wafer_run::WaferError> {
+    Ok(
+        wafer_core::clients::config::get_default(ctx, RUNTIME_KIND_CONFIG_KEY, "server").await?
+            != "browser",
+    )
 }
 
 /// The products block's own declared config vars. Single source of truth for
@@ -394,8 +399,15 @@ crate::impresspress_feature_block! {
         // Own products, groups and the seller surface exist only while
         // `WAFER_RUN_SHARED__ALLOW_USER_PRODUCTS` is on.
         if let Some(refusal) = routes::user_products_refusal(route) {
-            if !handlers::user_products_enabled(ctx).await {
-                return err_forbidden(refusal);
+            match handlers::user_products_enabled(ctx).await {
+                Ok(true) => {}
+                Ok(false) => return err_forbidden(refusal),
+                Err(e) => {
+                    return crate::blocks::crud::db_error_internal(
+                        e,
+                        "Could not read the seller switch",
+                    )
+                }
             }
         }
         // A platform suspension stops the seller's mutations while leaving

@@ -61,7 +61,10 @@ fn generate_state_id() -> Result<String, String> {
 
 pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Check ENABLE_OAUTH flag
-    let enable_oauth = crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await;
+    let enable_oauth = match crate::config_vars::get_bool(ctx, ENABLE_OAUTH_KEY, false).await {
+        Ok(enabled) => enabled,
+        Err(e) => return crud::db_error_internal(e, "Could not read the OAuth switch"),
+    };
     if !enable_oauth {
         return err_forbidden("OAuth login is not enabled");
     }
@@ -75,8 +78,14 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "IMPRESSPRESS__AUTH_UI__OAUTH_{}_CLIENT_ID",
         provider.to_uppercase()
     );
-    let Ok(client_id) = config::get(ctx, &client_id_key).await else {
-        return err_bad_request(&format!("OAuth provider '{provider}' not configured"));
+    // Unset and empty both mean the provider is not configured; a read the
+    // config block refused is a fault, not an unconfigured provider.
+    let client_id = match config::get_optional(ctx, &client_id_key).await {
+        Ok(Some(client_id)) if !client_id.is_empty() => client_id,
+        Ok(_) => {
+            return err_bad_request(&format!("OAuth provider '{provider}' not configured"));
+        }
+        Err(e) => return crud::db_error_internal(e, "Could not read the OAuth client id"),
     };
 
     let redirect_uri = config::get_default(
@@ -85,6 +94,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         "http://localhost:8090/b/auth/oauth/callback",
     )
     .await;
+    let redirect_uri = match redirect_uri {
+        Ok(redirect_uri) => redirect_uri,
+        Err(e) => return crud::db_error_internal(e, "Could not read the OAuth redirect URI"),
+    };
 
     // Generate PKCE code verifier and challenge.
     let code_verifier = match generate_pkce_verifier() {
@@ -138,7 +151,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
     // Bind the flow to this browser. The provider echoes `state_id` back to
     // whichever browser follows the callback URL; only the browser holding
     // this cookie may redeem it (see `state_binding`).
-    let binding = super::state_binding::issue(ctx, &state_id, PKCE_STATE_TTL_SECS).await;
+    let binding = match super::state_binding::issue(ctx, &state_id, PKCE_STATE_TTL_SECS).await {
+        Ok(binding) => binding,
+        Err(e) => return crud::db_error_internal(e, "Could not build the OAuth binding cookie"),
+    };
 
     ResponseBuilder::new()
         .status(302)

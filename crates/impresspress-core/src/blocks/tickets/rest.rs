@@ -191,7 +191,7 @@ pub async fn status(ctx: &dyn Context) -> OutputStream {
 }
 
 pub async fn prune(ctx: &dyn Context) -> OutputStream {
-    let result = maintenance::prune(ctx).await;
+    let result = maintenance::prune(ctx, chrono::Utc::now()).await;
     if result.complete {
         ok_json(&result)
     } else {
@@ -200,7 +200,10 @@ pub async fn prune(ctx: &dyn Context) -> OutputStream {
 }
 
 async fn collect_json<T: DeserializeOwned>(input: InputStream) -> Result<T, OutputStream> {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     if raw.len() > MAX_ADMIN_BODY {
         return Err(ResponseBuilder::new()
             .status(413)

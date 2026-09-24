@@ -35,7 +35,10 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: RefreshRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -82,7 +85,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // token minted against a different WAFER_RUN_SHARED__FRONTEND_URL value
     // (e.g. a leaked staging secret) must not refresh into a production
     // access token.
-    let expected_iss = expected_issuer(ctx).await;
+    let expected_iss = match expected_issuer(ctx).await {
+        Ok(expected_iss) => expected_iss,
+        Err(e) => return crud::db_error_internal(e, "Could not read the token issuer"),
+    };
     let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
     if iss != expected_iss {
         return error_response(ErrorCode::InvalidToken, "Invalid or expired refresh token");
@@ -131,12 +137,16 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         return error_response(ErrorCode::AccountDisabled, "Account is disabled");
     }
 
-    let require_verification = crate::config_vars::get_bool(
+    let require_verification = match crate::config_vars::get_bool(
         ctx,
         crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
         false,
     )
-    .await;
+    .await
+    {
+        Ok(required) => required,
+        Err(e) => return crud::db_error_internal(e, "Could not read the verification policy"),
+    };
     if require_verification && !user.email_verified {
         return error_response(ErrorCode::EmailNotVerified, "Email not verified");
     }
@@ -701,7 +711,10 @@ mod tests {
             if !(name == "wafer-run/database" && msg.action() == "database.update_where_count") {
                 return self.inner.call_block(name, msg, input).await;
             }
-            let bytes = input.collect_to_bytes().await;
+            let bytes = match input.collect_to_bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => return OutputStream::error(e),
+            };
             let on_tokens =
                 wafer_block::codec::decode::<crate::test_support::CollectionPeek>(&bytes)
                     .map(|p| p.collection == tokens::TABLE)

@@ -281,7 +281,10 @@ async fn handle_update_profile(
         return err_forbidden("Not authenticated");
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body = parse_form_body(&raw);
 
     // CSRF defense-in-depth: this is a plain (no-JS) `<form>` POST (see

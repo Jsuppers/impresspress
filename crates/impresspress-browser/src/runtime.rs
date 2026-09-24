@@ -200,11 +200,10 @@ mod tests {
             impresspress_core::streaming::body_too_large(&msg),
             "the marker the pipeline refuses on"
         );
-        let forwarded = futures::StreamExt::fold(input, Vec::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            acc
-        })
-        .await;
+        let forwarded = input
+            .collect_to_bytes()
+            .await
+            .expect("an in-memory body does not fail");
         assert!(
             forwarded.is_empty(),
             "an oversized body must not reach a block"
