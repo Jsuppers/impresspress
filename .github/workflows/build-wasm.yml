@@ -66,8 +66,8 @@ jobs:
       # `crates/impresspress/build.rs` bakes into the binary was the one place
       # a release resolved dependencies afresh instead of using the set CI
       # tested. All the deploy workflows carry the same flag now for the same
-      # reason. (`cargo install cargo-audit` is deliberately not in that set:
-      # it resolves a crates.io package, not this repository's lockfile.)
+      # reason. (The cargo-audit install in `audit.yml` is not in that set: it
+      # fetches a pinned release binary, not this repository's lockfile.)
       - name: Build WASM
         run: cd crates/impresspress-web && wasm-pack build --target web --release --out-dir pkg -- --locked
 

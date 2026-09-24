@@ -15,11 +15,12 @@ on:
       - 'Cargo.lock'
       - 'scripts/**'
       - '.github/workflows/ci.yml'
-      # The workflows this one calls. Without these two entries a change to the
-      # shared body — which is every job this gate runs — would start no
-      # workflow at all and merge ungated.
+      # The workflows this one calls, directly or through `ci-shared.yml`.
+      # Without these entries a change to the shared body — which is every job
+      # this gate runs — would start no workflow at all and merge ungated.
       - '.github/workflows/ci-shared.yml'
       - '.github/workflows/build-wasm.yml'
+      - '.github/workflows/audit.yml'
       # `ci-main.yml` is in THIS filter because it is not in its own trigger's
       # reach on a pull request: a pull request that touches only the merge
       # workflow would otherwise start no workflow at all and merge with no
