@@ -1256,6 +1256,28 @@ mod tests {
             )
             .expect("set bind");
             bind.forget();
+            // A lone statement's `all()`: the executor's one read of a table's
+            // declared column types (which columns hold JSON). It answers no
+            // columns, so every value is written and read as it is.
+            let all = Closure::<dyn Fn() -> js_sys::Promise>::new(move || {
+                let result = js_sys::Object::new();
+                js_sys::Reflect::set(&result, &JsValue::from_str("success"), &JsValue::TRUE)
+                    .expect("set success");
+                js_sys::Reflect::set(
+                    &result,
+                    &JsValue::from_str("results"),
+                    &js_sys::Array::new(),
+                )
+                .expect("set results");
+                js_sys::Promise::resolve(&JsValue::from(result))
+            });
+            js_sys::Reflect::set(
+                &statement,
+                &JsValue::from_str("all"),
+                all.as_ref().unchecked_ref(),
+            )
+            .expect("set all");
+            all.forget();
             JsValue::from(statement)
         });
         js_sys::Reflect::set(
