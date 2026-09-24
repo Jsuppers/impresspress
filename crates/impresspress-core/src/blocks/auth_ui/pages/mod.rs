@@ -50,7 +50,7 @@ pub(super) async fn site_config(ctx: &dyn Context) -> Result<SiteConfig, wafer_r
 ///
 /// A failed read is returned: a button hidden because the config block
 /// refused the read would look exactly like a provider nobody configured.
-pub(super) async fn oauth_provider_configured(
+pub(in crate::blocks::auth_ui) async fn oauth_provider_configured(
     ctx: &dyn Context,
     provider: &str,
 ) -> Result<bool, wafer_run::WaferError> {
