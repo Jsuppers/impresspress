@@ -13,9 +13,10 @@
 //!
 //! The other two files are instantiated from a template: the block's name is
 //! its directory, its crate name, its block id (`site/<name>`), its route
-//! prefix (`/b/<name>/`) and its collection prefix (`site__<name>__`) all at
-//! once, and a template that got any one of those wrong would be refused by
-//! validation with a diagnostic the author did not cause.
+//! prefix (`/b/<name>/`) and its collection prefix (`site__<name>__`, a
+//! hyphen spelled `_`) all at once, and a template that got any one of those
+//! wrong would be refused by validation with a diagnostic the author did not
+//! cause.
 //!
 //! # Why the reference is served rather than shipped as a file
 //!
@@ -32,7 +33,7 @@ use super::{
     contracts::{CreateBlockRequest, CreateBlockResponse, FileConflict, ReferenceResponse},
     files, no_store, no_store_db_error_internal, no_store_error,
     paths::{self, WorkspaceArea, BLOCK_NAME_RULE},
-    workspace, DevShared, WAFER_GUEST_VERSION,
+    validation, workspace, DevShared, WAFER_GUEST_VERSION,
 };
 use crate::blocks::crud;
 
@@ -139,20 +140,22 @@ impl Template {
 ///
 /// Each anchor is one of the five places the block's name is load-bearing —
 /// the crate name, the block id, the route prefix, the collection prefix and
-/// the config prefix — which is exactly the set validation checks. The
-/// hyphenated spelling carries through the collection and config prefixes
-/// unchanged (`site__my-shop__rows`, `SITE__MY-SHOP__KEY`), because that is
-/// what the runtime's own resource convention uses.
+/// the config prefix — which is exactly the set validation checks. The two
+/// prefixes are [`validation::collection_prefix`] and its uppercase, the
+/// spelling validation requires, so a hyphen in the name becomes `_` there
+/// (`site__my_shop__rows`, `SITE__MY_SHOP__KEY`) and stays a hyphen in the
+/// other three.
 fn instantiate(source: &str, from: &str, to: &str) -> String {
+    let (from_prefix, to_prefix) = (
+        validation::collection_prefix(from),
+        validation::collection_prefix(to),
+    );
     source
         .replace(&format!("name = \"{from}\""), &format!("name = \"{to}\""))
         .replace(&format!("site/{from}"), &format!("site/{to}"))
         .replace(&format!("/b/{from}/"), &format!("/b/{to}/"))
-        .replace(&format!("site__{from}__"), &format!("site__{to}__"))
-        .replace(
-            &format!("SITE__{}__", from.to_uppercase()),
-            &format!("SITE__{}__", to.to_uppercase()),
-        )
+        .replace(&from_prefix, &to_prefix)
+        .replace(&from_prefix.to_uppercase(), &to_prefix.to_uppercase())
 }
 
 /// Marker the `hello` template's source is spliced into.
@@ -363,8 +366,10 @@ mod tests {
         assert!(cargo.contains(r#"name = "my-shop""#), "{cargo}");
         assert!(lib.contains(r#"Block::new("site/my-shop""#), "{lib}");
         assert!(lib.contains("/b/my-shop/subscribe"), "{lib}");
-        assert!(lib.contains("site__my-shop__subscribers"), "{lib}");
-        assert!(lib.contains("SITE__MY-SHOP__"), "{lib}");
+        assert!(lib.contains("site__my_shop__subscribers"), "{lib}");
+        assert!(lib.contains("SITE__MY_SHOP__"), "{lib}");
+        assert!(!lib.contains("site__my-shop__"), "{lib}");
+        assert!(!lib.contains("SITE__MY-SHOP__"), "{lib}");
         // The handler function names survive: a blanket replace would have
         // produced `fn subscribe_my-shop`, which is not an identifier.
         assert!(lib.contains("fn subscribe("), "{lib}");

@@ -17,6 +17,36 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Dev sandbox: a hyphenated block spells its collections with `_`
+
+**What changes.** A sandbox block whose name has a hyphen (`blocks/my-shop`,
+registered as `site/my-shop`) now claims `site__my_shop__*` collections and
+`SITE__MY_SHOP__*` config keys — the spelling the runtime derives for the block
+id. The hyphenated spelling (`site__my-shop__*`, `SITE__MY-SHOP__*`) is refused
+at staging with `cap-collection` / `cap-config`, and so is any collection name
+that is not lowercase letters, digits and `_`. Blocks without a hyphen in their
+name (`site__newsletter__*`) are unaffected.
+
+**Why.** The database strips a hyphen from a table name before building SQL.
+A `site/my-shop` block that claimed `site__my-shop__notes` had its table created
+under that name, but every `create`, `list`, `update` and `count` ran against
+`site__myshop__notes`: with no such table they failed or came back empty, and
+when a block named `myshop` existed they read and wrote *its* rows.
+
+**Your data.** Nothing to migrate. A hyphenated block's own tables
+(`site__my-shop__*`) were created empty and no write could reach them, so no
+rows live there. Rows in `site__myshop__*` belong to a block named `myshop`
+(where one exists) and stay with it; a row a hyphenated block wrote there
+carries no record of which block wrote it and is not moved. Once rebuilt, the
+hyphenated block creates its table under the new name on `init` and starts
+empty. The empty `site__my-shop__*` tables are left behind unused.
+
+**What to do.** An already-active hyphenated block keeps running as it was
+accepted until it is next built: rename its collections and config keys to the
+`_` spelling (a freshly scaffolded block already uses it), rebuild, stage. A
+seed bundle exported with a hyphenated block under the old spelling is refused
+on import with the same diagnostic; re-export it after the rebuild.
+
 ### Config: your `.env` applies again, and one boot decides the ties
 
 **What changes.** A `WAFER_RUN_SHARED__*` / `{ORG}__{BLOCK}__*` environment

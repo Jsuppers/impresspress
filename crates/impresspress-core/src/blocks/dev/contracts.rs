@@ -485,9 +485,10 @@ pub struct BlockPathParams {
 pub struct CreateBlockRequest {
     /// The block's short name, e.g. `newsletter`. It becomes the directory
     /// `blocks/<name>/`, the crate name, the block id `site/<name>`, the
-    /// route prefix `/b/<name>/` and the collection prefix `site__<name>__`.
-    /// 2 to 32 characters: a lowercase letter followed by lowercase letters,
-    /// digits and hyphens, with no doubled hyphen and no trailing hyphen.
+    /// route prefix `/b/<name>/` and the collection prefix `site__<name>__`
+    /// (a hyphen spelled `_` there). 2 to 32 characters: a lowercase letter
+    /// followed by lowercase letters, digits and hyphens, with no doubled
+    /// hyphen and no trailing hyphen.
     pub name: String,
     /// Which starting point to write. `hello` is one public `GET` and
     /// nothing else; `table` is a newsletter block with a database table, an

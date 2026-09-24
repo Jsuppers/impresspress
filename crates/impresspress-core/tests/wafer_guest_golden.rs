@@ -47,7 +47,7 @@
 
 use std::{path::Path, process::Command, sync::Arc};
 
-use impresspress_core::blocks::dev::{control::DynamicBlockSpec, validation};
+use impresspress_core::blocks::dev::{control::DynamicBlockSpec, scaffold::Template, validation};
 use wafer_block::{http_codec, streams::input::InputStream, BlockCapabilities, Message};
 use wafer_block_sqlite::service::SQLiteDatabaseService;
 use wafer_run::{wasm::WasmiBlock, ResourceLimits, Wafer};
@@ -154,16 +154,37 @@ fn build_template(name: &str) -> Vec<u8> {
         .join(name);
     let out = tempfile::tempdir().expect("tempdir");
     copy_dir_all(&source, out.path()).expect("copy the template");
+    build_crate(name, out.path())
+}
 
+/// Scaffold `template` as block `name` — the three files `dev_create_block`
+/// writes, from [`Template::files`] itself — and build it.
+fn build_scaffolded(template: Template, name: &str) -> Vec<u8> {
+    let out = tempfile::tempdir().expect("tempdir");
+    let block_dir = format!("blocks/{name}/");
+    for (path, content) in template.files(name) {
+        let relative = path
+            .strip_prefix(&block_dir)
+            .unwrap_or_else(|| panic!("{path} is outside {block_dir}"));
+        let target = out.path().join(relative);
+        std::fs::create_dir_all(target.parent().expect("a parent"))
+            .expect("create the directory");
+        std::fs::write(&target, content).expect("write the scaffolded file");
+    }
+    build_crate(name, out.path())
+}
+
+/// Build the crate at `dir` for `wasm32-wasip1` and return the module.
+fn build_crate(name: &str, dir: &Path) -> Vec<u8> {
     let package = package_name(
-        &std::fs::read_to_string(out.path().join("Cargo.toml")).expect("read Cargo.toml"),
+        &std::fs::read_to_string(dir.join("Cargo.toml")).expect("read Cargo.toml"),
     );
     // `--offline` is the assertion, not an optimization: a template with a
     // single dependency would fail here rather than quietly working on a
     // machine with a warm registry cache. `--target-dir` is explicit so an
     // ambient `CARGO_TARGET_DIR` cannot move the artifact out from under the
     // read below.
-    let target_dir = out.path().join("target");
+    let target_dir = dir.join("target");
     let status = Command::new("cargo")
         .args([
             "build",
@@ -174,7 +195,7 @@ fn build_template(name: &str) -> Vec<u8> {
         ])
         .arg("--target-dir")
         .arg(&target_dir)
-        .current_dir(out.path())
+        .current_dir(dir)
         .status()
         .expect("run cargo");
     assert!(
@@ -475,4 +496,112 @@ async fn a_compiled_template_reports_the_block_info_the_sandbox_accepts() {
     assert!(spec
         .capabilities
         .allows_collection("site__newsletter__subscribers"));
+}
+
+/// POST one signup to `name`'s `subscribe` endpoint and return the status.
+async fn subscribe(wafer: &Wafer, name: &str, email: &str) -> u16 {
+    let out = wafer
+        .run_block(
+            &format!("site/{name}"),
+            http_msg("POST", &format!("/b/{name}/subscribe"), &[("auth.user_id", "")]),
+            InputStream::from_bytes(format!(r#"{{"email":"{email}"}}"#).into_bytes()),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("a buffered response");
+    http_codec::resolve_status(&out.meta, 200)
+}
+
+/// The emails `name`'s admin listing returns, in listing order.
+async fn subscriber_emails(wafer: &Wafer, name: &str) -> Vec<String> {
+    let out = wafer
+        .run_block(
+            &format!("site/{name}"),
+            http_msg(
+                "GET",
+                &format!("/b/{name}/subscribers"),
+                &[("auth.user_id", "admin_1"), ("auth.user_roles", "admin")],
+            ),
+            InputStream::empty(),
+        )
+        .await
+        .collect_buffered()
+        .await
+        .expect("a buffered response");
+    let listing: serde_json::Value = serde_json::from_slice(&out.body).unwrap_or_else(|e| {
+        panic!(
+            "{name} listing body ({e}): {:?}",
+            String::from_utf8_lossy(&out.body)
+        )
+    });
+    listing["subscribers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name} listing has no subscribers array: {listing}"))
+        .iter()
+        .map(|row| row["email"].as_str().expect("an email").to_string())
+        .collect()
+}
+
+/// Register `name`, scaffolded from the `table` template and admitted as the
+/// sandbox admits it.
+fn register_scaffolded(wafer: &mut Wafer, name: &str) {
+    let wasm = build_scaffolded(Template::Table, name);
+    let (block, spec) = load_as_the_sandbox_does(name, &wasm);
+    assert_eq!(spec.name, format!("site/{name}"));
+    wafer
+        .register_block(&format!("site/{name}"), Arc::new(block))
+        .unwrap_or_else(|e| panic!("register site/{name}: {e}"));
+}
+
+/// A block with a hyphen in its name, scaffolded as `dev_create_block`
+/// scaffolds it, can write a row and read it back.
+///
+/// The hyphen is what makes this a different test from the `newsletter` one:
+/// the collection the block claims is the table the database writes, only if
+/// the claimed spelling is one the database uses as written.
+#[tokio::test]
+async fn a_hyphenated_block_round_trips_its_own_rows() {
+    if !buildable() {
+        return;
+    }
+    let mut wafer = golden_wafer();
+    register_scaffolded(&mut wafer, "my-shop");
+    let wafer = wafer.start().await.expect("start the runtime");
+
+    assert_eq!(subscribe(&wafer, "my-shop", "mine@example.com").await, 200);
+    assert_eq!(
+        subscriber_emails(&wafer, "my-shop").await,
+        vec!["mine@example.com".to_string()],
+    );
+}
+
+/// `site/my-shop` and `site/myshop` are two blocks with two sets of tables:
+/// neither sees a row the other wrote.
+///
+/// A name with its hyphen removed is always another legal block name, so
+/// this is the pair a stripped identifier would merge.
+#[tokio::test]
+async fn a_hyphenated_block_cannot_reach_its_unhyphenated_twin() {
+    if !buildable() {
+        return;
+    }
+    let mut wafer = golden_wafer();
+    register_scaffolded(&mut wafer, "myshop");
+    register_scaffolded(&mut wafer, "my-shop");
+    let wafer = wafer.start().await.expect("start the runtime");
+
+    assert_eq!(subscribe(&wafer, "myshop", "twin@example.com").await, 200);
+    assert_eq!(subscribe(&wafer, "my-shop", "mine@example.com").await, 200);
+
+    assert_eq!(
+        subscriber_emails(&wafer, "my-shop").await,
+        vec!["mine@example.com".to_string()],
+        "site/my-shop reads only its own rows",
+    );
+    assert_eq!(
+        subscriber_emails(&wafer, "myshop").await,
+        vec!["twin@example.com".to_string()],
+        "site/myshop's table holds only its own rows",
+    );
 }

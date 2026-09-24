@@ -1172,11 +1172,11 @@ pub struct Block {
     pub summary: String,
     /// Platform services the block calls.
     pub requires: Vec<String>,
-    /// Database collections it may reach (`site__{name}__*`).
+    /// Database collections it may reach (`site__{name}__*`, `-` as `_`).
     pub collections: Vec<String>,
     /// Storage folders it may reach (`site/{name}` and below).
     pub storage_folders: Vec<String>,
-    /// Config keys it may read (`SITE__{NAME}__*`).
+    /// Config keys it may read (`SITE__{NAME}__*`, `-` as `_`).
     pub config_keys: Vec<String>,
     /// Endpoints it serves, in declaration order — which is also route
     /// precedence.
@@ -1220,7 +1220,8 @@ impl Block {
     }
 
     /// Claim a database collection. Must be `site__{name}__{table}` with the
-    /// block's own name — hyphens in the block name stay hyphens here.
+    /// block's own name, a hyphen in it spelled `_` (`my-shop` claims
+    /// `site__my_shop__*`), and only lowercase letters, digits and `_`.
     ///
     /// Claiming one also turns on the `schema` capability, which is what lets
     /// [`db::ensure_table`] create it. Raw DDL is never granted.
@@ -1236,9 +1237,9 @@ impl Block {
     }
 
     /// Claim a config key. Must start with `SITE__{NAME}__`, the block's own
-    /// name uppercased — hyphens in the block name stay hyphens here, as they
-    /// do in [`collection`](Block::collection), so `my-shop` claims
-    /// `SITE__MY-SHOP__*`.
+    /// name uppercased with a hyphen spelled `_`, as in
+    /// [`collection`](Block::collection), so `my-shop` claims
+    /// `SITE__MY_SHOP__*`.
     pub fn config_key(mut self, key: &str) -> Block {
         self.config_keys.push(key.to_string());
         self
