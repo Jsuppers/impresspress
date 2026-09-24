@@ -34,14 +34,6 @@ pub(crate) mod storage;
 /// is part of the non-test lib build under that feature.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_wrap {
-    #[cfg(test)]
-    use std::sync::Arc;
-
-    #[cfg(test)]
-    use wafer_core::interfaces::storage::service::StorageService;
-
-    #[cfg(test)]
-    use crate::blocks::storage::ImpresspressStorageBlock;
     use crate::test_support::TestContext;
 
     /// The deployment's admin block — the WRAP admin identity, and the block
@@ -75,32 +67,6 @@ pub(crate) mod test_wrap {
     /// reads `blocks::admin::AdminBlock` rather than re-listing anything.
     pub(crate) fn deployment_grants() -> Vec<wafer_run::ResourceGrant> {
         wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants
-    }
-
-    /// The `wafer-run/storage` block a files-block fixture must register:
-    /// the production namespacing shim over `service`, with the deployment's
-    /// grants already installed.
-    ///
-    /// Both halves are production wiring. `builder::registration` registers
-    /// [`ImpresspressStorageBlock`] under that name — a fixture that registers
-    /// the bare `wafer-core` `StorageBlock` instead skips the namespacing and
-    /// the op match, which is how `storage.get_streaming` was missing from
-    /// that match through 60 green PRs. And `builder::boot::post_start` then
-    /// injects the collected grants; the shim's constructor leaves that list
-    /// empty and refuses every `@`-prefixed cross-block reach while it is,
-    /// regardless of what the deployment granted. Skipping it is fail-closed,
-    /// but it leaves the fixture unable to tell a missing grant from an
-    /// unwired block — and its doc claiming production fidelity untrue.
-    ///
-    /// `cfg(test)` alone: the `test-support` lib build compiles this module
-    /// for [`as_files_block`] (which `TestContext::with_files` calls); the
-    /// fixtures that register a storage block all live in this crate's own
-    /// `#[cfg(test)]` modules.
-    #[cfg(test)]
-    pub(crate) fn storage_block(service: Arc<dyn StorageService>) -> Arc<ImpresspressStorageBlock> {
-        let block = crate::blocks::storage::create(service, Arc::from(ADMIN_BLOCK));
-        block.update_wrap_grants(&deployment_grants());
-        block
     }
 }
 
@@ -826,10 +792,7 @@ mod test_support {
                 crypto_svc,
             )),
         );
-        ctx.register_block(
-            "wafer-run/storage",
-            super::test_wrap::storage_block(storage),
-        );
+        ctx.register_block("wafer-run/storage", crate::blocks::storage::create(storage));
 
         let data = crate::util::json_map(serde_json::json!({
             "name": bucket,

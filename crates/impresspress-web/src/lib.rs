@@ -133,7 +133,7 @@ pub async fn initialize(options: JsValue) -> Result<(), JsValue> {
     #[cfg(feature = "browser-devtools")]
     let (factory, sandbox) = dev_runtime::attach(factory);
 
-    let (wafer, _storage_block) = factory.build(&[]).await?;
+    let wafer = factory.build(&[]).await?;
 
     web_sys::console::log_1(&"impresspress: WAFER runtime started".into());
 

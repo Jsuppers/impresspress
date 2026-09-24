@@ -14,9 +14,12 @@
 //! Cloudflare D1 backend.
 //!
 //! Tables must already exist via the owning block's migration files (applied
-//! at `lifecycle(Init)`); the shared `ensure_data_columns`/`ensure_query_columns`
-//! add only missing *columns* (always `TEXT` on SQLite) on demand — unless
-//! STRICT_SCHEMA is on, which this backend now honours (see [`STRICT_SCHEMA`]).
+//! at `lifecycle(Init)`). The shared `ensure_data_columns` adds only a missing
+//! *column* a write's data names (always `TEXT` on SQLite), and
+//! `require_columns` refuses a read, filter or guard that names an unknown
+//! column instead of adding it — unless STRICT_SCHEMA is on, which this
+//! backend honours (see [`STRICT_SCHEMA`]): then neither introspects, and the
+//! statement itself fails on an unmigrated column.
 //!
 //! ## Schema cache
 //!
@@ -659,7 +662,7 @@ wafer_core::forward_database_service! {
         /// returned.
         async fn schema_drop_table(&self, name: &str) -> Result<(), DatabaseError> {
             self.with_flush(async {
-                let stmt = wafer_sql_utils::ddl::build_drop_table(name, Self::BACKEND);
+                let stmt = wafer_sql_utils::ddl::build_drop_table(name, Self::BACKEND)?;
                 let dropped = self.run_execute(&stmt.sql, &[]).await;
                 SCHEMA_CACHE.invalidate(name);
                 dropped.map(|_| ())
@@ -673,7 +676,7 @@ wafer_core::forward_database_service! {
             column: &Column,
         ) -> Result<(), DatabaseError> {
             self.with_flush(async {
-                let stmt = wafer_sql_utils::ddl::build_add_column(table, column, Self::BACKEND);
+                let stmt = wafer_sql_utils::ddl::build_add_column(table, column, Self::BACKEND)?;
                 let added = self.run_execute(&stmt.sql, &[]).await;
                 SCHEMA_CACHE.invalidate(table);
                 added.map(|_| ())

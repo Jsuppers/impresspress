@@ -16,8 +16,6 @@ use serde::{Deserialize, Serialize};
 use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::{RuntimeError, Wafer};
 
-use crate::blocks::storage::ImpresspressStorageBlock;
-
 /// Request-current config flag set only while an authenticated deployment
 /// candidate is exporting a prepared runtime plan.
 ///
@@ -133,20 +131,13 @@ pub struct BootReport {
     pub ok: bool,
 }
 
-/// Call after `wafer.seal()` to inject collected WRAP grants into the storage
-/// block for cross-block access control. Private: [`boot`] is the only caller,
-/// which is what stops it from being a step a target can forget.
-fn post_start(wafer: &Wafer, storage_block: &ImpresspressStorageBlock) {
-    storage_block.update_wrap_grants(wafer.wrap_grants());
-}
-
 /// Per-target boot I/O for [`boot`]. Implemented by each platform to supply
 /// the one step that genuinely differs between them: what to seed and which
 /// shared snapshots to publish into once the admin block's `Init` has created
 /// the variables / block_settings tables.
 ///
 /// Everything else around it — the invariant `grants → seal → admin-first init
-/// → seed → init the rest → post_start` ordering — is owned by [`boot`].
+/// → seed → init the rest` ordering — is owned by [`boot`].
 ///
 /// Deliberately **not** an `Option` argument on [`boot`]: a target with
 /// nothing to seed writes a no-op impl and says why (native's
@@ -193,7 +184,6 @@ pub trait BootHooks {
 /// 4. `hooks.seed_after_admin_init` — seed + publish (see [`BootHooks`]).
 /// 5. every remaining block, in `Wafer::block_names()` order (sorted, so the
 ///    sequence is identical across processes and platforms).
-/// 6. `post_start()` — inject WRAP grants into the storage block.
 ///
 /// `policy` changes none of that ordering; it decides only what a failure at
 /// step 3, 4 or 5 does. See [`InitPolicy`].
@@ -211,7 +201,6 @@ pub trait BootHooks {
 /// `wafer.run`).
 pub async fn boot(
     wafer: &mut Wafer,
-    storage_block: &ImpresspressStorageBlock,
     hooks: &dyn BootHooks,
     grants: GrantSource<'_>,
     policy: InitPolicy,
@@ -268,9 +257,6 @@ pub async fn boot(
         }
         blocks.push(init_one(wafer, name, policy).await?);
     }
-
-    // 6. WRAP grants into the storage block.
-    post_start(wafer, storage_block);
 
     let ok = seed.ok && blocks.iter().all(|b| b.ok);
     Ok(BootReport {
@@ -391,7 +377,6 @@ mod tests {
     use wafer_run::{StaticConfigSource, Wafer};
 
     use super::*;
-    use crate::blocks::storage::ImpresspressStorageBlock;
 
     struct InitProbeBlock {
         name: &'static str,
@@ -488,15 +473,6 @@ mod tests {
         Wafer::new(config).unwrap()
     }
 
-    /// A storage block to satisfy `post_start`. Its grant list is what
-    /// `post_start` writes into, so the WRAP-grant tests read it back.
-    fn storage_block() -> Arc<ImpresspressStorageBlock> {
-        crate::blocks::storage::create(
-            Arc::new(crate::test_support::InMemoryStorageService::new()),
-            Arc::from(crate::blocks::admin::ADMIN_BLOCK_ID),
-        )
-    }
-
     /// Three probes plus the admin id, one of which optionally fails.
     fn wafer_with_probes(order: &Arc<Mutex<Vec<String>>>, failing: Option<&'static str>) -> Wafer {
         let mut wafer = empty_wafer();
@@ -527,11 +503,9 @@ mod tests {
     async fn ordering_is_admin_first_then_seed_then_the_rest_sorted() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, None);
-        let storage = storage_block();
 
         let report = boot(
             &mut wafer,
-            &storage,
             &ProbeHooks {
                 order: order.clone(),
                 fail: false,
@@ -584,11 +558,9 @@ mod tests {
         ] {
             let order = Arc::new(Mutex::new(Vec::new()));
             let mut wafer = wafer_with_probes(&order, None);
-            let storage = storage_block();
 
             boot(
                 &mut wafer,
-                &storage,
                 &ProbeHooks {
                     order: order.clone(),
                     fail: false,
@@ -613,11 +585,9 @@ mod tests {
     async fn tolerant_logs_a_failure_and_still_initializes_later_blocks() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, Some("test/alpha"));
-        let storage = storage_block();
 
         let report = boot(
             &mut wafer,
-            &storage,
             &ProbeHooks {
                 order: order.clone(),
                 fail: false,
@@ -639,11 +609,9 @@ mod tests {
     async fn strict_fails_closed_without_initializing_later_blocks() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, Some("test/alpha"));
-        let storage = storage_block();
 
         let error = boot(
             &mut wafer,
-            &storage,
             &ProbeHooks {
                 order: order.clone(),
                 fail: false,
@@ -665,11 +633,9 @@ mod tests {
     async fn reported_captures_every_block_and_keeps_going() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, Some("test/alpha"));
-        let storage = storage_block();
 
         let report = boot(
             &mut wafer,
-            &storage,
             &ProbeHooks {
                 order: order.clone(),
                 fail: false,
@@ -699,11 +665,9 @@ mod tests {
         for policy in [InitPolicy::Tolerant, InitPolicy::Strict] {
             let order = Arc::new(Mutex::new(Vec::new()));
             let mut wafer = wafer_with_probes(&order, None);
-            let storage = storage_block();
 
             let error = boot(
                 &mut wafer,
-                &storage,
                 &ProbeHooks {
                     order: order.clone(),
                     fail: true,
@@ -718,10 +682,8 @@ mod tests {
 
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, None);
-        let storage = storage_block();
         let report = boot(
             &mut wafer,
-            &storage,
             &ProbeHooks {
                 order: order.clone(),
                 fail: true,
@@ -756,10 +718,8 @@ mod tests {
 
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut from_db = wafer_with_probes(&order, None);
-        let storage = storage_block();
         boot(
             &mut from_db,
-            &storage,
             &ProbeHooks {
                 order: order.clone(),
                 fail: false,
@@ -778,10 +738,8 @@ mod tests {
         pre_installed
             .add_wrap_grants(expected.clone())
             .expect("the loaded grants are well-formed");
-        let storage2 = storage_block();
         boot(
             &mut pre_installed,
-            &storage2,
             &ProbeHooks {
                 order: order2,
                 fail: false,
@@ -801,14 +759,6 @@ mod tests {
                 .contains(crate::platform_state::wrap_grants::FIXTURE_RESOURCE),
             "the seeded grant must reach the sealed runtime",
         );
-        // Step 6: the same grants reach the storage block, which is what makes
-        // a cross-block read succeed at request time. Nothing tested this
-        // before, because it was a statement each target copied.
-        assert!(
-            format!("{:?}", storage.installed_wrap_grants())
-                .contains(crate::platform_state::wrap_grants::FIXTURE_RESOURCE),
-            "boot must close by injecting the sealed grants into the storage block",
-        );
     }
 
     /// `GrantSource::PreInstalled` must not go looking in a database — that is
@@ -826,10 +776,8 @@ mod tests {
 
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, None);
-        let storage = storage_block();
         boot(
             &mut wafer,
-            &storage,
             &ProbeHooks { order, fail: false },
             GrantSource::PreInstalled("the plan is authoritative"),
             InitPolicy::Strict,
@@ -853,10 +801,8 @@ mod tests {
     async fn report_serializes_the_deploy_wire_shape() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut wafer = wafer_with_probes(&order, Some("test/alpha"));
-        let storage = storage_block();
         let report = boot(
             &mut wafer,
-            &storage,
             &ProbeHooks { order, fail: false },
             GrantSource::PreInstalled("test fixture declares none"),
             InitPolicy::Reported,

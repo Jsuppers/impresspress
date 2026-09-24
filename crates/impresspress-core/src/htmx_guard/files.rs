@@ -12,7 +12,7 @@ use wafer_run::{Block, Message};
 
 use super::{Entry, Exempt};
 use crate::{
-    blocks::files::{repo, test_wrap, FilesBlock},
+    blocks::files::{repo, FilesBlock},
     test_support::{
         admin_msg,
         htmx::{Fixture, Page, Site},
@@ -55,7 +55,7 @@ async fn fixture() -> Fixture {
     let mut ctx = TestContext::with_files().await;
     ctx.register_block(
         "wafer-run/storage",
-        test_wrap::storage_block(Arc::new(InMemoryStorageService::new())),
+        crate::blocks::storage::create(Arc::new(InMemoryStorageService::new())),
     );
 
     for (name, public) in [("photos", true), ("docs", false)] {

@@ -289,19 +289,9 @@ impl RuntimeFactory {
 
     /// Build + boot one runtime. `dynamic` is empty on cold start.
     ///
-    /// Returns the booted `Wafer` and the storage block the caller needs for
-    /// later WRAP-grant republication; the caller decides whether this runtime
+    /// Returns the booted `Wafer`; the caller decides whether this runtime
     /// becomes the live one (`store_wafer`) or replaces one (`replace_wafer`).
-    pub async fn build(
-        &self,
-        dynamic: &[DynamicBlock],
-    ) -> Result<
-        (
-            wafer_run::Wafer,
-            Arc<impresspress_core::blocks::storage::ImpresspressStorageBlock>,
-        ),
-        JsValue,
-    > {
+    pub async fn build(&self, dynamic: &[DynamicBlock]) -> Result<wafer_run::Wafer, JsValue> {
         #[cfg(not(feature = "browser-devtools"))]
         let _ = dynamic;
 
@@ -530,14 +520,14 @@ impl RuntimeFactory {
         // the crypto service that signs with it.
         let jwt_secret_handle = builder.jwt_secret_handle();
 
-        let (mut wafer, storage_block) = builder
+        let mut wafer = builder
             .build()
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         wafer.set_asset_loader(&impresspress_browser::make_sw_asset_loader());
 
         // ── Phase 2 ─────────────────────────────────────────────────────────
         // Run the shared boot funnel: grants → seal → init_block(admin) →
-        // seed_after_admin_init → the remaining blocks → post_start.
+        // seed_after_admin_init → the remaining blocks.
         //
         // admin's `lifecycle(Init)` runs FIRST so its migrations create the
         // canonical `impresspress__admin__variables` + `block_settings` tables
@@ -558,7 +548,6 @@ impl RuntimeFactory {
         };
         builder::boot(
             &mut wafer,
-            &storage_block,
             &hooks,
             // The admin permissions page is served in the browser too, so the
             // rows it writes are this runtime's deployment-owned grants. The
@@ -574,7 +563,7 @@ impl RuntimeFactory {
         .await
         .map_err(|e| JsValue::from_str(&format!("boot: {e}")))?;
 
-        Ok((wafer, storage_block))
+        Ok(wafer)
     }
 
     /// The `Content-Security-Policy` every response is served under.

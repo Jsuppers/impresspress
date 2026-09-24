@@ -185,11 +185,13 @@ mod planning {
         );
     }
 
-    /// Lazily added columns are always `TEXT` on SQLite (D1 + sql.js), matching
-    /// the historical lazy column-add type both backends hand-rolled.
+    /// Lazily added columns are always `TEXT` on SQLite (D1 + sql.js),
+    /// whatever the value a write carries.
     #[test]
     fn lazy_column_add_is_text_on_sqlite() {
-        let stmt = ddl::build_add_text_column("items", "newcol", SQLITE);
+        let stmt =
+            ddl::build_add_column_for_value("items", "newcol", &serde_json::json!(42), SQLITE)
+                .expect("a plain column name");
         assert_eq!(stmt.sql, r#"ALTER TABLE "items" ADD COLUMN "newcol" TEXT"#);
     }
 

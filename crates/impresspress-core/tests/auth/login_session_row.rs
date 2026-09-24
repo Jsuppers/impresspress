@@ -36,7 +36,7 @@ async fn collect_or_panic(out: OutputStream) -> BufferedResponse {
         Err(TerminalNotResponse::Error(e)) => {
             panic!("handler returned error: {} ({:?})", e.message, e.code)
         }
-        Err(TerminalNotResponse::Drop) => panic!("handler dropped the request"),
+        Err(TerminalNotResponse::Drop { .. }) => panic!("handler dropped the request"),
         Err(TerminalNotResponse::Continue(_)) => panic!("handler returned Continue"),
         Err(TerminalNotResponse::Malformed) => panic!("handler returned malformed stream"),
     }

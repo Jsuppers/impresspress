@@ -25,16 +25,13 @@
 //! WRAP's own-namespace rule, the `schema` capability, and the real database
 //! handler.
 //!
-//! Two things this cannot claim. `WasmiBlock`'s linker defines every host
+//! One thing this cannot claim: `WasmiBlock`'s linker defines every host
 //! import regardless of the capability set — enforcement is per call, off the
 //! store's host state — so there is no load-time import filtering here to
-//! exercise. And `Wafer::start()` recomputes each block's effective
-//! capabilities as `declared ∩ config` and pushes them back into the block
-//! (`runtime/seal.rs::compute_effective_capabilities`), so the set passed at
-//! load is replaced before the first request. Loading through the production
-//! constructor with the accepted spec still matters: it is the call
-//! production makes, it is what a probe (which never reaches `start`) runs
-//! under, and it keeps this test honest if either of those two facts changes.
+//! exercise. The capabilities passed at load are the guest's bound:
+//! `Wafer::start()` narrows them to what the guest declares (∩ its
+//! `capabilities` block config) and never widens them, so a guest runs under
+//! at most the accepted spec, as it does in the sandbox.
 //!
 //! # When it does not run
 //!
@@ -260,9 +257,10 @@ fn golden_wafer() -> Wafer {
 ///    [`ResourceLimits::default`], which is the fuel/memory pair
 ///    `dev_runtime::guest_limits` also builds.
 ///
-/// A `load_from_bytes` here would be `BlockCapabilities::unrestricted()` — a
-/// set no staged block is ever handed, and one that would make step 2's
-/// refusals irrelevant to what actually ran.
+/// A `load_from_bytes` here would carry no bound at all, leaving the guest's
+/// capabilities to whatever an operator's `capabilities` block config states
+/// (`none()` without one) — a set that has nothing to do with step 2's
+/// refusals.
 fn load_as_the_sandbox_does(name: &str, wasm: &[u8]) -> (WasmiBlock, DynamicBlockSpec) {
     let inspected = WasmiBlock::load_with_capabilities(wasm, BlockCapabilities::none())
         .unwrap_or_else(|e| panic!("inspect-load {name}: {e}"));
@@ -611,5 +609,46 @@ async fn a_hyphenated_block_cannot_reach_its_unhyphenated_twin() {
         subscriber_emails(&wafer, "myshop").await,
         vec!["twin@example.com".to_string()],
         "site/myshop's table holds only its own rows",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Native discovery
+// ---------------------------------------------------------------------------
+
+/// A block the deployment built and placed under `blocks/` runs with the
+/// capabilities it declares: native discovery approves the declaration of the
+/// deployment's own blocks. A block loaded with no stated bound runs with
+/// none, and the `table` template's `Init` then cannot create its table.
+#[tokio::test]
+async fn a_discovered_block_runs_with_the_capabilities_it_declares() {
+    if !buildable() {
+        return;
+    }
+    let wasm = build_template("table");
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("blocks/newsletter/target");
+    std::fs::create_dir_all(&target).expect("create the block's target dir");
+    std::fs::write(target.join("block.wasm"), &wasm).expect("place the block");
+
+    let mut wafer = golden_wafer();
+    impresspress_core::builder::register_discovered_blocks(&mut wafer, root.path())
+        .expect("discover the block");
+    let wafer = wafer.start().await.expect("start the runtime");
+
+    let effective = wafer
+        .effective_capabilities("site/newsletter")
+        .expect("the discovered block has effective capabilities");
+    assert!(
+        effective.schema,
+        "the declared schema capability: {effective:?}"
+    );
+    assert!(
+        effective.allows_collection("site__newsletter__subscribers"),
+        "the declared collection: {effective:?}"
+    );
+    assert_eq!(
+        subscribe(&wafer, "newsletter", "found@example.com").await,
+        200
     );
 }

@@ -64,7 +64,9 @@ fn rendered_block_info_parses_and_matches_the_typed_builder() {
 
     assert_eq!(parsed.name, "site/newsletter");
     assert_eq!(parsed.interface, "http-handler@v1");
-    parsed.validate().expect("a valid BlockInfo");
+    parsed
+        .validate("site/newsletter")
+        .expect("a valid BlockInfo");
 
     let subscribe = parsed
         .endpoints
@@ -121,7 +123,7 @@ fn a_block_that_claims_nothing_is_fully_sandboxed() {
     let parsed: wafer_block::BlockInfo = serde_json::from_str(&rendered)
         .unwrap_or_else(|e| panic!("BlockInfo JSON ({e}): {rendered}"));
     assert_eq!(parsed.name, "site/hello");
-    parsed.validate().expect("a valid BlockInfo");
+    parsed.validate("site/hello").expect("a valid BlockInfo");
     assert!(parsed.requires.is_empty());
 
     let caps = parsed.capabilities.as_ref().expect("capabilities");

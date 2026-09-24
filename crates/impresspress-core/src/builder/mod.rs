@@ -41,6 +41,8 @@ pub use prepared::PreparedPlanExporter;
 /// this crate's own test code cannot: that a runtime built for wasm32 really
 /// does carry all six middleware blocks. See
 /// [`registration::register_middleware_blocks`].
+#[cfg(feature = "wasm")]
+pub use registration::register_discovered_blocks;
 pub use registration::{register_middleware_blocks, MIDDLEWARE_BLOCKS};
 
 pub struct ImpresspressBuilder {

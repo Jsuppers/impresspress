@@ -31,10 +31,12 @@
 //!
 //! Tables themselves must exist before any `create()` — every block ships
 //! explicit `migrations/*.sql` applied from the `Init` lifecycle. The shared
-//! `DbExec::ensure_data_columns`/`ensure_query_columns` add only *columns* on
-//! demand (always `TEXT` on SQLite), matching the native sqlite/postgres
-//! backends. Reads against a missing table return empty/NotFound via the
-//! `dbx_table_exists` guard the defaults run first.
+//! `DbExec::ensure_data_columns` adds only a missing *column* a write's data
+//! names (always `TEXT` on SQLite), and `DbExec::require_columns` refuses a
+//! read, filter or guard naming an unknown column instead of adding it,
+//! matching the native sqlite/postgres backends. Under STRICT_SCHEMA (below)
+//! neither introspects. Reads against a missing table return empty/NotFound
+//! via the `dbx_table_exists` guard the defaults run first.
 //!
 //! ## Schema cache + STRICT_SCHEMA (wafer-run #313)
 //!
