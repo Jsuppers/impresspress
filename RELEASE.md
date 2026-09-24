@@ -118,10 +118,13 @@ lowest-sorting spelling, and the other rows are deleted. Adding 002 re-runs
 the vector migration set, which is safe: 001 is `CREATE … IF NOT EXISTS` and
 002 finds nothing to change the second time.
 
-**Without the migration.** An index whose name has an uppercase letter stays
-listed but cannot be opened until 002 runs. An index named with more than 33
-characters cannot be reached under this release; delete it before upgrading,
-or recreate it under a shorter name after.
+**Without the migration.** Until 002 runs, one index whose name has an
+uppercase letter is enough to make the vector admin's index list answer an
+error (its vector count cannot be read under that name), and the index itself
+cannot be opened, queried or deleted. An index named with more than 33
+characters cannot be opened, queried or deleted under this release at all,
+migration or not, and one long enough that a table name passes 63 bytes breaks
+the list the same way: delete it before upgrading.
 
 
 ### Config: your `.env` applies again, and one boot decides the ties
