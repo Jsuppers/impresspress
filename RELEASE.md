@@ -66,6 +66,44 @@ deploy, so a changed migration applies once, with the same consequences it has
 anywhere else: any edit to the auth migration SQL still re-runs the auth set
 and signs every user out, once.
 
+### wafer-run e17debe4: D1 statement budget, argon2 ceiling, vector store
+
+**What changes.**
+
+- On Cloudflare, every request now tracks the D1 queries it sends against
+  D1's per-invocation limit, and a `create_many` or `batch` that would not
+  fit what the request has left is refused before it runs, as a 429 whose
+  message gives the numbers, instead of failing part-way inside D1. The limit
+  is the new Worker var `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, default
+  `1000` (Workers Paid). A value that is not a whole number of at least 1
+  fails every request with an error naming the var. That 429 means the
+  request did too much: retrying it does the same work and is refused again.
+- Native SQLite and Postgres have no such limit, and now take a
+  `create_many` or `batch` of any size (the old fixed cap of 1000 is gone).
+- A dev-sandbox data import (`seed/data.json`) is one transaction: an import
+  that fails leaves every table, the users and their passwords included, as
+  it was. Before, a failure after the users table was replaced could leave
+  the instance with no account that can sign in.
+- A stored argon2 password hash whose memory cost is above 46 MiB can no
+  longer be used to sign in, on any target: it is refused before any
+  derivation runs. Nothing
+  impresspress writes comes near it (19 MiB native, 4 MiB Cloudflare); a hash
+  imported from elsewhere at argon2-cffi's or RFC 9106's 64 MiB default is.
+- A native build with `native-embedding` registers the `wafer-run/vector`
+  store without loading an embedding model, so the vector store is there
+  even when the model cannot be downloaded (embedding stays with
+  `impresspress/fastembed`, which loads its model on first use).
+- The browser registers an injected vector service and an injected
+  embedding service each on its own. A build with `block-fastembed` refuses
+  an injected embedding service, since `impresspress/fastembed` already
+  serves embeddings there.
+
+**Who has to act.** A Cloudflare deploy on the Workers Free plan: set
+`IMPRESSPRESS_D1_QUERIES_PER_INVOCATION = "50"` in `wrangler.toml`'s
+`[vars]`, or the budget will admit writes D1 then refuses part-way. A user
+whose password hash was imported from another system at more than 46 MiB:
+reset the password. Nobody else.
+
 ### wafer-run 11723941: cut-off streams, Postgres settings, security headers
 
 **What changes.**
