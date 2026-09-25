@@ -311,7 +311,7 @@ zip = { version = "2", default-features = false }
 # parses them rather than grepping: a hand-rolled line matcher on a manifest is
 # the sort of approximate second implementation that goes stale exactly like
 # the "keep in sync" comments that test replaces.
-toml = "0.8"
+toml = "1"
 # `tests/repo_door.rs` resolves each file's `use` trees (aliases, `self as`,
 # globs, imports through an alias) to decide which door constant a bare or
 # aliased path names. Parsing is the same choice as `toml` above: a text
