@@ -206,6 +206,38 @@ async fn role_create_denial_is_403() {
     report(misses);
 }
 
+/// A duplicate role name is the create's own `AlreadyExists`, and that alone
+/// is the 409. A create that fails for another reason is a fault even when
+/// the name it wrote is taken: nothing re-reads the key to reinterpret the
+/// failure, because every backend classifies a duplicate itself (the
+/// `DatabaseService` contract). A re-read after the refused write would find
+/// `auditor` and answer this `Internal` as a 409.
+#[tokio::test]
+async fn a_create_that_fails_as_a_fault_is_a_500_even_when_the_name_is_taken() {
+    let (ctx, _) = fixture().await;
+    let body = r#"{"name":"auditor"}"#;
+    output_json(api(&ctx, "create", "/b/admin/api/iam/roles", body).await).await;
+
+    let duplicate = api(&ctx, "create", "/b/admin/api/iam/roles", body).await;
+    assert_eq!(
+        crate::test_support::output_http_status(duplicate).await,
+        409,
+        "the duplicate's own AlreadyExists is the conflict"
+    );
+
+    let faulty = FailingDbOpContext::failing_with(
+        ctx.clone(),
+        vec![(wafer_block::ServiceOp::DATABASE_CREATE, ROLES_TABLE)],
+        WaferError::new(ErrorCode::Internal, "disk I/O error"),
+    );
+    let out = api(&faulty, "create", "/b/admin/api/iam/roles", body).await;
+    assert_eq!(
+        crate::test_support::output_http_status(out).await,
+        500,
+        "a fault is not reinterpreted as a conflict by reading the key back"
+    );
+}
+
 /// The grant write, and the session invalidation after it lands (a write to
 /// the users table): a refusal at either is the deployment's grant, not an
 /// outage.
