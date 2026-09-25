@@ -899,6 +899,12 @@ mod boot_tests {
 
     #[async_trait::async_trait]
     impl DatabaseService for ErroringDb {
+        fn statement_budget(
+            &self,
+        ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError>
+        {
+            Ok(wafer_core::interfaces::database::service::StatementBudget::Unbounded)
+        }
         async fn schema_table_exists(&self, _name: &str) -> Result<bool, DatabaseError> {
             Err(DatabaseError::Internal(
                 "simulated wrap_grants existence-check failure".into(),

@@ -13,12 +13,42 @@
 //! `create_many`, `batch` and the guarded writes all reach D1 through one
 //! primitive, [`DbExec::run_transaction`], which this adapter implements with
 //! D1's native `db.batch()`: the statements run in order inside one implicit
-//! transaction and a failing statement rolls every earlier one back. The
-//! database handler caps one call at
-//! [`MAX_BATCH_WRITES`](wafer_block::wire::database::MAX_BATCH_WRITES)
-//! statements, which wafer sizes to the Workers Paid per-invocation D1 query
-//! limit (1000) counting each statement as a query; the Free plan allows 50,
-//! so a Free-plan deploy has to keep its calls smaller than the cap.
+//! transaction and a failing statement rolls every earlier one back.
+//!
+//! ## The per-invocation statement budget
+//!
+//! D1 runs at most a fixed number of queries per Worker invocation: 1000 on
+//! Workers Paid, 50 on the Free plan (D1's limits page, "Queries per Worker
+//! invocation"). A deploy states its plan's number in the
+//! `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` Worker var (default 1000; a
+//! Free-plan deploy sets 50), read once per invocation by
+//! [`CfEnvironment::capture`](crate::environment::CfEnvironment::capture).
+//!
+//! Every D1 service built in one invocation shares one [`D1QueryCount`],
+//! created at the Worker entry (`run_with_config`, `run_scheduled_with_config`)
+//! and counted ONLY in the statement-sending primitives below: one per
+//! `run_fetch`/`run_fetch_one`/`run_execute`/`run_scalar_*`, and one per
+//! statement of a `run_batch`/`run_transaction` (D1's limits page does not say
+//! whether a `db.batch()` counts as one query or N; N is the conservative
+//! reading). A statement is counted when it is sent, not when it succeeds,
+//! because D1 counts it either way. [`DbExec::statement_budget`] reports that
+//! count against the limit, and `wafer-core` admits every `create_many` and
+//! `batch` against it — in the database handler before the service runs, and
+//! again before the transaction's first statement — so a write the invocation
+//! cannot finish is refused whole instead of failing part-way inside D1.
+//!
+//! The counter is the invocation's, not the isolate's: one isolate interleaves
+//! concurrent requests, and each has its own D1 limit. So it is never a
+//! thread-local.
+//!
+//! A refusal because the invocation has run out is
+//! [`DatabaseError::ResourceExhausted`], which a client sees as HTTP 429. It
+//! does NOT mean "retry later": the same request retried does the same work
+//! and is refused again, so a client that auto-retries 429s would loop. It
+//! means this request asked for more statements than one invocation may run;
+//! the fix is a smaller request (or, on a plan that allows more, a raised
+//! `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`). A write larger than the whole
+//! limit is `InvalidArgument`.
 //!
 //! ## A taken key
 //!
@@ -93,6 +123,7 @@
 //! [`D1DatabaseService::schema_cache`].
 
 use std::{
+    cell::Cell,
     rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -105,7 +136,8 @@ use wafer_core::interfaces::database::{
     schema_cache::SchemaCache,
     service::{
         AggregateSpec, CapGuard, Column, DatabaseError, DatabaseService, GuardedInsert,
-        GuardedUpdate, Record, RecordList, Table, UpsertSpec, WriteOp, WriteOutcome,
+        GuardedUpdate, Record, RecordList, StatementBudget, Table, UpsertSpec, WriteOp,
+        WriteOutcome,
     },
 };
 use wafer_sql_utils::{introspect, Backend};
@@ -172,6 +204,35 @@ pub(crate) fn forget_isolate_schema() {
     ISOLATE_SCHEMA_CACHE.with(IdentityCache::clear);
 }
 
+/// The D1 statements one Worker invocation has sent, shared by every
+/// [`D1DatabaseService`] built in that invocation (see the module docs).
+///
+/// Create one at the Worker entry, once per `fetch` or `scheduled`
+/// invocation, and hand a clone to each service built while serving it: the
+/// request's own services, the runtime build's pre-`Init` handle, the
+/// request-log drain run from `ctx.wait_until`. They all count against the
+/// one D1 limit. Never keep one past its invocation or share it between two:
+/// an isolate interleaves concurrent requests, and each has its own limit.
+#[derive(Clone, Default)]
+pub struct D1QueryCount(Rc<Cell<u64>>);
+
+impl D1QueryCount {
+    /// A fresh count for a new invocation.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Statements sent in this invocation so far.
+    pub fn sent(&self) -> u64 {
+        self.0.get()
+    }
+
+    fn add(&self, statements: usize) {
+        let statements = u64::try_from(statements).unwrap_or(u64::MAX);
+        self.0.set(self.0.get().saturating_add(statements));
+    }
+}
+
 /// Async database service wrapping Cloudflare D1.
 pub struct D1DatabaseService {
     db: D1Database,
@@ -189,6 +250,11 @@ pub struct D1DatabaseService {
     /// the struct keeps the `Sync` bound `Arc<dyn DatabaseService>` needs; on
     /// wasm32's single thread the ordering is immaterial.
     strict_schema: AtomicBool,
+    /// This invocation's statement count (see [`D1QueryCount`]).
+    queries: D1QueryCount,
+    /// Statements one invocation may send: this deploy's
+    /// `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`.
+    query_limit: u64,
 }
 
 impl D1DatabaseService {
@@ -211,11 +277,23 @@ impl D1DatabaseService {
     /// `binding` is the D1 binding `db` came from. It is the key of the
     /// isolate's schema cache ([`isolate_schema_cache`]): two bindings are two
     /// databases, and one table name can name a different schema in each.
-    pub fn new(db: D1Database, strict_schema: bool, binding: &str) -> Self {
+    ///
+    /// `queries` is the invocation's statement count, shared with every other
+    /// D1 service built in it, and `query_limit` the statements one invocation
+    /// may send (see the module docs on the per-invocation budget).
+    pub fn new(
+        db: D1Database,
+        strict_schema: bool,
+        binding: &str,
+        queries: D1QueryCount,
+        query_limit: u64,
+    ) -> Self {
         Self {
             db,
             schema_cache: isolate_schema_cache(binding),
             strict_schema: AtomicBool::new(strict_schema),
+            queries,
+            query_limit,
         }
     }
 
@@ -296,6 +374,15 @@ impl DbExec for D1DatabaseService {
         self.strict_schema.load(Ordering::Relaxed)
     }
 
+    /// D1's per-invocation query limit and the statements this invocation has
+    /// sent through every D1 service sharing its [`D1QueryCount`].
+    fn statement_budget(&self) -> Result<StatementBudget, DatabaseError> {
+        Ok(StatementBudget::Limited {
+            limit: self.query_limit,
+            used: self.queries.sent(),
+        })
+    }
+
     async fn run_fetch(
         &self,
         sql: &str,
@@ -303,6 +390,7 @@ impl DbExec for D1DatabaseService {
         json: &JsonColumns,
     ) -> Result<Vec<Record>, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
+        self.queries.add(1);
         let results = stmt.all().await.map_err(db_err)?;
         let rows: Vec<serde_json::Value> = results.results().map_err(db_err)?;
         Ok(rows
@@ -318,6 +406,7 @@ impl DbExec for D1DatabaseService {
         json: &JsonColumns,
     ) -> Result<Record, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
+        self.queries.add(1);
         let row = match stmt.first::<serde_json::Value>(None).await {
             Ok(row) => row,
             // A `get`-by-id against a not-yet-created table is "not found",
@@ -334,15 +423,14 @@ impl DbExec for D1DatabaseService {
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<i64, DatabaseError> {
-        let result = self
-            .prepare_bind(sql, params)?
-            .run()
-            .await
-            .map_err(db_err)?;
+        let stmt = self.prepare_bind(sql, params)?;
+        self.queries.add(1);
+        let result = stmt.run().await.map_err(db_err)?;
         changes(&result)
     }
 
-    /// Delegates to [`run_fetch`](Self::run_fetch): a D1 binding is one
+    /// Delegates to [`run_fetch`](Self::run_fetch), which counts the
+    /// statement: a D1 binding is one
     /// handle, and every statement this adapter issues goes through
     /// `db.prepare()` on it — there is no reader/writer split for a
     /// `DELETE … RETURNING` to land on the wrong side of, and
@@ -373,6 +461,7 @@ impl DbExec for D1DatabaseService {
         params: &[serde_json::Value],
     ) -> Result<i64, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
+        self.queries.add(1);
         let row = stmt
             .first::<serde_json::Value>(None)
             .await
@@ -386,6 +475,7 @@ impl DbExec for D1DatabaseService {
         params: &[serde_json::Value],
     ) -> Result<f64, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
+        self.queries.add(1);
         let row = stmt
             .first::<serde_json::Value>(None)
             .await
@@ -393,6 +483,7 @@ impl DbExec for D1DatabaseService {
         Ok(scalar_f64(row))
     }
 
+    /// Counted by the `run_scalar_i64` it sends through, not here.
     async fn dbx_table_exists(&self, table: &str) -> Result<bool, DatabaseError> {
         let (sql, params) = introspect::build_table_exists(table, Backend::Sqlite);
         Ok(self.run_scalar_i64(&sql, &params).await? > 0)
@@ -454,6 +545,7 @@ impl DbExec for D1DatabaseService {
             let (sql, params) = op.sql_params();
             statements.push(self.prepare_bind(sql, params)?);
         }
+        self.queries.add(statements.len());
         let results = self.db.batch(statements).await.map_err(db_err)?;
 
         // D1 returns exactly one result per submitted statement, in order. A
@@ -524,6 +616,7 @@ impl DbExec for D1DatabaseService {
             let (sql, params) = op.sql_params();
             statements.push(self.prepare_bind(sql, params)?);
         }
+        self.queries.add(statements.len());
         let results = self.db.batch(statements).await.map_err(db_err)?;
         if results.len() != ops.len() {
             return Err(DatabaseError::Internal(format!(
@@ -766,6 +859,10 @@ impl DatabaseService for D1DatabaseService {
     fn set_strict_schema(&self, enabled: bool) {
         self.strict_schema.store(enabled, Ordering::Relaxed);
     }
+
+    fn statement_budget(&self) -> Result<StatementBudget, DatabaseError> {
+        DbExec::statement_budget(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1045,12 @@ mod tests {
         assert_eq!(scalar_f64(None), 0.0);
     }
 
+    /// A D1 service over `db` with a fresh invocation count and the Workers
+    /// Paid query limit, for the tests that are not about the budget.
+    fn service(db: D1Database, strict_schema: bool, binding: &str) -> D1DatabaseService {
+        D1DatabaseService::new(db, strict_schema, binding, D1QueryCount::new(), 1000)
+    }
+
     /// A `D1Database` that is never queried.
     ///
     /// `unchecked_into` only re-types the `JsValue`; it calls nothing on it.
@@ -968,8 +1071,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn every_d1_service_in_an_isolate_shares_one_schema_cache() {
         forget_isolate_schema();
-        let request_one = D1DatabaseService::new(never_queried_handle(), true, "DB");
-        let request_two = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let request_one = service(never_queried_handle(), true, "DB");
+        let request_two = service(never_queried_handle(), true, "DB");
         let cache = DbExec::schema_cache(&request_one).expect("the D1 backend keeps a cache");
         let other = DbExec::schema_cache(&request_two).expect("so does every other handle");
         assert!(std::ptr::eq(cache, other), "one isolate, one cache");
@@ -1062,7 +1165,7 @@ mod tests {
         forget_isolate_schema();
         let present = Rc::new(std::cell::Cell::new(false));
         let probes = Rc::new(std::cell::Cell::new(0u32));
-        let svc = D1DatabaseService::new(
+        let svc = service(
             scripted_d1(Rc::clone(&present), Rc::clone(&probes)),
             false,
             "DB",
@@ -1106,11 +1209,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn a_second_binding_is_not_answered_from_the_firsts_schema() {
         forget_isolate_schema();
-        let primary = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let primary = service(never_queried_handle(), true, "DB");
         let cache = DbExec::schema_cache(&primary).expect("a cache");
         cache.set_primary_key_if_gen("shared_name", vec!["id".into()], cache.generation());
 
-        let secondary = D1DatabaseService::new(never_queried_handle(), true, "ARCHIVE_DB");
+        let secondary = service(never_queried_handle(), true, "ARCHIVE_DB");
         assert_eq!(
             DbExec::schema_cache(&secondary)
                 .expect("a cache")
@@ -1126,10 +1229,10 @@ mod tests {
     #[wasm_bindgen_test]
     fn a_rebuild_forgets_what_the_isolate_had_memoized() {
         forget_isolate_schema();
-        let before = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let before = service(never_queried_handle(), true, "DB");
         let cache = DbExec::schema_cache(&before).expect("a cache");
         cache.set_primary_key_if_gen("rebuilt_t", vec!["id".into()], cache.generation());
-        let next_request = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let next_request = service(never_queried_handle(), true, "DB");
         assert_eq!(
             DbExec::schema_cache(&next_request)
                 .expect("a cache")
@@ -1140,7 +1243,7 @@ mod tests {
 
         forget_isolate_schema();
 
-        let after = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let after = service(never_queried_handle(), true, "DB");
         assert_eq!(
             DbExec::schema_cache(&after)
                 .expect("a cache")
@@ -1161,7 +1264,7 @@ mod tests {
     /// single drain.
     #[wasm_bindgen_test]
     fn a_d1_service_is_born_with_the_deploys_strict_schema_verdict() {
-        let strict = D1DatabaseService::new(never_queried_handle(), true, "DB");
+        let strict = service(never_queried_handle(), true, "DB");
         assert!(
             DbExec::strict_schema(&strict),
             "a service constructed with STRICT_SCHEMA on must already skip the \
@@ -1169,7 +1272,7 @@ mod tests {
              `set_strict_schema` on the drain or pre-Init handles",
         );
 
-        let lax = D1DatabaseService::new(never_queried_handle(), false, "DB");
+        let lax = service(never_queried_handle(), false, "DB");
         assert!(
             !DbExec::strict_schema(&lax),
             "and a service constructed with it off must still introspect",
@@ -1183,7 +1286,7 @@ mod tests {
     /// the constructor.
     #[wasm_bindgen_test]
     fn lifecycle_init_still_overrides_the_constructed_verdict() {
-        let svc = D1DatabaseService::new(never_queried_handle(), false, "DB");
+        let svc = service(never_queried_handle(), false, "DB");
         DatabaseService::set_strict_schema(&svc, true);
         assert!(DbExec::strict_schema(&svc));
 
@@ -1399,7 +1502,7 @@ mod tests {
     async fn create_many_is_one_batch_of_one_insert_per_row() {
         forget_isolate_schema();
         let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let svc = D1DatabaseService::new(
+        let svc = service(
             batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
             true,
             "DB",
@@ -1422,7 +1525,7 @@ mod tests {
     async fn run_transaction_decodes_each_result_as_its_op_asked() {
         forget_isolate_schema();
         let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let svc = D1DatabaseService::new(
+        let svc = service(
             batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
             true,
             "DB",
@@ -1467,7 +1570,7 @@ mod tests {
             None,
         ] {
             forget_isolate_schema();
-            let svc = D1DatabaseService::new(
+            let svc = service(
                 batching_d1(
                     BatchAnswer::Reject {
                         message: "D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT",
@@ -1498,7 +1601,7 @@ mod tests {
     async fn a_create_refused_for_a_taken_key_is_already_exists() {
         let create = |answer: BatchAnswer| async move {
             forget_isolate_schema();
-            let svc = D1DatabaseService::new(
+            let svc = service(
                 batching_d1(answer, Rc::new(std::cell::RefCell::new(Vec::new()))),
                 true,
                 "DB",
@@ -1542,7 +1645,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn a_batch_refused_for_anything_else_is_internal() {
         forget_isolate_schema();
-        let svc = D1DatabaseService::new(
+        let svc = service(
             batching_d1(
                 BatchAnswer::Reject {
                     message: "D1_ERROR: NOT NULL constraint failed: t.path: SQLITE_CONSTRAINT",
@@ -1557,5 +1660,218 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(matches!(err, DatabaseError::Internal(_)), "{err:?}");
+    }
+
+    // ── The per-invocation statement budget ─────────────────────────────────
+
+    fn used(svc: &D1DatabaseService) -> u64 {
+        match DbExec::statement_budget(svc) {
+            Ok(StatementBudget::Limited { used, .. }) => used,
+            other => panic!("a D1 service reports a limited budget: {other:?}"),
+        }
+    }
+
+    /// **Every statement-sending primitive counts what it sends, once.** A
+    /// lone statement is one; a `db.batch()` is one per statement; the
+    /// table-exists probe and `run_execute_returning` are counted by the
+    /// primitive they send through, not a second time on top.
+    #[wasm_bindgen_test]
+    async fn each_primitive_counts_the_statements_it_sends() {
+        forget_isolate_schema();
+        let svc = service(
+            batching_d1(
+                BatchAnswer::Succeed,
+                Rc::new(std::cell::RefCell::new(Vec::new())),
+            ),
+            true,
+            "DB",
+        );
+        let json = JsonColumns::NONE;
+        let mut expected = 0;
+        let mut step = |what: &str, delta: u64, svc: &D1DatabaseService| {
+            expected += delta;
+            assert_eq!(used(svc), expected, "after {what}");
+        };
+
+        DbExec::run_fetch(&svc, "SELECT 1", &[], json)
+            .await
+            .expect("fetch");
+        step("run_fetch", 1, &svc);
+        DbExec::run_fetch_one(&svc, "SELECT 1", &[], json)
+            .await
+            .expect("fetch one");
+        step("run_fetch_one", 1, &svc);
+        DbExec::run_execute(&svc, "UPDATE t SET a = 1", &[])
+            .await
+            .expect("execute");
+        step("run_execute", 1, &svc);
+        DbExec::run_execute_returning(&svc, "DELETE FROM t RETURNING *", &[], json)
+            .await
+            .expect("execute returning");
+        step("run_execute_returning", 1, &svc);
+        DbExec::run_scalar_i64(&svc, "SELECT 1", &[])
+            .await
+            .expect("scalar i64");
+        step("run_scalar_i64", 1, &svc);
+        DbExec::run_scalar_f64(&svc, "SELECT 1", &[])
+            .await
+            .expect("scalar f64");
+        step("run_scalar_f64", 1, &svc);
+        DbExec::dbx_table_exists(&svc, "t").await.expect("probe");
+        step("dbx_table_exists", 1, &svc);
+        DbExec::run_batch(
+            &svc,
+            &[
+                BatchOp::Execute {
+                    sql: "UPDATE t SET a = 1",
+                    params: &[],
+                },
+                BatchOp::Execute {
+                    sql: "UPDATE t SET a = 2",
+                    params: &[],
+                },
+            ],
+        )
+        .await
+        .expect("batch");
+        step("run_batch of 2", 2, &svc);
+        DbExec::run_transaction(
+            &svc,
+            &[
+                TxOp::Execute {
+                    sql: "UPDATE t SET a = 1",
+                    params: &[],
+                },
+                TxOp::Execute {
+                    sql: "UPDATE t SET a = 2",
+                    params: &[],
+                },
+                TxOp::Execute {
+                    sql: "UPDATE t SET a = 3",
+                    params: &[],
+                },
+            ],
+        )
+        .await
+        .expect("transaction");
+        step("run_transaction of 3", 3, &svc);
+    }
+
+    /// A statement D1 refuses was still sent, and D1 counts it: the budget
+    /// counts it too.
+    #[wasm_bindgen_test]
+    async fn a_refused_statement_still_counts() {
+        forget_isolate_schema();
+        let svc = service(
+            batching_d1(
+                BatchAnswer::Reject {
+                    message: "D1_ERROR: NOT NULL constraint failed: t.path: SQLITE_CONSTRAINT",
+                    cause: None,
+                },
+                Rc::new(std::cell::RefCell::new(Vec::new())),
+            ),
+            true,
+            "DB",
+        );
+        DbExec::run_execute(&svc, "UPDATE t SET a = 1", &[])
+            .await
+            .expect_err("refused");
+        assert_eq!(used(&svc), 1);
+    }
+
+    /// **A write the invocation cannot finish never reaches D1.** After the
+    /// request has already run queries, a `create_many` that fits D1's limit
+    /// but not what this invocation has left is `ResourceExhausted` and sends
+    /// no `batch()`: D1 would otherwise run out part-way through the request.
+    /// The same write in an invocation that has run nothing goes through as
+    /// one batch.
+    #[wasm_bindgen_test]
+    async fn a_create_many_past_what_the_invocation_has_left_sends_no_batch() {
+        const LIMIT: u64 = 10;
+        let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let queries = D1QueryCount::new();
+        forget_isolate_schema();
+        let svc = D1DatabaseService::new(
+            batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
+            true,
+            "DB",
+            queries.clone(),
+            LIMIT,
+        );
+        for _ in 0..4 {
+            DatabaseService::query_raw(&svc, "SELECT 1", &[])
+                .await
+                .expect("an earlier query in this request");
+        }
+        assert_eq!(queries.sent(), 4);
+
+        let err = DatabaseService::create_many(&svc, "request_logs", rows(6))
+            .await
+            .expect_err("6 inserts do not fit what is left of 10 after 4");
+        assert!(
+            matches!(err, DatabaseError::ResourceExhausted(_)),
+            "{err:?}"
+        );
+        assert!(batches.borrow().is_empty(), "D1 was never sent the batch");
+
+        // A new invocation, the same write: it fits, and runs as one batch.
+        forget_isolate_schema();
+        let fresh = D1DatabaseService::new(
+            batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
+            true,
+            "DB",
+            D1QueryCount::new(),
+            LIMIT,
+        );
+        DatabaseService::create_many(&fresh, "request_logs", rows(6))
+            .await
+            .expect("a fresh invocation has room");
+        assert_eq!(batches.borrow().len(), 1);
+    }
+
+    /// **Two requests interleaved in one isolate count separately.** Each
+    /// invocation's D1 services share that invocation's [`D1QueryCount`] and
+    /// no other: a request is not refused for statements a concurrent request
+    /// in the same isolate sent. Their awaits interleave, as an isolate
+    /// serving two requests runs them.
+    #[wasm_bindgen_test]
+    async fn two_interleaved_invocations_do_not_share_a_count() {
+        forget_isolate_schema();
+        let d1 = || {
+            batching_d1(
+                BatchAnswer::Succeed,
+                Rc::new(std::cell::RefCell::new(Vec::new())),
+            )
+        };
+        let request_a = service(d1(), true, "DB");
+        let request_b = service(d1(), true, "DB");
+
+        async fn run(
+            svc: &D1DatabaseService,
+            name: &'static str,
+            statements: usize,
+            order: &std::cell::RefCell<Vec<&'static str>>,
+        ) {
+            for _ in 0..statements {
+                DatabaseService::query_raw(svc, "SELECT 1", &[])
+                    .await
+                    .expect("query");
+                order.borrow_mut().push(name);
+            }
+        }
+        let order = std::cell::RefCell::new(Vec::new());
+        futures::future::join(
+            run(&request_a, "a", 3, &order),
+            run(&request_b, "b", 5, &order),
+        )
+        .await;
+
+        assert!(
+            order.borrow().windows(2).any(|pair| pair[0] != pair[1]),
+            "the two requests' statements interleaved: {:?}",
+            order.borrow()
+        );
+        assert_eq!(used(&request_a), 3, "request A counts only its own");
+        assert_eq!(used(&request_b), 5, "request B counts only its own");
     }
 }

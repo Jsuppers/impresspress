@@ -105,17 +105,16 @@ pub struct ImpresspressBuilder {
     /// Directory the native ONNX embedding model's weights are cached in
     /// (downloaded there on first use).
     ///
-    /// Only used by the `block-fastembed` feature (`impresspress/fastembed`)
-    /// and the `native-embedding` feature (`wafer-run/vector`'s embedding
-    /// service). Kept as `Option` (rather than feature-gated) so platforms
-    /// can always pass it; a build with either feature on and no directory
-    /// is refused.
+    /// Only used by the `block-fastembed` feature (`impresspress/fastembed`,
+    /// which `native-embedding` implies). Kept as `Option` (rather than
+    /// feature-gated) so platforms can always pass it; a build with the
+    /// feature on and no directory is refused.
     model_cache_dir: Option<std::path::PathBuf>,
-    /// Browser-side `VectorService` + `EmbeddingService`. When both are
-    /// `Some`, `build()` registers `wafer-run/vector` (with the pair) and
-    /// `impresspress/transformers-embed` (with the embedding service). The
-    /// native `register_vector_block` path is gated behind the
-    /// `native-embedding` feature and remains unaffected.
+    /// Browser-side `VectorService` and `EmbeddingService`, each registered on
+    /// its own: `build()` registers `wafer-run/vector` over the vector
+    /// service and `impresspress/transformers-embed` over the embedding
+    /// service. The native `register_vector_block` path is gated behind the
+    /// `native-embedding` feature.
     extra_vector_service: Option<Arc<dyn wafer_core::interfaces::vector::service::VectorService>>,
     extra_embedding_service:
         Option<Arc<dyn wafer_core::interfaces::vector::service::EmbeddingService>>,
@@ -285,11 +284,9 @@ impl ImpresspressBuilder {
     }
 
     /// Inject a browser-side `VectorService` (e.g. `BrowserVectorService` from
-    /// `impresspress-browser`). When both `vector_service` and `embedding_service`
-    /// are provided, `build()` registers `wafer-run/vector` with the pair and
-    /// `impresspress/transformers-embed` with the embedding half. Mutually
-    /// exclusive with the `native-embedding` feature path — both produce
-    /// `wafer-run/vector` and would conflict on register.
+    /// `impresspress-browser`). `build()` registers `wafer-run/vector` over it.
+    /// Mutually exclusive with the `native-embedding` feature path — both
+    /// produce `wafer-run/vector`, and `build()` fails on the second register.
     pub fn vector_service(
         mut self,
         svc: Arc<dyn wafer_core::interfaces::vector::service::VectorService>,
@@ -299,7 +296,10 @@ impl ImpresspressBuilder {
     }
 
     /// Inject a browser-side `EmbeddingService` (e.g. `BrowserEmbeddingService`
-    /// from `impresspress-browser`). See `vector_service` for full semantics.
+    /// from `impresspress-browser`). `build()` registers
+    /// `impresspress/transformers-embed` over it. Refused in a build with the
+    /// `block-fastembed` feature, whose `impresspress/fastembed` already serves
+    /// `embedding@v1`.
     pub fn embedding_service(
         mut self,
         svc: Arc<dyn wafer_core::interfaces::vector::service::EmbeddingService>,
@@ -402,9 +402,9 @@ impl ImpresspressBuilder {
 
     /// Set the directory the native ONNX embedding model is cached in.
     ///
-    /// Consumed by the `block-fastembed` and `native-embedding` features,
-    /// whose `FastembedService`s download the model there on first use.
-    /// Without it, a build with either feature on returns an error: the
+    /// Consumed by the `block-fastembed` feature (which `native-embedding`
+    /// implies), whose `FastembedService` downloads the model there on first
+    /// use. Without it, a build with the feature on returns an error: the
     /// directory is the embedder's to choose, and `wafer-block-fastembed`
     /// reads none of its own.
     pub fn model_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {

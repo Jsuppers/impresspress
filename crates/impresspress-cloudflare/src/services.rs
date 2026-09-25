@@ -23,16 +23,21 @@ use crate::{
 /// binding name.
 ///
 /// The binding name must match a `[[d1_databases]]` entry in the consumer's
-/// `wrangler.toml` (e.g. `"DB"`).
+/// `wrangler.toml` (e.g. `"DB"`). `queries` is the calling invocation's
+/// [`D1QueryCount`](crate::database::D1QueryCount): create one per `fetch` or
+/// `scheduled` invocation and pass it to every D1 service built in it, so each
+/// reports what that invocation has left of D1's per-invocation query limit.
 pub fn make_d1_database_service(
     env: &worker::Env,
     binding: &str,
+    queries: &database::D1QueryCount,
 ) -> Result<Arc<dyn DatabaseService>, worker::Error> {
     let environment = crate::environment::CfEnvironment::capture(env);
     Ok(make_d1_database_service_concrete(
         env,
         &environment,
         binding,
+        queries,
     )?)
 }
 
@@ -51,12 +56,19 @@ pub fn make_d1_database_service(
 /// per-request var reads `CfEnvironment` exists to stop back on the path. The
 /// public wrappers above capture because a consumer hands them only an `Env`
 /// — the same shape [`make_console_logger`] uses.
+///
+/// `queries` is the invocation's statement count, shared by every D1 service
+/// built in it (see [`database::D1QueryCount`]).
 pub(crate) fn make_d1_database_service_concrete(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,
     binding: &str,
+    queries: &database::D1QueryCount,
 ) -> Result<Arc<database::D1DatabaseService>, worker::Error> {
-    Ok(Arc::new(d1_service(env.d1(binding)?, environment, binding)))
+    Ok(Arc::new(
+        d1_service(env.d1(binding)?, environment, binding, queries)
+            .map_err(worker::Error::RustError)?,
+    ))
 }
 
 /// The environment → adapter joint, split out from the binding lookup above so
@@ -67,13 +79,24 @@ pub(crate) fn make_d1_database_service_concrete(
 /// [`make_d1_database_service_concrete`] as a whole cannot run under
 /// `wasm-bindgen-test`. Everything it decides is here, where a test can hand
 /// in a handle directly; what stays uncovered is the binding lookup and the
-/// `Arc`. See `the_service_takes_its_strict_verdict_from_the_environment`.
+/// `Arc`. See `the_service_takes_its_strict_verdict_from_the_environment` and
+/// `the_service_takes_its_query_limit_from_the_environment`.
+///
+/// Fails when the deploy's `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` is not a
+/// usable limit.
 pub(crate) fn d1_service(
     db: worker::D1Database,
     environment: &crate::environment::CfEnvironment,
     binding: &str,
-) -> database::D1DatabaseService {
-    database::D1DatabaseService::new(db, environment.strict_schema_enabled(), binding)
+    queries: &database::D1QueryCount,
+) -> Result<database::D1DatabaseService, String> {
+    Ok(database::D1DatabaseService::new(
+        db,
+        environment.strict_schema_enabled(),
+        binding,
+        queries.clone(),
+        environment.d1_queries_per_invocation()?,
+    ))
 }
 
 /// Construct a [`DatabaseService`] backed by D1 with a Cloudflare KV cache
@@ -92,10 +115,14 @@ pub(crate) fn d1_service(
 ///
 /// Fails fast if the KV binding is missing — silent degradation would
 /// mask a config-drift outage.
+///
+/// `queries` is the calling invocation's statement count, as for
+/// [`make_d1_database_service`].
 pub fn make_kv_cached_database_service(
     env: &worker::Env,
     d1_binding: &str,
     kv_binding: &str,
+    queries: &database::D1QueryCount,
 ) -> Result<Arc<dyn DatabaseService>, worker::Error> {
     let environment = crate::environment::CfEnvironment::capture(env);
     let (db, _backend, _batch_db) = make_kv_cached_database_service_with_backend(
@@ -104,6 +131,7 @@ pub fn make_kv_cached_database_service(
         d1_binding,
         kv_binding,
         kv_cached_db::CacheMode::default(),
+        queries,
     )?;
     Ok(db)
 }
@@ -134,8 +162,9 @@ pub(crate) fn make_kv_cached_database_service_with_backend(
     d1_binding: &str,
     kv_binding: &str,
     mode: kv_cached_db::CacheMode,
+    queries: &database::D1QueryCount,
 ) -> Result<KvCachedDbServiceWithBackend, worker::Error> {
-    let d1 = make_d1_database_service_concrete(env, environment, d1_binding)?;
+    let d1 = make_d1_database_service_concrete(env, environment, d1_binding, queries)?;
     let inner: Arc<dyn DatabaseService> = d1.clone();
     let backend = make_kv_backend(env, kv_binding)?;
     let db = Arc::new(kv_cached_db::KvCachedD1DatabaseService::with_mode(
@@ -290,6 +319,16 @@ mod tests {
         )
     }
 
+    fn service(environment: &crate::environment::CfEnvironment) -> database::D1DatabaseService {
+        d1_service(
+            never_queried_handle(),
+            environment,
+            "DB",
+            &database::D1QueryCount::new(),
+        )
+        .expect("a usable environment")
+    }
+
     /// The joint between the environment and the adapter.
     ///
     /// `database::tests` proves the adapter honours whatever verdict it is
@@ -301,15 +340,45 @@ mod tests {
         let mut on = empty_environment();
         on.set_strict_schema_for_test("true");
         assert!(
-            DbExec::strict_schema(&d1_service(never_queried_handle(), &on, "DB")),
+            DbExec::strict_schema(&service(&on)),
             "a deploy that sets the var must get a strict service",
         );
 
         let off = empty_environment();
         assert!(
-            !DbExec::strict_schema(&d1_service(never_queried_handle(), &off, "DB")),
+            !DbExec::strict_schema(&service(&off)),
             "and one that does not must not — a hardcoded `true` is as wrong \
              as a hardcoded `false`",
         );
+    }
+
+    /// The D1 service reports this deploy's query limit, not a constant: a
+    /// Free-plan deploy's 50 must reach the budget the database handler admits
+    /// writes against, and an unusable value must refuse to build a service.
+    #[wasm_bindgen_test]
+    fn the_service_takes_its_query_limit_from_the_environment() {
+        use wafer_core::interfaces::database::service::StatementBudget;
+
+        let limit = |environment: &crate::environment::CfEnvironment| match DbExec::statement_budget(
+            &service(environment),
+        ) {
+            Ok(StatementBudget::Limited { limit, used: 0 }) => limit,
+            other => panic!("a D1 service reports a limited budget: {other:?}"),
+        };
+
+        assert_eq!(limit(&empty_environment()), 1000, "unset is Workers Paid");
+        let mut free = empty_environment();
+        free.set_d1_queries_per_invocation_for_test("50");
+        assert_eq!(limit(&free), 50);
+
+        let mut malformed = empty_environment();
+        malformed.set_d1_queries_per_invocation_for_test("fifty");
+        assert!(d1_service(
+            never_queried_handle(),
+            &malformed,
+            "DB",
+            &database::D1QueryCount::new()
+        )
+        .is_err());
     }
 }

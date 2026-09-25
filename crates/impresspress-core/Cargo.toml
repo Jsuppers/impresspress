@@ -76,16 +76,15 @@ llm = [
     "reqwest/stream",
     "block-llm",
 ]
-# Native ONNX-backed embedding block (impresspress/fastembed) + SQLite
-# vector service. Pulls in wafer-block-fastembed (ONNX Runtime) and
-# enables the `vectors` feature of wafer-block-sqlite (sqlite-vec).
-# Required to register the `impresspress/vector` feature block.
+# Native ONNX-backed embedding block (impresspress/fastembed) + the SQLite
+# vector store behind `wafer-run/vector`. Enables the `vectors` feature of
+# wafer-block-sqlite (sqlite-vec) for the store; the embedding model is the
+# fastembed block's alone, so the store is registered without loading it.
 #
 # Implies `block-fastembed` and `block-vector` — the native-embedding
 # path registers both blocks; leaving them off while turning this on
 # would compile-fail.
 native-embedding = [
-    "dep:wafer-block-fastembed",
     "dep:wafer-block-sqlite",
     "dep:rusqlite",
     "block-fastembed",
@@ -171,12 +170,12 @@ wafer-sql-utils = { workspace = true }
 # SSRF predicates (`is_blocked_url`, `is_blocked_ipv4`/`_ipv6`) shared with
 # wafer-run's network block, used by `ssrf.rs` and `util.rs`.
 wafer-net-security = { workspace = true }
-# Native ONNX embeddings (optional — gated behind `native-embedding`).
+# Native ONNX embeddings (optional — gated behind `block-fastembed`, which
+# `native-embedding` implies).
 wafer-block-fastembed = { workspace = true, optional = true }
-# SQLite vector service (optional — gated behind `native-embedding`).
-# Both deps required together: vector service needs a sqlite-vec-enabled
-# connection, embedding service is the only way to fulfil the
-# `wafer-run/vector` block's EmbeddingService slot.
+# SQLite vector service (optional — gated behind `native-embedding`): the
+# `SqliteVecService` behind `wafer-run/vector` needs a sqlite-vec-enabled
+# `rusqlite` connection, so both deps come in together.
 wafer-block-sqlite = { workspace = true, optional = true, features = ["vectors"] }
 rusqlite = { workspace = true, optional = true }
 # CRC-32 for `blocks::dev::zip`'s stored-entry writer (gated behind

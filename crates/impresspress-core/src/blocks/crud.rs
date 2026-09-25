@@ -49,7 +49,12 @@ use crate::{
 ///   `wafer_block::http_codec` already renders as 429. Its message is a
 ///   classified, client-actionable refusal from the service — the same class
 ///   this repo already echoes for `InvalidArgument` — so it is passed
-///   through rather than sanitized.
+///   through rather than sanitized. One such quota is the database's
+///   statement budget: on Cloudflare D1 a write that does not fit what the
+///   request has left of D1's per-invocation query limit is refused before it
+///   runs. That 429 means the request did too much, not "retry later": the
+///   same request retried does the same work and is refused again, so a
+///   client must not auto-retry it. Its message gives the numbers.
 /// - [`ErrorCode::AlreadyExists`] is a write that duplicates a primary or
 ///   unique key — a request the database refused, not a fault — so it is a
 ///   **409**. Every `DatabaseService` reports a duplicate this way (see

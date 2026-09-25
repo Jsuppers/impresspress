@@ -181,7 +181,7 @@ pub struct InfraConfig {
     /// Where the native ONNX embedding model's weights are cached
     /// (`IMPRESSPRESS_MODEL_CACHE_DIR`), handed to
     /// `ImpresspressBuilder::model_cache_dir`. Read only by a build with
-    /// the `native-embedding` feature.
+    /// the `block-fastembed` feature (which `native-embedding` implies).
     pub model_cache_dir: String,
     pub listener: ListenerEnv,
 }
