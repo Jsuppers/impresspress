@@ -324,15 +324,26 @@ impl RuntimeFactory {
         // writes, and on a fresh profile — no table yet — it answers the empty
         // settings this build used to start from. The boot hook still seeds,
         // and republishes whatever that changes, after admin's Init.
+        //
+        // And the browser consents to its own migrations, as the native CLI
+        // does with `--run-migrations`: loading a new bundle IS deploying it.
+        // There is no operator step, no `/_deploy/init`, and no other place a
+        // browser install could ever bless a changed migration, so without the
+        // consent a database created by an older bundle would log "schema
+        // drift" and keep its old schema for good. With it, the gate still
+        // skips a block whose recorded hash matches the code, so a migration
+        // runs once per change, not once per boot.
         let db = impresspress_browser::make_database_service();
         let initial_block_settings = impresspress_core::platform_state::block_settings::load(&db)
             .await
             .map_err(|e| JsValue::from_str(&format!("load block settings: {e}")))?;
         let mut initial_config = builder::RuntimeConfig::new();
-        initial_config.both(
-            impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
-            initial_block_settings.to_config_json(),
-        );
+        initial_config
+            .both(
+                impresspress_core::features::BLOCK_SETTINGS_CONFIG_KEY,
+                initial_block_settings.to_config_json(),
+            )
+            .both(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1");
         // The factory's own `SharedConfigSource`, EMPTY at this point and
         // filled by the boot hook below once admin's migration has created the
         // variables table.
@@ -371,7 +382,8 @@ impl RuntimeFactory {
         )]
         let mut security_headers = serde_json::json!({ "csp": self.csp() });
 
-        // Both config surfaces, holding only the block settings read above.
+        // Both config surfaces, holding only the block settings read above and
+        // the migration consent.
         // The browser cannot know a single VARIABLE at build time: the
         // `variables` table does not exist until admin's migration runs, so
         // every value arrives through `BrowserBootHooks::seed_after_admin_init`,

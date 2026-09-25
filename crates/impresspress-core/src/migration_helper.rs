@@ -190,9 +190,11 @@ pub async fn apply_if_blessed(
     }
 
     // Fresh install (no previous apply) bootstraps without operator consent —
-    // there's no prior schema to protect, and dev/test/browser-WASM modes
-    // can't pass `--run-migrations`. Operator gating still applies to
-    // SCHEMA CHANGES (current_hash non-empty + different code_hash below).
+    // there's no prior schema to protect, and dev/test modes can't pass
+    // `--run-migrations`. Operator gating still applies to SCHEMA CHANGES
+    // (current_hash non-empty + different code_hash below); the browser gives
+    // that consent on every boot, because loading its bundle is its deploy
+    // (`impresspress-web`'s `RuntimeFactory::build`).
     let is_fresh = state.current_hash.is_empty();
     let should_apply = is_fresh || run_requested || state.blessed_hash == code_hash;
     if !should_apply {

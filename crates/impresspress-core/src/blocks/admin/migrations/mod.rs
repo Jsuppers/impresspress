@@ -84,10 +84,11 @@ const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgr
 // carries the operator-facing version.
 //
 // Where it runs: native applies it before every boot, and a Cloudflare deploy
-// applies it through `/_deploy/init`. A browser install that already holds an
-// admin schema does not — nothing sets `IMPRESSPRESS_RUN_MIGRATIONS` there, so
-// the gate logs drift and skips it, and such a database keeps the old
-// non-unique table until it is recreated. `assign` behaves as before on it.
+// applies it through `/_deploy/init`. A browser install applies it on the
+// first boot of a bundle that carries it: the browser sets
+// `IMPRESSPRESS_RUN_MIGRATIONS` on every boot, since loading a new bundle is
+// its deploy, and the gate then re-runs admin's set once because its hash
+// changed.
 //
 // Re-runnable, which admin's migrations must be twice over: the gate re-runs
 // the whole concatenated set from 001 whenever its hash changes, and the
