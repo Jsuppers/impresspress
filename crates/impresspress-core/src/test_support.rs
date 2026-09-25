@@ -4726,6 +4726,53 @@ mod tests {
         assert_eq!(res.records.len(), 0);
     }
 
+    /// A block reached through the router that reads a table it holds no
+    /// grant for is refused, as the runtime refuses it — with no opt-in.
+    ///
+    /// Before the fixture enforced WRAP on every frame this passed silently:
+    /// `dispatch` ran the block with no WRAP check at all, so a block missing
+    /// its grant was certified by every routed test.
+    #[tokio::test]
+    async fn a_routed_block_reading_a_table_it_holds_no_grant_for_is_refused() {
+        /// Answers with the outcome of listing `wafer-run/auth`'s users.
+        struct ReadsAuthUsers;
+
+        #[wafer_block::wafer_async_trait]
+        impl Block for ReadsAuthUsers {
+            fn info(&self) -> BlockInfo {
+                BlockInfo::new("test/reader", "0.0.1", "http-handler@v1", "reads users")
+            }
+
+            async fn handle(
+                &self,
+                ctx: &dyn Context,
+                _msg: Message,
+                _input: InputStream,
+            ) -> OutputStream {
+                match db::list(ctx, "wafer_run__auth__users", &ListOptions::default()).await {
+                    Ok(_) => OutputStream::respond(b"read".to_vec()),
+                    Err(e) => OutputStream::error(e),
+                }
+            }
+        }
+
+        let mut ctx = TestContext::with_auth().await;
+        ctx.register_block("test/reader", Arc::new(ReadsAuthUsers));
+        ctx.add_extra_route(crate::routing::ExtraRoute::new(
+            "/b/reader",
+            "test/reader",
+            crate::routing::RouteAccess::Public,
+        ));
+
+        let out = ctx.dispatch(anon_msg("retrieve", "/b/reader")).await;
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::PermissionDenied, "{e:?}");
+            }
+            other => panic!("the ungranted read must be refused, got {other:?}"),
+        }
+    }
+
     /// The fixture's own frame is test setup: it writes and reads any table,
     /// as the admin block may.
     #[tokio::test]
