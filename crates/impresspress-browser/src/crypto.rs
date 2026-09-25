@@ -3,12 +3,18 @@
 //! Both halves are the shared `wafer-block-crypto` implementations; no
 //! cryptography is written here.
 //!
-//! **Passwords.** The native runtime hashes with argon2id, which takes minutes
-//! per hash in single-threaded wasm at the default cost, so this target selects
-//! the other scheme `wafer-block-crypto` supports:
+//! **Passwords.** The native runtime hashes with argon2id. On wasm32
+//! `wafer-block-crypto` runs every argon2 derivation in a working buffer it
+//! allocates once and keeps (19 MiB at the default cost, 4 MiB at
+//! `Argon2Cost::Constrained`), because linear memory never shrinks; in a
+//! Service Worker that memory is shared with sql.js for the worker's life.
+//! This target selects the other scheme `wafer-block-crypto` supports, which
+//! holds no working memory:
 //! [`PasswordScheme::Pbkdf2Sha256`] at
 //! [`PBKDF2_SHA256_RECOMMENDED_ITERATIONS`] (OWASP's 2023 recommendation; NIST
-//! SP 800-132's floor is 10,000). Verification does NOT consult that choice —
+//! SP 800-132's floor is 10,000). The trade is CPU: about 180 ms per hash in
+//! wasm32, where argon2id takes about 17-35 ms at the default cost.
+//! Verification does NOT consult that choice —
 //! [`primitives::verify_password_any_scheme`] dispatches on the scheme the
 //! stored hash itself names, so a credential written by any target verifies
 //! here and selecting a scheme is not a password reset. That is what lets a
@@ -17,8 +23,9 @@
 //!
 //! One consequence, because it is a real cost and not only a capability: this
 //! target will now RUN argon2id if a stored hash names it, at whatever cost
-//! that hash declares — about 19.9 MiB of linear memory for the default
-//! `m=19456`, permanently, since wasm memory never shrinks. That is the right
+//! that hash declares — the smallest of `wafer-block-crypto`'s kept buffers
+//! that holds it (19 MiB for the default `m=19456`), permanently, since wasm
+//! memory never shrinks. That is the right
 //! answer for verifying a credential someone actually owns, and the wrong
 //! answer for anything synthetic. It is why the login timing-equalization hash
 //! (`impresspress_core::blocks::auth::timing_equalization_hash`) is derived

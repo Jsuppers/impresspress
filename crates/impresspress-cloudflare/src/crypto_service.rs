@@ -9,8 +9,9 @@
 //! the PR #155 → #170 production auth regression.)
 //!
 //! Password hashing is the one deliberate platform divergence: argon2id at
-//! [`Argon2Cost::Constrained`] (4 MiB / 2 iters), because Workers'
-//! CPU/memory limits rule out the default cost. Written through the shared
+//! [`Argon2Cost::Constrained`] (4 MiB / 2 iters), because the Workers Free
+//! plan's CPU limit rules out the default cost (about 3-8 ms per hash against
+//! 17-35 ms in V8; memory is not the constraint, both fit an isolate). Written through the shared
 //! [`PasswordScheme`] selector so the choice is one value rather than a
 //! `hash_password` call site, and verified through
 //! [`primitives::verify_password_any_scheme`], which dispatches on the scheme
@@ -83,8 +84,8 @@ impl CryptoService for ImpresspressCryptoService {
     ///
     /// `primitives::verify_password` (what this called before) is argon2-only
     /// and maps every parse failure to `PasswordMismatch`, so a credential
-    /// written by the browser target — PBKDF2, because argon2id is
-    /// unaffordable in single-threaded wasm — could never be verified here and
+    /// written by the browser target — PBKDF2, which holds no working
+    /// memory in the Service Worker — could never be verified here and
     /// the logs said the user kept mistyping their password. The shared
     /// dispatcher recognises both schemes and answers a distinct
     /// `MalformedHash` for one it does not know, which is never an accept.
@@ -130,7 +131,7 @@ mod password_parity {
 
     /// A credential this Worker wrote before the change still verifies, and
     /// this target keeps writing argon2id at the constrained cost — the
-    /// Workers CPU/memory limits rule out the default one.
+    /// Workers Free plan's CPU limit rules out the default one.
     #[wasm_bindgen_test]
     fn a_worker_written_hash_is_constrained_argon2id_and_verifies() {
         let svc = svc();
@@ -144,6 +145,50 @@ mod password_parity {
         match svc.compare_hash("wrong", &hash) {
             Err(CryptoError::PasswordMismatch) => {}
             other => panic!("expected PasswordMismatch, got {other:?}"),
+        }
+    }
+
+    /// libargon2 known-answer hashes (argon2-cffi `low_level.hash_secret`,
+    /// salt `00..0f`), password `correcthorsebatterystaple`: one per argon2
+    /// working-memory class `wafer-block-crypto` keeps on wasm32 (the
+    /// constrained preset, the default preset a native runtime writes, and the
+    /// 46 MiB ceiling), each derived here in that class's kept buffer.
+    const KAT_PASSWORD: &str = "correcthorsebatterystaple";
+    const KAT_BY_CLASS: [&str; 3] = [
+        "$argon2id$v=19$m=4096,t=2,p=1$AAECAwQFBgcICQoLDA0ODw$DOJe9Dre1CKOGYGj/SicLaOiPXVXJ1Jame2jnwMAoGU",
+        "$argon2id$v=19$m=19456,t=2,p=1$AAECAwQFBgcICQoLDA0ODw$7RmKhudBqFsX3LFSkYHsVYCSSV/j3hL/zZ9AjkvygIo",
+        "$argon2id$v=19$m=47104,t=1,p=1$AAECAwQFBgcICQoLDA0ODw$xnXTdHV0WrguRO6PuHmv73XvW60GvsB6rAVhzZddIts",
+    ];
+
+    /// A credential written by another runtime at any cost up to the ceiling
+    /// — a native account at the default cost included — verifies in the
+    /// Worker, and a wrong password against it is a mismatch.
+    #[wasm_bindgen_test]
+    fn hashes_up_to_the_memory_ceiling_verify_in_the_worker() {
+        let svc = svc();
+        for hash in KAT_BY_CLASS {
+            svc.compare_hash(KAT_PASSWORD, hash)
+                .unwrap_or_else(|e| panic!("{hash}: {e:?}"));
+            match svc.compare_hash("wrong", hash) {
+                Err(CryptoError::PasswordMismatch) => {}
+                other => panic!("{hash}: expected PasswordMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    /// A stored hash above the 46 MiB memory ceiling (argon2-cffi's own
+    /// default, m=65536) is refused before any derivation, so it cannot grow
+    /// the isolate's memory, and it is refused as a hash this runtime will
+    /// not run, never as a wrong password.
+    #[wasm_bindgen_test]
+    fn a_hash_above_the_memory_ceiling_is_refused_not_derived() {
+        const OVER_CEILING: &str = "$argon2id$v=19$m=65536,t=3,p=4$AAECAwQFBgcICQoLDA0ODw$ig/1Ydv8lGLja+cEry2Q+/MeqvCw1xexf4oGjq9DiAQ";
+        match svc().compare_hash(KAT_PASSWORD, OVER_CEILING) {
+            Err(CryptoError::MalformedHash(msg)) => assert!(
+                msg.contains("m=65536 exceeds the ceiling of 47104"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected MalformedHash, got {other:?}"),
         }
     }
 
