@@ -247,3 +247,41 @@ test('a cold visitor gets WebMCP tools without a reload', async ({ page }) => {
   }, null, { timeout: 10_000 });
   expect(await names.jsonValue()).toContain('list_products');
 });
+
+test('a restarted service worker does not re-run migrations it already applied', async ({ page, context }) => {
+  // Every block's `lifecycle(Init)` applies its migrations unless the
+  // migration state stamped in `block_settings` says they are current, and it
+  // reads that state from the runtime's config snapshot. The browser used to
+  // build every runtime with an EMPTY snapshot — only the seed hook after
+  // admin's Init filled it — so admin found no state on every boot, re-ran all
+  // of its migrations against the database it had already migrated, and its
+  // `ALTER TABLE … ADD COLUMN`s logged SQLite's "duplicate column name" in the
+  // worker's console each time (seen live on the dev sandbox). Native and
+  // Cloudflare read the settings before the build; the browser now does too.
+  //
+  // A migration re-run shows nowhere but the worker's console, so that is
+  // what this reads: messages with no page came from the service worker.
+  const duplicateColumns: string[] = [];
+  context.on('console', (msg) => {
+    if (msg.page() === null && /duplicate column name/i.test(msg.text())) {
+      duplicateColumns.push(msg.text());
+    }
+  });
+
+  // First boot: a fresh profile, so every migration runs once.
+  await page.goto('/', { waitUntil: 'commit' });
+  await page.waitForURL(/\/b\/auth\/login/, { timeout: 30_000 });
+  await expect(page.locator('input#email')).toBeVisible();
+
+  // Stop the worker. The next request starts a new one, whose `initialize()`
+  // boots a fresh runtime over the database the first boot left in OPFS —
+  // the same thing a browser does when it evicts an idle worker.
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('ServiceWorker.enable');
+  await cdp.send('ServiceWorker.stopAllWorkers');
+
+  await page.reload({ waitUntil: 'commit' });
+  await expect(page.locator('input#email')).toBeVisible({ timeout: 30_000 });
+
+  expect(duplicateColumns).toEqual([]);
+});
