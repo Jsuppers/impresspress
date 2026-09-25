@@ -534,7 +534,7 @@ impl ImpresspressBuilder {
 /// builder call that supplies it. `feature` is the Cargo feature that needs
 /// it, so the error says why the directory is asked for.
 #[cfg(feature = "block-fastembed")]
-fn required_model_cache_dir<'a>(
+pub(crate) fn required_model_cache_dir<'a>(
     dir: Option<&'a std::path::Path>,
     feature: &str,
 ) -> Result<&'a std::path::Path, RuntimeError> {

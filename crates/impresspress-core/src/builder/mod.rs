@@ -43,6 +43,8 @@ pub use prepared::PreparedPlanExporter;
 /// [`registration::register_middleware_blocks`].
 #[cfg(feature = "wasm")]
 pub use registration::register_discovered_blocks;
+#[cfg(feature = "block-fastembed")]
+pub(crate) use registration::required_model_cache_dir;
 pub use registration::{register_middleware_blocks, MIDDLEWARE_BLOCKS};
 
 pub struct ImpresspressBuilder {

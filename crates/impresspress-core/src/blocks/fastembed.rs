@@ -477,4 +477,23 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .is_none());
     }
+
+    /// The cache directory is the embedder's to choose: a build that turns
+    /// this block on without one is refused, naming the builder call that
+    /// supplies it, rather than falling back to a directory nobody picked.
+    #[test]
+    fn a_build_without_a_model_cache_dir_is_refused() {
+        let err = crate::builder::required_model_cache_dir(None, "block-fastembed")
+            .expect_err("no directory must be refused");
+        let text = err.to_string();
+        assert!(text.contains(".model_cache_dir("), "{text}");
+        assert!(text.contains("block-fastembed"), "{text}");
+
+        let dir = std::path::Path::new("/var/cache/models");
+        assert_eq!(
+            crate::builder::required_model_cache_dir(Some(dir), "block-fastembed")
+                .expect("a directory is used as given"),
+            dir
+        );
+    }
 }
