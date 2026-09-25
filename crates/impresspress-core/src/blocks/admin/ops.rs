@@ -1636,8 +1636,8 @@ mod tests {
     }
 
     /// A create that fails for a reason which is NOT a name collision keeps the
-    /// 500 — the re-read decides, so the classification cannot become "every
-    /// failed insert is a conflict".
+    /// 500 — only the write's own `AlreadyExists` is a conflict, so the
+    /// classification cannot become "every failed insert is a conflict".
     #[tokio::test]
     async fn a_create_that_fails_without_a_collision_is_still_internal() {
         let ctx = admin_ctx().await.break_writes();
@@ -1650,7 +1650,7 @@ mod tests {
         assert_eq!(
             crate::test_support::output_http_status(out).await,
             500,
-            "no row holds the key, so the write's own failure is the answer",
+            "a failure other than AlreadyExists is the write's own fault",
         );
     }
 

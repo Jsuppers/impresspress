@@ -4489,10 +4489,10 @@ mod tests {
     /// *successful* write on a backend whose writes are supposed to be
     /// failing. A handler branch reachable only when a filtered write fails
     /// then looks covered while production can never enter it, which is
-    /// exactly how `restore_fails_loudly_when_the_slug_collision_probe_
-    /// cannot_run` came to assert an outcome production could not produce
-    /// (see its doc comment; that instance was fixed on `FailingReadsDb`,
-    /// leaving this one armed for the next test to use it).
+    /// exactly how the restore collision-probe test in
+    /// `products/tests/handler_tests.rs` came to assert an outcome production
+    /// could not produce (that instance was fixed on `FailingReadsDb`, leaving
+    /// this one armed for the next test to use it).
     #[tokio::test]
     async fn break_writes_fails_every_filtered_write() {
         let ctx = seeded_ctx().await.break_writes();

@@ -88,9 +88,9 @@ pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputS
 /// [`crate::ui::server_error_response`]), and what it answers instead is
 /// classified here like every other failed database call: a WRAP denial is
 /// the 403 page and a quota the 429 page ([`crate::ui::refused_response`]), a
-/// duplicate key keeps its 409, anything else is logged under `context` and answered with the styled 500.
-/// An API caller (an `Accept` without `text/html`) gets the same statuses as
-/// JSON.
+/// duplicate key keeps its 409, anything else is logged under `context` and
+/// answered with the styled 500. An API caller (an `Accept` without
+/// `text/html`) gets the same statuses as JSON.
 pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str) -> OutputStream {
     match classify_db_error(error, None, context) {
         DbFailure::Refused(error) => crate::ui::refused_response(msg, error),

@@ -39,8 +39,9 @@ use crate::blocks::crud::{classify_db_error, DbFailure};
 /// error goes through the database-error classifier every block uses
 /// ([`classify_db_error`]): a refusal arrives as `Backend(PermissionDenied
 /// "Access denied")`, `Backend(ResourceExhausted)` or, for a duplicate key,
-/// `Backend(AlreadyExists)`, with its detail logged under `context`. Of the rest, an unreachable or timed-out backend
-/// (`Unavailable`, `DeadlineExceeded`) is [`AuthError::ProviderDown`], which
+/// `Backend(AlreadyExists)`, with its detail logged under `context`. Of the
+/// rest, an unreachable or timed-out backend (`Unavailable`,
+/// `DeadlineExceeded`) is [`AuthError::ProviderDown`], which
 /// the auth handler answers `Unavailable` (503) so the client keeps its
 /// retry signal; any other failure is a genuine fault, logged here and sent
 /// on as a generic `Internal`.
