@@ -75,7 +75,9 @@ pub struct FastembedBlock {
 impl FastembedBlock {
     /// Build a `FastembedBlock` with a lazy service whose model weights are
     /// cached under `cache_dir` (downloaded there on first use) — the
-    /// embedder's [`ImpresspressBuilder::model_cache_dir`](crate::builder::ImpresspressBuilder::model_cache_dir).
+    /// directory the embedder hands
+    /// [`ImpresspressBuilder`](crate::builder::ImpresspressBuilder)'s
+    /// `model_cache_dir`.
     ///
     /// The model is loaded on first embed, not here — this is cheap enough
     /// to call from `blocks::all_block_infos()` without triggering an ONNX

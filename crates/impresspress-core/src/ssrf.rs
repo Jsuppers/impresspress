@@ -5,9 +5,10 @@
 //! never runs on that path.
 //!
 //! The heavy lifting is delegated to the shared `wafer-net-security`
-//! classifier ([`wafer_net_security::is_blocked_url`]): scheme, `localhost`, and every private/loopback/link-local/CGNAT
-//! IPv4/IPv6 literal (including the IPv6-embedded-v4 forms — NAT64, 6to4,
-//! IPv4-mapped, IPv4-compatible). It does NOT reimplement IP parsing.
+//! classifier ([`wafer_net_security::is_blocked_url`]): scheme, `localhost`,
+//! and every private/loopback/link-local/CGNAT IPv4/IPv6 literal (including
+//! the IPv6-embedded-v4 forms — NAT64, 6to4, IPv4-mapped, IPv4-compatible).
+//! It does NOT reimplement IP parsing.
 //!
 //! This module *adds* the two hostname rules that classifier cannot express,
 //! because it matches the bare string `localhost` and nothing else:

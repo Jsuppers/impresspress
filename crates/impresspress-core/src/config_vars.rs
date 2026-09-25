@@ -27,11 +27,10 @@ pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 /// operator decision rather than an admin-editable runtime toggle:
 /// `blocks::config`'s `served_only_from_boot_map` answers it from the boot map
 /// whatever the `variables` table holds, and `CONFIG_SET` refuses to write it.
-/// Each target threads it onto both config surfaces at boot, the way
-/// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is threaded — the native CLI from the
-/// process environment, the Cloudflare worker from a `wrangler.toml` var
-/// through `CfEnvironment`. Absent means `all`, which is the behaviour every
-/// existing deployment already has.
+/// Each target threads it onto both config surfaces at boot — the native CLI
+/// from the process environment, the Cloudflare worker from a `wrangler.toml`
+/// var through `CfEnvironment`. Absent means `all`, which is the behaviour
+/// every existing deployment already has.
 ///
 /// # Why this exists
 ///

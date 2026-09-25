@@ -142,12 +142,15 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
                 // Like a malformed row, one provider whose key cannot be
                 // read must not take the others down with it — and it must
                 // not run without the key it names either, so it is left
-                // out. Create and update refuse to store a row whose key
-                // cannot be read, so one arrives here when a read that
-                // succeeded at save fails now — the grant was withdrawn
-                // since, or the read failed transiently (the next reload
-                // retries it) — or when the row reached the table without
-                // going through create or update.
+                // out. Create, and an update whose body names `key_var`,
+                // refuse to store a row whose key cannot be read; an update
+                // that leaves `key_var` alone stores the row whatever its key
+                // reads now, so the admin can still disable or repoint it.
+                // One arrives here, then, when a read that succeeded at the
+                // last check fails now — the grant was withdrawn since, or
+                // the read failed transiently (the next reload retries it) —
+                // or when the row reached the table without going through
+                // create or update.
                 Err(e) => tracing::error!(
                     "skipping provider row {}: its key_var could not be read: {e}",
                     rec.id
