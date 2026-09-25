@@ -10,12 +10,41 @@ Impresspress uses [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH
 
 ## Upgrade Notes
 
-Notes for operators upgrading an **existing** deployment. Migrations are gated:
-they run on a fresh install, or when the operator opts in with
-`impresspress --run-migrations` (native) / `deploy-cloudflare.sh deploy
---run-migrations` (Cloudflare). So whenever a release's code half assumes a
-data repair the migration half performs, it has to be called out here — the
-two ship together but only one of them runs by default.
+Notes for operators upgrading an **existing** deployment. On native,
+migrations are gated: they run on a fresh install, or when the operator opts
+in with `impresspress serve --run-migrations`. A Cloudflare deploy
+(`impresspress deploy`, which has no such flag) always runs them: its
+`/_deploy/prepare` funnel applies every block's migrations before the new
+version is promoted. A browser install applies them on the first boot of a
+bundle that changes them. So whenever a release's code half assumes a data
+repair the migration half performs, it has to be called out here — on native
+the two ship together but only one of them runs by default.
+
+### WRAP grants: append-only has a column of its own (admin migration 005)
+
+**What changes.** A custom WRAP grant stores append-only access in a new
+`append` column of `impresspress__admin__wrap_grants` (`write = 0, append =
+1`) instead of as `write = 2`. Migration 005 adds the column and moves any
+`write = 2` row onto it. A row that sets both `write` and `append` is refused
+and left out of the runtime's grants, as is a leftover `write = 2`.
+
+**Why.** Releases from before append-only grants existed read `write` as a
+flag, where any non-zero value means read-write. Rolling back to one after an
+append-only row had been written would have turned that grant into a
+read-write one. Such a release ignores the new column, so it now reads an
+append-only row as read-only: a rollback narrows access instead of widening
+it.
+
+**What to expect.** The permissions form offers read-only and read-write, so
+no deployment should hold a `write = 2` row and the repair should find nothing.
+Native applies admin's DDL, 005 included, on every start, before the runtime
+is built. A browser install applies it on the first boot of this bundle, and a
+Cloudflare deploy in its `/_deploy/prepare` funnel before the new version is
+promoted. The only window without the column is while `/_deploy/init` or
+`/_deploy/prepare` builds its runtime, before the funnel migrates: grants
+loaded then still decode (a missing `append` reads as unset), and the funnel
+reloads them after migrating. This is an admin migration, not an auth one:
+nobody is signed out.
 
 ### Browser: migrations run once per change, not on every boot
 

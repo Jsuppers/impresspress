@@ -102,6 +102,32 @@ const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgr
 const SQL_004_SQLITE: &str = include_str!("004_user_roles_unique.sqlite.sql");
 #[cfg(feature = "postgres")]
 const SQL_004_POSTGRES: &str = include_str!("004_user_roles_unique.postgres.sql");
+// 005 gives an append-only WRAP grant a column of its own.
+//
+// `wrap_grants` used to spell append-only as `write = 2`. A binary built
+// before append grants existed decodes `write` as a flag — any non-zero value
+// is read-write — so rolling back past that release, after an append row had
+// been written, would have turned every append-only grant into a read-write
+// one. Stored as `write = 0, append = 1`, the same row reads as read-only to
+// such a binary, which knows nothing of the new column: a rollback narrows the
+// grant instead of widening it. `platform_state::wrap_grants` is the one codec
+// for the pair, and refuses a row that sets both.
+//
+// The `UPDATE` moves any `write = 2` row onto the new form. No shipped writer
+// produced one — the permissions form offers read-only and read-write — so on
+// a real deployment it normally finds nothing; it is there for a row written
+// by hand (the admin SQL explorer), so none is left in a spelling the codec
+// now refuses.
+//
+// Re-runnable, like the rest of admin's set (see 004's note): a second
+// `ADD COLUMN` is swallowed as a duplicate column by both migration runners,
+// and once no row holds `write = 2` the `UPDATE` matches nothing.
+//
+// This reasoning lives here rather than in the .sql files for the reason 002's
+// note above gives.
+const SQL_005_SQLITE: &str = include_str!("005_wrap_grants_append_column.sqlite.sql");
+#[cfg(feature = "postgres")]
+const SQL_005_POSTGRES: &str = include_str!("005_wrap_grants_append_column.postgres.sql");
 
 /// Ordered SQLite migration scripts for this block, as `(basename, content)`
 /// pairs. Feeds the runtime `lifecycle_init` apply path.
@@ -111,6 +137,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     (VARIABLES_BLOCK_COLUMN, SQL_002_SQLITE),
     ("003_block_settings_seed_hash", SQL_003_SQLITE),
     (USER_ROLES_UNIQUE, SQL_004_SQLITE),
+    (WRAP_GRANTS_APPEND_COLUMN, SQL_005_SQLITE),
 ];
 
 /// Basename of the `variables.block` column + backfill, named once so the
@@ -120,6 +147,10 @@ pub(crate) const VARIABLES_BLOCK_COLUMN: &str = "002_variables_block_column";
 /// Basename of the grant-uniqueness repair, named once so the migration list
 /// and the test that slices it cannot drift apart.
 pub(crate) const USER_ROLES_UNIQUE: &str = "004_user_roles_unique";
+
+/// Basename of the append-grant column, named once so the migration list and
+/// the test that slices it cannot drift apart.
+pub(crate) const WRAP_GRANTS_APPEND_COLUMN: &str = "005_wrap_grants_append_column";
 
 /// Ordered PostgreSQL migration scripts, matching [`SQLITE_MIGRATIONS`] one
 /// for one. Selected at runtime by `apply_migrations` and reused by
@@ -132,6 +163,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     SQL_002_POSTGRES,
     SQL_003_POSTGRES,
     SQL_004_POSTGRES,
+    SQL_005_POSTGRES,
 ];
 #[cfg(not(feature = "postgres"))]
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[];
@@ -175,6 +207,7 @@ pub fn ddl_files(db_type: &str) -> &'static [&'static str] {
             SQL_002_SQLITE,
             SQL_003_SQLITE,
             SQL_004_SQLITE,
+            SQL_005_SQLITE,
         ]
     }
 }
@@ -182,8 +215,10 @@ pub fn ddl_files(db_type: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "postgres")]
-    use super::{SQL_001_POSTGRES, SQL_002_POSTGRES, SQL_003_POSTGRES, SQL_004_POSTGRES};
-    use super::{SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE, SQL_004_SQLITE};
+    use super::{
+        SQL_001_POSTGRES, SQL_002_POSTGRES, SQL_003_POSTGRES, SQL_004_POSTGRES, SQL_005_POSTGRES,
+    };
+    use super::{SQL_001_SQLITE, SQL_002_SQLITE, SQL_003_SQLITE, SQL_004_SQLITE, SQL_005_SQLITE};
 
     #[test]
     fn sqlite_migrations_contain_expected_ddl() {
@@ -196,6 +231,8 @@ mod tests {
         assert!(SQL_003_SQLITE.contains("ADD COLUMN seed_defaults_hash"));
         // 004 grant uniqueness
         assert!(SQL_004_SQLITE.contains("CREATE UNIQUE INDEX IF NOT EXISTS"));
+        // 005 append-grant column
+        assert!(SQL_005_SQLITE.contains("ADD COLUMN append"));
     }
 
     #[test]
@@ -205,6 +242,7 @@ mod tests {
         assert!(SQL_002_POSTGRES.contains("ADD COLUMN"));
         assert!(SQL_003_POSTGRES.contains("seed_defaults_hash"));
         assert!(SQL_004_POSTGRES.contains("CREATE UNIQUE INDEX IF NOT EXISTS"));
+        assert!(SQL_005_POSTGRES.contains("ADD COLUMN IF NOT EXISTS append"));
     }
 }
 

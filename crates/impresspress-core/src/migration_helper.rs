@@ -220,10 +220,6 @@ pub async fn apply_if_blessed(
             // name". Treat that as a benign no-op so the rest of the
             // migration batch (and the final `write_state` stamp) can
             // still run. Every other DDL failure propagates.
-            //
-            // This is the same tolerance pattern the per-write column-add
-            // path uses in `impresspress-cloudflare::D1DatabaseService::
-            // add_missing_columns`.
             let msg = e.to_string();
             if is_alter_add_column(trimmed) && is_duplicate_column_error(&msg) {
                 tracing::debug!(
@@ -599,6 +595,33 @@ mod tests {
                 count, 2,
                 "admin {dialect} migration 004: expected 2 statements, got {count}"
             );
+        }
+    }
+
+    #[test]
+    fn admin_005_splits_into_its_column_and_its_repair() {
+        // The `ADD COLUMN` has to reach the runner on its own, so a re-run's
+        // duplicate-column error is recognised and the `UPDATE` still runs.
+        for (dialect, sql) in [
+            (
+                "sqlite",
+                include_str!("blocks/admin/migrations/005_wrap_grants_append_column.sqlite.sql"),
+            ),
+            (
+                "postgres",
+                include_str!("blocks/admin/migrations/005_wrap_grants_append_column.postgres.sql"),
+            ),
+        ] {
+            let stmts: Vec<&str> = split_statements(sql)
+                .into_iter()
+                .filter(|s| has_executable_content(s))
+                .collect();
+            assert_eq!(
+                stmts.len(),
+                2,
+                "admin {dialect} migration 005: expected 2 statements, got {stmts:?}"
+            );
+            assert!(is_alter_add_column(stmts[0]), "{dialect}: {}", stmts[0]);
         }
     }
 
