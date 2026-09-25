@@ -185,6 +185,10 @@ pub fn dashboard_page(
     }
 }
 
+/// The `id` of [`chat_page`]'s scrolling message pane, for a control that has
+/// to address it — the messages composer scrolls it after a post.
+pub const CHAT_MESSAGES_ID: &str = "chat-messages";
+
 pub fn chat_page(
     thread_list: Markup,
     messages: Markup,
@@ -195,7 +199,7 @@ pub fn chat_page(
         div .page--chat {
             aside .chat-threads { (thread_list) }
             section .chat-main {
-                div .chat-messages { (messages) }
+                div .chat-messages #(CHAT_MESSAGES_ID) { (messages) }
                 div .chat-composer { (composer) }
             }
             @if let Some(r) = right_rail {

@@ -132,8 +132,10 @@ pub async fn context_list_page(ctx: &dyn Context, msg: &Message) -> OutputStream
                     // state is now false. It is removed here rather than
                     // re-rendered server-side: the response is one row, and
                     // re-sending the whole list to delete one sentence would
-                    // cost every reader the scroll position.
-                    hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('context-list-empty')?.remove();}"
+                    // cost every reader the scroll position. The effects are
+                    // applied by `ui/assets/chrome.js` (section 5).
+                    data-reset-on-success
+                    data-remove-on-success="context-list-empty"
                 {
                     div .form-group {
                         label .form-label for="new-context-type" { "Type" }
@@ -397,8 +399,11 @@ fn render_default_view(
                 hx-target="#entries-list"
                 hx-swap="beforeend"
                 // `#entries-empty` is the "No entries yet" line, now
-                // contradicted by the entry this swap appended.
-                hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('entries-empty')?.remove();var list=document.getElementById('entries-list');list.scrollTop=list.scrollHeight;}"
+                // contradicted by the entry this swap appended. The effects
+                // are applied by `ui/assets/chrome.js` (section 5).
+                data-reset-on-success
+                data-remove-on-success="entries-empty"
+                data-scroll-on-success="entries-list"
             {
                 div .flex .gap-2 .mb-2 {
                     select .form-input .w-auto name="kind" {
@@ -508,12 +513,15 @@ fn render_conversation_composer(post_url: &str) -> Markup {
             hx-post=(post_url)
             hx-target="#entries-list"
             hx-swap="beforeend"
-            // Scroll the parent `.chat-messages` (the chat_page template's
-            // pane wrapper) — `#entries-list` itself is no longer a scroll
-            // container in the conversation view (see render_conversation_messages).
+            // Scroll `#chat-messages` (the chat_page template's pane
+            // wrapper) — `#entries-list` itself is not a scroll container in
+            // the conversation view (see render_conversation_messages).
             // `#entries-empty` is the "No messages yet" line, now
-            // contradicted by the message this swap appended.
-            hx-on--after-request="if(event.detail.successful){this.reset();document.getElementById('entries-empty')?.remove();var list=document.getElementById('entries-list').parentElement;list.scrollTop=list.scrollHeight;}"
+            // contradicted by the message this swap appended. The effects
+            // are applied by `ui/assets/chrome.js` (section 5).
+            data-reset-on-success
+            data-remove-on-success="entries-empty"
+            data-scroll-on-success=(crate::ui::templates::CHAT_MESSAGES_ID)
         {
             // Hidden defaults: kind=message, role=user. Conversation lens is
             // an opinionated view — composers below the fold (settings page,
@@ -793,7 +801,7 @@ mod form_contract_tests {
             "an empty list must render #{id}; got: {html}"
         );
         assert!(
-            html.contains(&format!("getElementById('{id}')?.remove()")),
+            html.contains(&format!(r#"data-remove-on-success="{id}""#)),
             "the form that fills the list must drop #{id}; got: {html}"
         );
     }

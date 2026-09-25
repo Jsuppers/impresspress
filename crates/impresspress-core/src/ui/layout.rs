@@ -8,6 +8,9 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 use super::{assets, SiteConfig};
 
+/// The `htmx-config` every page carries. See the comment where it is emitted.
+const HTMX_CONFIG: &str = r#"{"allowEval":false}"#;
+
 /// Render a full HTML page with head (CSS + htmx) and body.
 pub fn page(title: &str, config: &SiteConfig, body: Markup) -> Markup {
     // Brand accent override. Sanitized to a safe CSS-color charset so a
@@ -37,6 +40,15 @@ pub fn page(title: &str, config: &SiteConfig, body: Markup) -> Markup {
                 @if !config.favicon_url.is_empty() {
                     link rel="icon" href=(config.favicon_url);
                 }
+                // htmx's own switch for every feature that compiles
+                // attribute text with `new Function`: `hx-on`, a `js:` value,
+                // a trigger filter. The served content-security policy has no
+                // `'unsafe-eval'`, so each of those would be refused by the
+                // browser anyway; with this off htmx refuses them first, with
+                // an `htmx:evalDisallowedError`, and never reaches the eval.
+                // Read at htmx's init, which waits for the document to be
+                // ready, so this tag only has to be in the head.
+                meta name="htmx-config" content=(HTMX_CONFIG);
                 script src=(assets::htmx_js_url()) defer {}
                 // The chrome's own behaviour — palette, drawer, toasts,
                 // modals — as one hashed asset instead of four raw strings
@@ -88,6 +100,30 @@ mod tests {
             rendered.contains(&assets::webmcp_js_url()),
             "the WebMCP script must be on every page: {rendered}"
         );
+    }
+
+    /// Every page turns htmx's eval off, and does so before htmx loads.
+    #[test]
+    fn every_page_disables_htmx_eval() {
+        let config = SiteConfig {
+            app_name: "Test".into(),
+            logo_url: String::new(),
+            logo_icon_url: String::new(),
+            favicon_url: String::new(),
+            primary_color: String::new(),
+            embedded_scripts: Vec::new(),
+            auth_headline: String::new(),
+            auth_tagline: String::new(),
+        };
+        let rendered = page("Title", &config, maud::html! { p { "body" } }).into_string();
+        let meta = r#"<meta name="htmx-config" content="{&quot;allowEval&quot;:false}">"#;
+        let at = rendered
+            .find(meta)
+            .unwrap_or_else(|| panic!("no allowEval=false htmx-config: {rendered}"));
+        let htmx = rendered
+            .find(&assets::htmx_js_url())
+            .expect("htmx is loaded");
+        assert!(at < htmx, "the config must precede htmx: {rendered}");
     }
 
     /// The chrome's behaviour ships as one hashed `<script src>`, not as
