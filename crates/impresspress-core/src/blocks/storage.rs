@@ -181,8 +181,7 @@ fn forward_logged(
 ) -> OutputStream {
     OutputStream::from_producer(move |sink, _cancel| async move {
         let mut inner = inner;
-        let log =
-            |status: String| log_storage_access(ctx.as_ref(), &caller, &kind, &path, status);
+        let log = |status: String| log_storage_access(ctx.as_ref(), &caller, &kind, &path, status);
         let ok = || format!("OK ({}ms)", now_millis().saturating_sub(start));
         while let Some(ev) = inner.next().await {
             match ev {

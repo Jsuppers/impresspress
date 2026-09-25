@@ -533,7 +533,9 @@ pub fn download_body_stream(
                 Some(StreamEvent::Chunk(bytes)) => return Some((Ok(bytes), Some(rest))),
                 Some(StreamEvent::Meta(_)) => continue,
                 Some(
-                    StreamEvent::Complete { .. } | StreamEvent::Drop { .. } | StreamEvent::Continue(_),
+                    StreamEvent::Complete { .. }
+                    | StreamEvent::Drop { .. }
+                    | StreamEvent::Continue(_),
                 ) => return None,
                 Some(StreamEvent::Error(err)) => Err(*err),
                 Some(StreamEvent::Halt { .. }) => Err(WaferError::new(
