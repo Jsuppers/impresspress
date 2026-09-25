@@ -1428,7 +1428,13 @@ async fn seed_jwt_secret(db: &Arc<dyn DatabaseService>) {
 /// exists for. A row an OLDER build left behind is the thing under test for
 /// the repair pass and for the admin edit form's masking.
 #[cfg(test)]
-pub(crate) async fn seed_row_with_flag(ctx: &dyn Context, key: &str, value: &str, sensitive: i64) {
+pub(crate) async fn seed_row_with_flag(
+    ctx: &crate::test_support::TestContext,
+    key: &str,
+    value: &str,
+    sensitive: i64,
+) {
+    let ctx = &ctx.fixture();
     let now = crate::util::now_rfc3339();
     let mut data = VariableRow {
         id: format!("var_{}", uuid::Uuid::new_v4()),
@@ -1463,13 +1469,13 @@ pub(crate) async fn seed_row_with_flag(ctx: &dyn Context, key: &str, value: &str
 /// distinguish them needs a fixture that can stage either.
 #[cfg(test)]
 pub(crate) async fn seed_row_with_owner(
-    ctx: &dyn Context,
+    ctx: &crate::test_support::TestContext,
     key: &str,
     value: &str,
     updated_by: &str,
 ) {
     insert(
-        ctx,
+        &ctx.fixture(),
         NewVariable {
             key: key.to_string(),
             value: value.to_string(),

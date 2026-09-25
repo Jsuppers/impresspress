@@ -370,12 +370,7 @@ mod tests {
     /// `wrap::check_access` the runtime applies. The auth schema is applied
     /// first, so the refusal is a denial and not a missing table.
     async fn denied_users_ctx() -> TestContext {
-        users_ctx().await.with_wrap(
-            "test/ungranted",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        )
+        users_ctx().await.running_as("test/ungranted")
     }
 
     /// The reason `RepoError` had to fold into `WaferError`.

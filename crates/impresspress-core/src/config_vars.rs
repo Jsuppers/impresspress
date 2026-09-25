@@ -1026,12 +1026,7 @@ mod truth_table_tests {
         const FOREIGN_FLAG: &str = "ACME__WIDGET__FLAG";
         let mut ctx = TestContext::new().await;
         ctx.set_config(FOREIGN_FLAG, "1");
-        let ctx = ctx.with_wrap(
-            "impresspress/tickets",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = ctx.running_as("impresspress/tickets");
         let err = get_bool(&ctx, FOREIGN_FLAG, true)
             .await
             .expect_err("a refused read must not answer the default");

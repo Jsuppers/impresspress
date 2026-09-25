@@ -42,12 +42,9 @@ use crate::{
 /// and not a missing table — which is the whole point: the two used to be
 /// indistinguishable from outside.
 async fn denied() -> TestContext {
-    TestContext::with_products().await.with_wrap(
-        "test/ungranted",
-        Vec::new(),
-        Vec::new(),
-        "impresspress/admin",
-    )
+    TestContext::with_products()
+        .await
+        .running_as("test/ungranted")
 }
 
 /// [`denied`] for a route that reads a setting through the config service
@@ -63,12 +60,10 @@ async fn denied_with_config(config: &[(&str, &str)]) -> TestContext {
     for (key, value) in config {
         ctx.set_config(key, value);
     }
-    ctx.with_wrap(
-        "test/ungranted",
-        Vec::new(),
-        vec![ResourceGrant::read("*", "*").typed(ResourceType::Config)],
-        "impresspress/admin",
-    )
+    ctx.add_deployment_grants(vec![
+        ResourceGrant::read("*", "*").typed(ResourceType::Config)
+    ]);
+    ctx.running_as("test/ungranted")
 }
 
 // --- handlers/catalog.rs -------------------------------------------------

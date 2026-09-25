@@ -664,12 +664,9 @@ mod denial_tests {
     /// handler, and mapped everything but `NotFound` onto `err_internal`.
     #[tokio::test]
     async fn a_denied_ticket_detail_page_is_403_not_500() {
-        let ctx = TestContext::with_tickets().await.with_wrap(
-            "test/ungranted",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_tickets()
+            .await
+            .running_as("test/ungranted");
         let mut msg = admin_msg("retrieve", "/b/tickets/admin/tickets/any-id");
         endpoint_match::dispatch(&mut msg, crate::blocks::tickets::ROUTES);
         assert_eq!(output_http_status(detail(&ctx, &msg).await).await, 403);

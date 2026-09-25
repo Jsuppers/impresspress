@@ -463,12 +463,7 @@ async fn orgs_page_read_denial_is_403_for_an_api_caller() {
 /// its own settings gets the 403 page, not a 500 and not a form of defaults.
 #[tokio::test]
 async fn settings_page_config_denial_is_the_403_page_not_a_500() {
-    let ctx = TestContext::with_auth().await.with_wrap(
-        "test/ungranted",
-        Vec::new(),
-        Vec::new(),
-        "impresspress/admin",
-    );
+    let ctx = TestContext::with_auth().await.running_as("test/ungranted");
     let mut msg = crate::test_support::admin_msg("retrieve", "/b/auth/admin/settings");
     msg.set_meta("http.header.accept", "text/html");
     let parts = wafer_block::http_codec::collect_http_response(

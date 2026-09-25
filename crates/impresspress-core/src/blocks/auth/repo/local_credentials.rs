@@ -143,7 +143,7 @@ mod typed_client_tests {
         // subject to the WRAP check (same pattern as sessions.rs seed helpers).
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        let ctx = ctx.with_wrap("wafer-run/auth", Vec::new(), vec![], "impresspress/admin");
+        let ctx = ctx.running_as("wafer-run/auth");
         insert(&ctx, "user-a", "$argon2id$dummy", false)
             .await
             .unwrap();
@@ -160,7 +160,7 @@ mod typed_client_tests {
     async fn has_password_is_true_only_once_a_credential_exists() {
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
-        let ctx = ctx.with_wrap("wafer-run/auth", Vec::new(), vec![], "impresspress/admin");
+        let ctx = ctx.running_as("wafer-run/auth");
 
         assert!(
             !has_password(&ctx, "user-a").await.unwrap(),
@@ -178,12 +178,7 @@ mod typed_client_tests {
 
     #[tokio::test]
     async fn find_by_unknown_user_returns_none() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         assert!(find_by_user_id(&ctx, "ghost").await.unwrap().is_none());
     }
 

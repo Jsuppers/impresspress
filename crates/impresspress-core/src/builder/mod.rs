@@ -45,6 +45,10 @@ pub use prepared::PreparedPlanExporter;
 pub use registration::register_discovered_blocks;
 #[cfg(all(test, feature = "block-fastembed"))]
 pub(crate) use registration::required_model_cache_dir;
+/// The alias list the builder installs, for `test_support::TestContext` to
+/// resolve calls through.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use registration::{granted_llm_router, SERVICE_ALIASES};
 pub use registration::{register_middleware_blocks, MIDDLEWARE_BLOCKS};
 
 pub struct ImpresspressBuilder {

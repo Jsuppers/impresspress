@@ -2146,8 +2146,10 @@ pub(crate) mod page_link_tests {
     /// row (network detail) and a Feature block (detail, toggle).
     pub(crate) async fn seeded_ctx() -> (TestContext, Seeds) {
         // Crypto as well: the API-keys tab's Create form mints a key, and
-        // `htmx_contract_tests` submits it.
-        let mut ctx = TestContext::with_auth_and_crypto().await;
+        // `htmx_contract_tests` submits it. The fixture's own frame: every
+        // request the tests send is routed, so it runs as the block it
+        // reaches.
+        let mut ctx = TestContext::with_auth_and_crypto().await.fixture();
         // The admin the requests come from (`admin_msg`'s user), as the real
         // account a signed-in admin is: a key the Create form mints is theirs,
         // and `api_keys.user_id` references the users table.

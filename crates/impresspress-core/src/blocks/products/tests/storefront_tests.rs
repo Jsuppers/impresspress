@@ -411,15 +411,7 @@ async fn the_storefront_config_answers_under_wrap() {
         ),
     ])
     .await
-    .with_wrap(
-        "impresspress/products",
-        ProductsBlock::new()
-            .info()
-            .call_allowlist()
-            .unwrap_or_default(),
-        crate::blocks::admin::AdminBlock::new().info().grants,
-        crate::blocks::admin::ADMIN_BLOCK_ID,
-    );
+    .running_as("impresspress/products");
     let (msg, input) = get_msg("/b/products/storefront/config", "");
     let body = output_to_json(dispatch(&ctx, msg, input).await).await;
     assert_eq!(body["embedded_checkout_available"], true, "{body}");

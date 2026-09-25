@@ -1686,21 +1686,11 @@ mod api_key_lifecycle_tests {
     /// looks like too, so an expiry test on this fixture would pass whatever
     /// the expiry check decided.
     ///
-    /// The grant is sourced from the real `impresspress/admin` `BlockInfo`
-    /// (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)`) so the
-    /// fixture cannot drift from production.
+    /// The grant is the one the real `impresspress/admin` `BlockInfo`
+    /// declares (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)`),
+    /// which the fixture carries as the runtime does.
     async fn ctx_that_can_read_roles() -> TestContext {
-        use wafer_run::Block;
-
-        use crate::blocks::admin::AdminBlock;
-
-        let grants = AdminBlock::new().info().grants;
-        TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            grants,
-            "impresspress/admin",
-        )
+        TestContext::with_auth().await.running_as("wafer-run/auth")
     }
 
     /// Write an `api_keys` row with `expires_at` exactly as given, bypassing
@@ -1803,12 +1793,7 @@ mod api_key_lifecycle_tests {
 
     #[tokio::test]
     async fn disabled_user_key_is_rejected() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let uid = seed_user_and_key(&ctx, "raw-disabled-key").await;
 
         users::set_disabled(&ctx, &uid, true)
@@ -1838,18 +1823,12 @@ mod get_user_roles_error_surfacing_tests {
 
     #[tokio::test]
     async fn denied_roles_table_read_is_an_error_not_empty_roles() {
-        // Auth owns `wafer_run__auth__users` (Rule 3 own-resource — always
-        // reachable) but not `impresspress__admin__user_roles` (admin-owned).
-        // In production, admin's own block-level grant
+        // `impresspress__admin__user_roles` is admin-owned. In production,
+        // admin's own block-level grant
         // (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)` in
-        // `blocks/admin/mod.rs`) makes that read succeed; passing no grants
-        // here simulates that grant regressing/missing.
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        // `blocks/admin/mod.rs`) makes the auth block's read succeed; a block
+        // the deployment grants nothing stands in for that grant regressing.
+        let ctx = TestContext::with_auth().await.running_as("test/ungranted");
 
         let res = get_user_roles(&ctx, "some-user-id").await;
         assert!(
@@ -1863,12 +1842,7 @@ mod get_user_roles_error_surfacing_tests {
         // If the roles-table read fails, `ensure_admin_role` must not
         // silently treat that as "no admin row yet" and insert a duplicate
         // — it must propagate the error and skip the insert entirely.
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("test/ungranted");
 
         let res = ensure_admin_role(&ctx, "some-user-id", "admin@example.com").await;
         assert!(

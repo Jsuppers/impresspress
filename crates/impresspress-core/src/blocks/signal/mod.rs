@@ -321,12 +321,7 @@ mod tests {
 
         let ctx = crate::test_support::TestContext::with_signal()
             .await
-            .with_wrap(
-                "test/ungranted",
-                Vec::new(),
-                Vec::new(),
-                "impresspress/admin",
-            );
+            .running_as("test/ungranted");
         let block = SignalBlock::new();
         let offer_path = "/b/signal/rooms/AB2CD3/offer";
         let mut misses = Vec::new();

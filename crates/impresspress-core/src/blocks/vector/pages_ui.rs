@@ -441,7 +441,21 @@ mod integration_tests {
     /// upstream by wafer-run's sqlite behavior tests and handler
     /// authorization suites. This fake keeps the page-rendering assertions
     /// meaningful: the rendered count still traces back to the seeded row.
-    struct FakeVectorBlock;
+    ///
+    /// It counts on the database service itself, as a vector backend reads
+    /// its own store — not through `wafer-run/database`, where the read would
+    /// be authorized as `wafer-run/vector`, which owns no such table.
+    struct FakeVectorBlock {
+        store: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
+    }
+
+    impl FakeVectorBlock {
+        fn over(ctx: &TestContext) -> Arc<Self> {
+            Arc::new(Self {
+                store: ctx.database_service(),
+            })
+        }
+    }
 
     #[wafer_block::wafer_async_trait]
     impl Block for FakeVectorBlock {
@@ -451,7 +465,7 @@ mod integration_tests {
 
         async fn handle(
             &self,
-            ctx: &dyn Context,
+            _ctx: &dyn Context,
             msg: Message,
             input: InputStream,
         ) -> OutputStream {
@@ -463,7 +477,9 @@ mod integration_tests {
                     };
                     let req: wafer_block::wire::vector::CountRequest =
                         wafer_block::codec::decode(&body).expect("decode count request");
-                    let count = db::count(ctx, &format!("{}_meta", req.index), &[])
+                    let count = self
+                        .store
+                        .count(&format!("{}_meta", req.index), &[])
                         .await
                         .expect("count fixture _meta table") as u64;
                     let resp = wafer_block::wire::vector::CountResponse { count };
@@ -547,7 +563,8 @@ mod integration_tests {
         // Counts now flow through the vector service (`vclient::count`),
         // so the list page needs the backend block registered to see a
         // non-zero count.
-        ctx.register_block("wafer-run/vector", Arc::new(FakeVectorBlock));
+        let fake = FakeVectorBlock::over(&ctx);
+        ctx.register_block("wafer-run/vector", fake);
         seed_docs_index(&ctx).await;
 
         let msg = admin_msg("retrieve", "/b/vector/");
@@ -643,7 +660,8 @@ mod integration_tests {
     #[tokio::test]
     async fn index_detail_page_happy_path() {
         let mut ctx = TestContext::with_vector().await;
-        ctx.register_block("wafer-run/vector", Arc::new(FakeVectorBlock));
+        let fake = FakeVectorBlock::over(&ctx);
+        ctx.register_block("wafer-run/vector", fake);
         seed_docs_index(&ctx).await;
 
         let msg = admin_msg("retrieve", "/b/vector/docs/");

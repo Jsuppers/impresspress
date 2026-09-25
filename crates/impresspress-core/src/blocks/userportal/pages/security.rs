@@ -523,8 +523,8 @@ mod tests {
     // authenticated user. PR #77 added the grant.
 
     #[tokio::test]
-    async fn wrap_denies_provider_links_list_without_grant() {
-        // Seed before opting in to WRAP — `seed_user` uses raw SQL.
+    async fn wrap_denies_provider_links_list_to_a_block_without_a_grant() {
+        // Seeded from the fixture's own frame — `seed_user` uses raw SQL.
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
         upsert(
@@ -539,14 +539,7 @@ mod tests {
         .await
         .unwrap();
 
-        let ctx = ctx.with_wrap(
-            "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = ctx.running_as("test/ungranted");
 
         use crate::blocks::auth::repo::provider_links;
         let err = provider_links::list_for_user(&ctx, "user-a")
@@ -560,8 +553,6 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_allows_provider_links_list_with_auth_block_grants() {
-        use crate::blocks::auth::service::auth_grants;
-
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
         upsert(
@@ -576,14 +567,7 @@ mod tests {
         .await
         .unwrap();
 
-        let ctx = ctx.with_wrap(
-            "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            auth_grants(),
-            "impresspress/admin",
-        );
+        let ctx = ctx.running_as("impresspress/userportal");
 
         use crate::blocks::auth::repo::provider_links;
         let links = provider_links::list_for_user(&ctx, "user-a")

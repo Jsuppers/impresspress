@@ -205,17 +205,17 @@ mod tests {
 /// Database faults for tests of multi-row writes.
 #[cfg(test)]
 pub(crate) mod test_faults {
-    use wafer_run::context::Context;
+    use crate::test_support::TestContext;
 
     /// Make every insert into `table` fail inside the database — after the
     /// statements before it in the same write have run — until the returned
     /// trigger is dropped. Fixture setup, the documented exception to the
     /// no-raw-SQL rule: nothing else fails the SECOND row of a write, which
     /// is the failure a non-atomic account creation leaves half done.
-    pub(crate) async fn fail_inserts_into(ctx: &dyn Context, table: &str) -> String {
+    pub(crate) async fn fail_inserts_into(ctx: &TestContext, table: &str) -> String {
         let trigger = format!("fail_{table}_insert");
         wafer_core::clients::database::exec_raw(
-            ctx,
+            &ctx.fixture(),
             &format!(
                 "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} \
                  BEGIN SELECT RAISE(ABORT, 'simulated failure on the second write'); END"
@@ -227,9 +227,13 @@ pub(crate) mod test_faults {
         trigger
     }
 
-    pub(crate) async fn drop_trigger(ctx: &dyn Context, trigger: &str) {
-        wafer_core::clients::database::exec_raw(ctx, &format!("DROP TRIGGER {trigger}"), &[])
-            .await
-            .expect("drop the failing trigger");
+    pub(crate) async fn drop_trigger(ctx: &TestContext, trigger: &str) {
+        wafer_core::clients::database::exec_raw(
+            &ctx.fixture(),
+            &format!("DROP TRIGGER {trigger}"),
+            &[],
+        )
+        .await
+        .expect("drop the failing trigger");
     }
 }

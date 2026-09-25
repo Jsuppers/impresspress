@@ -1287,23 +1287,16 @@ mod write_loss_tests {
     /// read now fails the page instead, so without the entry this test sees
     /// an error rather than an unthemed page.
     ///
-    /// The fixture must enforce `requires` (`with_wrap`) or the bug is
-    /// invisible here exactly as it was invisible in CI: an empty
-    /// `caller_requires` is what production reads as "declares no requires".
+    /// The fixture must run as the block (`running_as`) or the bug is
+    /// invisible here exactly as it was invisible in CI: the fixture's own
+    /// frame is unrestricted.
     #[tokio::test]
     async fn the_public_page_reads_its_theming_config() {
         use crate::test_support::{anon_msg, output_html};
 
         let mut ctx = test_ctx().await;
         ctx.set_config(BG_COLOR_KEY, "#123456");
-        let ctx = ctx.with_wrap(
-            LegalPagesBlock::BLOCK_NAME,
-            wafer_run::Block::info(&LegalPagesBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants,
-            crate::blocks::admin::ADMIN_BLOCK_ID,
-        );
+        let ctx = ctx.running_as(LegalPagesBlock::BLOCK_NAME);
         seed_doc(
             &ctx,
             DocumentType::Terms,
@@ -1570,12 +1563,7 @@ mod table_tests {
     async fn a_denied_document_read_is_403_not_500() {
         use crate::test_support::{admin_msg, output_http_status, TestContext};
 
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "test/ungranted",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("test/ungranted");
         let mut msg = admin_msg("retrieve", "/b/legalpages/api/documents/doc-7");
         assert!(matches!(
             endpoint_match::dispatch(&mut msg, ROUTES),

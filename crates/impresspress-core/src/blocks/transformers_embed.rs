@@ -80,7 +80,7 @@ mod grant_tests {
         ServiceOp,
     };
     use wafer_core::interfaces::vector::service::{EmbeddingService, VectorError};
-    use wafer_run::{Block as _, ErrorCode, InputStream, Message};
+    use wafer_run::{ErrorCode, InputStream, Message};
 
     use super::TransformersEmbedBlock;
     use crate::test_support::TestContext;
@@ -104,10 +104,9 @@ mod grant_tests {
     /// under the deployment's grants — the ones the embedding block declares.
     async fn count_tokens_as(caller: &str) -> Result<u64, wafer_run::WaferError> {
         let block = Arc::new(TransformersEmbedBlock::new(Arc::new(Stub)));
-        let grants = block.info().grants;
         let mut ctx = TestContext::new().await;
         ctx.register_block(TransformersEmbedBlock::BLOCK_NAME, block);
-        let ctx = ctx.with_wrap(caller, Vec::new(), grants, "impresspress/admin");
+        let ctx = ctx.running_as(caller);
         let body = codec::encode(&CountTokensRequest {
             text: "two words".into(),
         })

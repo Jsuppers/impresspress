@@ -807,17 +807,15 @@ mod tests {
 
     /// Regression test for the WRAP-grant gap that broke every authenticated
     /// request end-to-end (caught by native/browser E2E, not by any unit
-    /// test, because the default `TestContext` bypasses WRAP entirely — see
-    /// `without_with_wrap_grants_are_unchecked` in `test_support.rs`).
+    /// test).
     ///
     /// `extract_auth_meta` runs pre-dispatch in the `ImpresspressRouterBlock`
     /// context (id `impresspress/router`), so `current_auth_version`'s read
     /// of `wafer_run__auth__users` is WRAP-checked as the ROUTER's identity,
-    /// not the auth block's own. This test opts the fixture into real WRAP
-    /// enforcement (`with_wrap`, exercising `auth_grants()` — the same
-    /// grant list the runtime registers) so a missing grant here fails the
-    /// same way it fails in production: the read is refused, and so is every
-    /// request bearing an access JWT.
+    /// not the auth block's own. The fixture runs as the router against the
+    /// grants the deployment carries — `auth_grants()` among them — so a
+    /// missing grant here fails the same way it fails in production: the
+    /// read is refused, and so is every request bearing an access JWT.
     #[tokio::test]
     async fn extract_auth_meta_auth_version_read_is_wrap_authorized_for_the_router() {
         use wafer_run::Message;
@@ -827,15 +825,11 @@ mod tests {
         let token = sign_access_jwt_with_version(secret, &uid, 0, 3600);
 
         // Same underlying in-memory DB (shallow `Clone`), but every call
-        // through `wrapped` is now WRAP-checked as `impresspress/router`
-        // against the real `auth_grants()` list — exactly what the request
-        // pipeline does in production.
-        let wrapped = ctx.clone().with_wrap(
-            "impresspress/router",
-            Vec::new(),
-            crate::blocks::auth::service::auth_grants(),
-            "impresspress/admin",
-        );
+        // through `wrapped` is WRAP-checked as `impresspress/router` —
+        // exactly what the request pipeline does in production.
+        let wrapped = ctx
+            .clone()
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
 
         let mut msg = Message::new("http.request");
         extract_auth_meta(&wrapped, &format!("Bearer {token}"), secret, "", &mut msg)

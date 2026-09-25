@@ -16,12 +16,7 @@ use crate::test_support::{admin_msg, anon_msg, TestContext};
 
 /// A legalpages deployment whose caller holds no WRAP grants.
 async fn ungranted() -> TestContext {
-    test_ctx().await.with_wrap(
-        "test/ungranted",
-        Vec::new(),
-        Vec::new(),
-        "impresspress/admin",
-    )
+    test_ctx().await.running_as("test/ungranted")
 }
 
 async fn dispatch(ctx: &TestContext, msg: wafer_run::Message) -> OutputStream {

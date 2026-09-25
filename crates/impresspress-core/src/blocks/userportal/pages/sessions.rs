@@ -471,26 +471,19 @@ mod tests {
     // --- WRAP regression: catches a future removal of the userportal
     // grant on `auth::repo::sessions::TABLE`. Without it, /b/userportal/
     // sessions answers the 500 page for every authenticated user. PR #77
-    // added the grant; these tests fail closed if it's removed.
+    // added the grant; the `wrap_allows_*` tests fail closed if it's
+    // removed, and the denial below shows the read needs one.
 
     #[tokio::test]
-    async fn wrap_denies_sessions_list_without_grant() {
-        // Seed BEFORE enabling WRAP — `seed_user` uses raw SQL, which WRAP
-        // restricts to the admin block. In production, rows are seeded by
-        // owner/admin paths; userportal only reads them. The test mirrors
-        // that lifecycle.
+    async fn wrap_denies_sessions_list_to_a_block_without_a_grant() {
+        // Seeded from the fixture's own frame — `seed_user` uses raw SQL,
+        // which WRAP restricts to the admin block. In production, rows are
+        // seeded by owner/admin paths; userportal only reads them.
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
-        let ctx = ctx.with_wrap(
-            "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = ctx.running_as("test/ungranted");
 
         let err = sessions::list_for_user(&ctx, "user-a")
             .await
@@ -503,20 +496,11 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_allows_sessions_list_with_auth_block_grants() {
-        use crate::blocks::auth::service::auth_grants;
-
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
-        let ctx = ctx.with_wrap(
-            "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            auth_grants(),
-            "impresspress/admin",
-        );
+        let ctx = ctx.running_as("impresspress/userportal");
 
         let rows = sessions::list_for_user(&ctx, "user-a")
             .await
@@ -529,21 +513,12 @@ mod tests {
     /// `tokens` grant would turn every revoke into a 500.
     #[tokio::test]
     async fn wrap_allows_the_whole_revoke_path_with_auth_block_grants() {
-        use crate::blocks::auth::service::auth_grants;
-
         let ctx = TestContext::with_auth().await;
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         seed_refresh_row(&ctx, "user-a", "fam-1").await;
 
-        let ctx = ctx.with_wrap(
-            "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            auth_grants(),
-            "impresspress/admin",
-        );
+        let ctx = ctx.running_as("impresspress/userportal");
 
         let msg = routed(auth_msg("delete", "/b/userportal/sessions/fam-1", "user-a"));
         assert_eq!(output_status(handle_revoke(&ctx, &msg).await).await, 200);
