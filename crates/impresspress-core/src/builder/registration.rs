@@ -207,32 +207,19 @@ impl ImpresspressBuilder {
         // under `optional_requires`: without this registration the runtime
         // still boots, and the block's calls to it answer `Unimplemented`.
         #[cfg(feature = "native-embedding")]
-        register_vector_block(
-            &mut wafer,
-            self.sqlite_db_path.as_deref(),
-            required_model_cache_dir(self.model_cache_dir.as_deref(), "native-embedding")?,
-        )?;
+        register_vector_block(&mut wafer, self.sqlite_db_path.as_deref())?;
 
-        // Browser path: when callers (typically `impresspress-web`) inject vector
-        // + embedding services, register the runtime block + transformers
-        // embed feature block. Mutually exclusive with `native-embedding` —
-        // both producing `wafer-run/vector` would conflict on register.
-        if let (Some(vec_svc), Some(emb_svc)) =
-            (self.extra_vector_service, self.extra_embedding_service)
-        {
-            wafer_core::service_blocks::vector::register_with(
-                &mut wafer,
-                vec_svc,
-                emb_svc.clone(),
-            )?;
-            // Registered on every target, because the condition is the
-            // injected service and not the build.
-            //
-            // This used to carry a `cfg(target_arch = "wasm32")`, so a native
-            // caller that injected an embedding service got
-            // `wafer-run/vector` registered and the block that actually
-            // embeds silently dropped — and every embed call then failed with
-            // "block not found" wrapped in a 500.
+        // Browser path: an injected vector service backs `wafer-run/vector`,
+        // an injected embedding service backs the
+        // `impresspress/transformers-embed` feature block. Each is registered
+        // on its own service, on every target: the condition is the injection,
+        // not the build. An injected vector service in a `native-embedding`
+        // build fails on register (both produce `wafer-run/vector`).
+        if let Some(vec_svc) = self.extra_vector_service {
+            wafer_core::service_blocks::vector::register_with(&mut wafer, vec_svc)?;
+        }
+        if let Some(emb_svc) = self.extra_embedding_service {
+            one_embedding_block(cfg!(feature = "block-fastembed"))?;
             wafer.register_block(
                 "impresspress/transformers-embed".to_string(),
                 Arc::new(crate::blocks::transformers_embed::TransformersEmbedBlock::new(emb_svc)),
@@ -530,6 +517,25 @@ impl ImpresspressBuilder {
     }
 }
 
+/// Refuse an injected embedding service in a build whose
+/// `impresspress/fastembed` already serves `embedding@v1`.
+///
+/// `impresspress/vector` resolves THE block declaring `embedding@v1`
+/// (`blocks::vector::pages::embedding_block_for_model`), so a runtime serves
+/// embeddings from one block; with two, which one embedded a text would depend
+/// on registration order.
+fn one_embedding_block(fastembed_registered: bool) -> Result<(), RuntimeError> {
+    if fastembed_registered {
+        return Err(RuntimeError::Config(
+            "an embedding service was injected with ImpresspressBuilder::embedding_service, \
+             but this build has the block-fastembed feature, whose impresspress/fastembed \
+             block already serves embedding@v1; inject one or the other"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The embedder's model cache directory, or the build error naming the
 /// builder call that supplies it. `feature` is the Cargo feature that needs
 /// it, so the error says why the directory is asked for.
@@ -719,6 +725,21 @@ mod llm_router_grant_tests {
             .await
             .expect_err("an ungranted block is refused");
         assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    }
+}
+
+#[cfg(test)]
+mod one_embedding_block_tests {
+    use super::one_embedding_block;
+
+    /// An injected embedder is refused only where `impresspress/fastembed`
+    /// already serves `embedding@v1`. A guard: `build()` passes it the
+    /// `block-fastembed` feature, which no default lane compiles.
+    #[test]
+    fn an_injected_embedder_is_refused_only_beside_fastembed() {
+        assert!(one_embedding_block(false).is_ok());
+        let err = one_embedding_block(true).expect_err("two embedding blocks");
+        assert!(err.to_string().contains("block-fastembed"), "{err}");
     }
 }
 

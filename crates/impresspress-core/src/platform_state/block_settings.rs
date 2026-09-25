@@ -883,6 +883,12 @@ mod operational_error_tests {
 
     #[async_trait::async_trait]
     impl DatabaseService for AlwaysErrorsOnList {
+        fn statement_budget(
+            &self,
+        ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError>
+        {
+            Ok(wafer_core::interfaces::database::service::StatementBudget::Unbounded)
+        }
         async fn get(&self, _collection: &str, _id: &str) -> Result<Record, DatabaseError> {
             unreachable!("must not read a record after a list failure")
         }

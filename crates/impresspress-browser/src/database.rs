@@ -341,6 +341,14 @@ impl DbExec for BrowserDatabaseService {
         STRICT_SCHEMA.load(Ordering::Relaxed)
     }
 
+    /// sql.js runs in the page's own worker and has no per-invocation
+    /// statement limit, so a write of any size is admitted.
+    fn statement_budget(
+        &self,
+    ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError> {
+        Ok(wafer_core::interfaces::database::service::StatementBudget::Unbounded)
+    }
+
     /// Decoding is [`record_from_json_row`], the one policy every SQL-family
     /// backend now shares — the private `db_codec::build_records` this
     /// replaced was the last of the three copies.
@@ -678,6 +686,7 @@ wafer_core::forward_database_service! {
             schema_drop_table: custom,
             schema_add_column: custom,
             set_strict_schema: custom,
+            statement_budget: forward,
         }
 
         async fn create(

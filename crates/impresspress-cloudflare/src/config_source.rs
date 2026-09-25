@@ -540,6 +540,13 @@ mod tests {
         async fn schema_add_column(&self, _t: &str, _c: &Column) -> Result<(), DatabaseError> {
             unreachable!()
         }
+
+        fn statement_budget(
+            &self,
+        ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError>
+        {
+            Ok(wafer_core::interfaces::database::service::StatementBudget::Unbounded)
+        }
     }
 
     fn var(key: &str) -> ConfigVar {

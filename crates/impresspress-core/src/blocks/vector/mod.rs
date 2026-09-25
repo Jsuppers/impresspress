@@ -185,12 +185,12 @@ crate::impresspress_feature_block! {
         // call to one that is absent answers `Unimplemented`.
         .optional_requires(vec![
             // The runtime vector service (typed index/query/introspection
-            // ops). Registered only where an embedding backend is: the
-            // `native-embedding` build (`builder::boot::register_vector_block`,
-            // which also skips it when the fastembed model cannot be loaded)
-            // and a runtime that injected vector + embedding services.
-            // Without it the runtime still boots, and each call the block
-            // makes to it answers `Unimplemented`.
+            // ops). Registered only where a vector store is: the
+            // `native-embedding` build (`builder::boot::register_vector_block`)
+            // and a runtime that injected a vector service
+            // (`ImpresspressBuilder::vector_service`). Without it the runtime
+            // still boots, and each call the block makes to it answers
+            // `Unimplemented`.
             "wafer-run/vector".into(),
             // Embedding for ingest / query-by-text: one of the two is
             // registered on a given runtime, and the other is never called.

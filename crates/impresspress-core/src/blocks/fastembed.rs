@@ -6,11 +6,13 @@
 //! `ctx.call_block("impresspress/fastembed", ...)` whenever they need to embed
 //! text with a locally-hosted model.
 //!
-//! This block is feature-gated behind `native-embedding` because the
-//! underlying fastembed-rs crate pulls in ONNX Runtime (~100 MB of native
-//! deps on most platforms). Consumers that only need remote embedding
-//! providers — or the browser runtime where ONNX isn't applicable — should
-//! not pay the build cost, so registration is conditional in `blocks::mod`.
+//! This block is feature-gated behind `block-fastembed` (which
+//! `native-embedding` implies) because the underlying fastembed-rs crate
+//! pulls in ONNX Runtime (~100 MB of native deps on most platforms).
+//! Consumers that only need remote embedding providers — or the browser
+//! runtime where ONNX isn't applicable — should not pay the build cost, so
+//! the module is compiled (`blocks::mod`) and registered
+//! (`builder::registration`) only under that feature.
 //!
 //! ## Lazy service construction
 //!

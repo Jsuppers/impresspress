@@ -643,6 +643,16 @@ impl DatabaseService for ScopedDatabaseService {
             service.set_strict_schema(enabled);
         }
     }
+
+    /// The current request's D1 budget. Outside a request this is the same
+    /// "used outside request poll scope" error every other operation returns:
+    /// there is no invocation to report a budget for, and `Unbounded` would
+    /// be a lie.
+    fn statement_budget(
+        &self,
+    ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError> {
+        self.current()?.statement_budget()
+    }
 }
 
 #[derive(Default)]

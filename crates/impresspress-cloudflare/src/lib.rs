@@ -280,6 +280,13 @@ where
     // `worker::Env` keeps travelling alongside it for the D1/KV/R2 *bindings*,
     // which are not var reads. See `environment`'s module doc.
     let environment = CfEnvironment::capture(&env);
+    // The D1 statements this invocation sends, counted across every D1
+    // service it builds (its request services, a runtime build, the audit-log
+    // drain it hands to `ctx.wait_until`), against D1's per-invocation query
+    // limit. Created here, per invocation, and never kept: an isolate
+    // interleaves concurrent requests, and each has its own limit. See
+    // `database`'s module docs.
+    let queries = database::D1QueryCount::new();
 
     // `std::env` is stubbed to always-empty on `wasm32-unknown-unknown`, so
     // `impresspress_core::ui::assets::base_url()` can never observe
@@ -303,6 +310,7 @@ where
             req,
             env,
             environment,
+            &queries,
             request_config,
             prepare_plan,
             register_blocks,
@@ -353,6 +361,7 @@ where
         req,
         &env,
         &environment,
+        &queries,
         &request_config,
         register_blocks,
         register_post_build,
@@ -365,7 +374,7 @@ where
     // one retained by the isolate-cached runtime.
     let rows = impresspress_core::pipeline::drain_queued_request_logs();
     if !rows.is_empty() {
-        match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING) {
+        match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING, &queries) {
             Ok(batch_db) => {
                 ctx.wait_until(async move {
                     use wafer_core::interfaces::database::service::DatabaseService as _;
@@ -508,6 +517,9 @@ pub async fn run_scheduled_with_config<F, G>(
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let environment = CfEnvironment::capture(&env);
+    // This invocation's D1 statement count, for the reason `run_with_config`
+    // gives.
+    let queries = database::D1QueryCount::new();
     // Same reason as `run_with_config`: `std::env` is stubbed empty on wasm32,
     // so the Worker var is the only channel carrying an asset base URL. The
     // sweep renders no page, but the runtime this builds is published into the
@@ -537,6 +549,7 @@ pub async fn run_scheduled_with_config<F, G>(
     match run_scheduled_inner(
         &env,
         &environment,
+        &queries,
         &request_config,
         register_blocks,
         register_post_build,
@@ -596,6 +609,7 @@ pub async fn run_scheduled_with_config<F, G>(
 async fn run_scheduled_inner<F, G>(
     env: &worker::Env,
     environment: &CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -638,13 +652,19 @@ where
     let (rt, _cache_outcome) = runtime_cache::get_or_build(
         env,
         environment,
+        queries,
         request_config,
         register_blocks,
         register_post_build,
     )
     .await?;
-    let services =
-        warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
+    let services = warm_request_services(
+        env,
+        environment,
+        queries,
+        rt.wafer.config_snapshot(),
+        request_config,
+    )?;
 
     request_services::scope(services, async {
         let output = rt
@@ -754,10 +774,16 @@ async fn dispatch(
     response
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the invocation's captured environment and D1 statement count travel as \
+              parameters from the Worker entry that owns them"
+)]
 async fn run_inner<F, G>(
     req: worker::Request,
     env: &worker::Env,
     environment: &CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -776,13 +802,19 @@ where
     let (rt, cache_outcome) = runtime_cache::get_or_build(
         env,
         environment,
+        queries,
         request_config,
         register_blocks,
         register_post_build,
     )
     .await?;
-    let services =
-        warm_request_services(env, environment, rt.wafer.config_snapshot(), request_config)?;
+    let services = warm_request_services(
+        env,
+        environment,
+        queries,
+        rt.wafer.config_snapshot(),
+        request_config,
+    )?;
     let mut response = dispatch(&rt.wafer, req, services, defer).await?;
 
     // Cheap observability signal (2026-07-16 audit follow-up): one header

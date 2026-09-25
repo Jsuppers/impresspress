@@ -229,11 +229,10 @@ pub const DATA_CONTENT_TYPE: &str = "application/json";
 ///
 /// What bounded it from above was write cost, not memory: in the browser
 /// every database call that returns has saved the WHOLE sql.js database to
-/// OPFS (`dbFlush` in `impresspress-browser`'s `bridge.js`), and
-/// [`data_snapshot::import`] used to apply the snapshot one row per call. It
-/// now writes each table in `db::create_many`/`db::batch` calls of up to
-/// `MAX_BATCH_WRITES` rows, so an import costs a few whole-database saves
-/// rather than one per row. The limit stays at 2 MiB until a batched import
+/// OPFS (`dbFlush` in `impresspress-browser`'s `bridge.js`), so a row-per-call
+/// import saved it once per row. [`data_snapshot::import`] writes the whole
+/// snapshot in one `db::batch`, so an import costs one whole-database save.
+/// The limit stays at 2 MiB until a batched import
 /// of a larger snapshot has been timed on a real browser cold boot; that
 /// measurement, not the write count, is what a higher value has to rest on.
 pub const MAX_DATA_BYTES: usize = 2 * 1024 * 1024;

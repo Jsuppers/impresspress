@@ -306,16 +306,16 @@ async fn init_one(
 }
 
 /// Register the `wafer-run/vector` runtime block backed by native
-/// `SqliteVecService` + `FastembedService`.
+/// `SqliteVecService`.
 ///
 /// - Opens a dedicated `rusqlite::Connection` at `db_path`. SQLite supports
 ///   multi-connection access with WAL, so sharing the DB file with the
 ///   platform's `DatabaseService` connection is safe.
-/// - `FastembedService::default_model(model_cache_dir)` triggers an ONNX
-///   model download into `model_cache_dir` on first run. Failure is logged
-///   but does not abort startup — the vector runtime block simply won't be
-///   registered, and any attempt to use it will fail via the normal
-///   dependency-resolution path.
+/// - Loads no embedding model. `wafer-run/vector` serves only `vector@v1`;
+///   embedding is `impresspress/fastembed`'s (registered by `block-fastembed`,
+///   which this feature implies), and its model loads lazily on the first
+///   embed call. So the vector store is registered whether or not the model
+///   can be downloaded.
 ///
 /// This function is only compiled when the `native-embedding` feature is on;
 /// the `impresspress/vector` feature block registration in `impresspress-core` is
@@ -324,11 +324,9 @@ async fn init_one(
 pub(super) fn register_vector_block(
     wafer: &mut Wafer,
     db_path: Option<&str>,
-    model_cache_dir: &std::path::Path,
 ) -> Result<(), RuntimeError> {
-    use wafer_block_fastembed::FastembedService;
     use wafer_block_sqlite::vector::SqliteVecService;
-    use wafer_core::interfaces::vector::service::{EmbeddingService, VectorService};
+    use wafer_core::interfaces::vector::service::VectorService;
 
     let Some(db_path) = db_path else {
         return Err(RuntimeError::Config(
@@ -353,24 +351,7 @@ pub(super) fn register_vector_block(
             ))
         })?);
 
-    let emb_svc: Arc<dyn EmbeddingService> = match FastembedService::default_model(model_cache_dir)
-    {
-        Ok(svc) => Arc::new(svc),
-        Err(e) => {
-            // Model download can fail offline or on first-run with restricted
-            // egress. Log and skip registration so the rest of the runtime
-            // boots: `impresspress/vector` lists `wafer-run/vector` under
-            // `optional_requires`, so seal admits it and each of its calls to
-            // the absent block answers `Unimplemented`.
-            tracing::warn!(
-                error = ?e,
-                "fastembed model unavailable — skipping wafer-run/vector registration"
-            );
-            return Ok(());
-        }
-    };
-
-    wafer_core::service_blocks::vector::register_with(wafer, vec_svc, emb_svc)
+    wafer_core::service_blocks::vector::register_with(wafer, vec_svc)
 }
 
 #[cfg(test)]
@@ -475,6 +456,27 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    /// **The vector store does not wait on an embedding model.**
+    /// `wafer-run/vector` serves only `vector@v1`, so the native store is
+    /// registered from the database file alone: nothing is downloaded, and no
+    /// model directory is consulted.
+    #[cfg(feature = "native-embedding")]
+    #[test]
+    fn the_native_vector_store_registers_without_an_embedding_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("vectors.sqlite3");
+        let mut wafer = empty_wafer();
+
+        register_vector_block(&mut wafer, Some(db.to_str().expect("utf-8 path")))
+            .expect("register the vector store");
+
+        assert!(
+            wafer.block_names().iter().any(|n| n == "wafer-run/vector"),
+            "{:?}",
+            wafer.block_names()
+        );
     }
 
     /// A runtime holding only what a test registers. The statically linked

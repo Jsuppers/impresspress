@@ -1368,6 +1368,7 @@ wafer_core::forward_database_service! {
             schema_drop_table: forward,
             schema_add_column: forward,
             set_strict_schema: forward,
+            statement_budget: forward,
         }
 
         async fn create(
@@ -1451,6 +1452,14 @@ struct FailingReadsDb {
 
 #[async_trait::async_trait]
 impl wafer_core::interfaces::database::service::DatabaseService for FailingReadsDb {
+    fn statement_budget(
+        &self,
+    ) -> Result<
+        wafer_core::interfaces::database::service::StatementBudget,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner.statement_budget()
+    }
     async fn get(
         &self,
         collection: &str,
@@ -1762,6 +1771,14 @@ struct FailingWritesDb {
 
 #[async_trait::async_trait]
 impl wafer_core::interfaces::database::service::DatabaseService for FailingWritesDb {
+    fn statement_budget(
+        &self,
+    ) -> Result<
+        wafer_core::interfaces::database::service::StatementBudget,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
+        self.inner.statement_budget()
+    }
     async fn get(
         &self,
         collection: &str,

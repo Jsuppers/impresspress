@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use impresspress_core::{
     blocks::{
         admin::AdminBlock,
-        auth::repo::users,
+        auth::repo::{local_credentials, users},
         dev::{
             data_snapshot::{self, DataSnapshot},
             seed::{self, SeedManifest},
@@ -33,7 +33,10 @@ use impresspress_core::{
     util::json_map,
 };
 use serde_json::json;
-use wafer_core::clients::database as db;
+use wafer_core::{
+    clients::database as db,
+    interfaces::database::service::{DatabaseError, DatabaseService, StatementBudget},
+};
 use wafer_run::Block;
 
 // ---------------------------------------------------------------------------
@@ -546,8 +549,8 @@ async fn import_replaces_users_and_upserts_products_so_ownership_survives() {
 
 /// A bundle exported before admin migration 004 can repeat a grant; the
 /// destination's unique index over `(user_id, role)` would refuse the twin
-/// partway through an import that has already cleared the table. The twin is
-/// dropped instead, keeping the same survivor 004 keeps.
+/// and fail the whole import. The twin is dropped instead, keeping the same
+/// survivor 004 keeps.
 #[tokio::test]
 async fn import_collapses_twin_grants_from_a_pre_004_bundle() {
     let ctx = TestContext::with_products().await.with_auth_added().await;
@@ -1508,7 +1511,7 @@ fn sqlite_migration_sql() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Write cost: one call per table, not one per row.
+// Write cost: one call per import, not one per row.
 // ---------------------------------------------------------------------------
 
 /// `n` users (a `Mode::Replace` table) and `n` products (a `Mode::Upsert`
@@ -1559,14 +1562,13 @@ async fn counting_ctx() -> (TestContext, std::sync::Arc<std::sync::Mutex<WriteLo
         .record_writes()
 }
 
-/// **An N-row table is one write, not N.** The replaced table's rows go in
-/// one `create_many` and every upserted row in one `batch`; not one row goes
-/// through a single-row `create` or `upsert`. In the browser each database
-/// call is a whole-database save to OPFS, so this is the difference between
-/// a few saves and one per row. Before, the import made 30 `create` and 30
-/// `upsert` calls here.
+/// **An import is one write, not one per row.** The replaced table's delete
+/// and rows and every upserted row go in ONE `batch`; not one row goes through
+/// a single-row `create` or `upsert`, nor a `create_many` of its own. In the
+/// browser each database call is a whole-database save to OPFS, so this is
+/// the difference between one save and one per row.
 #[tokio::test]
-async fn an_import_writes_each_table_in_one_call_not_one_per_row() {
+async fn an_import_is_one_batch_not_one_call_per_row() {
     let (ctx, log) = counting_ctx().await;
 
     let report = data_snapshot::import(&ctx, &wide_snapshot(30, 30))
@@ -1577,8 +1579,12 @@ async fn an_import_writes_each_table_in_one_call_not_one_per_row() {
         let log = log.lock().unwrap();
         assert_eq!(log.creates, 0, "no row goes through a single-row create");
         assert_eq!(log.upserts, 0, "no row goes through a single-row upsert");
-        assert_eq!(log.create_many_rows, [30], "one create_many for the users");
-        assert_eq!(log.batch_ops, [30], "one batch for the products");
+        assert!(log.create_many_rows.is_empty(), "no create_many call");
+        assert_eq!(
+            log.batch_ops,
+            [1 + 30 + 30],
+            "one batch: the users' delete, 30 creates, 30 product upserts"
+        );
     }
     assert_eq!(report.tables.get(users::TABLE), Some(&30));
     assert_eq!(report.tables.get(PRODUCTS_TABLE), Some(&30));
@@ -1598,19 +1604,198 @@ async fn an_import_writes_each_table_in_one_call_not_one_per_row() {
     );
 }
 
-/// A table larger than one call may carry is split at
-/// `wafer_block::wire::database::MAX_BATCH_WRITES`, the most the database
-/// handler accepts — one row past it is a second call, not a refused import.
+/// Native SQLite has no per-invocation statement limit, so an import larger
+/// than any fixed per-call cap (the handler once refused a call over 1000
+/// rows or ops) is still one call, not split into several transactions.
 #[tokio::test]
-async fn a_table_past_one_calls_limit_is_written_in_several() {
-    let max = wafer_block::wire::database::MAX_BATCH_WRITES;
+async fn an_import_past_a_thousand_rows_is_still_one_batch() {
     let (ctx, log) = counting_ctx().await;
 
-    data_snapshot::import(&ctx, &wide_snapshot(max + 1, max + 1))
+    data_snapshot::import(&ctx, &wide_snapshot(1001, 1001))
         .await
         .expect("import");
 
     let log = log.lock().unwrap();
-    assert_eq!(log.create_many_rows, [max, 1]);
-    assert_eq!(log.batch_ops, [max, 1]);
+    assert!(log.create_many_rows.is_empty());
+    assert_eq!(log.batch_ops, [1 + 1001 + 1001]);
+}
+
+// ---------------------------------------------------------------------------
+// Atomicity: a failed import leaves every table as it was.
+// ---------------------------------------------------------------------------
+
+/// A destination holding one account with its password and its admin role —
+/// the rows a failed import must leave in place.
+async fn ctx_with_an_existing_owner() -> TestContext {
+    let ctx = TestContext::with_products().await.with_auth_added().await;
+    seed_row(
+        &ctx,
+        users::TABLE,
+        "user_existing",
+        json!({ "email": "existing@example.com", "display_name": "Existing Owner" }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        local_credentials::TABLE,
+        "cred_existing",
+        json!({
+            "user_id": "user_existing",
+            "password_hash": "$argon2id$existing",
+            "created_at": STAMP,
+        }),
+    )
+    .await;
+    seed_row(
+        &ctx,
+        user_roles::TABLE,
+        "role_existing",
+        json!({ "user_id": "user_existing", "role": "admin" }),
+    )
+    .await;
+    ctx
+}
+
+async fn ids_in(ctx: &TestContext, table: &str) -> Vec<String> {
+    let mut ids: Vec<String> = db::list_all(ctx, table, Vec::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// A snapshot whose credential rows repeat an id fails on the second one —
+/// after its users were written and the old credentials cleared, if those
+/// were separate writes. The import is one transaction, so the failure
+/// leaves the destination's users, credentials and roles exactly as they
+/// were: its owner can still sign in.
+#[tokio::test]
+async fn a_failed_import_leaves_the_existing_users_and_credentials_in_place() {
+    let ctx = ctx_with_an_existing_owner().await;
+    let row = |value: serde_json::Value| -> serde_json::Map<String, serde_json::Value> {
+        json_map(value).into_iter().collect()
+    };
+    let mut snap = DataSnapshot {
+        schema_version: data_snapshot::SCHEMA_VERSION,
+        tables: std::collections::BTreeMap::new(),
+    };
+    snap.tables.insert(
+        users::TABLE.to_string(),
+        vec![
+            row(json!({ "id": "user_a", "email": "a@example.com", "display_name": "A" })),
+            row(json!({ "id": "user_b", "email": "b@example.com", "display_name": "B" })),
+        ],
+    );
+    snap.tables.insert(
+        local_credentials::TABLE.to_string(),
+        vec![
+            row(json!({
+                "id": "cred_dup", "user_id": "user_a",
+                "password_hash": "$argon2id$a", "created_at": STAMP,
+            })),
+            row(json!({
+                "id": "cred_dup", "user_id": "user_b",
+                "password_hash": "$argon2id$b", "created_at": STAMP,
+            })),
+        ],
+    );
+
+    let err = data_snapshot::import(&ctx, &snap)
+        .await
+        .expect_err("a repeated credential id cannot import");
+    assert_eq!(err.code, wafer_run::ErrorCode::AlreadyExists, "{err:?}");
+
+    assert_eq!(ids_in(&ctx, users::TABLE).await, ["user_existing"]);
+    assert_eq!(
+        ids_in(&ctx, local_credentials::TABLE).await,
+        ["cred_existing"]
+    );
+    assert_eq!(ids_in(&ctx, user_roles::TABLE).await, ["role_existing"]);
+}
+
+/// Reports a fixed per-invocation statement budget in front of the real
+/// SQLite service, the way a Cloudflare D1 service reports its query limit.
+/// Every operation is the inner service's.
+struct BudgetedDb {
+    inner: std::sync::Arc<dyn DatabaseService>,
+    budget: StatementBudget,
+}
+
+impl BudgetedDb {
+    fn inner_service(&self) -> &dyn DatabaseService {
+        self.inner.as_ref()
+    }
+}
+
+wafer_core::forward_database_service! {
+    impl DatabaseService for BudgetedDb {
+        forward_to inner_service();
+
+        ops {
+            get: forward,
+            list: forward,
+            create: forward,
+            create_many: forward,
+            update: forward,
+            delete: forward,
+            count: forward,
+            sum: forward,
+            query_raw: forward,
+            exec_raw: forward,
+            delete_where: forward,
+            delete_where_count: forward,
+            take_where: forward,
+            update_where: forward,
+            update_where_count: forward,
+            increment_field_where: forward,
+            upsert: forward,
+            aggregate: forward,
+            batch: forward,
+            insert_guarded: forward,
+            update_guarded: forward,
+            ensure_schema_table: forward,
+            ensure_schema_tables: forward,
+            schema_table_exists: forward,
+            schema_columns: forward,
+            schema_drop_table: forward,
+            schema_add_column: forward,
+            set_strict_schema: forward,
+            statement_budget: custom,
+        }
+
+        fn statement_budget(&self) -> Result<StatementBudget, DatabaseError> {
+            Ok(self.budget)
+        }
+    }
+}
+
+/// An import is admitted against the backend's statement budget as a whole:
+/// one that does not fit what the invocation has left is refused before
+/// anything runs. Split into one call per table, its first calls would each
+/// fit and commit, and the refusal would land partway through.
+#[tokio::test]
+async fn an_import_over_the_statement_budget_writes_nothing() {
+    let ctx = ctx_with_an_existing_owner()
+        .await
+        .wrap_database_service(|inner| {
+            std::sync::Arc::new(BudgetedDb {
+                inner,
+                // 61 statements fit the limit; 40 are left.
+                budget: StatementBudget::Limited {
+                    limit: 100,
+                    used: 60,
+                },
+            })
+        });
+
+    let err = data_snapshot::import(&ctx, &wide_snapshot(30, 30))
+        .await
+        .expect_err("61 statements do not fit the 40 left");
+    assert_eq!(err.code, wafer_run::ErrorCode::ResourceExhausted, "{err:?}");
+
+    assert_eq!(ids_in(&ctx, users::TABLE).await, ["user_existing"]);
+    assert!(ids_in(&ctx, PRODUCTS_TABLE).await.is_empty());
 }

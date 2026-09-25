@@ -382,6 +382,14 @@ impl DatabaseService for KvCachedD1DatabaseService {
         self.inner.set_strict_schema(enabled);
     }
 
+    /// The wrapped D1 service's budget: the cache answers some reads without
+    /// a statement, but every statement it does send is D1's, counted there.
+    fn statement_budget(
+        &self,
+    ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError> {
+        self.inner.statement_budget()
+    }
+
     // Bulk-write ops on cached tables hard-error to avoid silent stale-cache footguns.
     async fn delete_where(
         &self,
@@ -769,7 +777,8 @@ impl DatabaseService for KvCachedD1DatabaseService {
 
     /// Refused when any op targets a cached table, like the other bulk
     /// writes: an `Update`/`Delete` by id would need the old row's keys, and
-    /// an `UpdateWhere`/`Upsert` the whole matched set's. Otherwise forwarded,
+    /// an `UpdateWhere`/`DeleteWhere`/`Upsert` the whole matched set's.
+    /// Otherwise forwarded,
     /// then the config version is bumped once per written table that feeds a
     /// cached runtime.
     async fn batch(&self, ops: Vec<WriteOp>) -> Result<Vec<WriteOutcome>, DatabaseError> {
@@ -1093,6 +1102,13 @@ mod tests {
             _column: &Column,
         ) -> Result<(), DatabaseError> {
             unreachable!()
+        }
+
+        fn statement_budget(
+            &self,
+        ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError>
+        {
+            Ok(wafer_core::interfaces::database::service::StatementBudget::Unbounded)
         }
     }
 

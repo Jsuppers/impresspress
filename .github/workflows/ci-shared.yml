@@ -185,6 +185,15 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo test --locked -p impresspress-core --no-default-features --features block-fastembed,test-support --lib blocks::fastembed
 
+      # `native-embedding` is in no default feature set either, so no other
+      # lane compiles `builder::boot::register_vector_block` or runs the test
+      # that pins it: the native vector store registers from its database
+      # file alone, loading no embedding model.
+      - name: Test the native vector store registration (native-embedding)
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --locked -p impresspress-core --no-default-features --features native-embedding,test-support --lib builder::boot
+
       # The workspace clippy above lints the default feature set, which leaves
       # `blocks::fastembed` out. Lint the crate with it compiled in; the
       # `tests/` targets assume the default block set, hence the defaults stay on.

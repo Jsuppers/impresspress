@@ -476,6 +476,13 @@ mod boot_hook_tests {
             self.note(format!("schema_add_column {table}.{}", column.name));
             Ok(())
         }
+
+        fn statement_budget(
+            &self,
+        ) -> Result<wafer_core::interfaces::database::service::StatementBudget, DatabaseError>
+        {
+            Ok(wafer_core::interfaces::database::service::StatementBudget::Unbounded)
+        }
     }
 
     /// KV backend that records every key it is asked to write, so the

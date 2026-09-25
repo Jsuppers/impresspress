@@ -61,6 +61,17 @@ pub(crate) const CF_LOG_LEVEL_KEY: &str = "IMPRESSPRESS_CF_LOG_LEVEL";
 /// through the dashboard — this list stays short.
 pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth::JWT_SECRET_KEY];
 
+/// Worker var (`env.var`) naming how many D1 queries one Worker invocation may
+/// run: D1's "Queries per Worker invocation" limit for this account's plan.
+/// Every D1 service built in an invocation reports its statement budget
+/// against it (see [`crate::database`]'s module docs). Unset means
+/// [`D1_QUERIES_PER_INVOCATION_DEFAULT`]; a Free-plan deploy sets `50`.
+pub(crate) const D1_QUERIES_PER_INVOCATION_KEY: &str = "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION";
+
+/// D1's per-invocation query limit on Workers Paid, the limit a deploy that
+/// does not set [`D1_QUERIES_PER_INVOCATION_KEY`] runs under.
+pub(crate) const D1_QUERIES_PER_INVOCATION_DEFAULT: u64 = 1000;
+
 /// Shared configuration consumed synchronously while the builder constructs
 /// middleware, plus the two operational knobs a deploy sets in
 /// `wrangler.toml`.
@@ -115,6 +126,7 @@ pub(crate) struct CfEnvironment {
     asset_base_url: Option<String>,
     allow_workers_dev: Option<String>,
     deploy_token: Option<String>,
+    d1_queries_per_invocation: Option<String>,
 
     // ── the release-asset contract ──────────────────────────────────────────
     release_asset_id: Option<String>,
@@ -197,6 +209,7 @@ impl CfEnvironment {
             asset_base_url: var(env, impresspress_core::ui::assets::ASSET_BASE_URL_VAR),
             allow_workers_dev: var(env, ALLOW_WORKERS_DEV_KEY),
             deploy_token: secret(env, impresspress_core::config_vars::DEPLOY_TOKEN_KEY),
+            d1_queries_per_invocation: var(env, D1_QUERIES_PER_INVOCATION_KEY),
 
             release_asset_id: var(env, request_services::RELEASE_ASSET_ID_VAR),
             release_asset_prefix: var(env, request_services::RELEASE_ASSET_PREFIX_VAR),
@@ -368,6 +381,35 @@ impl CfEnvironment {
         self.strict_schema
             .as_deref()
             .is_some_and(strict_schema_flag_enabled)
+    }
+
+    /// How many D1 queries one Worker invocation may run: the bound
+    /// `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, or
+    /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`] when it is unbound.
+    ///
+    /// A bound value that is not a whole number of at least 1 is an error
+    /// naming the var, not the default: a Free-plan deploy that mistyped `50`
+    /// would otherwise run with the Paid limit and meet D1's own refusal
+    /// part-way through a write instead of the budget's up front.
+    pub(crate) fn d1_queries_per_invocation(&self) -> Result<u64, String> {
+        let Some(raw) = self.d1_queries_per_invocation.as_deref() else {
+            return Ok(D1_QUERIES_PER_INVOCATION_DEFAULT);
+        };
+        match raw.trim().parse::<u64>() {
+            Ok(limit) if limit >= 1 => Ok(limit),
+            _ => Err(format!(
+                "{D1_QUERIES_PER_INVOCATION_KEY} is {raw:?}; it must be a whole number of at \
+                 least 1 (D1 allows 1000 queries per invocation on Workers Paid, 50 on Free)"
+            )),
+        }
+    }
+
+    /// Bind `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` to the raw string a
+    /// Worker var would carry. Test-only: production code fills every field
+    /// through [`capture`](Self::capture) and nowhere else.
+    #[cfg(test)]
+    pub(crate) fn set_d1_queries_per_invocation_for_test(&mut self, value: &str) {
+        self.d1_queries_per_invocation = Some(value.to_string());
     }
 
     /// The deploy-token secret. `None` disables the `/_deploy/*` control plane
@@ -595,6 +637,7 @@ pub(crate) mod test_support {
             asset_base_url: None,
             allow_workers_dev: None,
             deploy_token: None,
+            d1_queries_per_invocation: None,
             release_asset_id: None,
             release_asset_prefix: None,
             release_asset_manifest: None,
@@ -643,6 +686,9 @@ pub(crate) mod test_support {
                 e.allow_workers_dev = Some("v".to_string())
             }),
             ("deploy_token", |e| e.deploy_token = Some("v".to_string())),
+            ("d1_queries_per_invocation", |e| {
+                e.d1_queries_per_invocation = Some("v".to_string())
+            }),
             ("release_asset_id", |e| {
                 e.release_asset_id = Some("v".to_string())
             }),
@@ -777,6 +823,7 @@ mod tests {
             ),
             (ALLOW_WORKERS_DEV_KEY, "1"),
             (impresspress_core::config_vars::DEPLOY_TOKEN_KEY, "token"),
+            (D1_QUERIES_PER_INVOCATION_KEY, "50"),
             (
                 request_services::RELEASE_ASSET_ID_VAR,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -844,6 +891,7 @@ mod tests {
         );
         assert!(captured.allows_workers_dev());
         assert_eq!(captured.deploy_token(), Some("token"));
+        assert_eq!(captured.d1_queries_per_invocation(), Ok(50));
         assert_eq!(
             captured.release_asset_vars().prefix,
             Some(".impresspress/releases/v1/immutable/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -892,6 +940,37 @@ mod tests {
             !CfEnvironment::capture(&unbound.env).strict_schema_enabled(),
             "an unset var is off, matching wafer-core's `is_some_and`",
         );
+    }
+
+    /// The D1 query limit: unset is Workers Paid's 1000, a bound number is
+    /// taken as it is (a Free-plan deploy's 50), and anything that is not a
+    /// whole number of at least 1 is an error naming the var rather than a
+    /// silent fallback to the Paid limit.
+    #[wasm_bindgen_test]
+    fn the_d1_query_limit_defaults_to_paid_and_refuses_a_malformed_value() {
+        let unbound = RecordingEnv::new(&[]);
+        assert_eq!(
+            CfEnvironment::capture(&unbound.env).d1_queries_per_invocation(),
+            Ok(D1_QUERIES_PER_INVOCATION_DEFAULT)
+        );
+        for (raw, limit) in [("50", 50), (" 50 ", 50), ("1000", 1000), ("1", 1)] {
+            let env = RecordingEnv::new(&[(D1_QUERIES_PER_INVOCATION_KEY, raw)]);
+            assert_eq!(
+                CfEnvironment::capture(&env.env).d1_queries_per_invocation(),
+                Ok(limit),
+                "{raw:?}"
+            );
+        }
+        for raw in ["", "0", "-5", "5O", "fifty", "50.5"] {
+            let env = RecordingEnv::new(&[(D1_QUERIES_PER_INVOCATION_KEY, raw)]);
+            let err = CfEnvironment::capture(&env.env)
+                .d1_queries_per_invocation()
+                .expect_err(raw);
+            assert!(
+                err.contains(D1_QUERIES_PER_INVOCATION_KEY),
+                "{raw:?}: {err}"
+            );
+        }
     }
 
     /// An absent binding is `None`, not an empty string, and reading it still

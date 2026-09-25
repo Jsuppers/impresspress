@@ -604,11 +604,9 @@ const EMBEDDING_INTERFACE: &str = "embedding@v1";
 /// Reads `ctx.registered_blocks()`, the same signal
 /// [`service::vector_backend_available`] reads for the vector backend, and
 /// picks the block declaring [`EMBEDDING_INTERFACE`]. At most one is ever
-/// registered: the two registration sites in `builder::registration` are
-/// mutually exclusive (`native-embedding` registers `impresspress/fastembed`,
-/// an injected embedding service registers
-/// `impresspress/transformers-embed`), and both produce `wafer-run/vector`,
-/// which cannot be registered twice.
+/// registered: `builder::registration` registers `impresspress/fastembed`
+/// under `block-fastembed` and `impresspress/transformers-embed` over an
+/// injected embedding service, and refuses to build with both.
 ///
 /// This used to be a `cfg(target_arch)` body naming `impresspress/fastembed`
 /// off wasm32 and `impresspress/transformers-embed` on it, with `model_id`

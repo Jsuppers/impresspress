@@ -268,7 +268,7 @@ mod tests {
     use wafer_block_sqlite::vector::SqliteVecService;
     use wafer_core::{
         clients::{database as db, vector as vclient},
-        interfaces::vector::service::{EmbeddingService, SearchMode, VectorEntry},
+        interfaces::vector::service::{SearchMode, VectorEntry},
         service_blocks::vector::VectorBlock,
     };
 
@@ -281,25 +281,6 @@ mod tests {
 
     const LEGACY: &str = "impresspress__vector__Docs";
     const LOWERCASE: &str = "impresspress__vector__docs";
-
-    /// The vector block's embedding half, never reached by these tests.
-    struct NoEmbedding;
-
-    #[wafer_block::wafer_async_trait]
-    impl EmbeddingService for NoEmbedding {
-        fn model(&self) -> &str {
-            "none"
-        }
-        fn dimensions(&self) -> u32 {
-            3
-        }
-        async fn embed(
-            &self,
-            _texts: Vec<String>,
-        ) -> wafer_core::interfaces::vector::service::Result<Vec<Vec<f32>>> {
-            unreachable!("these tests never embed")
-        }
-    }
 
     fn blob(v: [f32; 3]) -> Vec<u8> {
         v.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -351,7 +332,7 @@ mod tests {
         let mut ctx = TestContext::with_vector().await;
         ctx.register_block(
             "wafer-run/vector",
-            Arc::new(VectorBlock::new(Arc::new(service), Arc::new(NoEmbedding))),
+            Arc::new(VectorBlock::new(Arc::new(service))),
         );
         ctx
     }

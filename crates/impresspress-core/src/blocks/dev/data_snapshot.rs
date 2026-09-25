@@ -4,8 +4,8 @@
 //! offers, the owner's own account. [`export`] reads an explicit table
 //! allowlist into a [`DataSnapshot`]; [`import`] applies it back through the
 //! typed database client. **No SQL text is generated or executed anywhere in
-//! this module** — every write is `db::create_many`, `db::batch` or
-//! `db::delete_by_filters`, exactly as amendment 9 requires and as
+//! this module** — the import is one `db::batch` of typed writes, exactly as
+//! amendment 9 requires and as
 //! `CLAUDE.md`'s "no raw SQL in block code" rule already demands of every
 //! other block.
 //!
@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use wafer_block::wire::database::{BatchWrite, OnConflict, UpsertRequest, MAX_BATCH_WRITES};
+use wafer_block::wire::database::{BatchWrite, OnConflict, UpsertRequest};
 use wafer_core::clients::database as db;
 use wafer_run::{context::Context, ErrorCode, WaferError};
 
@@ -126,8 +126,8 @@ pub enum Mode {
     /// the conflict columns, which are equal by definition) and takes every
     /// other column from the snapshot — see [`upsert_op`].
     Upsert(&'static [&'static str]),
-    /// Delete every row in the destination table first, then insert the
-    /// exported rows with `db::create_many`. Reserved for the tables whose *set* must match the
+    /// Delete every row in the destination table, then insert the exported
+    /// rows, in the import's one transaction. Reserved for the tables whose *set* must match the
     /// snapshot exactly: a fresh instance's own bootstrap admin (and its
     /// role assignment, and its local credentials) must be gone once someone
     /// else's account is imported, not merged alongside it.
@@ -783,22 +783,25 @@ mod replace_order_tests {
 /// the module docs for why a name outside it is refused (`InvalidArgument`)
 /// rather than silently skipped or written anyway.
 ///
-/// Each table is written in as few calls as the database allows: a `Replace`
-/// table is one `db::delete_by_filters` and then one `db::create_many`, and
-/// every `Upsert` row of every table goes into `db::batch` calls. Each of
-/// those calls is one transaction — all of its rows or none — and one OPFS
-/// flush in the browser, where a row-per-call import flushed the whole
-/// database once per row. A call carries at most [`MAX_BATCH_WRITES`] rows or
-/// ops, the most the database handler accepts, so a table past that is
-/// written in several.
+/// The whole import is ONE `db::batch`, so one transaction: all of its
+/// writes or none, and one OPFS flush in the browser. Each `Replace` table is
+/// a filtered delete of every row (`BatchWrite::DeleteWhere` with no filters)
+/// followed by a `Create` per snapshot row, in [`REPLACE_ORDER`]; then every
+/// `Upsert` row of every other table. A write that fails (a duplicate key, a
+/// bad row) rolls all of it back, so a failed import leaves the users, their
+/// credentials and every other table as they were.
 ///
-/// **Not atomic as a whole.** The delete that clears a `Replace` table is its
-/// own call (`db::batch` has no filtered delete), and the calls are separate
-/// transactions, so a failure partway through leaves the tables already
-/// written in their new state and the rest in their old one. What keeps that
-/// safe: every write is keyed on the snapshot's own row ids, so importing the
-/// same snapshot again (after a partial failure, or on purpose) converges to
-/// the same end state — `tests/dev_data_snapshot.rs`'s
+/// The database handler admits the batch, one statement per op, against the
+/// backend's statement budget before anything runs. SQLite and PostgreSQL
+/// take any size. On Cloudflare D1 an import larger than what the request has
+/// left is refused whole (`ResourceExhausted`, or `InvalidArgument` past the
+/// per-invocation limit) and nothing is written: a smaller bundle, or a
+/// raised `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` on a plan that allows it,
+/// is the fix, not a retry.
+///
+/// Every write is keyed on the snapshot's own row ids, so importing the same
+/// snapshot again converges to the same end state —
+/// `tests/dev_data_snapshot.rs`'s
 /// `import_replaces_users_and_upserts_products_so_ownership_survives` test
 /// re-imports and asserts no duplication.
 pub async fn import(
@@ -871,6 +874,7 @@ pub async fn import(
     }
 
     let mut report = ImportReport::default();
+    let mut writes = Vec::new();
     // `Replace` tables first, in `REPLACE_ORDER` — not the snapshot's own
     // alphabetical order. `Upsert` tables carry no such dependency (every
     // foreign id they reference — `product_id`, `offer_id` — is validated by
@@ -885,26 +889,19 @@ pub async fn import(
         } else {
             rows.iter().collect()
         };
-        db::delete_by_filters(ctx, table, Vec::new()).await?;
-        let written = rows.len();
-        let mut rows = rows
-            .into_iter()
-            .map(|row| {
-                imported_row(table, row)
-                    .into_iter()
-                    .collect::<HashMap<_, _>>()
-            })
-            .peekable();
-        while rows.peek().is_some() {
-            let call: Vec<_> = rows.by_ref().take(MAX_BATCH_WRITES).collect();
-            db::create_many(ctx, table, call).await?;
-        }
-        report.tables.insert(table.to_string(), written);
+        writes.push(BatchWrite::DeleteWhere {
+            collection: table.to_string(),
+            filters: Vec::new(),
+        });
+        report.tables.insert(table.to_string(), rows.len());
+        writes.extend(rows.into_iter().map(|row| BatchWrite::Create {
+            collection: table.to_string(),
+            data: imported_row(table, row).into_iter().collect(),
+        }));
     }
-    let mut upserts = Vec::new();
     for (table, rows) in &snapshot.tables {
         if REPLACE_ORDER.contains(&table.as_str()) {
-            continue; // already applied above, in dependency order
+            continue; // already queued above, in dependency order
         }
         // The mode comes from the allowlist rather than being assumed: it
         // carries the table's conflict target, and every remaining entry is
@@ -921,13 +918,13 @@ pub async fn import(
                 format!("{table:?} passed the allowlist check but has no upsert conflict target"),
             ));
         };
-        upserts.extend(rows.iter().map(|row| upsert_op(table, conflict, row)));
+        writes.extend(rows.iter().map(|row| upsert_op(table, conflict, row)));
         report.tables.insert(table.clone(), rows.len());
     }
-    let mut upserts = upserts.into_iter().peekable();
-    while upserts.peek().is_some() {
-        let call: Vec<_> = upserts.by_ref().take(MAX_BATCH_WRITES).collect();
-        db::batch(ctx, call).await?;
+    if !writes.is_empty() {
+        // The per-op results (each created row as stored) are not needed: the
+        // report counts the snapshot's rows, which is what was written.
+        db::batch(ctx, writes).await?;
     }
     Ok(report)
 }
@@ -937,7 +934,7 @@ pub async fn import(
 ///
 /// A bundle exported before admin migration 004 can carry twin grants, and
 /// the destination's unique index over the pair would refuse the second —
-/// failing the import partway, after the table was already cleared. The twin
+/// failing the whole import. The twin
 /// grants nothing its survivor does not, so it is dropped rather than
 /// refused. The survivor is the least `(created_at, id)`, the pair 004 ranks
 /// by, compared bytewise so the choice does not depend on row order.

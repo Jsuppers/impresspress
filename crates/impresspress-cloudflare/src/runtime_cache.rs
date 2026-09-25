@@ -805,6 +805,7 @@ fn publish_runtime(
 pub(crate) async fn get_or_build<F, G>(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &std::collections::HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -837,6 +838,7 @@ where
             return get_or_build_prepared(
                 env,
                 environment,
+                queries,
                 request_config,
                 plan,
                 register_blocks,
@@ -900,6 +902,7 @@ where
                 return hydrate_transient_dynamic_runtime(
                     env,
                     environment,
+                    queries,
                     request_config,
                     register_blocks
                         .take()
@@ -921,6 +924,7 @@ where
             return hydrate_transient_dynamic_runtime(
                 env,
                 environment,
+                queries,
                 request_config,
                 register_blocks
                     .take()
@@ -1013,6 +1017,7 @@ where
     let built = match crate::runtime_build::build_runtime(
         env,
         environment,
+        queries,
         request_config,
         None,
         register_blocks
@@ -1092,6 +1097,7 @@ where
 async fn hydrate_prepared_runtime<F, G>(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &std::collections::HashMap<String, String>,
     plan: &impresspress_core::PreparedRuntimePlan,
     register_blocks: F,
@@ -1111,6 +1117,7 @@ where
     let built = crate::runtime_build::build_runtime(
         env,
         environment,
+        queries,
         request_config,
         Some(plan),
         register_blocks,
@@ -1182,6 +1189,7 @@ where
 async fn hydrate_transient_dynamic_runtime<F, G>(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &std::collections::HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
@@ -1236,6 +1244,7 @@ where
     let built = crate::runtime_build::build_runtime(
         env,
         environment,
+        queries,
         request_config,
         None,
         register_blocks,
@@ -1290,6 +1299,7 @@ where
 async fn get_or_build_prepared<F, G>(
     env: &worker::Env,
     environment: &crate::environment::CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &std::collections::HashMap<String, String>,
     plan: Rc<impresspress_core::PreparedRuntimePlan>,
     register_blocks: F,
@@ -1354,6 +1364,7 @@ where
             return hydrate_transient_dynamic_runtime(
                 env,
                 environment,
+                queries,
                 request_config,
                 register_blocks,
                 register_post_build,
@@ -1383,6 +1394,7 @@ where
         let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
             env,
             environment,
+            queries,
             request_config,
             plan.as_ref(),
             register_blocks,
@@ -1420,6 +1432,7 @@ where
         let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
             env,
             environment,
+            queries,
             request_config,
             plan.as_ref(),
             register_blocks,
@@ -1490,6 +1503,7 @@ where
                 return Box::pin(get_or_build(
                     env,
                     environment,
+                    queries,
                     request_config,
                     register_blocks,
                     register_post_build,
@@ -1516,6 +1530,7 @@ where
         return Box::pin(get_or_build(
             env,
             environment,
+            queries,
             request_config,
             register_blocks,
             register_post_build,
@@ -1526,6 +1541,7 @@ where
     let (rt, build_ordinal, duration_ms) = hydrate_prepared_runtime(
         env,
         environment,
+        queries,
         request_config,
         plan.as_ref(),
         register_blocks,

@@ -322,7 +322,8 @@ pub async fn build_native_runtime(
         // feature can open a dedicated connection for `SqliteVecService`.
         // Ignored when the feature is off.
         .sqlite_db_path(&infra.db_path)
-        // Where the `native-embedding` feature's ONNX model is cached.
+        // Where `impresspress/fastembed`'s ONNX model is cached (the
+        // `block-fastembed` feature, which `native-embedding` implies).
         // Ignored when the feature is off.
         .model_cache_dir(&infra.model_cache_dir)
         .build()

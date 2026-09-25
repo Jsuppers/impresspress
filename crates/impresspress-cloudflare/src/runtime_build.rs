@@ -216,10 +216,12 @@ pub(crate) async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<Bo
 /// declares none, before any block that does, so the `variables` table exists
 /// by the time anything reads it. `migration_helper::read_state` reads the
 /// config snapshot, not the database.
-// Eight arguments. The captured environment is deliberately a parameter rather
+// Nine arguments. The captured environment is deliberately a parameter rather
 // than something re-derived from `env` here: reading a var twice per request is
 // exactly what `CfEnvironment` exists to stop, and a function that could reach
-// for `env.var` on its own would put that back.
+// for `env.var` on its own would put that back. The invocation's D1 statement
+// count is one for the same reason: it is created once at the Worker entry and
+// only travels.
 #[expect(
     clippy::too_many_arguments,
     reason = "the captured environment travels as a parameter so nothing here can \
@@ -228,6 +230,7 @@ pub(crate) async fn boot_prepared_runtime(built: &mut BuiltRuntime) -> Result<Bo
 pub(crate) async fn build_runtime<F, G>(
     env: &worker::Env,
     environment: &CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     request_config: &HashMap<String, String>,
     prepared_plan: Option<&impresspress_core::PreparedRuntimePlan>,
     register_blocks: F,
@@ -249,6 +252,7 @@ where
         runner::D1_BINDING,
         runner::KV_BINDING,
         cache_mode,
+        queries,
     )
     .map_err(|e| {
         format!(
@@ -584,6 +588,7 @@ fn request_config_surfaces(
 pub(crate) fn warm_request_services(
     env: &worker::Env,
     environment: &CfEnvironment,
+    queries: &crate::database::D1QueryCount,
     structural_snapshot: &HashMap<String, String>,
     request_config: &HashMap<String, String>,
 ) -> Result<std::rc::Rc<request_services::RequestServices>, Box<dyn std::error::Error>> {
@@ -593,6 +598,7 @@ pub(crate) fn warm_request_services(
         runner::D1_BINDING,
         runner::KV_BINDING,
         kv_cached_db::CacheMode::default(),
+        queries,
     )?;
     let storage = make_r2_storage_service(env, runner::R2_BINDING)?;
 

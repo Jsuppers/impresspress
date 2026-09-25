@@ -62,9 +62,9 @@ use crate::platform_state::user_roles;
 // That only equalizes anything if the throwaway hash is in the scheme THIS
 // deployment's crypto service actually writes, which is why it cannot be a
 // constant in this file. Native and Cloudflare hash with argon2id; the browser
-// hashes with PBKDF2-SHA256, because argon2id's ~19 MiB memory cost is
-// unaffordable in a Service Worker whose linear memory is shared with sql.js
-// and the rest of the runtime (see `impresspress-browser`'s `crypto` module).
+// hashes with PBKDF2-SHA256, which holds no working memory, where argon2id's
+// stays allocated in the Service Worker's linear memory (shared with sql.js)
+// for the worker's life (see `impresspress-browser`'s `crypto` module).
 //
 // The constant this replaced was an argon2id string, so it was wrong in both
 // directions:
