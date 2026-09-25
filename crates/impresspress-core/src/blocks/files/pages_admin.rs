@@ -239,6 +239,12 @@ impl From<&repo::buckets::BucketRow> for AdminBucketRow {
 }
 
 /// Render the admin Buckets table (or empty state).
+///
+/// The owner-id and date cells are monospaced (as are the shares table's
+/// "Created By" and the quotas table's "User" id cells): a fixed-length value
+/// then has a fixed width, so the columns do not re-flow as the value changes. That matters to the
+/// visual-baseline suite, which masks these per-run values — with a
+/// proportional font a different id moved every column to its right.
 pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
     if rows.is_empty() {
         return html! {
@@ -257,11 +263,11 @@ pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
                 @for r in rows {
                     tr data-bucket=(r.name) {
                         td data-label="Name" .font-medium { (r.name) }
-                        td data-label="Owner" .text-muted .text-sm { (r.owner_short) }
+                        td data-label="Owner" .text-muted .text-sm .font-mono { (r.owner_short) }
                         td data-label="Public" {
                             (components::status_badge(if r.public { "public" } else { "private" }))
                         }
-                        td data-label="Created" .text-muted .text-sm { (r.created_at_short) }
+                        td data-label="Created" .text-muted .text-sm .font-mono { (r.created_at_short) }
                     }
                 }
             }
@@ -384,7 +390,7 @@ pub fn render_admin_shares_table(rows: &[AdminShareRow]) -> Markup {
                         td data-label="Expires" .text-muted .text-sm {
                             @if let Some(exp) = &r.expires_short { (exp) } @else { "Never" }
                         }
-                        td data-label="Created By" .text-muted .text-sm { (r.owner_short) }
+                        td data-label="Created By" .text-muted .text-sm .font-mono { (r.owner_short) }
                     }
                 }
             }
@@ -498,7 +504,7 @@ pub fn render_admin_quotas_table(rows: &[AdminQuotaRow]) -> Markup {
             tbody {
                 @for r in rows {
                     tr {
-                        td data-label="User" .text-sm { (r.user_short) }
+                        td data-label="User" .text-sm .font-mono { (r.user_short) }
                         td data-label="Max Storage" .text-sm { (format_bytes(r.max_storage_bytes)) }
                         td data-label="Max File Size" .text-sm { (format_bytes(r.max_file_size_bytes)) }
                         td data-label="Max Files/Bucket" .text-sm { (r.max_files_per_bucket) }
@@ -665,6 +671,29 @@ mod tests {
         assert!(html.contains("public"));
         assert!(html.contains("private"));
         assert!(html.contains("2026-05-06"));
+    }
+
+    #[test]
+    fn render_admin_buckets_table_monospaces_the_id_and_date_cells() {
+        let rows = vec![AdminBucketRow {
+            name: "photos".into(),
+            owner_short: "019a2b3c".into(),
+            public: false,
+            created_at_short: "2026-09-25".into(),
+        }];
+        let html = render_admin_buckets_table(&rows).into_string();
+        for label in ["Owner", "Created"] {
+            let attr = format!(r#"data-label="{label}""#);
+            let tag = html
+                .split("<td")
+                .map(|t| t.split('>').next().unwrap_or(""))
+                .find(|t| t.contains(&attr))
+                .unwrap_or_else(|| panic!("no {label} cell: {html}"));
+            assert!(
+                tag.contains("font-mono"),
+                "{label} cell is not monospaced: {tag}"
+            );
+        }
     }
 
     /// One capped, expiring share row, as the repo decodes it.
