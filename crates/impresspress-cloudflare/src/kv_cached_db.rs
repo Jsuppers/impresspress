@@ -101,6 +101,11 @@ impl Default for CacheMode {
 /// Wraps a [`DatabaseService`] with a write-through-invalidated KV cache
 /// for the `variables` and `block_settings` read shapes
 /// [`cache_key::read_key`] recognizes.
+///
+/// A write's error is the inner service's, returned unchanged and before any
+/// invalidation or version bump: a write that duplicates a key stays the
+/// `AlreadyExists` the `DatabaseService` contract names, which
+/// `impresspress_core::blocks::crud` answers as a 409.
 pub struct KvCachedD1DatabaseService {
     inner: Arc<dyn DatabaseService>,
     kv: Arc<dyn KvBackend>,
@@ -889,7 +894,8 @@ mod tests {
     }
 
     /// [`DatabaseService`] stub whose `list` returns one fixed non-sensitive
-    /// variables row; every other method is unreachable on the list path.
+    /// variables row and whose `create` is refused as a taken key; every other
+    /// method is unreachable on the paths under test.
     struct MockDb;
 
     fn variables_rows() -> RecordList {
@@ -924,10 +930,12 @@ mod tests {
 
         async fn create(
             &self,
-            _collection: &str,
+            collection: &str,
             _data: HashMap<String, serde_json::Value>,
         ) -> Result<Record, DatabaseError> {
-            unreachable!()
+            Err(DatabaseError::AlreadyExists(format!(
+                "UNIQUE constraint failed: {collection}.key"
+            )))
         }
 
         async fn update(
@@ -1102,6 +1110,21 @@ mod tests {
 
     fn variables_list_opts() -> ListOptions {
         cache_key::block_list_opts(cache_key::CachedTable::Variables, "GDSF__SITE")
+    }
+
+    /// **The `DatabaseService` contract through the cache.** A create on a
+    /// cached table that the database refuses as a taken key comes back as
+    /// the same `AlreadyExists` — `crud`'s 409 — and, since nothing was
+    /// written, touches no cache entry and bumps no version stamp.
+    #[wasm_bindgen_test]
+    async fn a_refused_duplicate_create_stays_already_exists() {
+        let (svc, kv) = cached_service(KvGet::Missing);
+        let err = svc
+            .create(variables::TABLE, HashMap::new())
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, DatabaseError::AlreadyExists(_)), "{err:?}");
+        assert_eq!(kv.writes.get(), 0, "a refused write bumps nothing");
     }
 
     /// A `batch` that writes a cached table is refused before it reaches the
