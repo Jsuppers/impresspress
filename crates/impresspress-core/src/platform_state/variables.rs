@@ -2676,25 +2676,20 @@ mod boot_tests {
     #[tokio::test]
     async fn the_block_config_fallback_refuses_what_the_seeder_refuses() {
         let session = crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
-        let internal = "__IMPRESSPRESS_RUNTIME_KIND__";
+        let internal = crate::blocks::products::RUNTIME_KIND_CONFIG_KEY;
+        let strict = wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY;
         assert!(crate::config_vars::is_runtime_owned_key(internal));
         let app_env = HashMap::from([
             (session.to_string(), "0".to_string()),
             (internal.to_string(), "server".to_string()),
             (APP_NAME_KEY.to_string(), String::new()),
-            (
-                "WAFER_RUN__DATABASE__STRICT_SCHEMA".to_string(),
-                "true".to_string(),
-            ),
+            (strict.to_string(), "true".to_string()),
         ]);
 
         let usable = usable_env_exports(&app_env);
         assert_eq!(
             usable,
-            HashMap::from([(
-                "WAFER_RUN__DATABASE__STRICT_SCHEMA".to_string(),
-                "true".to_string()
-            )]),
+            HashMap::from([(strict.to_string(), "true".to_string())]),
             "only the export no check refuses may reach a block"
         );
 
