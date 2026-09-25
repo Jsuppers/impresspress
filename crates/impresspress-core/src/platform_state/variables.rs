@@ -2669,6 +2669,48 @@ mod boot_tests {
         assert_eq!(vars.get(key).map(String::as_str), Some("14"));
     }
 
+    /// `usable_env_exports` — the environment native's blocks resolve their
+    /// declared keys from, beneath the table — reaches the verdict
+    /// `seed_and_load` reaches: an export the seeder refuses is left out, one
+    /// it stores is kept.
+    #[tokio::test]
+    async fn the_block_config_fallback_refuses_what_the_seeder_refuses() {
+        let session = crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
+        let internal = "__IMPRESSPRESS_RUNTIME_KIND__";
+        assert!(crate::config_vars::is_runtime_owned_key(internal));
+        let app_env = HashMap::from([
+            (session.to_string(), "0".to_string()),
+            (internal.to_string(), "server".to_string()),
+            (APP_NAME_KEY.to_string(), String::new()),
+            (
+                "WAFER_RUN__DATABASE__STRICT_SCHEMA".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        let usable = usable_env_exports(&app_env);
+        assert_eq!(
+            usable,
+            HashMap::from([(
+                "WAFER_RUN__DATABASE__STRICT_SCHEMA".to_string(),
+                "true".to_string()
+            )]),
+            "only the export no check refuses may reach a block"
+        );
+
+        // The seeder stores none of the refused three, off the same batch.
+        let db = migrated_db().await;
+        let batch: Vec<(String, String)> = app_env.into_iter().collect();
+        let vars = seed_and_load(&db, &batch).await.expect("boot");
+        for key in [session, internal, APP_NAME_KEY] {
+            assert_eq!(vars.get(key), None, "{key} must not be seeded");
+        }
+
+        // A value the rule accepts is kept by both.
+        let accepted = HashMap::from([(session.to_string(), "14".to_string())]);
+        assert_eq!(usable_env_exports(&accepted), accepted);
+    }
+
     /// THE CONTRACT, both halves. The environment seeds a key no admin has
     /// edited; once an admin has edited it, the row wins permanently.
     #[tokio::test]

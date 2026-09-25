@@ -305,8 +305,9 @@ pub async fn build_native_runtime(
     // deploy decisions, not admin-editable rows) and which those blocks read
     // from their `lifecycle(Init)` config alone — neither consults
     // `config_get` or the process environment itself. Only the exports the
-    // seeder would accept take part (`usable_env_exports`), so one it refused
-    // for its key's value rule cannot reach a block's Init this way instead.
+    // seeder would accept take part (`usable_env_exports`), so one it refuses
+    // — a blank value, a runtime-owned key, a value its key's declared rule
+    // refuses — cannot reach a block's Init this way instead.
     let mut block_config =
         impresspress_core::platform_state::variables::usable_env_exports(app_env);
     block_config.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));

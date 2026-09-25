@@ -736,9 +736,16 @@ async fn a_network_limit_env_var_reaches_the_network_blocks_init() {
     );
 }
 
-/// A block declaring `WAFER_RUN_SHARED__AUTH__SESSION_LIFETIME_DAYS` that
-/// records what its `lifecycle(Init)` config carried for it.
-struct InitConfigProbe(Arc<std::sync::Mutex<Option<Option<String>>>>);
+/// The key [`InitConfigProbe`] declares, under its registration name's
+/// prefix (`BlockInfo::validate` refuses any other).
+const PROBE_KEY: &str = "TEST__INIT_CONFIG_PROBE__MODE";
+
+/// [`PROBE_KEY`]'s declared default.
+const PROBE_DEFAULT: &str = "declared-default";
+
+/// A block declaring [`PROBE_KEY`] that records what its `lifecycle(Init)`
+/// config carried for it.
+struct InitConfigProbe(Arc<std::sync::Mutex<Option<String>>>);
 
 #[wafer_block::wafer_async_trait]
 impl wafer_run::Block for InitConfigProbe {
@@ -750,11 +757,10 @@ impl wafer_run::Block for InitConfigProbe {
             "records the Init config it is handed",
         )
         .config_keys(vec![wafer_run::ConfigVar::new(
-            impresspress_core::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY,
+            PROBE_KEY,
             "the key under test",
-            "",
-        )
-        .optional()])
+            PROBE_DEFAULT,
+        )])
     }
 
     async fn lifecycle(
@@ -764,12 +770,7 @@ impl wafer_run::Block for InitConfigProbe {
     ) -> Result<(), wafer_run::WaferError> {
         if event.event_type == wafer_run::LifecycleType::Init {
             let config = wafer_block::BlockConfig::from_event(&event);
-            let seen = config.str_or(
-                impresspress_core::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY,
-                "",
-            );
-            *self.0.lock().expect("probe lock") =
-                Some((!seen.is_empty()).then(|| seen.to_string()));
+            *self.0.lock().expect("probe lock") = Some(config.str(PROBE_KEY).to_string());
         }
         Ok(())
     }
@@ -784,17 +785,15 @@ impl wafer_run::Block for InitConfigProbe {
     }
 }
 
-/// Boot a fresh runtime over `app_env` with an [`InitConfigProbe`] registered,
-/// and return the session-lifetime value its Init config carried.
-async fn session_lifetime_a_block_init_sees(name: &str, value: &str) -> Option<String> {
+/// Boot a fresh native runtime whose process environment exports
+/// [`PROBE_KEY`]` = value`, with an [`InitConfigProbe`] registered, and return
+/// what the probe's Init config carried for the key.
+async fn what_a_blocks_init_sees_for(name: &str, value: &str) -> String {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join(format!("{name}.sqlite3"));
     let storage_root = tmp.path().join("storage");
     std::fs::create_dir_all(&storage_root).expect("create storage root");
-    let app_env = HashMap::from([(
-        impresspress_core::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY.to_string(),
-        value.to_string(),
-    )]);
+    let app_env = HashMap::from([(PROBE_KEY.to_string(), value.to_string())]);
     let (mut wafer, _db) = build_runtime_with_env(&db_path, &storage_root, &app_env).await;
     let seen = Arc::new(std::sync::Mutex::new(None));
     wafer
@@ -816,24 +815,27 @@ async fn session_lifetime_a_block_init_sees(name: &str, value: &str) -> Option<S
     seen.expect("the probe's Init must have run")
 }
 
-/// An export the variables seeder refuses for its key's declared value rule
-/// must not reach a block's `lifecycle(Init)` through the environment
-/// fallback beneath the table instead. A fresh database is the case that
-/// matters: it has no row yet for the table to answer with, so the fallback is
-/// what a block's Init config would read.
+/// The environment beneath the variables table reaches a block's Init only
+/// through the checks the variables seeder applies to the same export
+/// (`variables::usable_env_exports`). An empty export is the one a
+/// test-registered block can observe: blank means unset to the seeder, so it
+/// must not beat the key's declared default at Init either — the
+/// `ConfigSource` would otherwise hand the block the empty string, which
+/// `resolve_declared` takes as a value. The declared value rules the same
+/// check applies are covered in `platform_state::variables`' unit tests; every
+/// rule today is on a `WAFER_RUN_SHARED__*` key, which no block may declare.
 #[tokio::test]
-async fn an_env_value_the_seeder_refuses_does_not_reach_a_blocks_init() {
-    // `0` fails `parse_session_lifetime_days`, the key's value rule.
+async fn an_env_export_the_seeder_refuses_does_not_reach_a_blocks_init() {
     assert_eq!(
-        session_lifetime_a_block_init_sees("refused_env_value", "0").await,
-        None,
-        "a refused export must not reach Init; the declared default applies"
+        what_a_blocks_init_sees_for("empty_env_export", "").await,
+        PROBE_DEFAULT,
+        "an empty export must leave the declared default in place"
     );
 
-    // The control: a value the rule accepts does reach it, so the `None`
-    // above is the refusal's and not the probe's.
+    // The control: an export the checks accept does reach Init, so the
+    // default above is the refusal's and not the probe's.
     assert_eq!(
-        session_lifetime_a_block_init_sees("accepted_env_value", "14").await,
-        Some("14".to_string()),
+        what_a_blocks_init_sees_for("accepted_env_export", "from-env").await,
+        "from-env",
     );
 }
