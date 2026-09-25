@@ -4030,7 +4030,7 @@ mod credential_check_tests {
     //! key) in the `Authorization` header, so step 2 is what resolves it; the
     //! database fault is injected at the wire op the credential check sends.
 
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use wafer_block_crypto::primitives;
     use wafer_run::{ErrorCode, InputStream, OutputStream, WaferError};
@@ -4072,7 +4072,7 @@ mod credential_check_tests {
             TEST_JWT_SECRET.as_bytes(),
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
         );
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!(sub));
         claims.insert("type".to_string(), serde_json::json!("access"));
         claims.insert(

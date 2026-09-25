@@ -19,7 +19,7 @@
 //! long-lived services directly.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -804,7 +804,7 @@ impl CryptoService for ScopedCryptoService {
     fn sign_for(
         &self,
         block_id: &str,
-        claims: HashMap<String, serde_json::Value>,
+        claims: BTreeMap<String, serde_json::Value>,
         expiry: Duration,
     ) -> Result<String, CryptoError> {
         crypto()?.sign_for(block_id, claims, expiry)
@@ -814,7 +814,7 @@ impl CryptoService for ScopedCryptoService {
         &self,
         block_id: &str,
         token: &str,
-    ) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
+    ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
         crypto()?.verify_for(block_id, token)
     }
 

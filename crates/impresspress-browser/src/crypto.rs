@@ -49,7 +49,7 @@
 //! only the coupling does. Pinned by
 //! `password_parity::hashing_works_before_the_jwt_secret_is_installed`.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use wafer_block_crypto::{
     primitives::{self, PasswordScheme, PBKDF2_SHA256_RECOMMENDED_ITERATIONS},
@@ -144,7 +144,7 @@ impl CryptoService for BrowserCryptoService {
     fn sign_for(
         &self,
         block_id: &str,
-        claims: HashMap<String, serde_json::Value>,
+        claims: BTreeMap<String, serde_json::Value>,
         expiry: Duration,
     ) -> Result<String, CryptoError> {
         self.jwt()?.sign_for(block_id, claims, expiry)
@@ -154,7 +154,7 @@ impl CryptoService for BrowserCryptoService {
         &self,
         block_id: &str,
         token: &str,
-    ) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
+    ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
         self.jwt()?.verify_for(block_id, token)
     }
 
@@ -306,7 +306,7 @@ mod password_parity {
         assert!(
             svc.sign_for(
                 "impresspress/auth",
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 std::time::Duration::from_secs(60)
             )
             .is_err(),

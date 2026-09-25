@@ -367,7 +367,7 @@ async fn require_user_rejects_a_token_signed_with_a_foreign_secret() {
         b"some-other-deployments-master-secret",
         impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID,
     );
-    let mut claims = std::collections::HashMap::new();
+    let mut claims = std::collections::BTreeMap::new();
     claims.insert("sub".to_string(), serde_json::json!(uid));
     claims.insert("type".to_string(), serde_json::json!("access"));
     claims.insert("iss".to_string(), serde_json::json!(TEST_ISSUER));

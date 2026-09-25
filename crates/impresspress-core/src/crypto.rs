@@ -261,7 +261,7 @@ pub async fn extract_auth_meta(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Duration};
+    use std::{collections::BTreeMap, time::Duration};
 
     use super::*;
 
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn pin_jwt_sign_verify_roundtrip() {
         let secret = b"test-secret-padded-to-32-bytes-or-more";
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-123"));
         let token = primitives::jwt_sign(claims, Duration::from_secs(3600), secret).unwrap();
         let verified = primitives::jwt_verify(&token, secret, JwtExpPolicy::Required).unwrap();
@@ -327,7 +327,7 @@ mod tests {
     // no longer exists.
 
     fn sign_access_jwt(secret: &str, sub: &str, jti: Option<&str>, ttl_secs: u64) -> String {
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!(sub));
         claims.insert("type".to_string(), serde_json::json!("access"));
         if let Some(j) = jti {
@@ -369,7 +369,7 @@ mod tests {
             master.as_bytes(),
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
         );
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-a"));
         claims.insert("type".to_string(), serde_json::json!("refresh"));
         let token =
@@ -488,9 +488,9 @@ mod tests {
     /// `"access"`; the caller adds `sub` and whatever else the case needs.
     fn sign_access_jwt_with(
         secret: &str,
-        fill: impl FnOnce(&mut HashMap<String, serde_json::Value>),
+        fill: impl FnOnce(&mut BTreeMap<String, serde_json::Value>),
     ) -> String {
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("type".to_string(), serde_json::json!("access"));
         fill(&mut claims);
         let derived = primitives::derive_block_key(
@@ -510,7 +510,7 @@ mod tests {
             master.as_bytes(),
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
         );
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-a"));
         claims.insert("type".to_string(), serde_json::json!("refresh"));
         let token =
@@ -534,7 +534,7 @@ mod tests {
             master.as_bytes(),
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
         );
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-a"));
         let token =
             primitives::jwt_sign(claims, Duration::from_secs(3600), derived.as_bytes()).unwrap();
@@ -553,7 +553,7 @@ mod tests {
         use wafer_run::Message;
         let ctx = crate::test_support::TestContext::with_auth().await;
         let master = "test-secret";
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-a"));
         claims.insert("type".to_string(), serde_json::json!("access"));
         let token =
@@ -599,7 +599,7 @@ mod tests {
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
         );
 
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-prod"));
         claims.insert("type".to_string(), serde_json::json!("access"));
         claims.insert("jti".to_string(), serde_json::json!("jti-prod"));
@@ -692,7 +692,7 @@ mod tests {
         auth_version: i64,
         ttl_secs: u64,
     ) -> String {
-        let mut claims = HashMap::new();
+        let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!(sub));
         claims.insert("type".to_string(), serde_json::json!("access"));
         claims.insert(

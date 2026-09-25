@@ -22,7 +22,7 @@
 //! [`MigrationTestCtx::mint_access_token`] verifies against the key
 //! `crypto::verify_access_token` derives.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use wafer_run::{context::Context, Block, InputStream, Message, OutputStream, WaferError};
 
@@ -102,7 +102,7 @@ impl MigrationTestCtx {
         extra: &[(&str, serde_json::Value)],
         ttl: Duration,
     ) -> String {
-        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut claims: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!(sub));
         claims.insert("type".to_string(), serde_json::json!("access"));
         claims.insert("iss".to_string(), serde_json::json!(TEST_ISSUER));

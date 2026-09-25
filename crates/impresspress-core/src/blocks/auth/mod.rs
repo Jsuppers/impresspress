@@ -28,7 +28,10 @@ pub mod migrations;
 pub mod repo;
 pub mod service;
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use wafer_core::clients::{config as config_client, crypto};
 use wafer_run::WaferError;
@@ -868,10 +871,9 @@ pub(crate) mod helpers {
     /// Refresh tokens carry one too, for a different reason: everything else
     /// on a refresh JWT is the same on both sides of a rotation — same user,
     /// same family, same auth method, same issuer — and `iat`/`exp` are whole
-    /// seconds. Without a per-token nonce, a rotation inside the second its
-    /// predecessor was minted in differs from that predecessor only in the
-    /// order a `HashMap` happened to serialize the payload in; when that
-    /// order repeats, the successor IS the predecessor, and its
+    /// seconds. The signer encodes claims canonically, so without a
+    /// per-token nonce a rotation inside the second its predecessor was
+    /// minted in signs to exactly the predecessor's bytes, and its
     /// `token_hash` collides with the row the rotation has just revoked.
     ///
     /// Access tokens also carry the user's current `auth_version` (P2c) —
@@ -937,7 +939,7 @@ pub(crate) mod helpers {
             .await
             .map_err(|e| crate::blocks::crud::db_error_internal(e, "auth_version lookup failed"))?;
 
-        let mut access_claims = HashMap::new();
+        let mut access_claims = BTreeMap::new();
         access_claims.insert(
             "user_id".to_string(),
             serde_json::Value::String(user_id.to_string()),
@@ -983,7 +985,7 @@ pub(crate) mod helpers {
         .await
         .map_err(wafer_run::OutputStream::error)?;
 
-        let mut refresh_claims = HashMap::new();
+        let mut refresh_claims = BTreeMap::new();
         refresh_claims.insert(
             "user_id".to_string(),
             serde_json::Value::String(user_id.to_string()),
@@ -1500,7 +1502,7 @@ pub(crate) mod helpers {
                 panic!("mint tokens failed")
             };
 
-            let jti = |claims: &HashMap<String, serde_json::Value>| {
+            let jti = |claims: &BTreeMap<String, serde_json::Value>| {
                 claims
                     .get("jti")
                     .and_then(|v| v.as_str())
