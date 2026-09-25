@@ -603,6 +603,33 @@ mod tests {
     }
 
     #[test]
+    fn admin_005_splits_into_its_column_and_its_repair() {
+        // The `ADD COLUMN` has to reach the runner on its own, so a re-run's
+        // duplicate-column error is recognised and the `UPDATE` still runs.
+        for (dialect, sql) in [
+            (
+                "sqlite",
+                include_str!("blocks/admin/migrations/005_wrap_grants_append_column.sqlite.sql"),
+            ),
+            (
+                "postgres",
+                include_str!("blocks/admin/migrations/005_wrap_grants_append_column.postgres.sql"),
+            ),
+        ] {
+            let stmts: Vec<&str> = split_statements(sql)
+                .into_iter()
+                .filter(|s| has_executable_content(s))
+                .collect();
+            assert_eq!(
+                stmts.len(),
+                2,
+                "admin {dialect} migration 005: expected 2 statements, got {stmts:?}"
+            );
+            assert!(is_alter_add_column(stmts[0]), "{dialect}: {}", stmts[0]);
+        }
+    }
+
+    #[test]
     fn products_sql_splits_into_expected_chunks() {
         // Counts the executable statements in the products block SQL files.
         // 9 CREATE TABLE + 9 CREATE INDEX = 18 statements per backend (the

@@ -17,6 +17,29 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### WRAP grants: append-only has a column of its own (admin migration 005) — upgrade with `--run-migrations`
+
+**What changes.** A custom WRAP grant stores append-only access in a new
+`append` column of `impresspress__admin__wrap_grants` (`write = 0, append =
+1`) instead of as `write = 2`. Migration 005 adds the column and moves any
+`write = 2` row onto it. A row that sets both `write` and `append` is refused
+and left out of the runtime's grants, as is a leftover `write = 2`.
+
+**Why.** Releases from before append-only grants existed read `write` as a
+flag, where any non-zero value means read-write. Rolling back to one after an
+append-only row had been written would have turned that grant into a
+read-write one. Such a release ignores the new column, so it now reads an
+append-only row as read-only: a rollback narrows access instead of widening
+it.
+
+**What to expect.** The permissions form offers read-only and read-write, so
+no deployment should hold a `write = 2` row and the repair should find nothing.
+Native applies 005 on every start, and a browser install on the first boot of
+this bundle. On Cloudflare, deploy with `--run-migrations`: until 005 runs,
+existing grants keep loading, but adding a custom grant fails because the
+column it writes does not exist yet. This is an admin migration, not an auth
+one: nobody is signed out.
+
 ### Browser: migrations run once per change, not on every boot
 
 **What changes.** A browser install now runs a block's migrations when their

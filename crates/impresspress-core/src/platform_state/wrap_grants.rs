@@ -33,8 +33,9 @@ pub struct WrapGrantRow {
     pub grantee: String,
     /// The table, storage path or other resource pattern being granted.
     pub resource: String,
-    /// Stored in the integer column `write` (migration 001) as
-    /// [`WRITE_READ`], [`WRITE_READ_WRITE`] or [`WRITE_APPEND`].
+    /// Stored as two integer flags: `write` (migration 001) set for a
+    /// read-write grant, `append` (migration 005) set for an append-only one,
+    /// neither for read-only. See [`encode_access`].
     pub write: GrantWrite,
     /// The stored wire value of the grant's [`ResourceType`] (its lowercase
     /// `Display` form: `db`, `config`, …); empty is the all-types wildcard.
@@ -47,9 +48,9 @@ pub struct WrapGrantRow {
 impl WrapGrantRow {
     /// Decode one row. `grantee`, `resource` and `write` are required (all
     /// `NOT NULL`); a row without them is not a grant and is refused rather
-    /// than defaulted, so a malformed row can never widen access. `write`
-    /// is decoded by [`decode_write`]; a value it does not recognise refuses
-    /// the row too.
+    /// than defaulted, so a malformed row can never widen access. The access
+    /// columns are decoded by [`decode_access`]; a value it does not
+    /// recognise, or a row that sets both flags, refuses the row too.
     pub fn from_record(id: &str, data: &HashMap<String, Value>) -> Result<Self, String> {
         let grantee = data
             .opt_str_field("grantee")
@@ -57,11 +58,7 @@ impl WrapGrantRow {
         let resource = data
             .opt_str_field("resource")
             .ok_or_else(|| format!("{TABLE} row `{id}` has no resource"))?;
-        let Some(write) = data.get("write") else {
-            return Err(format!("{TABLE} row `{id}` has no write column"));
-        };
-        let write = decode_write(write)
-            .ok_or_else(|| format!("{TABLE} row `{id}` has an unrecognised write value {write}"))?;
+        let write = decode_access(data).map_err(|e| format!("{TABLE} row `{id}` {e}"))?;
         Ok(Self {
             id: id.to_string(),
             grantee,
@@ -80,7 +77,9 @@ impl WrapGrantRow {
         data.insert("id".to_string(), json!(self.id));
         data.insert("grantee".to_string(), json!(self.grantee));
         data.insert("resource".to_string(), json!(self.resource));
-        data.insert("write".to_string(), json!(encode_write(self.write)));
+        let (write, append) = encode_access(self.write);
+        data.insert(WRITE_COLUMN.to_string(), json!(write));
+        data.insert(APPEND_COLUMN.to_string(), json!(append));
         data.insert("resource_type".to_string(), json!(self.resource_type));
         data.insert("description".to_string(), json!(self.description));
         data.insert("created_at".to_string(), json!(self.created_at));
@@ -111,40 +110,69 @@ impl WrapGrantRow {
     }
 }
 
-/// `write` column value of a read-only grant.
-pub const WRITE_READ: i64 = 0;
-/// `write` column value of a read-write grant.
-pub const WRITE_READ_WRITE: i64 = 1;
-/// `write` column value of an append-only grant.
-pub const WRITE_APPEND: i64 = 2;
+/// Set for a read-write grant.
+const WRITE_COLUMN: &str = "write";
+/// Set for an append-only grant (migration 005).
+const APPEND_COLUMN: &str = "append";
 
-fn encode_write(write: GrantWrite) -> i64 {
+/// The `(write, append)` flags a grant is stored as.
+///
+/// Append-only has a column of its own rather than a third `write` value
+/// because a binary built before append grants existed reads `write` as a
+/// flag, any non-zero value meaning read-write. A row stored this way reads as
+/// read-only to such a binary, which ignores `append`, so rolling back past
+/// this release narrows an append grant instead of widening it.
+fn encode_access(write: GrantWrite) -> (i64, i64) {
     match write {
-        GrantWrite::None => WRITE_READ,
-        GrantWrite::Full => WRITE_READ_WRITE,
-        GrantWrite::Append => WRITE_APPEND,
+        GrantWrite::None => (0, 0),
+        GrantWrite::Full => (1, 0),
+        GrantWrite::Append => (0, 1),
     }
 }
 
-/// The stored `write` value as a [`GrantWrite`]: the integer SQLite and
-/// Postgres store, a bool, or either spelled as a string by a hand-built
-/// fixture. `None` for anything else — the caller refuses the row rather
-/// than guess which access it meant.
-fn decode_write(value: &Value) -> Option<GrantWrite> {
-    let code = match value {
-        Value::Number(n) => n.as_i64()?,
-        Value::Bool(b) => i64::from(*b),
-        Value::String(s) => match s.as_str() {
-            "true" => WRITE_READ_WRITE,
-            "false" => WRITE_READ,
-            other => other.parse().ok()?,
-        },
-        _ => return None,
+/// The stored access columns as a [`GrantWrite`]. `write` is required;
+/// `append` reads as unset when it is absent or `NULL`, which is how a row
+/// looks where migration 005 has not run yet (a Cloudflare deployment holding
+/// back migrations, or `/_deploy/init` building its runtime before it
+/// migrates) — and treating it as unset never grants more than `write` says.
+/// A row that sets both flags is refused: it names two different accesses,
+/// and neither is a safe guess.
+fn decode_access(data: &HashMap<String, Value>) -> Result<GrantWrite, String> {
+    let Some(write) = data.get(WRITE_COLUMN) else {
+        return Err("has no write column".to_string());
     };
-    match code {
-        WRITE_READ => Some(GrantWrite::None),
-        WRITE_READ_WRITE => Some(GrantWrite::Full),
-        WRITE_APPEND => Some(GrantWrite::Append),
+    let write =
+        decode_flag(write).ok_or_else(|| format!("has an unrecognised write value {write}"))?;
+    let append = match data.get(APPEND_COLUMN) {
+        None | Some(Value::Null) => false,
+        Some(append) => decode_flag(append)
+            .ok_or_else(|| format!("has an unrecognised append value {append}"))?,
+    };
+    match (write, append) {
+        (false, false) => Ok(GrantWrite::None),
+        (true, false) => Ok(GrantWrite::Full),
+        (false, true) => Ok(GrantWrite::Append),
+        (true, true) => Err("sets both write and append".to_string()),
+    }
+}
+
+/// One stored access flag: the integer `0`/`1` SQLite and Postgres store, a
+/// bool, or either spelled as a string by a hand-built fixture. `None` for
+/// anything else — `write = 2` included — so the caller refuses the row
+/// rather than guess which access it meant.
+fn decode_flag(value: &Value) -> Option<bool> {
+    match value {
+        Value::Number(n) => match n.as_i64()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -344,8 +372,8 @@ mod tests {
     }
 
     /// An append-only grant survives the table and becomes an append-only
-    /// runtime grant — the column is an integer, not a bool, so it cannot
-    /// collapse into read-only or read-write on the way through.
+    /// runtime grant: stored as `write = 0, append = 1`, it cannot collapse
+    /// into read-only or read-write on the way through.
     #[tokio::test]
     async fn an_append_grant_round_trips_through_the_table() {
         let ctx = TestContext::with_admin().await;
@@ -358,7 +386,8 @@ mod tests {
         )
         .await
         .expect("create");
-        assert_eq!(created.to_data()["write"], serde_json::json!(WRITE_APPEND));
+        assert_eq!(created.to_data()[WRITE_COLUMN], serde_json::json!(0));
+        assert_eq!(created.to_data()[APPEND_COLUMN], serde_json::json!(1));
         let rows = list(&ctx).await.expect("list");
         assert_eq!(rows[0].write, GrantWrite::Append);
         let grant = rows[0]
@@ -366,6 +395,35 @@ mod tests {
             .into_resource_grant()
             .expect("a db append grant");
         assert_eq!(grant.write, GrantWrite::Append);
+    }
+
+    /// A binary built before append grants existed decoded `write` with
+    /// `RecordExt::bool_field` (any non-zero value is read-write) and has no
+    /// notion of `append`. Rolling back to one must not widen an append-only
+    /// grant, so the row as the database hands it back has to read as
+    /// read-only through that decoder — and as append-only through this one.
+    #[tokio::test]
+    async fn an_append_row_reads_as_read_only_to_a_binary_without_the_column() {
+        let ctx = TestContext::with_admin().await;
+        let created = create(
+            &ctx,
+            NewWrapGrant {
+                write: GrantWrite::Append,
+                ..new_grant("db")
+            },
+        )
+        .await
+        .expect("create");
+        let stored = db::get(&ctx, TABLE, &created.id)
+            .await
+            .expect("read the stored row");
+        assert!(
+            !stored.data.bool_field(WRITE_COLUMN),
+            "an older binary would read this append grant as read-write: {:?}",
+            stored.data
+        );
+        let decoded = WrapGrantRow::from_record(&stored.id, &stored.data).expect("decode");
+        assert_eq!(decoded.write, GrantWrite::Append);
     }
 
     /// An append grant not typed `db` is one the runtime refuses to install,
@@ -431,57 +489,227 @@ mod tests {
         assert!(list(&failing).await.is_err());
     }
 
-    /// `write` arrives as an integer from the database, or as a bool or a
-    /// string from a hand-built fixture; a row without it, or with a value
-    /// that names no access, is not a grant.
+    fn row_with(columns: &[(&str, Value)]) -> HashMap<String, Value> {
+        let mut data = HashMap::new();
+        data.insert("grantee".to_string(), serde_json::json!("a/b"));
+        data.insert("resource".to_string(), serde_json::json!("a__b__c"));
+        for (column, value) in columns {
+            data.insert((*column).to_string(), value.clone());
+        }
+        data
+    }
+
+    /// The access flags arrive as integers from the database, or as bools or
+    /// strings from a hand-built fixture. `append` may be absent or `NULL`
+    /// (a table migration 005 has not reached yet) and then reads as unset.
     #[test]
-    fn write_decodes_from_every_backend_shape_and_is_required() {
-        for (shape, want) in [
-            (serde_json::json!(1), GrantWrite::Full),
-            (serde_json::json!(0), GrantWrite::None),
-            (serde_json::json!(2), GrantWrite::Append),
-            (serde_json::json!(true), GrantWrite::Full),
-            (serde_json::json!(false), GrantWrite::None),
-            (serde_json::json!("1"), GrantWrite::Full),
-            (serde_json::json!("2"), GrantWrite::Append),
-            (serde_json::json!("true"), GrantWrite::Full),
+    fn access_decodes_from_every_backend_shape() {
+        use serde_json::json;
+        for (write, append, want) in [
+            (json!(1), None, GrantWrite::Full),
+            (json!(0), None, GrantWrite::None),
+            (json!(true), None, GrantWrite::Full),
+            (json!(false), None, GrantWrite::None),
+            (json!("1"), None, GrantWrite::Full),
+            (json!("true"), None, GrantWrite::Full),
+            (json!("0"), None, GrantWrite::None),
+            (json!(1), Some(json!(null)), GrantWrite::Full),
+            (json!(0), Some(json!(null)), GrantWrite::None),
+            (json!(1), Some(json!(0)), GrantWrite::Full),
+            (json!(0), Some(json!(0)), GrantWrite::None),
+            (json!(0), Some(json!(1)), GrantWrite::Append),
+            (json!(false), Some(json!(true)), GrantWrite::Append),
+            (json!("0"), Some(json!("1")), GrantWrite::Append),
         ] {
-            let mut data = HashMap::new();
-            data.insert("grantee".to_string(), serde_json::json!("a/b"));
-            data.insert("resource".to_string(), serde_json::json!("a__b__c"));
-            data.insert("write".to_string(), shape.clone());
-            let row = WrapGrantRow::from_record("wg_1", &data).expect("decode");
-            assert_eq!(row.write, want, "{shape}");
+            let mut columns = vec![(WRITE_COLUMN, write.clone())];
+            if let Some(append) = &append {
+                columns.push((APPEND_COLUMN, append.clone()));
+            }
+            let row = WrapGrantRow::from_record("wg_1", &row_with(&columns)).expect("decode");
+            assert_eq!(row.write, want, "write {write}, append {append:?}");
             assert_eq!(
                 row.resource_type, "",
                 "absent resource_type reads as the wildcard"
             );
         }
+    }
+
+    /// Every access round-trips through `to_data`, and the columns it writes
+    /// are exactly the flag pair [`encode_access`] names.
+    #[test]
+    fn access_round_trips_through_to_data() {
+        for (write, flags) in [
+            (GrantWrite::None, (0, 0)),
+            (GrantWrite::Full, (1, 0)),
+            (GrantWrite::Append, (0, 1)),
+        ] {
+            let row = NewWrapGrant {
+                write,
+                ..new_grant("db")
+            }
+            .into_row();
+            let data = row.to_data();
+            assert_eq!(
+                (&data[WRITE_COLUMN], &data[APPEND_COLUMN]),
+                (&serde_json::json!(flags.0), &serde_json::json!(flags.1)),
+                "{write:?}"
+            );
+            assert_eq!(
+                WrapGrantRow::from_record(&row.id, &data).expect("decode"),
+                row
+            );
+        }
+    }
+
+    /// A row without the required columns is not a grant.
+    #[test]
+    fn a_row_missing_a_required_column_is_refused() {
         for missing in ["grantee", "resource", "write"] {
-            let mut data = HashMap::new();
-            data.insert("grantee".to_string(), serde_json::json!("a/b"));
-            data.insert("resource".to_string(), serde_json::json!("a__b__c"));
-            data.insert("write".to_string(), serde_json::json!(1));
+            let mut data = row_with(&[(WRITE_COLUMN, serde_json::json!(1))]);
             data.remove(missing);
             let err = WrapGrantRow::from_record("wg_1", &data).expect_err(missing);
             assert!(err.contains(missing) && err.contains("wg_1"), "{err}");
         }
-        for unknown in [
-            serde_json::json!(3),
-            serde_json::json!(-1),
-            serde_json::json!("append"),
-            serde_json::json!(null),
+    }
+
+    /// A flag value that names no access is refused, not guessed at —
+    /// `write = 2`, the spelling append-only had before migration 005,
+    /// included — and so is a row that sets both flags.
+    #[test]
+    fn an_unrecognised_or_contradictory_access_is_refused() {
+        use serde_json::json;
+        for (write, append, names) in [
+            (json!(2), None, "write"),
+            (json!("2"), None, "write"),
+            (json!(3), None, "write"),
+            (json!(-1), None, "write"),
+            (json!("append"), None, "write"),
+            (json!(null), None, "write"),
+            (json!(0), Some(json!(2)), "append"),
+            (json!(0), Some(json!("yes")), "append"),
+            (json!(1), Some(json!(1)), "both"),
+            (json!(true), Some(json!(true)), "both"),
         ] {
-            let mut data = HashMap::new();
-            data.insert("grantee".to_string(), serde_json::json!("a/b"));
-            data.insert("resource".to_string(), serde_json::json!("a__b__c"));
-            data.insert("write".to_string(), unknown.clone());
-            let err = WrapGrantRow::from_record("wg_1", &data).expect_err("unknown write");
+            let mut columns = vec![(WRITE_COLUMN, write.clone())];
+            if let Some(append) = &append {
+                columns.push((APPEND_COLUMN, append.clone()));
+            }
+            let err = WrapGrantRow::from_record("wg_1", &row_with(&columns))
+                .expect_err("unrecognised access");
             assert!(
-                err.contains("write") && err.contains("wg_1"),
-                "{unknown}: {err}"
+                err.contains(names) && err.contains("wg_1"),
+                "write {write}, append {append:?}: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_005_tests {
+    //! What admin's `005_wrap_grants_append_column` does through the gated
+    //! runner Cloudflare and the browser apply it with, on a deployment that
+    //! already holds grants — the only database its `UPDATE` has anything to
+    //! do on. It lives beside the codec because this module owns the table.
+
+    use std::collections::HashMap;
+
+    use serde_json::json;
+    use wafer_block::GrantWrite;
+    use wafer_core::clients::database as db;
+
+    use super::{list, TABLE};
+    use crate::{
+        blocks::admin::migrations::{SQLITE_MIGRATIONS, WRAP_GRANTS_APPEND_COLUMN},
+        migration_helper,
+        test_support::TestContext,
+        util::RecordExt,
+    };
+
+    const ADMIN: &str = "impresspress/admin";
+
+    /// The migrations before 005, sliced out of the shipped list by name so
+    /// an unwired 005 cannot pass as applied.
+    fn before_005() -> Vec<&'static str> {
+        let at = SQLITE_MIGRATIONS
+            .iter()
+            .position(|(name, _)| *name == WRAP_GRANTS_APPEND_COLUMN)
+            .expect("005 is wired into SQLITE_MIGRATIONS");
+        SQLITE_MIGRATIONS[..at]
+            .iter()
+            .map(|(_, sql)| *sql)
+            .collect()
+    }
+
+    /// A row as the table held it before 005: access in `write` alone.
+    fn pre_005_row(id: &str, write: i64) -> HashMap<String, serde_json::Value> {
+        let mut data = HashMap::new();
+        for (column, value) in [
+            ("id", json!(id)),
+            ("grantee", json!("impresspress/legalpages")),
+            ("resource", json!("impresspress__legalpages__docs")),
+            ("write", json!(write)),
+            ("resource_type", json!("db")),
+            ("created_at", json!("2026-01-01T00:00:00Z")),
+            ("updated_at", json!("2026-01-01T00:00:00Z")),
+        ] {
+            data.insert(column.to_string(), value);
+        }
+        data
+    }
+
+    #[tokio::test]
+    async fn migration_005_moves_append_grants_off_the_write_column() {
+        let mut ctx = TestContext::new().await;
+        migration_helper::apply_migrations(&ctx, ADMIN, &before_005(), &[])
+            .await
+            .expect("001-004 apply");
+        for (id, write) in [("wg_read", 0), ("wg_full", 1), ("wg_append", 2)] {
+            // Straight to the table: `write = 2` is a spelling the only
+            // writer (`wrap_grants::create`) no longer produces.
+            db::create(&ctx, TABLE, pre_005_row(id, write))
+                .await
+                .expect("seed a pre-005 grant");
+        }
+
+        ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
+        let all: Vec<&str> = SQLITE_MIGRATIONS.iter().map(|(_, sql)| *sql).collect();
+        migration_helper::apply_migrations(&ctx, ADMIN, &all, &[])
+            .await
+            .expect("005 applies to a database holding grants");
+
+        for (id, write, append, access) in [
+            ("wg_read", 0, 0, GrantWrite::None),
+            ("wg_full", 1, 0, GrantWrite::Full),
+            ("wg_append", 0, 1, GrantWrite::Append),
+        ] {
+            let stored = db::get(&ctx, TABLE, id).await.expect("read the grant");
+            assert_eq!(
+                (&stored.data["write"], &stored.data["append"]),
+                (&json!(write), &json!(append)),
+                "{id}"
+            );
+            // What a binary without the column would make of the row.
+            assert_eq!(
+                stored.data.bool_field("write"),
+                access == GrantWrite::Full,
+                "{id} as a binary without the append column reads it"
+            );
+        }
+        let mut listed: Vec<(String, GrantWrite)> = list(&ctx)
+            .await
+            .expect("every migrated row decodes")
+            .into_iter()
+            .map(|row| (row.id, row.write))
+            .collect();
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            listed,
+            vec![
+                ("wg_append".to_string(), GrantWrite::Append),
+                ("wg_full".to_string(), GrantWrite::Full),
+                ("wg_read".to_string(), GrantWrite::None),
+            ]
+        );
     }
 }
 
@@ -605,6 +833,61 @@ mod boot_tests {
             .find(|g| g.resource == "bucket/y")
             .expect("empty resource_type row kept");
         assert_eq!(g4.resource_type, None);
+    }
+
+    /// The native CLI applies admin's DDL ungated on every boot
+    /// (`migration_helper::apply_ddl_via_service`). On a table 001-004
+    /// created, a row that spelled append-only `write = 2` comes out of 005 as
+    /// `write = 0, append = 1` and still loads as an append grant; running
+    /// the whole list again (the next boot) changes nothing.
+    #[tokio::test]
+    async fn migration_005_moves_a_write_2_row_onto_the_append_column() {
+        use crate::blocks::admin::migrations::{ddl_files, WRAP_GRANTS_APPEND_COLUMN};
+
+        let db = bare_db().await;
+        let all = ddl_files("sqlite");
+        let before_005 = &all[..all.len() - 1];
+        assert!(
+            all[all.len() - 1].contains("ADD COLUMN append"),
+            "{WRAP_GRANTS_APPEND_COLUMN} is the last admin migration"
+        );
+        crate::migration_helper::apply_ddl_via_service(&db, before_005)
+            .await
+            .expect("001-004 apply");
+
+        // Straight to the table in the pre-005 spelling, which the codec no
+        // longer writes.
+        let mut legacy = HashMap::new();
+        for (column, value) in [
+            ("id", json!("wg_legacy")),
+            ("grantee", json!("impresspress/legalpages")),
+            ("resource", json!("impresspress__legalpages__docs")),
+            ("write", json!(2)),
+            ("resource_type", json!("db")),
+            ("created_at", json!("2026-01-01T00:00:00Z")),
+            ("updated_at", json!("2026-01-01T00:00:00Z")),
+        ] {
+            legacy.insert(column.to_string(), value);
+        }
+        db.create(TABLE, legacy)
+            .await
+            .expect("seed a write = 2 row");
+        assert!(
+            load(&db).await.is_empty(),
+            "before 005 the codec refuses `write = 2`"
+        );
+
+        for boot in ["first", "second"] {
+            crate::migration_helper::apply_ddl_via_service(&db, all)
+                .await
+                .unwrap_or_else(|e| panic!("{boot} run of 001-005: {e}"));
+            let stored = db.get(TABLE, "wg_legacy").await.expect("read the row");
+            assert_eq!(stored.data["write"], json!(0), "{boot} run");
+            assert_eq!(stored.data["append"], json!(1), "{boot} run");
+            let grants = load(&db).await;
+            assert_eq!(grants.len(), 1, "{boot} run");
+            assert_eq!(grants[0].write, GrantWrite::Append, "{boot} run");
+        }
     }
 
     /// A [`DatabaseService`] whose existence check fails hard and whose every
