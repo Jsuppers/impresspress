@@ -20,7 +20,7 @@ pub mod htmx;
 pub mod source_scan;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -2965,31 +2965,22 @@ pub(crate) fn real_crypto_service() -> wafer_block_crypto::service::Argon2JwtCry
         .expect("test secret is long enough")
 }
 
-/// The production crypto service with the two things that make one claim set
-/// mint two different tokens pinned: the clock, and the claim order.
+/// The production crypto service with its clock pinned.
 ///
-/// A JWT payload is `serde_json` over a `HashMap`, so its keys come out in
-/// that map's iteration order, which `RandomState` randomizes per map. Two
-/// mints of an identical claim set therefore produce byte-identical tokens
-/// only when the two maps happen to agree, measured at about once in forty
-/// thousand for the refresh token's payload of nine claims. `iat`/`exp` are
-/// whole seconds, so a second mint also has to land inside the first one's
-/// second.
-///
-/// Neither is a property a handler may rely on: the first is a coin the
-/// standard library flips, and the second is ordinary in production (a client
-/// that refreshes right after logging in). A test that has to state what
-/// happens when two mints are indistinguishable cannot wait for a
-/// coincidence that rare, so this service makes it certain instead:
-/// every token is stamped with the instant this service was built, and every
-/// payload is written in sorted-key order. A mint path that needs its tokens
-/// to differ has to put something that differs in the claims, and a test over
-/// this service is what proves it does.
+/// The signer encodes claims canonically (keys sorted at every depth), so two
+/// mints of an identical claim set are byte-identical whenever they land in
+/// the same second: `iat`/`exp` are whole seconds. That is ordinary in
+/// production (a client that refreshes right after logging in) but only
+/// occasional in a test, which cannot wait for the scheduler to put two mints
+/// inside one second. This service makes it certain instead: every token is
+/// stamped with the instant this service was built. A mint path that needs
+/// its tokens to differ has to put something that differs in the claims, and
+/// a test over this service is what proves it does.
 ///
 /// It re-encodes what the real service signed rather than signing from
-/// scratch — same header, same key derivation, same claims, each token
-/// keeping its own lifetime — so it stays a pin on the payload, not a second
-/// implementation of JWT signing.
+/// scratch — same header, same key derivation, same claims in the same
+/// canonical order, each token keeping its own lifetime — so it stays a pin
+/// on the clock, not a second implementation of JWT signing.
 pub struct PinnedMintCrypto {
     inner: wafer_block_crypto::service::Argon2JwtCryptoService,
     /// The `iat` every token minted through this service carries.
@@ -3010,9 +3001,11 @@ impl PinnedMintCrypto {
         }
     }
 
-    /// Re-encode `token`'s payload with sorted keys and this service's pinned
-    /// `iat`, then re-sign it with `key`. The token's lifetime (`exp - iat`)
-    /// is carried over from what the inner service stamped.
+    /// Re-encode `token`'s payload with this service's pinned `iat`, then
+    /// re-sign it with `key`. The token's lifetime (`exp - iat`) is carried
+    /// over from what the inner service stamped. The payload is already
+    /// canonical and a `BTreeMap` keeps it in that order, so the re-encoding
+    /// changes nothing but the two timestamps.
     fn pin(&self, token: String, key: &[u8]) -> Result<String, CryptoError> {
         use wafer_block_crypto::primitives::{b64url_decode, b64url_encode, hmac_sha256};
 
@@ -3024,7 +3017,7 @@ impl PinnedMintCrypto {
                 "the crypto service did not return a compact JWT: {token}"
             )));
         };
-        let mut claims: std::collections::BTreeMap<String, serde_json::Value> =
+        let mut claims: BTreeMap<String, serde_json::Value> =
             serde_json::from_slice(&b64url_decode(payload)?).map_err(|e| {
                 CryptoError::SignError(format!("JWT payload is not an object: {e}"))
             })?;
@@ -3063,7 +3056,7 @@ impl CryptoService for PinnedMintCrypto {
     fn sign_for(
         &self,
         block_id: &str,
-        claims: HashMap<String, serde_json::Value>,
+        claims: BTreeMap<String, serde_json::Value>,
         expiry: std::time::Duration,
     ) -> Result<String, CryptoError> {
         let signed = self.inner.sign_for(block_id, claims, expiry)?;
@@ -3078,7 +3071,7 @@ impl CryptoService for PinnedMintCrypto {
         &self,
         block_id: &str,
         token: &str,
-    ) -> Result<HashMap<String, serde_json::Value>, CryptoError> {
+    ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
         self.inner.verify_for(block_id, token)
     }
 
@@ -3459,7 +3452,7 @@ pub const TEST_JWT_SECRET: &str = "test-jwt-secret";
 /// `set_config(blocks::auth::JWT_SECRET_KEY, TEST_JWT_SECRET)` — the secret is
 /// read from the config snapshot, not passed in.
 pub fn access_token_for(sub: &str, roles: &[&str]) -> String {
-    use std::{collections::HashMap, time::Duration};
+    use std::time::Duration;
 
     use wafer_block_crypto::primitives;
 
@@ -3467,7 +3460,7 @@ pub fn access_token_for(sub: &str, roles: &[&str]) -> String {
         TEST_JWT_SECRET.as_bytes(),
         crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
     );
-    let mut claims = HashMap::new();
+    let mut claims = BTreeMap::new();
     claims.insert("sub".to_string(), serde_json::json!(sub));
     claims.insert("type".to_string(), serde_json::json!("access"));
     // Must match `expected_issuer`'s default

@@ -17,6 +17,32 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### wafer-run 11723941: cut-off streams, Postgres settings, security headers
+
+**What changes.**
+
+- A response whose producer stops without finishing (it panicked, was
+  cancelled, or returned early mid-body) is an error, not a success carrying a
+  truncated body. On the native server that is a 500; on Cloudflare and in the
+  browser, where the status is already sent when a streamed body fails, the
+  body is aborted instead of ending cleanly, so a client sees a failed
+  download rather than a short file that looks whole.
+- A handler can no longer loosen a security header the site-wide
+  `wafer-run/security-headers` step set; a stricter one is combined with it.
+  A file download's sandboxing `Content-Security-Policy` is now sent beside
+  the site policy (a browser enforces both) instead of replacing it.
+- Postgres connects through sqlx 0.9, which reads two connection settings
+  differently: a password taken from a `.pgpass` file (or the file
+  `PGPASSFILE` names) is backslash-unescaped as libpq does, and an
+  `options[key]=value` parameter in `IMPRESSPRESS_DB_URL` is escaped for you.
+- Session tokens are signed over key-sorted claims. Tokens already issued
+  keep verifying; nobody is signed out.
+
+**Who has to act.** A Postgres deployment whose `.pgpass` password contains a
+backslash: write each literal `\` as `\\`. One whose `IMPRESSPRESS_DB_URL`
+hand-escapes an `options[...]` value (such as `my\ app`): write the plain
+value, URL-encoded (`my%20app`). Nobody else.
+
 ### wafer-run 01239cf3: block config at Init, model cache, discovery
 
 **What changes.**

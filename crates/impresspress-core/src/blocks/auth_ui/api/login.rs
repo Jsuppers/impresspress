@@ -457,7 +457,7 @@ mod tests {
             fn sign_for(
                 &self,
                 block_id: &str,
-                claims: std::collections::HashMap<String, serde_json::Value>,
+                claims: std::collections::BTreeMap<String, serde_json::Value>,
                 expiry: std::time::Duration,
             ) -> Result<String, CryptoError> {
                 self.inner.sign_for(block_id, claims, expiry)
@@ -466,7 +466,7 @@ mod tests {
                 &self,
                 block_id: &str,
                 token: &str,
-            ) -> Result<std::collections::HashMap<String, serde_json::Value>, CryptoError>
+            ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, CryptoError>
             {
                 self.inner.verify_for(block_id, token)
             }

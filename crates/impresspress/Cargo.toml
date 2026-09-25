@@ -116,7 +116,7 @@ uuid = { workspace = true }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
-toml = "0.8"
+toml = "1"
 
 [dev-dependencies]
 tempfile = "3"

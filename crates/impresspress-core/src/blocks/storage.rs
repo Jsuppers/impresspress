@@ -32,8 +32,8 @@ use wafer_core::{
     interfaces::storage::{handler::resolve_folder, service::StorageService},
 };
 use wafer_run::{
-    context::Context, Block, BlockInfo, InputStream, LifecycleEvent, Message, OutputStream,
-    WaferError,
+    context::Context, streams::output::TerminalNotResponse, Block, BlockInfo, InputStream,
+    LifecycleEvent, Message, OutputStream, WaferError,
 };
 
 use super::admin::STORAGE_ACCESS_LOGS_TABLE;
@@ -146,57 +146,10 @@ impl Block for ImpresspressStorageBlock {
         let path = log_path(ctx, &msg.kind, &request);
         drop(request);
 
-        // Events are forwarded as they arrive, one by one: frame boundaries
-        // are part of the storage wire protocol (a GET is a header chunk, a
-        // raw-frames marker, then the body chunks), and a download must not
-        // be buffered here.
         let start = now_millis();
         let kind = msg.kind.clone();
         let inner_out = self.inner.handle(ctx, msg, input).await;
-        let ctx_arc = ctx.clone_arc();
-
-        OutputStream::from_producer(move |sink, _cancel| async move {
-            let mut inner = inner_out;
-            let log = |status: String| {
-                log_storage_access(ctx_arc.as_ref(), &caller, &kind, &path, status)
-            };
-            let ok = || format!("OK ({}ms)", now_millis().saturating_sub(start));
-            while let Some(ev) = inner.next().await {
-                match ev {
-                    StreamEvent::Chunk(bytes) => {
-                        let _ = sink.send_chunk(bytes).await;
-                    }
-                    StreamEvent::Meta(entry) => {
-                        let _ = sink.send_meta(entry).await;
-                    }
-                    StreamEvent::Complete { meta } => {
-                        let _ = log(ok()).await;
-                        let _ = sink.complete(meta).await;
-                        return;
-                    }
-                    StreamEvent::Error(e) => {
-                        let _ = log(format!("ERROR: {}", e.message)).await;
-                        let _ = sink.error(*e).await;
-                        return;
-                    }
-                    StreamEvent::Drop { meta } => {
-                        let _ = sink.drop_request_with_meta(meta).await;
-                        return;
-                    }
-                    StreamEvent::Continue(m) => {
-                        let _ = sink.continue_with(m).await;
-                        return;
-                    }
-                    StreamEvent::Halt { body, meta } => {
-                        let _ = log(ok()).await;
-                        let _ = sink.halt(body, meta).await;
-                        return;
-                    }
-                }
-            }
-            // Stream ended without a terminal event — best-effort log.
-            let _ = log(ok()).await;
-        })
+        forward_logged(inner_out, ctx.clone_arc(), caller, kind, path, start)
     }
 
     async fn lifecycle(
@@ -206,6 +159,67 @@ impl Block for ImpresspressStorageBlock {
     ) -> std::result::Result<(), WaferError> {
         self.inner.lifecycle(ctx, event).await
     }
+}
+
+/// Forward `inner` to the caller and log its outcome once it ends.
+///
+/// Events are forwarded as they arrive, one by one: frame boundaries are part
+/// of the storage wire protocol (a GET is a header chunk, a raw-frames marker,
+/// then the body chunks), and a download must not be buffered here.
+///
+/// A stream that ends with no terminal event is logged as an error and
+/// answered with an `Error` terminal: the bytes forwarded so far may be a
+/// truncated prefix, so neither the log nor the caller may take them for a
+/// finished answer.
+fn forward_logged(
+    inner: OutputStream,
+    ctx: Arc<dyn Context>,
+    caller: String,
+    kind: String,
+    path: String,
+    start: u64,
+) -> OutputStream {
+    OutputStream::from_producer(move |sink, _cancel| async move {
+        let mut inner = inner;
+        let log = |status: String| log_storage_access(ctx.as_ref(), &caller, &kind, &path, status);
+        let ok = || format!("OK ({}ms)", now_millis().saturating_sub(start));
+        while let Some(ev) = inner.next().await {
+            match ev {
+                StreamEvent::Chunk(bytes) => {
+                    let _ = sink.send_chunk(bytes).await;
+                }
+                StreamEvent::Meta(entry) => {
+                    let _ = sink.send_meta(entry).await;
+                }
+                StreamEvent::Complete { meta } => {
+                    let _ = log(ok()).await;
+                    let _ = sink.complete(meta).await;
+                    return;
+                }
+                StreamEvent::Error(e) => {
+                    let _ = log(format!("ERROR: {}", e.message)).await;
+                    let _ = sink.error(*e).await;
+                    return;
+                }
+                StreamEvent::Drop { meta } => {
+                    let _ = sink.drop_request_with_meta(meta).await;
+                    return;
+                }
+                StreamEvent::Continue(m) => {
+                    let _ = sink.continue_with(m).await;
+                    return;
+                }
+                StreamEvent::Halt { body, meta } => {
+                    let _ = log(ok()).await;
+                    let _ = sink.halt(body, meta).await;
+                    return;
+                }
+            }
+        }
+        let error = WaferError::from(TerminalNotResponse::Malformed);
+        let _ = log(format!("ERROR: {}", error.message)).await;
+        let _ = sink.error(error).await;
+    })
 }
 
 /// Log a storage access event (best-effort).
@@ -775,5 +789,41 @@ mod tests {
         .await
         .expect_err("a read grant does not admit a write");
         assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    /// A stream that ends with no terminal event is logged as an error and
+    /// answered with one. Its bytes may be a truncated prefix, so the access
+    /// log must not record the request as served, and the caller must not
+    /// receive the prefix as a finished answer.
+    #[tokio::test]
+    async fn a_stream_with_no_terminal_is_logged_and_answered_as_an_error() {
+        use wafer_run::context::Context as _;
+
+        let caller = "impresspress/files";
+        let ctx = ctx_as(caller, Vec::new()).await;
+        // A stream whose terminal has already been read: what a source that
+        // ends with no terminal event looks like to the next reader.
+        let mut spent = OutputStream::respond(b"prefix".to_vec());
+        while spent.next().await.is_some() {}
+
+        let out = super::forward_logged(
+            spent,
+            ctx.clone_arc(),
+            caller.to_string(),
+            ServiceOp::STORAGE_GET.to_string(),
+            "impresspress/files/f/k".to_string(),
+            crate::util::now_millis(),
+        );
+
+        assert!(
+            chunks(out).await.is_err(),
+            "a stream with no terminal must reach the caller as an error"
+        );
+        let rows = audit_rows(&ctx).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].1.starts_with("ERROR: "),
+            "a stream with no terminal must not be logged as served: {rows:?}"
+        );
     }
 }

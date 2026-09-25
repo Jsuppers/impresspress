@@ -421,17 +421,17 @@ mod tests {
     ///
     /// Everything a refresh JWT carries is the same on both sides of one
     /// rotation — same user, same family, same auth method, same issuer, and
-    /// `iat`/`exp` are whole seconds — so unless something in the claims
-    /// distinguishes them, the two tokens differ only in the order the
-    /// payload's `HashMap` happened to serialize its keys in. When that order
-    /// repeats, the successor hashes to the `token_hash` the row the rotation
-    /// has just revoked already holds: the unique index refuses the insert,
+    /// `iat`/`exp` are whole seconds — and the signer encodes claims
+    /// canonically, so unless something in the claims distinguishes them the
+    /// successor is the predecessor, byte for byte. It hashes to the
+    /// `token_hash` the row the rotation has just revoked already holds: the
+    /// unique index refuses the insert,
     /// the refresh 500s, and because the presented token was revoked first the
     /// family is left with no live generation at all. The user is signed out
     /// by a refresh that should have been routine.
     ///
-    /// [`PinnedMintCrypto`](crate::test_support::PinnedMintCrypto) is what
-    /// makes that certain rather than occasional; the rest of the path is the
+    /// [`PinnedMintCrypto`](crate::test_support::PinnedMintCrypto) pins the
+    /// clock so both mints land in one second; the rest of the path is the
     /// real one.
     #[tokio::test]
     async fn a_rotation_inside_one_second_mints_a_distinct_token() {

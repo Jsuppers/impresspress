@@ -279,6 +279,10 @@ async fn forward_event(sink: OutputSink, ev: StreamEvent) -> Option<OutputSink> 
 /// doesn't want to drain the body into memory: the leading meta reaches the
 /// adapter before the first body chunk, so headers are applied before the body
 /// finishes.
+///
+/// A source that ends without a terminal event is replayed as an `Error`
+/// terminal: whatever it sent may be a truncated prefix, and nothing here can
+/// tell a finished body from a cut one.
 pub fn rebuild_streaming(
     leading_meta: Vec<MetaEntry>,
     next_event: Option<StreamEvent>,
@@ -291,9 +295,7 @@ pub fn rebuild_streaming(
             }
         }
         let Some(next_event) = next_event else {
-            // The stream ended right after its leading meta with no terminal;
-            // close out as an empty Complete.
-            let _ = sink.complete(Vec::new()).await;
+            let _ = sink.error(no_terminal_error()).await;
             return;
         };
         let Some(mut sink) = forward_event(sink, next_event).await else {
@@ -306,8 +308,13 @@ pub fn rebuild_streaming(
                 None => return,
             }
         }
-        // `rest` ended without a terminal; `from_producer` auto-Completes.
+        let _ = sink.error(no_terminal_error()).await;
     })
+}
+
+/// The error a stream that ended without a terminal event is answered with.
+fn no_terminal_error() -> WaferError {
+    WaferError::from(TerminalNotResponse::Malformed)
 }
 
 /// Outcome of draining a buffered response under a size cap.
@@ -502,20 +509,42 @@ pub fn stream_download(
 
 /// View the body-carrying events of a streaming response as a
 /// `Stream<Item = Result<Vec<u8>, WaferError>>`, prepending the already-peeked
-/// `first_chunk`. `Chunk`s map to `Ok(bytes)`; an `Error` terminal maps to a
-/// final `Err(e)`; mid-body `Meta` is dropped (too late to affect headers) and
-/// every other terminal ends the stream. Adapters pipe this straight into a
-/// platform `ReadableStream` body.
+/// `first_chunk`. Adapters pipe this straight into a platform `ReadableStream`
+/// body, which is already committed to a status and headers, so an `Err` item
+/// is the only way left to say the body is not whole: the adapter aborts the
+/// body on it instead of ending it cleanly.
+///
+/// `Chunk`s map to `Ok(bytes)` and mid-body `Meta` is dropped (too late to
+/// affect headers). A `Complete`, `Drop` or `Continue` terminal ends the body.
+/// Three endings are a final `Err`, because the bytes before them are a
+/// truncated prefix: an `Error` terminal; a stream that ends with no terminal
+/// at all; and a `Halt`, which carries a whole response of its own and cannot
+/// follow the `first_chunk` this body has already sent.
 pub fn download_body_stream(
     first_chunk: Vec<u8>,
     rest: OutputStream,
 ) -> impl futures::Stream<Item = Result<Vec<u8>, WaferError>> + 'static {
     let head = futures::stream::iter(std::iter::once(Ok(first_chunk)));
-    let tail = rest.filter_map(|ev| async move {
-        match ev {
-            StreamEvent::Chunk(bytes) => Some(Ok(bytes)),
-            StreamEvent::Error(err) => Some(Err(*err)),
-            _ => None,
+    // `None` once a terminal has been read, so nothing follows it.
+    let tail = futures::stream::unfold(Some(rest), |state| async move {
+        let mut rest = state?;
+        loop {
+            let item = match rest.next().await {
+                Some(StreamEvent::Chunk(bytes)) => return Some((Ok(bytes), Some(rest))),
+                Some(StreamEvent::Meta(_)) => continue,
+                Some(
+                    StreamEvent::Complete { .. }
+                    | StreamEvent::Drop { .. }
+                    | StreamEvent::Continue(_),
+                ) => return None,
+                Some(StreamEvent::Error(err)) => Err(*err),
+                Some(StreamEvent::Halt { .. }) => Err(WaferError::new(
+                    wafer_run::ErrorCode::Internal,
+                    "a Halt terminal cannot follow a streamed body",
+                )),
+                None => Err(no_terminal_error()),
+            };
+            return Some((item, None));
         }
     });
     head.chain(tail)
@@ -807,6 +836,98 @@ mod tests {
             items.last().unwrap().is_err(),
             "error terminal must surface"
         );
+    }
+
+    /// A stream whose terminal has already been read: what a source that ends
+    /// with no terminal event looks like to whoever reads it next. No
+    /// `OutputSink` produces one (a dropped sink sends an `Error`), but a
+    /// consumer is handed an `OutputStream`, not a promise about where it
+    /// came from.
+    async fn stream_without_terminal() -> OutputStream {
+        let mut spent = OutputStream::respond_with_meta(Vec::new(), Vec::new());
+        while spent.next().await.is_some() {}
+        spent
+    }
+
+    /// A download body whose source stops with no terminal is a truncated
+    /// prefix, so it ends in an `Err` the adapter aborts the body on — never
+    /// in a clean end that passes the prefix off as the whole file.
+    #[tokio::test]
+    async fn download_body_stream_errors_when_the_source_has_no_terminal() {
+        let items: Vec<Result<Vec<u8>, WaferError>> =
+            download_body_stream(b"head".to_vec(), stream_without_terminal().await)
+                .collect()
+                .await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_deref().ok(), Some(&b"head"[..]));
+        assert!(
+            items[1].is_err(),
+            "a body with no terminal must not end cleanly"
+        );
+    }
+
+    /// A `Halt` carries a whole response of its own, so it cannot follow the
+    /// first chunk this body already sent: the bytes before it are not the
+    /// response, and the body must not end as if they were.
+    #[tokio::test]
+    async fn download_body_stream_errors_on_a_halt_after_the_body_started() {
+        let rest = OutputStream::halt(b"a whole other response".to_vec(), Vec::new());
+        let items: Vec<Result<Vec<u8>, WaferError>> =
+            download_body_stream(b"head".to_vec(), rest).collect().await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items[1].is_err(), "a Halt mid-body must not end cleanly");
+    }
+
+    /// A producer that stops mid-body without a terminal hands the download
+    /// an `Error` (wafer-run's dropped-sink terminal), which the body
+    /// surfaces. This passes without the no-terminal arm above: it pins the
+    /// contract the adapters rely on, not this function's own branch.
+    #[tokio::test]
+    async fn download_body_stream_errors_when_the_producer_stops_without_a_terminal() {
+        let rest = OutputStream::from_producer(|sink, _cancel| async move {
+            sink.send_chunk(b"partial".to_vec()).await.ok();
+        });
+        let items: Vec<Result<Vec<u8>, WaferError>> =
+            download_body_stream(b"head".to_vec(), rest).collect().await;
+        assert!(
+            items.last().is_some_and(Result::is_err),
+            "a producer cut off mid-body must not end cleanly: {items:?}"
+        );
+    }
+
+    /// A stream that ends right after its leading meta, with no terminal, is
+    /// replayed as an error rather than as an empty success.
+    #[tokio::test]
+    async fn rebuild_streaming_errors_when_the_source_ends_after_its_meta() {
+        let leading = vec![meta(META_RESP_CONTENT_TYPE, "text/event-stream")];
+        let rebuilt = rebuild_streaming(leading, None, stream_without_terminal().await);
+        assert!(
+            matches!(
+                rebuilt.collect_buffered().await,
+                Err(TerminalNotResponse::Error(_))
+            ),
+            "a stream with no terminal must not replay as a Complete"
+        );
+    }
+
+    /// Same for a source that ends mid-body with no terminal: the replay ends
+    /// in an explicit `Error` of its own.
+    #[tokio::test]
+    async fn rebuild_streaming_errors_when_the_source_ends_mid_body() {
+        let leading = vec![meta(META_RESP_CONTENT_TYPE, "text/event-stream")];
+        let rebuilt = rebuild_streaming(
+            leading,
+            Some(StreamEvent::Chunk(b"first".to_vec())),
+            stream_without_terminal().await,
+        );
+        match rebuilt.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => assert_eq!(
+                e.message,
+                WaferError::from(TerminalNotResponse::Malformed).message,
+                "the replay names the missing terminal"
+            ),
+            other => panic!("expected an Error terminal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

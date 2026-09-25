@@ -458,6 +458,7 @@ mod contextual_retrieval_tests {
                                 return;
                             }
                         }
+                        let _ = sink.complete(Vec::new()).await;
                     })
                 }
                 other => OutputStream::error(WaferError::new(
