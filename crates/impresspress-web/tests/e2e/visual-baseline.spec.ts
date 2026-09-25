@@ -71,6 +71,7 @@ const ADMIN_ROUTES = [
 const COMMON_OPTS = {
   fullPage: true as const,
   maxDiffPixelRatio: 0,
+  threshold: 0,
   // Mask elements that vary per render (timestamps, counts, generated IDs).
   // Tests can override per-route if needed.
 };
