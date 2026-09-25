@@ -425,6 +425,10 @@ fn network() -> Result<Arc<dyn NetworkService>, NetworkError> {
         })
 }
 
+/// The database service of the request being polled, looked up per call.
+/// Every answer, errors included, is that service's unchanged — so a write
+/// that duplicates a key is the `AlreadyExists` the `DatabaseService`
+/// contract names (see `database.rs`, "A taken key").
 #[derive(Default)]
 pub(crate) struct ScopedDatabaseService {
     strict_schema: AtomicBool,

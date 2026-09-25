@@ -559,6 +559,8 @@ jobs:
       # `Cargo.lock` join the filter for the same reason as the cloudflare job
       # above: a wafer-run pin bump moves this crate's dependencies without
       # touching a file under `crates/impresspress-browser/`.
+      # `crates/impresspress-bundle/assets/vendor/` joins it because the wasm
+      # tests run the sql.js build vendored there.
       # `crates/impresspress-core/` joins it because the browser depends on core
       # by path — the streaming decision, the SSRF gate and the OpenAI wire
       # codec all live there now, so a change confined to core is a change to
@@ -572,7 +574,7 @@ jobs:
         # unconditional behaviour the merge gate has always had.
         if: inputs.pull-request
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-browser/ crates/impresspress-core/ Cargo.toml Cargo.lock)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-browser/ crates/impresspress-core/ crates/impresspress-bundle/assets/vendor/ Cargo.toml Cargo.lock)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -625,8 +627,9 @@ jobs:
       # so without the hook the generated test module fails to load with
       # ERR_MODULE_NOT_FOUND and the job FAILS before a single wasm test in the
       # crate runs — it is not a silent skip. The hook (the same one the
-      # `node --test` step above passes via `--import`) stubs that one
-      # specifier and passes everything else through.
+      # `node --test` step above passes via `--import`) resolves that one
+      # specifier to the vendored sql.js build — which the sql.js tests in
+      # `src/database.rs` run against — and passes everything else through.
       # NODE_OPTIONS rather than an argument because wasm-bindgen-test-runner
       # builds the `node` command line itself; the path is relative to
       # `crates/impresspress-browser`, which is where `wasm-pack` runs `cargo

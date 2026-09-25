@@ -178,40 +178,17 @@ async fn fetch_live(ctx: &dyn Context, code: &str) -> Result<RoomRow, RoomError>
     })
 }
 
-/// What a failed [`create_row`] against `code`'s uniqueness actually means.
-///
-/// Every backend in this workspace reports a PK collision as
-/// `ErrorCode::AlreadyExists`, which is `Taken` outright. One that does not
-/// classify it answers `Internal` (or `Aborted`), and that is settled by
-/// re-reading the code — the reasoning and the probe-after-the-write shape
-/// are written out at `crud::taken_key_or_db_error`, which this mirrors for
-/// this block's own error type: probing *after* the failed write, not
-/// before, is what closes the two-hosts-roll-the-same-code race — a
-/// pre-check that found the code free leaves a gap a competing create can
-/// still land in, and the loser of that race is exactly the request that
-/// would otherwise surface as a raw `Db` (500) instead of the documented
-/// `Taken` (409).
-async fn taken_or_db_error(ctx: &dyn Context, code: &str, error: WaferError) -> RoomError {
-    match error.code {
-        // Every backend in this workspace classifies the violation itself.
-        ErrorCode::AlreadyExists => return RoomError::Taken,
-        // The two shapes a constraint violation can arrive as from a backend
-        // that does not.
-        ErrorCode::Internal | ErrorCode::Aborted => {}
-        // Anything else (WRAP refusal, quota, ...) is not a code collision.
-        _ => return RoomError::Db(error),
+/// What a failed [`create_row`] against `code`'s uniqueness means: a PK
+/// collision is `Taken`, and every backend reports one as
+/// `ErrorCode::AlreadyExists`. Because the refused write itself is the
+/// answer, the two-hosts-roll-the-same-code race has no gap to lose: the
+/// loser of that race gets `Taken` (409), never a raw `Db` (500). Anything
+/// else is a database fault.
+fn taken_or_db_error(error: WaferError) -> RoomError {
+    if error.code == ErrorCode::AlreadyExists {
+        return RoomError::Taken;
     }
-    match db_read::list_bounded(
-        ctx,
-        TABLE,
-        code_filter(code),
-        Bound::UniqueKey("signal rooms.code is the table's PRIMARY KEY"),
-    )
-    .await
-    {
-        Ok(rows) if !rows.is_empty() => RoomError::Taken,
-        _ => RoomError::Db(error),
-    }
+    RoomError::Db(error)
 }
 
 /// The write half of [`open_room`]: build the row and insert it
@@ -235,7 +212,7 @@ async fn create_row(
     data.insert("expires_at".into(), json!(iso_plus_seconds(ttl_secs)));
     match db::create(ctx, TABLE, data).await {
         Ok(_) => Ok(()),
-        Err(e) => Err(taken_or_db_error(ctx, code, e).await),
+        Err(e) => Err(taken_or_db_error(e)),
     }
 }
 

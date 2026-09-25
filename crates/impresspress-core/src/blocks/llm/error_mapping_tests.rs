@@ -572,3 +572,30 @@ async fn an_unreadable_thread_list_fails_the_chat_page() {
         String::from_utf8_lossy(&parts.body)
     );
 }
+
+/// A second provider under a name the first holds is refused by the
+/// `providers.name` UNIQUE index, and every backend reports that refusal as
+/// `AlreadyExists`. `crud::db_error_internal` answers it as the 409 it is —
+/// not "Internal server error" for an admin who re-typed a name — and the
+/// driver's text, which names the table and the column, stays in the log.
+#[tokio::test]
+async fn a_duplicate_provider_name_is_a_409_not_a_500() {
+    let (ctx, _) = with_a_provider().await;
+
+    let out = api(
+        &ctx,
+        admin_msg("create", "/b/llm/api/providers"),
+        r#"{"name":"main","protocol":"open_ai","endpoint":"https://api.openai.com/v1"}"#,
+    )
+    .await;
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    let body = String::from_utf8_lossy(&parts.body);
+    assert_eq!(parts.status, 409, "{body}");
+    assert!(body.contains(crate::blocks::crud::DUPLICATE_KEY), "{body}");
+    assert!(!body.contains(PROVIDERS_TABLE), "schema leaked: {body}");
+
+    let rows = wafer_core::clients::database::count(&ctx, PROVIDERS_TABLE, &[])
+        .await
+        .expect("count providers");
+    assert_eq!(rows, 1, "the refused create must not have written a row");
+}

@@ -708,11 +708,10 @@ fn attach_metadata(
 }
 
 /// This module's DDL does not go through `DbExec`, so it invalidates the
-/// database service's cached schema itself ([`exec_ddl`]). Under
-/// `wasm-pack test --node` every bridge call rejects — there is no sql.js —
-/// which is exactly the case the invalidation has to cover: a statement that
-/// failed may still have applied, and a later `DatabaseService` read must not
-/// be served a fact the DDL invalidated.
+/// database service's cached schema itself ([`exec_ddl`]). A statement that
+/// fails is exactly the case the invalidation has to cover: it may still have
+/// applied, and a later `DatabaseService` read must not be served a fact the
+/// DDL invalidated.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod schema_invalidation {
     use wafer_core::interfaces::database::exec::DbExec;
@@ -738,11 +737,12 @@ mod schema_invalidation {
         seed("vec_untouched_t");
 
         let ran = exec_ddl(
-            &[r#"CREATE TABLE "vec_ddl_t" (id TEXT PRIMARY KEY)"#.to_string()],
+            // Unterminated, so it fails whether or not sql.js is loaded.
+            &[r#"CREATE TABLE "vec_ddl_t" (id TEXT PRIMARY KEY"#.to_string()],
             &["vec_ddl_t".to_string()],
         );
 
-        assert!(ran.is_err(), "there is no sql.js under Node");
+        assert!(ran.is_err(), "the statement is malformed");
         assert_eq!(cache.primary_key("vec_ddl_t"), None);
         assert_eq!(
             cache.primary_key("vec_untouched_t"),

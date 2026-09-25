@@ -154,10 +154,9 @@ pub(super) async fn handle_update_role(
     // column's own `UNIQUE` exists only on a table that migration created,
     // not on one that predates it. The 409 below depends on that index —
     // on such a table without it, the update lands and two roles share the
-    // name. The refusal is classified AFTER it happened, as
-    // `ops::create_role` classifies the same collision — see
-    // `crud::taken_key_or_db_error` for why a probe after the refused write
-    // closes the race a read beforehand would leave open.
+    // name. The refused write says so itself (`AlreadyExists`, which
+    // `crud::taken_key_or_db_error` answers as this 409), so there is no
+    // read beforehand for a competing rename to slip past.
     let record = match db::update(ctx, ROLES_TABLE, id, data).await {
         Ok(record) => record,
         Err(e) if e.code == wafer_run::ErrorCode::NotFound => {
@@ -167,14 +166,12 @@ pub(super) async fn handle_update_role(
             Some(new_name) => {
                 return crud::taken_key_or_db_error(
                     e,
-                    super::ops::role_name_taken(ctx, new_name),
                     &format!(
                         "A role named \"{new_name}\" already exists. Rename this role to \
                          another name."
                     ),
                     "Database error",
                 )
-                .await
             }
             None => return crud::db_error(e, "Role not found", "Database error"),
         },
@@ -438,48 +435,15 @@ pub(super) async fn handle_create_permission(
         // `ops::create_role` make, through the same helper. It also stops this
         // line flattening a WRAP refusal to 500, which is what
         // `crud::db_error_internal` inside the helper takes care of.
-        Err(e) => {
-            crate::blocks::crud::taken_key_or_db_error(
-                e,
-                permission_name_taken(ctx, &body.name),
-                &format!(
-                    "A permission named \"{}\" already exists. Edit that permission, or pick \
+        Err(e) => crate::blocks::crud::taken_key_or_db_error(
+            e,
+            &format!(
+                "A permission named \"{}\" already exists. Edit that permission, or pick \
                      another name.",
-                    body.name
-                ),
-                "Database error",
-            )
-            .await
-        }
-    }
-}
-
-/// Whether a permission called `name` exists. The probe
-/// [`handle_create_permission`] hands to
-/// [`crate::blocks::crud::taken_key_or_db_error`];
-/// `permissions.name` is UNIQUE, so one row is all there can be and a
-/// `NotFound` from the lookup is the "free" answer rather than a failure.
-///
-/// It lives here rather than beside `ops::role_name_taken` so the table name
-/// reaching `db::get_by_field` stays the module's own `PERMISSIONS_TABLE`
-/// constant — `scripts/audit-wrap-grants.sh` resolves the `(caller, table)`
-/// pair statically, and a table passed in as a `&str` becomes
-/// `<unresolved:table>` and needs a pragma instead of a real grant check.
-async fn permission_name_taken(
-    ctx: &dyn Context,
-    name: &str,
-) -> Result<bool, wafer_run::WaferError> {
-    match db::get_by_field(
-        ctx,
-        PERMISSIONS_TABLE,
-        "name",
-        serde_json::Value::String(name.to_string()),
-    )
-    .await
-    {
-        Ok(_) => Ok(true),
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => Ok(false),
-        Err(e) => Err(e),
+                body.name
+            ),
+            "Database error",
+        ),
     }
 }
 

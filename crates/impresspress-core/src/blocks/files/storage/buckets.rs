@@ -87,14 +87,12 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
         Err(e) => {
             return crud::taken_key_or_db_error(
                 e,
-                repo::buckets::name_exists(ctx, &body.name),
                 &format!(
                     "A bucket named \"{}\" already exists. Pick another name.",
                     body.name
                 ),
                 "Failed to create bucket",
             )
-            .await
         }
     };
 

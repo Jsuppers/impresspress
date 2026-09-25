@@ -1318,6 +1318,8 @@ pub struct WriteLog {
 
 /// The decorator behind [`TestContext::record_writes`]: notes the writes
 /// [`WriteLog`] counts and forwards every call, those included, to `inner`.
+/// Errors come back unchanged, so a duplicate key is still the
+/// `AlreadyExists` the `DatabaseService` contract names.
 struct RecordingDb {
     inner: Arc<dyn wafer_core::interfaces::database::service::DatabaseService>,
     log: Arc<std::sync::Mutex<WriteLog>>,
@@ -1423,7 +1425,8 @@ wafer_core::forward_database_service! {
 /// `DatabaseService` decorator used by [`TestContext::break_reads`] and
 /// [`TestContext::break_list_reads`]. Every read method fails with
 /// [`DatabaseError::Internal`]; every mutating/schema method delegates to
-/// `inner` unchanged.
+/// `inner` unchanged, so a write that duplicates a key still fails as the
+/// `AlreadyExists` the `DatabaseService` contract names.
 ///
 /// "Mutating" includes the filtered-write family (`update_where*`,
 /// `delete_where*`, `increment_field_where`), which this decorator must
@@ -1726,8 +1729,10 @@ fn simulated_read_failure() -> wafer_core::interfaces::database::service::Databa
 }
 
 /// `DatabaseService` decorator used by [`TestContext::break_writes`]. Every
-/// mutating method fails with [`DatabaseError::Internal`]; every read/schema
-/// method delegates to `inner` unchanged.
+/// mutating method fails with [`DatabaseError::Internal`] — a broken
+/// database, never a taken key, which the `DatabaseService` contract reports
+/// as `AlreadyExists` — and every read/schema method delegates to `inner`
+/// unchanged.
 ///
 /// "Mutating" includes the filtered-write family (`update_where*`,
 /// `delete_where*`, `take_where`, `increment_field_where`), which this
@@ -1747,8 +1752,8 @@ fn simulated_read_failure() -> wafer_core::interfaces::database::service::Databa
 /// filtered write SUCCEEDED on a database whose writes are supposed to be
 /// failing. `repo::products::restore` of an already-live product is exactly
 /// that write. A handler branch reachable only when a filtered write fails
-/// then looks covered while production can never enter it; `restore_fails_
-/// loudly_when_the_slug_collision_probe_cannot_run` was that test on
+/// then looks covered while production can never enter it; the restore
+/// collision-probe test in `products/tests/handler_tests.rs` was that test on
 /// [`FailingReadsDb`], and this double kept the same defect armed for the
 /// next one.
 struct FailingWritesDb {
@@ -4484,10 +4489,10 @@ mod tests {
     /// *successful* write on a backend whose writes are supposed to be
     /// failing. A handler branch reachable only when a filtered write fails
     /// then looks covered while production can never enter it, which is
-    /// exactly how `restore_fails_loudly_when_the_slug_collision_probe_
-    /// cannot_run` came to assert an outcome production could not produce
-    /// (see its doc comment; that instance was fixed on `FailingReadsDb`,
-    /// leaving this one armed for the next test to use it).
+    /// exactly how the restore collision-probe test in
+    /// `products/tests/handler_tests.rs` came to assert an outcome production
+    /// could not produce (that instance was fixed on `FailingReadsDb`, leaving
+    /// this one armed for the next test to use it).
     #[tokio::test]
     async fn break_writes_fails_every_filtered_write() {
         let ctx = seeded_ctx().await.break_writes();

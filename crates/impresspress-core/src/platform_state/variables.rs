@@ -2068,12 +2068,10 @@ mod tests {
 
     /// **A taken key is the write's own answer, on the database these tests
     /// run on.** A second variable with a taken key is refused by the UNIQUE
-    /// index, and the refusal reaches the caller as `AlreadyExists` — so the
-    /// 409 holds even when the re-read cannot run at all (the probe here
-    /// fails). While the SQLite backend answered `Internal`, a probe that
-    /// could not run kept that write's own failure: a 500.
+    /// index, and the refusal reaches the caller as `AlreadyExists` — the
+    /// `DatabaseService` contract the 409 rests on, with nothing re-read.
     #[tokio::test]
-    async fn a_taken_key_is_already_exists_and_a_conflict_without_a_re_read() {
+    async fn a_taken_key_is_already_exists_and_a_conflict() {
         let ctx = TestContext::with_admin().await;
         let new = || NewVariable {
             key: "SITE__TAKEN".into(),
@@ -2095,16 +2093,9 @@ mod tests {
 
         let out = crate::blocks::crud::taken_key_or_db_error(
             refused,
-            async {
-                Err(WaferError::new(
-                    wafer_run::ErrorCode::Unavailable,
-                    "read path down",
-                ))
-            },
             "SITE__TAKEN already exists",
             "Database error",
-        )
-        .await;
+        );
         assert_eq!(crate::test_support::output_http_status(out).await, 409);
     }
 

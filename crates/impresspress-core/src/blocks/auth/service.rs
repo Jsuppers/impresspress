@@ -38,9 +38,10 @@ use crate::blocks::crud::{classify_db_error, DbFailure};
 /// body — while a raw WRAP refusal names the grant and the table. So the
 /// error goes through the database-error classifier every block uses
 /// ([`classify_db_error`]): a refusal arrives as `Backend(PermissionDenied
-/// "Access denied")` or `Backend(ResourceExhausted)` with its detail logged
-/// under `context`. Of the rest, an unreachable or timed-out backend
-/// (`Unavailable`, `DeadlineExceeded`) is [`AuthError::ProviderDown`], which
+/// "Access denied")`, `Backend(ResourceExhausted)` or, for a duplicate key,
+/// `Backend(AlreadyExists)`, with its detail logged under `context`. Of the
+/// rest, an unreachable or timed-out backend (`Unavailable`,
+/// `DeadlineExceeded`) is [`AuthError::ProviderDown`], which
 /// the auth handler answers `Unavailable` (503) so the client keeps its
 /// retry signal; any other failure is a genuine fault, logged here and sent
 /// on as a generic `Internal`.

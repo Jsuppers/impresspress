@@ -742,30 +742,20 @@ pub fn make_database_service() -> std::sync::Arc<dyn DatabaseService> {
 // signature) or the suite entry is removed/renamed/re-gated, this stops
 // compiling — surfacing the drift at the consumer rather than only inside
 // wafer-run. The assertion is never
-// executed and constructs no trait object, so it pulls in no sql.js/OPFS bridge
-// call: it stays green under Node, where that bridge does not exist.
+// executed and constructs no trait object, so it makes no sql.js/OPFS bridge
+// call.
 //
-// ── Gap: a live behavioral run is not feasible in the current CI ──
+// ── What runs live, and what only typechecks ──
 //
-// A real `run_conformance(&BrowserDatabaseService).await` needs the JS bridge
-// this adapter is hardwired to (`crate::bridge` → `/js/bridge.js`) to be
-// functional, which requires BOTH:
-//   1. sql.js loaded — `bridge.js` STATICALLY imports the vendored ESM wrapper
-//      `/vendor/sql-wasm-esm.js` (dynamic `import()` is forbidden in Service
-//      Workers, so it cannot be lazified) plus `/vendor/sql-wasm.wasm`; and
-//   2. OPFS — `dbInit` reads and `dbFlush` (invoked by every mutating
-//      `DatabaseService` method via `with_flush`) writes the DB through
-//      `navigator.storage.getDirectory()`.
-// The CI job runs under Node (`wasm-pack test --node`), which has neither a
-// server serving `/vendor/*` nor OPFS, so a live run is infeasible without new
-// test infrastructure. Smallest change that would close the gap: a Node/headless
-// test double for the `bridge` DB fns — sql.js instantiated in-memory (the
-// vendored `sql-wasm.wasm` already lives at
-// `crates/impresspress-bundle/assets/vendor/`) with `dbFlush` shimmed to a
-// resolved no-op — then this module can call
-// `run_conformance(&BrowserDatabaseService).await` under a
-// `#[wasm_bindgen_test]` for a full behavioral run. The adapter itself needs no
-// change; only the JS half is swapped for a memory-backed one in the test.
+// `sql_js_conformance` below drives this adapter against REAL sql.js under
+// `wasm-pack test --node`: `js/test/node-hooks.mjs` resolves bridge.js's static
+// `/vendor/sql-wasm-esm.js` import to the vendored build in
+// `crates/impresspress-bundle/assets/vendor/`, and the test installs an
+// in-memory stand-in for the OPFS directory `dbInit` reads and `dbFlush`
+// writes. It pins the unique-key classification (`AlreadyExists`) that
+// `impresspress_core::blocks::crud`'s 409 rests on. The full
+// `run_conformance(&BrowserDatabaseService).await` is not run live; this module
+// only typechecks it, and the same two pieces are what a live run would use.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod conformance {
     use wafer_core::interfaces::database::{
@@ -778,10 +768,114 @@ mod conformance {
     /// argument to the shared conformance suite. Typechecking the call — with
     /// the `&BrowserDatabaseService` → `&dyn DatabaseService` coercion
     /// `run_conformance` requires — is what enforces the trait-surface
-    /// conformance; awaiting it here would need the sql.js/OPFS bridge, which
-    /// the module doc explains is unavailable under `wasm-pack test --node`.
+    /// conformance; awaiting it here would run the whole suite live, which the
+    /// note above says this crate does not do.
     async fn _browser_adapter_is_conformable(svc: &BrowserDatabaseService) {
         run_conformance(svc as &dyn DatabaseService).await;
+    }
+}
+
+/// **The `DatabaseService` contract on real sql.js.** A write that duplicates
+/// a primary or unique key is `AlreadyExists` — the 409
+/// `impresspress_core::blocks::crud` answers, without re-reading the key —
+/// and any other refused write is `Internal`. sql.js reports every refusal as
+/// a JS exception carrying only SQLite's text, so this is the one place the
+/// classification can be seen working: the exception comes from the vendored
+/// sql.js build the site serves, through `bridge.js`, into the adapter's own
+/// `create`.
+///
+/// Under `wasm-pack test --node`, `js/test/node-hooks.mjs` points bridge.js's
+/// `/vendor/sql-wasm-esm.js` import at that vendored build, and
+/// [`install_memory_opfs`] stands in for the OPFS directory `dbInit` reads
+/// and `dbFlush` writes.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod sql_js_conformance {
+    use std::collections::HashMap;
+
+    use wafer_core::interfaces::database::service::{DatabaseError, DatabaseService};
+    use wasm_bindgen::prelude::wasm_bindgen;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::BrowserDatabaseService;
+
+    #[wasm_bindgen(inline_js = r#"
+export function installMemoryOpfs() {
+    const files = new Map();
+    const handle = (name) => ({
+        async getFile() {
+            const data = files.get(name);
+            return { async arrayBuffer() { return data.slice().buffer; } };
+        },
+        async createWritable() {
+            let data = new Uint8Array(0);
+            return {
+                async write(chunk) { data = chunk; },
+                async close() { files.set(name, data); },
+            };
+        },
+    });
+    const root = {
+        async getFileHandle(name, options) {
+            if (!files.has(name)) {
+                if (!(options && options.create)) {
+                    throw new DOMException('no such file', 'NotFoundError');
+                }
+                files.set(name, new Uint8Array(0));
+            }
+            return handle(name);
+        },
+    };
+    Object.defineProperty(globalThis.navigator, 'storage', {
+        configurable: true,
+        value: { async getDirectory() { return root; } },
+    });
+}
+"#)]
+    extern "C" {
+        /// An in-memory OPFS: `navigator.storage.getDirectory()` answering
+        /// the file-handle calls bridge.js makes, starting empty.
+        #[wasm_bindgen(js_name = installMemoryOpfs)]
+        fn install_memory_opfs();
+    }
+
+    fn row(id: &str, name: Option<&str>) -> HashMap<String, serde_json::Value> {
+        let mut row = HashMap::from([("id".to_string(), serde_json::json!(id))]);
+        if let Some(name) = name {
+            row.insert("name".to_string(), serde_json::json!(name));
+        }
+        row
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_duplicate_insert_is_already_exists() {
+        install_memory_opfs();
+        crate::bridge::dbInit().await.expect("sql.js loads");
+        let svc = BrowserDatabaseService;
+        svc.exec_raw(
+            "CREATE TABLE sql_js_dup_t (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+            &[],
+        )
+        .await
+        .expect("create table");
+
+        svc.create("sql_js_dup_t", row("a", Some("first")))
+            .await
+            .expect("the first row lands");
+        for (what, taken) in [
+            ("primary key", row("a", Some("second"))),
+            ("unique column", row("b", Some("first"))),
+        ] {
+            let err = svc.create("sql_js_dup_t", taken).await.expect_err(what);
+            assert!(
+                matches!(err, DatabaseError::AlreadyExists(_)),
+                "{what}: {err:?}"
+            );
+        }
+        let err = svc
+            .create("sql_js_dup_t", row("c", None))
+            .await
+            .expect_err("NOT NULL");
+        assert!(matches!(err, DatabaseError::Internal(_)), "{err:?}");
     }
 }
 
@@ -958,11 +1052,12 @@ mod schema_cache_policy {
 /// The invalidation half of the cache: every schema change the shared executor
 /// does not make has to drop what the cache knows about the table it changed.
 ///
-/// Each of these calls a bridge function, which rejects under
-/// `wasm-pack test --node` (there is no sql.js there) — which is the point:
-/// the invalidation has to happen whatever the statement returned, because a
-/// failed DDL may still have applied. The test seeds a fact, calls the real
-/// method, and asserts the fact is gone however the call ended.
+/// Each of these calls a bridge function, which under `wasm-pack test --node`
+/// rejects until `sql_js_conformance` has loaded sql.js and may run after —
+/// and either is the point: the invalidation has to happen whatever the
+/// statement returned, because a failed DDL may still have applied. The test
+/// seeds a fact, calls the real method, and asserts the fact is gone however
+/// the call ended.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod schema_invalidation {
     use wafer_core::interfaces::database::{

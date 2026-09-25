@@ -515,7 +515,7 @@ pub(crate) async fn current_auth_version(
 /// anonymous tells a signed-in client it has been signed out. So the request
 /// is refused with this. A refusal the database classifier keeps
 /// ([`crate::blocks::crud::classify_db_error`]: a WRAP denial's 403 "Access
-/// denied", a quota's 429) is answered as it stands; any other fault is
+/// denied", a quota's 429, a duplicate key's 409) is answered as it stands; any other fault is
 /// logged under `context` and answered `Unavailable` (503), the status a
 /// client retries rather than one that means "sign in again".
 pub(crate) fn credential_check_failed(error: WaferError, context: &str) -> WaferError {

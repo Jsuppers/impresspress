@@ -26,6 +26,12 @@
 //! [`impresspress_core::sqlite_text_error::statement_error`]: a primary- or
 //! unique-key violation is [`DatabaseError::AlreadyExists`], as the native
 //! backends report it from the driver's code, and anything else `Internal`.
+//! That is part of the `DatabaseService` contract, not a courtesy:
+//! `impresspress_core::blocks::crud` answers `AlreadyExists` as a 409 and
+//! never re-reads a key to find out what a refused write meant. The tests
+//! `a_create_refused_for_a_taken_key_is_already_exists` and
+//! `a_batch_refused_for_a_taken_key_is_already_exists` pin it for the
+//! single-row and the batch path.
 //!
 //! ## Lazy column-add
 //!
@@ -1185,7 +1191,9 @@ mod tests {
         assert!(!DbExec::strict_schema(&svc));
     }
 
-    /// What a [`batching_d1`] double's `batch()` does with what it is handed.
+    /// What a [`batching_d1`] double's `batch()` does with what it is handed,
+    /// and what a lone statement's `run()` does.
+    #[derive(Clone, Copy)]
     enum BatchAnswer {
         /// Resolve with one successful result per statement: `changes: 1`, and
         /// a `RETURNING` statement's row echoed back as `{"id": "row-<n>"}`.
@@ -1199,9 +1207,38 @@ mod tests {
         },
     }
 
+    impl BatchAnswer {
+        /// The promise a lone `run()` returns: one successful result with
+        /// `changes: 1`, or the rejection. A rejected `batch()` is the same
+        /// rejection.
+        fn settle_run(self) -> js_sys::Promise {
+            match self {
+                BatchAnswer::Succeed => {
+                    let result = js_sys::Object::new();
+                    js_sys::Reflect::set(&result, &JsValue::from_str("success"), &JsValue::TRUE)
+                        .expect("set success");
+                    let meta = js_sys::Object::new();
+                    js_sys::Reflect::set(&meta, &JsValue::from_str("changes"), &JsValue::from(1))
+                        .expect("set changes");
+                    js_sys::Reflect::set(&result, &JsValue::from_str("meta"), &meta)
+                        .expect("set meta");
+                    js_sys::Promise::resolve(&JsValue::from(result))
+                }
+                BatchAnswer::Reject { message, cause } => {
+                    let error = js_sys::Error::new(message);
+                    if let Some(cause) = cause {
+                        error.set_cause(&js_sys::Error::new(cause));
+                    }
+                    js_sys::Promise::reject(&JsValue::from(error))
+                }
+            }
+        }
+    }
+
     /// A `D1Database` double for the batch path: `prepare(sql)` → a statement
     /// that remembers its SQL, `bind(...)` → the same statement, and
-    /// `batch(statements)` → [`BatchAnswer`]. `batches` records the SQL of
+    /// `batch(statements)` → [`BatchAnswer`], as is a lone statement's
+    /// `run()` (the single-row `create`). `batches` records the SQL of
     /// every statement of every `batch()` call, so a test can tell one
     /// round trip of N statements from N round trips.
     fn batching_d1(
@@ -1262,6 +1299,15 @@ mod tests {
             )
             .expect("set first");
             first.forget();
+            // A lone statement's `run()`: a single-row write.
+            let run = Closure::<dyn Fn() -> js_sys::Promise>::new(move || answer.settle_run());
+            js_sys::Reflect::set(
+                &statement,
+                &JsValue::from_str("run"),
+                run.as_ref().unchecked_ref(),
+            )
+            .expect("set run");
+            run.forget();
             JsValue::from(statement)
         });
         js_sys::Reflect::set(
@@ -1318,13 +1364,7 @@ mod tests {
                         }
                         js_sys::Promise::resolve(&JsValue::from(results))
                     }
-                    BatchAnswer::Reject { message, cause } => {
-                        let error = js_sys::Error::new(message);
-                        if let Some(cause) = cause {
-                            error.set_cause(&js_sys::Error::new(cause));
-                        }
-                        js_sys::Promise::reject(&JsValue::from(error))
-                    }
+                    BatchAnswer::Reject { .. } => answer.settle_run(),
                 }
             },
         );
@@ -1446,6 +1486,56 @@ mod tests {
                 "cause {cause:?}: {err:?}"
             );
         }
+    }
+
+    /// **The `DatabaseService` contract on D1's single-row write.** A `create`
+    /// whose `INSERT` D1 refuses for a taken key is `AlreadyExists` — which
+    /// `crud` answers as a 409 without re-reading the key — and a refusal for
+    /// anything else stays `Internal`. The rejection comes from the
+    /// statement's own `run()`, so this is the path every single-row create
+    /// takes, not the batch one above.
+    #[wasm_bindgen_test]
+    async fn a_create_refused_for_a_taken_key_is_already_exists() {
+        let create = |answer: BatchAnswer| async move {
+            forget_isolate_schema();
+            let svc = D1DatabaseService::new(
+                batching_d1(answer, Rc::new(std::cell::RefCell::new(Vec::new()))),
+                true,
+                "DB",
+            );
+            let row = std::collections::HashMap::from([
+                ("id".to_string(), serde_json::json!("taken")),
+                ("path".to_string(), serde_json::json!("/r/0")),
+            ]);
+            DatabaseService::create(&svc, "t", row).await
+        };
+
+        assert!(
+            create(BatchAnswer::Succeed).await.is_ok(),
+            "the double writes"
+        );
+        for cause in [
+            Some("UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT"),
+            None,
+        ] {
+            let err = create(BatchAnswer::Reject {
+                message: "D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT",
+                cause,
+            })
+            .await
+            .expect_err("refused");
+            assert!(
+                matches!(err, DatabaseError::AlreadyExists(_)),
+                "cause {cause:?}: {err:?}"
+            );
+        }
+        let err = create(BatchAnswer::Reject {
+            message: "D1_ERROR: NOT NULL constraint failed: t.path: SQLITE_CONSTRAINT",
+            cause: Some("NOT NULL constraint failed: t.path: SQLITE_CONSTRAINT"),
+        })
+        .await
+        .expect_err("refused");
+        assert!(matches!(err, DatabaseError::Internal(_)), "{err:?}");
     }
 
     /// Any other refusal stays a fault.

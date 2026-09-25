@@ -5,6 +5,15 @@
 //! - `make_sqlite_database_service(path)` — wraps `wafer-block-sqlite`
 //!   `SQLiteDatabaseService`.
 //! - `make_postgres_database_service(url)` — feature-gated on `postgres`.
+//!
+//! Both services come from wafer-run and classify a write that duplicates a
+//! primary or unique key as `DatabaseError::AlreadyExists` from the driver's
+//! own code (`SQLITE_CONSTRAINT_UNIQUE`/`_PRIMARYKEY`, SQLSTATE `23505`). That
+//! is part of the `DatabaseService` contract: `impresspress_core::blocks::crud`
+//! answers `AlreadyExists` as a 409 and never re-reads a key to find out what
+//! a refused write meant. wafer-run's `run_conformance` pins it for both;
+//! `a_duplicate_insert_is_already_exists` below pins it for the SQLite service
+//! as this crate opens it.
 
 use std::sync::Arc;
 
@@ -133,7 +142,49 @@ pub(crate) fn postgres_target(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::postgres_target;
+    use std::collections::HashMap;
+
+    use wafer_core::interfaces::database::service::DatabaseError;
+
+    use super::{make_sqlite_database_service, postgres_target};
+
+    /// **The `DatabaseService` contract on the SQLite service this crate
+    /// opens.** A create that repeats a primary key, or a `UNIQUE` column, is
+    /// `AlreadyExists` — the 409 `crud` answers — and not `Internal`, the
+    /// 500 a fault is.
+    #[tokio::test]
+    async fn a_duplicate_insert_is_already_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("dup.db");
+        let svc =
+            make_sqlite_database_service(path.to_str().expect("utf-8 path")).expect("open sqlite");
+        svc.exec_raw(
+            "CREATE TABLE dup_t (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+            &[],
+        )
+        .await
+        .expect("create table");
+        let row = |id: &str, name: &str| {
+            HashMap::from([
+                ("id".to_string(), serde_json::json!(id)),
+                ("name".to_string(), serde_json::json!(name)),
+            ])
+        };
+
+        svc.create("dup_t", row("a", "first"))
+            .await
+            .expect("the first row lands");
+        for (what, taken) in [
+            ("primary key", row("a", "second")),
+            ("unique column", row("b", "first")),
+        ] {
+            let err = svc.create("dup_t", taken).await.expect_err(what);
+            assert!(
+                matches!(err, DatabaseError::AlreadyExists(_)),
+                "{what}: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn postgres_target_drops_user_info_and_query() {
