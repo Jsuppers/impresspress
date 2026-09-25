@@ -220,10 +220,6 @@ pub async fn apply_if_blessed(
             // name". Treat that as a benign no-op so the rest of the
             // migration batch (and the final `write_state` stamp) can
             // still run. Every other DDL failure propagates.
-            //
-            // This is the same tolerance pattern the per-write column-add
-            // path uses in `impresspress-cloudflare::D1DatabaseService::
-            // add_missing_columns`.
             let msg = e.to_string();
             if is_alter_add_column(trimmed) && is_duplicate_column_error(&msg) {
                 tracing::debug!(

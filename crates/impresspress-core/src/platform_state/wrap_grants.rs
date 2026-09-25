@@ -132,9 +132,9 @@ fn encode_access(write: GrantWrite) -> (i64, i64) {
 
 /// The stored access columns as a [`GrantWrite`]. `write` is required;
 /// `append` reads as unset when it is absent or `NULL`, which is how a row
-/// looks where migration 005 has not run yet (a Cloudflare deployment holding
-/// back migrations, or `/_deploy/init` building its runtime before it
-/// migrates) — and treating it as unset never grants more than `write` says.
+/// looks where migration 005 has not run yet (`/_deploy/init` or
+/// `/_deploy/prepare` building its runtime before the funnel migrates) — and
+/// treating it as unset never grants more than `write` says.
 /// A row that sets both flags is refused: it names two different accesses,
 /// and neither is a safe guess.
 fn decode_access(data: &HashMap<String, Value>) -> Result<GrantWrite, String> {

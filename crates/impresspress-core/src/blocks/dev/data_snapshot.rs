@@ -210,7 +210,10 @@ pub const TABLE_EXCLUDED: &[&str] = &[
     request_logs::TABLE,
     AUDIT_LOGS_TABLE,
     STORAGE_ACCESS_LOGS_TABLE,
-    wrap_grants::TABLE, // re-synced from every registered block's own `BlockInfo.grants()` at boot
+    // Admin-created WRAP grants. Authored, but access policy: an import that
+    // carried them would widen what blocks may touch on the destination
+    // without its operator granting it, so each deployment keeps its own.
+    wrap_grants::TABLE,
     // --- auth: session/credential plumbing scoped to this running
     // instance (bearer material this instance issued, not the owner's own
     // login — see `local_credentials` above), plus multi-tenant org
