@@ -98,8 +98,10 @@ jobs:
 
       - name: Install Playwright
         working-directory: crates/impresspress-web
+        # `npm ci`, as CI's `e2e-visual` job does: the lockfile pins the
+        # Playwright release, and with it the Chromium build that renders.
         run: |
-          npm install
+          npm ci
           npx playwright install chromium --with-deps
 
       - name: Start native impresspress server in background
@@ -129,9 +131,16 @@ jobs:
         working-directory: crates/impresspress-web
         env:
           TEST_PORT: 8093
+        # The same package script CI's `e2e-visual` job runs, so the same specs
+        # run in the same order against the same database. It is not enough to
+        # run visual-baseline.spec.ts alone: delegated-actions.spec.ts sorts
+        # first and makes requests of its own, and the admin database and
+        # network pages show counts of those requests, so a baseline rendered
+        # without it never matches CI's render.
+        #
         # `--update-snapshots` overwrites mismatched PNGs in place.
         # Test step succeeds even if snapshots changed; we detect via git diff below.
-        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts --update-snapshots
+        run: npm run e2e:visual -- --update-snapshots
 
       - name: Stop servers
         if: always()
