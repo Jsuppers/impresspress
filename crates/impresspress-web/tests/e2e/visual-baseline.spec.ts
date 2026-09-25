@@ -68,12 +68,23 @@ const ADMIN_ROUTES = [
   { path: '/b/storage/admin/quotas', name: 'storage-admin-quotas' },
 ];
 
+// The tolerance is measured, not guessed. Baselines are CI's own render
+// (`regen-visual-baselines.yml`), so a matching page differs from its
+// baseline only by rendering noise — and across repeated CI runs of this
+// suite at zero tolerance that noise was a handful of pixels one colour
+// level apart (a per-pixel YIQ distance of 0.004 on Playwright's 0-1 scale;
+// nothing larger in any run). `threshold` sits just above that noise, and no
+// pixel beyond it is allowed, so a real change of even one pixel fails.
+//
+// A value that varies from run to run is masked rather than tolerated — see
+// `volatileMasks` below. A tolerance wide enough to absorb one would also
+// absorb real regressions: a 1% pixel ratio lets a 1280x720 capture differ
+// in 9,216 pixels, and Playwright's default per-pixel `threshold` of 0.2
+// ignores a change between two light greys outright.
 const COMMON_OPTS = {
   fullPage: true as const,
-  maxDiffPixelRatio: 0,
-  threshold: 0,
-  // Mask elements that vary per render (timestamps, counts, generated IDs).
-  // Tests can override per-route if needed.
+  threshold: 0.01,
+  maxDiffPixels: 0,
 };
 
 // What the admin captures mask: values that differ from one run to the next.
