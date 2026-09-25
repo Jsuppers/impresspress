@@ -4796,6 +4796,12 @@ mod tests {
     /// could never boot passed every unit test.
     struct Declares(BlockInfo);
 
+    /// A key in the shared namespace, which no block may declare.
+    const RESERVED_PROBE_KEY: &str = "WAFER_RUN_SHARED__PROBE";
+    /// A key in another block's namespace, which `test/declared` may not
+    /// declare.
+    const FOREIGN_PROBE_KEY: &str = "OTHER__BLOCK__KEY";
+
     #[wafer_block::wafer_async_trait]
     impl Block for Declares {
         fn info(&self) -> BlockInfo {
@@ -4836,7 +4842,7 @@ mod tests {
             Arc::new(Declares(
                 BlockInfo::new("test/declared", "0.0.1", "probe@v1", "reserved key").config_keys(
                     vec![wafer_run::ConfigVar::new(
-                        "WAFER_RUN_SHARED__PROBE",
+                        RESERVED_PROBE_KEY,
                         "reserved",
                         "",
                     )],
@@ -4852,7 +4858,7 @@ mod tests {
         ctx.register_block_info(
             "test/declared",
             BlockInfo::new("test/declared", "0.0.1", "probe@v1", "foreign key").config_keys(vec![
-                wafer_run::ConfigVar::new("OTHER__BLOCK__KEY", "foreign", ""),
+                wafer_run::ConfigVar::new(FOREIGN_PROBE_KEY, "foreign", ""),
             ]),
         );
     }
