@@ -107,9 +107,9 @@ fn llm_error_response(context: &str, e: LlmError) -> OutputStream {
 /// rotation therefore takes effect on the next reload (boot or any provider
 /// CRUD write), not per chat request.
 ///
-/// Shared by the provider CRUD handlers, `LlmBlock::lifecycle(Init)`, and
-/// the one-shot legacy-provider migration (which is why it takes the
-/// provider-admin handle rather than the whole block).
+/// Shared by the provider CRUD handlers and `LlmBlock::lifecycle(Init)`
+/// (which is why it takes the provider-admin handle rather than the whole
+/// block).
 ///
 /// Errors are returned to the caller, which answers them through
 /// `crud::db_error_internal`: the row read keeps its database code, so a WRAP
@@ -142,8 +142,12 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
                 // Like a malformed row, one provider whose key cannot be
                 // read must not take the others down with it — and it must
                 // not run without the key it names either, so it is left
-                // out. Create and update refuse to store such a row; one
-                // arrives here only when a grant was withdrawn afterwards.
+                // out. Create and update refuse to store a row whose key
+                // cannot be read, so one arrives here when a read that
+                // succeeded at save fails now — the grant was withdrawn
+                // since, or the read failed transiently (the next reload
+                // retries it) — or when the row reached the table without
+                // going through create or update.
                 Err(e) => tracing::error!(
                     "skipping provider row {}: its key_var could not be read: {e}",
                     rec.id
@@ -176,8 +180,9 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
 ///
 /// A read that fails is returned: a refused read says nothing about whether
 /// a key exists, so the caller must not run the provider without one.
-/// [`reload_provider_service`] leaves that provider out; create and update
-/// refuse the write up front through [`check_key_var_readable`].
+/// [`reload_provider_service`] leaves that provider out; create, and an update
+/// naming `key_var`, refuse the write up front through
+/// [`check_key_var_readable`].
 async fn resolve_provider_key(
     ctx: &dyn Context,
     cfg: &mut ProviderConfig,
@@ -201,9 +206,10 @@ async fn resolve_provider_key(
 
 /// Refuse to store a provider whose `key_var` this block cannot read.
 ///
-/// Checked before the row is written, so an admin who names a variable the
-/// block holds no grant for (another block's `*_SECRET_KEY`, say) is told so
-/// on the save and nothing is stored. The value itself is discarded; the
+/// Checked before the row is written — on every create, and on an update
+/// whose body names `key_var` — so an admin who names a variable the block
+/// holds no grant for (another block's `*_SECRET_KEY`, say) is told so on the
+/// save and nothing is stored. The value itself is discarded; the
 /// reload resolves it.
 async fn check_key_var_readable(ctx: &dyn Context, cfg: &ProviderConfig) -> Result<(), WaferError> {
     match cfg.key_var.as_deref() {
@@ -457,6 +463,7 @@ pub(in crate::blocks::llm) async fn update_provider(
     // `key_var` string clears it too, which is what it means to the create
     // form; this route takes JSON only, and the admin page has no edit form.
     // See `UpdateProviderRequest`.
+    let names_key_var = body.key_var.is_some();
     if let Some(k) = body.key_var {
         cfg.key_var = k.filter(|s| !s.is_empty());
     }
@@ -476,8 +483,15 @@ pub(in crate::blocks::llm) async fn update_provider(
         return err_bad_request(&e);
     }
 
-    if let Err(e) = check_key_var_readable(ctx, &cfg).await {
-        return crud::db_error_internal(e, "Failed to read the provider's key_var");
+    // Only a body that names `key_var` is checked: a patch that leaves the
+    // stored variable alone must still reach a row whose key has become
+    // unreadable since it was saved, so the admin can disable, rename or
+    // repoint it rather than meet a 403 on every edit. The reload leaves such
+    // a row out whatever this patch sets.
+    if names_key_var {
+        if let Err(e) = check_key_var_readable(ctx, &cfg).await {
+            return crud::db_error_internal(e, "Failed to read the provider's key_var");
+        }
     }
 
     let mut data = config_to_row(&cfg);
@@ -1018,6 +1032,42 @@ mod tests {
             stored_key_vars(&ctx).await,
             vec![("openai-main".to_string(), Some(KEY_VAR.to_string()))]
         );
+    }
+
+    /// A stored provider whose key has become unreadable can still be
+    /// disabled: a patch that does not name `key_var` is not refused over the
+    /// variable it leaves alone.
+    #[tokio::test]
+    async fn a_provider_with_a_stale_key_grant_can_still_be_disabled() {
+        let (mut ctx, _admin, block) = keyed_fixture().await;
+        let mut cfg = ProviderConfig::new(
+            "stale".to_string(),
+            ProviderProtocol::OpenAi,
+            "https://api.openai.com/v1".to_string(),
+        );
+        cfg.key_var = Some(UNREADABLE_VAR.to_string());
+        let id = db::create(&ctx, PROVIDERS_TABLE, config_to_row(&cfg))
+            .await
+            .expect("seed provider row")
+            .id;
+        ctx.refuse_config_reads_of(UNREADABLE_VAR, refused());
+
+        let out = update_provider(
+            &block,
+            &ctx,
+            &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+            json_input(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        let body = output_json(out).await;
+        assert_eq!(body["enabled"], serde_json::json!(false), "{body}");
+
+        let stored = db::get(&ctx, PROVIDERS_TABLE, &id)
+            .await
+            .expect("row still there");
+        let stored = row_to_config(&stored).expect("stored row decodes");
+        assert!(!stored.enabled, "the disable must be stored");
+        assert_eq!(stored.key_var.as_deref(), Some(UNREADABLE_VAR));
     }
 
     /// A stored provider whose key can no longer be read is left out of the

@@ -5,8 +5,8 @@
 //! `MultiBackendLlmService` router), so `LlmBlock` does NOT need a concrete
 //! `LlmService` handle. What it does need directly is the *provider-admin*
 //! surface — `configure`, `providers_snapshot`, `discover_models` — used by
-//! the provider CRUD endpoints, `lifecycle(Init)`, and the legacy-provider
-//! migration to keep the in-memory router in sync with the DB.
+//! the provider CRUD endpoints and `lifecycle(Init)` to keep the in-memory
+//! router in sync with the DB.
 //!
 //! Splitting this surface into its own trait lets `LlmBlock` hold
 //! `Arc<dyn ProviderAdmin>` instead of the concrete, `reqwest`/`tokio`-backed

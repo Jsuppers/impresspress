@@ -212,9 +212,9 @@ fn merged(
 /// What `'none'` beside other sources means is left to the security-headers
 /// block, which reads this value through `merge_csp`: in a directive it adds
 /// sources to, `'none'` is dropped from a list that has others; in the
-/// narrow-only `base-uri` and `form-action`, `'none'` wins over the rest. Names compare
-/// ASCII-case-insensitively, as a browser compares them; each is written as
-/// `before` (or, for a new one, `after`) spelled it.
+/// narrow-only `base-uri` and `form-action`, `'none'` wins over the rest.
+/// Names compare ASCII-case-insensitively, as a browser compares them; each is
+/// written as `before` (or, for a new one, `after`) spelled it.
 fn combine_csp(before: &str, after: &str) -> String {
     let parse = |policy: &str| -> Vec<(String, Vec<String>)> {
         policy
