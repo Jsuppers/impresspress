@@ -301,7 +301,7 @@ async fn chat_fixture(service: StubLlmServiceBlock) -> (TestContext, String) {
     ctx.set_config(DEFAULT_MODEL_VAR, "stub-model");
     ctx.register_block("wafer-run/llm", Arc::new(service));
     let thread = crate::blocks::messages::service::create_context(
-        &ctx,
+        &ctx.fixture(),
         "user-a",
         "conversation",
         "T",

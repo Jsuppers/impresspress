@@ -67,7 +67,9 @@ fn caller(action: &str, path: &str) -> Message {
 
 fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
     Box::pin(async {
-        let mut ctx = TestContext::with_userportal().await;
+        // The fixture's own frame: every request below is routed, so each
+        // runs as the block it reaches.
+        let mut ctx = TestContext::with_userportal().await.fixture();
         let crypto_service = Arc::new(
             wafer_block_crypto::service::Argon2JwtCryptoService::new(
                 "test-jwt-secret-padded-to-min-32-bytes-aaaa".to_string(),

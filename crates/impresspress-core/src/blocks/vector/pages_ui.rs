@@ -527,6 +527,9 @@ mod integration_tests {
     /// Seed one row in the vector registry plus the matching `_meta` table
     /// so the listing has both a registry entry and a vector count to show.
     async fn seed_docs_index(ctx: &TestContext) {
+        // Staged from the fixture's own frame: the `_meta` table is the
+        // vector backend's, which creates it through raw DDL.
+        let ctx = &ctx.fixture();
         // Registry row.
         let mut registry_row: HashMap<String, serde_json::Value> = HashMap::new();
         registry_row.insert("prefixed_name".into(), json!("impresspress__vector__docs"));

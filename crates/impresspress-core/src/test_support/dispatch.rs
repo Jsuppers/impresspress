@@ -21,10 +21,11 @@ use wafer_run::{Block, ResourceGrant};
 /// Who called into a [`super::TestContext`] frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Caller {
-    /// Nobody: a top-level frame. A block entered through
-    /// [`super::TestContext::running_as`] runs here, as a block the router or
-    /// the listener dispatched to does in production — its own context has
-    /// no caller.
+    /// Nobody: a top-level frame — the context `Wafer::run_block` builds for
+    /// the block a listener or flow step dispatches to, which has no caller.
+    /// A block entered through [`super::TestContext::running_as`] runs here.
+    /// A block the router reaches is not top-level: `impresspress/router`
+    /// calls it, and [`super::TestContext::dispatch`] routes the same way.
     Nobody,
     /// The test itself, calling from the fixture's unframed context: the
     /// migrations, seeds and direct repository calls a test sets up with.

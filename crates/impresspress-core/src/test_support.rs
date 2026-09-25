@@ -307,12 +307,16 @@ impl TestContext {
         self.register_block("wafer-run/config", block);
     }
 
-    /// This context runs `block`'s code, in the frame the runtime gives a
-    /// block it dispatches to: no caller, and `block`'s own declared
-    /// `requires` allowlist installed — `requires` plus `optional_requires`,
+    /// This context runs `block`'s code, in the frame `Wafer::run_block`
+    /// gives the block a listener or flow step dispatches to: no caller, and
+    /// `block`'s own declared `requires` allowlist installed — `requires` plus `optional_requires`,
     /// read off the block this fixture registered under that name, else off
     /// the built-in block's declaration, else unrestricted for a name no
     /// block carries (a synthetic caller such as `test/ungranted`).
+    ///
+    /// A request the router admits reaches its block from
+    /// `impresspress/router`, not from nowhere; a test about that path uses
+    /// [`Self::dispatch`], which routes through the router's frame.
     ///
     /// Every block it reaches through `call_block` is called by `block`, and
     /// every service op those calls make is authorized as `block` against
@@ -607,7 +611,9 @@ impl TestContext {
         ctx.running_as(crate::blocks::files::FilesBlock::BLOCK_NAME)
     }
 
-    /// Build a `TestContext` with admin + auth + userportal migrations applied.
+    /// Build a `TestContext` with admin + auth + userportal migrations
+    /// applied, running as `impresspress/userportal` (see
+    /// [`Self::running_as`]); stage and assert through [`Self::fixture`].
     #[cfg(feature = "block-userportal")]
     pub async fn with_userportal() -> Self {
         let ctx = Self::with_auth().await;
@@ -617,10 +623,12 @@ impl TestContext {
             crate::blocks::userportal::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/userportal")
     }
 
-    /// Build a TestContext with admin, auth, and tickets migrations applied.
+    /// Build a TestContext with admin, auth, and tickets migrations applied,
+    /// running as `impresspress/tickets` (see [`Self::running_as`]); stage
+    /// and assert through [`Self::fixture`].
     #[cfg(feature = "block-tickets")]
     pub async fn with_tickets() -> Self {
         let mut ctx = Self::with_auth().await;
@@ -634,10 +642,12 @@ impl TestContext {
             "impresspress/tickets",
             Arc::new(crate::blocks::tickets::TicketsBlock::new()),
         );
-        ctx
+        ctx.running_as("impresspress/tickets")
     }
 
-    /// Build a `TestContext` with admin + auth + vector migrations applied.
+    /// Build a `TestContext` with admin + auth + vector migrations applied,
+    /// running as `impresspress/vector` (see [`Self::running_as`]); stage and
+    /// assert through [`Self::fixture`].
     #[cfg(feature = "block-vector")]
     pub async fn with_vector() -> Self {
         let ctx = Self::with_auth().await;
@@ -647,10 +657,12 @@ impl TestContext {
             crate::blocks::vector::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/vector")
     }
 
-    /// Build a `TestContext` with admin + llm migrations applied.
+    /// Build a `TestContext` with admin + llm migrations applied, running as
+    /// `impresspress/llm` (see [`Self::running_as`]); stage and assert
+    /// through [`Self::fixture`].
     ///
     /// Admin first so the `impresspress__admin__block_settings` tracking
     /// table exists before llm's `apply_if_blessed` upserts its row (the
@@ -665,10 +677,12 @@ impl TestContext {
             crate::blocks::llm::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/llm")
     }
 
-    /// Build a `TestContext` with admin + products migrations applied.
+    /// Build a `TestContext` with admin + products migrations applied,
+    /// running as `impresspress/products` (see [`Self::running_as`]); stage
+    /// and assert through [`Self::fixture`].
     ///
     /// Admin migrations run first so the `impresspress__admin__block_settings`
     /// tracking table exists before products' `apply_if_blessed` upserts its
@@ -691,10 +705,11 @@ impl TestContext {
             "impresspress/products",
             Arc::new(crate::blocks::products::ProductsBlock::new()),
         );
-        ctx
+        ctx.running_as("impresspress/products")
     }
 
-    /// Build a `TestContext` with admin + signal migrations applied.
+    /// Build a `TestContext` with admin + signal migrations applied, running
+    /// as `impresspress/signal` (see [`Self::running_as`]).
     ///
     /// No auth: the signal block has no user and never reads one — every
     /// endpoint is public, so admin-only is enough to let its own
@@ -710,7 +725,7 @@ impl TestContext {
             crate::blocks::signal::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/signal")
     }
 
     /// Build a `TestContext` with admin + dev-sandbox migrations applied, the
@@ -789,7 +804,7 @@ impl TestContext {
         let shared = dev::DevShared::new(control, shell);
         self.dev_shared = Some(shared.clone());
         let block = Arc::new(dev::DevBlock::with_workspace(shared));
-        self.register_block(dev::BLOCK_NAME, block.clone());
+        self.register_block(dev::BLOCK_NAME, block);
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // `wafer-run/storage` block — its handler is what turns the block's
@@ -3262,15 +3277,15 @@ pub fn admin_msg(action: &str, path: &str) -> Message {
 /// write their rows into the same table under their own WRAP identity, so a
 /// test in any block asserts against it the same way.
 ///
-/// `ctx` must be able to read that table — for a fixture running as a
-/// non-admin block, count through [`TestContext::fixture`] so a missing READ
-/// grant cannot be mistaken for a missing row.
+/// Read from the fixture's own frame ([`TestContext::fixture`]), whatever
+/// block `ctx` runs as, so a missing READ grant on the block under test
+/// cannot be mistaken for a missing row.
 pub async fn audit_rows(
-    ctx: &dyn Context,
+    ctx: &TestContext,
     action: &str,
 ) -> Vec<wafer_core::clients::database::Record> {
     crate::db_read::list_every(
-        ctx,
+        &ctx.fixture(),
         crate::blocks::admin::AUDIT_LOGS_TABLE,
         vec![wafer_block::db::Filter {
             field: "action".to_string(),
@@ -3283,7 +3298,7 @@ pub async fn audit_rows(
 }
 
 /// How many admin audit-log rows carry `action`. See [`audit_rows`].
-pub async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
+pub async fn audit_count(ctx: &TestContext, action: &str) -> usize {
     audit_rows(ctx, action).await.len()
 }
 
