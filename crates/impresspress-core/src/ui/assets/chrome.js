@@ -11,8 +11,9 @@
 //   2. mobile drawer    (was emitted by `ui::Page::render`)
 //   3. toasts           (was emitted by `ui::layout::page`)
 //   4. modals           (was emitted by `ui::layout::page`)
+//   5. htmx after-success effects (never inline; appended after section 4)
 //
-// Sections 1, 2 and 4 are IIFEs with their own idempotence guards. Section 3's
+// Sections 1, 2, 4 and 5 are IIFEs with their own idempotence guards. Section 3's
 // `showToast` listener is deliberately NOT wrapped: it binds `document.body`
 // directly and declares nothing. The htmx error listeners that follow it ARE
 // wrapped, because the three of them share one `toast()` helper and a shared
@@ -622,5 +623,63 @@ document.body.addEventListener("showToast", function(e) {
     document.body.addEventListener("openModal", function (e) {
         var d = e.detail || {};
         if (d.id) openModal(d.id);
+    });
+})();
+
+// --- 5. after-success effects of htmx requests ---
+//
+// What a control does once ITS OWN htmx request succeeds, declared as
+// attributes on the element that issued the request (the form, or the button
+// carrying `hx-post`/`hx-delete`):
+//
+//   data-reload-on-success          reload the page — for an `hx-swap="none"`
+//                                   action whose result only a fresh render
+//                                   shows (a created row, a restored product)
+//   data-reset-on-success           reset the form, so the next entry starts
+//                                   empty
+//   data-remove-on-success="<id>"   remove that element — an empty-state line
+//                                   the swap has just contradicted
+//   data-scroll-on-success="<id>"   scroll that element to its bottom — the
+//                                   list the swap has just appended to
+//
+// These are not `hx-on--after-request` attributes because htmx compiles an
+// `hx-on` value with `new Function`, which a content-security policy treats as
+// eval, and the policy every page is served with has no `'unsafe-eval'`:
+// `wafer-run/security-headers` refuses to add it. An `hx-on` handler therefore
+// never runs — the browser logs a CSP refusal and the page does nothing.
+// `ui::layout::page` sets htmx's `allowEval` to false as well, so htmx itself
+// refuses every eval-shaped attribute (`hx-on`, a `js:` value, a trigger
+// filter) with an `htmx:evalDisallowedError` rather than leaving it to the
+// policy, and `ui::tests::pages_carry_no_htmx_eval_attributes` keeps them out
+// of the markup.
+//
+// Only the issuing element's own attributes count, read from
+// `detail.elt`. A failed request does none of this; section 3 above toasts it.
+(function () {
+    if (window.__successEffectsInit) return;
+    window.__successEffectsInit = true;
+
+    document.body.addEventListener("htmx:afterRequest", function (e) {
+        var detail = e.detail || {};
+        if (detail.successful !== true) return;
+        var el = detail.elt;
+        if (!(el instanceof Element)) return;
+
+        var removeId = el.getAttribute("data-remove-on-success");
+        if (removeId) {
+            var gone = document.getElementById(removeId);
+            if (gone) gone.remove();
+        }
+        if (el.hasAttribute("data-reset-on-success") && typeof el.reset === "function") {
+            el.reset();
+        }
+        var scrollId = el.getAttribute("data-scroll-on-success");
+        if (scrollId) {
+            var list = document.getElementById(scrollId);
+            if (list) list.scrollTop = list.scrollHeight;
+        }
+        if (el.hasAttribute("data-reload-on-success")) {
+            window.location.reload();
+        }
     });
 })();

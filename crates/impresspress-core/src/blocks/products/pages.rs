@@ -477,7 +477,7 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         hx-post=(restore_url)
                                         hx-swap="none"
                                         data-error-label="Could not restore this product"
-                                        hx-on--after-request=(reload_on_success())
+                                        data-reload-on-success
                                     { "Restore" }
                                 }
                             },
@@ -523,30 +523,6 @@ pub async fn manage_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
         content,
     )
     .await
-}
-
-/// The `hx-on--after-request` body shared by every one-shot action button on
-/// these pages: reload the page once the action lands. `hx-swap="none"` means a
-/// 2xx changes nothing on its own, so the reload is what shows the result.
-///
-/// It used to carry a failure half as well — parse the API's `message` out of
-/// the response and raise it on the `showToast` channel — because without one a
-/// refused action rendered as nothing happening at all, which is the worst
-/// outcome on a page whose buttons are the only way to undo a delete or shut a
-/// money surface down. That half is gone because it stopped being this page's
-/// problem: `ui/assets/chrome.js`'s toast section now carries global
-/// `htmx:responseError` / `htmx:sendError` / `htmx:timeout` listeners that
-/// raise the same `message` for EVERY failed htmx request on every shelled
-/// page. Keeping the copy here would toast the same refusal twice.
-///
-/// What the copy did carry that the generic listener cannot infer is WHICH
-/// control failed — `"Could not archive this offer"` rather than
-/// `"Request failed (502)"`, which matters on a payment-link row holding an
-/// Archive and a Deactivate button. That did not go away with it: each button
-/// declares its own `data-error-label`, and the listener uses it whenever the
-/// response carries no message of its own.
-fn reload_on_success() -> String {
-    "if(event.detail.successful){location.reload()}".to_string()
 }
 
 /// Close-only manager for a soft-deleted product: archive its offers,
@@ -685,7 +661,7 @@ pub async fn deleted_product_close(
                                 hx-delete=(offer_url)
                                 hx-swap="none"
                                 data-error-label="Could not archive this offer"
-                                hx-on--after-request=(reload_on_success())
+                                data-reload-on-success
                             { "Archive offer" }
                         }
                     }
@@ -708,7 +684,7 @@ pub async fn deleted_product_close(
                                                 hx-delete=(link_url)
                                                 hx-swap="none"
                                                 data-error-label="Could not deactivate this payment link"
-                                                hx-on--after-request=(reload_on_success())
+                                                data-reload-on-success
                                             { "Deactivate" }
                                         }
                                     }
@@ -3134,7 +3110,7 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
                                         hx-post=(restore_url)
                                         hx-swap="none"
                                         data-error-label="Could not restore this product"
-                                        hx-on--after-request=(reload_on_success())
+                                        data-reload-on-success
                                     { "Restore" }
                                 }
                             },

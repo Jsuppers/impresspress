@@ -158,7 +158,7 @@ fn add_provider_form() -> Markup {
         form
             hx-post="/b/llm/api/providers"
             hx-swap="none"
-            hx-on--after-request="if(event.detail.successful){location.reload()}"
+            data-reload-on-success
         {
             div .form-row .gap-3 {
                 div .form-group {
@@ -353,7 +353,7 @@ fn provider_row(id: &str, cfg: &ProviderConfig, manages: bool) -> Markup {
                             // reloads to show it, so nothing is swapped.
                             hx-swap="none"
                             hx-confirm={"Discover models for \"" (cfg.name) "\" from its /v1/models endpoint?"}
-                            hx-on--after-request="if(event.detail.successful){location.reload()}"
+                            data-reload-on-success
                         {
                             "Discover"
                         }

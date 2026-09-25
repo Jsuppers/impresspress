@@ -1364,8 +1364,9 @@ mod tests {
     /// - an identifier that merely begins with `on` (`once`, `online`), because
     ///   the run of letters has to be followed by `=` and a value opener.
     /// - htmx's `hx-on--…` / `hx-on:…`, whose event name is empty at that
-    ///   point. That channel is pinned by
-    ///   [`htmx_handler_channel_is_pinned`] instead of being silently ignored.
+    ///   point. That channel is refused by
+    ///   [`pages_carry_no_htmx_eval_attributes`] instead of being silently
+    ///   ignored.
     fn handler_attributes(src: &str) -> Vec<(usize, String)> {
         let bytes = src.as_bytes();
         let mut found = Vec::new();
@@ -1484,49 +1485,150 @@ mod tests {
         );
     }
 
-    /// htmx's `hx-on--*` attributes are pinned, not ignored.
+    /// Every htmx attribute in `src` whose value htmx would compile with
+    /// `new Function`, as `(line number, snippet)`.
     ///
-    /// They carry JavaScript exactly the way an `onclick` value does, so they
-    /// are the same hazard through a different channel: four of the nine
-    /// interpolate a `format!`-built body, which is the identical shape the
-    /// rule above exists for. Converting them means moving behaviour off
-    /// htmx's own event names and is its own change, so this pull request
-    /// leaves them — but it does not leave the door open. A tenth site, in any
-    /// file, fails here.
+    /// Four shapes, and they are every place htmx 2 evaluates attribute text:
     ///
-    /// (`hx-on` also happens to slip past the detector above, whose event name
-    /// is empty after the `on`. This is what stops that from being a silent
-    /// gap; the detector's own doc comment used to claim a leading-character
-    /// rule saved them, which was wrong — `-` is not alphanumeric.)
-    #[test]
-    fn htmx_handler_channel_is_pinned() {
-        // Assembled rather than written out, because this file is one of the
-        // files scanned and a literal here would count itself.
-        let needle = format!("hx-{}", "on");
-        let mut counts: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for (path, src) in handler_scan_sources() {
-            let n = src.matches(needle.as_str()).count();
-            if n > 0 {
-                let rel = path
-                    .rsplit_once("/src/")
-                    .map(|(_, tail)| tail.to_string())
-                    .unwrap_or(path);
-                *counts.entry(rel).or_default() += n;
+    /// - `hx-on…` in any spelling (`hx-on:click`, `hx-on--after-request`,
+    ///   `hx-on::load`) — the handler body is compiled as a function;
+    /// - `hx-vars` — its whole value is evaluated, always;
+    /// - `hx-vals` / `hx-headers` whose value opens with `js:` or
+    ///   `javascript:` — the rest is evaluated;
+    /// - `hx-trigger` whose value holds a `[` — the bracketed filter is
+    ///   evaluated.
+    ///
+    /// The attribute name is matched with its `data-` twin (`data-hx-on…`),
+    /// which htmx reads identically. For the last two shapes the value is read
+    /// from its opener — `"`, `'`, maud's `(` or `{` — up to the matching
+    /// closer, so a maud expression that builds the value is inspected too,
+    /// as far as its literal text shows it.
+    fn htmx_eval_attributes(src: &str) -> Vec<(usize, String)> {
+        let mut found = Vec::new();
+        let mut flag = |i: usize| {
+            let snippet = src[i..]
+                .chars()
+                .take(48)
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .collect();
+            found.push((src[..i].matches('\n').count() + 1, snippet));
+        };
+        // The value of the attribute whose name ends at `after`, or `None` for
+        // a bare attribute or one that is not followed by `=`.
+        let value_at = |after: usize| -> Option<&str> {
+            let rest = src[after..].trim_start().strip_prefix('=')?.trim_start();
+            let open = rest.chars().next()?;
+            let close = match open {
+                '"' | '\'' => open,
+                '(' => ')',
+                '{' => '}',
+                _ => return None,
+            };
+            let body = &rest[1..];
+            Some(body.find(close).map_or(body, |end| &body[..end]))
+        };
+        for (i, _) in src.match_indices("hx-") {
+            let before = src[..i].strip_suffix("data-").unwrap_or(&src[..i]);
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                continue;
+            }
+            let rest = &src[i + 3..];
+            let name_len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':'))
+                .count();
+            let name = &rest[..name_len];
+            let after = i + 3 + name_len;
+            let hit = match name {
+                "vars" => true,
+                "vals" | "headers" => value_at(after).is_some_and(|v| {
+                    let v = v.trim_start().trim_start_matches(['"', '\'']).trim_start();
+                    v.starts_with("js:") || v.starts_with("javascript:")
+                }),
+                "trigger" => value_at(after).is_some_and(|v| v.contains('[')),
+                _ => name == "on" || name.starts_with("on-") || name.starts_with("on:"),
+            };
+            if hit {
+                flag(i);
             }
         }
-        let actual: Vec<(String, usize)> = counts.into_iter().collect();
-        let expected: Vec<(String, usize)> = vec![
-            ("blocks/llm/ui.rs".to_string(), 2),
-            ("blocks/messages/pages.rs".to_string(), 3),
-            ("blocks/products/pages.rs".to_string(), 4),
-        ];
-        assert_eq!(
-            actual, expected,
-            "the htmx handler-attribute inventory moved. Every one of these \
-             carries JavaScript in an attribute value: a new one needs the same \
-             argument the nine existing ones got, and a converted one should be \
-             struck from this pin."
+        found
+    }
+
+    /// The detector sees every eval-shaped htmx attribute, and none of the
+    /// htmx attributes that only resemble one.
+    #[test]
+    fn htmx_eval_attribute_detector_sees_every_shape() {
+        // Spelled `{hx}` and substituted, because this file is scanned and a
+        // literal here would be a violation in its own test data.
+        let fixture = |s: &str| blank_comments(&s.replace("{hx}", "hx-"));
+
+        for spelling in [
+            r#"form {hx}on--after-request="location.reload()""#,
+            r#"<button {hx}on:click="go()">"#,
+            r#"div {hx}on::load="go()""#,
+            r#"div data-{hx}on:click="go()""#,
+            r#"div {hx}vars="a:1""#,
+            r#"div {hx}vals="js:{a: 1}""#,
+            r#"div {hx}vals='javascript:{a: 1}'"#,
+            r#"div {hx}headers={"js:" (expr)}"#,
+            r#"div {hx}trigger="click[ctrlKey]""#,
+            r#"div {hx}trigger = "every 2s [ready()]""#,
+            "div\n    {hx}on--after-request=(body)",
+        ] {
+            assert!(
+                !htmx_eval_attributes(&fixture(spelling)).is_empty(),
+                "the gate must see `{spelling}`"
+            );
+        }
+        for innocent in [
+            r#"form {hx}post="/b/x" {hx}swap="none""#,
+            r#"div {hx}vals='{"a": 1}'"#,
+            r#"div {hx}headers={"{\"a\": 1}"}"#,
+            r#"div {hx}trigger="load""#,
+            r#"input {hx}trigger="input changed delay:300ms""#,
+            r##"div {hx}target="#list" {hx}confirm="Sure?""##,
+            r#"div data-reload-on-success"#,
+            r#"// {hx}on--after-request="x()""#,
+            r#"/// {hx}vars="a:1""#,
+        ] {
+            assert!(
+                htmx_eval_attributes(&fixture(innocent)).is_empty(),
+                "the gate must not flag `{innocent}`"
+            );
+        }
+    }
+
+    /// No page carries an htmx attribute that htmx would evaluate.
+    ///
+    /// Every page is served under a content-security policy with no
+    /// `'unsafe-eval'` (`wafer-run/security-headers` refuses to add one), and
+    /// `ui::layout::page` sets htmx's `allowEval` to false, so any such
+    /// attribute is dead on arrival: the control renders, and the behaviour
+    /// it declares never runs. What a control does after its request succeeds
+    /// is declared with the `data-*-on-success` attributes that
+    /// `ui/assets/chrome.js` section 5 applies; the Playwright spec
+    /// `crates/impresspress-web/tests/e2e/htmx-success-effects.spec.ts` proves
+    /// they run under the real header.
+    #[test]
+    fn pages_carry_no_htmx_eval_attributes() {
+        let mut offenders = Vec::new();
+        for (path, src) in handler_scan_sources() {
+            for (line, snippet) in htmx_eval_attributes(&src) {
+                offenders.push(format!("{path}:{line} ({snippet})"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "htmx attributes that need eval remain — they never run under the \
+             served CSP. Declare the effect with a `data-*-on-success` \
+             attribute (ui/assets/chrome.js, section 5) or a delegated \
+             listener instead:\n{}",
+            offenders.join("\n")
         );
     }
 

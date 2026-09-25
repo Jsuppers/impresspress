@@ -3165,18 +3165,19 @@ fn rendered_hx_post(html: &str) -> Option<String> {
 }
 
 /// The Restore button reloads the page on success, and does NOT carry its own
-/// failure branch any more.
+/// failure branch.
 ///
-/// It used to: a refused restore — a slug collision is reachable, see
-/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — rendered as
-/// nothing happening at all, on the only door out of soft delete, so the button
-/// parsed the message out itself. `ui/assets/chrome.js` now carries a global
-/// `htmx:responseError` listener that does exactly that for every refused htmx
-/// request on every shelled page (`ui/assets/test/chrome_error_toast.test.mjs`
-/// is its test), so a copy here would toast the same refusal twice. What is
-/// pinned here is the half that is still this page's: the reload, guarded on
-/// success so a refusal does not silently reload the page and look like it
-/// worked.
+/// A refused restore — a slug collision is reachable, see
+/// `restore_reports_a_slug_conflict_instead_of_an_opaque_error` — must not
+/// render as nothing happening, on the only door out of soft delete.
+/// `ui/assets/chrome.js` carries a global `htmx:responseError` listener that
+/// toasts every refused htmx request on every shelled page
+/// (`ui/assets/test/chrome_error_toast.test.mjs` is its test), so a copy here
+/// would toast the same refusal twice. What is pinned here is the half that is
+/// this page's: `data-reload-on-success`, which the same file's section 5
+/// applies only to a successful request, so a refusal does not reload the
+/// page and look like it worked. It is not an `hx-on` handler: those need
+/// `'unsafe-eval'`, which the served policy never grants.
 #[tokio::test]
 async fn manage_products_deleted_view_reports_a_failed_restore() {
     let ctx = ctx().await;
@@ -3192,8 +3193,15 @@ async fn manage_products_deleted_view_reports_a_failed_restore() {
     let html = output_to_html(super::super::pages::manage_products(&ctx, &msg).await).await;
 
     assert!(
-        html.contains("if(event.detail.successful){location.reload()}"),
+        html.contains("data-reload-on-success"),
         "the restore button must reload only on success: {html}"
+    );
+    // Assembled, because `ui::tests::pages_carry_no_htmx_eval_attributes`
+    // scans this file and a literal would count as one.
+    let htmx_handler = format!("hx-{}", "on");
+    assert!(
+        !html.contains(&htmx_handler),
+        "an htmx handler attribute never runs under the served CSP: {html}"
     );
     assert!(
         !html.contains("new CustomEvent('showToast'"),
