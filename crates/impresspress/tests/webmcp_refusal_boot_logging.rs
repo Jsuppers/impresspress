@@ -175,7 +175,7 @@ async fn build_runtime_with_extra_blocks(
             )
             .expect("jwt crypto service"),
         )
-        .network(impresspress_native::make_fetch_network_service().expect("network service"))
+        .network(impresspress_native::make_fetch_network_service())
         .logger(impresspress_native::make_tracing_logger());
     for (name, block) in extras {
         builder = builder.extra_block(name, block);

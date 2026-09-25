@@ -207,7 +207,11 @@ impl ImpresspressBuilder {
         // under `optional_requires`: without this registration the runtime
         // still boots, and the block's calls to it answer `Unimplemented`.
         #[cfg(feature = "native-embedding")]
-        register_vector_block(&mut wafer, self.sqlite_db_path.as_deref())?;
+        register_vector_block(
+            &mut wafer,
+            self.sqlite_db_path.as_deref(),
+            required_model_cache_dir(self.model_cache_dir.as_deref(), "native-embedding")?,
+        )?;
 
         // Browser path: when callers (typically `impresspress-web`) inject vector
         // + embedding services, register the runtime block + transformers
@@ -261,10 +265,21 @@ impl ImpresspressBuilder {
         // native and wasm32 — there is no longer a linkme (native) /
         // hand-synced-list (wasm32) split. Previously native relied on
         // per-block `register_static_block!` (linkme) and wasm32 on a separate
-        // `register_all_static_blocks` list; both are gone. The three
-        // non-zero-arg blocks (`llm`, framework `auth`, wasm32
-        // `transformers-embed`) are registered explicitly below.
+        // `register_all_static_blocks` list; both are gone. The four
+        // non-zero-arg blocks (`fastembed`, `llm`, framework `auth`,
+        // `transformers-embed`) are registered explicitly.
         crate::blocks::register_feature_blocks(&mut wafer)?;
+
+        // `impresspress/fastembed` caches its model under the embedder's
+        // directory, so it is registered here with it rather than from the
+        // zero-arg manifest.
+        #[cfg(feature = "block-fastembed")]
+        wafer.register_block(
+            crate::blocks::fastembed::FastembedBlock::BLOCK_NAME,
+            Arc::new(crate::blocks::fastembed::FastembedBlock::new(
+                required_model_cache_dir(self.model_cache_dir.as_deref(), "block-fastembed")?,
+            )),
+        )?;
 
         // Admin is registered here rather than from the manifest: its
         // constructor takes the same `Arc<RwLock<BlockSettings>>` handed to
@@ -513,6 +528,23 @@ impl ImpresspressBuilder {
 
         Ok(wafer)
     }
+}
+
+/// The embedder's model cache directory, or the build error naming the
+/// builder call that supplies it. `feature` is the Cargo feature that needs
+/// it, so the error says why the directory is asked for.
+#[cfg(feature = "block-fastembed")]
+pub(crate) fn required_model_cache_dir<'a>(
+    dir: Option<&'a std::path::Path>,
+    feature: &str,
+) -> Result<&'a std::path::Path, RuntimeError> {
+    dir.ok_or_else(|| {
+        RuntimeError::Config(format!(
+            "the `{feature}` feature is enabled but no model cache directory was \
+             provided to ImpresspressBuilder — call .model_cache_dir(...) before \
+             .build()"
+        ))
+    })
 }
 
 /// Register the WASM blocks under `root/blocks/**/target/block.wasm` and the

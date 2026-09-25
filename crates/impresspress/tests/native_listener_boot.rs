@@ -8,7 +8,7 @@
 //! (`build_native_runtime`, `register_http_listener`, `boot_native`) with a
 //! listener setting the listener refuses.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use impresspress::cli::server::{boot_native, build_native_runtime};
 use impresspress_native::{register_http_listener, InfraConfig, ListenerEnv};
@@ -27,6 +27,7 @@ fn infra_for(db_path: &Path, storage_root: &Path, listener: ListenerEnv) -> Infr
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        model_cache_dir: "data/models".to_string(),
         listener,
     }
 }
@@ -40,7 +41,7 @@ async fn boot_with(listener: ListenerEnv) -> anyhow::Result<()> {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer = build_native_runtime(&infra, database, &[], false)
+    let mut wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
         .await
         .expect("build impresspress runtime");
     register_http_listener(&mut wafer, &infra.listen, "site-main", &infra.listener);

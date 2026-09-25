@@ -57,7 +57,8 @@
 //!   (see [`D1DatabaseService::new`]) and re-applied at lifecycle `Init` via
 //!   [`set_strict_schema`](DatabaseService::set_strict_schema) for the one
 //!   service a Wafer runtime is built around (the shared `wafer-run/database`
-//!   handler reads the same var from `ctx.config_get`). When set the executor
+//!   block reads the same var from its `lifecycle(Init)` config, which the
+//!   `ConfigSource` overlay resolves from the Worker env). When set the executor
 //!   trusts the migrated schema: no table-exists probe, no lazy column-add.
 //!   Production CF deploys enable it (wrangler `[vars]`); a write/query
 //!   referencing an unmigrated column then fails loudly, as intended.
@@ -197,7 +198,8 @@ impl D1DatabaseService {
     /// [`CfEnvironment::strict_schema_enabled`](crate::environment::CfEnvironment::strict_schema_enabled).
     ///
     /// `Init` still calls [`DatabaseService::set_strict_schema`] on the
-    /// runtime's own service; it reads the same var through `ctx.config_get`,
+    /// runtime's own service; it reads the same var from its `lifecycle(Init)`
+    /// config, which the `ConfigSource` overlay resolves from the Worker env,
     /// so it re-affirms this value rather than contradicting it.
     ///
     /// `binding` is the D1 binding `db` came from. It is the key of the

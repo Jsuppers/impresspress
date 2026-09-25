@@ -886,12 +886,7 @@ mod tests {
                 };
                 let req: cfg_wire::GetRequest = match codec::decode(&data) {
                     Ok(r) => r,
-                    Err(e) => {
-                        return OutputStream::error(wafer_run::WaferError::new(
-                            ErrorCode::Internal,
-                            e.message,
-                        ));
-                    }
+                    Err(e) => return OutputStream::error(e.invalid_argument()),
                 };
                 let value = self
                     .cfg

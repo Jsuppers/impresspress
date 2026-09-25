@@ -21,7 +21,7 @@
 //! This drives the page through `Wafer::run_block` — the entry point the HTTP
 //! listener uses — on a runtime from `build_native_runtime`, the binary's own.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, GrantSource, InitPolicy};
@@ -49,6 +49,7 @@ fn infra_for(db_path: &Path, storage_root: &Path) -> InfraConfig {
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        model_cache_dir: "data/models".to_string(),
         listener: Default::default(),
     }
 }
@@ -64,7 +65,7 @@ async fn the_admin_email_settings_page_renders_its_form_on_the_real_runtime() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer = build_native_runtime(&infra, database, &[], false)
+    let mut wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
         .await
         .expect("build impresspress runtime");
     boot(

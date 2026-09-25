@@ -34,6 +34,7 @@ async fn wrap_grants_are_read_through_the_database_service() {
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        model_cache_dir: "data/models".to_string(),
         listener: Default::default(),
     };
 
@@ -65,7 +66,7 @@ async fn wrap_grants_are_read_through_the_database_service() {
         .await
         .expect("seed grant");
 
-    let wafer = build_native_runtime(&infra, database, &[], false)
+    let wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
         .await
         .expect("build impresspress runtime");
 

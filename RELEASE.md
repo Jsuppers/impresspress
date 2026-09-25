@@ -17,6 +17,37 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### wafer-run 01239cf3: block config at Init, model cache, discovery
+
+**What changes.**
+
+- `WAFER_RUN__DATABASE__STRICT_SCHEMA` and the network limits
+  (`WAFER_RUN__NETWORK__MAX_RESPONSE_BYTES`, `…__CONNECT_TIMEOUT_SECS`,
+  `…__READ_TIMEOUT_SECS`, `…__REQUEST_TIMEOUT_SECS`,
+  `…__STREAM_TIMEOUT_SECS`) reach their blocks through each block's start
+  config. Native resolves them from the process environment beneath the
+  variables table; Cloudflare reads STRICT_SCHEMA from the Worker var as
+  before. An invalid network limit now fails the `wafer-run/network` block's
+  start, naming the key, instead of the process's boot.
+- `/openapi.json` and `/.well-known/agent.json` leave out every block the
+  admin toggle has turned off, as `/b/webmcp/manifest.json` already did, and
+  an operation the router gates above its declared level carries
+  `bearerAuth`.
+- The runtime refuses to start when two endpoints declare the same method on
+  the same route (`{id}` and `{item_id}` count as the same).
+- `WAFER_RUN__FASTEMBED__CACHE_DIR` is no longer read. A build with
+  `block-fastembed` or `native-embedding` passes the model cache directory to
+  `ImpresspressBuilder::model_cache_dir` and is refused without one. The
+  `impresspress` binary passes `IMPRESSPRESS_MODEL_CACHE_DIR` (default
+  `data/models`, the directory the old variable defaulted to); both features
+  are off in its default build.
+
+**Who has to act.** A native deployment built with `native-embedding` that
+set `WAFER_RUN__FASTEMBED__CACHE_DIR`: set `IMPRESSPRESS_MODEL_CACHE_DIR` to
+the same directory. A consumer calling `ImpresspressBuilder` with either
+feature: call `.model_cache_dir(...)`. Nobody else: the other variables keep
+their names and meaning.
+
 ### Config: a read that fails is an error, not the default
 
 **What changes.** Every config read in impresspress now fails closed. A key

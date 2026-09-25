@@ -5,10 +5,10 @@
 //! never runs on that path.
 //!
 //! The heavy lifting is delegated to the shared `wafer-net-security`
-//! classifier ([`wafer_core::security::is_blocked_url`], re-exported from that
-//! crate): scheme, `localhost`, and every private/loopback/link-local/CGNAT
-//! IPv4/IPv6 literal (including the IPv6-embedded-v4 forms — NAT64, 6to4,
-//! IPv4-mapped, IPv4-compatible). It does NOT reimplement IP parsing.
+//! classifier ([`wafer_net_security::is_blocked_url`]): scheme, `localhost`,
+//! and every private/loopback/link-local/CGNAT IPv4/IPv6 literal (including
+//! the IPv6-embedded-v4 forms — NAT64, 6to4, IPv4-mapped, IPv4-compatible).
+//! It does NOT reimplement IP parsing.
 //!
 //! This module *adds* the two hostname rules that classifier cannot express,
 //! because it matches the bare string `localhost` and nothing else:
@@ -47,7 +47,7 @@
 /// Well-known cloud instance-metadata service **DNS hostnames**.
 ///
 /// The IP-literal metadata endpoints are already rejected by
-/// [`wafer_core::security::is_blocked_url`] via its existing arms —
+/// [`wafer_net_security::is_blocked_url`] via its existing arms —
 /// AWS/Azure/OpenStack `169.254.169.254` and GCP `[fd00:ec2::254]` are
 /// link-local / unique-local, and Alibaba's `100.100.100.200` is CGNAT
 /// (`100.64.0.0/10`). What that classifier cannot know is the *name* form,
@@ -133,14 +133,14 @@ pub fn is_loopback_host(host: &str) -> bool {
 /// outbound request is dispatched.
 ///
 /// Composes the shared literal-URL classifier
-/// ([`wafer_core::security::is_blocked_url`] — scheme / `localhost` / all
+/// ([`wafer_net_security::is_blocked_url`] — scheme / `localhost` / all
 /// private-IP literal forms) with the two hostname rules this module layers on
 /// top: the cloud-metadata denylist ([`is_cloud_metadata_host`]) and the
 /// `localhost` pseudo-domain ([`is_loopback_host`]).
 /// An unparseable URL is treated as blocked (the shared classifier already
 /// returns `true` for it). See the module docs for the DNS-rebinding boundary.
 pub fn is_ssrf_blocked_url(url: &str) -> bool {
-    if wafer_core::security::is_blocked_url(url) {
+    if wafer_net_security::is_blocked_url(url) {
         return true;
     }
     // Only reached when the URL parsed and its host is NOT an IP literal or the

@@ -27,11 +27,10 @@ pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 /// operator decision rather than an admin-editable runtime toggle:
 /// `blocks::config`'s `served_only_from_boot_map` answers it from the boot map
 /// whatever the `variables` table holds, and `CONFIG_SET` refuses to write it.
-/// Each target threads it onto both config surfaces at boot, the way
-/// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is threaded — the native CLI from the
-/// process environment, the Cloudflare worker from a `wrangler.toml` var
-/// through `CfEnvironment`. Absent means `all`, which is the behaviour every
-/// existing deployment already has.
+/// Each target threads it onto both config surfaces at boot — the native CLI
+/// from the process environment, the Cloudflare worker from a `wrangler.toml`
+/// var through `CfEnvironment`. Absent means `all`, which is the behaviour
+/// every existing deployment already has.
 ///
 /// # Why this exists
 ///
@@ -916,6 +915,21 @@ mod shared_vars_tests {
 mod csp_rule_tests {
     use super::{check_config_value, CSP_DIRECTIVES_KEY, DEFAULT_CSP_DIRECTIVES};
     use crate::test_support::TestContext;
+
+    /// A value rule for an undeclared key would never run where an export is
+    /// named: the native seeder only sees declared keys, and
+    /// `variables::usable_env_exports` drops a refused export without logging
+    /// on the strength of that.
+    #[test]
+    fn every_value_rule_names_a_declared_key() {
+        for rule in super::config_value_rules() {
+            assert!(
+                super::is_declared_key(rule.key),
+                "{} has a value rule but no declaring ConfigVar",
+                rule.key
+            );
+        }
+    }
 
     /// The shipped default is a policy the security-headers merge takes whole.
     #[test]

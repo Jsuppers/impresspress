@@ -81,19 +81,18 @@ pub mod vector;
 /// added in exactly one place.
 ///
 /// Each entry's `cfg` gates the block on its `block-*` Cargo feature; the
-/// dual-target blocks compile with no `cfg` (always on). `fastembed` carries
-/// `feature = "block-fastembed"`, which is never enabled on wasm32 (it pulls
-/// ONNX Runtime — see the `pub mod fastembed` cfg above), so the same gate
-/// covers "native-only" without a redundant `not(target_arch = "wasm32")`.
+/// dual-target blocks compile with no `cfg` (always on).
 ///
 /// Special cases stay **out** of the manifest and are registered explicitly by
 /// `ImpresspressBuilder::build`, because their constructors are not zero-argument:
 /// `impresspress/llm` (`Arc<dyn ProviderAdmin>`, via [`register_llm`]),
 /// `wafer-run/auth` (framework `AuthBlock` wrapping `AuthServiceImpl`, via
-/// [`register_auth`]), and `impresspress/transformers-embed` (injected
-/// `Arc<dyn EmbeddingService>`). `llm`'s `BlockInfo` is still added to
-/// [`all_block_infos`] below via a `NoopProviderAdmin` handle (info is
-/// declarative and never drives the provider surface).
+/// [`register_auth`]), `impresspress/transformers-embed` (injected
+/// `Arc<dyn EmbeddingService>`) and `impresspress/fastembed` (the embedder's
+/// model cache directory). `llm`'s `BlockInfo` is still added to
+/// [`all_block_infos`] below via a `NoopProviderAdmin` handle, and
+/// `fastembed`'s via an empty cache path (info is declarative and never
+/// drives the provider surface or loads a model).
 macro_rules! feature_block_manifest {
     ( $( $(#[$cfg:meta])? $ctor:path ),+ $(,)? ) => {
         /// `BlockInfo` for every zero-arg impresspress feature block, plus the
@@ -136,6 +135,14 @@ macro_rules! feature_block_manifest {
                 llm::LlmBlock::new(std::sync::Arc::new(llm::provider_admin::NoopProviderAdmin))
                     .info(),
             );
+
+            // `impresspress/fastembed` is registered separately (its ctor
+            // takes the builder's model cache directory). `info()` loads no
+            // model, so the directory it is given here is never read. Native
+            // only: `block-fastembed` pulls ONNX Runtime and is never enabled
+            // on wasm32.
+            #[cfg(feature = "block-fastembed")]
+            infos.push(fastembed::FastembedBlock::new(std::path::PathBuf::new()).info());
 
             infos
         }
@@ -183,10 +190,6 @@ feature_block_manifest! {
     vector::VectorBlock,
     #[cfg(feature = "block-signal")]
     signal::SignalBlock,
-    // Native-only: fastembed pulls ONNX Runtime; `block-fastembed` is never
-    // enabled on wasm32, so this gate doubles as "not wasm32".
-    #[cfg(feature = "block-fastembed")]
-    fastembed::FastembedBlock,
 }
 
 /// Bytes for a block-owned entry of the shared `/b/static/` asset manifest,
