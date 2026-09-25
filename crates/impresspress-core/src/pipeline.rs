@@ -2547,6 +2547,79 @@ mod discovery_tests {
         );
     }
 
+    /// `/openapi.json` and the agent card describe the same block set as the
+    /// manifest above: a block the admin toggle turned off 404s every route,
+    /// so neither document may describe one of its endpoints.
+    #[tokio::test]
+    async fn disabled_block_is_described_in_no_discovery_document() {
+        struct ProductsDisabled;
+        impl FeatureConfig for ProductsDisabled {
+            fn is_block_enabled(&self, full_name: &str) -> bool {
+                full_name != "impresspress/products"
+            }
+        }
+
+        async fn document(
+            ctx: &TestContext,
+            path: &str,
+            features: &dyn FeatureConfig,
+        ) -> serde_json::Value {
+            let mut msg = anon_msg("retrieve", path);
+            msg.set_meta("http.header.host", "impresspress.example.com");
+            let out = handle_request(
+                ctx,
+                msg,
+                InputStream::from_bytes(Vec::new()),
+                None,
+                TEST_JWT_SECRET,
+                false,
+                features,
+                &real_block_infos(),
+                &[],
+            )
+            .await;
+            serde_json::from_slice(&collect_or_panic(out).await.body)
+                .expect("discovery response is valid JSON")
+        }
+        fn product_skills(card: &serde_json::Value) -> Vec<String> {
+            card["skills"]
+                .as_array()
+                .expect("agent card skills array")
+                .iter()
+                .map(|s| s["id"].as_str().expect("skill id").to_string())
+                .filter(|id| id.starts_with("impresspress/products/"))
+                .collect()
+        }
+        const STOREFRONT: &str = "/b/products/storefront/config";
+
+        let ctx = TestContext::new().await;
+
+        let enabled = document(&ctx, "/openapi.json", &AllEnabled).await;
+        assert!(
+            !enabled["paths"][STOREFRONT].is_null(),
+            "precondition: the products block is described while enabled: {}",
+            enabled["paths"]
+        );
+        let disabled = document(&ctx, "/openapi.json", &ProductsDisabled).await;
+        assert!(
+            disabled["paths"][STOREFRONT].is_null(),
+            "a disabled block's endpoints must not be in /openapi.json: {}",
+            disabled["paths"]
+        );
+
+        let enabled = document(&ctx, "/.well-known/agent.json", &AllEnabled).await;
+        assert!(
+            !product_skills(&enabled).is_empty(),
+            "precondition: the products block lists skills while enabled: {enabled}"
+        );
+        let disabled = document(&ctx, "/.well-known/agent.json", &ProductsDisabled).await;
+        assert_eq!(
+            product_skills(&disabled),
+            Vec::<String>::new(),
+            "a disabled block must list no skills in the agent card"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Refusal-logging amplification (see also
     // `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`
