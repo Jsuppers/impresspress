@@ -272,8 +272,8 @@ impl DbExec for D1DatabaseService {
     ///   minutes). The rebuild that follows calls [`forget_isolate_schema`].
     ///
     ///   What can be stale in that window is bounded by what is cached:
-    ///   a negative table-exists is never stored (see
-    ///   [`table_present_for_op`](Self::table_present_for_op)), so a table the
+    ///   a negative table-exists is never stored (the shared
+    ///   `DbExec::table_present_for_op` memoizes only a present table), so a table the
     ///   migration creates is not read as missing; a column list that predates
     ///   an `ADD COLUMN` only makes the lazy add re-run, which
     ///   `add_column_checked` treats as benign; and a primary key is stale
@@ -286,39 +286,6 @@ impl DbExec for D1DatabaseService {
 
     fn strict_schema(&self) -> bool {
         self.strict_schema.load(Ordering::Relaxed)
-    }
-
-    /// The shared table-exists guard, except that a **negative** answer is
-    /// never memoized.
-    ///
-    /// The shared default caches both answers, which is right for a
-    /// request-scoped cache and wrong for an isolate-scoped one: a table a
-    /// migration creates a moment later would read as missing for the life of
-    /// the isolate, and a `list` against a missing table answers an empty
-    /// `RecordList` rather than an error — a silent wrong answer, for minutes.
-    /// A positive is safe to keep: nothing drops a table at runtime on D1
-    /// (the schema-mutation methods are refused, and a migration's `DROP`
-    /// goes through `exec_raw`, which clears this cache).
-    ///
-    /// The cost of not caching it is one `sqlite_master` probe per operation
-    /// against a table that does not exist — the pre-cache behaviour, on a
-    /// path production does not take at all (live deploys set STRICT_SCHEMA,
-    /// which skips the guard outright).
-    async fn table_present_for_op(&self, table: &str) -> Result<bool, DatabaseError> {
-        if self.strict_schema() {
-            return Ok(true);
-        }
-        if self.schema_cache.table_exists(table) == Some(true) {
-            return Ok(true);
-        }
-        // Generation snapshot before the probe yields, as the shared default
-        // takes one: a write-back that raced a schema mutation is dropped.
-        let gen0 = self.schema_cache.generation();
-        let exists = self.dbx_table_exists(table).await?;
-        if exists {
-            self.schema_cache.set_table_exists_if_gen(table, true, gen0);
-        }
-        Ok(exists)
     }
 
     async fn run_fetch(
@@ -1076,13 +1043,12 @@ mod tests {
     /// migration that creates it is seen by the next operation rather than by
     /// the next runtime rebuild.
     ///
-    /// **Fails on the shared default**, which caches both answers: cheap and
-    /// right for a per-request cache, wrong for an isolate-scoped one. The
-    /// second probe below would be answered `false` from the cache, and a
-    /// `list` against a table the executor believes is missing returns an
-    /// empty `RecordList` — a silent wrong answer, for as long as the isolate
-    /// lives. A positive is still memoized: nothing drops a table at runtime
-    /// on D1.
+    /// The shared `DbExec::table_present_for_op` is what this adapter runs,
+    /// so this is a guard on that default as D1 uses it: the cache here is
+    /// isolate-scoped, and a memoized "missing" would make a `list` against
+    /// the table answer an empty `RecordList` — a silent wrong answer, for as
+    /// long as the isolate lives. A positive is still memoized: nothing drops
+    /// a table at runtime on D1.
     #[wasm_bindgen_test]
     async fn a_missing_table_is_re_probed_until_it_appears() {
         forget_isolate_schema();
@@ -1098,11 +1064,10 @@ mod tests {
             DbExec::table_present_for_op(&svc, "later_t").await.ok(),
             Some(false)
         );
-        assert_eq!(
-            DbExec::schema_cache(&svc)
+        assert!(
+            !DbExec::schema_cache(&svc)
                 .expect("a cache")
-                .table_exists("later_t"),
-            None,
+                .table_known_present("later_t"),
             "a missing table must leave no memoized fact behind"
         );
 
@@ -1278,6 +1243,23 @@ mod tests {
             )
             .expect("set all");
             all.forget();
+            // A lone statement's `first()`: the executor's one probe of where
+            // a created row's id comes from (`introspect::build_id_policy`),
+            // issued in strict mode too. It answers `0` — the executor mints
+            // the id — as for every `TEXT` primary key impresspress declares.
+            let first = Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |_col: JsValue| {
+                let row = js_sys::Object::new();
+                js_sys::Reflect::set(&row, &JsValue::from_str("id_policy"), &JsValue::from(0))
+                    .expect("set id_policy");
+                js_sys::Promise::resolve(&JsValue::from(row))
+            });
+            js_sys::Reflect::set(
+                &statement,
+                &JsValue::from_str("first"),
+                first.as_ref().unchecked_ref(),
+            )
+            .expect("set first");
+            first.forget();
             JsValue::from(statement)
         });
         js_sys::Reflect::set(
@@ -1369,7 +1351,8 @@ mod tests {
     /// **`create_many` is one D1 round trip.** The rows reach D1 as ONE
     /// `batch()` of one INSERT each — the call D1 runs as a single implicit
     /// transaction — rather than a `run()` per row. Strict schema is on, as in
-    /// production, so no introspection statement joins the batch.
+    /// production, so no introspection statement joins the batch (the id
+    /// policy probe runs on its own, ahead of it).
     #[wasm_bindgen_test]
     async fn create_many_is_one_batch_of_one_insert_per_row() {
         forget_isolate_schema();

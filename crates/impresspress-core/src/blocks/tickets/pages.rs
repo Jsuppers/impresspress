@@ -482,7 +482,10 @@ pub async fn types(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let vars = super::config::config_vars();
-    let readiness = SecurityReadiness::load(ctx).await;
+    let readiness = match SecurityReadiness::load(ctx).await {
+        Ok(readiness) => readiness,
+        Err(e) => return crud::db_error_page(msg, e, "ticket settings page: config read failed"),
+    };
     let content = html! {
         (components::page_header(
             "Ticket settings",

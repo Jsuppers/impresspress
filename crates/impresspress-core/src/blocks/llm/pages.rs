@@ -154,7 +154,10 @@ pub async fn page(ctx: &dyn Context, msg: &Message) -> OutputStream {
             (Vec::new(), true)
         }
     };
-    let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
+    let default_model = match config::get_default(ctx, DEFAULT_MODEL_VAR, "").await {
+        Ok(model) => model,
+        Err(e) => return crud::db_error_page(msg, e, "llm chat page: default model read failed"),
+    };
 
     let llm_chat_js_url = super::assets::llm_chat_js_url();
     let content = render_page_body(
@@ -395,8 +398,20 @@ fn render_right_rail(
 // ---------------------------------------------------------------------------
 
 pub async fn settings_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let default_provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
-    let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
+    let default_provider = match config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER)
+        .await
+    {
+        Ok(provider) => provider,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "llm settings page: default provider read failed")
+        }
+    };
+    let default_model = match config::get_default(ctx, DEFAULT_MODEL_VAR, "").await {
+        Ok(model) => model,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "llm settings page: default model read failed")
+        }
+    };
 
     // Load per-thread overrides. An empty list means "no thread pins a
     // provider" — the state an untouched deployment is in — so an unreadable

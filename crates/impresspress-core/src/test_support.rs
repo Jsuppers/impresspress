@@ -226,7 +226,7 @@ impl TestContext {
             wafer_core::service_blocks::database::DatabaseBlock::new(svc.clone()),
         );
 
-        Self {
+        let mut ctx = Self {
             db_service: svc,
             database_block,
             config: Arc::new(HashMap::new()),
@@ -244,7 +244,13 @@ impl TestContext {
             #[cfg(feature = "block-dev")]
             dev_shared: None,
             _db_file: db_file,
-        }
+        };
+        // Every target's builder registers a config block, so an unset key
+        // answers the service's `NotFound` and a client read falls back to
+        // its default. A fixture without one would answer "no such block",
+        // which the config client returns as an error.
+        ctx.install_env_config_block();
+        ctx
     }
 
     /// Insert a single config entry into the snapshot.
@@ -252,11 +258,10 @@ impl TestContext {
     /// Makes a fresh `Arc<HashMap>` clone on each call — fine for tests,
     /// where the number of entries is small and mutations happen at setup time.
     ///
-    /// Also (re)registers a real `wafer-run/config` service block backed by the
+    /// Also (re)registers the `wafer-run/config` service block over the
     /// updated map, so block code that reads config through the typed client
     /// (`wafer_core::clients::config::get`/`get_default`) sees the same values
-    /// as `config_get`. Without this, those client calls route to an
-    /// unregistered block and silently fall back to their hardcoded default.
+    /// as `config_get`.
     ///
     /// On a fixture whose `wafer-run/config` is the production block (see
     /// [`Self::install_config_block`]) the value joins that block's boot map
@@ -271,6 +276,12 @@ impl TestContext {
             self.install_config_block();
             return;
         }
+        self.install_env_config_block();
+    }
+
+    /// Serve `wafer-run/config` from the framework `ConfigBlock` over this
+    /// fixture's config map.
+    fn install_env_config_block(&mut self) {
         let svc = wafer_core::service_blocks::config::EnvConfigService::new();
         for (k, v) in self.config.iter() {
             wafer_core::interfaces::config::service::ConfigService::set(&svc, k, v);
@@ -300,7 +311,9 @@ impl TestContext {
     ///
     /// `requires` is that block's OWN declared allowlist. It is caller-owned
     /// data, so a test acting as a real block must source it from
-    /// `<Block>::new().info().requires` and never re-list the names: the
+    /// `<Block>::new().info().call_allowlist()` — `requires` plus
+    /// `optional_requires`, what the runtime admits — and never re-list the
+    /// names: the
     /// point of the gate is that the test and the runtime read the same
     /// declaration. An empty list means "declares no `requires`", which
     /// production reads as unrestricted — correct for a synthetic caller
@@ -335,11 +348,12 @@ impl TestContext {
         self
     }
 
-    /// This context with `name`'s own declared `requires` installed — the
+    /// This context with `name`'s own declared call allowlist installed — the
     /// sub-context `RuntimeContext::dispatch_call` hands a callee.
     ///
     /// Resolution mirrors `Wafer::resolve_block_requires_uncached`: read the
-    /// registered snapshot, and an empty or absent list means unrestricted.
+    /// registered snapshot's `BlockInfo::call_allowlist` (`requires` plus
+    /// `optional_requires`), and an empty or absent list means unrestricted.
     /// Here the snapshot is `block_infos`, which `register_block` keeps as a
     /// mirror of the blocks map.
     fn for_callee(&self, name: &str) -> Self {
@@ -350,7 +364,7 @@ impl TestContext {
             .block_infos
             .iter()
             .find(|b| b.name == name)
-            .map(|b| b.requires.clone())
+            .and_then(wafer_run::BlockInfo::call_allowlist)
             .unwrap_or_default();
         ctx
     }
@@ -750,7 +764,9 @@ impl TestContext {
         // copy: `dev::export` reaches storage and the database through
         // `call_block`, and production refuses any target the block did not
         // declare before it looks at a single grant.
-        let requires = wafer_run::Block::info(&*block).requires;
+        let requires = wafer_run::Block::info(&*block)
+            .call_allowlist()
+            .unwrap_or_default();
         self.with_wrap(
             dev::BLOCK_NAME,
             requires,
@@ -1127,6 +1143,56 @@ impl TestContext {
         self.block_infos.retain(|b| b.name != name);
         info.name = name.to_string();
         self.block_infos.push(info);
+    }
+
+    /// Make every `config.set` fail with an `Internal` error while reads keep
+    /// answering from the registered config block — the shape a config store
+    /// that cannot be written takes. Used to prove a save handler reports the
+    /// failure instead of a success.
+    pub fn refuse_config_writes(&mut self) {
+        self.refuse_config_op(
+            wafer_block::common::ServiceOp::CONFIG_SET,
+            None,
+            WaferError::new(ErrorCode::Internal, "simulated config write failure"),
+        );
+    }
+
+    /// Make every `config.get` answer `error` while writes keep reaching the
+    /// registered config block — a config read the caller is refused. Used to
+    /// prove a handler sends the refusal through its classifier instead of
+    /// answering with a default or echoing the refusal's own text.
+    pub fn refuse_config_reads(&mut self, error: WaferError) {
+        self.refuse_config_op(wafer_block::common::ServiceOp::CONFIG_GET, None, error);
+    }
+
+    /// [`Self::refuse_config_reads`] for the one key `key`: every other read
+    /// reaches the registered config block. Reproduces a caller that holds a
+    /// grant for most keys but not this one.
+    pub fn refuse_config_reads_of(&mut self, key: &str, error: WaferError) {
+        self.refuse_config_op(
+            wafer_block::common::ServiceOp::CONFIG_GET,
+            Some(key.to_string()),
+            error,
+        );
+    }
+
+    fn refuse_config_op(&mut self, op: &'static str, key: Option<String>, error: WaferError) {
+        let inner = self
+            .blocks
+            .lock()
+            .expect("blocks mutex poisoned")
+            .get("wafer-run/config")
+            .cloned()
+            .expect("every fixture registers a config block");
+        self.register_block(
+            "wafer-run/config",
+            Arc::new(RefusingConfigOp {
+                inner,
+                op,
+                key,
+                error,
+            }),
+        );
     }
 
     /// Replace the database backing this context with one whose mutating
@@ -2072,8 +2138,11 @@ impl Context for TestContext {
                 };
                 match block {
                     Some(b) => b.handle(&callee, msg, input).await,
+                    // The runtime's answer for nothing to dispatch to:
+                    // `NotFound` is reserved for a service saying the thing
+                    // a request names does not exist.
                     None => OutputStream::error(WaferError::new(
-                        ErrorCode::NotFound,
+                        ErrorCode::Unimplemented,
                         format!("block '{other}' not registered in TestContext"),
                     )),
                 }
@@ -2235,7 +2304,10 @@ impl Context for FailingDbOpContext {
 
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
         if name == "wafer-run/database" && self.failing.iter().any(|(op, _)| *op == msg.action()) {
-            let bytes = input.collect_to_bytes().await;
+            let bytes = match input.collect_to_bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => return OutputStream::error(e),
+            };
             let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
                 .map(|p| p.collection)
                 .unwrap_or_default();
@@ -2491,7 +2563,10 @@ impl Context for RendezvousDbOpContext {
         if !(name == "wafer-run/database" && msg.action() == self.op) {
             return self.inner.call_block(name, msg, input).await;
         }
-        let bytes = input.collect_to_bytes().await;
+        let bytes = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let matches = wafer_block::codec::decode::<CollectionPeek>(&bytes)
             .map(|p| p.collection == self.collection)
             .unwrap_or(false);
@@ -2611,7 +2686,10 @@ impl Context for FloatAggregateContext {
         if !rewrites {
             return self.inner.call_block(name, msg, input).await;
         }
-        let request_bytes = input.collect_to_bytes().await;
+        let request_bytes = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let request: wafer_block::wire::database::AggregateRequest =
             match wafer_block::codec::decode(&request_bytes) {
                 Ok(request) => request,
@@ -2839,6 +2917,45 @@ impl TestContext {
             Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(svc));
         ctx.register_block("wafer-run/crypto", crypto_block);
         ctx.running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID)
+    }
+}
+
+/// The config block behind [`TestContext::refuse_config_writes`] and
+/// [`TestContext::refuse_config_reads`]: every `op` (on `key`, when one is
+/// named) answers `error`, everything else reaches the wrapped block.
+struct RefusingConfigOp {
+    inner: Arc<dyn Block>,
+    op: &'static str,
+    key: Option<String>,
+    error: WaferError,
+}
+
+#[wafer_block::wafer_async_trait]
+impl Block for RefusingConfigOp {
+    fn info(&self) -> BlockInfo {
+        self.inner.info()
+    }
+
+    async fn handle(&self, ctx: &dyn Context, msg: Message, input: InputStream) -> OutputStream {
+        if msg.kind != self.op {
+            return self.inner.handle(ctx, msg, input).await;
+        }
+        let Some(key) = &self.key else {
+            return OutputStream::error(self.error.clone());
+        };
+        let body = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
+        let requested = wafer_block::codec::decode::<wafer_block::wire::config::GetRequest>(&body)
+            .map(|req| req.key)
+            .unwrap_or_default();
+        if &requested == key {
+            return OutputStream::error(self.error.clone());
+        }
+        self.inner
+            .handle(ctx, msg, InputStream::from_bytes(body))
+            .await
     }
 }
 

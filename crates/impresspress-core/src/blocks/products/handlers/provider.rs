@@ -94,7 +94,10 @@ pub(in crate::blocks::products) fn provider_error(
 }
 
 pub(super) async fn connection_status(ctx: &dyn Context) -> OutputStream {
-    ok_json(&stripe_provider::connection_status(ctx).await)
+    match stripe_provider::connection_status(ctx).await {
+        Ok(status) => ok_json(&status),
+        Err(e) => crud::db_error_internal(e, "Could not read the Stripe settings"),
+    }
 }
 
 pub(super) async fn webhook_events(ctx: &dyn Context, msg: &Message) -> OutputStream {
@@ -189,7 +192,10 @@ pub(super) async fn seller_onboarding(
     if msg.user_id().is_empty() {
         return err_unauthorized("Authentication required");
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let request: SellerOnboardingRequest = match serde_json::from_slice(&raw) {
         Ok(request) => request,
         Err(error) => return err_bad_request(&format!("Invalid request body: {error}")),
@@ -218,7 +224,10 @@ pub(super) async fn billing_portal(
     if msg.user_id().is_empty() {
         return err_unauthorized("Authentication required");
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let request: BillingPortalRequest = match serde_json::from_slice(&raw) {
         Ok(request) => request,
         Err(error) => return err_bad_request(&format!("Invalid request body: {error}")),

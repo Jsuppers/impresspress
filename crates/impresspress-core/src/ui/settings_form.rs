@@ -83,8 +83,7 @@ impl<'a> SettingsSection<'a> {
 /// saved writes those over every stored value on the page.
 ///
 /// `get_many` also refuses the whole batch when WRAP denies the caller ONE of
-/// the keys, where `config::get_default` swallowed the denial into that key's
-/// default. So a page that renders a var its block may not read is an error
+/// the keys, so a page that renders a var its block may not read is an error
 /// page rather than a field showing the default: the page has no value to
 /// show and its Save would have written the default over the stored one.
 async fn current_values<'v>(
@@ -384,7 +383,10 @@ pub async fn save_settings(
     allowed: &[ConfigVar],
     block_label: &str,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: HashMap<String, String> = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid request: {e}")),
@@ -788,9 +790,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_settings_surfaces_config_set_failure() {
-        // No `wafer-run/config` block registered → config::set fails. Before the
-        // fix the loop swallowed the error and reported success anyway.
-        let ctx = TestContext::new().await;
+        // Every config::set fails; a loop that swallowed the error would
+        // report success anyway.
+        let mut ctx = TestContext::new().await;
+        ctx.refuse_config_writes();
         let allowed = [var(APP_NAME_KEY, "App", InputType::Text)];
         let out = run_save(&ctx, &allowed, serde_json::json!({APP_NAME_KEY: "MyApp"})).await;
         assert!(
@@ -843,7 +846,9 @@ mod tests {
         let body = output_json(out).await;
         assert_eq!(body["message"], "Settings saved");
         assert_eq!(
-            config::get_default(&ctx, "X__API_SECRET", "").await,
+            config::get_default(&ctx, "X__API_SECRET", "")
+                .await
+                .expect("config read"),
             "original-secret",
             "an empty submit for a sensitive field must not clear/overwrite the stored secret"
         );
@@ -858,7 +863,9 @@ mod tests {
         let body = output_json(out).await;
         assert_eq!(body["message"], "Settings saved");
         assert_eq!(
-            config::get_default(&ctx, "X__API_SECRET", "").await,
+            config::get_default(&ctx, "X__API_SECRET", "")
+                .await
+                .expect("config read"),
             "brand-new-secret",
             "a genuinely retyped secret must be saved"
         );
@@ -894,7 +901,9 @@ mod tests {
             "a client that posts the mask must be told, not thanked"
         );
         assert_eq!(
-            config::get_default(&ctx, "X__API_SECRET", "").await,
+            config::get_default(&ctx, "X__API_SECRET", "")
+                .await
+                .expect("config read"),
             "original-secret",
             "and the stored secret must survive the refusal"
         );
@@ -931,7 +940,9 @@ mod tests {
         .await;
         assert_eq!(crate::test_support::output_http_status(out).await, 400);
         assert_eq!(
-            config::get_default(&ctx, APP_NAME_KEY, "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
             "MyApp",
             "a refused save must not have written the fields before the refusal"
         );
@@ -1017,12 +1028,16 @@ mod tests {
             "the refusal is a bad request that names the remedy, not a 500"
         );
         assert_eq!(
-            config::get_default(&ctx, APP_NAME_KEY, "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
             "MyApp",
             "and nothing ahead of it in the allowlist may have been written"
         );
         assert_eq!(
-            config::get_default(&ctx, "X__PLAIN_NOTE", "").await,
+            config::get_default(&ctx, "X__PLAIN_NOTE", "")
+                .await
+                .expect("config read"),
             "operator-flagged-value",
         );
     }
@@ -1096,7 +1111,9 @@ mod tests {
             "precondition: the writer refuses the second var mid-loop"
         );
         assert_eq!(
-            config::get_default(&ctx, APP_NAME_KEY, "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
             "Renamed",
             "precondition: the first var was written before the refusal"
         );
@@ -1156,7 +1173,9 @@ mod tests {
         .expect("seed the app name");
 
         assert_eq!(
-            config::get_default(&ctx, BOOT_ONLY, "").await,
+            config::get_default(&ctx, BOOT_ONLY, "")
+                .await
+                .expect("config read"),
             MASKED_VALUE,
             "the fixture only means something if the boot map is what the form read"
         );
@@ -1188,8 +1207,18 @@ mod tests {
             "submitting the value the form was shown must not be refused by the writer \
              after the pre-pass allowed it"
         );
-        assert_eq!(config::get_default(&ctx, APP_NAME_KEY, "").await, "Renamed",);
-        assert_eq!(config::get_default(&ctx, BOOT_ONLY, "").await, MASKED_VALUE);
+        assert_eq!(
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
+            "Renamed",
+        );
+        assert_eq!(
+            config::get_default(&ctx, BOOT_ONLY, "")
+                .await
+                .expect("config read"),
+            MASKED_VALUE
+        );
     }
 
     /// A refusal raised by the WRITER is reported as the refusal it is.
@@ -1243,7 +1272,9 @@ mod tests {
             "a guard the writer enforces is a bad request, not a server fault"
         );
         assert_eq!(
-            config::get_default(&ctx, "X__PLAIN_NOTE", "").await,
+            config::get_default(&ctx, "X__PLAIN_NOTE", "")
+                .await
+                .expect("config read"),
             "operator-flagged-value",
         );
     }
@@ -1323,12 +1354,16 @@ mod tests {
             "saving the page unedited must not be refused"
         );
         assert_eq!(
-            config::get_default(&ctx, APP_NAME_KEY, "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
             "Renamed",
             "and the edit the operator actually made must land"
         );
         assert_eq!(
-            config::get_default(&ctx, "X__NOTE", "").await,
+            config::get_default(&ctx, "X__NOTE", "")
+                .await
+                .expect("config read"),
             MASKED_VALUE,
             "the untouched row is unchanged",
         );
@@ -1364,7 +1399,12 @@ mod tests {
         )
         .await;
         assert_eq!(crate::test_support::output_http_status(out).await, 400);
-        assert_eq!(config::get_default(&ctx, APP_NAME_KEY, "").await, "MyApp",);
+        assert_eq!(
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
+            "MyApp",
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1419,9 @@ mod tests {
         let body = output_json(out).await;
         assert_eq!(body["message"], "Settings saved");
         assert_eq!(
-            config::get_default(&ctx, APP_NAME_KEY, "").await,
+            config::get_default(&ctx, APP_NAME_KEY, "")
+                .await
+                .expect("config read"),
             "",
             "a non-sensitive field's empty submit is a real write, unlike a sensitive field's"
         );
@@ -1435,7 +1477,9 @@ mod config_store_reproduction {
 
         // Live reads see it, which is why this looks like it works.
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+                .await
+                .expect("config read"),
             saved
         );
 
@@ -1443,7 +1487,9 @@ mod config_store_reproduction {
         ctx.boot_config_service().await;
 
         assert_eq!(
-            wafer_core::clients::config::get_default(&ctx, KEY, "unset").await,
+            wafer_core::clients::config::get_default(&ctx, KEY, "unset")
+                .await
+                .expect("config read"),
             saved,
             "a setting saved through an admin form must outlive the process that saved it"
         );

@@ -11,7 +11,6 @@
 //! Request body is `application/x-www-form-urlencoded` (the GET page
 //! submits a plain HTML form — no JS).
 
-use wafer_core::clients::config;
 use wafer_run::{context::Context, InputStream, Message, OutputStream};
 
 use crate::{
@@ -22,11 +21,10 @@ use crate::{
             repo::{bootstrap_tokens, users},
             service::hash_token,
         },
-        auth_ui::redirect::{default_post_login_redirect, is_safe_local_redirect},
+        auth_ui::redirect::{configured_admin_default, default_post_login_redirect},
         crud,
         errors::error_response,
     },
-    config_vars::POST_LOGIN_REDIRECT_KEY,
     http::{
         err_bad_request, err_forbidden, err_internal_no_cause, err_unauthorized, ResponseBuilder,
     },
@@ -34,7 +32,10 @@ use crate::{
 };
 
 pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let form = parse_form_body(&raw);
 
     // CSRF defense-in-depth: this is a plain (no-JS) `<form>` POST, so the
@@ -63,8 +64,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         Some(p) if !p.is_empty() => p.clone(),
         _ => return err_bad_request("missing password"),
     };
-    if let Err((code, msg)) = super::password_policy::validate_new_password(ctx, &password).await {
-        return error_response(code, &msg);
+    match super::password_policy::validate_new_password(ctx, &password).await {
+        Ok(Ok(())) => {}
+        Ok(Err((code, msg))) => return error_response(code, &msg),
+        Err(response) => return response,
     }
 
     let token_hash = hash_token(&token);
@@ -136,11 +139,9 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
     //    right completion signal. Honor WAFER_RUN_SHARED__POST_LOGIN_REDIRECT
     //    (validated) like login/oauth, defaulting to the admin home — the old
     //    `/b/auth/dashboard` target is not a registered route (404).
-    let post_login_raw = config::get_default(ctx, POST_LOGIN_REDIRECT_KEY, "/b/admin/").await;
-    let admin_default = if is_safe_local_redirect(&post_login_raw) {
-        post_login_raw
-    } else {
-        "/b/admin/".to_string()
+    let admin_default = match configured_admin_default(ctx).await {
+        Ok(admin_default) => admin_default,
+        Err(e) => return crud::db_error_internal(e, "Could not read the post-login redirect"),
     };
     // Bootstrap redemption always creates the admin account (step 2 above),
     // so `is_admin` is always `true` here — routed through the same

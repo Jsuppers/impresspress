@@ -36,7 +36,12 @@ pub async fn dashboard_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(buttons) => buttons,
         Err(e) => return crud::db_error_page(msg, e, "userportal dashboard: buttons read failed"),
     };
-    let config = SiteConfig::load(ctx).await;
+    let config = match SiteConfig::load(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
     let is_admin = UserInfo::from_message(msg).is_some_and(|u| u.is_admin());
 
     let body = html! {

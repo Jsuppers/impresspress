@@ -246,7 +246,10 @@ pub async fn handle_create_button(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let mut data = match parse_button_form(&raw) {
         Ok(d) => d,
         Err(resp) => return resp,
@@ -367,7 +370,10 @@ pub async fn handle_update_button(
     input: InputStream,
     id: &str,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let mut data = match parse_button_form(&raw) {
         Ok(d) => d,
         Err(resp) => return resp,
@@ -747,7 +753,9 @@ mod tests {
         let as_portal = |grants| {
             base.clone().with_wrap(
                 "impresspress/userportal",
-                wafer_run::Block::info(&UserPortalBlock::new()).requires,
+                wafer_run::Block::info(&UserPortalBlock::new())
+                    .call_allowlist()
+                    .unwrap_or_default(),
                 grants,
                 crate::blocks::admin::ADMIN_BLOCK_ID,
             )

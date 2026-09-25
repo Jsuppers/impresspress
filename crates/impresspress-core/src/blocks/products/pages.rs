@@ -238,7 +238,10 @@ pub async fn overview(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(analytics) => analytics,
         Err(error) => return crud::db_error_internal(error, "Database error"),
     };
-    let user_products_enabled = super::handlers::user_products_enabled(ctx).await;
+    let user_products_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
 
     let content = html! {
         (admin_tabs("overview"))
@@ -634,7 +637,13 @@ pub async fn deleted_product_close(
     } else {
         "/b/products/my-products?view=deleted"
     };
-    let seller_enabled = !admin && super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = !admin
+        && match super::handlers::user_products_enabled(ctx).await {
+            Ok(value) => value,
+            Err(e) => {
+                return crud::db_error_page(msg, e, "products page: seller switch read failed")
+            }
+        };
     let deleted_at = product.str_field("deleted_at");
     let content = html! {
         @if admin {
@@ -757,7 +766,10 @@ pub async fn admin_sellers(ctx: &dyn Context, msg: &Message) -> OutputStream {
         Ok(pending) => pending,
         Err(error) => return crud::db_error_internal(error, "Could not list seller products"),
     };
-    let selling_enabled = super::handlers::user_products_enabled(ctx).await;
+    let selling_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
 
     let content = html! {
         (admin_tabs("sellers"))
@@ -966,7 +978,12 @@ pub async fn admin_seller_detail(
 
 pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> OutputStream {
     let configured_currency =
-        wafer_core::clients::config::get_default(ctx, DEFAULT_CURRENCY, "USD").await;
+        match wafer_core::clients::config::get_default(ctx, DEFAULT_CURRENCY, "USD").await {
+            Ok(currency) => currency,
+            Err(e) => {
+                return crud::db_error_page(msg, e, "product wizard: default currency read failed")
+            }
+        };
     let mut default_currency = super::money::normalize_currency(&configured_currency)
         .unwrap_or_else(|_| "USD".to_string());
     let template_definitions = [
@@ -994,7 +1011,12 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
     let seller_templates = if admin {
         std::collections::HashSet::new()
     } else {
-        super::handlers::seller_policy::allowed_templates(ctx).await
+        match super::handlers::seller_policy::allowed_templates(ctx).await {
+            Ok(templates) => templates,
+            Err(e) => {
+                return crud::db_error_page(msg, e, "product wizard: seller policy read failed")
+            }
+        }
     };
     let template_definitions: Vec<_> = template_definitions
         .into_iter()
@@ -1007,16 +1029,21 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
     let mut seller_currencies = if admin {
         Vec::new()
     } else {
-        super::handlers::seller_policy::allowed_currencies(ctx)
-            .await
-            .into_iter()
-            .collect::<Vec<_>>()
+        match super::handlers::seller_policy::allowed_currencies(ctx).await {
+            Ok(currencies) => currencies.into_iter().collect::<Vec<_>>(),
+            Err(e) => {
+                return crud::db_error_page(msg, e, "product wizard: seller policy read failed")
+            }
+        }
     };
     seller_currencies.sort();
     if !seller_currencies.is_empty() && !seller_currencies.contains(&default_currency) {
         default_currency = seller_currencies[0].clone();
     }
-    let automatic_tax = super::stripe::automatic_tax_enabled(ctx).await;
+    let automatic_tax = match super::stripe::automatic_tax_enabled(ctx).await {
+        Ok(enabled) => enabled,
+        Err(e) => return crud::db_error_page(msg, e, "product wizard: automatic tax read failed"),
+    };
     // Blank when no platform country is configured: the field's placeholder
     // then asks for the list, which is the honest prompt. It used to prefill
     // `US` on a deployment that had never said it was in the US.
@@ -1703,7 +1730,13 @@ pub async fn product_manager(
         Ok(offers) => offers,
         Err(error) => return crud::db_error_internal(error, "Could not load product pricing"),
     };
-    let seller_enabled = !admin && super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = !admin
+        && match super::handlers::user_products_enabled(ctx).await {
+            Ok(value) => value,
+            Err(e) => {
+                return crud::db_error_page(msg, e, "products page: seller switch read failed")
+            }
+        };
     let product_api_url = if admin {
         format!("/b/products/api/admin/products/{product_id}")
     } else {
@@ -2120,7 +2153,10 @@ fn stripe_connection_card(status: &StripeConnectionStatus) -> Markup {
 }
 
 pub async fn stripe_setup(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let status = stripe_provider::connection_status(ctx).await;
+    let status = match stripe_provider::connection_status(ctx).await {
+        Ok(status) => status,
+        Err(e) => return crud::db_error_page(msg, e, "stripe setup page: settings read failed"),
+    };
     let connected = matches!(
         status.state,
         StripeConnectionState::ConnectedTest | StripeConnectionState::ConnectedLive
@@ -2368,7 +2404,10 @@ fn seller_status_card(account: Option<&SellerAccount>, fee_basis_points: u16) ->
 
 pub async fn portal_home(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
-    let seller_enabled = super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
     let purchases_count = match repo::purchases::count_for_user(ctx, &user_id).await {
         Ok(count) => count,
         Err(error) => return crud::db_error_internal(error, "Database error"),
@@ -2502,7 +2541,10 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
         },
         None => Vec::new(),
     };
-    let seller_enabled = super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
     let content = html! {
         (portal_tabs("selling", seller_enabled))
         (seller_page_links("dashboard"))
@@ -2523,7 +2565,10 @@ pub async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream 
 }
 
 pub async fn seller_orders(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let seller_enabled = super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
     let account = match repo::seller_accounts::get_for_user(ctx, msg.user_id()).await {
         Ok(Some(account)) => account,
         Ok(None) => {
@@ -2712,7 +2757,12 @@ async fn order_detail(
             "Back to my purchases",
             portal_tabs(
                 "purchases",
-                super::handlers::user_products_enabled(ctx).await,
+                match super::handlers::user_products_enabled(ctx).await {
+                    Ok(enabled) => enabled,
+                    Err(e) => {
+                        return crud::db_error_page(msg, e, "order page: seller switch read failed")
+                    }
+                },
             ),
         ),
         OrderPageAccess::Seller => (
@@ -2960,7 +3010,10 @@ async fn order_detail(
 
 pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
-    let seller_enabled = super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
     let (page, page_size, _) = msg.pagination_params(20);
 
     // `?view=deleted` is the seller's mirror of the admin Deleted tab, and
@@ -3125,7 +3178,10 @@ pub async fn my_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
 
 pub async fn my_purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
-    let seller_enabled = super::handlers::user_products_enabled(ctx).await;
+    let seller_enabled = match super::handlers::user_products_enabled(ctx).await {
+        Ok(value) => value,
+        Err(e) => return crud::db_error_page(msg, e, "products page: seller switch read failed"),
+    };
     let (page, page_size, _) = msg.pagination_params(20);
 
     let filters = vec![Filter {
@@ -3184,9 +3240,11 @@ pub async fn my_purchases(ctx: &dyn Context, msg: &Message) -> OutputStream {
 /// their on-page order. Pulled from the declared [`ConfigVar`] metadata — the
 /// block-owned ones from `super::config_vars()`, the shared ones from
 /// `config_vars::shared_var()` — so nothing is re-declared in a parallel tuple.
-async fn settings_vars(ctx: &dyn Context) -> SettingsVars {
+/// A failed runtime read is returned: the list decides whether secret keys
+/// may be edited here.
+async fn settings_vars(ctx: &dyn Context) -> Result<SettingsVars, wafer_run::WaferError> {
     let own = super::config_vars();
-    let trusted_server = super::stripe_secret_operations_allowed(ctx).await;
+    let trusted_server = super::stripe_secret_operations_allowed(ctx);
     let mut stripe = vec![config_vars::var_in(&own, STRIPE_PUBLISHABLE_KEY)];
     let mut stripe_advanced = vec![config_vars::var_in(&own, STRIPE_API_VERSION)];
     let mut webhooks = vec![config_vars::shared_var(FRONTEND_URL_KEY)];
@@ -3204,7 +3262,7 @@ async fn settings_vars(ctx: &dyn Context) -> SettingsVars {
             config_vars::var_in(&own, WEBHOOK_SECRET),
         ]);
     }
-    SettingsVars {
+    Ok(SettingsVars {
         features: vec![config_vars::shared_var(ALLOW_USER_PRODUCTS_KEY)],
         stripe,
         stripe_advanced,
@@ -3223,7 +3281,7 @@ async fn settings_vars(ctx: &dyn Context) -> SettingsVars {
             config_vars::var_in(&own, SELLER_MAX_PRODUCTS),
         ],
         webhooks,
-    }
+    })
 }
 
 struct SettingsVars {
@@ -3251,8 +3309,18 @@ impl SettingsVars {
 }
 
 pub async fn settings(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let trusted_server = super::stripe_secret_operations_allowed(ctx).await;
-    let vars = settings_vars(ctx).await;
+    let settings = async {
+        Ok::<_, wafer_run::WaferError>((
+            super::stripe_secret_operations_allowed(ctx),
+            settings_vars(ctx).await?,
+        ))
+    };
+    let (trusted_server, vars) = match settings.await {
+        Ok(settings) => settings,
+        Err(e) => {
+            return crud::db_error_page(msg, e, "products settings page: runtime read failed")
+        }
+    };
     let sections = [
         SettingsSection::new("Stripe credentials", icons::dollar_sign(), &vars.stripe)
             .description(
@@ -3323,5 +3391,9 @@ pub async fn handle_save_settings(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    settings_form::save_settings(ctx, msg, input, &settings_vars(ctx).await.all(), "products").await
+    let vars = match settings_vars(ctx).await {
+        Ok(vars) => vars,
+        Err(e) => return crud::db_error_internal(e, "Could not read the products runtime"),
+    };
+    settings_form::save_settings(ctx, msg, input, &vars.all(), "products").await
 }

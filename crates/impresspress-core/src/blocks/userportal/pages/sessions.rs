@@ -46,7 +46,12 @@ pub async fn sessions_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (render_table(&rows, current_family))
     };
 
-    let config = SiteConfig::load(ctx).await;
+    let config = match SiteConfig::load(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
     super::account_page(&config, "Sessions", Some("/b/userportal/"), body)
 }
 
@@ -480,7 +485,9 @@ mod tests {
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
+                .call_allowlist()
+                .unwrap_or_default(),
             Vec::new(),
             "impresspress/admin",
         );
@@ -504,7 +511,9 @@ mod tests {
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
+                .call_allowlist()
+                .unwrap_or_default(),
             auth_grants(),
             "impresspress/admin",
         );
@@ -529,7 +538,9 @@ mod tests {
 
         let ctx = ctx.with_wrap(
             "impresspress/userportal",
-            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new()).requires,
+            wafer_run::Block::info(&crate::blocks::userportal::UserPortalBlock::new())
+                .call_allowlist()
+                .unwrap_or_default(),
             auth_grants(),
             "impresspress/admin",
         );

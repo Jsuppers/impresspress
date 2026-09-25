@@ -741,7 +741,12 @@ crate::impresspress_feature_block! {
                 if old_tab.is_empty() {
                     redirect_308("/b/admin/settings/permissions")
                 } else {
-                    redirect_308(&format!("/b/admin/settings/permissions?subtab={old_tab}"))
+                    // Encoded: the value is the decoded query, and a
+                    // `Location` header carries ASCII only.
+                    redirect_308(&format!(
+                        "/b/admin/settings/permissions?subtab={}",
+                        crate::util::urlencode(old_tab)
+                    ))
                 }
             }
             Route::GrantsPage => pages::grants_page(ctx, &msg).await,
@@ -857,7 +862,10 @@ async fn handle_create_wrap_grant(
     mut msg: Message,
     input: InputStream,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let form = parse_form_body(&raw);
     let grantee = form.get("grantee").cloned().unwrap_or_default();
     let resource = form.get("resource").cloned().unwrap_or_default();
@@ -968,6 +976,37 @@ mod tests {
             .unwrap_or("");
         assert_eq!(status, "308");
         assert_eq!(location, "/b/admin/settings/email");
+    }
+
+    /// The legacy permissions URL carries its `?tab=` over as `?subtab=` in a
+    /// `Location` header, which the HTTP codec refuses with a 500 when it
+    /// holds a character outside ASCII (or a control character). The query
+    /// value arrives decoded, so it has to be encoded again on the way out.
+    #[tokio::test]
+    async fn the_permissions_redirect_encodes_the_tab_it_carries() {
+        let ctx = crate::test_support::TestContext::with_admin().await;
+        let mut msg = crate::test_support::admin_msg("retrieve", "/b/admin/permissions");
+        msg.set_meta("req.query.tab", "r\u{f4}les\r\nX-Injected: 1");
+        let out = AdminBlock::new()
+            .handle(&ctx, msg, InputStream::empty())
+            .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        assert_eq!(
+            parts.status,
+            308,
+            "{:?}",
+            String::from_utf8_lossy(&parts.body)
+        );
+        let location = parts
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.as_str())
+            .expect("a Location header");
+        assert_eq!(
+            location,
+            "/b/admin/settings/permissions?subtab=r%C3%B4les%0D%0AX-Injected%3A+1"
+        );
     }
 
     /// `enabled` must report the block's actual enablement, not a literal.
@@ -1261,9 +1300,9 @@ mod delegation_tests {
     // Registered as `impresspress/files` and answers 200 to anything, so a
     // request this block still forwarded would come back a success and fail
     // the assertion for the right reason. (`TestContext::call_block` answers
-    // `NotFound` for an unregistered block, and the real files block now 404s
-    // the synthetic paths itself, so neither would tell forwarding apart from
-    // refusing.)
+    // `Unimplemented` for an unregistered block, and the real files block
+    // 404s the synthetic paths itself, so neither would tell forwarding apart
+    // from refusing.)
     crate::impresspress_feature_block! {
         struct ProbeFilesBlock;
         name: "impresspress/files",
@@ -1503,7 +1542,10 @@ mod test_support {
             if name != "wafer-run/database" || msg.action() != "database.list" {
                 return self.inner.call_block(name, msg, input).await;
             }
-            let bytes = input.collect_to_bytes().await;
+            let bytes = match input.collect_to_bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => return wafer_run::OutputStream::error(e),
+            };
             let collection =
                 wafer_block::codec::decode::<crate::test_support::CollectionPeek>(&bytes)
                     .map(|peek| peek.collection)

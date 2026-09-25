@@ -389,3 +389,38 @@ fn stripe_webhook_is_never_an_agent_tool() {
          authenticated by HMAC — never an agent tool"
     );
 }
+
+/// The storefront config answers under the WRAP checks production runs.
+///
+/// Whether this runtime may hold Stripe secrets is the runtime-owned
+/// `RUNTIME_KIND_CONFIG_KEY`, which belongs to no block's namespace: a
+/// config-client read of it is refused for `impresspress/products`, so the
+/// endpoint must take it off the `config_get` snapshot the adapter publishes.
+/// Driven as the products block with its own declared allowlist and the
+/// deployment's grants.
+#[tokio::test]
+async fn the_storefront_config_answers_under_wrap() {
+    let ctx = ctx_with(&[
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_SECRET_KEY",
+            "sk_test_server_only",
+        ),
+        (
+            "IMPRESSPRESS__PRODUCTS__STRIPE_PUBLISHABLE_KEY",
+            "pk_test_browser_safe",
+        ),
+    ])
+    .await
+    .with_wrap(
+        "impresspress/products",
+        ProductsBlock::new()
+            .info()
+            .call_allowlist()
+            .unwrap_or_default(),
+        crate::blocks::admin::AdminBlock::new().info().grants,
+        crate::blocks::admin::ADMIN_BLOCK_ID,
+    );
+    let (msg, input) = get_msg("/b/products/storefront/config", "");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(body["embedded_checkout_available"], true, "{body}");
+}

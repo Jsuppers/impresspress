@@ -17,7 +17,12 @@ pub async fn profile_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
         return redirect(302, "/b/auth/login");
     }
 
-    let site_config = SiteConfig::load(ctx).await;
+    let site_config = match SiteConfig::load(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
     let user = UserInfo::from_message(msg);
     // `UserRow.display_name`, not the `name` alias this page used to read:
     // both are written together by `users::insert` and

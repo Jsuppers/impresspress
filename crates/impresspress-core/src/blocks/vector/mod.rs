@@ -173,33 +173,36 @@ crate::impresspress_feature_block! {
         )
         .instance_mode(InstanceMode::Singleton)
         .requires(vec![
-            // The runtime vector service (typed index/query/introspection ops).
-            "wafer-run/vector".into(),
             // Registry table reads/writes + per-index counts go through the
             // database service; without this entry caller_requires denies
             // every db::* call and the admin list silently renders empty.
             "wafer-run/database".into(),
-            // Embedding for ingest / query-by-text. Allowlist entries are
-            // call-time only, so listing both targets is safe on either
-            // target (the unused one is simply never called).
+            // `migration_helper::db_backend` reads the database backend through
+            // the config client when the block's migrations run at Init.
+            "wafer-run/config".into(),
+        ])
+        // Soft dependencies: on the call allowlist, not checked at seal, and a
+        // call to one that is absent answers `Unimplemented`.
+        .optional_requires(vec![
+            // The runtime vector service (typed index/query/introspection
+            // ops). Registered only where an embedding backend is: the
+            // `native-embedding` build (`builder::boot::register_vector_block`,
+            // which also skips it when the fastembed model cannot be loaded)
+            // and a runtime that injected vector + embedding services.
+            // Without it the runtime still boots, and each call the block
+            // makes to it answers `Unimplemented`.
+            "wafer-run/vector".into(),
+            // Embedding for ingest / query-by-text: one of the two is
+            // registered on a given runtime, and the other is never called.
             "impresspress/fastembed".into(),
             "impresspress/transformers-embed".into(),
             // Contextual retrieval (`ingestion::add_context`, reached from
             // `POST /b/vector/api/ingest` with `contextual: true`) makes two
             // calls: `impresspress/llm` for the deployment's default
             // (provider, model) pair, and `wafer-run/llm` for the completion
-            // itself via `wafer_core::clients::llm::chat`. Both were missing,
-            // so every contextual ingest was refused here — above the grant
-            // check, unconditionally, on every target — and the refusal was
-            // swallowed at `default_llm_target`'s `.ok()?` and logged as "no
-            // default LLM model configured", naming the wrong cause. The
-            // ingest then returned raw chunks while reporting success.
-            //
-            // Neither is a hard dependency: `add_context` degrades to the raw
-            // chunks when they are absent, which is why `block-vector` can
-            // ship without an llm backend. `requires` is a call-time
-            // allowlist, not a load-time dependency, so naming them costs a
-            // deployment that has neither exactly nothing.
+            // itself via `wafer_core::clients::llm::chat`. `add_context`
+            // degrades to the raw chunks when they are absent, which is why
+            // `block-vector` can ship without an llm backend.
             "impresspress/llm".into(),
             "wafer-run/llm".into(),
         ])
@@ -266,6 +269,44 @@ mod table_tests {
             assert_eq!(ep.path, row.template);
             assert_eq!(ep.auth, row.auth, "{}", row.template);
         }
+    }
+}
+
+/// `seal()` refuses a block whose `requires` names a block that is not
+/// registered. The vector block runs without the runtime vector service (a
+/// build with no embedding backend) and without an llm backend, so it must
+/// boot beside nothing but the database and config blocks.
+#[cfg(test)]
+mod seal_tests {
+    use std::sync::Arc;
+
+    use super::VectorBlock;
+
+    #[tokio::test]
+    async fn the_block_seals_without_its_soft_dependencies() {
+        let mut wafer = wafer_run::Wafer::builder()
+            .disable_inventory()
+            .disable_lockfile()
+            .build()
+            .expect("build a bare runtime");
+        let db: Arc<dyn wafer_core::interfaces::database::service::DatabaseService> = Arc::new(
+            wafer_block_sqlite::service::SQLiteDatabaseService::open_in_memory()
+                .expect("open in-memory sqlite"),
+        );
+        wafer_core::service_blocks::database::register_with(&mut wafer, db)
+            .expect("register the database block");
+        wafer_core::service_blocks::config::register_with(
+            &mut wafer,
+            Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+        )
+        .expect("register the config block");
+        wafer
+            .register_block("impresspress/vector", Arc::new(VectorBlock::new()))
+            .expect("register the vector block");
+        wafer
+            .seal()
+            .await
+            .expect("vector must seal without wafer-run/vector, an embedding block or llm");
     }
 }
 

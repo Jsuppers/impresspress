@@ -17,6 +17,90 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Config: a read that fails is an error, not the default
+
+**What changes.** Every config read in impresspress now fails closed. A key
+that is not set still reads as its declared default, but a read the config
+block refuses (a missing grant, an undecodable request, a config block that is
+not registered) is answered as the error it is: the page or API call shows the
+403 or 500 instead of rendering with a default. Before, such a failure read as
+the default — an unreadable `ALLOW_SIGNUP` read as "on", an unreadable
+`__IMPRESSPRESS_RUNTIME_KIND__` read as "server", an unreadable Mailgun key as
+"email not configured".
+
+**Who has to act.** Nobody on a working deployment: every impresspress block
+may read the keys it reads. A 403 that names no obvious cause after the upgrade
+is a grant that was missing all along; the log line carries the key.
+
+### Security headers: the CSP override is checked where it is saved
+
+**What changes.** `WAFER_RUN_SHARED__CSP_DIRECTIVES` must be a policy the
+security-headers block takes whole. The admin Variables page, the settings
+forms and `config.set` refuse a value holding a character outside visible
+ASCII (a smart quote or NBSP pasted from a document), a host wildcard or an
+`http://` host in a script directive (`script-src https://*.js.stripe.com`
+included — name `https://js.stripe.com`), a `report-uri` off this site,
+`frame-ancestors`, or a repeated directive. The same check runs when a boot
+seeds the variables table from the process environment: a value that fails it
+is not stored, and the boot logs it at ERROR.
+
+**Who has to act.** Check the stored value and the process environment before
+upgrading: a character outside visible ASCII now fails the security-headers
+block's start, so the runtime does not boot until it is corrected. Wildcards, `http://` script hosts and
+off-site `report-uri` are no longer sent; the start logs each one as
+`CSP config refused`. The shipped default is unaffected.
+
+### Runtime: a missing block answers 501, and `requires` is checked at start
+
+**What changes.** A request dispatched to a block that is not registered
+answers 501 (`Unimplemented`) instead of 404, and so does an `OPTIONS`,
+`TRACE` or `CONNECT` request routed to a block that serves only
+`http-handler@v1` actions (it was a 400). A deployment whose blocks `require` a
+block it does not register now refuses to start, naming both. impresspress's
+own blocks list their soft dependencies separately, so no default build is
+affected; a consumer's own block may need its `requires` corrected.
+
+### LLM providers: a `/` in a provider name is refused
+
+A provider's name is its backend id, and the llm service refuses a backend id
+holding a `/`. Creating or renaming a provider to such a name is refused; a
+stored provider row with one is skipped at load with a warning naming it.
+Rename it to use the provider.
+
+### Native: request bodies stream to the handler
+
+The native listener now streams a request body instead of reading it whole
+first. The 10 MiB cap and the body read timeout still apply; the timeout now
+also counts the time the handler takes between reads. An upload that fails
+part-way (dropped connection, cap, timeout) stores nothing, and the client gets
+413, 408 or 400.
+
+### CORS: no `Access-Control-Allow-Origin` without `Origin`
+
+With `WAFER_RUN_SHARED__CORS_ALLOWED_ORIGINS` set, a request that carries no
+`Origin` no longer gets the configured list back as
+`Access-Control-Allow-Origin`, and every response carries `Vary: Origin`.
+
+### Rate limits: counters are stamped in RFC 3339
+
+**What changes.** The rate-counter rows (`wafer_run__auth__rate_limits`,
+written by the Cloudflare rate limiter) now record
+`created_at` / `updated_at` as RFC 3339 text on SQLite/D1, and the tickets
+retention prune compares them against an RFC 3339 cutoff. On Postgres the
+prune's cutoff was refused by the `TIMESTAMPTZ` binding, so every retention
+pass listed `rate-counters` among its errors; that step now runs.
+
+**Your data.** Nothing to migrate. A row written before the upgrade keeps the
+`YYYY-MM-DD HH:MM:SS` spelling until its key is hit again; the prune sorts
+such a row below any cutoff on its own calendar date, so an idle counter can
+be swept up to a day early (after 48 hours rather than 72). Sweeping only
+resets a counter, and the built-in windows are a minute or an hour.
+
+The comment in `auth/migrations/008_rate_limits.postgres.sql` still says the
+timestamps come from SQL `CURRENT_TIMESTAMP`; they are now bound by the
+executor. It is left as written: any edit to the auth migration SQL re-runs
+the auth migrations and signs every user out.
+
 ### Rate limits: an IPv6 client is one /64
 
 **What changes.** Every IP-keyed rate-limit bucket (login, signup, password

@@ -42,6 +42,19 @@ async fn seed_orders_past_the_ceiling(ctx: &TestContext, total_cents: i64) {
     .expect("seed orders");
 }
 
+/// `table` holds more rows than one capped read returns: `db::list_all`
+/// refuses it with `OutOfRange` instead of answering the first page.
+async fn assert_unpaged_read_refuses(ctx: &TestContext, table: &str) {
+    let refused = db::list_all(ctx, table, vec![])
+        .await
+        .expect_err("a capped read of a table past the ceiling must refuse");
+    assert_eq!(
+        refused.code,
+        wafer_run::ErrorCode::OutOfRange,
+        "{refused:?}"
+    );
+}
+
 /// Gross volume is the sum over EVERY paid order, not over the first page of
 /// them.
 ///
@@ -66,23 +79,9 @@ async fn gross_volume_counts_every_order_past_the_unpaged_ceiling() {
     assert_eq!(analytics[0].paid_order_count, PAST_THE_CEILING as u64);
     assert_eq!(analytics[0].order_count, PAST_THE_CEILING as u64);
 
-    // The read the totals used to be summed over, run here so the assertion
-    // above is not taking the ceiling on trust: it stops one row short, and
-    // adding its rows up in Rust — which is exactly what the old code did —
-    // reaches a different, smaller figure.
-    let unpaged = db::list_all(&ctx, repo::purchases::PURCHASES_TABLE, vec![])
-        .await
-        .expect("unpaged read");
-    assert_eq!(unpaged.len(), db_read::UNPAGED_LIMIT as usize);
-    let scanned: i64 = unpaged
-        .iter()
-        .map(|record| crate::util::RecordExt::i64_field(record, "total_cents"))
-        .sum();
-    assert_eq!(scanned, i64::from(db_read::UNPAGED_LIMIT) * 100);
-    assert_ne!(
-        scanned, analytics[0].gross_volume_minor,
-        "the row scan this replaced is short by the truncated tail"
-    );
+    // The table really is past a single unpaged read: the capped read the
+    // totals were once summed over refuses it rather than stop one row short.
+    assert_unpaged_read_refuses(&ctx, repo::purchases::PURCHASES_TABLE).await;
 }
 
 /// The order count the analytics publishes and the one `count_all` publishes
@@ -130,14 +129,7 @@ async fn top_products_cover_every_paid_order_past_the_ceiling() {
         .await
         .expect("analytics");
 
-    assert_eq!(
-        db::list_all(&ctx, repo::purchases::LINE_ITEMS_TABLE, vec![])
-            .await
-            .expect("unpaged read")
-            .len(),
-        db_read::UNPAGED_LIMIT as usize,
-        "the line-item read this replaced stops one row short"
-    );
+    assert_unpaged_read_refuses(&ctx, repo::purchases::LINE_ITEMS_TABLE).await;
     let top = &analytics[0].top_products;
     assert_eq!(top.len(), 1, "one product");
     assert_eq!(top[0].product_id, "prod_1");
@@ -173,14 +165,7 @@ async fn suspension_reads_every_product_the_seller_owns() {
         .expect("owned products");
 
     assert_eq!(owned.len(), PAST_THE_CEILING as usize);
-    assert_eq!(
-        db::list_all(&ctx, repo::products::TABLE, vec![])
-            .await
-            .expect("unpaged read")
-            .len(),
-        db_read::UNPAGED_LIMIT as usize,
-        "the read this replaced stops one product short"
-    );
+    assert_unpaged_read_refuses(&ctx, repo::products::TABLE).await;
 }
 
 /// A seller listing that is showing a prefix says so, and publishes the real

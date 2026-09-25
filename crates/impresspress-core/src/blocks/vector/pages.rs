@@ -120,7 +120,10 @@ pub(super) async fn create_index(
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body = match parse_create_index_body(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&e),
@@ -323,7 +326,10 @@ pub(super) async fn upsert(ctx: &dyn Context, input: InputStream) -> OutputStrea
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: UpsertRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -427,7 +433,10 @@ pub(super) async fn query(ctx: &dyn Context, input: InputStream) -> OutputStream
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let mut body: QueryRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -643,7 +652,10 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
     if !service::vector_backend_available(ctx) {
         return err_vector_backend_unavailable();
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: IngestRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -820,7 +832,10 @@ pub(super) async fn ingest(ctx: &dyn Context, input: InputStream) -> OutputStrea
 /// (the embedding block returns an empty vector list). A runtime with no
 /// embedding block registered answers 503, not 500.
 pub(super) async fn embed(ctx: &dyn Context, input: InputStream) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: EmbedRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

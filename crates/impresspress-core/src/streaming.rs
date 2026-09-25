@@ -93,20 +93,21 @@ pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 /// plumbing to read it from, and this is a security floor rather than a knob.
 pub const MAX_NETWORK_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
-/// Maximum **request** body the transport buffers before dispatch, in bytes.
-/// A larger body is refused with HTTP 413 and never reaches a block.
+/// Maximum **request** body a transport admits, in bytes. A larger body is
+/// refused with HTTP 413 and never reaches a block whole.
 ///
-/// No transport streams request bodies: every one of the three reads the body
-/// whole before building the `(Message, InputStream)` pair. Both wasm adapters
-/// buffer it here — `impresspress-cloudflare`'s `worker_request_to_message`
-/// and `impresspress-browser`'s `request_to_message`, which is why this is a
-/// single constant rather than a literal in each — and the native listener
-/// buffers it in `wafer-block-http-listener` under its `max_body_bytes`
-/// config, whose default is this same 10 MiB — and
-/// `impresspress_native::serve::register_http_listener` configures that block
-/// with `flow` + `listen` only, so the default is what it runs. An
-/// `InputStream` carrying the request body therefore always holds bytes that
-/// are already in memory, whatever a consumer does with it.
+/// Both wasm adapters read the body whole before building the
+/// `(Message, InputStream)` pair and enforce this constant there —
+/// `impresspress-cloudflare`'s `worker_request_to_message` and
+/// `impresspress-browser`'s `request_to_message`, which is why it is a single
+/// constant rather than a literal in each. The native listener
+/// (`wafer-block-http-listener`) streams the body instead, under its own
+/// `max_body_bytes` config, whose default is this same 10 MiB —
+/// `impresspress_native::serve::register_http_listener` does not set it, so
+/// the default is what it runs. It refuses a declared `Content-Length` over
+/// the cap before dispatch, and fails the `InputStream` of a body that grows
+/// past it (or stalls, or whose connection drops) with an `Err` item, which
+/// every consumer answers as a failure rather than storing the prefix.
 ///
 /// It is the hard ceiling on an upload, so anything a block advertises as a
 /// per-request size limit has to be clamped to it — see
@@ -115,24 +116,22 @@ pub const MAX_NETWORK_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 ///
 /// # What the check does and does not buy
 ///
-/// Only one of the three transports can refuse an oversized body *before* it
-/// is resident, and only conditionally: the Cloudflare adapter checks a
-/// declared `Content-Length` first and returns without reading the stream, so
-/// a well-formed oversized upload never enters the isolate. A chunked request
-/// (no length, or a lying one) is caught by the post-read check, by which time
-/// the bytes are already in the isolate — and the browser adapter reads the
-/// whole `ArrayBuffer` before it can measure it at all, so there the cap only
-/// changes the status, never the peak memory. It is a contract, not a memory
-/// guard.
+/// On the wasm adapters the cap is a contract, not a memory guard: the
+/// Cloudflare adapter checks a declared `Content-Length` first and returns
+/// without reading the stream, so a well-formed oversized upload never enters
+/// the isolate, but a chunked request (no length, or a lying one) is caught by
+/// the post-read check, by which time the bytes are already in the isolate —
+/// and the browser adapter reads the whole `ArrayBuffer` before it can measure
+/// it at all, so there the cap only changes the status, never the peak memory.
 ///
 /// # Why it is not simply larger
 ///
-/// The body is held whole (128 MB on a Cloudflare Worker, one shared linear
-/// memory in the Service Worker), and a multipart upload holds the envelope
-/// and the extracted file at once. A genuinely larger upload needs a streamed
-/// request body, which `wafer_run::InputStream` cannot carry on wasm today —
-/// its `from_stream` requires `Send` and every JS-backed byte stream
-/// (`worker::ByteStream`, `wasm_streams`) is `!Send`.
+/// The wasm adapters hold the body whole (128 MB on a Cloudflare Worker, one
+/// shared linear memory in the Service Worker), and a multipart upload holds
+/// the envelope and the extracted file at once. A genuinely larger upload
+/// needs those adapters to hand the transport's byte stream to
+/// `wafer_run::InputStream::from_stream`, mapping every read error to an `Err`
+/// item, and the files block to store it without collecting it first.
 ///
 /// # Cross-repo coupling
 ///
@@ -183,14 +182,23 @@ pub fn is_streaming_content_type(ct: &str) -> bool {
     lower.starts_with("text/event-stream") || lower.starts_with("application/octet-stream")
 }
 
-/// The canonical `resp.content_type` among the leading meta entries, if any.
-/// Legacy aliases (a literal `Content-Type` meta key) are not honored — the
-/// canonical-keys-only policy is pinned by `wafer_block::http_codec`.
+/// The response content type among the leading meta entries, if any, as
+/// `wafer_block::http_codec` classifies it (`resp.content_type`, or any case
+/// of `resp.header.content-type`).
+///
+/// `None` as well when the leading meta holds an entry no transport can send.
+/// Such a response is answered with `http_codec::unsendable_response` before
+/// any header goes out, whichever path it takes: the buffered one through
+/// `http_codec::collect_http_response`, the streaming one in each adapter's
+/// `build_streaming_response`.
 pub fn leading_content_type(meta: &[MetaEntry]) -> Option<&str> {
-    http_codec::response_meta_parts(meta).find_map(|part| match part {
-        ResponseMetaPart::ContentType(ct) => Some(ct),
-        _ => None,
-    })
+    http_codec::response_meta_parts(meta)
+        .ok()?
+        .into_iter()
+        .find_map(|part| match part {
+            ResponseMetaPart::ContentType(ct) => Some(ct),
+            _ => None,
+        })
 }
 
 /// True when the response carries the explicit [`META_RESP_STREAM`] opt-in
@@ -673,7 +681,9 @@ mod tests {
         // The marker is inert to the HTTP header layer.
         assert!(
             http_codec::response_meta_parts(&m)
-                .all(|p| !matches!(p, ResponseMetaPart::Header { name, .. } if name == "stream")),
+                .expect("the download meta is sendable")
+                .iter()
+                .all(|p| !matches!(p, ResponseMetaPart::Header { name, .. } if *name == "stream")),
             "the streaming marker must never surface as a response header"
         );
     }

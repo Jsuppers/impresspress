@@ -7,8 +7,13 @@
 //!   `Argon2JwtCryptoService`, so tests exercising `crypto::random_bytes` and
 //!   `crypto::hash` see the same wire contract as production.
 //!
-//! Any other block call returns `NotFound` — including `wafer-run/config`,
-//! which makes `config::get_default(..., "sqlite")` fall back to the default.
+//! - `call_block("wafer-run/config", ...)` to a real `ConfigBlock` with no key
+//!   set, so every config read answers the unset `NotFound` and
+//!   `config::get_default(..., "sqlite")` falls back to the default, as it
+//!   does on a deployment that configured nothing.
+//!
+//! Any other block call answers `Unimplemented`, the runtime's answer for a
+//! block that is not registered.
 //!
 //! [`MigrationTestCtx::config_get`] serves exactly one key,
 //! `WAFER_RUN__AUTH__JWT_SECRET`, because the auth service reads it
@@ -27,7 +32,7 @@ pub const TEST_MASTER_SECRET: &str = "test-jwt-secret-padded-to-min-32-bytes-aaa
 
 /// The issuer every fixture-minted token carries: `expected_issuer` reads
 /// `WAFER_RUN_SHARED__FRONTEND_URL` through the config client, which this
-/// fixture does not register, so the declared default is what the verifier
+/// fixture leaves unset, so the declared default is what the verifier
 /// compares against.
 pub const TEST_ISSUER: &str = "http://localhost:5173";
 
@@ -35,6 +40,7 @@ pub const TEST_ISSUER: &str = "http://localhost:5173";
 pub struct MigrationTestCtx {
     db_block: Arc<dyn Block>,
     crypto_block: Arc<dyn Block>,
+    config_block: Arc<dyn Block>,
 }
 
 impl MigrationTestCtx {
@@ -72,9 +78,14 @@ impl MigrationTestCtx {
         let crypto_block: Arc<dyn Block> = Arc::new(
             wafer_core::service_blocks::crypto::CryptoBlock::new(crypto_svc),
         );
+        let config_block: Arc<dyn Block> =
+            Arc::new(wafer_core::service_blocks::config::ConfigBlock::new(
+                Arc::new(wafer_core::service_blocks::config::EnvConfigService::new()),
+            ));
         Self {
             db_block,
             crypto_block,
+            config_block,
         }
     }
 
@@ -143,8 +154,9 @@ impl Context for AsAuthUi {
         match block_name {
             "wafer-run/database" => self.0.db_block.handle(self, msg, input).await,
             "wafer-run/crypto" => self.0.crypto_block.handle(self, msg, input).await,
+            "wafer-run/config" => self.0.config_block.handle(self, msg, input).await,
             _ => OutputStream::error(WaferError::new(
-                wafer_run::ErrorCode::NotFound,
+                wafer_run::ErrorCode::Unimplemented,
                 format!("block '{block_name}' not registered in test ctx"),
             )),
         }
@@ -197,8 +209,9 @@ impl Context for MigrationTestCtx {
                     .handle(&AsAuthUi(self.clone()), msg, input)
                     .await
             }
+            "wafer-run/config" => self.config_block.handle(self, msg, input).await,
             _ => OutputStream::error(WaferError::new(
-                wafer_run::ErrorCode::NotFound,
+                wafer_run::ErrorCode::Unimplemented,
                 format!("block '{block_name}' not registered in test ctx"),
             )),
         }
@@ -210,8 +223,9 @@ impl Context for MigrationTestCtx {
 
     /// Serves the JWT master secret and nothing else. `AuthServiceImpl` reads
     /// it synchronously (the `csrf.rs` pattern) to verify the access token a
-    /// request carries; every other key stays unset so `config::get_default`
-    /// falls back to the declared default.
+    /// request carries. Keys read through the config client come from the
+    /// empty config block instead, so `config::get_default` falls back to
+    /// the declared default.
     fn config_get(&self, key: &str) -> Option<&str> {
         (key == impresspress_core::blocks::auth::JWT_SECRET_KEY).then_some(TEST_MASTER_SECRET)
     }

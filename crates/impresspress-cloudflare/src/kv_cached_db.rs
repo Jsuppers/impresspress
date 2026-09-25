@@ -944,8 +944,7 @@ mod tests {
         }
 
         /// Marker implementation: a caller that reaches the inner adapter's
-        /// own `take_where` gets a row tagged with the collection, whereas the
-        /// trait default would go through `list` + `delete` above.
+        /// own `take_where` gets a row tagged with the collection.
         async fn take_where(
             &self,
             collection: &str,
@@ -1005,6 +1004,15 @@ mod tests {
             _collection: &str,
             _rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
         ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+            unreachable!()
+        }
+
+        async fn update_where(
+            &self,
+            _collection: &str,
+            _filters: &[Filter],
+            _data: HashMap<String, serde_json::Value>,
+        ) -> Result<(), DatabaseError> {
             unreachable!()
         }
 

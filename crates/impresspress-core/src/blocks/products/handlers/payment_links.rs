@@ -49,7 +49,10 @@ async fn authorized_offer<'m>(
 }
 
 async fn body<T: serde::de::DeserializeOwned>(input: InputStream) -> Result<T, OutputStream> {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     serde_json::from_slice(&raw).map_err(|error| err_bad_request(&format!("Invalid body: {error}")))
 }
 

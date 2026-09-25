@@ -36,7 +36,7 @@ pub async fn settings_body(ctx: &dyn Context, msg: &Message) -> Result<Markup, W
     // separately; a third read for the count would have made the page's answer
     // to "how many keys are pinned" depend on which snapshot you asked.
     let rows = variables::list_all(ctx).await?;
-    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await;
+    let offer_reset = variables::deployment_seeds_from_process_env(ctx).await?;
     let upgrade_pins = bulk_release_count(&rows, offer_reset);
 
     Ok(html! {
@@ -857,7 +857,10 @@ pub async fn handle_create_variable(
     msg: &Message,
     input: InputStream,
 ) -> OutputStream {
-    let bytes = input.collect_to_bytes().await;
+    let bytes = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body = parse_form_body(&bytes);
 
     let key = body.get("key").map(|s| s.as_str()).unwrap_or("");
@@ -1048,7 +1051,10 @@ pub async fn handle_update_variable(
     input: InputStream,
 ) -> OutputStream {
     let var_key = msg.var("key");
-    let bytes = input.collect_to_bytes().await;
+    let bytes = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body = parse_form_body(&bytes);
 
     // What `handle_edit_variable_form` rendered for this key: a masked field is

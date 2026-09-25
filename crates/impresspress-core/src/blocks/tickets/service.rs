@@ -142,7 +142,9 @@ pub async fn update_type(
         .unwrap_or_else(|| bool_field(&stored, "public_visible"));
     if currently_public
         && !(remains_active && remains_public)
-        && public_submissions_enabled(ctx).await
+        && public_submissions_enabled(ctx)
+            .await
+            .map_err(ServiceError::Db)?
     {
         let count = repo::count_public_types(ctx)
             .await
@@ -389,7 +391,11 @@ pub async fn update_workflow(
         if effective_status.is_open() || effective_hold {
             None
         } else {
-            Some(expiry_for(ctx, effective_status).await)
+            Some(
+                expiry_for(ctx, effective_status)
+                    .await
+                    .map_err(ServiceError::Db)?,
+            )
         }
     } else {
         nullable_str_field(&current, "expires_at").map(str::to_string)
@@ -602,22 +608,24 @@ async fn propagate_expiry(ctx: &dyn Context, ticket_id: &str, expiry: Option<&st
     }
 }
 
-async fn expiry_for(ctx: &dyn Context, status: TicketStatus) -> String {
+/// When a ticket closed as `status` expires. A failed retention read is
+/// returned: guessing a retention period decides when data is deleted.
+async fn expiry_for(ctx: &dyn Context, status: TicketStatus) -> Result<String, WaferError> {
     let (key, default_days) = match status {
         TicketStatus::Spam => (RETENTION_SPAM, 30),
         TicketStatus::Rejected | TicketStatus::Duplicate => (RETENTION_REJECTED, 180),
         TicketStatus::Resolved => (RETENTION_RESOLVED, 365),
-        _ => return crate::util::now_rfc3339(),
+        _ => return Ok(crate::util::now_rfc3339()),
     };
     let days = config::get_default(ctx, key, &default_days.to_string())
-        .await
+        .await?
         .parse::<i64>()
         .unwrap_or(default_days)
         .clamp(1, 3_650);
-    (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+    Ok((chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339())
 }
 
-async fn public_submissions_enabled(ctx: &dyn Context) -> bool {
+async fn public_submissions_enabled(ctx: &dyn Context) -> Result<bool, WaferError> {
     crate::config_vars::get_bool(ctx, PUBLIC_ENABLED, false).await
 }
 

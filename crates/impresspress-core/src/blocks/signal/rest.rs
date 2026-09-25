@@ -54,7 +54,10 @@ fn max_sdp_bytes(ctx: &dyn Context) -> usize {
 /// — before the store is ever touched, the same discipline `valid_code`
 /// applies to the code itself.
 async fn sdp_body(ctx: &dyn Context, input: InputStream) -> Result<String, OutputStream> {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     let body: Body =
         serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
     if body.sdp.len() > max_sdp_bytes(ctx) {

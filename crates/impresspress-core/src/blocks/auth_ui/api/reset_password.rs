@@ -23,16 +23,19 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         token: String,
         new_password: String,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: Req = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
 
-    if let Err((code, msg)) =
-        super::password_policy::validate_new_password(ctx, &body.new_password).await
-    {
-        return error_response(code, &msg);
+    match super::password_policy::validate_new_password(ctx, &body.new_password).await {
+        Ok(Ok(())) => {}
+        Ok(Err((code, msg))) => return error_response(code, &msg),
+        Err(response) => return response,
     }
 
     // Find user by reset token. The DB column stores `sha256_hex(raw)`;

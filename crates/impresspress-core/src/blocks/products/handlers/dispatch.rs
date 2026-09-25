@@ -22,7 +22,9 @@ use crate::{
 /// (re-exported as `handlers::user_products_enabled`) so the admin Overview
 /// page (`pages::overview`) can render an accurate notice instead of a silent
 /// empty catalog when it's off.
-pub(in crate::blocks::products) async fn user_products_enabled(ctx: &dyn Context) -> bool {
+pub(in crate::blocks::products) async fn user_products_enabled(
+    ctx: &dyn Context,
+) -> Result<bool, wafer_run::WaferError> {
     crate::config_vars::get_bool(ctx, ALLOW_USER_PRODUCTS_KEY, false).await
 }
 

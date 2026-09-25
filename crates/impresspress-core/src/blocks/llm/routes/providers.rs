@@ -137,10 +137,18 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
     let mut configs: Vec<ProviderConfig> = Vec::with_capacity(records.len());
     for rec in &records {
         match row_to_config(rec) {
-            Ok(mut cfg) if cfg.enabled => {
-                resolve_provider_key(ctx, &mut cfg).await;
-                configs.push(cfg);
-            }
+            Ok(mut cfg) if cfg.enabled => match resolve_provider_key(ctx, &mut cfg).await {
+                Ok(()) => configs.push(cfg),
+                // Like a malformed row, one provider whose key cannot be
+                // read must not take the others down with it — and it must
+                // not run without the key it names either, so it is left
+                // out. Create and update refuse to store such a row; one
+                // arrives here only when a grant was withdrawn afterwards.
+                Err(e) => tracing::error!(
+                    "skipping provider row {}: its key_var could not be read: {e}",
+                    rec.id
+                ),
+            },
             Ok(_) => {} // disabled — skip
             Err(e) => {
                 // A malformed row should not poison the whole reload —
@@ -161,25 +169,46 @@ pub(in crate::blocks::llm) async fn reload_provider_service(
 /// config client. `key_var` takes precedence over any inline `api_key`;
 /// with no `key_var` the config is left untouched.
 ///
-/// Resolution failure (unset var, empty value, denied read) is logged and
-/// leaves `api_key` as-is — the provider then runs unauthenticated, and the
-/// per-protocol encoder decides whether that's an error (`MissingApiKey` →
-/// 401) on the next chat call. Local OpenAI-compatible servers legitimately
-/// run without a key.
-async fn resolve_provider_key(ctx: &dyn Context, cfg: &mut ProviderConfig) {
+/// A variable that is unset or empty is logged and leaves `api_key` as-is —
+/// the provider then runs unauthenticated, and the per-protocol encoder
+/// decides whether that's an error (`MissingApiKey` → 401) on the next chat
+/// call. Local OpenAI-compatible servers legitimately run without a key.
+///
+/// A read that fails is returned: a refused read says nothing about whether
+/// a key exists, so the caller must not run the provider without one.
+/// [`reload_provider_service`] leaves that provider out; create and update
+/// refuse the write up front through [`check_key_var_readable`].
+async fn resolve_provider_key(
+    ctx: &dyn Context,
+    cfg: &mut ProviderConfig,
+) -> Result<(), WaferError> {
     let Some(var) = cfg.key_var.as_deref() else {
-        return;
+        return Ok(());
     };
-    match config::get(ctx, var).await {
-        Ok(value) if !value.is_empty() => cfg.api_key = Some(value),
-        Ok(_) => tracing::warn!(
+    match config::get_optional(ctx, var).await? {
+        Some(value) if !value.is_empty() => cfg.api_key = Some(value),
+        Some(_) => tracing::warn!(
             "provider '{}': key_var `{var}` is set but empty — provider will run unauthenticated",
             cfg.name
         ),
-        Err(e) => tracing::warn!(
-            "provider '{}': failed to resolve key_var `{var}`: {e} — provider will run unauthenticated",
+        None => tracing::warn!(
+            "provider '{}': key_var `{var}` is not set — provider will run unauthenticated",
             cfg.name
         ),
+    }
+    Ok(())
+}
+
+/// Refuse to store a provider whose `key_var` this block cannot read.
+///
+/// Checked before the row is written, so an admin who names a variable the
+/// block holds no grant for (another block's `*_SECRET_KEY`, say) is told so
+/// on the save and nothing is stored. The value itself is discarded; the
+/// reload resolves it.
+async fn check_key_var_readable(ctx: &dyn Context, cfg: &ProviderConfig) -> Result<(), WaferError> {
+    match cfg.key_var.as_deref() {
+        Some(var) => config::get_optional(ctx, var).await.map(|_| ()),
+        None => Ok(()),
     }
 }
 
@@ -310,7 +339,10 @@ pub(in crate::blocks::llm) async fn create_provider(
         return refusal;
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: CreateProviderRequest = match parse_create_provider_body(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&e),
@@ -318,8 +350,8 @@ pub(in crate::blocks::llm) async fn create_provider(
 
     // Presence is enforced by the type; emptiness still has to be, because
     // `""` is a valid JSON string and neither a usable name nor a URL.
-    if body.name.is_empty() {
-        return err_bad_request("`name` is required");
+    if let Err(e) = crate::blocks::llm::schema::validate_provider_name(&body.name) {
+        return err_bad_request(&e);
     }
     if body.endpoint.is_empty() {
         return err_bad_request("`endpoint` is required");
@@ -344,6 +376,10 @@ pub(in crate::blocks::llm) async fn create_provider(
     }
     if let Err(e) = check_max_tokens_field(&cfg) {
         return err_bad_request(&e);
+    }
+
+    if let Err(e) = check_key_var_readable(ctx, &cfg).await {
+        return crud::db_error_internal(e, "Failed to read the provider's key_var");
     }
 
     let mut data = config_to_row(&cfg);
@@ -377,11 +413,20 @@ pub(in crate::blocks::llm) async fn update_provider(
         Err(response) => return response,
     };
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: UpdateProviderRequest = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
     };
+    // Refused before any row is read, like the protocol.
+    if let Some(name) = body.name.as_deref().filter(|s| !s.is_empty()) {
+        if let Err(e) = crate::blocks::llm::schema::validate_provider_name(name) {
+            return err_bad_request(&e);
+        }
+    }
 
     // Load existing record so we can apply the patch on top of stored values.
     let existing = match db::get(ctx, PROVIDERS_TABLE, &id).await {
@@ -429,6 +474,10 @@ pub(in crate::blocks::llm) async fn update_provider(
     // pairing as sending both in one body.
     if let Err(e) = check_max_tokens_field(&cfg) {
         return err_bad_request(&e);
+    }
+
+    if let Err(e) = check_key_var_readable(ctx, &cfg).await {
+        return crud::db_error_internal(e, "Failed to read the provider's key_var");
     }
 
     let mut data = config_to_row(&cfg);
@@ -552,10 +601,13 @@ mod tests {
     // which needs the concrete `ProviderLlmService` and so carries the same
     // gate.
     #[cfg(feature = "llm")]
-    use crate::blocks::llm::{providers::config::ProviderProtocol, EXAMPLE_KEY_VAR};
+    use crate::blocks::llm::EXAMPLE_KEY_VAR;
     use crate::{
-        blocks::llm::routes::test_support::{
-            admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
+        blocks::llm::{
+            providers::config::ProviderProtocol,
+            routes::test_support::{
+                admin_msg, routed, stub_block, PanicCtx, RecordingProviderAdmin,
+            },
         },
         test_support::{output_json, TestContext},
     };
@@ -646,6 +698,42 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// A provider's name is its `backend_id` on the llm router, which the llm
+    /// handler refuses on every call when it holds a `/` (the model resource
+    /// `{backend}/{model}` would be ambiguous). So the name is refused where
+    /// the admin can still choose another, on create and on rename, before
+    /// the store is touched (`PanicCtx`).
+    #[tokio::test]
+    async fn a_provider_name_with_a_slash_is_refused() {
+        let block = stub_block();
+        let create = create_provider(
+            &block,
+            &PanicCtx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            InputStream::from_bytes(
+                br#"{"name":"openai/x","protocol":"open_ai","endpoint":"https://x.example"}"#
+                    .to_vec(),
+            ),
+        )
+        .await;
+        let rename = update_provider(
+            &block,
+            &PanicCtx,
+            &routed(admin_msg("update", "/b/llm/api/providers/row-1")),
+            InputStream::from_bytes(br#"{"name":"openai/x"}"#.to_vec()),
+        )
+        .await;
+        for (what, out) in [("create", create), ("rename", rename)] {
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::InvalidArgument, "{what}");
+                    assert!(e.message.contains('/'), "{what}: {}", e.message);
+                }
+                other => panic!("{what}: expected InvalidArgument, got {other:?}"),
+            }
         }
     }
 
@@ -843,6 +931,124 @@ mod tests {
             ],
             "{label}: the wire field set must equal ProviderView's, or the published \
              schema describes something the handler does not emit"
+        );
+    }
+
+    /// A variable the fixture refuses to let the llm block read, as WRAP
+    /// refuses another block's secret.
+    const UNREADABLE_VAR: &str = "IMPRESSPRESS__LLM__TEST_UNREADABLE_KEY";
+
+    fn refused() -> WaferError {
+        WaferError::new(
+            ErrorCode::PermissionDenied,
+            "WRAP: impresspress/llm holds no grant on the key variable",
+        )
+    }
+
+    /// Every provider row stored, as `(name, key_var)`.
+    async fn stored_key_vars(ctx: &TestContext) -> Vec<(String, Option<String>)> {
+        db_read::list_bounded(ctx, PROVIDERS_TABLE, vec![], Bound::Curated("test"))
+            .await
+            .expect("list providers")
+            .iter()
+            .map(|rec| {
+                let cfg = row_to_config(rec).expect("stored row decodes");
+                (cfg.name, cfg.key_var)
+            })
+            .collect()
+    }
+
+    /// A create naming a `key_var` the block cannot read is the classified
+    /// denial, and nothing is stored or configured.
+    #[tokio::test]
+    async fn a_create_with_an_unreadable_key_var_stores_nothing() {
+        let (mut ctx, admin, block) = keyed_fixture().await;
+        ctx.refuse_config_reads_of(UNREADABLE_VAR, refused());
+
+        let out = create_provider(
+            &block,
+            &ctx,
+            &admin_msg("create", "/b/llm/api/providers"),
+            json_input(serde_json::json!({
+                "name": "openai-main",
+                "protocol": "open_ai",
+                "endpoint": "https://api.openai.com/v1",
+                "key_var": UNREADABLE_VAR,
+            })),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_http_json(out).await,
+            serde_json::json!({ "error": "PermissionDenied", "message": "Access denied" }),
+        );
+        assert_eq!(stored_key_vars(&ctx).await, vec![]);
+        assert!(admin.providers_snapshot().is_empty());
+    }
+
+    /// An update pointing a provider at an unreadable `key_var` is refused
+    /// and the stored row keeps the variable it had.
+    #[tokio::test]
+    async fn an_update_to_an_unreadable_key_var_leaves_the_row_alone() {
+        let (mut ctx, _admin, block) = keyed_fixture().await;
+        let created = output_json(
+            create_provider(
+                &block,
+                &ctx,
+                &admin_msg("create", "/b/llm/api/providers"),
+                create_body(),
+            )
+            .await,
+        )
+        .await;
+        let id = created["id"].as_str().expect("created id").to_string();
+        ctx.refuse_config_reads_of(UNREADABLE_VAR, refused());
+
+        let out = update_provider(
+            &block,
+            &ctx,
+            &routed(admin_msg("update", &format!("/b/llm/api/providers/{id}"))),
+            json_input(serde_json::json!({ "key_var": UNREADABLE_VAR })),
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::output_http_json(out).await,
+            serde_json::json!({ "error": "PermissionDenied", "message": "Access denied" }),
+        );
+        assert_eq!(
+            stored_key_vars(&ctx).await,
+            vec![("openai-main".to_string(), Some(KEY_VAR.to_string()))]
+        );
+    }
+
+    /// A stored provider whose key can no longer be read is left out of the
+    /// reload — never run keyless — and the other providers still load.
+    #[tokio::test]
+    async fn a_reload_skips_a_provider_whose_key_cannot_be_read() {
+        let (mut ctx, admin, _block) = keyed_fixture().await;
+        for (name, var) in [("healthy", KEY_VAR), ("poisoned", UNREADABLE_VAR)] {
+            let mut cfg = ProviderConfig::new(
+                name.to_string(),
+                ProviderProtocol::OpenAi,
+                "https://api.openai.com/v1".to_string(),
+            );
+            cfg.key_var = Some(var.to_string());
+            db::create(&ctx, PROVIDERS_TABLE, config_to_row(&cfg))
+                .await
+                .expect("seed provider row");
+        }
+        ctx.refuse_config_reads_of(UNREADABLE_VAR, refused());
+
+        reload_provider_service(&ctx, admin.as_ref())
+            .await
+            .expect("one unreadable key does not fail the reload");
+        let loaded: Vec<(String, Option<String>)> = admin
+            .providers_snapshot()
+            .into_iter()
+            .map(|p| (p.name, p.api_key))
+            .collect();
+        assert_eq!(
+            loaded,
+            vec![("healthy".to_string(), Some(SECRET.to_string()))]
         );
     }
 

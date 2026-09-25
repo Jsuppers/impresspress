@@ -35,15 +35,26 @@ fn csv_values(raw: &str, uppercase: bool) -> HashSet<String> {
         .collect()
 }
 
-async fn configured_values(ctx: &dyn Context, key: &str, uppercase: bool) -> HashSet<String> {
-    csv_values(&config::get_default(ctx, key, "").await, uppercase)
+async fn configured_values(
+    ctx: &dyn Context,
+    key: &str,
+    uppercase: bool,
+) -> Result<HashSet<String>, wafer_run::WaferError> {
+    Ok(csv_values(
+        &config::get_default(ctx, key, "").await?,
+        uppercase,
+    ))
 }
 
-pub(crate) async fn allowed_templates(ctx: &dyn Context) -> HashSet<String> {
+pub(crate) async fn allowed_templates(
+    ctx: &dyn Context,
+) -> Result<HashSet<String>, wafer_run::WaferError> {
     configured_values(ctx, SELLER_ALLOWED_TEMPLATES, false).await
 }
 
-pub(crate) async fn allowed_currencies(ctx: &dyn Context) -> HashSet<String> {
+pub(crate) async fn allowed_currencies(
+    ctx: &dyn Context,
+) -> Result<HashSet<String>, wafer_run::WaferError> {
     configured_values(ctx, SELLER_ALLOWED_CURRENCIES, true).await
 }
 
@@ -55,7 +66,9 @@ pub(crate) async fn validate_product_fields(
         let Some(template) = template.as_str() else {
             return Err(err_bad_request("product_template_id must be a string"));
         };
-        let allowed = allowed_templates(ctx).await;
+        let allowed = allowed_templates(ctx).await.map_err(|e| {
+            crate::blocks::crud::db_error_internal(e, "Could not read the seller policy")
+        })?;
         if !allowed.is_empty() && !allowed.contains(&template.trim().to_ascii_lowercase()) {
             return Err(err_bad_request(
                 "This product template is not allowed for sellers",
@@ -72,7 +85,11 @@ pub(crate) async fn validate_product_fields(
         let Some(category) = category.as_str() else {
             return Err(err_bad_request("category must be a string"));
         };
-        let allowed = configured_values(ctx, SELLER_ALLOWED_CATEGORIES, false).await;
+        let allowed = configured_values(ctx, SELLER_ALLOWED_CATEGORIES, false)
+            .await
+            .map_err(|e| {
+                crate::blocks::crud::db_error_internal(e, "Could not read the seller policy")
+            })?;
         if !allowed.is_empty()
             && !category.trim().is_empty()
             && !allowed.contains(&category.trim().to_ascii_lowercase())
@@ -128,7 +145,9 @@ pub(crate) async fn validate_currency(
     currency: &str,
 ) -> Result<(), OutputStream> {
     let currency = money::normalize_currency(currency).map_err(err_bad_request)?;
-    let allowed = allowed_currencies(ctx).await;
+    let allowed = allowed_currencies(ctx).await.map_err(|e| {
+        crate::blocks::crud::db_error_internal(e, "Could not read the seller policy")
+    })?;
     if !allowed.is_empty() && !allowed.contains(&currency) {
         return Err(err_bad_request("This currency is not allowed for sellers"));
     }
@@ -139,7 +158,11 @@ pub(crate) async fn ensure_product_capacity(
     ctx: &dyn Context,
     user_id: &str,
 ) -> Result<(), OutputStream> {
-    let configured = config::get_default(ctx, SELLER_MAX_PRODUCTS, "0").await;
+    let configured = config::get_default(ctx, SELLER_MAX_PRODUCTS, "0")
+        .await
+        .map_err(|e| {
+            crate::blocks::crud::db_error_internal(e, "Could not read the seller limit")
+        })?;
     let limit = match configured.trim().parse::<i64>() {
         Ok(limit) if limit >= 0 => limit,
         Ok(_) | Err(_) => {

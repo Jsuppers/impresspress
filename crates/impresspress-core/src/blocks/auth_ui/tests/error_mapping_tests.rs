@@ -88,7 +88,10 @@ impl Context for BatchDenied {
         if name != "wafer-run/database" || msg.action() != "database.batch" {
             return self.inner.call_block(name, msg, input).await;
         }
-        let bytes = input.collect_to_bytes().await;
+        let bytes = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return wafer_run::OutputStream::error(e),
+        };
         let request: wafer_block::wire::database::BatchRequest =
             wafer_block::codec::decode(&bytes).expect("a batch request");
         if request.ops.iter().any(|op| op.collection() == self.table) {

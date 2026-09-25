@@ -362,7 +362,10 @@ where
     T: DeserializeOwned,
     F: FnOnce(String) -> OutputStream,
 {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     serde_json::from_slice(&raw).map_err(|e| on_error(e.to_string()))
 }
 

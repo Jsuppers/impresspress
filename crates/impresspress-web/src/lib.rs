@@ -52,15 +52,19 @@ pub mod runtime_factory;
 
 pub use runtime_factory::{RuntimeFactory, RuntimeOptions, SandboxMode};
 
+/// The operator-level `csp` the browser runtime hands `wafer-run/security-headers`,
+/// which merges it directive by directive over its own baseline and refuses
+/// anything that would weaken it (`'unsafe-eval'`, a `frame-ancestors`
+/// directive — that one is the block's `frame_ancestors` key — or a repeated
+/// directive), so nothing here may be one of those.
 const IMPRESSPRESS_CSP: &str = concat!(
     "default-src 'self'; ",
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; ",
+    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; ",
     "style-src 'self' 'unsafe-inline'; ",
     "img-src 'self' data: blob: https:; ",
     "font-src 'self' https:; ",
     "connect-src 'self' https://cdn.jsdelivr.net https://esm.run https://huggingface.co ",
         "https://raw.githubusercontent.com https://*.huggingface.co https://*.hf.co https://*.xethub.hf.co; ",
-    "frame-ancestors 'none'; ",
     "base-uri 'self'; ",
     "form-action 'self'",
 );

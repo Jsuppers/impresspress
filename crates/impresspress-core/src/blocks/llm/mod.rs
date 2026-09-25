@@ -254,13 +254,14 @@ pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
 ///
 /// Zero is rejected rather than forwarded: Anthropic answers `400` for
 /// `max_tokens: 0`, so honouring it would turn a mis-typed variable into a
-/// provider error on every chat instead of a logged fallback.
-pub(super) async fn default_max_tokens(ctx: &dyn Context) -> u32 {
-    let raw = config::get_default(ctx, DEFAULT_MAX_TOKENS_VAR, "").await;
+/// provider error on every chat instead of a logged fallback. A failed read
+/// is returned, not answered with the built-in default.
+pub(super) async fn default_max_tokens(ctx: &dyn Context) -> Result<u32, WaferError> {
+    let raw = config::get_default(ctx, DEFAULT_MAX_TOKENS_VAR, "").await?;
     if raw.is_empty() {
-        return DEFAULT_MAX_TOKENS;
+        return Ok(DEFAULT_MAX_TOKENS);
     }
-    match raw.parse::<u32>() {
+    Ok(match raw.parse::<u32>() {
         Ok(value) if value > 0 => value,
         _ => {
             tracing::warn!(
@@ -271,7 +272,7 @@ pub(super) async fn default_max_tokens(ctx: &dyn Context) -> u32 {
             );
             DEFAULT_MAX_TOKENS
         }
-    }
+    })
 }
 
 // The previous in-process `default_target()` helper has moved to a
@@ -529,8 +530,8 @@ impl LlmBlock {
             .unwrap_or_default();
 
         let default_provider =
-            config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
-        let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
+            config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await?;
+        let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await?;
 
         let final_provider = if provider_block.is_empty() {
             default_provider
@@ -582,26 +583,39 @@ impl LlmBlock {
     /// caller that has to reach a completion needs a budget for it —
     /// Anthropic-protocol providers refuse a request that carries none.
     async fn handle_default_target(&self, ctx: &dyn Context) -> OutputStream {
-        let provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
-        let model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
-        if model.is_empty() || provider.is_empty() {
-            return ok_json(&DefaultTarget::unconfigured());
+        match Self::default_target(ctx).await {
+            Ok(target) => ok_json(&target),
+            Err(e) => crud::db_error_internal(e, "Could not read the default llm target"),
         }
-        ok_json(&DefaultTarget::configured(
+    }
+
+    /// [`Self::handle_default_target`]'s answer; a failed read is returned
+    /// rather than reported as an unconfigured target.
+    async fn default_target(ctx: &dyn Context) -> Result<DefaultTarget, WaferError> {
+        let provider = config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await?;
+        let model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await?;
+        if model.is_empty() || provider.is_empty() {
+            return Ok(DefaultTarget::unconfigured());
+        }
+        Ok(DefaultTarget::configured(
             &provider,
             &model,
-            default_max_tokens(ctx).await,
+            default_max_tokens(ctx).await?,
         ))
     }
 
     async fn handle_get_config(&self, ctx: &dyn Context) -> OutputStream {
-        let default_provider =
-            config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER).await;
-        let default_model = config::get_default(ctx, DEFAULT_MODEL_VAR, "").await;
-        ok_json(&contracts::LlmConfigResponse {
-            default_provider,
-            default_model,
-        })
+        let defaults = async {
+            Ok::<_, WaferError>(contracts::LlmConfigResponse {
+                default_provider: config::get_default(ctx, DEFAULT_PROVIDER_VAR, DEFAULT_PROVIDER)
+                    .await?,
+                default_model: config::get_default(ctx, DEFAULT_MODEL_VAR, "").await?,
+            })
+        };
+        match defaults.await {
+            Ok(response) => ok_json(&response),
+            Err(e) => crud::db_error_internal(e, "Could not read the default llm target"),
+        }
     }
 
     /// `POST /b/llm/api/config`. Three outcomes, two of them successful:
@@ -613,7 +627,10 @@ impl LlmBlock {
     async fn handle_post_config(&self, ctx: &dyn Context, input: InputStream) -> OutputStream {
         use contracts::{ConfigAcknowledgement, ConfigUpdateResponse, ThreadOverrideView};
 
-        let raw = input.collect_to_bytes().await;
+        let raw = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
         let body: contracts::ConfigUpdateRequest = match serde_json::from_slice(&raw) {
             Ok(b) => b,
             Err(e) => return err_bad_request(&format!("Invalid body: {e}")),
@@ -940,18 +957,18 @@ mod config_tests {
     async fn the_max_token_budget_is_read_from_its_variable() {
         let mut ctx = TestContext::with_llm().await;
         assert_eq!(
-            default_max_tokens(&ctx).await,
+            default_max_tokens(&ctx).await.expect("read"),
             DEFAULT_MAX_TOKENS,
             "an unset variable is the built-in default"
         );
 
         ctx.set_config(DEFAULT_MAX_TOKENS_VAR, "1500");
-        assert_eq!(default_max_tokens(&ctx).await, 1500);
+        assert_eq!(default_max_tokens(&ctx).await.expect("read"), 1500);
 
         for bad in ["0", "-1", "lots", "4096.5", " 4096"] {
             ctx.set_config(DEFAULT_MAX_TOKENS_VAR, bad);
             assert_eq!(
-                default_max_tokens(&ctx).await,
+                default_max_tokens(&ctx).await.expect("read"),
                 DEFAULT_MAX_TOKENS,
                 "{bad:?} is not a usable budget and must fall back"
             );

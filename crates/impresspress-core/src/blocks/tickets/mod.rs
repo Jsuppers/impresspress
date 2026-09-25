@@ -323,7 +323,7 @@ crate::impresspress_feature_block! {
     },
     handle: |this, ctx, mut msg, input| {
         if msg.kind == "tickets.maintenance" {
-            return ok_json(&maintenance::prune(ctx).await);
+            return ok_json(&maintenance::prune(ctx, chrono::Utc::now()).await);
         }
         let Some(route) = endpoint_match::dispatch(&mut msg, ROUTES) else {
             return ui::not_found_response(&msg);

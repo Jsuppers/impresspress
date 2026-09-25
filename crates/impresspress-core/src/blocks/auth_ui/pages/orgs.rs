@@ -31,7 +31,12 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         (render_orgs_body(&orgs_list))
     };
 
-    let config = SiteConfig::load(ctx).await;
+    let config = match SiteConfig::load(ctx).await {
+        Ok(site) => site,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "page: site config read failed")
+        }
+    };
     let markup = ui::layout::page(
         "Organizations",
         &config,

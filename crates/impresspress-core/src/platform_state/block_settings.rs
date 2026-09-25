@@ -959,6 +959,23 @@ mod operational_error_tests {
             unreachable!()
         }
 
+        async fn take_where(
+            &self,
+            _collection: &str,
+            _filters: &[Filter],
+        ) -> Result<Vec<Record>, DatabaseError> {
+            unreachable!()
+        }
+
+        async fn update_where(
+            &self,
+            _collection: &str,
+            _filters: &[Filter],
+            _data: HashMap<String, serde_json::Value>,
+        ) -> Result<(), DatabaseError> {
+            unreachable!()
+        }
+
         async fn batch(
             &self,
             _ops: Vec<wafer_core::interfaces::database::service::WriteOp>,

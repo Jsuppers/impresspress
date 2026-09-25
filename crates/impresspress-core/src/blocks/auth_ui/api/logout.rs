@@ -70,7 +70,15 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
             // lifetime is extended past 24h, silently re-enabling a
             // logged-out token.
             let access_lifetime =
-                crate::blocks::auth::helpers::access_token_lifetime_secs(ctx).await;
+                match crate::blocks::auth::helpers::access_token_lifetime_secs(ctx).await {
+                    Ok(secs) => secs,
+                    Err(e) => {
+                        return crud::db_error_internal(
+                            e,
+                            "Logout could not read the access-token lifetime",
+                        )
+                    }
+                };
             let expires_at = exp_str
                 .parse::<i64>()
                 .ok()
@@ -104,7 +112,10 @@ pub async fn handle(ctx: &dyn Context, msg: &Message) -> OutputStream {
         }
     }
 
-    let cookie = build_auth_cookie("", 0, ctx).await;
+    let cookie = match build_auth_cookie("", 0, ctx).await {
+        Ok(cookie) => cookie,
+        Err(e) => return crud::db_error_internal(e, "Logout could not build the cookie"),
+    };
     ResponseBuilder::new()
         .set_cookie(&cookie)
         .status(303)

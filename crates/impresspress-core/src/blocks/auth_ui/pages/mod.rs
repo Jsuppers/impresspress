@@ -26,7 +26,7 @@ use crate::{
 /// branding did not reach the login page until the process restarted, and on
 /// Cloudflare never reached it at all. Delegates to the one async loader now,
 /// so these pages cannot drift from the rest of the site.
-pub(super) async fn site_config(ctx: &dyn Context) -> SiteConfig {
+pub(super) async fn site_config(ctx: &dyn Context) -> Result<SiteConfig, wafer_run::WaferError> {
     SiteConfig::load_for_auth(ctx).await
 }
 
@@ -47,7 +47,13 @@ pub(super) async fn site_config(ctx: &dyn Context) -> SiteConfig {
 /// no D1 row reaches that surface. Same defect as the branding reads, on a
 /// page where the symptom is a missing sign-in button rather than a wrong
 /// colour.
-pub(super) async fn oauth_provider_configured(ctx: &dyn Context, provider: &str) -> bool {
+///
+/// A failed read is returned: a button hidden because the config block
+/// refused the read would look exactly like a provider nobody configured.
+pub(in crate::blocks::auth_ui) async fn oauth_provider_configured(
+    ctx: &dyn Context,
+    provider: &str,
+) -> Result<bool, wafer_run::WaferError> {
     use wafer_core::clients::config;
 
     let up = provider.to_ascii_uppercase();
@@ -56,22 +62,22 @@ pub(super) async fn oauth_provider_configured(ctx: &dyn Context, provider: &str)
         &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{up}_CLIENT_ID"),
         "",
     )
-    .await;
+    .await?;
     if client_id.is_empty() {
-        return false;
+        return Ok(false);
     }
     let client_secret = config::get_default(
         ctx,
         &format!("IMPRESSPRESS__AUTH_UI__OAUTH_{up}_CLIENT_SECRET"),
         "",
     )
-    .await;
+    .await?;
     if client_secret.is_empty() {
-        return false;
+        return Ok(false);
     }
-    !config::get_default(ctx, OAUTH_REDIRECT_URI_KEY, "")
-        .await
-        .is_empty()
+    Ok(!config::get_default(ctx, OAUTH_REDIRECT_URI_KEY, "")
+        .await?
+        .is_empty())
 }
 
 /// Display label for an OAuth provider button.
@@ -343,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn site_config_reads_from_ctx_config_get_with_defaults() {
         let ctx = TestContext::new().await;
-        let cfg = site_config(&ctx).await;
+        let cfg = site_config(&ctx).await.expect("site config");
 
         assert_eq!(cfg.app_name, DEFAULT_APP_NAME);
         assert_eq!(cfg.logo_url, "", "no wordmark image by default");
@@ -358,7 +364,7 @@ mod tests {
         ctx.set_config(AUTH_LOGO_URL_KEY, "https://example.com/auth.png");
         ctx.set_config(LOGO_URL_KEY, "https://example.com/main.png");
 
-        let cfg = site_config(&ctx).await;
+        let cfg = site_config(&ctx).await.expect("site config");
         assert_eq!(cfg.logo_url, "https://example.com/auth.png");
     }
 
@@ -367,7 +373,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.set_config(LOGO_URL_KEY, "https://example.com/main.png");
 
-        let cfg = site_config(&ctx).await;
+        let cfg = site_config(&ctx).await.expect("site config");
         assert_eq!(cfg.logo_url, "https://example.com/main.png");
     }
 
@@ -376,7 +382,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.set_config(APP_NAME_KEY, "MyApp");
 
-        let cfg = site_config(&ctx).await;
+        let cfg = site_config(&ctx).await.expect("site config");
         assert_eq!(cfg.app_name, "MyApp");
     }
 
@@ -388,7 +394,7 @@ mod tests {
             "https://a.example.com/a.js, https://b.example.com/b.js,",
         );
 
-        let cfg = site_config(&ctx).await;
+        let cfg = site_config(&ctx).await.expect("site config");
         assert_eq!(
             cfg.embedded_scripts,
             vec![
@@ -404,13 +410,17 @@ mod tests {
         ctx.set_config(OAUTH_GITHUB_CLIENT_ID_KEY, "id");
         ctx.set_config(OAUTH_GITHUB_CLIENT_SECRET_KEY, "secret");
         assert!(
-            !oauth_provider_configured(&ctx, "github").await,
+            !oauth_provider_configured(&ctx, "github")
+                .await
+                .expect("config read"),
             "should be false without REDIRECT_URI"
         );
 
         ctx.set_config(OAUTH_REDIRECT_URI_KEY, "https://example.com/cb");
         assert!(
-            oauth_provider_configured(&ctx, "github").await,
+            oauth_provider_configured(&ctx, "github")
+                .await
+                .expect("config read"),
             "should be true once all three are set"
         );
     }
@@ -418,8 +428,14 @@ mod tests {
     #[tokio::test]
     async fn oauth_provider_configured_false_when_missing_any_key() {
         let ctx = TestContext::new().await;
-        assert!(!oauth_provider_configured(&ctx, "github").await);
-        assert!(!oauth_provider_configured(&ctx, "google").await);
-        assert!(!oauth_provider_configured(&ctx, "microsoft").await);
+        assert!(!oauth_provider_configured(&ctx, "github")
+            .await
+            .expect("config read"));
+        assert!(!oauth_provider_configured(&ctx, "google")
+            .await
+            .expect("config read"));
+        assert!(!oauth_provider_configured(&ctx, "microsoft")
+            .await
+            .expect("config read"));
     }
 }

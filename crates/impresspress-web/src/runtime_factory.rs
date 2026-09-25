@@ -490,6 +490,11 @@ impl RuntimeFactory {
                 // The `/b/dev` page previews the live site in a same-origin
                 // iframe. An exported site frames nothing.
                 security_headers["frame_ancestors"] = serde_json::json!("self");
+                // The compiler worker spawns blob-URL subordinate workers. The
+                // operator `csp` cannot grant `blob:` in `worker-src` — the
+                // block refuses it there — so the embedder asks the block
+                // itself, which adds exactly that source and nothing else.
+                security_headers["allow_blob_workers"] = serde_json::json!(true);
                 // `/b/dev` is cross-origin isolated (COOP + COEP) for the
                 // compiler's `SharedArrayBuffer`, and a COEP document can only
                 // embed nested documents that carry a compatible COEP themselves
@@ -579,10 +584,10 @@ impl RuntimeFactory {
     fn csp(&self) -> String {
         let mut csp = crate::IMPRESSPRESS_CSP.to_string();
         if self.mode.workspace() {
-            // The compiler worker (a same-origin module worker that spawns
-            // blob-URL subordinate workers) and the live-site preview iframe
-            // on `/b/dev`.
-            csp.push_str("; worker-src 'self' blob:; frame-src 'self'");
+            // The compiler worker (a same-origin module worker; its blob-URL
+            // subordinate workers come from `allow_blob_workers`) and the
+            // live-site preview iframe on `/b/dev`.
+            csp.push_str("; worker-src 'self'; frame-src 'self'");
         }
         csp
     }

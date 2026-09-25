@@ -356,8 +356,9 @@ pub(super) fn register_vector_block(
         Err(e) => {
             // Model download can fail offline or on first-run with restricted
             // egress. Log and skip registration so the rest of the runtime
-            // boots; `impresspress/vector` registration will fail dep resolution
-            // with a clearer error than a half-wired block would.
+            // boots: `impresspress/vector` lists `wafer-run/vector` under
+            // `optional_requires`, so seal admits it and each of its calls to
+            // the absent block answers `Unimplemented`.
             tracing::warn!(
                 error = ?e,
                 "fastembed model unavailable — skipping wafer-run/vector registration"
@@ -379,7 +380,7 @@ mod tests {
         Block, BlockInfo,
     };
     use wafer_core::interfaces::database::service::DatabaseService;
-    use wafer_run::{StaticConfigSource, Wafer};
+    use wafer_run::Wafer;
 
     use super::*;
 
@@ -473,9 +474,15 @@ mod tests {
             .unwrap();
     }
 
+    /// A runtime holding only what a test registers. The statically linked
+    /// blocks stay out: `wafer-run/web` requires a storage block these probes
+    /// never register, and seal refuses a block whose `requires` is unmet.
     fn empty_wafer() -> Wafer {
-        let config: Arc<dyn wafer_run::ConfigSource> = Arc::new(StaticConfigSource::default());
-        Wafer::new(config).unwrap()
+        Wafer::builder()
+            .disable_inventory()
+            .disable_lockfile()
+            .build()
+            .expect("build a bare runtime")
     }
 
     /// Three probes plus the admin id, one of which optionally fails.

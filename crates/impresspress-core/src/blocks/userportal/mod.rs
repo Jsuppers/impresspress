@@ -214,31 +214,39 @@ impl UserPortalBlock {
         // a tab that renders and then 404s. See `routing::gate_from_request`.
         let settings = crate::routing::gate_from_request(ctx, msg);
 
-        let is_enabled = |name: &str| -> bool {
-            use crate::features::FeatureConfig;
-            settings.is_block_enabled(name)
-        };
-
-        let config_val = serde_json::json!({
-            "logo_url": config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await,
-            "app_name": config::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await,
-            // Blank = "use the built-in brand accent" (same contract as the
-            // admin chrome; see layout::page). The old `#6366f1` fallback here
-            // was the pre-rebrand indigo leaking into portal clients.
-            "primary_color": config::get_default(ctx, PRIMARY_COLOR_KEY, "").await,
-            "enable_oauth": config::get_default(ctx, ENABLE_OAUTH_KEY, "false").await,
-            "allow_signup": config::get_default(ctx, ALLOW_SIGNUP_KEY, "true").await,
-            "show_powered_by": true,
-            "features": {
-                "files": is_enabled("impresspress/files"),
-                "products": is_enabled("impresspress/products"),
-                "user_products": config::get_default(ctx, ALLOW_USER_PRODUCTS_KEY, "false").await,
-                "legal_pages": is_enabled("impresspress/legalpages"),
-                "userportal": is_enabled("impresspress/userportal"),
-            }
-        });
-        ok_json(&config_val)
+        match portal_config(ctx, &settings).await {
+            Ok(config_val) => ok_json(&config_val),
+            Err(e) => crud::db_error_internal(e, "Failed to read the portal config"),
+        }
     }
+}
+
+/// The public portal config: branding, the signup and OAuth switches, and
+/// which feature tabs the router serves. A setting that cannot be read fails
+/// the whole answer rather than showing a default in its place.
+async fn portal_config(
+    ctx: &dyn Context,
+    settings: &crate::features::BlockSettings,
+) -> Result<serde_json::Value, wafer_run::WaferError> {
+    use crate::features::FeatureConfig;
+    let is_enabled = |name: &str| settings.is_block_enabled(name);
+    Ok(serde_json::json!({
+        "logo_url": config::get_default(ctx, crate::config_vars::LOGO_URL_KEY, "").await?,
+        "app_name": config::get_default(ctx, APP_NAME_KEY, DEFAULT_APP_NAME).await?,
+        // Blank = "use the built-in brand accent" (same contract as the
+        // admin chrome; see layout::page).
+        "primary_color": config::get_default(ctx, PRIMARY_COLOR_KEY, "").await?,
+        "enable_oauth": config::get_default(ctx, ENABLE_OAUTH_KEY, "false").await?,
+        "allow_signup": config::get_default(ctx, ALLOW_SIGNUP_KEY, "true").await?,
+        "show_powered_by": true,
+        "features": {
+            "files": is_enabled("impresspress/files"),
+            "products": is_enabled("impresspress/products"),
+            "user_products": config::get_default(ctx, ALLOW_USER_PRODUCTS_KEY, "false").await?,
+            "legal_pages": is_enabled("impresspress/legalpages"),
+            "userportal": is_enabled("impresspress/userportal"),
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +289,10 @@ async fn handle_update_profile(
         return err_forbidden("Not authenticated");
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body = parse_form_body(&raw);
 
     // CSRF defense-in-depth: this is a plain (no-JS) `<form>` POST (see

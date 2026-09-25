@@ -104,6 +104,24 @@ pub fn models_row(models: &[String]) -> HashMap<String, serde_json::Value> {
     row
 }
 
+/// Why a provider `name` cannot be used, or `Ok`.
+///
+/// The name is the provider's `backend_id` on the `wafer-run/llm` router, and
+/// every model it serves is authorized as the resource
+/// `{prefix}{backend_id}/{model_id}`. A `/` inside the name would make that
+/// resource ambiguous — a grant on `a/*` would reach a provider named `a/b` —
+/// so the llm handler refuses such a `backend_id` on every call. Refused here
+/// too, where the admin can still pick another name.
+pub fn validate_provider_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("`name` is required".to_string());
+    }
+    if name.contains('/') {
+        return Err(format!("`name` must not contain `/`: {name}"));
+    }
+    Ok(())
+}
+
 /// Decode a database [`Record`] into a [`ProviderConfig`].
 ///
 /// The returned `api_key` is always `None` — the reload path
@@ -116,6 +134,7 @@ pub fn row_to_config(record: &Record) -> Result<ProviderConfig, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing `name`".to_string())?
         .to_string();
+    validate_provider_name(&name)?;
 
     let protocol_str = record
         .data
@@ -371,6 +390,28 @@ mod tests {
         };
         let err = row_to_config(&record).expect_err("must reject an unknown token");
         assert!(err.contains("invalid `max_tokens_field`"), "got: {err}");
+    }
+
+    /// A stored row whose name holds a `/` is refused on load: the reload
+    /// skips it with a warning rather than configure a backend every call to
+    /// which would be refused.
+    #[test]
+    fn row_to_config_rejects_a_name_with_a_slash() {
+        let record = Record {
+            id: "p-1".into(),
+            data: [
+                ("name".to_string(), serde_json::json!("openai/x")),
+                ("protocol".to_string(), serde_json::json!("open_ai")),
+                (
+                    "endpoint".to_string(),
+                    serde_json::json!("https://x.example"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let err = row_to_config(&record).expect_err("a slash in the name must be refused");
+        assert!(err.contains('/'), "{err}");
     }
 
     #[test]

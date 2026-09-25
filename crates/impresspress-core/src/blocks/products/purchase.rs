@@ -439,7 +439,10 @@ async fn refund_purchase(
     input: InputStream,
     id: String,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     // An absent body is a legitimate "no reason given" (every caller today
     // sends `{}` for that, but a genuinely empty body is treated the same
     // way defensively). A NON-empty body that fails to parse is malformed

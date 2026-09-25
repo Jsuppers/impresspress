@@ -23,7 +23,10 @@ use super::{
 };
 use crate::{
     blocks::auth::repo::{local_credentials, provider_links, sessions, tokens, users},
-    test_support::{admin_msg, auth_msg, output_http_status, FailingDbOpContext, TestContext},
+    test_support::{
+        admin_msg, anon_msg, auth_msg, output_http_json, output_http_status, output_json,
+        FailingDbOpContext, TestContext,
+    },
 };
 
 const USER: &str = "user-a";
@@ -392,4 +395,52 @@ async fn button_list_reread_denial_is_the_classified_notice() {
         "{html}"
     );
     assert!(!html.contains("holds no grant"), "{html}");
+}
+
+// --- the public config -----------------------------------------------------
+
+/// `GET /b/userportal/config` is public, so its body is exactly the portal's
+/// settings: every value a plain string or bool, never a serialised `Result`
+/// (`{"Ok": …}`) around one.
+#[tokio::test]
+async fn the_public_config_is_the_settings_themselves() {
+    let mut ctx = fixture().await;
+    ctx.set_config(crate::config_vars::APP_NAME_KEY, "Acme");
+    ctx.set_config(crate::config_vars::ALLOW_SIGNUP_KEY, "false");
+    let out = fragment(&ctx, anon_msg("retrieve", "/b/userportal/config"), "").await;
+    assert_eq!(
+        output_json(out).await,
+        serde_json::json!({
+            "logo_url": "",
+            "app_name": "Acme",
+            "primary_color": "",
+            "enable_oauth": "false",
+            "allow_signup": "false",
+            "show_powered_by": true,
+            "features": {
+                "files": true,
+                "products": true,
+                "user_products": "false",
+                "legal_pages": true,
+                "userportal": true,
+            }
+        }),
+    );
+}
+
+/// A refused config read answers the classified 403 on this public route —
+/// neither a default in the refused value's place nor the refusal's own
+/// text, which names grants and blocks.
+#[tokio::test]
+async fn a_refused_config_read_is_the_classified_denial() {
+    let mut ctx = fixture().await;
+    ctx.refuse_config_reads(WaferError::new(
+        ErrorCode::PermissionDenied,
+        "WRAP: impresspress/userportal holds no grant on wafer-run/config",
+    ));
+    let out = fragment(&ctx, anon_msg("retrieve", "/b/userportal/config"), "").await;
+    assert_eq!(
+        output_http_json(out).await,
+        serde_json::json!({ "error": "PermissionDenied", "message": "Access denied" }),
+    );
 }

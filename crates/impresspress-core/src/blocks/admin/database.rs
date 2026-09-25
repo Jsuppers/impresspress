@@ -44,7 +44,7 @@ pub(in crate::blocks::admin) enum IntrospectError {
 /// backend's own table listing, or from a column read that found the table),
 /// so a build error here is a fault, not user input.
 async fn table_row_count(ctx: &dyn Context, name: &str) -> Result<i64, WaferError> {
-    let count_sql = introspect::build_table_row_count(name, crate::db_backend(ctx).await)
+    let count_sql = introspect::build_table_row_count(name, crate::db_backend(ctx).await?)
         .map_err(|e| WaferError::new(ErrorCode::Internal, format!("count {name}: {e}")))?;
     let rows = db::query_raw(ctx, &count_sql, &[]).await?;
     rows.first()
@@ -70,7 +70,7 @@ async fn table_row_count(ctx: &dyn Context, name: &str) -> Result<i64, WaferErro
 pub(in crate::blocks::admin) async fn introspect_table_summaries(
     ctx: &dyn Context,
 ) -> Result<Vec<TableSummary>, WaferError> {
-    let sql = introspect::build_list_tables(crate::db_backend(ctx).await);
+    let sql = introspect::build_list_tables(crate::db_backend(ctx).await?);
     let records = db::query_raw(ctx, &sql, &[]).await?;
     let mut out = Vec::with_capacity(records.len());
     for r in &records {
@@ -96,8 +96,11 @@ pub(in crate::blocks::admin) async fn introspect_columns(
     ctx: &dyn Context,
     table: &str,
 ) -> Result<(Vec<ColumnInfo>, i64), IntrospectError> {
-    let (info_sql, info_args) = introspect::build_table_info(table, crate::db_backend(ctx).await)
-        .map_err(|_| IntrospectError::InvalidName)?;
+    let backend = crate::db_backend(ctx)
+        .await
+        .map_err(IntrospectError::Read)?;
+    let (info_sql, info_args) =
+        introspect::build_table_info(table, backend).map_err(|_| IntrospectError::InvalidName)?;
     let columns = db::query_raw(ctx, &info_sql, &info_args)
         .await
         .map_err(IntrospectError::Read)?;
@@ -138,7 +141,10 @@ pub(in crate::blocks::admin) async fn introspect_columns(
 
 /// `GET /b/admin/api/database/info`.
 pub(super) async fn handle_info(ctx: &dyn Context) -> OutputStream {
-    let backend = crate::db_backend(ctx).await;
+    let backend = match crate::db_backend(ctx).await {
+        Ok(backend) => backend,
+        Err(e) => return crud::db_error_internal(e, "Could not read the database backend"),
+    };
     let sql = introspect::build_list_tables(backend);
     let tables = match db::query_raw(ctx, &sql, &[]).await {
         Ok(t) => t,
@@ -390,7 +396,10 @@ pub(super) async fn handle_query(ctx: &dyn Context, input: InputStream) -> Outpu
         #[serde(default)]
         args: Vec<serde_json::Value>,
     }
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let body: QueryReq = match serde_json::from_slice(&raw) {
         Ok(b) => b,
         Err(e) => return err_bad_request(&format!("Invalid body: {e}")),

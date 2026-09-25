@@ -474,13 +474,13 @@ pub(crate) async fn replay_webhook_event(
     ctx: &dyn Context,
     event_id: &str,
 ) -> Result<OutputStream, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe webhook replay is disabled in the browser runtime",
         ));
     }
-    let secret = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await;
+    let secret = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await?;
     if secret.is_empty() {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
@@ -582,26 +582,35 @@ pub(crate) async fn replay_webhook_event(
 }
 
 pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    if !stripe_secret_operations_allowed(ctx).await {
+    let settings = async {
+        Ok::<_, WaferError>((
+            stripe_secret_operations_allowed(ctx),
+            config::get_optional(ctx, STRIPE_SECRET_KEY).await?,
+            config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_STRIPE_API_VERSION).await?,
+        ))
+    };
+    let (secret_operations_allowed, stripe_key, stripe_api_version) = match settings.await {
+        Ok(settings) => settings,
+        Err(e) => return crud::db_error_internal(e, "Could not read the Stripe settings"),
+    };
+    if !secret_operations_allowed {
         return err_forbidden(
             "Stripe secret-key checkout is disabled in the browser runtime; use a trusted remote commerce API or a pre-created Payment Link",
         );
     }
-    let Ok(stripe_key) = config::get(ctx, STRIPE_SECRET_KEY).await else {
-        return err_unavailable("Stripe is not configured");
-    };
-    if stripe_key.trim().is_empty() {
+    if stripe_key.is_none_or(|key| key.trim().is_empty()) {
         return err_unavailable("Stripe is not configured");
     }
-    let stripe_api_version =
-        config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_STRIPE_API_VERSION).await;
     if !is_stable_stripe_api_version(&stripe_api_version) {
         return err_internal_no_cause(
             "Stripe API version must be a stable YYYY-MM-DD.release value",
         );
     }
 
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let request: CheckoutRequest = match serde_json::from_slice(&raw) {
         Ok(request) => request,
         Err(error) => return err_bad_request(&format!("Invalid body: {error}")),
@@ -623,7 +632,9 @@ pub async fn handle_checkout(ctx: &dyn Context, msg: &Message, input: InputStrea
 /// (`pages::product_wizard`), which used to compare the raw value against
 /// `"true"` — so `=1` turned tax on at checkout while the wizard drew the
 /// toggle off.
-pub(in crate::blocks::products) async fn automatic_tax_enabled(ctx: &dyn Context) -> bool {
+pub(in crate::blocks::products) async fn automatic_tax_enabled(
+    ctx: &dyn Context,
+) -> Result<bool, WaferError> {
     crate::config_vars::get_bool(ctx, AUTOMATIC_TAX, false).await
 }
 
@@ -1100,8 +1111,10 @@ async fn handle_offer_checkout(
 
     let owner_is_user = product.str_field("owner_kind") == "user";
     let (seller_account_id, stripe_account_id, fee_basis_points) = if owner_is_user {
-        if !super::handlers::user_products_enabled(ctx).await {
-            return err_not_found("Offer not found");
+        match super::handlers::user_products_enabled(ctx).await {
+            Ok(true) => {}
+            Ok(false) => return err_not_found("Offer not found"),
+            Err(e) => return crud::db_error_internal(e, "Could not read the seller switch"),
         }
         let owner_id = product.str_field("owner_id");
         let seller = match repo::seller_accounts::ready_for_user(ctx, owner_id).await {
@@ -1183,7 +1196,16 @@ async fn handle_offer_checkout(
         }
     }
 
-    let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
+    let origins = async {
+        Ok::<_, WaferError>((
+            config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await?,
+            config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await?,
+        ))
+    };
+    let (base_url, allowed_origins) = match origins.await {
+        Ok(origins) => origins,
+        Err(e) => return crud::db_error_internal(e, "Could not read the checkout origins"),
+    };
     let success_url = request.success_url.clone().unwrap_or_else(|| {
         format!("{base_url}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}")
     });
@@ -1191,7 +1213,6 @@ async fn handle_offer_checkout(
         .cancel_url
         .clone()
         .unwrap_or_else(|| format!("{base_url}/checkout/cancel"));
-    let allowed_origins = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await;
     if !is_allowed_checkout_url(&success_url, &base_url, &allowed_origins)
         || !is_allowed_checkout_url(&cancel_url, &base_url, &allowed_origins)
     {
@@ -1278,7 +1299,14 @@ async fn handle_offer_checkout(
         return err_internal_no_cause("Checkout order could not be claimed");
     }
 
-    let automatic_tax = offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await;
+    let automatic_tax = offer.checkout.automatic_tax
+        || match automatic_tax_enabled(ctx).await {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                record_checkout_failure(ctx, &order.id, &error.message).await;
+                return crud::db_error_internal(error, "Could not read the automatic tax setting");
+            }
+        };
     let country = match platform_country(ctx).await {
         Ok(country) => country,
         Err(error) => {
@@ -1389,7 +1417,7 @@ async fn payment_link_seller_context(
     if product.str_field("owner_kind") != "user" {
         return Ok((String::new(), String::new(), 0));
     }
-    if !super::handlers::user_products_enabled(ctx).await {
+    if !super::handlers::user_products_enabled(ctx).await? {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "user product selling is disabled",
@@ -1822,7 +1850,7 @@ pub(crate) async fn sync_offer_catalog(
     product_id: &str,
     offer_id: &str,
 ) -> Result<ManagedOffer, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe catalog synchronization is disabled in the browser runtime",
@@ -1905,7 +1933,7 @@ pub(crate) async fn archive_offer_catalog(
     if synced_components.is_empty() {
         return repo::offers::archive(ctx, product_id, offer_id).await;
     }
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe catalog archival is disabled in the browser runtime",
@@ -2144,7 +2172,7 @@ pub(crate) async fn create_payment_link(
     offer_id: &str,
     request: &PaymentLinkCreateRequest,
 ) -> Result<ManagedPaymentLink, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe Payment Link creation is disabled in the browser runtime",
@@ -2188,8 +2216,8 @@ pub(crate) async fn create_payment_link(
         .map_err(|error| WaferError::new(wafer_run::ErrorCode::InvalidArgument, error))?;
     let after_completion_url = request.after_completion_url.as_deref();
     if let Some(url) = after_completion_url {
-        let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await;
-        let allowed = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await;
+        let base_url = config::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await?;
+        let allowed = config::get_default(ctx, CHECKOUT_ALLOWED_ORIGINS, "").await?;
         if !is_allowed_checkout_url(url, &base_url, &allowed) {
             return Err(WaferError::new(
                 wafer_run::ErrorCode::InvalidArgument,
@@ -2236,7 +2264,7 @@ pub(crate) async fn create_payment_link(
         product.str_field("name"),
         &preset_id,
         after_completion_url,
-        offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await,
+        offer.checkout.automatic_tax || automatic_tax_enabled(ctx).await?,
         country.as_ref(),
         fee_minor,
         fee_basis_points,
@@ -2426,7 +2454,7 @@ async fn retire_payment_link_for_archival(
     let Err(error) = deactivate_payment_link(ctx, offer_id, link_id).await else {
         return Ok(());
     };
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         // Queuing buys nothing in a runtime that cannot reach Stripe at all,
         // and the refusal is the honest answer to "archive this".
         return Err(error);
@@ -2459,7 +2487,7 @@ pub(crate) async fn deactivate_payment_link(
         // locally.
         return repo::payment_links::deactivate_local(ctx, offer_id, link_id).await;
     }
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe Payment Link deactivation is disabled in the browser runtime",
@@ -2612,7 +2640,7 @@ pub(crate) async fn take_down_payment_link(
     ctx: &dyn Context,
     link_id: &str,
 ) -> Result<PaymentLinkTakedown, WaferError> {
-    if !stripe_secret_operations_allowed(ctx).await {
+    if !stripe_secret_operations_allowed(ctx) {
         return Err(WaferError::new(
             wafer_run::ErrorCode::FailedPrecondition,
             "Stripe Payment Link deactivation is disabled in the browser runtime",
@@ -3249,11 +3277,20 @@ fn bounded_provider_diagnostic(value: Option<&serde_json::Value>, limit: usize) 
 }
 
 pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
-    if !stripe_secret_operations_allowed(ctx).await {
+    let settings = async {
+        Ok::<_, WaferError>((
+            stripe_secret_operations_allowed(ctx),
+            config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await?,
+        ))
+    };
+    let (secret_operations_allowed, webhook_secret) = match settings.await {
+        Ok(settings) => settings,
+        Err(e) => return crud::db_error_internal(e, "Could not read the Stripe webhook settings"),
+    };
+    if !secret_operations_allowed {
         return err_forbidden("Stripe webhooks are disabled in the browser runtime");
     }
     // Verify Stripe webhook signature - REQUIRED
-    let webhook_secret = config::get_default(ctx, STRIPE_WEBHOOK_SECRET, "").await;
     if webhook_secret.is_empty() {
         return err_unavailable(
             "STRIPE_WEBHOOK_SECRET not configured — webhook processing disabled for security",
@@ -3263,7 +3300,10 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
     if sig_header.is_empty() {
         return err_unauthorized("Missing Stripe-Signature header");
     }
-    let raw_body = input.collect_to_bytes().await;
+    let raw_body = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     if !verify_stripe_signature(&raw_body, &sig_header, &webhook_secret) {
         return err_unauthorized("Invalid webhook signature");
     }
@@ -4504,9 +4544,22 @@ pub async fn handle_webhook(ctx: &dyn Context, msg: &Message, input: InputStream
 /// Fire a webhook for product/billing events.
 /// Best-effort — if PRODUCTS_WEBHOOK_URL is not configured, this is a no-op.
 /// The webhook is signed with HMAC-SHA256 using PRODUCTS_WEBHOOK_SECRET.
+/// A settings read that fails is logged and nothing is sent, like every other
+/// failure here: the event it reports has already been processed.
 async fn fire_products_webhook(ctx: &dyn Context, event: &str, data: &serde_json::Value) {
-    let url = config::get_default(ctx, WEBHOOK_URL, "").await;
-    let secret = config::get_default(ctx, WEBHOOK_SECRET, "").await;
+    let settings = async {
+        Ok::<_, WaferError>((
+            config::get_default(ctx, WEBHOOK_URL, "").await?,
+            config::get_default(ctx, WEBHOOK_SECRET, "").await?,
+        ))
+    };
+    let (url, secret) = match settings.await {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!(event = %event, error = %e, "products webhook not sent: settings read failed");
+            return;
+        }
+    };
     if url.is_empty() {
         return;
     }

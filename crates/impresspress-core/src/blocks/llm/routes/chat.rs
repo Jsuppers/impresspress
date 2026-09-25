@@ -135,7 +135,10 @@ async fn dispatch_chat(
     msg: &Message,
     input: InputStream,
 ) -> Result<DispatchOutcome, OutputStream> {
-    let raw = input.collect_to_bytes().await;
+    let raw = input
+        .collect_to_bytes()
+        .await
+        .map_err(OutputStream::error)?;
     let contracts::ChatRequest {
         thread_id,
         message,
@@ -212,7 +215,9 @@ async fn dispatch_chat(
     //    replies, which are unbounded when the field is absent.
     let max_tokens = match max_tokens {
         Some(requested) => requested,
-        None => default_max_tokens(ctx).await,
+        None => default_max_tokens(ctx).await.map_err(|e| {
+            crate::blocks::crud::db_error_internal(e, "Could not read the max-token budget")
+        })?,
     };
     let chat_req = ChatRequest {
         backend_id,

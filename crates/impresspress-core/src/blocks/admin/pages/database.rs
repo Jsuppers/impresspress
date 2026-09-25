@@ -416,7 +416,12 @@ fn render_sql_error(msg: &str) -> Markup {
 }
 
 pub async fn database_page(ctx: &dyn Context, msg: &Message) -> OutputStream {
-    let backend = crate::db_backend(ctx).await;
+    let backend = match crate::db_backend(ctx).await {
+        Ok(backend) => backend,
+        Err(e) => {
+            return crate::blocks::crud::db_error_page(msg, e, "database page: backend read failed")
+        }
+    };
     let selected = msg.query("table");
     let selected = (!selected.is_empty()).then_some(selected);
     let tab = Tab::from_query(msg.query("tab"));
@@ -470,7 +475,10 @@ pub async fn handle_database_query(
     _msg: &Message,
     input: wafer_run::InputStream,
 ) -> OutputStream {
-    let raw = input.collect_to_bytes().await;
+    let raw = match input.collect_to_bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => return OutputStream::error(e),
+    };
     let form = parse_form_body(&raw);
     let query = form.get("query").cloned().unwrap_or_default();
 

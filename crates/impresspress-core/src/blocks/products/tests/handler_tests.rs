@@ -1643,7 +1643,7 @@ async fn admin_patch_refuses_a_product_soft_deleted_inside_the_request() {
         super::super::repo::products::soft_delete(deleting.as_ref(), "racer")
             .await
             .expect("the concurrent delete lands");
-        serde_json::to_vec(&serde_json::json!({"name": "after"})).unwrap()
+        Ok(serde_json::to_vec(&serde_json::json!({"name": "after"})).unwrap())
     }));
     let (msg, _) = update_msg(
         "/b/products/api/admin/products/racer",
@@ -1787,7 +1787,10 @@ impl wafer_run::context::Context for RaceTheRestoreWrite {
         if name != "wafer-run/database" || msg.action() != "database.update_where_count" {
             return self.inner.call_block(name, msg, input).await;
         }
-        let bytes = input.collect_to_bytes().await;
+        let bytes = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return wafer_run::OutputStream::error(e),
+        };
         let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
             .map(|peek| peek.collection)
             .unwrap_or_default();
@@ -5079,7 +5082,10 @@ impl wafer_run::context::Context for DeleteBetweenProductReads {
         if name != "wafer-run/database" || msg.action() != "database.get" {
             return self.inner.call_block(name, msg, input).await;
         }
-        let bytes = input.collect_to_bytes().await;
+        let bytes = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return wafer_run::OutputStream::error(e),
+        };
         let collection = wafer_block::codec::decode::<CollectionPeek>(&bytes)
             .map(|peek| peek.collection)
             .unwrap_or_default();

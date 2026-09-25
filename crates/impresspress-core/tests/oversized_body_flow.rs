@@ -90,8 +90,14 @@ fn flow_json(terminal_block: &str) -> String {
 }
 
 async fn run_flow(terminal_block: &str, terminal: Arc<dyn Block>) -> http_codec::HttpResponseParts {
-    let mut wafer =
-        Wafer::new(Arc::new(StaticConfigSource::default())).expect("build a bare runtime");
+    // Only the two steps under test: the statically linked blocks stay out,
+    // since `wafer-run/web` requires a storage block this flow never needs
+    // and seal refuses an unmet `requires`.
+    let mut wafer = Wafer::builder()
+        .disable_inventory()
+        .disable_lockfile()
+        .build()
+        .expect("build a bare runtime");
     wafer
         .register_block("test/headers", Arc::new(HeaderMiddleware))
         .expect("register the middleware step");

@@ -390,8 +390,9 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 /// - **Crypto**: the cause is the `wafer-run/crypto` service hashing a
 ///   password or drawing random bytes, which reads no table.
 /// - **Invariant**: the cause is this process, not a service — a row outside
-///   its contract, a setting outside its range (`config::get_default` answers
-///   the default, never a database error), a serialization or the OS RNG.
+///   its contract, a setting read successfully but outside its range (a
+///   failed config read goes through the door like a database one), a
+///   serialization or the OS RNG.
 /// - **Classified**: the cause already went through
 ///   `crud::classify_db_error` and came back `Internal` — its WRAP denials and
 ///   quotas were answered before this call. `dev::seal_no_store` is the one:
@@ -1672,7 +1673,7 @@ const CAUSE_DROPPED: &[(&str, usize, &str)] = &[
          field, a concurrent or already-scheduled webhook delivery, a checkout \
          claim or subscription lookup that succeeded and matched nothing, a \
          resolved checkout component its offer no longer has, and a setting \
-         outside its range (`config::get_default` never errors) — \
+         outside its range (read successfully; a failed read goes through the door) — \
          none carries a cause",
     ),
     (

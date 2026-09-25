@@ -27,27 +27,27 @@ pub(crate) struct StripeClient {
 
 impl StripeClient {
     pub(crate) async fn load(ctx: &dyn Context) -> Result<Self, WaferError> {
-        if !stripe_secret_operations_allowed(ctx).await {
+        if !stripe_secret_operations_allowed(ctx) {
             return Err(WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "Stripe secret-key operations are disabled in the browser runtime; configure a trusted remote commerce API instead",
             ));
         }
-        let secret_key = config::get_default(ctx, STRIPE_SECRET_KEY, "").await;
+        let secret_key = config::get_default(ctx, STRIPE_SECRET_KEY, "").await?;
         let livemode = secret_livemode(&secret_key).ok_or_else(|| {
             WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "Stripe secret key must be a test or live secret key",
             )
         })?;
-        let api_version = config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_API_VERSION).await;
+        let api_version = config::get_default(ctx, STRIPE_API_VERSION, DEFAULT_API_VERSION).await?;
         if !super::stripe::is_stable_stripe_api_version(&api_version) {
             return Err(WaferError::new(
                 ErrorCode::FailedPrecondition,
                 "Stripe API version must be a stable named release",
             ));
         }
-        let api_url = config::get_default(ctx, STRIPE_API_URL, "https://api.stripe.com").await;
+        let api_url = config::get_default(ctx, STRIPE_API_URL, "https://api.stripe.com").await?;
         Ok(Self {
             secret_key,
             api_url: api_url.trim_end_matches('/').to_string(),

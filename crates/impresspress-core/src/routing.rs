@@ -678,9 +678,16 @@ pub async fn route_to_block(
         // from a snapshot of the variables table memoized against the
         // config-write generation, so this is one query per write, not one
         // per request to `/`.
-        let has_landing_page = crate::config_vars::is_truthy(
-            &wafer_core::clients::config::get_default(ctx, HAS_LANDING_PAGE_KEY, "false").await,
-        );
+        let has_landing_page =
+            match crate::config_vars::get_bool(ctx, HAS_LANDING_PAGE_KEY, false).await {
+                Ok(has_landing_page) => has_landing_page,
+                Err(e) => {
+                    return crate::blocks::crud::db_error_internal(
+                        e,
+                        "routing: landing page switch read failed",
+                    )
+                }
+            };
         if has_landing_page {
             return ctx.call_block("wafer-run/web", msg, input).await;
         }
