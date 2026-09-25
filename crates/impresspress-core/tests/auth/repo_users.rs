@@ -6,11 +6,11 @@ use impresspress_core::{
     test_support::seed_user,
 };
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 #[tokio::test]
 async fn insert_then_find_by_email_and_id() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
 
     let inserted = seed_user("a@example.com")
@@ -48,7 +48,7 @@ async fn insert_then_find_by_email_and_id() {
 
 #[tokio::test]
 async fn insert_with_avatar_roundtrips() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
 
     let inserted = seed_user("b@example.com")

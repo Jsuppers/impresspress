@@ -12,7 +12,7 @@
 use impresspress_core::blocks::auth::migrations;
 use wafer_core::clients::database as db;
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 const EXPECTED_TABLES: &[&str] = &[
     "wafer_run__auth__users",
@@ -26,11 +26,11 @@ const EXPECTED_TABLES: &[&str] = &[
 
 #[tokio::test]
 async fn migration_001_creates_all_tables() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration 001 apply");
 
     let rows = db::query_raw(
-        &ctx,
+        &ctx.fixture(),
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'wafer_run__auth__%'",
         &[],
     )
@@ -57,7 +57,7 @@ async fn migration_001_creates_all_tables() {
 
 #[tokio::test]
 async fn migration_001_is_idempotent() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("first apply");
     migrations::apply(&ctx)
         .await

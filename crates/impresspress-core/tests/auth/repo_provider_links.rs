@@ -6,11 +6,11 @@ use impresspress_core::{
     test_support::seed_user,
 };
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 #[tokio::test]
 async fn upsert_insert_then_update_same_provider_ref() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let uid1 = seed_user("a@example.com").insert(&ctx).await.id;
     let uid2 = seed_user("b@example.com").insert(&ctx).await.id;
@@ -88,7 +88,7 @@ async fn upsert_insert_then_update_same_provider_ref() {
 
 #[tokio::test]
 async fn find_missing_is_none() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     assert!(provider_links::find_by_provider_ref(&ctx, "github", "nope")
         .await
@@ -98,7 +98,7 @@ async fn find_missing_is_none() {
 
 #[tokio::test]
 async fn provider_axis_is_independent() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let uid_gh = seed_user("gh@example.com").insert(&ctx).await.id;
     let uid_goog = seed_user("goog@example.com").insert(&ctx).await.id;

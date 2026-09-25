@@ -12,16 +12,16 @@ use std::collections::HashMap;
 
 use impresspress_core::{
     blocks::auth::{migrations, repo::orgs},
-    test_support::seed_user,
+    test_support::{seed_user, TestContext},
 };
 use serde_json::{json, Value};
 use wafer_core::clients::database as db;
 use wafer_run::WaferError;
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 async fn insert_org(
-    ctx: &MigrationTestCtx,
+    ctx: &TestContext,
     name: &str,
     owner_user_id: Option<&str>,
     verified: Option<(&str, &str)>,
@@ -44,7 +44,7 @@ async fn insert_org(
 
 #[tokio::test]
 async fn find_by_name_returns_none_for_unknown() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let row = orgs::find_by_name(&ctx, "does-not-exist").await.unwrap();
     assert!(row.is_none());
@@ -52,7 +52,7 @@ async fn find_by_name_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn a_reserved_seed_reads_back_reserved_and_unowned() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let row = orgs::find_by_name(&ctx, "wafer-run")
         .await
@@ -65,7 +65,7 @@ async fn a_reserved_seed_reads_back_reserved_and_unowned() {
 
 #[tokio::test]
 async fn a_reserved_name_cannot_be_claimed() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let uid = seed_user("u@x.com").insert(&ctx).await.id;
 
@@ -105,7 +105,7 @@ async fn a_reserved_name_cannot_be_claimed() {
 
 #[tokio::test]
 async fn a_provider_org_is_claimable_once_but_reserved_rows_are_exempt() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let a = seed_user("a@x.com").insert(&ctx).await.id;
     let b = seed_user("b@x.com").insert(&ctx).await.id;

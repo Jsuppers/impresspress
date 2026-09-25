@@ -13,11 +13,12 @@ use impresspress_core::{
 use wafer_core::interfaces::auth::service::{AuthError, AuthService, Role, UserId};
 use wafer_run::context::Context;
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 #[tokio::test]
 async fn user_profile_returns_row_with_empty_orgs() {
-    let ctx: Arc<dyn Context> = Arc::new(MigrationTestCtx::new().await);
+    let ctx: Arc<dyn Context> =
+        Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
     let u = seed_user("p@e.com")
@@ -42,7 +43,8 @@ async fn user_profile_returns_row_with_empty_orgs() {
 
 #[tokio::test]
 async fn user_profile_missing_user_is_not_found() {
-    let ctx: Arc<dyn Context> = Arc::new(MigrationTestCtx::new().await);
+    let ctx: Arc<dyn Context> =
+        Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
     let svc = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
@@ -58,7 +60,8 @@ async fn user_profile_missing_user_is_not_found() {
 
 #[tokio::test]
 async fn user_profile_maps_non_admin_role_to_user() {
-    let ctx: Arc<dyn Context> = Arc::new(MigrationTestCtx::new().await);
+    let ctx: Arc<dyn Context> =
+        Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
     let u = seed_user("ordinary@e.com")

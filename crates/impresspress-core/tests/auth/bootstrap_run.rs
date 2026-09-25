@@ -12,7 +12,7 @@ use impresspress_core::{
     test_support::seed_user,
 };
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 fn cfg_email_pw(email: &str, pw: &str) -> AuthConfig {
     AuthConfig::from_env_for_test(&[
@@ -31,7 +31,7 @@ fn cfg_empty() -> AuthConfig {
 
 #[tokio::test]
 async fn email_password_path_creates_admin_with_local_credentials() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migrations");
 
     bootstrap::run(&ctx, &cfg_email_pw("root@x.io", "pw"))
@@ -61,7 +61,7 @@ async fn email_password_path_creates_admin_with_local_credentials() {
 
 #[tokio::test]
 async fn token_path_inserts_bootstrap_token_row() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migrations");
 
     bootstrap::run(&ctx, &cfg_token("secret-token"))
@@ -85,7 +85,7 @@ async fn token_path_inserts_bootstrap_token_row() {
 
 #[tokio::test]
 async fn no_config_is_noop() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migrations");
 
     bootstrap::run(&ctx, &cfg_empty())
@@ -97,7 +97,7 @@ async fn no_config_is_noop() {
 
 #[tokio::test]
 async fn skipped_when_users_already_exist() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migrations");
 
     seed_user("existing@x.io")
@@ -133,7 +133,7 @@ async fn bootstrap_row_matches_the_hand_built_map_it_replaced() {
     use serde_json::Value;
     use wafer_core::clients::database as db;
 
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migrations");
 
     bootstrap::run(&ctx, &cfg_email_pw("root@x.io", "pw"))
@@ -191,7 +191,7 @@ async fn bootstrap_row_matches_the_hand_built_map_it_replaced() {
 async fn bootstrap_writes_no_user_roles_row() {
     use impresspress_core::platform_state::user_roles;
 
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migrations");
     bootstrap::run(&ctx, &cfg_email_pw("root@x.io", "pw"))
         .await

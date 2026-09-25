@@ -6,11 +6,11 @@ use impresspress_core::{
     test_support::seed_user,
 };
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 #[tokio::test]
 async fn insert_find_touch_delete_expired() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let uid = seed_user("s@example.com")
         .display_name("S")
@@ -85,7 +85,7 @@ async fn insert_find_touch_delete_expired() {
 
 #[tokio::test]
 async fn find_for_user_missing_family_returns_none() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     let uid = seed_user("missing@example.com")
         .display_name("S")
@@ -104,7 +104,7 @@ async fn find_for_user_missing_family_returns_none() {
 /// was swept or dropped by migration 012.
 #[tokio::test]
 async fn touch_on_an_unknown_family_reports_zero_rather_than_erroring() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
 
     assert_eq!(

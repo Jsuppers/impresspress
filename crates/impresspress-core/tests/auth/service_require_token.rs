@@ -14,7 +14,7 @@ use impresspress_core::{
 use wafer_core::interfaces::auth::service::{AuthError, AuthService, TokenScope};
 use wafer_run::{context::Context, Message};
 
-use crate::common::MigrationTestCtx;
+use crate::common::{auth_fixture, MintAccessToken};
 
 fn bearer(tok: &str) -> Message {
     let mut m = Message::new("auth.require_token");
@@ -24,7 +24,7 @@ fn bearer(tok: &str) -> Message {
 
 #[tokio::test]
 async fn require_token_enforces_scope_and_rejects_an_access_jwt() {
-    let raw_ctx = Arc::new(MigrationTestCtx::new().await);
+    let raw_ctx = Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     let ctx: Arc<dyn Context> = raw_ctx.clone();
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 

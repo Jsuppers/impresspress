@@ -8,16 +8,19 @@
 //! missing table, the caller's `let _ =` swallowed the error, and rate
 //! limiting silently never triggered.
 
-use impresspress_core::blocks::auth::{migrations, repo::rate_limits};
+use impresspress_core::{
+    blocks::auth::{migrations, repo::rate_limits},
+    test_support::TestContext,
+};
 use serde_json::json;
 use wafer_block::db::{Filter, FilterOp};
 use wafer_core::clients::database as db;
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 /// Drive the production upsert; the row id is only used for a brand-new
 /// counter, so it just has to be unique per call.
-async fn hit(ctx: &MigrationTestCtx, key: &str, now: i64, window_cutoff: i64) -> i64 {
+async fn hit(ctx: &TestContext, key: &str, now: i64, window_cutoff: i64) -> i64 {
     let id = format!("rl-test-{key}-{now}");
     rate_limits::windowed_increment(ctx, &id, key, now, window_cutoff)
         .await
@@ -26,7 +29,7 @@ async fn hit(ctx: &MigrationTestCtx, key: &str, now: i64, window_cutoff: i64) ->
 
 /// The stored `(count, window_start)` for `key`, read independently of the
 /// function under test.
-async fn read_counter(ctx: &MigrationTestCtx, key: &str) -> (i64, i64) {
+async fn read_counter(ctx: &TestContext, key: &str) -> (i64, i64) {
     let rows = db::list_all(
         ctx,
         rate_limits::TABLE,
@@ -55,7 +58,7 @@ async fn read_counter(ctx: &MigrationTestCtx, key: &str) -> (i64, i64) {
 
 #[tokio::test]
 async fn migration_008_rate_limits_supports_windowed_counter_upsert() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("migration apply");
     migrations::apply(&ctx)
         .await

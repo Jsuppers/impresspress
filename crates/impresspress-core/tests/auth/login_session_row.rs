@@ -7,15 +7,19 @@
 //! inserted a row, so a single tab wrote roughly forty-eight a day and the
 //! page listed each as a separate device.
 //!
-//! These tests use `MigrationTestCtx` for its real `wafer-run/crypto` routing
-//! so password hashing and JWT signing work the same way as production.
+//! These tests run on `common::auth_fixture` for its real `wafer-run/crypto`
+//! block, so password hashing and JWT signing work the same way as
+//! production.
 //! Plan A2: `seed_password_user` applies migrations before inserting so the
 //! typed schema (with `NOT NULL` constraints) is in place.
 
-use impresspress_core::blocks::{
-    auth::{repo::sessions, AUTH_BLOCK_ID},
-    auth_ui::AuthUiBlock,
-    userportal::UserPortalBlock,
+use impresspress_core::{
+    blocks::{
+        auth::{repo::sessions, AUTH_BLOCK_ID},
+        auth_ui::AuthUiBlock,
+        userportal::UserPortalBlock,
+    },
+    test_support::TestContext,
 };
 use serde_json::json;
 use wafer_core::clients::crypto;
@@ -24,7 +28,7 @@ use wafer_run::{
     Block, ErrorCode, InputStream, Message, OutputStream, WaferError,
 };
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 /// Drain an `OutputStream` to a `BufferedResponse`. Mirrors the helper in
 /// `impresspress-core/src/test_support.rs` (which is `#[cfg(test)]` and not
@@ -50,7 +54,7 @@ async fn collect_or_panic(out: OutputStream) -> BufferedResponse {
 /// doesn't gate on verification.
 ///
 /// Plan A2 note: passwords live in `local_credentials`, not on the users row.
-async fn seed_password_user(ctx: &MigrationTestCtx, email: &str, password: &str) -> String {
+async fn seed_password_user(ctx: &TestContext, email: &str, password: &str) -> String {
     use impresspress_core::{
         blocks::auth::{migrations, repo::local_credentials},
         test_support::seed_user,
@@ -67,7 +71,7 @@ async fn seed_password_user(ctx: &MigrationTestCtx, email: &str, password: &str)
 
     // Set email_verified via exec_raw (test-fixture setup — CLAUDE.md exception).
     db::exec_raw(
-        ctx,
+        &ctx.fixture(),
         "UPDATE wafer_run__auth__users SET email_verified = 1 WHERE id = ?",
         &[json!(&user.id)],
     )
@@ -89,7 +93,7 @@ fn login_msg() -> Message {
     m
 }
 
-async fn invoke_login(ctx: &MigrationTestCtx, email: &str, password: &str) -> String {
+async fn invoke_login(ctx: &TestContext, email: &str, password: &str) -> String {
     let block = AuthUiBlock::default();
     let body = json!({"email": email, "password": password}).to_string();
     let msg = login_msg();
@@ -105,7 +109,7 @@ async fn invoke_login(ctx: &MigrationTestCtx, email: &str, password: &str) -> St
 /// the login was refused *as a bad credential*: a 500, 404 or 429 would also
 /// write no session row, so "no row" alone proves nothing.
 async fn invoke_login_expecting_error(
-    ctx: &MigrationTestCtx,
+    ctx: &TestContext,
     email: &str,
     password: &str,
 ) -> WaferError {
@@ -136,7 +140,7 @@ fn refresh_token_of(body: &str) -> String {
 }
 
 /// The `family` claim on a refresh JWT, which is also the session row's key.
-async fn family_of(ctx: &MigrationTestCtx, refresh_token: &str) -> String {
+async fn family_of(ctx: &TestContext, refresh_token: &str) -> String {
     crypto::verify(ctx, refresh_token)
         .await
         .expect("verify refresh token")
@@ -146,7 +150,7 @@ async fn family_of(ctx: &MigrationTestCtx, refresh_token: &str) -> String {
         .to_string()
 }
 
-async fn invoke_refresh(ctx: &MigrationTestCtx, refresh_token: &str) -> String {
+async fn invoke_refresh(ctx: &TestContext, refresh_token: &str) -> String {
     let block = AuthUiBlock::default();
     let body = json!({ "refresh_token": refresh_token }).to_string();
     let mut msg = Message::new("http.request");
@@ -161,7 +165,7 @@ async fn invoke_refresh(ctx: &MigrationTestCtx, refresh_token: &str) -> String {
 
 #[tokio::test]
 async fn login_creates_one_session_row_keyed_by_the_refresh_family() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID).await;
     let user_id = seed_password_user(&ctx, "alice@example.com", "hunter2hunter2").await;
 
     let resp_body = invoke_login(&ctx, "alice@example.com", "hunter2hunter2").await;
@@ -194,7 +198,7 @@ async fn login_creates_one_session_row_keyed_by_the_refresh_family() {
 /// touched — not four rows inserted. On the pre-012 tree this asserted four.
 #[tokio::test]
 async fn refreshing_touches_the_one_row_instead_of_inserting_more() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID).await;
     let user_id = seed_password_user(&ctx, "erin@example.com", "erin-password-1").await;
 
     let mut refresh =
@@ -228,7 +232,7 @@ async fn refreshing_touches_the_one_row_instead_of_inserting_more() {
 async fn the_session_row_expires_when_the_refresh_token_does() {
     use impresspress_core::blocks::auth::config::SESSION_LIFETIME_DAYS_DEFAULT;
 
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID).await;
     let user_id = seed_password_user(&ctx, "frank@example.com", "frank-password1").await;
     let body = invoke_login(&ctx, "frank@example.com", "frank-password1").await;
     let refresh = refresh_token_of(&body);
@@ -261,7 +265,7 @@ async fn the_session_row_expires_when_the_refresh_token_does() {
 
 #[tokio::test]
 async fn invalid_credentials_do_not_create_a_session_row() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID).await;
     let user_id = seed_password_user(&ctx, "bob@example.com", "correct-horse").await;
 
     let err = invoke_login_expecting_error(&ctx, "bob@example.com", "WRONG-password").await;
@@ -306,7 +310,7 @@ async fn invalid_credentials_do_not_create_a_session_row() {
 /// a hash of a token whose `iat` only ticks once a second.
 #[tokio::test]
 async fn two_logins_produce_two_distinct_session_rows() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID).await;
     let user_id = seed_password_user(&ctx, "carol@example.com", "passw0rd-passw0rd").await;
 
     let _ = invoke_login(&ctx, "carol@example.com", "passw0rd-passw0rd").await;
@@ -332,7 +336,7 @@ async fn two_logins_produce_two_distinct_session_rows() {
 /// This is what the user sees in their browser at `/b/userportal/sessions`.
 #[tokio::test]
 async fn userportal_sessions_page_renders_row_after_login() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth_ui::AUTH_UI_BLOCK_ID).await;
     let user_id = seed_password_user(&ctx, "diana@example.com", "diana-password").await;
 
     let _ = invoke_login(&ctx, "diana@example.com", "diana-password").await;

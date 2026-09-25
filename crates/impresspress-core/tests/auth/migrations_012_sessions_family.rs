@@ -13,15 +13,15 @@
 //! production. Raw SQL in this file is test-fixture setup and assertion, the
 //! explicit exception CLAUDE.md carves out.
 
-use impresspress_core::blocks::auth::migrations;
+use impresspress_core::{blocks::auth::migrations, test_support::TestContext};
 use serde_json::json;
 use wafer_core::clients::database as db;
 
-use crate::common::MigrationTestCtx;
+use crate::common::auth_fixture;
 
 /// The column names of `table`, as SQLite reports them.
-async fn columns(ctx: &MigrationTestCtx, table: &str) -> Vec<String> {
-    db::query_raw(ctx, &format!("PRAGMA table_info({table})"), &[])
+async fn columns(ctx: &TestContext, table: &str) -> Vec<String> {
+    db::query_raw(&ctx.fixture(), &format!("PRAGMA table_info({table})"), &[])
         .await
         .expect("PRAGMA table_info")
         .iter()
@@ -34,18 +34,22 @@ async fn columns(ctx: &MigrationTestCtx, table: &str) -> Vec<String> {
         .collect()
 }
 
-async fn row_count(ctx: &MigrationTestCtx, table: &str) -> i64 {
-    db::query_raw(ctx, &format!("SELECT COUNT(*) AS n FROM {table}"), &[])
-        .await
-        .expect("count rows")
-        .first()
-        .and_then(|r| r.data.get("n").and_then(|v| v.as_i64()))
-        .expect("COUNT(*) returns a number")
+async fn row_count(ctx: &TestContext, table: &str) -> i64 {
+    db::query_raw(
+        &ctx.fixture(),
+        &format!("SELECT COUNT(*) AS n FROM {table}"),
+        &[],
+    )
+    .await
+    .expect("count rows")
+    .first()
+    .and_then(|r| r.data.get("n").and_then(|v| v.as_i64()))
+    .expect("COUNT(*) returns a number")
 }
 
 #[tokio::test]
 async fn fresh_apply_keys_sessions_on_family_and_drops_the_token_hash_column() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("apply migrations");
 
     let cols = columns(&ctx, "wafer_run__auth__sessions").await;
@@ -78,24 +82,28 @@ async fn fresh_apply_keys_sessions_on_family_and_drops_the_token_hash_column() {
     }
 
     // `family` is the primary key, not just a column.
-    let pk: Vec<String> = db::query_raw(&ctx, "PRAGMA table_info(wafer_run__auth__sessions)", &[])
-        .await
-        .expect("PRAGMA table_info")
-        .iter()
-        .filter(|r| r.data.get("pk").and_then(|v| v.as_i64()).unwrap_or(0) > 0)
-        .filter_map(|r| {
-            r.data
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect();
+    let pk: Vec<String> = db::query_raw(
+        &ctx.fixture(),
+        "PRAGMA table_info(wafer_run__auth__sessions)",
+        &[],
+    )
+    .await
+    .expect("PRAGMA table_info")
+    .iter()
+    .filter(|r| r.data.get("pk").and_then(|v| v.as_i64()).unwrap_or(0) > 0)
+    .filter_map(|r| {
+        r.data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
+    .collect();
     assert_eq!(pk, vec!["family".to_string()], "family is the primary key");
 }
 
 #[tokio::test]
 async fn fresh_apply_creates_the_maintenance_singleton() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("apply migrations");
 
     let cols = columns(&ctx, "wafer_run__auth__maintenance").await;
@@ -118,7 +126,7 @@ async fn fresh_apply_creates_the_maintenance_singleton() {
 /// `CREATE TABLE IF NOT EXISTS` alone would do.
 #[tokio::test]
 async fn apply_over_an_existing_001_table_with_rows_replaces_the_shape() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
 
     // 1. The pre-012 world, spelled out rather than derived from the
     //    migration list: this is the on-disk shape a deployment running 011
@@ -153,7 +161,7 @@ async fn apply_over_an_existing_001_table_with_rows_replaces_the_shape() {
     // 2. A user and a session row of the old shape, the way a live database
     //    holds them.
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "INSERT INTO wafer_run__auth__users \
          (id, email, display_name, role, created_at, updated_at) \
          VALUES ('u1', 'u1@example.com', 'U1', 'user', \
@@ -163,7 +171,7 @@ async fn apply_over_an_existing_001_table_with_rows_replaces_the_shape() {
     .await
     .expect("seed pre-existing user");
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "INSERT INTO wafer_run__auth__sessions \
          (token_hash, user_id, created_at, last_used_at, expires_at) \
          VALUES ('deadbeef', 'u1', '2026-01-01T00:00:00Z', \
@@ -210,7 +218,7 @@ async fn apply_over_an_existing_001_table_with_rows_replaces_the_shape() {
 /// deliberately drops, and leaves both tables in the post-012 shape.
 #[tokio::test]
 async fn migration_012_is_idempotent() {
-    let ctx = MigrationTestCtx::new().await;
+    let ctx = auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await;
     migrations::apply(&ctx).await.expect("first apply");
     migrations::apply(&ctx).await.expect("second apply");
 
