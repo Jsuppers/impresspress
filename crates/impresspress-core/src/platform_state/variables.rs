@@ -2676,7 +2676,7 @@ mod boot_tests {
     #[tokio::test]
     async fn the_block_config_fallback_refuses_what_the_seeder_refuses() {
         let session = crate::blocks::auth::config::SESSION_LIFETIME_DAYS_KEY;
-        let internal = crate::blocks::products::RUNTIME_KIND_CONFIG_KEY;
+        let internal = "__IMPRESSPRESS_RUNTIME_KIND__";
         let strict = wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY;
         assert!(crate::config_vars::is_runtime_owned_key(internal));
         let app_env = HashMap::from([
