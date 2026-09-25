@@ -50,6 +50,13 @@ use crate::{
 ///   classified, client-actionable refusal from the service — the same class
 ///   this repo already echoes for `InvalidArgument` — so it is passed
 ///   through rather than sanitized.
+/// - [`ErrorCode::AlreadyExists`] is a write that duplicates a primary or
+///   unique key — a request the database refused, not a fault — so it is a
+///   **409**. Every `DatabaseService` reports a duplicate this way (see
+///   [`taken_key_or_db_error`]). The driver's own text names the table and the
+///   column, which is schema, so it is logged and the client is told only
+///   [`DUPLICATE_KEY`]; a route that knows which key it wrote says so through
+///   [`taken_key_or_db_error`] instead.
 /// - Everything else is an internal failure: `context` is the fixed log
 ///   label, the cause is logged, and the client gets the sanitized
 ///   `"Internal server error (ref: <id>)"`.
@@ -80,8 +87,8 @@ pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputS
 /// A page whose read failed is never drawn from defaults (see
 /// [`crate::ui::server_error_response`]), and what it answers instead is
 /// classified here like every other failed database call: a WRAP denial is
-/// the 403 page and a quota the 429 page ([`crate::ui::refused_response`]),
-/// anything else is logged under `context` and answered with the styled 500.
+/// the 403 page and a quota the 429 page ([`crate::ui::refused_response`]), a
+/// duplicate key keeps its 409, anything else is logged under `context` and answered with the styled 500.
 /// An API caller (an `Accept` without `text/html`) gets the same statuses as
 /// JSON.
 pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str) -> OutputStream {
@@ -102,13 +109,17 @@ pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str)
 /// answers a 2xx notice ([`crate::ui::swap_error_response`] and its row
 /// variant, or an alert in the swapped body) and puts this reason in it. It is
 /// classified like every other failed database call: a WRAP denial says access
-/// was denied and a quota says the usage limit, with the denial's own text
+/// was denied, a quota says the usage limit and a duplicate key says the entry
+/// already exists, with the denial's own text
 /// (grant and table names) logged, never shown. Anything else is logged under
 /// `context` and said as a fault.
 pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static str {
     match classify_db_error(error, None, context) {
         DbFailure::Refused(error) if error.code == ErrorCode::ResourceExhausted => {
             "it is over its usage limit right now"
+        }
+        DbFailure::Refused(error) if error.code == ErrorCode::AlreadyExists => {
+            "it duplicates an entry that already exists"
         }
         DbFailure::Refused(_) => "access to it was denied",
         DbFailure::Internal(error) => {
@@ -130,7 +141,8 @@ pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static 
 /// a database failure is exactly what `tests/error_door.rs` exists to stop.
 pub enum DbFailure {
     /// A refusal the client is told about as it stands: the caller's 404,
-    /// the 403 a WRAP denial becomes, the 429 a quota keeps. The cause, when
+    /// the 403 a WRAP denial becomes, the 429 a quota keeps, the 409 a
+    /// duplicate key is. The cause, when
     /// it was one that must not be published, has already been logged and
     /// replaced.
     Refused(wafer_run::WaferError),
@@ -169,9 +181,24 @@ pub fn classify_db_error(
             ErrorCode::ResourceExhausted,
             error.message,
         )),
+        (ErrorCode::AlreadyExists, _) => {
+            tracing::info!(
+                context = %context,
+                error = %error,
+                "database refused a write that duplicates a unique key",
+            );
+            DbFailure::Refused(wafer_run::WaferError::new(
+                ErrorCode::AlreadyExists,
+                DUPLICATE_KEY,
+            ))
+        }
         _ => DbFailure::Internal(error),
     }
 }
+
+/// What a client is told when its write duplicated a unique key and the route
+/// did not name the key (see [`classify_db_error`]).
+pub const DUPLICATE_KEY: &str = "A record with the same key already exists";
 
 /// [`DbFailure`] as the response every caller but `blocks::dev` wants.
 fn seal(failure: DbFailure, context: &str) -> OutputStream {
@@ -185,88 +212,36 @@ fn seal(failure: DbFailure, context: &str) -> OutputStream {
 // Duplicate natural keys
 // ---------------------------------------------------------------------------
 
-/// What a failed `create` against a table with a UNIQUE natural key —
+/// What a failed write against a table with a UNIQUE natural key —
 /// `variables.key`, `roles.name`, `permissions.name`, `buckets.name` —
-/// actually means.
+/// answers when the caller can say which key was taken.
 ///
-/// It lives here, beside [`db_error_internal`] it delegates to, because it is
-/// the same decision in every block that has such a key: the admin block
-/// (roles, permissions, variables) and the files block (bucket names) call
-/// this one function rather than each keeping the reasoning below.
+/// The write's own error is the whole answer. Every `DatabaseService` this
+/// workspace runs on reports a write that duplicates a primary or unique key
+/// as `DatabaseError::AlreadyExists` — native SQLite and PostgreSQL from the
+/// driver's code, Cloudflare D1 and the browser's sql.js from SQLite's text
+/// ([`crate::sqlite_text_error::statement_error`]) — and the database
+/// handler sends that on as [`ErrorCode::AlreadyExists`]. That is part of the
+/// service contract, not a courtesy: an adapter that reports a duplicate as
+/// anything else is a broken adapter, and each one's classification is
+/// pinned by a test in its own crate. So nothing here re-reads the key to
+/// find out what the write meant.
 ///
-/// Those inserts are refused by the database when the key is already
-/// taken, and that refusal used to ship as `err_internal("Database error", e)`:
-/// a `500 Internal server error (ref: …)` for a request that is not a fault at
-/// all. An admin who re-types a key that exists was told the server broke, and
-/// an operator reading the log could not tell that request from a corrupt row
-/// or an outage. The honest answer is **409** — the key is taken, edit it or
-/// pick another — which is what [`ErrorCode::AlreadyExists`] resolves to in
-/// `wafer_block::http_codec::error_code_to_http_status`.
-///
-/// The write's own error answers it. `wafer_core`'s `DatabaseService` contract
-/// names a write that duplicates a primary or unique key
-/// `DatabaseError::AlreadyExists`, and the database handler's
-/// `db_error_to_wafer` sends that to the caller as [`ErrorCode::AlreadyExists`]
-/// — native SQLite and PostgreSQL from the driver's code, Cloudflare D1 and the
-/// browser's sql.js from SQLite's text
-/// ([`crate::sqlite_text_error::statement_error`]). That code goes straight to
-/// the 409, with no re-read. It must not reach [`db_error_internal`], which
-/// classifies only `NotFound`, `PermissionDenied` and `ResourceExhausted` and
-/// folds everything else into a 500.
-///
-/// A `DatabaseService` that does not classify — an adapter outside this
-/// workspace, which the trait asks to map its driver's violation but cannot
-/// make it — reports the same refusal as [`ErrorCode::Internal`], so that code
-/// is settled by re-reading the key. [`ErrorCode::Aborted`] is re-read too:
-/// `error_code_to_http_status` already renders it 409, and the "concurrency
-/// conflict" it names is what a unique-index collision is. If the key turns
-/// out to be taken, that is this conflict; if it does not, the write's own
-/// failure is kept.
-///
-/// Probing **after** the failed write rather than before it is what closes the
-/// race: a pre-check that found the key free leaves a gap in which a competing
-/// create can claim it, and the loser of that race is exactly the request that
-/// would still have answered 500. Re-reading afterwards has no such gap — the
-/// insert has already been refused, and the row that refused it is there to be
-/// found. It also costs the successful create nothing, since the probe only
-/// runs on the error path.
-///
-/// `probe` is the "is this key taken now?" read, passed as its own future so it
-/// is only awaited here. Three answers, not two: taken is the conflict, free is
-/// a genuine fault, and a probe that could not run is **not** "free" — "could
-/// not tell" keeps the write's own failure, so a transient read outage cannot
-/// turn a 500 into a wrong 409 or vice versa.
-///
-/// `context` is the log label every non-collision answer carries into
-/// [`db_error_internal`] — the caller's own ("Failed to create bucket"), not a
-/// generic one, so an operator reading the log still knows which write failed.
-pub async fn taken_key_or_db_error(
+/// [`classify_db_error`] already answers a duplicate as a 409, with a generic
+/// message because it cannot know which key a route wrote. This is the same
+/// 409 with `conflict` as its message — "a role named X already exists" —
+/// for the routes that do know. Anything else is [`db_error_internal`]'s,
+/// under the caller's own `context` ("Failed to create bucket"), so an
+/// operator reading the log still knows which write failed.
+pub fn taken_key_or_db_error(
     error: wafer_run::WaferError,
-    probe: impl std::future::Future<Output = Result<bool, wafer_run::WaferError>>,
     conflict: &str,
     context: &str,
 ) -> OutputStream {
-    match error.code {
-        // Every backend in this workspace classifies the violation itself.
-        ErrorCode::AlreadyExists => return err_conflict(conflict),
-        // The two codes a constraint violation can arrive as from a backend
-        // that does not.
-        ErrorCode::Internal | ErrorCode::Aborted => {}
-        // A WRAP refusal (403) or a quota (429) is not a name collision and
-        // keeps the status `crud` gives it.
-        _ => return db_error_internal(error, context),
+    if error.code == ErrorCode::AlreadyExists {
+        return err_conflict(conflict);
     }
-    match probe.await {
-        Ok(true) => err_conflict(conflict),
-        Ok(false) => db_error_internal(error, context),
-        Err(probe_error) => {
-            tracing::warn!(
-                error = %probe_error,
-                "could not re-read the key a refused insert may have collided with",
-            );
-            db_error_internal(error, context)
-        }
-    }
+    db_error_internal(error, context)
 }
 
 /// Response body of every CRUD delete.
@@ -848,77 +823,78 @@ mod path_var_tests {
 
 #[cfg(test)]
 mod tests {
-    use wafer_run::{ErrorCode, WaferError};
+    use wafer_run::{streams::output::TerminalNotResponse, ErrorCode, WaferError};
 
-    use super::taken_key_or_db_error;
+    use super::{db_error, db_error_internal, taken_key_or_db_error, DUPLICATE_KEY};
 
-    /// A backend that classifies the violation short-circuits: the 409 comes
-    /// straight off `AlreadyExists` and the probe is never run. Sent to
-    /// `crud::db_error_internal` instead — which classifies only `NotFound` /
-    /// `PermissionDenied` / `ResourceExhausted` and folds the rest into a 500 —
-    /// every taken key would be a 500 again.
+    /// A duplicate key is a 409 from both doors, with the driver's text —
+    /// which names the table and the column — replaced. Folded into the
+    /// 500 as it used to be, every route that creates a row under a unique
+    /// key without naming that key answered a re-typed name with "Internal
+    /// server error".
     #[tokio::test]
-    async fn a_backend_classified_already_exists_is_the_conflict_without_a_probe() {
-        let probed = std::cell::Cell::new(false);
+    async fn a_duplicate_key_is_a_sanitized_409_from_every_door() {
+        let driver = || {
+            WaferError::new(
+                ErrorCode::AlreadyExists,
+                "unique constraint violated: UNIQUE constraint failed: impresspress__llm__providers.name",
+            )
+        };
+        for (door, out) in [
+            (
+                "db_error_internal",
+                db_error_internal(driver(), "Database error"),
+            ),
+            (
+                "db_error",
+                db_error(driver(), "Row not found", "Database error"),
+            ),
+        ] {
+            match out.collect_buffered().await {
+                Err(TerminalNotResponse::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::AlreadyExists, "{door}");
+                    assert_eq!(e.message, DUPLICATE_KEY, "{door}");
+                }
+                other => panic!("{door}: expected the 409, got {other:?}"),
+            }
+        }
+    }
+
+    /// A route that knows the key says which: the same 409, its own words.
+    #[tokio::test]
+    async fn a_duplicate_key_is_the_callers_named_conflict() {
         let out = taken_key_or_db_error(
             WaferError::new(ErrorCode::AlreadyExists, "duplicate key"),
-            async {
-                probed.set(true);
-                Ok(false)
-            },
             "TAKEN already exists",
             "Database error",
-        )
-        .await;
-
-        assert_eq!(crate::test_support::output_http_status(out).await, 409);
-        assert!(
-            !probed.get(),
-            "the backend already answered; do not re-read"
         );
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::AlreadyExists);
+                assert_eq!(e.message, "TAKEN already exists");
+            }
+            other => panic!("expected the named 409, got {other:?}"),
+        }
     }
 
-    /// `Aborted` is a probe candidate alongside `Internal`: it renders as 409
-    /// too, and the "concurrency conflict" it names is what a unique-index
-    /// collision is. The re-read still decides, so a free key keeps the fault.
+    /// Nothing but `AlreadyExists` is a duplicate. An `Internal` is a fault
+    /// whatever the key's state — the classification is the adapter's job,
+    /// and nothing here re-reads the key to second-guess it — and a WRAP
+    /// refusal keeps the 403 `crud` gives it.
     #[tokio::test]
-    async fn an_aborted_write_is_classified_by_the_probe_like_an_internal_one() {
-        let taken = taken_key_or_db_error(
-            WaferError::new(ErrorCode::Aborted, "write conflict"),
-            async { Ok(true) },
+    async fn only_already_exists_is_a_conflict() {
+        let internal = taken_key_or_db_error(
+            WaferError::new(ErrorCode::Internal, "disk I/O error"),
             "TAKEN already exists",
             "Database error",
-        )
-        .await;
-        assert_eq!(crate::test_support::output_http_status(taken).await, 409);
+        );
+        assert_eq!(crate::test_support::output_http_status(internal).await, 500);
 
-        let free = taken_key_or_db_error(
-            WaferError::new(ErrorCode::Aborted, "write conflict"),
-            async { Ok(false) },
-            "TAKEN already exists",
-            "Database error",
-        )
-        .await;
-        assert_eq!(crate::test_support::output_http_status(free).await, 500);
-    }
-
-    /// A code that is neither is not a collision candidate at all — it keeps
-    /// the status `crud` gives it, and never reaches the probe.
-    #[tokio::test]
-    async fn a_wrap_refusal_keeps_its_403_and_is_never_probed() {
-        let probed = std::cell::Cell::new(false);
-        let out = taken_key_or_db_error(
+        let denied = taken_key_or_db_error(
             WaferError::new(ErrorCode::PermissionDenied, "denied"),
-            async {
-                probed.set(true);
-                Ok(true)
-            },
             "TAKEN already exists",
             "Database error",
-        )
-        .await;
-
-        assert_eq!(crate::test_support::output_http_status(out).await, 403);
-        assert!(!probed.get(), "a WRAP refusal is not a name collision");
+        );
+        assert_eq!(crate::test_support::output_http_status(denied).await, 403);
     }
 }

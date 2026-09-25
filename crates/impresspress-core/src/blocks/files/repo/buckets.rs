@@ -158,31 +158,6 @@ pub async fn list_recent(ctx: &dyn Context, limit: u32) -> Result<Page<BucketRow
     ))
 }
 
-/// Whether a bucket named `name` exists, whoever owns it.
-///
-/// The probe [`super::super::storage::handle_create_bucket`] hands to
-/// [`crate::blocks::crud::taken_key_or_db_error`] after a refused [`insert`]:
-/// `name` is UNIQUE (migration 002), so one row is all there can be and a
-/// `NotFound` from the lookup is the "free" answer rather than a failure.
-///
-/// It is deliberately NOT owner-scoped. The question is whether the folder is
-/// already claimed, and a name held by another user is exactly the case the
-/// unique index exists to refuse.
-pub async fn name_exists(ctx: &dyn Context, name: &str) -> Result<bool, WaferError> {
-    match db::get_by_field(
-        ctx,
-        TABLE,
-        "name",
-        serde_json::Value::String(name.to_string()),
-    )
-    .await
-    {
-        Ok(_) => Ok(true),
-        Err(e) if e.code == wafer_run::ErrorCode::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
 /// Insert a bucket row (`created_at` stamped with
 /// [`crate::util::now_rfc3339`]) and return it.
 ///

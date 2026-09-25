@@ -2039,21 +2039,11 @@ async fn restore_reports_a_conflict_when_the_slug_is_reclaimed_before_the_retry(
     );
 }
 
-/// The third direction of the same rule, and the one the retry's new
-/// classification could get wrong: "cannot have collided" is not "clear".
-///
-/// Migration 005's unique index is partial on `slug <> ''` as well as on
-/// `deleted_at IS NULL`, so a product with no slug cannot be refused by it —
-/// any number of rows may carry an empty one. A failed restore of such a row
-/// is therefore not a slug question at all, and reading the probe's "nothing
-/// holds that slug" as a clear slug would retry a collision that cannot
-/// exist and then, on the second failure, blame a slug that is the empty
-/// string: `Another product already uses the slug ""`, 409, for what is
-/// really a database wobble.
-///
-/// So an empty slug is [`SlugProbe::Unknown`], and the write's own error goes
-/// out against a correlation id — the same answer as a probe that could not
-/// run, for the same reason: no slug answer is available.
+/// A restore write that fails for a reason other than the slug index is not
+/// a slug question at all. Only `AlreadyExists` sends a failed restore to the
+/// collision probe; any other failure is the write's own error, against a
+/// correlation id — never a 409 blaming a slug, which for a product with no
+/// slug would be `Another product already uses the slug ""`.
 #[tokio::test]
 async fn restore_of_a_slugless_product_reports_the_write_failure_not_a_slug_conflict() {
     let ctx = ctx().await;
@@ -2098,26 +2088,20 @@ async fn restore_of_a_slugless_product_reports_the_write_failure_not_a_slug_conf
     );
 }
 
-/// The other direction of the same rule: "could not tell" is not "conflict".
-/// When the restore write fails and the collision probe that would name the
-/// slug cannot itself run, the response must carry the write's real failure —
-/// an `Internal` error against a correlation id an admin can quote — rather
-/// than a confident 409 blaming a slug nothing has confirmed is taken.
+/// "Could not tell" is not "clear": when the restore write is refused on the
+/// slug index and the collision probe that would name the claimant cannot
+/// itself run, nothing is retried, and the write's own answer stands. That
+/// answer is `AlreadyExists` — the backend's classification of the unique
+/// violation — so the response is the 409 `crud` gives a duplicate key,
+/// without a slug to name, rather than a guess in either direction.
 ///
 /// The restore write is failed by a REAL slug collision (the claimant seeded
-/// below), not by breaking the write itself. That matters: the earlier
-/// version of this test seeded no claimant and relied on
-/// `TestContext::break_list_reads` to fail the write too, which it did only
-/// because `FailingReadsDb` inherited the `DatabaseService` trait's
-/// read-based `update_where_count` default — count, then update. Every real
-/// backend overrides that with one `UPDATE` carrying no `count`, so in
-/// production the write landed, the handler returned 200, and the branch
-/// this test names was unreachable. The test asserted an outcome production
-/// could not produce. With the double corrected, the failure has to come
-/// from something production can actually do — and the unique index from
-/// migration 005 is exactly that.
+/// below), not by breaking the write itself: `TestContext::break_list_reads`
+/// fails only listings, and every real backend runs a restore as one
+/// `UPDATE` with no listing in it, so the index is the one thing production
+/// can make this write fail on.
 #[tokio::test]
-async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
+async fn restore_whose_collision_probe_cannot_run_keeps_the_writes_own_conflict() {
     let ctx = ctx().await;
 
     let mut original = HashMap::new();
@@ -2159,9 +2143,15 @@ async fn restore_fails_loudly_when_the_slug_collision_probe_cannot_run() {
         serde_json::json!({}),
     );
     let out = dispatch(&ctx, msg, input).await;
-    assert!(
-        output_is_error(out, ErrorCode::Internal).await,
-        "a probe that could not run must fail the restore, not be read as a clear slug"
+    let error = match out.collect_buffered().await {
+        Err(wafer_run::streams::output::TerminalNotResponse::Error(e)) => e,
+        other => panic!("a refused restore must fail: {other:?}"),
+    };
+    assert_eq!(
+        (error.code, error.message.as_str()),
+        (ErrorCode::AlreadyExists, crate::blocks::crud::DUPLICATE_KEY),
+        "a probe that could not run must neither retry nor name a slug it has \
+         not confirmed: {error:?}"
     );
     assert!(
         is_soft_deleted(&ctx, "original").await,

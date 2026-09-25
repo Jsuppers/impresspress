@@ -233,34 +233,6 @@ async fn holds(ctx: &dyn Context, user_id: &str, role: &str) -> Result<bool, Waf
     Ok(!rows.is_empty())
 }
 
-/// Whether a write refused with `error` was refused because `user_id`
-/// already holds `role` — the unique index over `(user_id, role)`.
-///
-/// Classified the way [`crate::blocks::crud::taken_key_or_db_error`]
-/// classifies a unique-index collision, and for the same reasons: a backend
-/// that says `AlreadyExists` has answered; one that reports `Internal` or
-/// `Aborted` may be a constraint violation it did not classify, so the pair is
-/// re-read AFTER the refusal, when the row that refused it is there to be
-/// found; any other code (a WRAP refusal, a quota) is not a collision. A
-/// re-read that itself fails is "could not tell", which keeps the write's own
-/// error rather than guessing.
-async fn refused_as_held(ctx: &dyn Context, user_id: &str, role: &str, error: &WaferError) -> bool {
-    match error.code {
-        ErrorCode::AlreadyExists => true,
-        ErrorCode::Internal | ErrorCode::Aborted => match holds(ctx, user_id, role).await {
-            Ok(held) => held,
-            Err(probe_error) => {
-                tracing::warn!(
-                    error = %probe_error,
-                    "could not re-read the grant a refused user_roles write may have collided with",
-                );
-                false
-            }
-        },
-        _ => false,
-    }
-}
-
 /// Grant `role` to `user_id` unless they already hold it. `assigned_by` is
 /// the granting admin's id, or empty for a grant the system makes. The
 /// single writer for this table.
@@ -292,9 +264,9 @@ pub async fn assign(
     };
     let rec = match db::create(ctx, TABLE, row.to_data()).await {
         Ok(rec) => rec,
-        Err(e) if refused_as_held(ctx, user_id, role, &e).await => {
-            return Ok(Assigned::AlreadyAssigned)
-        }
+        // The unique index over `(user_id, role)` refused it: the grant is
+        // held. `AlreadyExists` is how every backend reports that.
+        Err(e) if e.code == ErrorCode::AlreadyExists => return Ok(Assigned::AlreadyAssigned),
         Err(e) => return Err(e),
     };
     UserRoleRow::from_record(&rec.id, &rec.data)
@@ -318,9 +290,7 @@ pub async fn rename_role(
     data.insert("updated_at".to_string(), json!(crate::util::now_rfc3339()));
     match db::update(ctx, TABLE, &grant.id, data).await {
         Ok(_) => Ok(()),
-        Err(e) if refused_as_held(ctx, &grant.user_id, new_role, &e).await => {
-            remove(ctx, &grant.id).await
-        }
+        Err(e) if e.code == ErrorCode::AlreadyExists => remove(ctx, &grant.id).await,
         Err(e) => Err(e),
     }
 }

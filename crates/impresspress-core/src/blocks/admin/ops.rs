@@ -240,11 +240,10 @@ pub(super) async fn update_user_fields(
 // Role mutations
 // ---------------------------------------------------------------------------
 
-/// Whether a role called `name` exists. The probe [`create_role`] hands to
-/// [`taken_key_or_db_error`], and the check `iam::handle_assign_role` makes
-/// before granting one; `roles.name` is UNIQUE, so one row is all there can
-/// be and a `NotFound` from the lookup is the "free" answer rather than a
-/// failure.
+/// Whether a role called `name` exists — the check `iam::handle_assign_role`
+/// makes before granting one. `roles.name` is UNIQUE, so one row is all there
+/// can be and a `NotFound` from the lookup is the "no such role" answer rather
+/// than a failure.
 pub(super) async fn role_name_taken(
     ctx: &dyn Context,
     name: &str,
@@ -292,13 +291,11 @@ pub(super) async fn create_role(
         Err(e) => {
             return Err(taken_key_or_db_error(
                 e,
-                role_name_taken(ctx, name),
                 &format!(
                     "A role named \"{name}\" already exists. Edit that role, or pick another name."
                 ),
                 "Database error",
-            )
-            .await)
+            ))
         }
     };
 
@@ -1047,14 +1044,12 @@ pub(super) async fn create_variable(
         Err(e) => {
             return Err(taken_key_or_db_error(
                 e,
-                async { variables::get_by_key(ctx, key).await.map(|r| r.is_some()) },
                 &format!(
                     "A variable named \"{key}\" already exists. Edit that variable, or pick \
                      another key."
                 ),
                 "Database error",
-            )
-            .await)
+            ))
         }
     };
 
@@ -1480,9 +1475,9 @@ mod tests {
     ///
     /// `DatabaseService::create` may answer with the row it stored or with an
     /// acknowledgement. `variables::insert` used to decode that echo and return
-    /// the decode failure as an error — and a failed insert is classified by
-    /// re-reading the key, which found the row this very request had just
-    /// written. The admin was told the key already existed, the
+    /// the decode failure as an error — and a failed insert was then
+    /// classified by re-reading the key, which found the row this very request
+    /// had just written. The admin was told the key already existed, the
     /// `variable.create` audit row was skipped, and the untracked row made
     /// every retry conflict forever. The write succeeded, so the answer has to
     /// say so.
@@ -1515,7 +1510,7 @@ mod tests {
     /// is.
     ///
     /// The other half of the same rule, with a different consequence.
-    /// `update_variable` runs no duplicate-key probe, so a decode failure after
+    /// `update_variable` never answers a conflict, so a decode failure after
     /// a committed `db::update` was "only" a 500 — but it returned BEFORE
     /// `audit_log`, so the edit happened and nothing recorded it. An audit
     /// trail that is missing a change it should contain cannot be told apart

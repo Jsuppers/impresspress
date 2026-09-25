@@ -516,12 +516,12 @@ async fn restore_product(ctx: &dyn Context, id: &str) -> OutputStream {
     // Soft delete FREES the product's slug — migration 005's unique index is
     // partial on `deleted_at IS NULL` — and nothing stops a product created
     // afterwards from claiming it. Restoring the original then violates that
-    // index's `(owner_kind, owner_id, slug)` key, which arrives here as a
-    // generic database failure and would go out as an opaque 500. The
-    // Deleted view's Restore button only reloads on success, so that 500 is
-    // invisible: the one door out of soft delete would appear to do nothing
-    // at all. Name the collision instead, so an admin can free the slug and
-    // retry.
+    // index's `(owner_kind, owner_id, slug)` key, which arrives here as
+    // `AlreadyExists`: the only unique key a restore's `UPDATE` can collide
+    // on, since it changes nothing but `deleted_at`. The Deleted view's
+    // Restore button only reloads on success, so a refusal that names nothing
+    // leaves the one door out of soft delete looking broken. Name the
+    // collision instead, so an admin can free the slug and retry.
     //
     // The write is what asks the question. This used to be a pre-check
     // *before* `restore`, which left the answer stale by exactly the gap
@@ -536,67 +536,63 @@ async fn restore_product(ctx: &dyn Context, id: &str) -> OutputStream {
     // `SlugProbe::Clear` arm below for what is done about that.
     match repo::products::restore(ctx, id).await {
         Ok(record) => product_json(&record),
-        // The filtered write matched zero rows: no such product, or one that
-        // was never deleted. Never a slug collision, so it does not go near
-        // the probe.
-        Err(e) if e.code == ErrorCode::NotFound => write_error(e, RESTORE_FAILED),
-        Err(e) => match restore_slug_conflict(ctx, id).await {
-            SlugProbe::Claimed(slug) => slug_taken(&slug),
-            // Nothing holds the slug, so nothing stands between this product
-            // and the catalog — try again rather than reporting a failure the
-            // database would no longer produce.
-            //
-            // The probe reads rows that go on changing after the write it is
-            // explaining, which is the one thing writing first does NOT fix:
-            // a claimant renamed or deleted in that gap leaves the probe with
-            // nothing to blame, and a clear probe reported as-is would send
-            // back the opaque 500 this whole branch exists to avoid — for a
-            // restore that would now succeed. A clear probe is therefore a
-            // reason to retry, not an answer.
-            //
-            // Exactly one retry, and its failure is CLASSIFIED rather than
-            // forwarded. The retry is itself a write, so the gap the probe
-            // closed reopens behind it: a claimant arriving between the clear
-            // probe and the retry violates the same index the first write
-            // did, and handing that second error to `write_error` gave back
-            // the very 500 this branch exists to avoid — on a request that is
-            // a slug conflict, whose slug the probe has right here. A retry
-            // LOOP is not the fix: a competing request is free to go on
-            // re-claiming the slug, and the answer worth giving (someone
-            // holds it; free it and restore again) is already known.
-            //
-            // One retry stays safe for the reason it always was: `restore`
-            // only clears `deleted_at` on the same already-deleted row, so
-            // repeating it creates no duplicate record and no ancillary
-            // state.
-            //
-            // (The write's own error does say which index refused it —
-            // `AlreadyExists` on every backend in this workspace — but not
-            // which live product holds the slug, and not whether it still
-            // does. The probe is what names the claimant, and a clear probe
-            // is what says the restore would now go through.)
-            SlugProbe::Clear(slug) => match repo::products::restore(ctx, id).await {
-                Ok(record) => product_json(&record),
-                // The row stopped being a deleted product in the meantime —
-                // a concurrent restore landed first, or it was purged. That
-                // is not this caller's slug conflict, and the 404 every other
-                // product endpoint gives for a row it cannot act on is the
-                // honest answer. Same reasoning as the first write's
-                // `NotFound` arm above.
-                Err(again) if again.code == ErrorCode::NotFound => {
-                    write_error(again, RESTORE_FAILED)
-                }
-                // Refused twice with a clear probe in between: the slug was
-                // free when it was read and is not free now, which is a
-                // claimant that arrived in the gap. Report the conflict.
-                Err(_) => slug_taken(&slug),
-            },
-            // The probe could not run. "Could not tell" is not "clear" — a
-            // retry would be guessing — and it is not "conflict" either, so
-            // the write's own error is the one worth recording, against a
-            // correlation id the admin can quote.
-            SlugProbe::Unknown => write_error(e, RESTORE_FAILED),
-        },
+        // The index refused the write. Anything else — the filtered write
+        // matching zero rows (no such product, or one never deleted), a fault
+        // — is not a slug collision and does not go near the probe.
+        Err(e) if e.code == ErrorCode::AlreadyExists => {
+            match restore_slug_conflict(ctx, id).await {
+                SlugProbe::Claimed(slug) => slug_taken(&slug),
+                // Nothing holds the slug, so nothing stands between this product
+                // and the catalog — try again rather than reporting a failure the
+                // database would no longer produce.
+                //
+                // The probe reads rows that go on changing after the write it is
+                // explaining, which is the one thing writing first does NOT fix:
+                // a claimant renamed or deleted in that gap leaves the probe with
+                // nothing to blame, and reporting the first write's refusal would
+                // turn away a restore that would now succeed. A clear probe is therefore a
+                // reason to retry, not an answer.
+                //
+                // Exactly one retry, and its failure is CLASSIFIED rather than
+                // forwarded. The retry is itself a write, so the gap the probe
+                // closed reopens behind it: a claimant arriving between the clear
+                // probe and the retry violates the same index the first write
+                // did, and handing that second error to `write_error` would answer
+                // a conflict that names no slug — on a request whose slug the
+                // probe has right here. A retry
+                // LOOP is not the fix: a competing request is free to go on
+                // re-claiming the slug, and the answer worth giving (someone
+                // holds it; free it and restore again) is already known.
+                //
+                // One retry stays safe for the reason it always was: `restore`
+                // only clears `deleted_at` on the same already-deleted row, so
+                // repeating it creates no duplicate record and no ancillary
+                // state.
+                //
+                // (The write's own error says the slug was taken when it ran, but
+                // not whether it still is. A clear probe is what says the restore
+                // would now go through.)
+                SlugProbe::Clear(slug) => match repo::products::restore(ctx, id).await {
+                    Ok(record) => product_json(&record),
+                    // Refused twice with a clear probe in between: the slug was
+                    // free when it was read and is not free now, which is a
+                    // claimant that arrived in the gap. Report the conflict.
+                    Err(again) if again.code == ErrorCode::AlreadyExists => slug_taken(&slug),
+                    // Anything else is the retry's own failure. A `NotFound` is
+                    // the row having stopped being a deleted product in the
+                    // meantime — a concurrent restore landed first, or it was
+                    // purged — which is not this caller's slug conflict, and the
+                    // 404 every other product endpoint gives for a row it cannot
+                    // act on is the honest answer.
+                    Err(again) => write_error(again, RESTORE_FAILED),
+                },
+                // The probe could not run. "Could not tell" is not "clear" — a
+                // retry would be guessing — so the write's own answer stands: the
+                // 409 its `AlreadyExists` is, without a slug to name.
+                SlugProbe::Unknown => write_error(e, RESTORE_FAILED),
+            }
+        }
+        Err(e) => write_error(e, RESTORE_FAILED),
     }
 }
 

@@ -394,10 +394,10 @@ fn gated_block(rel: &str) -> Option<&'static str> {
 ///   failed config read goes through the door like a database one), a
 ///   serialization or the OS RNG.
 /// - **Classified**: the cause already went through
-///   `crud::classify_db_error` and came back `Internal` — its WRAP denials and
-///   quotas were answered before this call. `dev::seal_no_store` is the one:
-///   it seals the dev block's failures with `Cache-Control: no-store`, which
-///   `crud`'s own sealer cannot add.
+///   `crud::classify_db_error` and came back `Internal` — its WRAP denials,
+///   quotas and duplicate keys were answered before this call.
+///   `dev::seal_no_store` is the one: it seals the dev block's failures with
+///   `Cache-Control: no-store`, which `crud`'s own sealer cannot add.
 ///
 /// The gate compares counts both ways. A label that is not listed, or that
 /// appears more often than listed, is a new tail: route it through the door
@@ -735,7 +735,8 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
             label: "context",
             count: 1,
             why: "classified: `seal_no_store`'s `DbFailure::Internal` arm, after \
-                  `crud::classify_db_error` answered WRAP denials and quotas",
+                  `crud::classify_db_error` answered WRAP denials, quotas and \
+                  duplicate keys",
         }],
     ),
 ];
