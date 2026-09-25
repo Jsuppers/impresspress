@@ -305,6 +305,49 @@ mod tests {
         }
     }
 
+    /// Drive the load route against the stub service and return its SSE body,
+    /// or the terminal the stream ended on instead of completing.
+    async fn load_body(stub: StubLlmServiceBlock) -> Result<String, TerminalNotResponse> {
+        let ctx = ctx_with(stub).await;
+        let out = load_model(
+            &stub_block(),
+            &ctx,
+            &routed(admin_msg(
+                "create",
+                "/b/llm/api/models/openai-main/gpt-4o/load",
+            )),
+        )
+        .await;
+        let buf = out.collect_buffered().await?;
+        Ok(String::from_utf8(buf.body).expect("SSE body is utf8"))
+    }
+
+    /// A load that finishes is a whole SSE response: `[DONE]`, then a
+    /// completed stream. The producer has to end it itself; a stream it lets
+    /// go of without a terminal is an error to every consumer, which a
+    /// buffering transport answers with a 500.
+    #[tokio::test]
+    async fn a_finished_model_load_ends_in_done_and_completes() {
+        let body = load_body(StubLlmServiceBlock::default())
+            .await
+            .expect("a finished load completes");
+        assert_eq!(body, "data: [DONE]\n\n");
+    }
+
+    /// A load the service refuses ends in the in-band error frame, and the
+    /// stream still completes: the frame is the failure signal, and the body
+    /// that carries it is whole.
+    #[tokio::test]
+    async fn a_refused_model_load_ends_in_an_error_frame_and_completes() {
+        let body = load_body(StubLlmServiceBlock {
+            error: Some((ErrorCode::NotFound, "no such model".to_string())),
+            ..Default::default()
+        })
+        .await
+        .expect("an SSE body ending in the error frame completes");
+        assert_eq!(body, "event: error\ndata: {}\n\n");
+    }
+
     #[tokio::test]
     async fn unload_model_requires_path_vars() {
         let block = stub_block();

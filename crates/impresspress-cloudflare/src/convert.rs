@@ -172,9 +172,13 @@ fn apply_parts_to_headers(headers: &Headers, parts: &[ResponseMetaPart<'_>]) -> 
 
 /// Build a streaming Worker `Response`: status + headers from the leading meta
 /// (applied *before* the body finishes), body piped chunk-by-chunk into the
-/// Worker's native `ReadableStream`. A body-read `Error` terminal surfaces as a
-/// stream error (aborting the response body) rather than a silent truncation —
-/// the HTTP status is already committed, so it cannot be downgraded to 413.
+/// Worker's native `ReadableStream`. Every ending
+/// [`streaming::download_body_stream`] frames as an `Err` — an `Error`
+/// terminal (a body-read failure, or a producer that stopped without a
+/// terminal), no terminal at all, a `Halt` after the body started — surfaces
+/// as a stream error (aborting the response body) rather than a silent
+/// truncation: the HTTP status is already committed, so it cannot be
+/// downgraded to 413 or 500.
 ///
 /// For the same reason, leading meta no transport can send is answered with
 /// the codec's `unsendable_response` here, before a status or a byte is
@@ -366,7 +370,7 @@ mod response_tests {
         streaming::{META_RESP_STREAM, STREAM_MARKER_VALUE},
     };
     use wafer_block::{meta::META_RESP_CONTENT_TYPE, MetaEntry};
-    use wafer_run::OutputStream;
+    use wafer_run::{ErrorCode as WaferErrorCode, OutputStream, WaferError};
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::output_to_response;
@@ -405,6 +409,72 @@ mod response_tests {
         let body: serde_json::Value =
             serde_json::from_str(&resp.text().await.expect("read body")).expect("a JSON body");
         assert_eq!(body["error"], "Internal");
+    }
+
+    /// A streamed body is aborted, not ended, when it fails part-way: by
+    /// then the status is committed, so the aborted body is the only signal
+    /// that the bytes are not whole. Two ways a body fails: an `Error`
+    /// terminal, and a producer that stops without one, which wafer-run ends
+    /// with an `Error` of its own.
+    #[wasm_bindgen_test]
+    async fn a_body_that_fails_part_way_is_aborted_not_ended() {
+        for explicit_error in [true, false] {
+            let stream = OutputStream::from_producer(move |sink, _cancel| async move {
+                for (key, value) in [
+                    (META_RESP_STREAM, STREAM_MARKER_VALUE),
+                    (META_RESP_CONTENT_TYPE, "application/pdf"),
+                ] {
+                    let _ = sink
+                        .send_meta(MetaEntry {
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        })
+                        .await;
+                }
+                let _ = sink.send_chunk(b"%PDF-1.7 first half".to_vec()).await;
+                if explicit_error {
+                    let _ = sink
+                        .error(WaferError::new(
+                            WaferErrorCode::Unavailable,
+                            "object read failed",
+                        ))
+                        .await;
+                }
+            });
+
+            let mut resp = output_to_response(stream).await.expect("build response");
+
+            assert_eq!(resp.status_code(), 200);
+            assert!(
+                resp.bytes().await.is_err(),
+                "a truncated body must not read back as complete (explicit error: {explicit_error})"
+            );
+        }
+    }
+
+    /// The same path without a failure delivers every byte.
+    #[wasm_bindgen_test]
+    async fn a_streamed_body_delivers_every_chunk() {
+        let stream = OutputStream::from_producer(|sink, _cancel| async move {
+            for (key, value) in [
+                (META_RESP_STREAM, STREAM_MARKER_VALUE),
+                (META_RESP_CONTENT_TYPE, "application/pdf"),
+            ] {
+                let _ = sink
+                    .send_meta(MetaEntry {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    })
+                    .await;
+            }
+            let _ = sink.send_chunk(b"one ".to_vec()).await;
+            let _ = sink.send_chunk(b"two".to_vec()).await;
+            let _ = sink.complete(Vec::new()).await;
+        });
+
+        let mut resp = output_to_response(stream).await.expect("build response");
+
+        assert_eq!(resp.text().await.expect("read body"), "one two");
     }
 
     /// **Fails before wafer-run 9a080676**, whose codec rendered an error as

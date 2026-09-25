@@ -4,6 +4,15 @@
 //! the same terminal frames ([`SSE_DONE_FRAME`] / [`SSE_ERROR_FRAME`]) via
 //! the shared [`sse_json_frame`] encoder, so the wire format can't drift
 //! between them.
+//!
+//! Every SSE response ends in one of those two terminal frames followed by an
+//! explicit `Complete` ([`finish_sse`]). The error frame is the in-band
+//! failure signal, and a body that ends in it is whole: by the time it is
+//! sent the status line and every earlier frame are on the wire on a
+//! streaming transport, and an `Error` terminal would only abort that body,
+//! or turn it into a 500 on a buffering one, discarding the frame that says
+//! what happened. The one path without a terminal is a consumer that has
+//! already gone away, where there is no one left to send one to.
 
 use std::sync::Arc;
 
@@ -41,6 +50,16 @@ fn sse_json_frame<T: serde::Serialize>(item: &T) -> Option<Vec<u8>> {
     frame.extend_from_slice(&json);
     frame.extend_from_slice(b"\n\n");
     Some(frame)
+}
+
+/// End an SSE response: send `frame` (one of [`SSE_DONE_FRAME`] /
+/// [`SSE_ERROR_FRAME`]) and then the `Complete` terminal. A frame the
+/// consumer is no longer there to receive ends the producer without a
+/// terminal; the dropped sink then closes the stream as an error nobody reads.
+async fn finish_sse(sink: OutputSink, frame: &[u8]) {
+    if sink.send_chunk(frame.to_vec()).await.is_ok() {
+        let _ = sink.complete(Vec::new()).await;
+    }
 }
 
 /// Send the `text/event-stream` content-type as a mid-stream meta event so
@@ -103,7 +122,7 @@ where
         let mut truncated = false;
         while let Some(item) = stream.next().await {
             let Ok(chunk) = item else {
-                let _ = sink.send_chunk(SSE_ERROR_FRAME.to_vec()).await;
+                finish_sse(sink, SSE_ERROR_FRAME).await;
                 return;
             };
             if let ChunkDelta::Text(s) = &chunk.delta {
@@ -120,7 +139,7 @@ where
                 }
             }
             let Some(frame) = sse_json_frame(&chunk) else {
-                let _ = sink.send_chunk(SSE_ERROR_FRAME.to_vec()).await;
+                finish_sse(sink, SSE_ERROR_FRAME).await;
                 return;
             };
             if sink.send_chunk(frame).await.is_err() {
@@ -160,11 +179,11 @@ where
                 error = %error,
                 "llm streamed assistant turn was delivered but could not be stored"
             );
-            let _ = sink.send_chunk(SSE_ERROR_FRAME.to_vec()).await;
+            finish_sse(sink, SSE_ERROR_FRAME).await;
             return;
         }
 
-        let _ = sink.send_chunk(SSE_DONE_FRAME.to_vec()).await;
+        finish_sse(sink, SSE_DONE_FRAME).await;
     })
 }
 
@@ -194,14 +213,14 @@ where
             // terminate the stream with a final `event: error` frame, so the
             // consumer sees a clean SSE event instead of an abrupt disconnect.
             let Some(frame) = item.ok().and_then(|v| sse_json_frame(&v)) else {
-                let _ = sink.send_chunk(SSE_ERROR_FRAME.to_vec()).await;
+                finish_sse(sink, SSE_ERROR_FRAME).await;
                 return;
             };
             if sink.send_chunk(frame).await.is_err() {
                 return;
             }
         }
-        let _ = sink.send_chunk(SSE_DONE_FRAME.to_vec()).await;
+        finish_sse(sink, SSE_DONE_FRAME).await;
     })
 }
 
@@ -281,7 +300,7 @@ mod tests {
         let buf = out
             .collect_buffered()
             .await
-            .expect("producer auto-completes");
+            .expect("the error frame ends a whole SSE body, so the stream completes");
         let body = String::from_utf8(buf.body).expect("SSE body is utf8");
 
         assert!(

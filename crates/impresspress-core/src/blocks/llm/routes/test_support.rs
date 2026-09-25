@@ -397,7 +397,7 @@ impl Block for StubLlmServiceBlock {
             ),
             ServiceOp::LLM_UNLOAD_MODEL => OutputStream::respond(Vec::new()),
             // A load that finishes at once: no progress frames.
-            ServiceOp::LLM_LOAD_MODEL => OutputStream::from_producer(|_sink, _cancel| async {}),
+            ServiceOp::LLM_LOAD_MODEL => OutputStream::respond_with_meta(Vec::new(), Vec::new()),
             ServiceOp::LLM_CHAT => {
                 self.chat_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -412,6 +412,7 @@ impl Block for StubLlmServiceBlock {
                             return;
                         }
                     }
+                    let _ = sink.complete(Vec::new()).await;
                 })
             }
             other => OutputStream::error(WaferError::new(

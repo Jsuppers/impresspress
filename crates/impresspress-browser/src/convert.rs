@@ -416,11 +416,12 @@ fn make_response(
 ///
 /// The framing is [`streaming::download_body_stream`] — the same function the
 /// Cloudflare adapter pipes into its Worker `ReadableStream`, so the two agree
-/// on what a mid-body failure means: an `Error` terminal becomes an `Err`
-/// item, which errors the JS stream and aborts the response body. Every other
-/// event that is not a `Chunk` (mid-body `Meta`, and each of the non-error
-/// terminals) is filtered out rather than forwarded, and the body simply ends
-/// when the `OutputStream` does.
+/// on what a mid-body failure means: an `Error` terminal (which is also how
+/// wafer-run ends a stream whose producer stopped without a terminal), a
+/// stream with no terminal at all, or a `Halt` after the body started becomes
+/// an `Err` item, which errors the JS stream and aborts the response body.
+/// Mid-body `Meta` is dropped, and a `Complete`, `Drop` or `Continue` terminal
+/// ends the body cleanly.
 ///
 /// The status is already committed by the time a body read fails, so an error
 /// cannot be downgraded to a 413/500 — but a reader that gets an abort knows
@@ -1000,6 +1001,32 @@ mod response_tests {
         assert!(
             read.is_err(),
             "a truncated download must not read back as a complete body"
+        );
+    }
+
+    /// A producer that stops mid-body without a terminal — it returned early,
+    /// panicked or was cancelled — aborts the body too. wafer-run ends such a
+    /// stream with an `Error` terminal, and the status is already committed,
+    /// so the aborted body is the only way left to say the file is not whole.
+    #[wasm_bindgen_test]
+    async fn a_producer_that_stops_mid_body_aborts_the_body() {
+        let stream = OutputStream::from_producer(|sink, _cancel| async move {
+            let _ = sink
+                .send_meta(meta(META_RESP_STREAM, STREAM_MARKER_VALUE))
+                .await;
+            let _ = sink
+                .send_meta(meta(META_RESP_CONTENT_TYPE, "application/pdf"))
+                .await;
+            let _ = sink.send_chunk(b"%PDF-1.7 first half".to_vec()).await;
+        });
+
+        let resp = output_to_response(stream).await.expect("build response");
+
+        assert_eq!(resp.status(), 200);
+        let read = JsFuture::from(resp.array_buffer().expect("array_buffer")).await;
+        assert!(
+            read.is_err(),
+            "a body cut off without a terminal must not read back as complete"
         );
     }
 
