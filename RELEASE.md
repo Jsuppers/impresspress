@@ -37,13 +37,16 @@ two ship together but only one of them runs by default.
   the same route (`{id}` and `{item_id}` count as the same).
 - `WAFER_RUN__FASTEMBED__CACHE_DIR` is no longer read. A build with
   `block-fastembed` or `native-embedding` passes the model cache directory to
-  `ImpresspressBuilder::model_cache_dir` and is refused without one. No
-  shipped binary enables either feature.
+  `ImpresspressBuilder::model_cache_dir` and is refused without one. The
+  `impresspress` binary passes `IMPRESSPRESS_MODEL_CACHE_DIR` (default
+  `data/models`, the directory the old variable defaulted to); both features
+  are off in its default build.
 
-**Who has to act.** A consumer building with `block-fastembed` or
-`native-embedding`: call `.model_cache_dir(...)` (pass `data/models` to keep
-the weights already downloaded there). Nobody else: the environment variables
-keep their names and meaning.
+**Who has to act.** A native deployment built with `native-embedding` that
+set `WAFER_RUN__FASTEMBED__CACHE_DIR`: set `IMPRESSPRESS_MODEL_CACHE_DIR` to
+the same directory. A consumer calling `ImpresspressBuilder` with either
+feature: call `.model_cache_dir(...)`. Nobody else: the other variables keep
+their names and meaning.
 
 ### Config: a read that fails is an error, not the default
 

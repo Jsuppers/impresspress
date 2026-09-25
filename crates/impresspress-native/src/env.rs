@@ -103,6 +103,7 @@ const DB_PATH_VAR: &str = "IMPRESSPRESS_DB_PATH";
 const DB_URL_VAR: &str = "IMPRESSPRESS_DB_URL";
 const STORAGE_TYPE_VAR: &str = "IMPRESSPRESS_STORAGE_TYPE";
 const STORAGE_ROOT_VAR: &str = "IMPRESSPRESS_STORAGE_ROOT";
+const MODEL_CACHE_DIR_VAR: &str = "IMPRESSPRESS_MODEL_CACHE_DIR";
 const TRUSTED_PROXIES_VAR: &str = "IMPRESSPRESS_TRUSTED_PROXIES";
 const HEADER_READ_TIMEOUT_VAR: &str = "IMPRESSPRESS_HEADER_READ_TIMEOUT_SECS";
 const BODY_READ_TIMEOUT_VAR: &str = "IMPRESSPRESS_BODY_READ_TIMEOUT_SECS";
@@ -177,6 +178,11 @@ pub struct InfraConfig {
     pub db_url: Option<String>,
     pub storage_type: String,
     pub storage_root: String,
+    /// Where the native ONNX embedding model's weights are cached
+    /// (`IMPRESSPRESS_MODEL_CACHE_DIR`), handed to
+    /// `ImpresspressBuilder::model_cache_dir`. Read only by a build with
+    /// the `native-embedding` feature.
+    pub model_cache_dir: String,
     pub listener: ListenerEnv,
 }
 
@@ -189,6 +195,7 @@ impl InfraConfig {
             db_url: std::env::var(DB_URL_VAR).ok(),
             storage_type: env_or(STORAGE_TYPE_VAR, "local"),
             storage_root: env_or(STORAGE_ROOT_VAR, "data/storage"),
+            model_cache_dir: env_or(MODEL_CACHE_DIR_VAR, "data/models"),
             listener: ListenerEnv::from_vars(|key| std::env::var(key).ok()),
         }
     }
@@ -206,6 +213,7 @@ impl std::fmt::Debug for InfraConfig {
             )
             .field("storage_type", &self.storage_type)
             .field("storage_root", &self.storage_root)
+            .field("model_cache_dir", &self.model_cache_dir)
             .field("listener", &self.listener)
             .finish()
     }
@@ -224,6 +232,7 @@ mod infra_config_tests {
             db_url: Some("postgres://app:hunter2@db.internal:5432/prod".into()),
             storage_type: "local".into(),
             storage_root: "data/storage".into(),
+            model_cache_dir: "data/models".into(),
             listener: super::ListenerEnv::default(),
         };
         let shown = format!("{infra:?}");

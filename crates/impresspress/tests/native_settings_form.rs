@@ -49,6 +49,7 @@ fn infra_for(db_path: &Path, storage_root: &Path) -> InfraConfig {
             .to_str()
             .expect("storage root is valid utf-8")
             .to_string(),
+        model_cache_dir: "data/models".to_string(),
         listener: Default::default(),
     }
 }
