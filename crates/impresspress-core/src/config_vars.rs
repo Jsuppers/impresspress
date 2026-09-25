@@ -916,6 +916,21 @@ mod csp_rule_tests {
     use super::{check_config_value, CSP_DIRECTIVES_KEY, DEFAULT_CSP_DIRECTIVES};
     use crate::test_support::TestContext;
 
+    /// A value rule for an undeclared key would never run where an export is
+    /// named: the native seeder only sees declared keys, and
+    /// `variables::usable_env_exports` drops a refused export without logging
+    /// on the strength of that.
+    #[test]
+    fn every_value_rule_names_a_declared_key() {
+        for rule in super::config_value_rules() {
+            assert!(
+                super::is_declared_key(rule.key),
+                "{} has a value rule but no declaring ConfigVar",
+                rule.key
+            );
+        }
+    }
+
     /// The shipped default is a policy the security-headers merge takes whole.
     #[test]
     fn the_default_policy_passes_its_own_rule() {

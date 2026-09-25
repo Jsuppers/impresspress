@@ -1130,8 +1130,9 @@ async fn seed_one_secret(
 /// `cli::server_config::filter_to_declared_keys` drops every undeclared key —
 /// so this guard is defence in depth for a caller that assembles its own
 /// batch, not the thing standing between the process environment and the
-/// table. Its coverage lives in this module's unit tests, because nothing on
-/// the native path can reach it.
+/// table. (The same check does stand between the environment and native's
+/// blocks: [`usable_env_exports`] applies it to the unfiltered app
+/// environment.)
 ///
 /// This path does **not** carry the JWT signing secret, even though
 /// [`crate::config_vars::is_instance_owned_key`] names it as the one
@@ -1177,26 +1178,21 @@ pub async fn seed_and_load(
     // ones the summary line may point at it for.
     let mut upgrade_pins = 0usize;
     for (key, value) in env_vars {
-        if crate::config_vars::is_runtime_owned_key(key) {
-            tracing::warn!(
-                key = %key,
-                "refusing to store a runtime-owned key from the environment; \
-                 infrastructure and adapter-injected keys are never variables-table config"
-            );
-            continue;
-        }
-        if value.is_empty() {
-            continue;
-        }
-        // The key's declared value rule DOES apply here, unlike the URL guard
-        // below: it is about what the value means to its reader, not about who
-        // supplied it. Storing a value the reader refuses would fail that
-        // reader on every call (an out-of-range session lifetime fails every
-        // login), so the export is skipped and named; the stored value, else
-        // the declared default, stays in effect.
-        if let Err(e) = crate::config_vars::check_config_value(key, value) {
-            log_refused_env_value(key, value, &e);
-            continue;
+        match check_env_export(key, value) {
+            Ok(()) => {}
+            Err(EnvRefusal::RuntimeOwned) => {
+                tracing::warn!(
+                    key = %key,
+                    "refusing to store a runtime-owned key from the environment; \
+                     infrastructure and adapter-injected keys are never variables-table config"
+                );
+                continue;
+            }
+            Err(EnvRefusal::Empty) => continue,
+            Err(EnvRefusal::ValueRule(e)) => {
+                log_refused_env_value(key, value, &e);
+                continue;
+            }
         }
         // Deliberately NOT `util::validate_url_value`, the guard
         // `blocks::config`'s `CONFIG_SET` and `admin::ops::update_variable`
@@ -1316,6 +1312,55 @@ pub async fn seed_and_load(
         .into_iter()
         .map(|loaded| (loaded.row.key, loaded.row.value))
         .collect())
+}
+
+/// Why an environment export does not configure its key.
+enum EnvRefusal {
+    /// [`crate::config_vars::is_runtime_owned_key`]: never stored config.
+    RuntimeOwned,
+    /// Blank means unset, so the export must not blank out anything.
+    Empty,
+    /// The key's declared value rule refused the value, for this reason.
+    ValueRule(String),
+}
+
+/// The checks every environment export must pass before it configures its
+/// key, whichever surface it would configure: [`seed_and_load`] applies them
+/// before storing a row, and [`usable_env_exports`] before handing the export
+/// to the blocks' `ConfigSource`.
+///
+/// The key's declared value rule DOES apply, unlike the URL guard
+/// [`seed_and_load`] deliberately leaves out: it is about what the value means to its reader, not
+/// about who supplied it. Handing a reader a value it refuses would fail that
+/// reader on every call (an out-of-range session lifetime fails every login),
+/// so the export is refused; the stored value, else the declared default,
+/// stays in effect.
+fn check_env_export(key: &str, value: &str) -> Result<(), EnvRefusal> {
+    if crate::config_vars::is_runtime_owned_key(key) {
+        return Err(EnvRefusal::RuntimeOwned);
+    }
+    if value.is_empty() {
+        return Err(EnvRefusal::Empty);
+    }
+    crate::config_vars::check_config_value(key, value).map_err(EnvRefusal::ValueRule)
+}
+
+/// The exports in `app_env` that may configure their key: every one
+/// [`check_env_export`] accepts, the same verdict [`seed_and_load`] reaches
+/// before storing a row.
+///
+/// Native's blocks resolve their declared keys from the variables table, then
+/// from these, so an export the seeder refused must not reach a block through
+/// this second route. Nothing is logged here: every key with a value rule is
+/// a declared key (`config_vars`' `every_value_rule_names_a_declared_key`
+/// holds that), and [`seed_and_load`] has already named a refused export of
+/// one at ERROR.
+pub fn usable_env_exports(app_env: &HashMap<String, String>) -> HashMap<String, String> {
+    app_env
+        .iter()
+        .filter(|(key, value)| check_env_export(key, value).is_ok())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// Name an environment export a boot seeder refused for failing its key's

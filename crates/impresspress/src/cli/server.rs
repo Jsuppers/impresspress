@@ -123,8 +123,9 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 ///
 /// `app_env` is the process environment's app config — every key carrying
 /// `__` (`collect_app_env_vars`). Its declared keys seed the variables table;
-/// the whole map is also the fallback the blocks' `ConfigSource` resolves
-/// from, beneath the table (see the `config_source` call below).
+/// every export the seeder's checks accept is also the fallback the blocks'
+/// `ConfigSource` resolves from, beneath the table (see the `config_source`
+/// call below).
 ///
 /// `run()` calls this with the service it built from `infra`; the integration
 /// tests call it with a service they seeded first, so what they exercise is
@@ -303,8 +304,11 @@ pub async fn build_native_runtime(
     // `filter_to_declared_keys` keeps out of the table (they are operator
     // deploy decisions, not admin-editable rows) and which those blocks read
     // from their `lifecycle(Init)` config alone — neither consults
-    // `config_get` or the process environment itself.
-    let mut block_config = app_env.clone();
+    // `config_get` or the process environment itself. Only the exports the
+    // seeder would accept take part (`usable_env_exports`), so one it refused
+    // for its key's value rule cannot reach a block's Init this way instead.
+    let mut block_config =
+        impresspress_core::platform_state::variables::usable_env_exports(app_env);
     block_config.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
     let wafer = with_config
         .config_source(Arc::new(wafer_run::StaticConfigSource::new(block_config)))
