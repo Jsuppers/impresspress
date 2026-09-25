@@ -130,7 +130,7 @@ export async function dbFlush() {
 // single source of truth (no separate `storage_paths.mjs` copy to drift
 // out of sync). bridge.js's other top-level import
 // (`/vendor/sql-wasm-esm.js`) doesn't resolve under plain Node, so the
-// test run stubs it via `js/test/node-hooks.mjs`
+// test run resolves it to the vendored build via `js/test/node-hooks.mjs`
 // (`node --import ./js/test/node-hooks.mjs --test ...`); see that file's
 // header comment. These helpers ARE also reachable from real
 // request-handling code (storagePut/storageGet/storageDelete/storageList
