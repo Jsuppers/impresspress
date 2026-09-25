@@ -143,13 +143,14 @@ fn secret(env: &worker::Env, name: &str) -> Option<String> {
 /// `wafer-core` does.
 ///
 /// This deliberately mirrors `wafer-core`'s private `config_flag_enabled`
-/// (`interfaces/database/handler.rs`), which is what
-/// `handle_lifecycle` applies at `Init`: trimmed, `"true"` case-insensitively
-/// or `"1"`, and nothing else. Both readings are of the *same* var — the
-/// constructor's, through [`CfEnvironment::strict_schema_enabled`], and
-/// `Init`'s, through `ctx.config_get` on a config map this environment fills
-/// (`BUILDER_WORKER_VAR_KEYS`) — so a value the two disagreed about would put a
-/// runtime's own D1 service and its drain handle into different modes.
+/// (`interfaces/database/handler.rs`), which is what `strict_schema_from`
+/// applies to the database block's `Init` config: trimmed, `"true"`
+/// case-insensitively or `"1"`, and nothing else. Both readings are of the
+/// *same* var — the constructor's, through
+/// [`CfEnvironment::strict_schema_enabled`], and `Init`'s, through the
+/// `ConfigSource` overlay this environment fills (`BUILDER_WORKER_VAR_KEYS`) —
+/// so a value the two disagreed about would put a runtime's own D1 service and
+/// its drain handle into different modes.
 ///
 /// It is therefore NOT
 /// [`impresspress_core::config_vars::is_truthy`], the repository's general
@@ -353,9 +354,9 @@ impl CfEnvironment {
     /// already applied (see
     /// [`make_d1_database_service_concrete`](crate::services::make_d1_database_service_concrete)),
     /// because `wafer-run`'s own application of it — `handle_lifecycle`
-    /// calling [`DatabaseService::set_strict_schema`] at `Init`, from
-    /// `ctx.config_get` — only ever reaches the one service a *Wafer runtime*
-    /// was built around. Two D1 services are built outside any runtime and so
+    /// calling [`DatabaseService::set_strict_schema`] at `Init`, from the
+    /// database block's `Init` config — only ever reaches the one service a
+    /// *Wafer runtime* was built around. Two D1 services are built outside any runtime and so
     /// are never reached by it: the request-log drain's batch handle in
     /// `run_with_config` (constructed per request, used inside
     /// `ctx.wait_until`) and the handle `build_runtime` reads `block_settings`
@@ -854,8 +855,8 @@ mod tests {
 
     /// The STRICT_SCHEMA verdict every D1 service is constructed with must be
     /// the one `wafer-core` would reach from the same string, because
-    /// `handle_lifecycle` re-applies the var through `ctx.config_get` on the
-    /// runtime's own service. If the two readings disagreed, that service and
+    /// `handle_lifecycle` re-applies the var from the database block's `Init`
+    /// config on the runtime's own service. If the two readings disagreed, that service and
     /// the request-log drain's handle would run in different modes off one var.
     ///
     /// `"yes"` and `"on"` are the rows that matter: they are true for

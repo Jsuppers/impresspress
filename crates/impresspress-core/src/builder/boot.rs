@@ -311,10 +311,11 @@ async fn init_one(
 /// - Opens a dedicated `rusqlite::Connection` at `db_path`. SQLite supports
 ///   multi-connection access with WAL, so sharing the DB file with the
 ///   platform's `DatabaseService` connection is safe.
-/// - `FastembedService::default_model()` triggers an ONNX model download on
-///   first run. Failure is logged but does not abort startup — the vector
-///   runtime block simply won't be registered, and any attempt to use it
-///   will fail via the normal dependency-resolution path.
+/// - `FastembedService::default_model(model_cache_dir)` triggers an ONNX
+///   model download into `model_cache_dir` on first run. Failure is logged
+///   but does not abort startup — the vector runtime block simply won't be
+///   registered, and any attempt to use it will fail via the normal
+///   dependency-resolution path.
 ///
 /// This function is only compiled when the `native-embedding` feature is on;
 /// the `impresspress/vector` feature block registration in `impresspress-core` is
@@ -323,6 +324,7 @@ async fn init_one(
 pub(super) fn register_vector_block(
     wafer: &mut Wafer,
     db_path: Option<&str>,
+    model_cache_dir: &std::path::Path,
 ) -> Result<(), RuntimeError> {
     use wafer_block_fastembed::FastembedService;
     use wafer_block_sqlite::vector::SqliteVecService;
@@ -351,7 +353,8 @@ pub(super) fn register_vector_block(
             ))
         })?);
 
-    let emb_svc: Arc<dyn EmbeddingService> = match FastembedService::default_model() {
+    let emb_svc: Arc<dyn EmbeddingService> = match FastembedService::default_model(model_cache_dir)
+    {
         Ok(svc) => Arc::new(svc),
         Err(e) => {
             // Model download can fail offline or on first-run with restricted

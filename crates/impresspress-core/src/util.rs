@@ -539,8 +539,8 @@ pub fn url_path_decode(s: &str) -> String {
 /// ranges alongside their IPv4 counterparts.
 ///
 /// Literal IP classification is delegated to the shared `wafer-net-security`
-/// predicates ([`wafer_core::security::is_blocked_ipv4`] /
-/// [`is_blocked_ipv6`](wafer_core::security::is_blocked_ipv6)) so this write
+/// predicates ([`wafer_net_security::is_blocked_ipv4`] /
+/// [`is_blocked_ipv6`](wafer_net_security::is_blocked_ipv6)) so this write
 /// gate stays in lock-step with the outbound fetch layer instead of
 /// hand-rolling its own (narrower) range list. That covers, beyond the RFC
 /// 1918 private ranges, the CGNAT (`100.64.0.0/10`), link-local, benchmarking,
@@ -617,12 +617,12 @@ pub(crate) fn validate_url_value(value: &str) -> Result<(), String> {
     // fetch layer blocks (CGNAT, multicast, NAT64/6to4 embeddings, …).
     match parsed.host() {
         Some(url::Host::Ipv4(v4)) => {
-            if wafer_core::security::is_blocked_ipv4(v4) {
+            if wafer_net_security::is_blocked_ipv4(v4) {
                 return Err("URL must not point to private/internal IP addresses".to_string());
             }
         }
         Some(url::Host::Ipv6(v6)) => {
-            if wafer_core::security::is_blocked_ipv6(v6) {
+            if wafer_net_security::is_blocked_ipv6(v6) {
                 return Err("URL must not point to private/internal IP addresses".to_string());
             }
         }

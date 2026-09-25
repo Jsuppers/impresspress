@@ -100,6 +100,15 @@ pub struct ImpresspressBuilder {
     /// (rather than feature-gated) so platforms can always pass it; the
     /// field is simply ignored when the feature is off.
     sqlite_db_path: Option<String>,
+    /// Directory the native ONNX embedding model's weights are cached in
+    /// (downloaded there on first use).
+    ///
+    /// Only used by the `block-fastembed` feature (`impresspress/fastembed`)
+    /// and the `native-embedding` feature (`wafer-run/vector`'s embedding
+    /// service). Kept as `Option` (rather than feature-gated) so platforms
+    /// can always pass it; a build with either feature on and no directory
+    /// is refused.
+    model_cache_dir: Option<std::path::PathBuf>,
     /// Browser-side `VectorService` + `EmbeddingService`. When both are
     /// `Some`, `build()` registers `wafer-run/vector` (with the pair) and
     /// `impresspress/transformers-embed` (with the embedding service). The
@@ -146,6 +155,7 @@ impl ImpresspressBuilder {
             extra_image_services: Vec::new(),
             extra_routes: Vec::new(),
             sqlite_db_path: None,
+            model_cache_dir: None,
             extra_vector_service: None,
             extra_embedding_service: None,
             config_source: None,
@@ -385,6 +395,18 @@ impl ImpresspressBuilder {
     /// `build()` call will return an error.
     pub fn sqlite_db_path(mut self, path: impl Into<String>) -> Self {
         self.sqlite_db_path = Some(path.into());
+        self
+    }
+
+    /// Set the directory the native ONNX embedding model is cached in.
+    ///
+    /// Consumed by the `block-fastembed` and `native-embedding` features,
+    /// whose `FastembedService`s download the model there on first use.
+    /// Without it, a build with either feature on returns an error: the
+    /// directory is the embedder's to choose, and `wafer-block-fastembed`
+    /// reads none of its own.
+    pub fn model_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.model_cache_dir = Some(dir.into());
         self
     }
 }

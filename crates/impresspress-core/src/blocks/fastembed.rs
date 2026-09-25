@@ -14,8 +14,8 @@
 //!
 //! ## Lazy service construction
 //!
-//! `FastembedService::default_model()` triggers ONNX model download + load
-//! (tens to hundreds of MB) — not cheap. The `info()` path in
+//! `FastembedService::default_model(cache_dir)` triggers ONNX model download +
+//! load (tens to hundreds of MB) — not cheap. The `info()` path in
 //! `blocks::all_block_infos()` constructs every block just to read its
 //! metadata, so we must *not* eagerly load the model in the constructor.
 //! The service is built lazily on the first `handle()` call and cached for
@@ -29,7 +29,10 @@
 //! is dropped mid-load leaves it running for the others. A failed or
 //! panicked load is not cached, so a later request starts a fresh one.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use futures::{
     channel::oneshot,
@@ -70,14 +73,17 @@ pub struct FastembedBlock {
 }
 
 impl FastembedBlock {
-    /// Build a `FastembedBlock` with a lazy service.
+    /// Build a `FastembedBlock` with a lazy service whose model weights are
+    /// cached under `cache_dir` (downloaded there on first use) — the
+    /// embedder's [`ImpresspressBuilder::model_cache_dir`](crate::builder::ImpresspressBuilder::model_cache_dir).
     ///
     /// The model is loaded on first embed, not here — this is cheap enough
     /// to call from `blocks::all_block_infos()` without triggering an ONNX
     /// download.
-    pub fn new() -> Self {
-        Self::with_loader(|| {
-            FastembedService::default_model()
+    pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
+        let cache_dir = cache_dir.into();
+        Self::with_loader(move || {
+            FastembedService::default_model(cache_dir.clone())
                 .map(|svc| Arc::new(svc) as Arc<dyn EmbeddingService>)
                 .map_err(|e| format!("fastembed init failed: {e}"))
         })
@@ -158,17 +164,8 @@ impl FastembedBlock {
     }
 }
 
-impl Default for FastembedBlock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FastembedBlock {
-    /// The block's registered name. Mirrors the `BLOCK_NAME` const the
-    /// `impresspress_feature_block!` macro generates for the zero-arg feature
-    /// blocks, so the `(feature, name, constructor)` manifest in
-    /// [`crate::blocks`] can reference `FastembedBlock::BLOCK_NAME` uniformly.
+    /// The block's registered name.
     pub const BLOCK_NAME: &'static str = "impresspress/fastembed";
 }
 

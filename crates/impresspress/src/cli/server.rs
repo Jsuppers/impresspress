@@ -10,7 +10,7 @@
 //! with the integration tests in `tests/` so the runtime they exercise is the
 //! one the binary builds.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use impresspress_core::builder::{self, ImpresspressBuilder};
@@ -55,8 +55,9 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
         "infrastructure config loaded"
     );
 
-    // 4. Collect app config vars from env (non-IMPRESSPRESS_* prefixed, filtered to declared keys)
-    let env_vars = filter_to_declared_keys(collect_app_env_vars());
+    // 4. Collect app config vars from env (every key carrying `__`; the
+    // declared ones are seeded into the variables table below).
+    let app_env = collect_app_env_vars();
 
     // 5. Construct the platform database service up front. Native seeds the
     //    variables / block_settings tables BEFORE the wafer exists because its
@@ -75,7 +76,7 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     .context("construct database service")?;
 
     // 5b-7b. Seed, load, and build the runtime (shared with the tests).
-    let mut wafer = build_native_runtime(&infra, database, &env_vars, run_migrations).await?;
+    let mut wafer = build_native_runtime(&infra, database, &app_env, run_migrations).await?;
 
     // 8. Native-only: register http-listener.
     //    impresspress dispatches all HTTP traffic through the `site-main` flow
@@ -120,13 +121,18 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 /// service: pre-wafer admin DDL, variable seeding, the block-settings
 /// hash-gate load, admin-created WRAP grants, and `ImpresspressBuilder::build()`.
 ///
+/// `app_env` is the process environment's app config — every key carrying
+/// `__` (`collect_app_env_vars`). Its declared keys seed the variables table;
+/// the whole map is also the fallback the blocks' `ConfigSource` resolves
+/// from, beneath the table (see the `config_source` call below).
+///
 /// `run()` calls this with the service it built from `infra`; the integration
 /// tests call it with a service they seeded first, so what they exercise is
 /// the runtime the binary builds rather than a copy of these steps.
 pub async fn build_native_runtime(
     infra: &InfraConfig,
     database: Arc<dyn DatabaseService>,
-    env_vars: &[(String, String)],
+    app_env: &HashMap<String, String>,
     run_migrations: bool,
 ) -> anyhow::Result<Wafer> {
     // Create the admin variables / block_settings tables pre-wafer by running
@@ -142,7 +148,8 @@ pub async fn build_native_runtime(
 
     // Seed env/auto-gen/JWT variables + run the #222 block-settings hash-gate,
     // all through the shared `impresspress_core` seeders over the service.
-    let vars = impresspress_core::platform_state::variables::seed_and_load(&database, env_vars)
+    let env_vars = filter_to_declared_keys(app_env.clone());
+    let vars = impresspress_core::platform_state::variables::seed_and_load(&database, &env_vars)
         .await
         .map_err(|e| anyhow!("seed and load variables: {e}"))?;
     tracing::info!(vars = vars.len(), "variables loaded from database");
@@ -177,29 +184,15 @@ pub async fn build_native_runtime(
     .await
     .map_err(|e| anyhow!("load block settings: {e}"))?;
 
-    // STRICT_SCHEMA (`WAFER_RUN__DATABASE__STRICT_SCHEMA`): a deploy-time
-    // operational flag, read straight from the process env — exactly like the
-    // Cloudflare target reads it from a worker var. It is deliberately NOT
-    // routed through the declared-key DB-seeded `vars` path: `all_block_infos()`
-    // enumerates only impresspress feature blocks, so the wafer-core
-    // `wafer-run/database` service block's config var is not a "declared key"
-    // and `filter_to_declared_keys` would drop it — and it's an operator deploy
-    // decision, not an admin-editable runtime toggle to persist in the
-    // variables table. The `wafer-run/database` block reads it via
-    // `ctx.config_get` at Init and calls `set_strict_schema`. Threaded into
-    // both config surfaces below (async config service + sync snapshot), which
-    // must carry identical data.
-    let strict_schema =
-        std::env::var(wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY).ok();
-
-    // `IMPRESSPRESS_REQUEST_LOG`: the same shape, and threaded here for a
-    // second reason on top of the one above. It is an infrastructure key
+    // `IMPRESSPRESS_REQUEST_LOG`: an operational flag read straight from the
+    // process env. It is an infrastructure key
     // (`config_vars::is_infrastructure_key`), so `blocks::config` answers it
     // from the boot map whatever the `variables` table holds and `CONFIG_SET`
     // refuses to write it — the process environment is the only channel it
-    // has. `filter_to_declared_keys` would drop it too: it is nobody's
-    // declared `ConfigVar`, deliberately, because it is an operator deploy
-    // decision rather than an admin-editable runtime toggle.
+    // has. `collect_app_env_vars` drops it (no `__`), and
+    // `filter_to_declared_keys` would too: it is nobody's declared
+    // `ConfigVar`, deliberately, because it is an operator deploy decision
+    // rather than an admin-editable runtime toggle.
     // `pipeline::write_request_log` reads it per request via `config_get`.
     let request_log = std::env::var(impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY).ok();
 
@@ -264,12 +257,6 @@ pub async fn build_native_runtime(
     if run_migrations {
         runtime_config.both(impresspress_core::migration_helper::RUN_MIGRATIONS_KEY, "1");
     }
-    if let Some(v) = strict_schema {
-        runtime_config.both(
-            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY,
-            v,
-        );
-    }
     if let Some(v) = request_log {
         runtime_config.both(impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY, v);
     }
@@ -307,13 +294,22 @@ pub async fn build_native_runtime(
         },
     );
 
+    // The blocks' declared keys resolve from the variables table, then from
+    // the process environment. The table wins where it holds a row: the env
+    // loop in `seed_and_load` has already applied the precedence for every
+    // key impresspress declares. The environment answers the keys only
+    // wafer-run's own service blocks declare — `WAFER_RUN__DATABASE__
+    // STRICT_SCHEMA`, the `WAFER_RUN__NETWORK__*` limits — which
+    // `filter_to_declared_keys` keeps out of the table (they are operator
+    // deploy decisions, not admin-editable rows) and which those blocks read
+    // from their `lifecycle(Init)` config alone — neither consults
+    // `config_get` or the process environment itself.
+    let mut block_config = app_env.clone();
+    block_config.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
     let wafer = with_config
-        .config_source(Arc::new(wafer_run::StaticConfigSource::new(vars.clone())))
+        .config_source(Arc::new(wafer_run::StaticConfigSource::new(block_config)))
         .crypto(impresspress_native::make_jwt_crypto_service(jwt_secret)?)
-        .network(
-            impresspress_native::make_fetch_network_service()
-                .context("construct network service")?,
-        )
+        .network(impresspress_native::make_fetch_network_service())
         .logger(impresspress_native::make_tracing_logger())
         .block_settings(features)
         .wrap_grants(db_grants)

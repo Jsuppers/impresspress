@@ -497,7 +497,7 @@ Land it as its own small PR after PR #40 merges, with ruling 5.5's amendment
   behaviour F4 fixed. If a real second consumer appears, the subscriber install
   belongs somewhere both entry points reach.
 - **The `localhost` pseudo-domain rule lives in `impresspress-core::ssrf`, not
-  upstream.** `wafer_core::security::is_blocked_url` matches the bare string
+  upstream.** `wafer_net_security::is_blocked_url` matches the bare string
   `localhost` only. If a wafer-run bump ever adds the RFC 6761 rule upstream,
   `ssrf::is_loopback_host` becomes redundant and should be deleted rather than
   left as a second implementation.

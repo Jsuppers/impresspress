@@ -966,10 +966,11 @@ impl TestContext {
     /// database.
     ///
     /// NOT a full boot. `cli/server.rs` additionally publishes
-    /// `BLOCK_SETTINGS_CONFIG_KEY`, `RUN_MIGRATIONS_KEY` and
-    /// `STRICT_SCHEMA_CONFIG_KEY` to both surfaces, passes the declared-key
-    /// filtered process environment into `seed_and_load` rather than `&[]`,
-    /// installs a `ConfigSource`, and registers the config block through
+    /// `BLOCK_SETTINGS_CONFIG_KEY` and `RUN_MIGRATIONS_KEY` to both surfaces,
+    /// passes the declared-key filtered process environment into
+    /// `seed_and_load` rather than `&[]`, installs a `ConfigSource` (the
+    /// loaded variables over the process environment), and registers the
+    /// config block through
     /// `ImpresspressBuilder::build()` rather than by hand. A test that needs
     /// any of those — block settings in particular — wants
     /// `impresspress/tests/boot_lifecycle.rs`'s `build_native_runtime`
@@ -2693,7 +2694,7 @@ impl Context for FloatAggregateContext {
         let request: wafer_block::wire::database::AggregateRequest =
             match wafer_block::codec::decode(&request_bytes) {
                 Ok(request) => request,
-                Err(e) => return OutputStream::error(e),
+                Err(e) => return OutputStream::error(e.invalid_argument()),
             };
         let numeric = Self::numeric_aliases(&request);
         let out = self
@@ -2713,7 +2714,7 @@ impl Context for FloatAggregateContext {
         let mut records: Vec<wafer_block::wire::database::Record> =
             match wafer_block::codec::decode(&buf.body) {
                 Ok(records) => records,
-                Err(e) => return OutputStream::error(e),
+                Err(e) => return OutputStream::error(e.internal()),
             };
         for record in &mut records {
             for alias in &numeric {
@@ -2854,7 +2855,7 @@ impl Context for EcholessWriteContext {
         let mut record: wafer_block::wire::database::Record =
             match wafer_block::codec::decode(&buf.body) {
                 Ok(record) => record,
-                Err(e) => return OutputStream::error(e),
+                Err(e) => return OutputStream::error(e.internal()),
             };
         record
             .data
@@ -3167,11 +3168,14 @@ impl<'a> SeedUser<'a> {
 /// well-known ones plus impresspress's own, which is the config block's
 /// ([`crate::blocks::config::CONFIG_INTERFACE`]). `Wafer` holds the same two
 /// sets — `wafer_block::interfaces::all()` at construction, plus whatever
-/// `register_interface` adds, which in this repo is that one spec.
-fn interface_specs() -> Vec<wafer_block::InterfaceSpec> {
-    let mut specs = wafer_block::interfaces::all();
-    specs.push(crate::blocks::config::interface_spec());
-    specs
+/// `register_interface` adds, which in this repo is that one spec — keyed by
+/// interface name, as `check_action_interface` reads them.
+fn interface_specs() -> HashMap<String, wafer_block::InterfaceSpec> {
+    wafer_block::interfaces::all()
+        .into_iter()
+        .chain([crate::blocks::config::interface_spec()])
+        .map(|spec| (spec.name.clone(), spec))
+        .collect()
 }
 
 /// Build an anonymous request `Message`. No `auth.user_id` meta set.
@@ -4673,9 +4677,7 @@ mod tests {
         assert_eq!(sites[0].0, "blocks/config.rs", "{sites:?}");
         assert!(sites[0].1.contains("interface_spec()"), "{sites:?}");
         assert!(
-            interface_specs()
-                .iter()
-                .any(|spec| spec.name == crate::blocks::config::CONFIG_INTERFACE),
+            interface_specs().contains_key(crate::blocks::config::CONFIG_INTERFACE),
             "the fixture's spec set must hold the spec that call site registers"
         );
     }

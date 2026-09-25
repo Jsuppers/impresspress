@@ -193,7 +193,7 @@ pub async fn get_many(
         )
         .await;
     let buf = out.collect_buffered().await.map_err(WaferError::from)?;
-    let resp: GetManyResponse = codec::decode(&buf.body)?;
+    let resp: GetManyResponse = codec::decode(&buf.body).map_err(codec::DecodeError::internal)?;
     Ok(resp.values)
 }
 
@@ -262,7 +262,7 @@ impl VariablesConfigBlock {
             .map_err(|e| {
                 OutputStream::error(WaferError::new(
                     ErrorCode::InvalidArgument,
-                    format!("config.get: {}", e.message),
+                    format!("config.get: {e}"),
                 ))
             })
     }

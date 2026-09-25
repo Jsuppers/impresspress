@@ -12,7 +12,7 @@
 //! listener's own `http_codec::build_http_message`, and renders the answer
 //! with the listener's own `collect_http_response`.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, GrantSource, InitPolicy};
@@ -51,7 +51,7 @@ async fn a_refused_login_is_answered_with_its_detail_code() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer = build_native_runtime(&infra, database, &[], false)
+    let mut wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
         .await
         .expect("build impresspress runtime");
     let report = boot(

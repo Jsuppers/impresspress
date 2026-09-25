@@ -16,10 +16,7 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use impresspress::cli::{
-    server::{build_native_runtime, NativeBootHooks},
-    server_config::filter_to_declared_keys,
-};
+use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, BootHooks, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
 use wafer_core::interfaces::database::service::DatabaseService;
@@ -62,24 +59,24 @@ fn infra_for(db_path: &Path, storage_root: &Path) -> InfraConfig {
 /// `DatabaseService` handle so the test can inspect `block_settings` rows
 /// directly afterwards.
 async fn build_runtime(db_path: &Path, storage_root: &Path) -> (Wafer, Arc<dyn DatabaseService>) {
-    build_runtime_with_env(db_path, storage_root, &[]).await
+    build_runtime_with_env(db_path, storage_root, &HashMap::new()).await
 }
 
-/// [`build_runtime`] with an explicit env-var batch, the one `run()` builds
-/// with `filter_to_declared_keys(collect_app_env_vars())`. Passed as an
-/// argument rather than exported into the process environment: env mutation is
-/// `unsafe` in Rust 2024 and races every other test in the binary.
+/// [`build_runtime`] with an explicit app environment, the map `run()` builds
+/// with `collect_app_env_vars()`. Passed as an argument rather than exported
+/// into the process environment: env mutation is `unsafe` in Rust 2024 and
+/// races every other test in the binary.
 async fn build_runtime_with_env(
     db_path: &Path,
     storage_root: &Path,
-    env_vars: &[(String, String)],
+    app_env: &HashMap<String, String>,
 ) -> (Wafer, Arc<dyn DatabaseService>) {
     let infra = infra_for(db_path, storage_root);
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
 
-    let wafer = build_native_runtime(&infra, database.clone(), env_vars, false)
+    let wafer = build_native_runtime(&infra, database.clone(), app_env, false)
         .await
         .expect("build impresspress runtime");
 
@@ -322,7 +319,7 @@ async fn a_prepared_plans_grants_reach_the_sealed_runtime() {
             )
             .expect("jwt crypto service"),
         )
-        .network(impresspress_native::make_fetch_network_service().expect("network service"))
+        .network(impresspress_native::make_fetch_network_service())
         .logger(impresspress_native::make_tracing_logger())
         .apply_prepared_plan(&plan, "app", &build_sha, &lock, &assets)
         .expect("apply prepared plan");
@@ -386,7 +383,7 @@ async fn a_malformed_deployment_grant_fails_the_build() {
             )
             .expect("jwt crypto service"),
         )
-        .network(impresspress_native::make_fetch_network_service().expect("network service"))
+        .network(impresspress_native::make_fetch_network_service())
         .logger(impresspress_native::make_tracing_logger())
         // An append-only grant is a database-collection grant; typed
         // Storage it is one the runtime will not install.
@@ -456,8 +453,9 @@ async fn the_native_build_fills_the_synchronous_config_surface() {
 /// It used to be discarded from the second boot on — env vars were seeded with
 /// `INSERT OR IGNORE`, so they only ever landed on a virgin database. This
 /// drives two boots over the *same* sqlite file with two different values to
-/// cover exactly that, and shapes the batch with `filter_to_declared_keys`, so
-/// what reaches the seeder is what reaches it in production.
+/// cover exactly that, and hands the environment to `build_native_runtime`,
+/// which shapes the seed batch with `filter_to_declared_keys` as it does in
+/// production.
 ///
 /// Both boots here are a FRESH database's, so the first one creates the row and
 /// records the one-time upgrade transition, and the second is the steady state.
@@ -480,16 +478,16 @@ async fn a_process_env_var_wins_over_the_row_a_previous_boot_stored() {
 
     const KEY: &str = "WAFER_RUN_SHARED__APP_NAME";
 
-    // The operator's environment, exactly as `run()` shapes it.
+    // The operator's environment, as `build_native_runtime` receives it.
     let environment = |app_name: &str| {
-        filter_to_declared_keys(HashMap::from([
+        HashMap::from([
             (KEY.to_string(), app_name.to_string()),
             // Infrastructure: never a variables-table row.
             (
                 impresspress_core::config_vars::DEPLOY_TOKEN_KEY.to_string(),
                 "deploy-token".to_string(),
             ),
-        ]))
+        ])
     };
 
     // --- First boot: fresh database, the operator's value lands. ---
@@ -571,10 +569,7 @@ async fn a_leftover_row_for_a_retired_var_boots_lists_and_deletes() {
     );
 
     // --- Upgrade boot, with the retired var still exported. ---
-    let environment = filter_to_declared_keys(HashMap::from([(
-        RETIRED.to_string(),
-        "https://env.example".to_string(),
-    )]));
+    let environment = HashMap::from([(RETIRED.to_string(), "https://env.example".to_string())]);
     let (mut wafer, db) = build_runtime_with_env(&db_path, &storage_root, &environment).await;
     let report = boot(
         &mut wafer,
@@ -640,4 +635,102 @@ async fn stored(db: &Arc<dyn DatabaseService>, key: &str) -> Option<String> {
         .await
         .expect("read the variables table")
         .map(|row| row.value)
+}
+
+/// Boot a fresh runtime over `app_env` and hand back its report and database.
+async fn boot_fresh_with_env(
+    name: &str,
+    app_env: HashMap<String, String>,
+) -> (
+    impresspress_core::builder::BootReport,
+    Arc<dyn DatabaseService>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join(format!("{name}.sqlite3"));
+    let storage_root = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    let (mut wafer, db) = build_runtime_with_env(&db_path, &storage_root, &app_env).await;
+    let report = boot(
+        &mut wafer,
+        &NativeBootHooks,
+        NATIVE_GRANTS,
+        InitPolicy::Reported,
+    )
+    .await
+    .expect("seal");
+    (report, db, tmp)
+}
+
+/// A write naming a column the table does not have: added lazily unless
+/// STRICT_SCHEMA is on, refused when it is.
+async fn write_with_an_undeclared_column(db: &Arc<dyn DatabaseService>) -> bool {
+    let mut data = HashMap::new();
+    data.insert("key".to_string(), serde_json::json!("P4_STRICT_PROBE"));
+    data.insert("value".to_string(), serde_json::json!("x"));
+    data.insert(
+        "column_no_migration_declares".to_string(),
+        serde_json::json!("x"),
+    );
+    db.create(impresspress_core::platform_state::variables::TABLE, data)
+        .await
+        .is_ok()
+}
+
+/// `WAFER_RUN__DATABASE__STRICT_SCHEMA` is an operator's process-env knob
+/// that `wafer-run/database` reads from its `lifecycle(Init)` config. Native
+/// keeps it out of the variables table (nothing impresspress declares), so
+/// the block's `ConfigSource` must resolve it from the process environment —
+/// or the block applies its declared `false` and the export does nothing.
+#[tokio::test]
+async fn the_strict_schema_env_var_reaches_the_database_blocks_init() {
+    let (report, db, _tmp) = boot_fresh_with_env(
+        "strict_schema_env",
+        HashMap::from([(
+            wafer_core::interfaces::database::handler::STRICT_SCHEMA_CONFIG_KEY.to_string(),
+            "true".to_string(),
+        )]),
+    )
+    .await;
+    assert!(report.ok, "a strict boot must succeed: {report:?}");
+    assert!(
+        !write_with_an_undeclared_column(&db).await,
+        "STRICT_SCHEMA was exported, so the database must refuse to add a column lazily"
+    );
+
+    // The control: without the export the same write adds its column, so the
+    // refusal above is STRICT_SCHEMA's and not the write's.
+    let (report, db, _tmp) = boot_fresh_with_env("strict_schema_unset", HashMap::new()).await;
+    assert!(report.ok, "{report:?}");
+    assert!(
+        write_with_an_undeclared_column(&db).await,
+        "without STRICT_SCHEMA a write adds the column it names"
+    );
+}
+
+/// The `wafer-run/network` limits are the block's declared config, read at
+/// its `lifecycle(Init)`: an operator's process-env value must reach it, and
+/// an invalid one must fail that block's Init naming the key rather than be
+/// replaced by the default.
+#[tokio::test]
+async fn a_network_limit_env_var_reaches_the_network_blocks_init() {
+    const KEY: &str = wafer_core::interfaces::network::service::MAX_RESPONSE_BYTES_KEY;
+    let (report, _db, _tmp) = boot_fresh_with_env(
+        "network_limit_env",
+        HashMap::from([(KEY.to_string(), "not-a-number".to_string())]),
+    )
+    .await;
+    let network = report
+        .blocks
+        .iter()
+        .find(|b| b.block == "wafer-run/network")
+        .unwrap_or_else(|| panic!("wafer-run/network must be initialised: {report:?}"));
+    assert!(
+        !network.ok,
+        "an invalid exported limit must fail the network block's Init: {network:?}"
+    );
+    assert!(
+        network.error.as_deref().is_some_and(|e| e.contains(KEY)),
+        "the Init error must name the key: {network:?}"
+    );
 }

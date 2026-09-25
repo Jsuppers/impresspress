@@ -8,8 +8,8 @@ use std::cell::Cell;
 use wafer_block::http_codec;
 use wafer_core::clients::config as config_client;
 use wafer_run::{
-    context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockInfo, ErrorCode,
-    InputStream, Message, MetaEntry, OutputStream, WaferError,
+    context::Context, streams::output::TerminalNotResponse, AuthLevel, BlockEndpoint, BlockInfo,
+    ErrorCode, InputStream, Message, MetaEntry, OutputStream, WaferError,
 };
 
 use crate::{
@@ -112,28 +112,22 @@ fn caller_auth_level(msg: &Message) -> AuthLevel {
     AuthLevel::Authenticated
 }
 
-/// Every registered block with its endpoint list narrowed to what `caller`
-/// may invoke, resolved with `routing::effective_access` — the filter the
-/// WebMCP manifest applies, reused so `/openapi.json`, the agent card and the
-/// manifest cannot disagree about who is told an endpoint exists. Blocks are
-/// kept even when nothing in them is visible, so block-level metadata the
-/// documents carry stays stable across tiers.
-fn visible_to_caller(
-    block_infos: &[BlockInfo],
-    caller: AuthLevel,
-    extra_routes: &[ExtraRoute],
-) -> Vec<BlockInfo> {
-    let ceiling = endpoint_match::auth_rank(caller);
+/// The registered blocks the admin feature toggle leaves on — the set every
+/// discovery projection (`/openapi.json`, the agent card and the WebMCP
+/// manifest) is generated from.
+///
+/// `block_infos` is every REGISTERED block, but `route_to_block` 404s any
+/// block the toggle has turned off (routing.rs's feature gate, backed by the
+/// live `block_settings` row). Describing a disabled block's endpoints would
+/// hand the reader routes that 404 on every call, so the documents are built
+/// from the enabled subset only — gated under the same name the router gates
+/// with (`feature_gate_name`; the inspector's `BlockInfo` name and its
+/// route's `block` name differ).
+fn enabled_infos(block_infos: &[BlockInfo], features: &dyn FeatureConfig) -> Vec<BlockInfo> {
     block_infos
         .iter()
-        .map(|block| {
-            let mut visible = block.clone();
-            visible.endpoints.retain(|ep| {
-                endpoint_match::auth_rank(routing::effective_access(block, ep, extra_routes))
-                    <= ceiling
-            });
-            visible
-        })
+        .filter(|b| features.is_block_enabled(routing::feature_gate_name(&b.name)))
+        .cloned()
         .collect()
 }
 
@@ -378,18 +372,32 @@ pub async fn handle_request(
             }
         };
 
-        // Same ceiling and the same resolver as the manifest below, so the
+        // Same block set, ceiling and resolver as the manifest below, so the
         // three projections of one declaration agree on who is told about
         // it. Two projections with different disclosure rules is the pattern
-        // that produced the `dedupe_hash` leak.
+        // that produced the `dedupe_hash` leak. The resolver also decides
+        // each operation's OpenAPI `security` requirement, so a Public
+        // endpoint the router gates as Admin is published with `bearerAuth`.
         let caller = caller_auth_level(&msg);
-        let visible_infos = visible_to_caller(block_infos, caller, extra_routes);
+        let enabled_infos = enabled_infos(block_infos, features);
+        let effective_auth = |block: &BlockInfo, ep: &BlockEndpoint| {
+            routing::effective_access(block, ep, extra_routes)
+        };
 
         let body = if is_openapi {
-            wafer_core::discovery::generate_openapi(&visible_infos, &project_name, "", &server_url)
+            wafer_core::discovery::generate_openapi(
+                &enabled_infos,
+                caller,
+                effective_auth,
+                &project_name,
+                "",
+                &server_url,
+            )
         } else {
             wafer_core::discovery::generate_agent_card(
-                &visible_infos,
+                &enabled_infos,
+                caller,
+                effective_auth,
                 &project_name,
                 "",
                 &server_url,
@@ -430,20 +438,7 @@ pub async fn handle_request(
     // identity, like the discovery documents above.
     if path == "/b/webmcp/manifest.json" {
         let caller = caller_auth_level(&msg);
-
-        // `block_infos` is every REGISTERED block, but `route_to_block`
-        // 404s any block the admin feature toggle has turned off
-        // (routing.rs's feature gate, backed by the live `block_settings`
-        // row). Advertising a disabled block's tools would hand the agent
-        // names that 404 on every call, so the manifest is generated from
-        // the enabled subset only — gated under the same name the router
-        // gates with (`feature_gate_name`; the inspector's `BlockInfo` name
-        // and its route's `block` name differ).
-        let enabled_infos: Vec<BlockInfo> = block_infos
-            .iter()
-            .filter(|b| features.is_block_enabled(routing::feature_gate_name(&b.name)))
-            .cloned()
-            .collect();
+        let enabled_infos = enabled_infos(block_infos, features);
 
         // MUST resolve the auth ceiling with `routing::effective_access`, not
         // the plain `ep.auth`. This router admits on `max(prefix_tier,

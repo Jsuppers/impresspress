@@ -168,6 +168,9 @@ schemars = { version = "1", features = ["chrono04"] }
 # + `derive`/`sea-query-derive` for the whole graph — defeating wafer-sql-utils'
 # `default-features = false` trim (wafer-run #317). Removed.
 wafer-sql-utils = { workspace = true }
+# SSRF predicates (`is_blocked_url`, `is_blocked_ipv4`/`_ipv6`) shared with
+# wafer-run's network block, used by `ssrf.rs` and `util.rs`.
+wafer-net-security = { workspace = true }
 # Native ONNX embeddings (optional — gated behind `native-embedding`).
 wafer-block-fastembed = { workspace = true, optional = true }
 # SQLite vector service (optional — gated behind `native-embedding`).
