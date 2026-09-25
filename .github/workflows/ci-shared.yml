@@ -1311,12 +1311,14 @@ jobs:
             exit 1
           fi
 
-      # webmcp.spec.ts runs AFTER the visual baselines: it seeds a product into
-      # the same database, and a product that exists before the admin pages are
+      # Playwright runs the files it is given in PATH order, not argument
+      # order. webmcp.spec.ts runs AFTER the visual baselines only because `w`
+      # sorts after `v`, and it must: it seeds a product into the same
+      # database, and a product that exists before the admin pages are
       # screenshotted would show up in them.
       #
-      # delegated-actions.spec.ts is last and writes nothing — it filters a
-      # list, opens and closes a modal, toggles a password field, and hops
+      # delegated-actions.spec.ts sorts first, which is harmless because it
+      # writes nothing — it filters a list, opens and closes a modal, toggles a password field, and hops
       # between two products admin tabs, all of which are the browser-side half
       # of the `data-action` rule that
       # `ui::tests::pages_carry_no_event_handler_attributes` enforces on the
@@ -1329,6 +1331,20 @@ jobs:
         env:
           TEST_PORT: 8093
         run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts tests/e2e/webmcp.spec.ts tests/e2e/delegated-actions.spec.ts
+
+      # A step of its own, not one more file on the line above: Playwright
+      # orders the files it is given by path, not by argument order, so on
+      # that line this spec would run BEFORE visual-baseline.spec.ts. It
+      # writes — an LLM provider, messages contexts and entries, a
+      # deleted-then-restored product — because what it proves is that a
+      # control's after-success effect (reload, reset, drop the empty line,
+      # scroll) runs under the CSP this server really sends, and those effects
+      # only follow a real write. Those rows would show up in the screenshots.
+      - name: Run htmx after-success effects end-to-end tests (native server, port 8093)
+        working-directory: crates/impresspress-web
+        env:
+          TEST_PORT: 8093
+        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/htmx-success-effects.spec.ts
 
       - name: Stop server
         if: always()
