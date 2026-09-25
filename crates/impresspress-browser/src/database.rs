@@ -151,20 +151,82 @@ pub struct BrowserDatabaseService;
 ///
 /// See [`resolve_flush_outcome`] for the precedence and why each arm is what
 /// it is.
+///
+/// Every logical mutation also starts and ends on a connection that is not
+/// inside a transaction — see [`end_open_transaction`] for why, and for what
+/// each end does when it finds one.
 pub(crate) async fn with_flush_mapped<T, E>(
     op: impl std::future::Future<Output = Result<T, E>>,
     map_flush: impl FnOnce(String) -> E,
 ) -> Result<T, E> {
+    match end_open_transaction() {
+        Ok(false) => {}
+        Ok(true) => tracing::error!(
+            "a transaction was open on the sql.js connection before a write; rolled it back, \
+             discarding every statement run inside it since it began"
+        ),
+        // The write runs anyway: when the connection cannot be settled (no
+        // database loaded, a wedged connection) its own statements fail too,
+        // and they say more about why than this probe can.
+        Err(e) => {
+            tracing::error!(error = %e, "could not check the sql.js connection before a write")
+        }
+    }
     with_flush_through(op, flush_through_bridge, map_flush).await
 }
 
-/// The one flush this crate performs: hand the sql.js database to `bridge.js`
-/// to write out to OPFS.
+/// The one flush this crate performs: end whatever transaction the operation
+/// left open, then hand the sql.js database to `bridge.js` to write out to
+/// OPFS.
+///
+/// The flush is attempted whatever the transaction check found, because the
+/// committed statements before it are owed their durability. A transaction
+/// that was still open is an error even when the flush succeeds: its
+/// statements were rolled back, so the operation must not be reported done.
 async fn flush_through_bridge() -> Result<(), String> {
-    bridge::dbFlush()
+    let left_open = end_open_transaction();
+    let flushed = bridge::dbFlush()
         .await
         .map(|_| ())
-        .map_err(|e| format!("flush to OPFS: {}", bridge::describe(&e)))
+        .map_err(|e| format!("flush to OPFS: {}", bridge::describe(&e)));
+    match left_open {
+        Ok(false) => flushed,
+        Ok(true) => Err(
+            "the write left a transaction open on the sql.js connection; it was rolled back, \
+             with every statement run inside it"
+                .to_string(),
+        ),
+        Err(e) => Err(format!("end the transaction the write left open: {e}")),
+    }
+}
+
+/// Roll back the transaction open on the sql.js connection, if there is one:
+/// `Ok(true)` when there was, `Ok(false)` when the connection was clean.
+///
+/// sql.js offers no way to ask whether a transaction is open, so the
+/// `ROLLBACK` is the question: SQLite refuses it with
+/// [`NO_ACTIVE_TRANSACTION`] exactly when there is none.
+///
+/// Why every logical mutation asks, at both ends: a transaction left open —
+/// a `BEGIN` sent through the unflushed `query_raw`, or one a failed
+/// `ROLLBACK` could not end — swallows everything after it. Every later
+/// statement runs inside it, and the next flush's `db.export()`, which closes
+/// and reopens the connection, rolls all of them back, although each
+/// reported success. Asking before the write keeps the write's own
+/// statements out of a transaction that is not its own; asking before the
+/// flush turns that silent rollback into an error the caller sees.
+///
+/// Rolling back changes the schema back to what it was when the transaction
+/// began, so the memoized schema is dropped with it.
+fn end_open_transaction() -> Result<bool, String> {
+    match bridge_control("ROLLBACK") {
+        Ok(()) => {
+            forget_schema();
+            Ok(true)
+        }
+        Err(refused) if refused.contains(NO_ACTIVE_TRANSACTION) => Ok(false),
+        Err(refused) => Err(refused),
+    }
 }
 
 /// [`with_flush_mapped`] with the flush supplied by the caller.
@@ -382,7 +444,16 @@ impl DbExec for BrowserDatabaseService {
     /// primitive here it does not flush; the `DatabaseService` method that
     /// called it does, once.
     async fn run_transaction(&self, ops: &[TxOp<'_>]) -> Result<Vec<TxResult>, DatabaseError> {
-        in_transaction(ops, |op| match *op {
+        in_transaction(bridge_control, || {
+            ops.iter().map(|op| self.run_tx_op(op)).collect()
+        })
+    }
+}
+
+impl BrowserDatabaseService {
+    /// One statement of a [`DbExec::run_transaction`], run through the bridge.
+    fn run_tx_op(&self, op: &TxOp<'_>) -> Result<TxResult, DatabaseError> {
+        match *op {
             TxOp::Execute { sql, params } => {
                 let params_js = db_codec::params_to_js(params).map_err(DatabaseError::Internal)?;
                 let rows = bridge::db_exec_raw(sql, params_js).map_err(|e| statement_failed(&e))?;
@@ -394,7 +465,7 @@ impl DbExec for BrowserDatabaseService {
                     .map(|row| record_from_json_row(row, json))
                     .collect(),
             )),
-        })
+        }
     }
 }
 
@@ -405,54 +476,153 @@ fn statement_failed(e: &wasm_bindgen::JsValue) -> DatabaseError {
     impresspress_core::sqlite_text_error::statement_error(format!("sql exec: {e:?}"))
 }
 
-/// Run `ops` through `run` as one transaction: `BEGIN`, every op in order,
-/// `COMMIT` — and on the first failure `ROLLBACK` and that failure, so either
-/// every op is applied or none is.
+/// The error type of a caller of [`in_transaction`]: how it spells the two
+/// failures the framing itself can report.
+pub(crate) trait TxError: std::fmt::Display {
+    /// SQLite refused a `BEGIN` or `COMMIT`; `message` is its text.
+    fn refused(message: String) -> Self;
+    /// A failed transaction could not be rolled back, so the connection is
+    /// still inside it. Never a caller's mistake, whatever the failure that
+    /// started it was.
+    fn stuck(message: String) -> Self;
+}
+
+impl TxError for DatabaseError {
+    /// Classified like any other refused statement, so a busy database stays
+    /// `Unavailable`.
+    fn refused(message: String) -> Self {
+        impresspress_core::sqlite_text_error::statement_error(format!("sql exec: {message}"))
+    }
+
+    fn stuck(message: String) -> Self {
+        DatabaseError::Internal(message)
+    }
+}
+
+/// Run one transaction-control statement (`BEGIN`, `COMMIT`, `ROLLBACK`) on
+/// the one sql.js connection, answering with SQLite's text when it is refused
+/// — the text [`in_transaction`] reads the connection's state from.
+pub(crate) fn bridge_control(sql: &str) -> Result<(), String> {
+    bridge::db_exec_raw(sql, db_codec::empty_params())
+        .map(|_| ())
+        .map_err(|e| bridge::describe(&e))
+}
+
+/// SQLite's refusal of a `BEGIN` on a connection that is already inside a
+/// transaction.
+const NESTED_BEGIN: &str = "cannot start a transaction within a transaction";
+
+/// SQLite's refusal of a `ROLLBACK` on a connection that is not inside a
+/// transaction — which, after a failed statement, means SQLite has already
+/// rolled the transaction back itself (it does for `SQLITE_FULL`,
+/// `SQLITE_NOMEM`, `SQLITE_IOERR` and an interrupt).
+const NO_ACTIVE_TRANSACTION: &str = "no transaction is active";
+
+/// Run `body` as one transaction on the one sql.js connection: `BEGIN`,
+/// `body`, `COMMIT` — and on any failure `ROLLBACK` and that failure, so
+/// either everything `body` ran is applied or none of it is. Every
+/// transaction in this crate goes through here: this module's
+/// [`DbExec::run_transaction`] and `vector::service`'s index rename.
 ///
-/// `run` is synchronous, and that is what makes this a transaction on a
+/// `control` runs `BEGIN`/`COMMIT`/`ROLLBACK` and answers with SQLite's text
+/// when one is refused ([`bridge_control`] in production); [`TxError`] turns
+/// that text into the caller's error type. `control` is a parameter so the
+/// framing can be driven by a recording runner (`transaction_framing`) and a
+/// `ROLLBACK` failure can be injected in front of real sql.js
+/// (`sql_js_transactions`), which has no other way to refuse one.
+///
+/// Everything is synchronous, and that is what makes this a transaction on a
 /// database other code shares: every bridge call is synchronous, so nothing
 /// between `BEGIN` and `COMMIT` yields to the executor, and no other task's
-/// statement can land inside it. It is a parameter so the framing can be
-/// tested without sql.js (`transaction_framing`).
+/// statement can land inside it.
 ///
-/// A failed `ROLLBACK` is logged, not returned: the caller is owed the
-/// statement's own failure. A connection left inside a transaction refuses
-/// the next `BEGIN` ("cannot start a transaction within a transaction"), so
-/// the log is what names the cause when that happens.
-fn in_transaction(
-    ops: &[TxOp<'_>],
-    mut run: impl FnMut(&TxOp<'_>) -> Result<TxResult, DatabaseError>,
-) -> Result<Vec<TxResult>, DatabaseError> {
-    const BEGIN: TxOp<'static> = TxOp::Execute {
-        sql: "BEGIN",
-        params: &[],
+/// A connection left inside a transaction is the failure this guards against
+/// from both ends, because sql.js does not surface it any other way: every
+/// later statement would run inside that transaction, and the next flush —
+/// `db.export()` closes and reopens the connection — would silently roll back
+/// what those statements wrote, although each of them reported success.
+///
+/// - **At `BEGIN`**, the `BEGIN` itself is the probe: SQLite refuses it with
+///   [`NESTED_BEGIN`] when a transaction is already open. Every logical write
+///   starts on a clean connection ([`with_flush_mapped`] sees to it), so one
+///   open here was opened during this write, and its earlier statements — a
+///   lazy `ADD COLUMN` before a `create_many`'s inserts, say — ran inside it.
+///   It cannot be committed (nobody framed those statements) or kept (the
+///   flush would roll it back), so it is rolled back and the write fails,
+///   saying why.
+/// - **After a failed `ROLLBACK`**: [`NO_ACTIVE_TRANSACTION`] means SQLite
+///   already ended the transaction, and the connection is clean. Any other
+///   refusal is retried once; if that fails too the connection is still
+///   inside the transaction, and the caller gets an error saying so, carrying
+///   the original failure, rather than the original failure alone. The check
+///   before the flush that follows ([`flush_through_bridge`]) then ends it.
+pub(crate) fn in_transaction<T, E: TxError>(
+    mut control: impl FnMut(&str) -> Result<(), String>,
+    body: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    begin(&mut control).map_err(E::refused)?;
+    let outcome = body().and_then(|value| control("COMMIT").map(|()| value).map_err(E::refused));
+    let failure = match outcome {
+        Ok(value) => return Ok(value),
+        Err(failure) => failure,
     };
-    const COMMIT: TxOp<'static> = TxOp::Execute {
-        sql: "COMMIT",
-        params: &[],
-    };
-    const ROLLBACK: TxOp<'static> = TxOp::Execute {
-        sql: "ROLLBACK",
-        params: &[],
-    };
-
-    run(&BEGIN)?;
-    let mut results = Vec::with_capacity(ops.len());
-    let outcome = ops.iter().try_for_each(|op| {
-        results.push(run(op)?);
-        Ok(())
-    });
-    let outcome = outcome.and_then(|()| run(&COMMIT).map(|_| ()));
-    if let Err(failure) = outcome {
-        if let Err(rollback) = run(&ROLLBACK) {
+    match rollback(&mut control) {
+        Ok(()) => Err(failure),
+        Err(stuck) => {
             tracing::error!(
-                error = %rollback,
-                "ROLLBACK after a failed transaction failed; sql.js may still be inside it"
+                error = %failure,
+                rollback = %stuck,
+                "a failed transaction could not be rolled back; the sql.js connection is \
+                 still inside it"
             );
+            Err(E::stuck(format!(
+                "{failure}; ROLLBACK failed twice ({stuck}), so the connection is still inside \
+                 the failed transaction"
+            )))
         }
-        return Err(failure);
     }
-    Ok(results)
+}
+
+/// `BEGIN` — refused, after rolling back, when a transaction is already
+/// open. See [`in_transaction`].
+fn begin(control: &mut impl FnMut(&str) -> Result<(), String>) -> Result<(), String> {
+    match control("BEGIN") {
+        Err(refused) if refused.contains(NESTED_BEGIN) => {
+            let rolled_back = match control("ROLLBACK") {
+                Ok(()) => "rolled it back".to_string(),
+                Err(e) => format!("could not roll it back either: {e}"),
+            };
+            forget_schema();
+            tracing::error!(
+                %rolled_back,
+                "a transaction was already open on the sql.js connection at BEGIN"
+            );
+            Err(format!(
+                "{refused}: a transaction was already open on the sql.js connection, so this \
+                 write's statements before BEGIN ran inside it; {rolled_back}"
+            ))
+        }
+        other => other,
+    }
+}
+
+/// `ROLLBACK`, retried once — `Err` only when the connection is still inside
+/// the transaction after both attempts. See [`in_transaction`].
+fn rollback(control: &mut impl FnMut(&str) -> Result<(), String>) -> Result<(), String> {
+    let first = match control("ROLLBACK") {
+        Ok(()) => return Ok(()),
+        Err(refused) if refused.contains(NO_ACTIVE_TRANSACTION) => {
+            tracing::debug!(error = %refused, "SQLite already rolled the failed transaction back");
+            return Ok(());
+        }
+        Err(refused) => refused,
+    };
+    tracing::warn!(error = %first, "ROLLBACK after a failed transaction failed; retrying it");
+    match control("ROLLBACK") {
+        Ok(()) => Ok(()),
+        Err(refused) if refused.contains(NO_ACTIVE_TRANSACTION) => Ok(()),
+        Err(refused) => Err(format!("{first}; then {refused}")),
+    }
 }
 
 // ─── DatabaseService — an explicit ledger over the shared DbExec defaults ─────
@@ -799,8 +969,11 @@ mod sql_js_conformance {
     use super::BrowserDatabaseService;
 
     #[wasm_bindgen(inline_js = r#"
+let writes = 0;
+export function opfsWrites() { return writes; }
 export function installMemoryOpfs() {
     const files = new Map();
+    writes = 0;
     const handle = (name) => ({
         async getFile() {
             const data = files.get(name);
@@ -810,7 +983,7 @@ export function installMemoryOpfs() {
             let data = new Uint8Array(0);
             return {
                 async write(chunk) { data = chunk; },
-                async close() { files.set(name, data); },
+                async close() { files.set(name, data); writes += 1; },
             };
         },
     });
@@ -835,7 +1008,12 @@ export function installMemoryOpfs() {
         /// An in-memory OPFS: `navigator.storage.getDirectory()` answering
         /// the file-handle calls bridge.js makes, starting empty.
         #[wasm_bindgen(js_name = installMemoryOpfs)]
-        fn install_memory_opfs();
+        pub(super) fn install_memory_opfs();
+
+        /// How many times a file was written to the OPFS installed last —
+        /// one per `dbFlush`.
+        #[wasm_bindgen(js_name = opfsWrites)]
+        pub(super) fn opfs_writes() -> u32;
     }
 
     fn row(id: &str, name: Option<&str>) -> HashMap<String, serde_json::Value> {
@@ -1240,68 +1418,101 @@ mod flush_precedence {
 }
 
 /// The `BEGIN`/`COMMIT`/`ROLLBACK` framing of [`in_transaction`], driven
-/// through a recording statement runner instead of sql.js (which does not
-/// exist under `wasm-pack test --node`).
+/// through a recording stand-in for the connection that keeps SQLite's one
+/// piece of state — whether a transaction is open — and refuses the control
+/// statements with SQLite's own texts. `sql_js_transactions` below runs the
+/// cases real sql.js can produce against real sql.js.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod transaction_framing {
     use std::cell::RefCell;
 
-    use wafer_core::interfaces::database::{
-        exec::{TxOp, TxResult},
-        service::DatabaseError,
-    };
+    use wafer_core::interfaces::database::service::DatabaseError;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use super::in_transaction;
+    use super::{in_transaction, NESTED_BEGIN, NO_ACTIVE_TRANSACTION};
 
-    /// Three inserts, the second of which may fail the way sql.js reports a
-    /// taken key.
-    fn inserts() -> [TxOp<'static>; 3] {
-        [
-            TxOp::Execute {
-                sql: "INSERT INTO t (id) VALUES ('a')",
-                params: &[],
-            },
-            TxOp::Execute {
-                sql: "INSERT INTO t (id) VALUES ('b')",
-                params: &[],
-            },
-            TxOp::Execute {
-                sql: "INSERT INTO t (id) VALUES ('c')",
-                params: &[],
-            },
-        ]
+    /// A connection: whether a transaction is open, every statement it was
+    /// handed, and the refusals scripted for it.
+    #[derive(Default)]
+    struct Connection {
+        open: bool,
+        seen: Vec<String>,
+        /// `ROLLBACK`s to refuse, with a text that is not "no transaction".
+        refuse_rollbacks: usize,
+        /// Refuse the `COMMIT`.
+        refuse_commit: bool,
     }
 
-    /// Every statement the runner saw, in order, failing the one whose SQL
-    /// contains `fail_on`.
-    fn run_recording(
-        ops: &[TxOp<'_>],
-        fail_on: Option<&str>,
-    ) -> (Result<Vec<TxResult>, DatabaseError>, Vec<String>) {
-        let seen = RefCell::new(Vec::new());
-        let out = in_transaction(ops, |op| {
-            let (sql, _) = op.sql_params();
-            seen.borrow_mut().push(sql.to_string());
-            match fail_on {
-                Some(needle) if sql.contains(needle) => {
-                    Err(impresspress_core::sqlite_text_error::statement_error(
-                        "sql exec: JsValue(Error: UNIQUE constraint failed: t.id)".into(),
-                    ))
+    impl Connection {
+        fn control(&mut self, sql: &str) -> Result<(), String> {
+            self.seen.push(sql.to_string());
+            match sql {
+                "BEGIN" if self.open => Err(NESTED_BEGIN.to_string()),
+                "BEGIN" => {
+                    self.open = true;
+                    Ok(())
                 }
-                _ => Ok(TxResult::Execute(1)),
+                "COMMIT" if self.refuse_commit => Err("database is full".into()),
+                "COMMIT" => {
+                    self.open = false;
+                    Ok(())
+                }
+                "ROLLBACK" if !self.open => {
+                    Err(format!("cannot rollback - {NO_ACTIVE_TRANSACTION}"))
+                }
+                "ROLLBACK" if self.refuse_rollbacks > 0 => {
+                    self.refuse_rollbacks -= 1;
+                    Err("cannot rollback transaction - SQL statements in progress".into())
+                }
+                "ROLLBACK" => {
+                    self.open = false;
+                    Ok(())
+                }
+                other => panic!("not a control statement: {other}"),
             }
-        });
-        (out, seen.into_inner())
+        }
+    }
+
+    /// Run a three-insert transaction whose second insert fails the way
+    /// sql.js reports a taken key when `fail` is set. `ended_by_sqlite` closes
+    /// the transaction as the failure happens, as SQLite does itself for
+    /// `SQLITE_FULL` and friends.
+    fn run(
+        conn: &RefCell<Connection>,
+        fail: bool,
+        ended_by_sqlite: bool,
+    ) -> Result<Vec<&'static str>, DatabaseError> {
+        in_transaction(
+            |sql| conn.borrow_mut().control(sql),
+            || {
+                let mut done = Vec::new();
+                for insert in ["insert a", "insert b", "insert c"] {
+                    conn.borrow_mut().seen.push(insert.to_string());
+                    if fail && insert == "insert b" {
+                        if ended_by_sqlite {
+                            conn.borrow_mut().open = false;
+                        }
+                        return Err(impresspress_core::sqlite_text_error::statement_error(
+                            "sql exec: JsValue(Error: UNIQUE constraint failed: t.id)".into(),
+                        ));
+                    }
+                    done.push(insert);
+                }
+                Ok(done)
+            },
+        )
     }
 
     #[wasm_bindgen_test]
     fn every_statement_runs_between_begin_and_commit() {
-        let (out, seen) = run_recording(&inserts(), None);
-        assert_eq!(out.expect("committed").len(), 3);
-        assert_eq!(seen.first().map(String::as_str), Some("BEGIN"));
-        assert_eq!(seen.last().map(String::as_str), Some("COMMIT"));
-        assert_eq!(seen.len(), 5, "{seen:?}");
+        let conn = RefCell::new(Connection::default());
+        assert_eq!(run(&conn, false, false).expect("committed").len(), 3);
+        let conn = conn.into_inner();
+        assert_eq!(
+            conn.seen,
+            ["BEGIN", "insert a", "insert b", "insert c", "COMMIT"]
+        );
+        assert!(!conn.open);
     }
 
     /// **The all-or-nothing half.** A failing statement rolls back the ones
@@ -1310,27 +1521,351 @@ mod transaction_framing {
     /// it. The failure reaches the caller as the taken key it was.
     #[wasm_bindgen_test]
     fn a_failing_statement_rolls_back_and_nothing_after_it_runs() {
-        let (out, seen) = run_recording(&inserts(), Some("'b'"));
+        let conn = RefCell::new(Connection::default());
+        let out = run(&conn, true, false);
         assert!(
             matches!(out, Err(DatabaseError::AlreadyExists(_))),
             "{out:?}"
         );
-        assert_eq!(
-            seen,
-            [
-                "BEGIN",
-                "INSERT INTO t (id) VALUES ('a')",
-                "INSERT INTO t (id) VALUES ('b')",
-                "ROLLBACK",
-            ],
-        );
+        let conn = conn.into_inner();
+        assert_eq!(conn.seen, ["BEGIN", "insert a", "insert b", "ROLLBACK"]);
+        assert!(!conn.open);
     }
 
     /// A `COMMIT` that fails is a failed transaction too.
     #[wasm_bindgen_test]
     fn a_failed_commit_rolls_back() {
-        let (out, seen) = run_recording(&inserts(), Some("COMMIT"));
-        assert!(out.is_err());
-        assert_eq!(seen.last().map(String::as_str), Some("ROLLBACK"));
+        let conn = RefCell::new(Connection {
+            refuse_commit: true,
+            ..Connection::default()
+        });
+        assert!(run(&conn, false, false).is_err());
+        let conn = conn.into_inner();
+        assert_eq!(conn.seen.last().map(String::as_str), Some("ROLLBACK"));
+        assert!(!conn.open);
+    }
+
+    /// SQLite ends a transaction itself on some failures, and then refuses
+    /// the `ROLLBACK` as having nothing to roll back. The connection is
+    /// clean, so that refusal is not retried and the caller gets the
+    /// statement's own failure.
+    #[wasm_bindgen_test]
+    fn a_rollback_sqlite_already_did_is_not_a_failure() {
+        let conn = RefCell::new(Connection::default());
+        let out = run(&conn, true, true);
+        assert!(
+            matches!(out, Err(DatabaseError::AlreadyExists(_))),
+            "{out:?}"
+        );
+        let conn = conn.into_inner();
+        assert_eq!(conn.seen, ["BEGIN", "insert a", "insert b", "ROLLBACK"]);
+    }
+
+    /// **Fails on the pre-change tree**, which logged a refused `ROLLBACK`
+    /// and returned with the connection still inside the transaction. The
+    /// `ROLLBACK` is retried, and the connection ends up outside it.
+    #[wasm_bindgen_test]
+    fn a_refused_rollback_is_retried_until_the_transaction_is_gone() {
+        let conn = RefCell::new(Connection {
+            refuse_rollbacks: 1,
+            ..Connection::default()
+        });
+        let out = run(&conn, true, false);
+        assert!(
+            matches!(out, Err(DatabaseError::AlreadyExists(_))),
+            "{out:?}"
+        );
+        let conn = conn.into_inner();
+        assert!(!conn.open, "the connection was left inside the transaction");
+        assert_eq!(
+            conn.seen,
+            ["BEGIN", "insert a", "insert b", "ROLLBACK", "ROLLBACK"]
+        );
+    }
+
+    /// **Fails on the pre-change tree**, which answered with the statement's
+    /// own failure — a taken key, a 409 — while the connection stayed inside
+    /// the transaction. A connection that cannot be rolled back is a fault,
+    /// and the error says what state it left.
+    #[wasm_bindgen_test]
+    fn a_rollback_that_keeps_failing_is_an_internal_error_naming_the_state() {
+        let conn = RefCell::new(Connection {
+            refuse_rollbacks: 2,
+            ..Connection::default()
+        });
+        match run(&conn, true, false) {
+            Err(DatabaseError::Internal(msg)) => {
+                assert!(msg.contains("still inside"), "{msg}");
+                assert!(msg.contains("UNIQUE constraint failed"), "{msg}");
+            }
+            other => panic!("expected the stuck-connection error, got {other:?}"),
+        }
+    }
+
+    /// **Fails on the pre-change tree**, which returned the refused `BEGIN`
+    /// and left the transaction open, so whatever ran next ran inside it. A
+    /// transaction already open at `BEGIN` is rolled back, and the write
+    /// fails saying so rather than running its statements.
+    #[wasm_bindgen_test]
+    fn a_transaction_open_at_begin_is_rolled_back_and_refused() {
+        let conn = RefCell::new(Connection {
+            open: true,
+            ..Connection::default()
+        });
+        match run(&conn, false, false) {
+            Err(DatabaseError::Internal(msg)) => {
+                assert!(msg.contains("already open"), "{msg}");
+            }
+            other => panic!("expected the open-transaction error, got {other:?}"),
+        }
+        let conn = conn.into_inner();
+        assert_eq!(conn.seen, ["BEGIN", "ROLLBACK"]);
+        assert!(!conn.open);
+    }
+}
+
+/// Transactions and flushes against REAL sql.js, through the service a block
+/// calls — the harness `sql_js_conformance` describes.
+///
+/// "Durable" is checked the only way that means anything here: by reopening
+/// the database from the OPFS image (`crate::db_init`) and reading it back.
+/// sql.js's `db.export()`, which every flush runs, closes and reopens the
+/// connection, so a write that reported success from inside a transaction
+/// nobody committed is rolled back by that flush and is simply not there.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod sql_js_transactions {
+    use std::collections::HashMap;
+
+    use wafer_core::interfaces::database::service::{DatabaseError, DatabaseService, WriteOp};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{
+        bridge_control, in_transaction,
+        sql_js_conformance::{install_memory_opfs, opfs_writes},
+        BrowserDatabaseService,
+    };
+
+    const TABLE: &str = "sql_js_tx_t";
+
+    /// A fresh in-memory OPFS, a fresh sql.js database on it, and one table.
+    async fn fresh() -> BrowserDatabaseService {
+        install_memory_opfs();
+        crate::db_init().await.expect("sql.js loads");
+        let svc = BrowserDatabaseService;
+        svc.exec_raw(
+            &format!("CREATE TABLE {TABLE} (id TEXT PRIMARY KEY, name TEXT)"),
+            &[],
+        )
+        .await
+        .expect("create table");
+        svc
+    }
+
+    fn row(id: &str) -> HashMap<String, serde_json::Value> {
+        HashMap::from([
+            ("id".to_string(), serde_json::json!(id)),
+            ("name".to_string(), serde_json::json!(format!("row {id}"))),
+        ])
+    }
+
+    /// The ids in the table as the flushed OPFS image holds them, sorted.
+    async fn durable_ids(svc: &BrowserDatabaseService) -> Vec<String> {
+        crate::db_init().await.expect("reopen from OPFS");
+        let mut ids: Vec<String> = svc
+            .query_raw(&format!("SELECT id FROM {TABLE}"), &[])
+            .await
+            .expect("read back")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// **The coalescing half of the durability contract, on the real
+    /// service.** `create_many` is one logical mutation however many rows it
+    /// carries and however many statements it takes — here twenty inserts,
+    /// plus the lazy ADD COLUMNs for the `created_at`/`updated_at` stamps
+    /// before them — so it writes the database to OPFS exactly once, and that
+    /// one write holds every row. Fails when `create_many` is `forward` (no
+    /// flush: nothing durable) or flushes per statement.
+    #[wasm_bindgen_test]
+    async fn create_many_flushes_to_opfs_exactly_once() {
+        let svc = fresh().await;
+        let ids: Vec<String> = (0..20).map(|i| format!("r{i:02}")).collect();
+
+        let before = opfs_writes();
+        let inserted = svc
+            .create_many(TABLE, ids.iter().map(|id| row(id)).collect())
+            .await
+            .expect("create_many");
+        assert_eq!(inserted, 20);
+        assert_eq!(opfs_writes() - before, 1, "one logical write, one flush");
+
+        assert_eq!(durable_ids(&svc).await, ids);
+    }
+
+    /// The same for `batch`: a create, an update and a delete in one call are
+    /// one transaction and one OPFS write.
+    #[wasm_bindgen_test]
+    async fn batch_flushes_to_opfs_exactly_once() {
+        let svc = fresh().await;
+        svc.create_many(TABLE, vec![row("keep"), row("drop")])
+            .await
+            .expect("seed");
+
+        let before = opfs_writes();
+        let outcomes = svc
+            .batch(vec![
+                WriteOp::Create {
+                    collection: TABLE.into(),
+                    data: row("new"),
+                },
+                WriteOp::Update {
+                    collection: TABLE.into(),
+                    id: "keep".into(),
+                    data: HashMap::from([("name".to_string(), serde_json::json!("kept"))]),
+                },
+                WriteOp::Delete {
+                    collection: TABLE.into(),
+                    id: "drop".into(),
+                },
+            ])
+            .await
+            .expect("batch");
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(opfs_writes() - before, 1, "one logical write, one flush");
+
+        assert_eq!(durable_ids(&svc).await, ["keep", "new"]);
+    }
+
+    /// **Fails on the pre-change tree.** A transaction left open on the
+    /// connection — here by a `BEGIN` sent through `query_raw`, which does
+    /// not flush and so never reaches the reopen that would end it — used to
+    /// swallow the next `create_many`: its lazy `ADD COLUMN`s ran inside that
+    /// transaction and its own `BEGIN` was refused ("cannot start a
+    /// transaction within a transaction"). The write now rolls the stranger's
+    /// transaction back before it starts, and its rows land and are durable.
+    #[wasm_bindgen_test]
+    async fn a_transaction_left_open_does_not_swallow_the_next_create_many() {
+        let svc = fresh().await;
+        svc.query_raw("BEGIN", &[])
+            .await
+            .expect("open a transaction");
+
+        let inserted = svc
+            .create_many(TABLE, vec![row("a"), row("b")])
+            .await
+            .expect("create_many recovers the connection");
+        assert_eq!(inserted, 2);
+        assert_eq!(durable_ids(&svc).await, ["a", "b"]);
+    }
+
+    /// **Fails on the pre-change tree**, where the `BEGIN` was reported as a
+    /// successful write and the flush's reopen then rolled it back unseen. A
+    /// write that leaves a transaction open is an error: whatever ran inside
+    /// that transaction is gone.
+    #[wasm_bindgen_test]
+    async fn a_write_that_leaves_a_transaction_open_is_an_error() {
+        let svc = fresh().await;
+        let err = svc
+            .exec_raw("BEGIN", &[])
+            .await
+            .expect_err("the flush rolled the transaction back");
+        assert!(
+            matches!(&err, DatabaseError::Internal(msg) if msg.contains("left a transaction open")),
+            "{err:?}"
+        );
+
+        svc.create(TABLE, row("after"))
+            .await
+            .expect("a later write");
+        assert_eq!(durable_ids(&svc).await, ["after"]);
+    }
+
+    /// **Fails on the pre-change tree.** sql.js cannot be made to refuse a
+    /// `ROLLBACK` from outside, so the first one is refused here, in front of
+    /// the real connection, which it therefore leaves inside the failed
+    /// transaction. The pre-change framing logged that and returned, and the
+    /// next write — a plain `create`, reported as a success — ran inside the
+    /// dead transaction and was rolled back by its own flush, silently. Now
+    /// the `ROLLBACK` is retried (`transaction_framing` pins that on its
+    /// own) and the next write checks the connection before it starts, so the
+    /// failed transaction's first insert is gone and the later write is
+    /// durable; either one alone keeps this passing.
+    #[wasm_bindgen_test]
+    async fn a_refused_rollback_does_not_leave_the_connection_inside_the_transaction() {
+        let svc = fresh().await;
+        let mut refused = false;
+        let out: Result<(), DatabaseError> = in_transaction(
+            |sql| {
+                if sql == "ROLLBACK" && !refused {
+                    refused = true;
+                    return Err("cannot rollback transaction - SQL statements in progress".into());
+                }
+                bridge_control(sql)
+            },
+            || {
+                for id in ["a", "a"] {
+                    let params = crate::db_codec::params_to_js(&[serde_json::json!(id)])
+                        .map_err(DatabaseError::Internal)?;
+                    crate::bridge::db_exec_raw(
+                        &format!("INSERT INTO {TABLE} (id) VALUES (?)"),
+                        params,
+                    )
+                    .map_err(|e| super::statement_failed(&e))?;
+                }
+                Ok(())
+            },
+        );
+        assert!(refused, "the injected refusal was never reached");
+        assert!(
+            matches!(out, Err(DatabaseError::AlreadyExists(_))),
+            "{out:?}"
+        );
+
+        svc.create(TABLE, row("b")).await.expect("a later write");
+        assert_eq!(durable_ids(&svc).await, ["b"]);
+    }
+
+    /// **Fails on the pre-change tree.** sql.js's `db.export()`, which every
+    /// flush runs, closes the connection and opens a new one — and a new
+    /// connection has SQLite's defaults: foreign keys off, and no
+    /// `base64_decode` (the function the vector service's upsert stores its
+    /// blobs through). `dbInit` set both up once, so after the first flush
+    /// neither held. A foreign key is enforced, and the function is there,
+    /// after as many flushes as it takes.
+    #[wasm_bindgen_test]
+    async fn the_connection_setup_survives_a_flush() {
+        let svc = fresh().await;
+        svc.exec_raw("CREATE TABLE sql_js_fk_parent (id TEXT PRIMARY KEY)", &[])
+            .await
+            .expect("parent table");
+        svc.exec_raw(
+            "CREATE TABLE sql_js_fk_child (id TEXT PRIMARY KEY, \
+             parent TEXT REFERENCES sql_js_fk_parent(id))",
+            &[],
+        )
+        .await
+        .expect("child table");
+
+        let orphan = HashMap::from([
+            ("id".to_string(), serde_json::json!("c1")),
+            ("parent".to_string(), serde_json::json!("no such parent")),
+        ]);
+        let err = svc
+            .create("sql_js_fk_child", orphan)
+            .await
+            .expect_err("a dangling foreign key is refused");
+        assert!(
+            matches!(&err, DatabaseError::Internal(msg) if msg.contains("FOREIGN KEY")),
+            "{err:?}"
+        );
+
+        let decoded = svc
+            .query_raw("SELECT length(base64_decode('AAAA')) AS n", &[])
+            .await
+            .expect("base64_decode is registered");
+        assert_eq!(decoded[0].data.get("n"), Some(&serde_json::json!(3)));
     }
 }

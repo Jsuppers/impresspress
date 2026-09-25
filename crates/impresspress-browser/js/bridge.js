@@ -14,7 +14,7 @@ const DB_FILENAME = 'impresspress.db';
 
 /**
  * Load sql.js WASM, try to load existing DB from OPFS, create new if none exists.
- * Sets PRAGMA foreign_keys=ON.
+ * Then sets the connection up — see `configureConnection`.
  */
 export async function dbInit() {
     const SQL = await initSqlJs({
@@ -40,6 +40,19 @@ export async function dbInit() {
         _db = new SQL.Database();
     }
 
+    configureConnection();
+}
+
+/**
+ * Per-connection setup, which SQLite does not store in the database file:
+ * foreign-key enforcement and the `base64_decode` scalar function.
+ *
+ * Run on every connection `_db` holds, not once per `dbInit`: sql.js's
+ * `export()` (which `dbFlush` calls) closes the connection and opens a new
+ * one on the same in-memory file, and drops every registered function on the
+ * way, so the connection after a flush starts from SQLite's defaults.
+ */
+function configureConnection() {
     _db.run('PRAGMA foreign_keys = ON;');
 
     // Custom scalar fn used by BrowserVectorService.upsert to ship f32 blobs
@@ -111,10 +124,18 @@ export function dbQueryRaw(sql, params) {
  * or Service Worker is killed while `dbFlush` itself is exporting/writing),
  * which is an inherent OPFS/browser-crash risk independent of this
  * batching, not a window this change introduces.
+ *
+ * sql.js's `export()` closes the connection and opens a new one, which rolls
+ * back a transaction still open on it. The Rust side ends any such
+ * transaction itself before calling this (`end_open_transaction` in
+ * `database.rs`), so that rollback is reported rather than silent.
  */
 export async function dbFlush() {
     if (!_db) return;
     const data = _db.export();
+    // `export()` reopened the connection; set the new one up before anything
+    // can run on it.
+    configureConnection();
     const root = await navigator.storage.getDirectory();
     const fileHandle = await root.getFileHandle(DB_FILENAME, { create: true });
     const writable = await fileHandle.createWritable();

@@ -17,6 +17,26 @@ they run on a fresh install, or when the operator opts in with
 data repair the migration half performs, it has to be called out here — the
 two ship together but only one of them runs by default.
 
+### Browser: migrations run once per change, not on every boot
+
+**What changes.** A browser install now runs a block's migrations when their
+hash differs from the one recorded in its database — once, on the first boot
+of a bundle that changes them — and skips them otherwise.
+
+**Why.** The browser built its runtime before reading the recorded migration
+state, so the gate treated every boot (every service-worker start, and every
+dev-sandbox rebuild) as a fresh install and re-ran every block's full
+migration set. That is where the "duplicate column name" warnings in the
+worker console came from. For the auth block the set includes
+`004_refresh_tokens`, which begins by dropping the refresh-token table.
+
+**What to expect.** The first boot of this release re-runs nothing new: every
+block's recorded hash already matches. From then on a browser install behaves
+like a native one started with `--run-migrations`: loading a new bundle is its
+deploy, so a changed migration applies once, with the same consequences it has
+anywhere else: any edit to the auth migration SQL still re-runs the auth set
+and signs every user out, once.
+
 ### wafer-run 11723941: cut-off streams, Postgres settings, security headers
 
 **What changes.**
@@ -1366,12 +1386,11 @@ pass `--run-migrations` still logs the generic `schema drift` warning for the
 admin block until it does once; that warning is about the recorded hash, not
 the schema.
 
-**Browser installs made before this release do not get it.** A browser install
-applies migrations only when it creates its database; nothing passes
-`--run-migrations` there, so an install whose admin schema already exists logs
-the drift warning and keeps the old table, without the index. Twin grants
-remain possible there, as before. The role-delete revocation and the
-assign-endpoint check do not depend on the index and apply everywhere.
+**Browser installs get it on their next boot.** A browser install applies a
+changed migration on the first boot of the bundle that carries it (see
+"Browser: migrations run once per change" above), so the repair and the index
+land there too. The role-delete revocation and the assign-endpoint check do
+not depend on the index and apply everywhere.
 
 ## The release workflow has never produced a release
 

@@ -580,29 +580,27 @@ fn exec_ddl(statements: &[String], tables: &[String]) -> VResult<()> {
     ran
 }
 
-/// Run `statements` between `BEGIN` and `COMMIT`, rolling back on the first
-/// failure so a half-moved index never persists.
+/// Run `statements` as one transaction — the crate's one framing,
+/// [`database::in_transaction`] — so a half-moved index never persists.
 fn in_transaction(statements: &[sql::PreparedStmt]) -> VResult<()> {
-    let run = |sql: &str, params: &[serde_json::Value]| -> VResult<()> {
-        let params_js = db_codec::params_to_js(params).map_err(VectorError::Internal)?;
-        bridge::db_exec_raw(sql, params_js)
-            .map(|_| ())
-            .map_err(|e| VectorError::Internal(js_err(e)))
-    };
-    run("BEGIN", &[])?;
-    let outcome = statements
-        .iter()
-        .try_for_each(|stmt| run(&stmt.sql, &stmt.params))
-        .and_then(|()| run("COMMIT", &[]));
-    if outcome.is_err() {
-        if let Err(rollback) = run("ROLLBACK", &[]) {
-            tracing::error!(
-                error = %rollback,
-                "ROLLBACK after a failed index rename failed; sql.js may still be inside it"
-            );
-        }
+    database::in_transaction(database::bridge_control, || {
+        statements.iter().try_for_each(|stmt| {
+            let params_js = db_codec::params_to_js(&stmt.params).map_err(VectorError::Internal)?;
+            bridge::db_exec_raw(&stmt.sql, params_js)
+                .map(|_| ())
+                .map_err(|e| VectorError::Internal(js_err(e)))
+        })
+    })
+}
+
+impl database::TxError for VectorError {
+    fn refused(message: String) -> Self {
+        VectorError::Internal(message)
     }
-    outcome
+
+    fn stuck(message: String) -> Self {
+        VectorError::Internal(message)
+    }
 }
 
 /// A loaded vector row: `(id, vector, metadata)`.
