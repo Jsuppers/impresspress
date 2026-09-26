@@ -47,10 +47,10 @@ use crate::blocks::crud::{classify_db_error, DbFailure};
 /// on as a generic `Internal`.
 fn backend_error(error: WaferError, context: &str) -> AuthError {
     match classify_db_error(error, None, context) {
-        DbFailure::Refused(refusal) => AuthError::Backend(refusal),
+        DbFailure::Refused(refusal) => AuthError::Backend(refusal.into_error()),
         DbFailure::Internal(fault)
             if matches!(
-                fault.code,
+                fault.code(),
                 ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
             ) =>
         {

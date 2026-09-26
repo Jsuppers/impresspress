@@ -386,9 +386,11 @@ pub(crate) fn no_store_db_error_internal(error: WaferError, context: &str) -> Ou
 /// Seal a [`crate::blocks::crud::DbFailure`] as a `/b/dev` response.
 fn seal_no_store(failure: crate::blocks::crud::DbFailure, context: &str) -> OutputStream {
     match failure {
-        crate::blocks::crud::DbFailure::Refused(error) => OutputStream::error(with_no_store(error)),
-        crate::blocks::crud::DbFailure::Internal(error) => {
-            crate::http::err_internal(context, error)
+        crate::blocks::crud::DbFailure::Refused(refusal) => {
+            OutputStream::error(with_no_store(refusal.into_error()))
+        }
+        crate::blocks::crud::DbFailure::Internal(fault) => {
+            crate::http::err_internal(context, fault.into_error())
         }
     }
 }

@@ -522,7 +522,7 @@ pub(crate) fn credential_check_failed(error: WaferError, context: &str) -> Wafer
     use crate::blocks::crud::{classify_db_error, DbFailure};
 
     match classify_db_error(error, None, context) {
-        DbFailure::Refused(refusal) => refusal,
+        DbFailure::Refused(refusal) => refusal.into_error(),
         DbFailure::Internal(fault) => {
             tracing::error!(context = %context, error = %fault, "credential check failed");
             WaferError::new(

@@ -98,9 +98,9 @@ pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputS
 /// `text/html`) gets the same statuses as JSON.
 pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str) -> OutputStream {
     match classify_db_error(error, None, context) {
-        DbFailure::Refused(error) => crate::ui::refused_response(msg, error),
-        DbFailure::Internal(error) => {
-            tracing::error!(context = %context, error = %error, "page read failed");
+        DbFailure::Refused(refusal) => crate::ui::refused_response(msg, refusal.into_error()),
+        DbFailure::Internal(fault) => {
+            tracing::error!(context = %context, error = %fault, "page read failed");
             crate::ui::server_error_response(msg)
         }
     }
@@ -120,15 +120,15 @@ pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str)
 /// `context` and said as a fault.
 pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static str {
     match classify_db_error(error, None, context) {
-        DbFailure::Refused(error) if error.code == ErrorCode::ResourceExhausted => {
+        DbFailure::Refused(refusal) if refusal.code() == ErrorCode::ResourceExhausted => {
             "it is over its usage limit right now"
         }
-        DbFailure::Refused(error) if error.code == ErrorCode::AlreadyExists => {
+        DbFailure::Refused(refusal) if refusal.code() == ErrorCode::AlreadyExists => {
             "it duplicates an entry that already exists"
         }
         DbFailure::Refused(_) => "access to it was denied",
-        DbFailure::Internal(error) => {
-            tracing::error!(context = %context, error = %error, "fragment read failed");
+        DbFailure::Internal(fault) => {
+            tracing::error!(context = %context, error = %fault, "fragment read failed");
             "something went wrong"
         }
     }
@@ -144,17 +144,76 @@ pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static 
 /// including its refusals. It seals this itself through
 /// `dev::no_store_db_error`. **Nothing else may**: a third classification of
 /// a database failure is exactly what `tests/error_door.rs` exists to stop.
+///
+/// Only [`classify_db_error`] can build one. Both variants wrap a type whose
+/// field is private to this module, so a caller can take a `DbFailure` apart
+/// but cannot assemble one from an unclassified error and hand it to a sealer
+/// that trusts it was classified:
+///
+/// ```
+/// use impresspress_core::blocks::crud::{classify_db_error, DbFailure};
+/// use wafer_run::{ErrorCode, WaferError};
+///
+/// let failure = classify_db_error(WaferError::new(ErrorCode::Internal, "x"), None, "doc");
+/// assert!(matches!(failure, DbFailure::Internal(fault) if fault.code() == ErrorCode::Internal));
+/// ```
+///
+/// ```compile_fail
+/// use impresspress_core::blocks::crud::{DbFailure, Refusal};
+/// use wafer_run::{ErrorCode, WaferError};
+///
+/// // A raw WRAP denial passed off as already classified.
+/// let _ = DbFailure::Refused(Refusal(WaferError::new(ErrorCode::PermissionDenied, "x")));
+/// ```
 pub enum DbFailure {
     /// A refusal the client is told about as it stands: the caller's 404,
     /// the 403 a WRAP denial becomes, the 429 a quota keeps, the 409 a
     /// duplicate key is. The cause, when
     /// it was one that must not be published, has already been logged and
     /// replaced.
-    Refused(wafer_run::WaferError),
+    Refused(Refusal),
     /// An internal fault, carried back untouched — sanitizing it and minting
     /// its correlation id is [`crate::http::err_internal`]'s job, and doing
     /// it here would mean two places that log a 500.
-    Internal(wafer_run::WaferError),
+    Internal(Fault),
+}
+
+/// [`DbFailure::Refused`]'s error: safe to send to the client as it stands.
+pub struct Refusal(wafer_run::WaferError);
+
+impl Refusal {
+    /// The refusal's code: `NotFound`, `PermissionDenied`,
+    /// `ResourceExhausted` or `AlreadyExists`.
+    pub fn code(&self) -> ErrorCode {
+        self.0.code
+    }
+
+    /// The error to answer the client with.
+    pub fn into_error(self) -> wafer_run::WaferError {
+        self.0
+    }
+}
+
+/// [`DbFailure::Internal`]'s error: the untouched cause, never shown to the
+/// client.
+pub struct Fault(wafer_run::WaferError);
+
+impl Fault {
+    /// The cause's code.
+    pub fn code(&self) -> ErrorCode {
+        self.0.code
+    }
+
+    /// The cause, for the caller to log and seal.
+    pub fn into_error(self) -> wafer_run::WaferError {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
 }
 
 /// Classify a failed database call. `not_found` is `Some` when a `NotFound`
@@ -167,37 +226,29 @@ pub fn classify_db_error(
     not_found: Option<&str>,
     context: &str,
 ) -> DbFailure {
+    let refused = |code, message: &str| {
+        DbFailure::Refused(Refusal(wafer_run::WaferError::new(code, message)))
+    };
     match (error.code, not_found) {
-        (ErrorCode::NotFound, Some(label)) => {
-            DbFailure::Refused(wafer_run::WaferError::new(ErrorCode::NotFound, label))
-        }
+        (ErrorCode::NotFound, Some(label)) => refused(ErrorCode::NotFound, label),
         (ErrorCode::PermissionDenied, _) => {
             tracing::warn!(
                 context = %context,
                 error = %error,
                 "database access denied — a WRAP grant or a row guard refused this call",
             );
-            DbFailure::Refused(wafer_run::WaferError::new(
-                ErrorCode::PermissionDenied,
-                "Access denied",
-            ))
+            refused(ErrorCode::PermissionDenied, "Access denied")
         }
-        (ErrorCode::ResourceExhausted, _) => DbFailure::Refused(wafer_run::WaferError::new(
-            ErrorCode::ResourceExhausted,
-            error.message,
-        )),
+        (ErrorCode::ResourceExhausted, _) => refused(ErrorCode::ResourceExhausted, &error.message),
         (ErrorCode::AlreadyExists, _) => {
             tracing::info!(
                 context = %context,
                 error = %error,
                 "database refused a write that duplicates a unique key",
             );
-            DbFailure::Refused(wafer_run::WaferError::new(
-                ErrorCode::AlreadyExists,
-                DUPLICATE_KEY,
-            ))
+            refused(ErrorCode::AlreadyExists, DUPLICATE_KEY)
         }
-        _ => DbFailure::Internal(error),
+        _ => DbFailure::Internal(Fault(error)),
     }
 }
 
@@ -208,8 +259,8 @@ pub const DUPLICATE_KEY: &str = "A record with the same key already exists";
 /// [`DbFailure`] as the response every caller but `blocks::dev` wants.
 fn seal(failure: DbFailure, context: &str) -> OutputStream {
     match failure {
-        DbFailure::Refused(error) => OutputStream::error(error),
-        DbFailure::Internal(error) => err_internal(context, error),
+        DbFailure::Refused(refusal) => OutputStream::error(refusal.into_error()),
+        DbFailure::Internal(fault) => err_internal(context, fault.into_error()),
     }
 }
 
