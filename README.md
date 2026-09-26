@@ -22,6 +22,14 @@ IMPRESSPRESS_LISTEN=127.0.0.1:8090 \
 
 Open <http://127.0.0.1:8090/b/auth/login> and sign in with `admin@example.com` and `admin123`. Local data is stored under `data/` by default.
 
+To pepper password hashes with a key kept outside the database, export
+`IMPRESSPRESS_PASSWORD_PEPPER_KEY` (generate one with `openssl rand -base64 32`
+and back it up: losing it locks out every account it peppered). The key is
+read from the process environment only and is never stored or served as
+config. `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` (rotation) and
+`IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` (`true`/`false`) complete it; read
+RELEASE.md's "password pepper" upgrade note before setting either.
+
 If you commit from this checkout, point git at the repository's hooks once so formatting and clippy run the same way CI does (this needs the nightly toolchain's rustfmt: `rustup toolchain install nightly --component rustfmt`):
 
 ```sh
