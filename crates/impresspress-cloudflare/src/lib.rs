@@ -1062,7 +1062,14 @@ mod deferred_drain_tests {
 
         assert_eq!(
             *order.borrow(),
-            ["row, reserved 4", "a, reserved 0", "b, reserved 0"]
+            [
+                format!(
+                    "row, reserved {}",
+                    impresspress_core::after_response::AUDIT_ROW_STATEMENTS
+                ),
+                "a, reserved 0".to_string(),
+                "b, reserved 0".to_string(),
+            ]
         );
     }
 
