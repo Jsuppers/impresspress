@@ -93,8 +93,10 @@
 //! names (always `TEXT` on SQLite), and `DbExec::require_columns` refuses a
 //! read, filter or guard naming an unknown column instead of adding it,
 //! matching the native sqlite/postgres backends. Under STRICT_SCHEMA (below)
-//! neither introspects. Reads against a missing table return empty/NotFound
-//! via the `dbx_table_exists` guard the defaults run first.
+//! neither introspects. Outside STRICT_SCHEMA, reads against a missing table
+//! return empty/NotFound via the `dbx_table_exists` guard the defaults run
+//! first; under it the statement reaches D1 and its "no such table" failure
+//! is `Internal`, as on the native backends.
 //!
 //! ## Schema cache + STRICT_SCHEMA (wafer-run #313)
 //!
@@ -494,13 +496,14 @@ impl DbExec for D1DatabaseService {
     ) -> Result<Record, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
         self.send(1)?;
-        let row = match stmt.first::<serde_json::Value>(None).await {
-            Ok(row) => row,
-            // A `get`-by-id against a not-yet-created table is "not found",
-            // matching the native backends' `QueryReturnedNoRows` mapping.
-            Err(e) if is_no_such_table(&e.to_string()) => return Err(DatabaseError::NotFound),
-            Err(e) => return Err(db_err(e)),
-        };
+        // A missing table is a fault, not an absent row: it goes through
+        // `db_err` like every other failure and comes back `Internal`, as it
+        // does on native SQLite and PostgreSQL. `NotFound` is only a query
+        // that ran and matched no row.
+        let row = stmt
+            .first::<serde_json::Value>(None)
+            .await
+            .map_err(db_err)?;
         row.map(|row| record_from_json_row(row, json))
             .ok_or(DatabaseError::NotFound)
     }
@@ -1049,14 +1052,6 @@ fn schema_mutation_unsupported(method: &str, target: &str) -> DatabaseError {
     ))
 }
 
-/// Whether a D1 error message indicates the target table doesn't exist.
-/// D1 surfaces SQLite's `no such table: X` verbatim through the JsValue
-/// error; we string-match because the `worker::Error` type doesn't expose
-/// SQLite's structured error code.
-pub(crate) fn is_no_such_table(msg: &str) -> bool {
-    msg.contains("no such table")
-}
-
 // Note: unit tests for the pure SQL-planning layer live in `wafer-sql-utils`
 // and `wafer-core::interfaces::database::exec` (shared across all SQL
 // backends). `impresspress-cloudflare` only compiles on `wasm32-unknown-unknown`
@@ -1148,6 +1143,58 @@ mod tests {
     /// `conformance.rs`.
     fn never_queried_handle() -> D1Database {
         wasm_bindgen::JsCast::unchecked_into::<D1Database>(JsValue::undefined())
+    }
+
+    /// A D1 handle whose every statement's `first()` rejects with the error
+    /// D1 raises for a table that does not exist — its message as D1 spells
+    /// it, with `cause` attached when `cause` is `Some`, since D1 sets one on
+    /// some rejections and not on others — and whose `all()` (the
+    /// introspection reads) answers no rows, as SQLite's `PRAGMA table_info`
+    /// does for a missing table. The object is structural: worker-rs calls
+    /// `prepare`, `bind`, `first` and `all` on it by name, as on a real
+    /// binding.
+    fn missing_table_handle(cause: Option<&str>) -> D1Database {
+        let handle = js_sys::Function::new_with_args(
+            "cause",
+            "const stmt = {
+                bind() { return stmt; },
+                first() {
+                    const message =
+                        'D1_ERROR: no such table: impresspress__d1test__never_created: SQLITE_ERROR';
+                    return Promise.reject(
+                        cause === undefined ? new Error(message) : new Error(message, { cause }),
+                    );
+                },
+                all() { return Promise.resolve({ results: [], success: true, meta: {} }); },
+            };
+            return { prepare() { return stmt; } };",
+        )
+        .call1(&JsValue::NULL, &cause.map_or(JsValue::UNDEFINED, JsValue::from_str))
+        .expect("the fake binding builds");
+        wasm_bindgen::JsCast::unchecked_into::<D1Database>(handle)
+    }
+
+    /// Under STRICT_SCHEMA (every generated `wrangler.toml`) a `get` against a
+    /// table that does not exist reaches D1, which fails the statement. That
+    /// failure is a fault — `Internal`, as native SQLite and PostgreSQL report
+    /// it — and never `NotFound`, which `crud::get_record` would answer as the
+    /// caller's 404 ("no such row") when nothing could be read at all.
+    #[wasm_bindgen_test]
+    async fn a_get_against_a_missing_table_is_a_fault_not_an_absent_row() {
+        for cause in [
+            Some("no such table: impresspress__d1test__never_created: SQLITE_ERROR"),
+            None,
+        ] {
+            forget_isolate_schema();
+            let svc = service(missing_table_handle(cause), true, "DB");
+            let err = DatabaseService::get(&svc, "impresspress__d1test__never_created", "any-id")
+                .await
+                .expect_err("the statement fails");
+            assert!(
+                matches!(err, DatabaseError::Internal(ref text) if text.contains("no such table")),
+                "cause {cause:?}: a missing table must be Internal, got {err:?}"
+            );
+        }
     }
 
     /// **Fails with a per-service cache**: every D1 service in an isolate has

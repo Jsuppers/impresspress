@@ -667,12 +667,7 @@ async fn reconcile_refund_operation(
     ctx: &dyn Context,
     operation: &wafer_core::clients::database::Record,
 ) -> Result<OperationOutcome, WaferError> {
-    let refund = wafer_core::clients::database::get(
-        ctx,
-        repo::refunds::TABLE,
-        operation.str_field("aggregate_id"),
-    )
-    .await?;
+    let refund = repo::refunds::get(ctx, operation.str_field("aggregate_id")).await?;
     if repo::refunds::status_of(&refund)? == RefundStatus::Succeeded {
         return Ok(OperationOutcome::Succeeded(
             refund.json_text_field("response_json"),

@@ -44,6 +44,11 @@ async fn get_by_field_optional(
     }
 }
 
+/// The refund row with `id`; `NotFound` when there is none.
+pub(crate) async fn get(ctx: &dyn Context, id: &str) -> Result<Record, WaferError> {
+    db::get(ctx, TABLE, id).await
+}
+
 pub(crate) async fn get_by_idempotency_key(
     ctx: &dyn Context,
     idempotency_key: &str,

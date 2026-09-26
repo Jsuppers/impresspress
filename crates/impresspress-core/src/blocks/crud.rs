@@ -78,9 +78,10 @@ pub fn db_error(error: wafer_run::WaferError, not_found: &str, context: &str) ->
 /// [`db_error`] for a call whose `NotFound` is NOT the client's row.
 ///
 /// `db::paginated_list` and `db::create` are told the table by the block, not
-/// by the request, so a `NotFound` from them means the table is missing —
-/// a deployment fault, and a 500. Turning it into a 404 would tell a caller
-/// their query found nothing when in fact nothing could be queried.
+/// by the request, and name no row of the caller's, so whatever `NotFound`
+/// they return is not the caller's 404 — it stays a 500. Turning it into a
+/// 404 would tell a caller their query found nothing when in fact the call
+/// failed.
 /// Everything else is classified exactly as [`db_error`] classifies it,
 /// `PermissionDenied` included.
 pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputStream {
@@ -98,9 +99,9 @@ pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputS
 /// `text/html`) gets the same statuses as JSON.
 pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str) -> OutputStream {
     match classify_db_error(error, None, context) {
-        DbFailure::Refused(error) => crate::ui::refused_response(msg, error),
-        DbFailure::Internal(error) => {
-            tracing::error!(context = %context, error = %error, "page read failed");
+        DbFailure::Refused(refusal) => crate::ui::refused_response(msg, refusal),
+        DbFailure::Internal(fault) => {
+            tracing::error!(context = %context, error = %fault, "page read failed");
             crate::ui::server_error_response(msg)
         }
     }
@@ -120,15 +121,15 @@ pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str)
 /// `context` and said as a fault.
 pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static str {
     match classify_db_error(error, None, context) {
-        DbFailure::Refused(error) if error.code == ErrorCode::ResourceExhausted => {
+        DbFailure::Refused(refusal) if refusal.code() == ErrorCode::ResourceExhausted => {
             "it is over its usage limit right now"
         }
-        DbFailure::Refused(error) if error.code == ErrorCode::AlreadyExists => {
+        DbFailure::Refused(refusal) if refusal.code() == ErrorCode::AlreadyExists => {
             "it duplicates an entry that already exists"
         }
         DbFailure::Refused(_) => "access to it was denied",
-        DbFailure::Internal(error) => {
-            tracing::error!(context = %context, error = %error, "fragment read failed");
+        DbFailure::Internal(fault) => {
+            tracing::error!(context = %context, error = %fault, "fragment read failed");
             "something went wrong"
         }
     }
@@ -144,60 +145,123 @@ pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static 
 /// including its refusals. It seals this itself through
 /// `dev::no_store_db_error`. **Nothing else may**: a third classification of
 /// a database failure is exactly what `tests/error_door.rs` exists to stop.
+///
+/// Only [`classify_db_error`] can build one. Both variants wrap a type whose
+/// field is private to this module, so a caller can take a `DbFailure` apart
+/// but cannot assemble one from an unclassified error and hand it to a sealer
+/// that trusts it was classified:
+///
+/// ```
+/// use impresspress_core::blocks::crud::{classify_db_error, DbFailure};
+/// use wafer_run::{ErrorCode, WaferError};
+///
+/// let failure = classify_db_error(WaferError::new(ErrorCode::Internal, "x"), None, "doc");
+/// assert!(matches!(failure, DbFailure::Internal(fault) if fault.code() == ErrorCode::Internal));
+/// ```
+///
+/// ```compile_fail
+/// use impresspress_core::blocks::crud::{DbFailure, Refusal};
+/// use wafer_run::{ErrorCode, WaferError};
+///
+/// // A raw WRAP denial passed off as already classified.
+/// let _ = DbFailure::Refused(Refusal(WaferError::new(ErrorCode::PermissionDenied, "x")));
+/// ```
+///
+/// ```compile_fail
+/// use impresspress_core::blocks::crud::{DbFailure, Fault};
+/// use wafer_run::{ErrorCode, WaferError};
+///
+/// // An unclassified error passed off as a fault the classifier kept.
+/// let _ = DbFailure::Internal(Fault(WaferError::new(ErrorCode::PermissionDenied, "x")));
+/// ```
 pub enum DbFailure {
     /// A refusal the client is told about as it stands: the caller's 404,
     /// the 403 a WRAP denial becomes, the 429 a quota keeps, the 409 a
     /// duplicate key is. The cause, when
     /// it was one that must not be published, has already been logged and
     /// replaced.
-    Refused(wafer_run::WaferError),
+    Refused(Refusal),
     /// An internal fault, carried back untouched — sanitizing it and minting
     /// its correlation id is [`crate::http::err_internal`]'s job, and doing
     /// it here would mean two places that log a 500.
-    Internal(wafer_run::WaferError),
+    Internal(Fault),
+}
+
+/// [`DbFailure::Refused`]'s error: safe to send to the client as it stands.
+pub struct Refusal(wafer_run::WaferError);
+
+impl Refusal {
+    /// The refusal's code: `NotFound`, `PermissionDenied`,
+    /// `ResourceExhausted` or `AlreadyExists`.
+    pub fn code(&self) -> ErrorCode {
+        self.0.code
+    }
+
+    /// The error to answer the client with.
+    pub fn into_error(self) -> wafer_run::WaferError {
+        self.0
+    }
+}
+
+/// [`DbFailure::Internal`]'s error: the untouched cause, never shown to the
+/// client.
+pub struct Fault(wafer_run::WaferError);
+
+impl Fault {
+    /// The cause's code.
+    pub fn code(&self) -> ErrorCode {
+        self.0.code
+    }
+
+    /// The cause, for the caller to log and seal.
+    pub fn into_error(self) -> wafer_run::WaferError {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
 }
 
 /// Classify a failed database call. `not_found` is `Some` when a `NotFound`
 /// from this call means the row the *caller* named (so it is their 404), and
 /// `None` when the block chose the address itself — a `db::paginated_list`
 /// or `db::create` against a table the request never named, where a
-/// `NotFound` is a missing table and therefore a 500.
+/// `NotFound` names no row of the caller's and is therefore a 500.
+///
+/// A missing table is not a `NotFound` on any backend under STRICT_SCHEMA
+/// (every Cloudflare deploy): the statement fails, and that failure is
+/// `Internal`, so it is a 500 whichever way `not_found` is set.
 pub fn classify_db_error(
     error: wafer_run::WaferError,
     not_found: Option<&str>,
     context: &str,
 ) -> DbFailure {
+    let refused = |code, message: &str| {
+        DbFailure::Refused(Refusal(wafer_run::WaferError::new(code, message)))
+    };
     match (error.code, not_found) {
-        (ErrorCode::NotFound, Some(label)) => {
-            DbFailure::Refused(wafer_run::WaferError::new(ErrorCode::NotFound, label))
-        }
+        (ErrorCode::NotFound, Some(label)) => refused(ErrorCode::NotFound, label),
         (ErrorCode::PermissionDenied, _) => {
             tracing::warn!(
                 context = %context,
                 error = %error,
                 "database access denied — a WRAP grant or a row guard refused this call",
             );
-            DbFailure::Refused(wafer_run::WaferError::new(
-                ErrorCode::PermissionDenied,
-                "Access denied",
-            ))
+            refused(ErrorCode::PermissionDenied, "Access denied")
         }
-        (ErrorCode::ResourceExhausted, _) => DbFailure::Refused(wafer_run::WaferError::new(
-            ErrorCode::ResourceExhausted,
-            error.message,
-        )),
+        (ErrorCode::ResourceExhausted, _) => refused(ErrorCode::ResourceExhausted, &error.message),
         (ErrorCode::AlreadyExists, _) => {
             tracing::info!(
                 context = %context,
                 error = %error,
                 "database refused a write that duplicates a unique key",
             );
-            DbFailure::Refused(wafer_run::WaferError::new(
-                ErrorCode::AlreadyExists,
-                DUPLICATE_KEY,
-            ))
+            refused(ErrorCode::AlreadyExists, DUPLICATE_KEY)
         }
-        _ => DbFailure::Internal(error),
+        _ => DbFailure::Internal(Fault(error)),
     }
 }
 
@@ -208,8 +272,8 @@ pub const DUPLICATE_KEY: &str = "A record with the same key already exists";
 /// [`DbFailure`] as the response every caller but `blocks::dev` wants.
 fn seal(failure: DbFailure, context: &str) -> OutputStream {
     match failure {
-        DbFailure::Refused(error) => OutputStream::error(error),
-        DbFailure::Internal(error) => err_internal(context, error),
+        DbFailure::Refused(refusal) => OutputStream::error(refusal.into_error()),
+        DbFailure::Internal(fault) => err_internal(context, fault.into_error()),
     }
 }
 
@@ -609,15 +673,15 @@ mod db_error_tests {
     }
 
     /// `db_error_internal` is the same classification MINUS the 404: a
-    /// `NotFound` from a call the block addressed (a missing table) is a
-    /// deployment fault, not the caller's missing row.
+    /// `NotFound` from a call the block addressed names no row of the
+    /// caller's, so it is a 500, not their missing row.
     #[tokio::test]
-    async fn db_error_internal_keeps_a_missing_table_a_500_but_still_403s_a_denial() {
-        let missing_table = db_error_internal(
-            wafer_err(ErrorCode::NotFound, "no such table"),
+    async fn db_error_internal_keeps_a_not_found_a_500_but_still_403s_a_denial() {
+        let not_found = db_error_internal(
+            wafer_err(ErrorCode::NotFound, "record not found"),
             "Database error",
         );
-        assert_eq!(output_http_status(missing_table).await, 500);
+        assert_eq!(output_http_status(not_found).await, 500);
 
         let denied = db_error_internal(
             wafer_err(ErrorCode::PermissionDenied, "WRAP: no grant"),
@@ -669,6 +733,34 @@ mod db_error_tests {
     /// applies.
     async fn denied_ctx() -> TestContext {
         TestContext::new().await.running_as("test/ungranted")
+    }
+
+    /// Under STRICT_SCHEMA — what every Cloudflare deploy runs — a statement
+    /// against a table that does not exist reaches native SQLite and fails.
+    /// The routes that name a row (`get_record`, `update_record`,
+    /// `delete_record`) must answer that as the fault it is, a 500, not as
+    /// the caller's missing row. A real missing table, not a hand-built
+    /// error: the fixture never creates it.
+    #[tokio::test]
+    async fn a_missing_table_under_strict_schema_is_a_500_not_the_callers_404() {
+        const NEVER_CREATED: &str = "impresspress__crudtest__never_created";
+        let ctx = TestContext::new().await;
+        ctx.set_strict_schema(true);
+
+        let got = get_record(&ctx, NEVER_CREATED, "any-id", "Row")
+            .await
+            .expect_err("the read fails");
+        assert_eq!(output_http_status(got).await, 500, "get_record");
+
+        let updated = update_record(&ctx, NEVER_CREATED, "any-id", HashMap::new(), "Row")
+            .await
+            .expect_err("the write fails");
+        assert_eq!(output_http_status(updated).await, 500, "update_record");
+
+        let deleted = delete_record(&ctx, NEVER_CREATED, "any-id", "Row")
+            .await
+            .expect_err("the delete fails");
+        assert_eq!(output_http_status(deleted).await, 500, "delete_record");
     }
 
     #[tokio::test]
