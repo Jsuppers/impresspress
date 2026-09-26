@@ -108,7 +108,10 @@ pub mod storage;
 // that surface is exactly this list.
 use std::{collections::HashMap, sync::Arc};
 
-use impresspress_core::builder::ImpresspressBuilder;
+use impresspress_core::{
+    builder::ImpresspressBuilder,
+    request_log_queue::{self, queue_request_logs, RequestLogQueue},
+};
 pub use services::{
     make_config_service, make_console_logger, make_d1_database_service, make_fetch_network_service,
     make_jwt_crypto_service, make_kv_cached_database_service, make_r2_storage_service,
@@ -131,23 +134,19 @@ thread_local! {
     static ISOLATE_INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One-time isolate initialization: selects [`RequestLogMode::Queued`]
-/// (audit rows drain into `ctx.wait_until` off the response path — see
-/// `run`) and [`DeferMode::Queued`] (work a handler defers until after its
-/// response drains into `ctx.wait_until` too — see `dispatch`; spawned any
-/// other way it would be cancelled with the response). Consumers should call
-/// this from their worker's `#[event(start)]` handler; `run()` also invokes
-/// it behind a once-per-isolate guard, so isolates stay correct either way
-/// and repeat calls are no-ops.
+/// One-time isolate initialization: selects [`DeferMode::Queued`] (work a
+/// handler defers until after its response drains into `ctx.wait_until` — see
+/// `dispatch`; spawned any other way it would be cancelled with the
+/// response). Audit rows need no isolate setting: `dispatch` queues each
+/// request's rows in that request's own queue. Consumers should call this
+/// from their worker's `#[event(start)]` handler; `run()` also invokes it
+/// behind a once-per-isolate guard, so isolates stay correct either way and
+/// repeat calls are no-ops.
 ///
-/// [`RequestLogMode::Queued`]: impresspress_core::pipeline::RequestLogMode::Queued
 /// [`DeferMode::Queued`]: impresspress_core::deferred::DeferMode::Queued
 pub fn init_isolate() {
     ISOLATE_INITIALIZED.with(|done| {
         if !done.get() {
-            impresspress_core::pipeline::set_request_log_mode(
-                impresspress_core::pipeline::RequestLogMode::Queued,
-            );
             impresspress_core::deferred::set_mode(impresspress_core::deferred::DeferMode::Queued);
             done.set(true);
         }
@@ -354,9 +353,10 @@ where
         return serve_static_asset_from_r2(&env, key, content_type).await;
     }
 
-    // Isolate-scoped init (request-log mode) — no-op after the first call;
-    // consumers with an #[event(start)] handler have already run it.
+    // Isolate-scoped init — no-op after the first call; consumers with an
+    // #[event(start)] handler have already run it.
     init_isolate();
+    let audit = RequestLogQueue::new();
     let result = run_inner(
         req,
         &env,
@@ -365,55 +365,32 @@ where
         &request_config,
         register_blocks,
         register_post_build,
+        &audit,
         &|task| ctx.wait_until(task),
     )
     .await;
 
-    // Persist any audit rows queued during this dispatch off the response
-    // path. Derive the D1 handle from THIS request's Env instead of borrowing
-    // one retained by the isolate-cached runtime.
-    let rows = impresspress_core::pipeline::drain_queued_request_logs();
-    if !rows.is_empty() {
-        match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING, &queries) {
-            Ok(batch_db) => {
-                ctx.wait_until(async move {
-                    use wafer_core::interfaces::database::service::DatabaseService as _;
-
-                    let mut by_table: std::collections::HashMap<
-                        &'static str,
-                        Vec<std::collections::HashMap<String, serde_json::Value>>,
-                    > = std::collections::HashMap::new();
-                    for row in rows {
-                        by_table.entry(row.table).or_default().push(row.data);
-                    }
-                    for (table, rows) in by_table {
-                        let n = rows.len();
-                        if let Err(e) = batch_db.create_many(table, rows).await {
-                            // Structured metric line (not a Server-Timing header:
-                            // this closure runs in `ctx.wait_until`, after the
-                            // response has already been sent). See
-                            // `impresspress_core::metrics`'s module doc.
-                            let rows_str = n.to_string();
-                            let err_str = e.to_string();
-                            worker::console_log!(
-                                "{}",
-                                impresspress_core::metrics::metric_line(
-                                    "audit_log_persist_failed",
-                                    &[("table", table), ("rows", &rows_str), ("error", &err_str)],
-                                )
-                            );
-                        }
-                    }
-                });
-            }
-            Err(e) => worker::console_log!(
-                "{}",
-                impresspress_core::metrics::metric_line(
-                    "audit_log_persist_failed",
-                    &[("error", &e.to_string())],
-                )
-            ),
+    // Persist this request's audit rows off the response path, through a D1
+    // handle derived from THIS request's Env and counted against THIS
+    // invocation's query limit — the rows are this request's own (see
+    // `impresspress_core::request_log_queue`). Rows the invocation has no
+    // statements left for are carried to a later request, not dropped.
+    let rows = audit.take();
+    match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING, &queries) {
+        Ok(batch_db) => {
+            ctx.wait_until(async move {
+                let report = request_log_queue::persist(batch_db.as_ref(), rows).await;
+                log_request_log_persist_report(&report);
+            });
         }
+        Err(e) if !rows.is_empty() => worker::console_log!(
+            "{}",
+            impresspress_core::metrics::metric_line(
+                "audit_log_persist_failed",
+                &[("rows", &rows.len().to_string()), ("error", &e.to_string())],
+            )
+        ),
+        Err(_) => {}
     }
 
     retry_pending_config_version(&env, |task| ctx.wait_until(task));
@@ -442,6 +419,45 @@ where
                 500,
             )
         }
+    }
+}
+
+/// Log what [`request_log_queue::persist`] did not write, as structured
+/// metric lines (not a Server-Timing header: this runs in `ctx.wait_until`,
+/// after the response has been sent). See `impresspress_core::metrics`'s
+/// module doc.
+fn log_request_log_persist_report(report: &request_log_queue::PersistReport) {
+    use impresspress_core::metrics::metric_line;
+    for failure in &report.failures {
+        worker::console_log!(
+            "{}",
+            metric_line(
+                "audit_log_persist_failed",
+                &[
+                    ("table", failure.table),
+                    ("rows", &failure.rows.to_string()),
+                    ("error", &failure.error),
+                ],
+            )
+        );
+    }
+    if report.carried_over > 0 {
+        worker::console_log!(
+            "{}",
+            metric_line(
+                "audit_log_carried_over",
+                &[("rows", &report.carried_over.to_string())],
+            )
+        );
+    }
+    if report.dropped > 0 {
+        worker::console_log!(
+            "{}",
+            metric_line(
+                "audit_log_carry_over_dropped",
+                &[("rows", &report.dropped.to_string())],
+            )
+        );
     }
 }
 
@@ -527,20 +543,14 @@ pub async fn run_scheduled_with_config<F, G>(
     impresspress_core::ui::assets::set_base_url_override(environment.asset_base_url());
     init_isolate();
 
-    // WHY THERE IS NO `drain_queued_request_logs` HERE, unlike `run`.
+    // WHY THERE IS NO REQUEST-LOG QUEUE HERE, unlike `run`.
     //
-    // `init_isolate` selects `RequestLogMode::Queued` for the whole isolate,
-    // so both entry points arrive with queueing on — but only the request
-    // pipeline enqueues, and the one thing that runs on this path
-    // (`auth.maintenance`, dispatched by `run_block`) does not go through it.
-    // The queue is therefore always empty here, and a drain would be dead
-    // code that reads as if it were load-bearing.
-    //
-    // It stops being empty the day anything on the scheduled path dispatches
-    // through the pipeline: at that point the rows accumulate in a
-    // thread-local nothing empties, on an isolate that may serve fetches for
-    // hours. Add the drain (through `ctx.wait_until`, exactly as `run` does)
-    // in the same change that adds such a dispatch.
+    // Only the request pipeline writes audit rows, and the one thing that
+    // runs on this path (`auth.maintenance`, dispatched by `run_block`) does
+    // not go through it. Should anything on the scheduled path ever dispatch
+    // through the pipeline, its rows would be inserted inline, because no
+    // `request_log_queue::queue_request_logs` scope is installed here — no
+    // row is left in a queue nothing persists.
     //
     // The same holds for `impresspress_core::deferred`'s queue: only the
     // auth-ui mail handlers defer, and the sweep reaches none of them. A
@@ -748,10 +758,13 @@ async fn dispatch(
     wafer: &wafer_run::Wafer,
     req: worker::Request,
     services: std::rc::Rc<request_services::RequestServices>,
+    audit: &std::rc::Rc<RequestLogQueue>,
     defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>> {
     let deferred_services = std::rc::Rc::clone(&services);
-    let response = request_services::scope(services, async move {
+    // Both scopes are re-entered on every poll, so a request interleaved with
+    // this one neither uses its services nor queues into its audit log.
+    let dispatched = queue_request_logs(std::rc::Rc::clone(audit), async move {
         // 7. Convert request → message; preserve auth header in meta.
         let auth_header = req.headers().get("authorization")?;
         let (mut msg, input) = convert::worker_request_to_message(&req).await?;
@@ -763,8 +776,8 @@ async fn dispatch(
         // poll scope also covers lazily consumed service-backed streams.
         let output = wafer.run("site-main", msg, input).await;
         Ok(convert::output_to_response(output).await?)
-    })
-    .await;
+    });
+    let response = request_services::scope(services, dispatched).await;
     for task in impresspress_core::deferred::drain() {
         defer(Box::pin(request_services::scope(
             std::rc::Rc::clone(&deferred_services),
@@ -787,6 +800,7 @@ async fn run_inner<F, G>(
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
+    audit: &std::rc::Rc<RequestLogQueue>,
     defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>>
 where
@@ -815,7 +829,7 @@ where
         rt.wafer.config_snapshot(),
         request_config,
     )?;
-    let mut response = dispatch(&rt.wafer, req, services, defer).await?;
+    let mut response = dispatch(&rt.wafer, req, services, audit, defer).await?;
 
     // Cheap observability signal (2026-07-16 audit follow-up): one header
     // assembly from a value already computed by `get_or_build`. Gated to
@@ -1001,6 +1015,7 @@ mod deferred_drain_tests {
             &wafer,
             req,
             request_services::RequestServices::marker(7),
+            &RequestLogQueue::new(),
             &move |task| sink.borrow_mut().push(task),
         )
         .await
