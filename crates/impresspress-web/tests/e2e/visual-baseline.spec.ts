@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { ADMIN_STATE_PATH, loginAsAdmin } from './fixtures/auth';
 
 const ANON_ROUTES = [
@@ -68,12 +68,50 @@ const ADMIN_ROUTES = [
   { path: '/b/storage/admin/quotas', name: 'storage-admin-quotas' },
 ];
 
+// The tolerance is measured, not guessed. Baselines are CI's own render
+// (`regen-visual-baselines.yml`), so a matching page differs from its
+// baseline only by rendering noise — and across repeated CI runs of this
+// suite at zero tolerance that noise was a handful of pixels one colour
+// level apart (a per-pixel YIQ distance of 0.004 on Playwright's 0-1 scale;
+// nothing larger in any run). `threshold` sits just above that noise, and no
+// pixel beyond it is allowed, so a real change of even one pixel fails.
+//
+// A value that varies from run to run is masked rather than tolerated — see
+// `volatileMasks` below. A tolerance wide enough to absorb one would also
+// absorb real regressions: a 1% pixel ratio lets a 1280x720 capture differ
+// in 9,216 pixels, and Playwright's default per-pixel `threshold` of 0.2
+// ignores a change between two light greys outright.
 const COMMON_OPTS = {
   fullPage: true as const,
-  maxDiffPixelRatio: 0.01,
-  // Mask elements that vary per render (timestamps, counts, generated IDs).
-  // Tests can override per-route if needed.
+  threshold: 0.01,
+  maxDiffPixels: 0,
 };
+
+// What the admin captures mask: values that differ from one run to the next.
+//
+// - Dates and timestamps rendered as `<time>` — among them the dashboard
+//   charts' first/last-day labels, which move daily because the window ends
+//   today (`ui/components/chart.rs`).
+// - The storage-admin tables' per-run cells: `owner_short` is the first 8
+//   hex digits of the bootstrap admin's freshly generated UUIDv7, and the
+//   bucket's creation date. Those cells are monospaced
+//   (`blocks/files/pages_admin.rs`), so the value changing does not change
+//   the column's width and the mask box stays put.
+// - Latencies the run measured itself. `data-volatile-metric` wraps the
+//   duration figures on the admin network page (`blocks/admin/pages/network.rs`).
+//   The mask covers the owning `<td>`, not the span: the span is as wide as
+//   its text, so "5ms" and "12ms" would paint different mask boxes. The
+//   admin dashboard's "Avg Response" tile is reached by its label instead,
+//   because `components::stat_card` takes its value as a plain `&str` with
+//   nowhere to hang an attribute — a Rust test pins that label so a rename
+//   cannot silently unmask the tile.
+function volatileMasks(page: Page) {
+  return [
+    page.locator('[data-relative-time], .relative-time, time'),
+    page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
+    page.locator('td:has([data-volatile-metric]), .stat-card:has-text("Avg Response") .stat-value'),
+  ];
+}
 
 test.describe('visual baseline — anonymous', () => {
   for (const r of ANON_ROUTES) {
@@ -94,28 +132,7 @@ test.describe('visual baseline — admin', () => {
       await page.goto(r.path, { waitUntil: 'networkidle' });
       await expect(page).toHaveScreenshot(`admin-${r.name}.png`, {
         ...COMMON_OPTS,
-        // Mask relative timestamps + per-run-variable cells (storage-admin
-        // tables display `owner_short` = first 8 chars of the bootstrap
-        // admin's freshly-generated UUIDv7, plus `created_at_short` for
-        // the bucket). See pages_admin.rs:254-259 for the tagged `td`
-        // cells. Without these masks the storage-admin screenshots drift
-        // ~0.02-0.05 pixel ratio between captures.
-        mask: [
-          page.locator('[data-relative-time], .relative-time, time'),
-          page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
-          // Values the baseline run itself produces: latencies it measured, and
-          // wall-clock stamps of requests it made. Until now nothing pinned them
-          // and the 1% tolerance absorbed the drift, which made them latent
-          // fragility rather than a live flake. `data-volatile-metric` wraps the
-          // duration figures on the admin network page (see
-          // `blocks/admin/pages/network.rs`); the timestamps beside them are
-          // `<time>` elements and are already covered by the mask above. The
-          // admin dashboard's "Avg Response" tile is reached by its label
-          // instead, because `components::stat_card` takes its value as a plain
-          // `&str` with nowhere to hang an attribute — a Rust test pins that
-          // label so a rename cannot silently unmask the tile.
-          page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
-        ],
+        mask: volatileMasks(page),
       });
     });
   }
@@ -187,12 +204,7 @@ test.describe('visual baseline — admin vector', () => {
     await page.goto('/b/vector/', { waitUntil: 'networkidle' });
     await expect(page).toHaveScreenshot('admin-vector-list-desktop.png', {
       ...COMMON_OPTS,
-      mask: [
-        page.locator('[data-relative-time], .relative-time, time'),
-        page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
-        // Per-run measured values; see the admin describe block above.
-        page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
-      ],
+      mask: volatileMasks(page),
     });
   });
 });
@@ -219,12 +231,7 @@ test.describe('visual baseline mobile — admin (375px)', () => {
       await page.goto(r.path, { waitUntil: 'networkidle' });
       await expect(page).toHaveScreenshot(`admin-${r.name}-mobile.png`, {
         ...COMMON_OPTS,
-        mask: [
-          page.locator('[data-relative-time], .relative-time, time'),
-          page.locator('td[data-label="Owner"], td[data-label="Created"], td[data-label="Created By"]'),
-          // Per-run measured values; see the admin describe block above.
-          page.locator('[data-volatile-metric], .stat-card:has-text("Avg Response") .stat-value'),
-        ],
+        mask: volatileMasks(page),
       });
     });
   }

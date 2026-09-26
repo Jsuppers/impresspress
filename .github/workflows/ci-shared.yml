@@ -1342,7 +1342,11 @@ jobs:
         working-directory: crates/impresspress-web
         env:
           TEST_PORT: 8093
-        run: npx playwright test --config=tests/playwright.visual-baseline.config.ts tests/e2e/visual-baseline.spec.ts tests/e2e/webmcp.spec.ts tests/e2e/delegated-actions.spec.ts
+        # The file list lives in the `e2e:visual` package script because
+        # `regen-visual-baselines.yml` must run exactly this set: the specs
+        # share one server and one database, and what an earlier spec writes
+        # shows up in a later screenshot. See that workflow's header.
+        run: npm run e2e:visual
 
       # A step of its own, not one more file on the line above: Playwright
       # orders the files it is given by path, not by argument order, so on

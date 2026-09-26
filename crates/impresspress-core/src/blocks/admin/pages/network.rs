@@ -126,8 +126,9 @@ async fn network_inbound_tab(
 ///
 /// `avg_ms` and `last_seen` are per-run values — a latency measured by the
 /// running deployment and the wall-clock time of a request it served — so
-/// each is wrapped in the element the visual-baseline suite masks
-/// (`crates/impresspress-web/tests/e2e/visual-baseline.spec.ts`). The
+/// each is wrapped in an element the visual-baseline suite keys its masks on
+/// (`crates/impresspress-web/tests/e2e/visual-baseline.spec.ts`; it masks a
+/// `<time>` directly and the whole cell around a `data-volatile-metric`). The
 /// wrappers are inside the cell, not attributes on the `<td>`, because
 /// `components::data_table` emits the `<td>` itself and takes only the
 /// cell's inner markup, which it carries through verbatim.
@@ -175,7 +176,7 @@ fn inbound_row(
 ///
 /// `duration` and `created` are produced by whichever run is looking at the
 /// page — during a visual-baseline capture that is the capture run itself —
-/// so each is wrapped in the element the baseline suite masks. The wrapper
+/// so each is wrapped in an element the baseline suite keys its masks on. The wrapper
 /// sits inside the cell rather than on the `<td>` for the same reason as in
 /// [`inbound_row`]: `components::data_table` owns the `<td>`.
 fn detail_row(

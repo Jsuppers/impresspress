@@ -12,13 +12,6 @@ pub fn bar_chart_card(
     view_href: &str,
 ) -> maud::Markup {
     let max = data.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
-    let fmt_short = |s: &str| -> String {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .map(|d| d.format("%b %-d").to_string())
-            .unwrap_or_else(|_| s.to_string())
-    };
-    let first_label = data.first().map(|(d, _)| fmt_short(d)).unwrap_or_default();
-    let last_label = data.last().map(|(d, _)| fmt_short(d)).unwrap_or_default();
     html! {
         section .card {
             header .card__head {
@@ -40,11 +33,33 @@ pub fn bar_chart_card(
                         }
                     }
                 }
-                div .charts-css__range {
-                    span { (first_label) }
-                    span { (last_label) }
-                }
+                (date_range(data))
             }
+        }
+    }
+}
+
+/// The first / last date labels under a 30-day chart.
+///
+/// Each label is a `<time>` carrying the ISO day, because it is a date: the
+/// window ends today, so the text changes every day, and the visual-baseline
+/// suite masks `time` elements for exactly that reason.
+fn date_range(data: &[(String, i64)]) -> Markup {
+    let label = |day: Option<&String>| -> Markup {
+        match day {
+            Some(day) => {
+                let short = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                    .map(|d| d.format("%b %-d").to_string())
+                    .unwrap_or_else(|_| day.clone());
+                html! { time datetime=(day) { (short) } }
+            }
+            None => html! { span {} },
+        }
+    };
+    html! {
+        div .charts-css__range {
+            (label(data.first().map(|(d, _)| d)))
+            (label(data.last().map(|(d, _)| d)))
         }
     }
 }
@@ -155,11 +170,6 @@ pub fn line_chart_card(
         )
     });
     let area = format!("0,60 {line} 100,60");
-    let fmt_short = |s: &str| -> String {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .map(|d| d.format("%b %-d").to_string())
-            .unwrap_or_else(|_| s.to_string())
-    };
     html! {
         section .card {
             header .card__head {
@@ -215,10 +225,7 @@ pub fn line_chart_card(
                         }
                     }
                 }
-                div .charts-css__range {
-                    span { (data.first().map(|(d, _)| fmt_short(d)).unwrap_or_default()) }
-                    span { (data.last().map(|(d, _)| fmt_short(d)).unwrap_or_default()) }
-                }
+                (date_range(data))
             }
         }
     }
@@ -303,6 +310,26 @@ mod tests {
             "x range labels missing"
         );
         assert!(m.contains("chart__dot"), "endpoint dot missing");
+    }
+
+    /// The range labels move with the calendar, so both chart kinds must emit
+    /// them as `<time>` — the element the visual-baseline suite masks. A plain
+    /// `<span>` here makes the dashboard screenshot change every day.
+    #[test]
+    fn chart_date_range_labels_are_time_elements() {
+        let data = vec![("2026-08-27".to_string(), 0), ("2026-09-25".to_string(), 4)];
+        let cards = [
+            super::line_chart_card("Errors", "Last 30 days", &data, "var(--x)", "/x"),
+            super::bar_chart_card("Requests", "Last 30 days", &data, "var(--x)", "/x"),
+        ];
+        for card in cards {
+            let m = card.into_string();
+            assert!(
+                m.contains(r#"<time datetime="2026-08-27">Aug 27</time>"#)
+                    && m.contains(r#"<time datetime="2026-09-25">Sep 25</time>"#),
+                "range labels are not <time> elements: {m}"
+            );
+        }
     }
 
     #[test]
