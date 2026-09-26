@@ -32,7 +32,7 @@
 
 use impresspress_core::test_support::source_scan::{strip_line_comments, SourceWalk};
 
-/// `(door, table, const, qualifier)` for every door this gate covers.
+/// `(door, table, const)` for every door this gate covers.
 ///
 /// `door` names the door in the failure message and keys the two allowlists.
 /// It is the owning module's name wherever a module owns one table; where a
@@ -41,253 +41,211 @@ use impresspress_core::test_support::source_scan::{strip_line_comments, SourceWa
 /// each table is its own door, so an exemption for one is not an exemption
 /// for the other.
 ///
-/// `consts` are the path fragments the second scan looks for. `<module>::TABLE`
-/// for a module's primary table and `<module>::<NAME>_TABLE` for a second one
-/// cover a caller that spells the whole path; a door whose constant is
-/// re-exported under an alias (`products/mod.rs` hands `blocks::dev` a
-/// `<NAME>_TABLE` alias for every collection the block declares) lists the
-/// alias too, because `use blocks::products::OFFERS_TABLE` is a call site the
-/// path spelling never sees.
-///
-/// `qualifier` is the path fragment a file must ALSO contain for that token
-/// to be attributed to this door. It is what keeps a block's own same-named
-/// repo module out of the match: products has a `repo::variables::TABLE`, so
-/// `variables::TABLE` counts as the platform door only when the file also
-/// names `platform_state`. For the auth users door the fragment is `auth`
-/// and for the files doors it is `files`, which every path to
-/// `blocks::<block>::repo::<module>` necessarily spells.
-const TABLES: &[(&str, &str, &[&str], &str)] = &[
+/// `const` is the constant's full path from the crate root, which is what the
+/// second scan compares every path a file names against once it has been
+/// resolved to the same form ([`Names`]). A full path is what tells two
+/// same-named constants apart — products' `repo::variables::TABLE` is not
+/// the platform's `platform_state::variables::TABLE` — without asking what
+/// else the file happens to mention. The file that defines the constant is
+/// the door itself and is never an offender.
+const TABLES: &[(&str, &str, &str)] = &[
     (
         "variables",
         "impresspress__admin__variables",
-        &["variables::TABLE"],
-        "platform_state",
+        "crate::platform_state::variables::TABLE",
     ),
     (
         "block_settings",
         "impresspress__admin__block_settings",
-        &["block_settings::TABLE"],
-        "platform_state",
+        "crate::platform_state::block_settings::TABLE",
     ),
     (
         "wrap_grants",
         "impresspress__admin__wrap_grants",
-        &["wrap_grants::TABLE"],
-        "platform_state",
+        "crate::platform_state::wrap_grants::TABLE",
     ),
     (
         "request_logs",
         "impresspress__admin__request_logs",
-        &["request_logs::TABLE"],
-        "platform_state",
+        "crate::platform_state::request_logs::TABLE",
     ),
     (
         "user_roles",
         "impresspress__admin__user_roles",
-        &["user_roles::TABLE"],
-        "platform_state",
+        "crate::platform_state::user_roles::TABLE",
     ),
-    ("users", "wafer_run__auth__users", &["users::TABLE"], "auth"),
+    (
+        "users",
+        "wafer_run__auth__users",
+        "crate::blocks::auth::repo::users::TABLE",
+    ),
     // The three auth doors this PR adds. `sessions` and `tokens` are the
     // pair B12 re-keyed and wired retention for; `maintenance` is the
     // sweeper's singleton, new in migration 012.
     (
         "sessions",
         "wafer_run__auth__sessions",
-        &["sessions::TABLE"],
-        "auth",
+        "crate::blocks::auth::repo::sessions::TABLE",
     ),
     (
         "refresh_tokens",
         "wafer_run__auth__tokens",
-        &["tokens::TABLE"],
-        "auth",
+        "crate::blocks::auth::repo::tokens::TABLE",
     ),
     (
         "auth_maintenance",
         "wafer_run__auth__maintenance",
-        &["maintenance::TABLE"],
-        "auth",
+        "crate::blocks::auth::repo::maintenance::TABLE",
     ),
     (
         "buckets",
         "impresspress__files__buckets",
-        &["buckets::TABLE"],
-        "files",
+        "crate::blocks::files::repo::buckets::TABLE",
     ),
     (
         "objects",
         "impresspress__files__objects",
-        &["objects::TABLE"],
-        "files",
+        "crate::blocks::files::repo::objects::TABLE",
     ),
     (
         "shares",
         "impresspress__files__cloud_shares",
-        &["shares::TABLE"],
-        "files",
+        "crate::blocks::files::repo::shares::TABLE",
     ),
     (
         "share_access_logs",
         "impresspress__files__cloud_access_logs",
-        &["shares::ACCESS_LOGS_TABLE"],
-        "files",
+        "crate::blocks::files::repo::shares::ACCESS_LOGS_TABLE",
     ),
     (
         "quota",
         "impresspress__files__cloud_quotas",
-        &["quota::TABLE"],
-        "files",
+        "crate::blocks::files::repo::quota::TABLE",
     ),
     (
         "views",
         "impresspress__files__views",
-        &["views::TABLE"],
-        "files",
+        "crate::blocks::files::repo::views::TABLE",
     ),
     (
         "documents",
         "impresspress__legalpages__documents",
-        &["documents::TABLE"],
-        "legalpages",
+        "crate::blocks::legalpages::repo::documents::TABLE",
     ),
     // The products doors. Every table the block declares, each owned by its
-    // own `repo/<module>.rs`. The second const on most rows is the alias
-    // `blocks/products/mod.rs` re-exports for `blocks::dev::data_snapshot`'s
-    // closed-list bookkeeping; `purchases` and `subscriptions` name their
-    // constants that way inside the door itself, which is why those doors
-    // appear on their own IDENT list below.
+    // own `repo/<module>.rs`. `blocks/products/mod.rs` re-exports most of
+    // them under a `<NAME>_TABLE` alias for `blocks::dev::data_snapshot`'s
+    // closed-list bookkeeping; the resolver follows a re-export to the
+    // constant it names, so an alias needs no row of its own.
     (
         "products",
         "impresspress__products__products",
-        &["products::TABLE"],
-        "products",
+        "crate::blocks::products::repo::products::TABLE",
     ),
     (
         "product_versions",
         "impresspress__products__product_versions",
-        &["product_versions::TABLE", "PRODUCT_VERSIONS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::product_versions::TABLE",
     ),
     (
         "offers",
         "impresspress__products__offers",
-        &["offers::TABLE", "OFFERS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::offers::TABLE",
     ),
     (
         "offer_components",
         "impresspress__products__offer_components",
-        &["offer_components::TABLE", "OFFER_COMPONENTS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::offer_components::TABLE",
     ),
     (
         "payment_links",
         "impresspress__products__payment_links",
-        &["payment_links::TABLE", "PAYMENT_LINKS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::payment_links::TABLE",
     ),
     (
         "checkout_presets",
         "impresspress__products__checkout_presets",
-        &["checkout_presets::TABLE", "CHECKOUT_PRESETS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::checkout_presets::TABLE",
     ),
     (
         "purchases",
         "impresspress__products__purchases",
-        &["PURCHASES_TABLE"],
-        "products",
+        "crate::blocks::products::repo::purchases::PURCHASES_TABLE",
     ),
     (
         "line_items",
         "impresspress__products__line_items",
-        &["LINE_ITEMS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::purchases::LINE_ITEMS_TABLE",
     ),
     (
         "refunds",
         "impresspress__products__refunds",
-        &["refunds::TABLE", "REFUNDS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::refunds::TABLE",
     ),
     (
         "disputes",
         "impresspress__products__disputes",
-        &["disputes::TABLE", "DISPUTES_TABLE"],
-        "products",
+        "crate::blocks::products::repo::disputes::TABLE",
     ),
     (
         "entitlements",
         "impresspress__products__entitlements",
-        &["entitlements::TABLE", "ENTITLEMENTS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::entitlements::TABLE",
     ),
     (
         "subscriptions",
         "impresspress__products__subscriptions",
-        &["SUBSCRIPTIONS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::subscriptions::SUBSCRIPTIONS_TABLE",
     ),
     (
         "subscription_items",
         "impresspress__products__subscription_items",
-        &["subscription_items::TABLE", "SUBSCRIPTION_ITEMS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::subscription_items::TABLE",
     ),
     (
         "seller_accounts",
         "impresspress__products__seller_accounts",
-        &["seller_accounts::TABLE", "SELLER_ACCOUNTS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::seller_accounts::TABLE",
     ),
     (
         "provider_operations",
         "impresspress__products__provider_operations",
-        &["provider_operations::TABLE", "PROVIDER_OPERATIONS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::provider_operations::TABLE",
     ),
     (
         "stripe_events",
         "impresspress__products__stripe_events",
-        &["stripe_events::TABLE", "STRIPE_EVENTS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::stripe_events::TABLE",
     ),
     (
         "products_variables",
         "impresspress__products__variables",
-        &["variables::TABLE", "PRODUCTS_VARIABLES_TABLE"],
-        "products",
+        "crate::blocks::products::repo::variables::TABLE",
     ),
     (
         "groups",
         "impresspress__products__groups",
-        &["groups::TABLE", "GROUPS_TABLE"],
-        "products",
+        "crate::blocks::products::repo::groups::TABLE",
     ),
     (
         "types",
         "impresspress__products__types",
-        &["types::TABLE", "TYPES_TABLE"],
-        "products",
+        "crate::blocks::products::repo::types::TABLE",
     ),
     (
         "group_templates",
         "impresspress__products__group_templates",
-        &["group_templates::TABLE", "GROUP_TEMPLATES_TABLE"],
-        "products",
+        "crate::blocks::products::repo::group_templates::TABLE",
     ),
     (
         "product_templates",
         "impresspress__products__product_templates",
-        &["product_templates::TABLE", "PRODUCT_TEMPLATES_TABLE"],
-        "products",
+        "crate::blocks::products::repo::product_templates::TABLE",
     ),
     (
         "llm_settings",
         "impresspress__llm__settings",
-        &["settings::TABLE"],
-        "llm",
+        "crate::blocks::llm::repo::settings::TABLE",
     ),
 ];
 
@@ -307,10 +265,11 @@ fn sources(walk: &SourceWalk) -> Vec<(String, String)> {
 }
 
 /// Every file the walk reaches, as `(path, code, names)`: [`sources`]'s pair
-/// plus what the raw text names once its `use` items are resolved
-/// ([`Names`]). Parsed from the raw text, not the comment-stripped code, so
-/// the parse sees the file the compiler sees, and parsed once per test
-/// binary: every test that reads it shares the one walk.
+/// plus what the raw text names once its paths are resolved to full paths
+/// from the crate root, re-exports followed ([`Names`], [`Crate`]). Parsed
+/// from the raw text, not the comment-stripped code, so the parse sees the
+/// file the compiler sees, and parsed once per test binary: every test that
+/// reads it shares the one walk.
 fn parsed() -> &'static [(String, String, Names)] {
     static PARSED: std::sync::OnceLock<Vec<(String, String, Names)>> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| {
@@ -334,10 +293,17 @@ fn parsed() -> &'static [(String, String, Names)] {
                         .collect::<Vec<_>>()
                 }));
             }
-            workers
+            let mut parsed: Vec<(String, String, Names)> = workers
                 .into_iter()
                 .flat_map(|w| w.join().expect("a parse worker panicked"))
-                .collect()
+                .collect();
+            Crate::resolve(
+                &mut parsed
+                    .iter_mut()
+                    .map(|(_, _, names)| names)
+                    .collect::<Vec<_>>(),
+            );
+            parsed
         })
     })
 }
@@ -712,7 +678,7 @@ const LITERAL_ALLOWED: &[(&str, &[&str])] = &[
 #[test]
 fn only_the_door_names_a_platform_table() {
     let sources = sources(&scan());
-    for (door, literal, _consts, _qualifier) in TABLES {
+    for (door, literal, _const) in TABLES {
         let allowed = LITERAL_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
@@ -732,15 +698,16 @@ fn only_the_door_names_a_platform_table() {
 /// `platform_state::variables::TABLE` to `db::list_all` — which compiles
 /// cleanly because the constant is `pub` for `blocks/admin`'s
 /// `collections(..)` registration. This scan closes that gap: a file that
-/// imports `platform_state` and names `<module>::TABLE` — by its path, or
-/// through an import that leaves some other spelling at the call site (a
-/// grouped `TABLE`, a module alias, a glob; [`names_const`]) — must be on the
-/// list below, each entry justified on why it is not a query around the door.
+/// names a door's constant — by its path, relative or absolute, or through
+/// an import or re-export that leaves some other spelling at the call site
+/// (a grouped `TABLE`, a module alias, a glob, `products::OFFERS_TABLE`;
+/// [`names_const`]) — must be on the list below, each entry justified on why
+/// it is not a query around the door.
 ///
-/// The `platform_state` condition is what keeps a block's own
-/// `repo::variables::TABLE` (products has one) out of the match. The doors
-/// themselves are not listed: inside `platform_state/<module>.rs` the
-/// constant is plain `TABLE`, never `<module>::TABLE`.
+/// Attribution is by the constant's full path, so a block's own
+/// `repo::variables::TABLE` (products has one) is never the platform's. The
+/// doors themselves are not listed: the file that defines a constant is
+/// never an offender for it ([`is_door`]).
 const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "variables",
@@ -1164,7 +1131,6 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // the admin SQL explorer's refusal list; see the note on
             // the `variables` door above
             "secret_tables.rs",
-            "blocks/products/repo/purchases.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             "blocks/products/tests/page_link_tests.rs",
@@ -1183,7 +1149,6 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "line_items",
         &[
-            "blocks/products/repo/purchases.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             // names `LINE_ITEMS_TABLE` for the witness assertion that a
@@ -1226,7 +1191,6 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "subscriptions",
         &[
-            "blocks/products/repo/subscriptions.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             "blocks/products/tests/handler_tests.rs",
@@ -1281,21 +1245,6 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     (
         "products_variables",
         &[
-            // A false attribution, kept rather than silenced: the file
-            // names `platform_state::variables::TABLE` (the config
-            // store) and, separately, `products::PURCHASES_TABLE`, and
-            // the second import is what puts the "products" qualifier in
-            // it. It never names this table, and it issues no query at
-            // all — see the note on the `variables` door above.
-            "secret_tables.rs",
-            // The same false attribution as `secret_tables.rs` above, from
-            // the other direction: the admin block names
-            // `platform_state::variables::TABLE` in its `collections(..)`
-            // and, separately, carries `"impresspress/products"` as the
-            // grantee of a `ResourceGrant` — a block id in a string, which
-            // is what puts the "products" qualifier in the file. It never
-            // names this table.
-            "blocks/admin/mod.rs",
             "blocks/products/mod.rs",
             "blocks/dev/data_snapshot.rs",
             "blocks/products/tests/offer_pricing_tests.rs",
@@ -1360,52 +1309,80 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// What one source file's code names, resolved through its `use` items.
+/// What one source file's code names, as full paths from the crate root.
 ///
 /// Parsed, not pattern-matched: `syn` reads the file into its scopes — the
 /// file itself, each inline `mod`, each block — and records in each one the
-/// names its `use` items bind, the globs they open, the `const`/`static`
-/// items it defines, and every path its code spells. Paths inside macro
-/// arguments come from the macro's token stream; comments and string
-/// literals are not tokens, so neither can name anything. An import is
-/// resolved the way the compiler would read it: `user_roles::{self as ur}`
-/// binds `ur`, `use ur::{TABLE}` then binds `TABLE` through `ur`, and
-/// `user_roles::{*}` opens a glob.
+/// module it belongs to, the names its `use` items bind, the globs they open,
+/// the `const`/`static`/`mod` items it defines, and every path its code
+/// spells. Paths inside macro arguments come from the macro's token stream;
+/// comments and string literals are not tokens, so neither can name
+/// anything — a block id like `"impresspress/products"` in a fixture names no
+/// table.
+///
+/// Every spelled or imported path is then resolved the way the compiler
+/// would read it ([`Names::absolute`]): `crate::…` as written, `self::` and
+/// `super::` against the scope's module, and a path starting with any other
+/// name through what that name is in scope — a `use` binding
+/// (`user_roles::{self as ur}` binds `ur`; `use ur::{TABLE}` then binds
+/// `TABLE` through `ur`), an item the scope defines (`repo::offers::TABLE`
+/// in `blocks/products/mod.rs` is that module's child `repo`), or a glob
+/// (`use super::*` in a test module). [`Crate`] then follows re-exports
+/// across files, so `blocks::products::OFFERS_TABLE` lands on
+/// `blocks::products::repo::offers::TABLE`.
 ///
 /// A name is looked up in its own scope and every enclosing one, and a name
 /// bound more than once is resolved through every binding. That
 /// over-approximates (an inline `mod` does not really see its parent's
 /// imports), and deliberately: the gate is a ban, so a spelling it cannot
-/// place must count against the file rather than slip past it.
+/// place must count against the file rather than slip past it. What it never
+/// does is attribute a constant to a door by what ELSE the file mentions.
 struct Names {
     scopes: Vec<Scope>,
-    /// Every path the file spells or imports, in every form it resolves to
-    /// ([`Names::resolve`]) — computed once, since it does not depend on
-    /// which constant is being asked about.
-    resolved: std::collections::HashSet<Vec<String>>,
+    /// Every path the file spells or imports, resolved to its full path from
+    /// the crate root in every form it can take ([`Names::absolute`]) —
+    /// before [`Crate`] follows re-exports.
+    local: std::collections::HashSet<Vec<String>>,
+    /// `local` with every re-export followed ([`Crate::expand`]): what the
+    /// file names. Filled in once the whole crate has been parsed.
+    named: std::collections::HashSet<Vec<String>>,
 }
 
 #[derive(Default)]
 struct Scope {
     parent: Option<usize>,
-    /// Name bound by a `use` → every path it is bound to in this scope.
+    /// The module this scope's code is in, from the crate root
+    /// (`["crate", "blocks", "products"]`). A block shares its module's.
+    module: Vec<String>,
+    /// Whether this scope IS a module (the file, or an inline `mod`), so its
+    /// `use` bindings are items of `module` another file can reach.
+    is_module: bool,
+    /// Name bound by a `use` → every path it is bound to, as written.
     bindings: std::collections::HashMap<String, Vec<Vec<String>>>,
-    /// The module paths opened by a `use …::*`.
+    /// The module paths opened by a `use …::*`, as written.
     globs: Vec<Vec<String>>,
-    /// `const` / `static` items this scope defines: an explicit item beats a
-    /// glob of the same name in the same scope and every scope inside it.
+    /// `globs`, each resolved to its full paths once, so a lookup that
+    /// passes a glob does not resolve the glob's own path all over again.
+    resolved_globs: Vec<Vec<String>>,
+    /// `const` / `static` / `mod` items this scope defines: an explicit item
+    /// beats a glob of the same name in the same scope and every scope
+    /// inside it.
     own_items: std::collections::HashSet<String>,
     /// Every path the scope's code spells, and whether it is qualified by
     /// something that is not a path segment (`::TABLE`, `<T>::TABLE`), which
-    /// makes a one-segment path something other than a bare name in scope.
+    /// makes it no path of this crate's.
     paths: Vec<(Vec<String>, bool)>,
-    /// The names the scope's code spells bare (one segment, unqualified).
-    bare: std::collections::HashSet<String>,
-    /// `globs`, each in every form it resolves to.
-    resolved_globs: Vec<Vec<String>>,
 }
 
+/// How many aliases deep a path is followed before the resolver gives up —
+/// far more than any real chain, and a stop for a cyclic one.
+const RESOLVE_DEPTH: u8 = 8;
+
 impl Names {
+    /// `rel` is the file's path under `src/`, which is its module path: the
+    /// crate has no `#[path]` attributes, so `blocks/products/mod.rs` is
+    /// `crate::blocks::products` and `blocks/products/pages.rs` is
+    /// `crate::blocks::products::pages`.
     fn parse(rel: &str, text: &str) -> Self {
         use syn::visit::Visit;
 
@@ -1414,10 +1391,14 @@ impl Names {
             current: usize,
         }
         impl Builder {
-            fn scoped(&mut self, visit: impl FnOnce(&mut Self)) {
+            fn scoped(&mut self, module: Option<String>, visit: impl FnOnce(&mut Self)) {
                 let outer = self.current;
+                let mut path = self.scopes[outer].module.clone();
+                path.extend(module.clone());
                 self.scopes.push(Scope {
                     parent: Some(outer),
+                    module: path,
+                    is_module: module.is_some(),
                     ..Scope::default()
                 });
                 self.current = self.scopes.len() - 1;
@@ -1472,14 +1453,16 @@ impl Names {
         }
         impl<'ast> Visit<'ast> for Builder {
             fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                self.scope().own_items.insert(item.ident.to_string());
                 if item.content.is_some() {
-                    self.scoped(|b| syn::visit::visit_item_mod(b, item));
+                    let name = item.ident.to_string();
+                    self.scoped(Some(name), |b| syn::visit::visit_item_mod(b, item));
                 } else {
                     syn::visit::visit_item_mod(self, item);
                 }
             }
             fn visit_block(&mut self, block: &'ast syn::Block) {
-                self.scoped(|b| syn::visit::visit_block(b, block));
+                self.scoped(None, |b| syn::visit::visit_block(b, block));
             }
             fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
                 self.tree(&mut Vec::new(), &item.tree);
@@ -1499,7 +1482,7 @@ impl Names {
             fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
                 match &expr.qself {
                     // `<T as Trait>::NAME`: the segments after the qualified
-                    // self are the trait's, never a bare name in scope.
+                    // self are the trait's, never a path in scope.
                     Some(q) => {
                         self.visit_type(&q.ty);
                         self.record(&expr.path, q.position, true);
@@ -1527,37 +1510,45 @@ impl Names {
         let file = syn::parse_file(text)
             .unwrap_or_else(|e| panic!("{rel}: the gate cannot read what it cannot parse: {e}"));
         let mut builder = Builder {
-            scopes: vec![Scope::default()],
+            scopes: vec![Scope {
+                module: module_of(rel),
+                is_module: true,
+                ..Scope::default()
+            }],
             current: 0,
         };
         builder.visit_file(&file);
         let mut names = Names {
             scopes: builder.scopes,
-            resolved: std::collections::HashSet::new(),
+            local: std::collections::HashSet::new(),
+            named: std::collections::HashSet::new(),
         };
+        // Parents come before their children, so each scope's globs resolve
+        // against the enclosing scopes' already-resolved ones.
         for at in 0..names.scopes.len() {
-            let scope = &names.scopes[at];
-            let spelled = scope.paths.iter().map(|(path, _)| path);
-            let imported = scope.bindings.values().flatten();
-            let resolved: Vec<Vec<String>> = spelled
-                .chain(imported)
-                .flat_map(|path| names.resolve(at, path))
-                .collect();
-            let bare = scope
-                .paths
-                .iter()
-                .filter(|(path, pathed)| !pathed && path.len() == 1)
-                .map(|(path, _)| path[0].clone())
-                .collect();
-            let resolved_globs = scope
+            let resolved = names.scopes[at]
                 .globs
                 .iter()
-                .flat_map(|glob| names.resolve(at, glob))
+                .flat_map(|glob| names.absolute(at, glob))
                 .collect();
-            names.resolved.extend(resolved);
-            names.scopes[at].bare = bare;
-            names.scopes[at].resolved_globs = resolved_globs;
+            names.scopes[at].resolved_globs = resolved;
         }
+        let mut local = std::collections::HashSet::new();
+        for at in 0..names.scopes.len() {
+            let scope = &names.scopes[at];
+            // A `::`-led or `<T>::`-qualified path is no path of this crate's.
+            let spelled = scope
+                .paths
+                .iter()
+                .filter(|(_, pathed)| !pathed)
+                .map(|(path, _)| path);
+            let imported = scope.bindings.values().flatten();
+            for path in spelled.chain(imported) {
+                local.extend(names.absolute(at, path));
+            }
+            local.extend(scope.resolved_globs.iter().cloned());
+        }
+        names.local = local;
         names
     }
 
@@ -1566,42 +1557,97 @@ impl Names {
         std::iter::successors(Some(scope), |s| self.scopes[*s].parent)
     }
 
-    /// Every path `path` can stand for in `scope`: itself, and — through each
-    /// binding of its first segment visible there — the bound path with the
-    /// rest appended, recursively, so an alias of an alias lands on the real
-    /// module. A leading `self::` / `super::` is dropped first; the scopes it
-    /// would pick are already on the chain being searched.
-    fn resolve(&self, scope: usize, path: &[String]) -> Vec<Vec<String>> {
+    /// Every full path (from `crate`) that `path`, spelled in `scope`, can
+    /// stand for.
+    fn absolute(&self, scope: usize, path: &[String]) -> Vec<Vec<String>> {
         let mut out = Vec::new();
-        self.resolve_into(scope, path, 8, &mut out);
+        self.absolute_into(scope, path, RESOLVE_DEPTH, &mut out);
         out
     }
 
-    fn resolve_into(&self, scope: usize, path: &[String], depth: u8, out: &mut Vec<Vec<String>>) {
-        let start = path
-            .iter()
-            .take_while(|s| *s == "self" || *s == "super")
-            .count();
-        let path = &path[start..];
+    fn absolute_into(&self, scope: usize, path: &[String], depth: u8, out: &mut Vec<Vec<String>>) {
         let Some(head) = path.first() else {
             return;
         };
-        out.push(path.to_vec());
+        let module = &self.scopes[scope].module;
+        let rest = &path[1..];
+        match head.as_str() {
+            "crate" | "impresspress_core" => {
+                out.push(
+                    std::iter::once("crate".to_string())
+                        .chain(rest.iter().cloned())
+                        .collect(),
+                );
+                return;
+            }
+            "self" => {
+                out.push(module.iter().chain(rest).cloned().collect());
+                return;
+            }
+            "super" => {
+                let ups = path.iter().take_while(|s| *s == "super").count();
+                // `module` always starts with `crate`, which no `super` climbs past.
+                let keep = module.len().saturating_sub(ups).max(1);
+                out.push(module[..keep].iter().chain(&path[ups..]).cloned().collect());
+                return;
+            }
+            _ => {}
+        }
         if depth == 0 {
             return;
         }
-        for bound in self
-            .chain(scope)
-            .filter_map(|s| self.scopes[s].bindings.get(head))
-            .flatten()
-        {
-            if bound.as_slice() == [head.clone()] {
-                continue; // `use user_roles;` binds the name to itself
+        // Walking outwards: the first scope that binds or defines `head`
+        // decides what it is; a glob on the way may also supply it.
+        for at in self.chain(scope) {
+            let here = &self.scopes[at];
+            let bound: Vec<&Vec<String>> = here
+                .bindings
+                .get(head)
+                .into_iter()
+                .flatten()
+                // `use user_roles;` binds the name to itself — an extern
+                // crate or an item already in scope, not an alias.
+                .filter(|target| target.as_slice() != [head.clone()])
+                .collect();
+            if !bound.is_empty() {
+                for target in bound {
+                    let mut resolved = Vec::new();
+                    self.absolute_into(at, target, depth - 1, &mut resolved);
+                    out.extend(
+                        resolved
+                            .into_iter()
+                            .map(|r| r.into_iter().chain(rest.iter().cloned()).collect()),
+                    );
+                }
+                return;
             }
-            let next: Vec<String> = bound.iter().chain(&path[1..]).cloned().collect();
-            self.resolve_into(scope, &next, depth - 1, out);
+            if here.own_items.contains(head) {
+                out.push(here.module.iter().chain(path).cloned().collect());
+                return;
+            }
+            for glob in &here.resolved_globs {
+                out.push(glob.iter().chain(path).cloned().collect());
+            }
         }
+        // Nothing in the file binds it: an item of the scope's module this
+        // parse does not track (a `fn`, a type), or an extern crate. Either
+        // way it is read as the module's own, which names no door.
+        out.push(module.iter().chain(path).cloned().collect());
     }
+}
+
+/// The module path of the file at `rel` (relative to `src/`).
+fn module_of(rel: &str) -> Vec<String> {
+    let stem = rel.strip_suffix(".rs").unwrap_or(rel);
+    let mut module = vec!["crate".to_string()];
+    module.extend(stem.split('/').map(str::to_string));
+    if matches!(
+        module.last().map(String::as_str),
+        Some("mod" | "lib" | "main")
+    ) {
+        module.pop();
+    }
+    module
 }
 
 /// Every maximal `ident (:: ident)*` run in `tokens`, descending into groups
@@ -1641,53 +1687,136 @@ fn collect_paths(tokens: proc_macro2::TokenStream, out: &mut Vec<(Vec<String>, b
     }
 }
 
-/// Whether the code `names` describes names `ident` — by its path
-/// (`user_roles::TABLE`, `self::ur::TABLE`), by an import that binds the
-/// constant or its module under any name (`user_roles::{self, TABLE}`,
-/// `user_roles::{self as ur}` then `ur::TABLE`, `use ur::{TABLE}` then a bare
-/// `TABLE`), or by a glob (`user_roles::*` or `user_roles::{*}`, then a bare
-/// `TABLE` that no `const`/`static` between the use and the glob's scope
-/// shadows). An import names the constant even before a call site uses it.
-/// An `ident` with no `::` (`PRODUCT_TEMPLATES_TABLE`) is named by any path
-/// ending in it. A bare `TABLE` alone is not evidence of anything, every
-/// door names its own; the import is what attributes it.
-fn names_const(names: &Names, ident: &str) -> bool {
-    let (module, name) = match ident.rsplit_once("::") {
-        Some((module, name)) => (Some(module), name),
-        None => (None, ident),
-    };
-    let ends_with = |path: &[String], tail: &[&str]| {
-        path.len() >= tail.len()
-            && path[path.len() - tail.len()..]
-                .iter()
-                .zip(tail)
-                .all(|(a, b)| a == b)
-    };
-    let tail: Vec<&str> = module.into_iter().chain([name]).collect();
-    if names.resolved.iter().any(|path| ends_with(path, &tail)) {
-        return true;
-    }
-    let Some(module) = module else {
-        return false;
-    };
-    // A bare `name` resolves to a glob of `module` when, walking outwards
-    // from the scope that spells it, a scope opening that glob comes before
-    // any scope that defines or imports `name` explicitly.
-    for (at, scope) in names.scopes.iter().enumerate() {
-        if !scope.bare.contains(name) {
-            continue;
-        }
-        for outer_at in names.chain(at) {
-            let outer = &names.scopes[outer_at];
-            if outer.own_items.contains(name) || outer.bindings.contains_key(name) {
-                break;
-            }
-            if outer.resolved_globs.iter().any(|g| ends_with(g, &[module])) {
-                return true;
+/// What the whole crate re-exports: every module-level `use` is an item of
+/// its module that another file can name (`crate::blocks::products::
+/// OFFERS_TABLE` is `pub(crate) use repo::offers::TABLE as OFFERS_TABLE` in
+/// `blocks/products/mod.rs`), and every module-level glob opens its target
+/// under the module's name.
+#[derive(Default)]
+struct Crate {
+    /// `module::name` → the full paths the `use` binding it points at.
+    aliases: std::collections::HashMap<Vec<String>, Vec<Vec<String>>>,
+    /// `module` → the full paths of the modules its globs open.
+    globs: std::collections::HashMap<Vec<String>, Vec<Vec<String>>>,
+    /// Every item path the crate is known to define (see [`Crate::resolve`]).
+    items: std::collections::HashSet<Vec<String>>,
+}
+
+impl Crate {
+    /// Fill in [`Names::named`] for every file of one crate, re-exports
+    /// followed across all of them.
+    fn resolve(files: &mut [&mut Names]) {
+        let mut krate = Crate::default();
+        for names in files.iter().map(|n| &**n) {
+            for (at, scope) in names.scopes.iter().enumerate() {
+                if !scope.is_module {
+                    continue;
+                }
+                for (name, targets) in &scope.bindings {
+                    let key: Vec<String> = scope.module.iter().chain([name]).cloned().collect();
+                    let entry = krate.aliases.entry(key).or_default();
+                    for target in targets {
+                        entry.extend(names.absolute(at, target));
+                    }
+                }
+                for glob in &scope.resolved_globs {
+                    krate
+                        .globs
+                        .entry(scope.module.clone())
+                        .or_default()
+                        .push(glob.clone());
+                }
             }
         }
+        // What a glob can supply: the items this crate is known to define —
+        // its modules, their `const`/`static`/`mod` items and their `use`
+        // bindings. A glob that resolved to anything else
+        // (`use wafer_run::prelude::*`) opens nothing here.
+        for names in files.iter().map(|n| &**n) {
+            for scope in names.scopes.iter().filter(|scope| scope.is_module) {
+                krate.items.insert(scope.module.clone());
+                for item in &scope.own_items {
+                    krate
+                        .items
+                        .insert(scope.module.iter().chain([item]).cloned().collect());
+                }
+            }
+        }
+        krate.items.extend(krate.aliases.keys().cloned());
+        for names in files.iter_mut() {
+            let mut named = std::collections::HashSet::new();
+            for path in &names.local {
+                krate.expand(path, RESOLVE_DEPTH, &mut named);
+            }
+            names.named = named;
+        }
     }
-    false
+
+    /// `path` and every path it reaches through a re-export: wherever a
+    /// prefix of it is a module-level `use`, the binding's target with the
+    /// rest appended, and wherever a prefix is a module with a glob, the
+    /// glob's target with the rest appended when the target defines the next
+    /// segment.
+    fn expand(&self, path: &[String], depth: u8, out: &mut std::collections::HashSet<Vec<String>>) {
+        if !out.insert(path.to_vec()) || depth == 0 {
+            return;
+        }
+        for k in 1..=path.len() {
+            let (prefix, rest) = path.split_at(k);
+            for target in self.aliases.get(prefix).into_iter().flatten() {
+                let next: Vec<String> = target.iter().chain(rest).cloned().collect();
+                self.expand(&next, depth - 1, out);
+            }
+            // `module::name` through a glob in `module` is `target::name` —
+            // when `target` defines `name`, which is all a glob brings in.
+            let Some(name) = rest.first() else {
+                continue;
+            };
+            for target in self.globs.get(prefix).into_iter().flatten() {
+                let item: Vec<String> = target.iter().chain([name]).cloned().collect();
+                if self.items.contains(&item) {
+                    let next: Vec<String> =
+                        item.into_iter().chain(rest[1..].iter().cloned()).collect();
+                    self.expand(&next, depth - 1, out);
+                }
+            }
+        }
+    }
+}
+
+/// Whether the file `names` describes names the constant at `path` (a full
+/// path, `crate::platform_state::user_roles::TABLE`) — spelled out, through
+/// an import that binds the constant or its module under any name
+/// (`user_roles::{self, TABLE}`, `user_roles::{self as ur}` then
+/// `ur::TABLE`, `use ur::{TABLE}` then a bare `TABLE`), through a glob
+/// (`user_roles::*`, then a bare `TABLE` that no `const`/`static` between the
+/// use and the glob's scope shadows), relative to the file's module
+/// (`super::repo::offers::TABLE`), or through a re-export elsewhere in the
+/// crate. An import names the constant even before a call site uses it.
+fn names_const(names: &Names, path: &str) -> bool {
+    let path: Vec<String> = path.split("::").map(str::to_string).collect();
+    names.named.contains(&path)
+}
+
+/// Whether the file at `rel` is the module that defines the constant at
+/// `path` — the door itself, which names its own constant freely.
+fn is_door(rel: &str, path: &str) -> bool {
+    let module = module_of(rel);
+    let owner: Vec<&str> = path
+        .rsplit_once("::")
+        .map_or(vec![], |(m, _)| m.split("::").collect());
+    module.iter().map(String::as_str).eq(owner)
+}
+
+/// [`Names`] for a set of fixture files, re-exports resolved across them as
+/// the real crate's are.
+fn fixture_crate(files: &[(&str, &str)]) -> Vec<Names> {
+    let mut parsed: Vec<Names> = files
+        .iter()
+        .map(|(rel, src)| Names::parse(rel, src))
+        .collect();
+    Crate::resolve(&mut parsed.iter_mut().collect::<Vec<_>>());
+    parsed
 }
 
 #[test]
@@ -1827,15 +1956,184 @@ fn a_grouped_import_of_the_const_is_naming_it() {
             false,
         ),
     ] {
-        let names = Names::parse("case", src);
-        assert_eq!(names_const(&names, "user_roles::TABLE"), named, "{src}");
+        let names = &fixture_crate(&[("case.rs", src)])[0];
+        assert_eq!(
+            names_const(names, "crate::platform_state::user_roles::TABLE"),
+            named,
+            "{src}"
+        );
     }
+}
+
+/// A constant is attributed to a door by the full path it resolves to, and
+/// by nothing else the file mentions.
+///
+/// Each case is a small crate — `(file under src/, source)` pairs — and asks
+/// whether its LAST file names one constant. The must-not-catch cases are
+/// the false attributions the gate once made by matching a qualifier as a
+/// substring anywhere in the file; the must-catch cases include spellings
+/// that carry no qualifier at all (`super::repo::variables`), which that
+/// match could not see.
+#[test]
+fn a_constant_is_attributed_by_its_full_path() {
+    const PLATFORM_VARIABLES: &str = "crate::platform_state::variables::TABLE";
+    const PRODUCTS_VARIABLES: &str = "crate::blocks::products::repo::variables::TABLE";
+    const OFFERS: &str = "crate::blocks::products::repo::offers::TABLE";
+    const PRODUCTS_MOD: &str = "pub(crate) use repo::{offers::TABLE as OFFERS_TABLE, purchases::PURCHASES_TABLE};\nmod repo;";
+    let cases: &[(&[(&str, &str)], &str, bool)] = &[
+        // must not catch: the platform config store's constant next to a
+        // products re-export is not products' variables table
+        (
+            &[
+                ("blocks/products/mod.rs", PRODUCTS_MOD),
+                (
+                    "secret_tables.rs",
+                    "use crate::{blocks::products::PURCHASES_TABLE, platform_state::variables};\nfn f() { let _ = [variables::TABLE, PURCHASES_TABLE]; }",
+                ),
+            ],
+            PRODUCTS_VARIABLES,
+            false,
+        ),
+        // ... though it is the platform's
+        (
+            &[
+                ("blocks/products/mod.rs", PRODUCTS_MOD),
+                (
+                    "secret_tables.rs",
+                    "use crate::{blocks::products::PURCHASES_TABLE, platform_state::variables};\nfn f() { let _ = [variables::TABLE, PURCHASES_TABLE]; }",
+                ),
+            ],
+            PLATFORM_VARIABLES,
+            true,
+        ),
+        // must not catch: a block id in a string names no table
+        (
+            &[(
+                "blocks/admin/mod.rs",
+                "use crate::platform_state::variables;\nfn f() { let _ = (variables::TABLE, \"impresspress/products\"); }",
+            )],
+            PRODUCTS_VARIABLES,
+            false,
+        ),
+        // must not catch: products' own `variables` repo is not the platform's
+        (
+            &[(
+                "blocks/products/pages.rs",
+                "use super::repo::variables;\nfn f() { let _ = variables::TABLE; }",
+            )],
+            PLATFORM_VARIABLES,
+            false,
+        ),
+        // must catch: the same file names products' table, with no
+        // "products" anywhere in its text
+        (
+            &[(
+                "blocks/products/pages.rs",
+                "use super::repo::variables;\nfn f() { let _ = variables::TABLE; }",
+            )],
+            PRODUCTS_VARIABLES,
+            true,
+        ),
+        // must catch: `super::super::` from a nested module
+        (
+            &[(
+                "blocks/products/handlers/offer.rs",
+                "fn f() { let _ = super::super::repo::offers::TABLE; }",
+            )],
+            OFFERS,
+            true,
+        ),
+        // must catch: a child module named relative to the file's own module
+        (
+            &[(
+                "blocks/products/mod.rs",
+                "mod repo;\nfn f() { let _ = repo::offers::TABLE; }",
+            )],
+            OFFERS,
+            true,
+        ),
+        // must catch: a test module reaching the parent's child through
+        // `use super::*`
+        (
+            &[(
+                "blocks/products/pages.rs",
+                "mod tests { use super::*; fn f() { let _ = repo::offers::TABLE; } }\nuse super::repo;",
+            )],
+            OFFERS,
+            true,
+        ),
+        // must catch: a re-exported alias in another file
+        (
+            &[
+                ("blocks/products/mod.rs", PRODUCTS_MOD),
+                (
+                    "blocks/dev/data_snapshot.rs",
+                    "use crate::blocks::products::OFFERS_TABLE;\nfn f() { let _ = OFFERS_TABLE; }",
+                ),
+            ],
+            OFFERS,
+            true,
+        ),
+        // must catch: a module re-exported through a glob
+        (
+            &[
+                ("blocks/products/mod.rs", "pub use repo::*;\nmod repo;"),
+                ("blocks/products/repo/mod.rs", "pub mod offers;"),
+                (
+                    "blocks/dev/data_snapshot.rs",
+                    "fn f() { let _ = crate::blocks::products::offers::TABLE; }",
+                ),
+            ],
+            OFFERS,
+            true,
+        ),
+        // must catch: a module alias
+        (
+            &[(
+                "blocks/dev/data_snapshot.rs",
+                "use crate::blocks::products::repo::offers as o;\nfn f() { let _ = o::TABLE; }",
+            )],
+            OFFERS,
+            true,
+        ),
+        // must not catch: another module's `offers`
+        (
+            &[(
+                "blocks/dev/data_snapshot.rs",
+                "use crate::blocks::files::repo::offers;\nfn f() { let _ = offers::TABLE; }",
+            )],
+            OFFERS,
+            false,
+        ),
+        // must not catch: an alias chain that loops names nothing
+        (
+            &[(
+                "blocks/dev/data_snapshot.rs",
+                "use a as b;\nuse b as a;\nfn f() { let _ = a::TABLE; }",
+            )],
+            OFFERS,
+            false,
+        ),
+    ];
+    for (files, constant, named) in cases {
+        let crate_names = fixture_crate(files);
+        let names = crate_names.last().expect("a case has a file");
+        assert_eq!(
+            names_const(names, constant),
+            *named,
+            "{constant} in {:?}",
+            files.last()
+        );
+    }
+    assert!(is_door("blocks/products/repo/offers.rs", OFFERS));
+    assert!(!is_door("blocks/products/repo/mod.rs", OFFERS));
+    assert!(is_door("platform_state/variables.rs", PLATFORM_VARIABLES));
 }
 
 #[test]
 fn only_the_allowlist_names_a_platform_table_via_the_const() {
     let parsed = parsed();
-    for (door, _, consts, qualifier) in TABLES {
+    for (door, _, constant) in TABLES {
         let allowed = IDENT_ALLOWED
             .iter()
             .find(|(m, _)| m == door)
@@ -1843,15 +2141,13 @@ fn only_the_allowlist_names_a_platform_table_via_the_const() {
             .unwrap_or(&[]);
         let offenders: Vec<&String> = parsed
             .iter()
-            .filter(|(path, _, _)| !matches_allowlist(path, allowed))
-            .filter(|(_, src, names)| {
-                src.contains(qualifier) && consts.iter().any(|ident| names_const(names, ident))
-            })
+            .filter(|(path, _, _)| !matches_allowlist(path, allowed) && !is_door(path, constant))
+            .filter(|(_, _, names)| names_const(names, constant))
             .map(|(path, _, _)| path)
             .collect();
         assert!(
             offenders.is_empty(),
-            "these files name the table via one of `{consts:?}` instead of calling a \
+            "these files name the table via `{constant}` instead of calling a \
              `{door}` repo function: {offenders:?}"
         );
     }
@@ -1866,7 +2162,8 @@ fn no_allowlist_entry_is_dead() {
         .iter()
         .map(|(path, src, _)| (path.clone(), src.clone()))
         .collect();
-    for (door, literal, consts, _qualifier) in TABLES {
+    let mut dead = Vec::new();
+    for (door, literal, constant) in TABLES {
         for (m, files) in LITERAL_ALLOWED {
             if m != door {
                 continue;
@@ -1886,15 +2183,26 @@ fn no_allowlist_entry_is_dead() {
                 continue;
             }
             for entry in *files {
-                assert!(
-                    parsed.iter().any(|(path, _, names)| path == entry
-                        && consts.iter().any(|ident| names_const(names, ident))),
-                    "`{entry}` is allowlisted for `{consts:?}` but no longer names any \
-                     of them; drop the entry rather than leaving a standing exemption"
-                );
+                if is_door(entry, constant) {
+                    dead.push(format!(
+                        "`{entry}` is the `{door}` door itself, which is never an offender"
+                    ));
+                } else if !parsed
+                    .iter()
+                    .any(|(path, _, names)| path == entry && names_const(names, constant))
+                {
+                    dead.push(format!(
+                        "`{entry}` is allowlisted for `{constant}` but no longer names it"
+                    ));
+                }
             }
         }
     }
+    assert!(
+        dead.is_empty(),
+        "drop these entries rather than leaving a standing exemption:\n{}",
+        dead.join("\n")
+    );
 }
 
 /// The old names are gone: `admin_schema.rs` and the `blocks::admin`
