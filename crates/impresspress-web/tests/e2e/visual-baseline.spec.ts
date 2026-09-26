@@ -106,6 +106,15 @@ const SHELL_SCROLLERS = '.shell__body, .sidebar__groups';
 // The loop converges because the overflow it removes does not grow with the
 // viewport; a page whose content did would never settle, and that fails here
 // rather than producing an arbitrarily tall capture.
+//
+// Chromium's compositor caps a surface at 16,384px (its maximum texture
+// size), so a capture near or past that is not one to trust. The cap below
+// keeps a margin under it. The tallest capture today is
+// admin-variables at about 12,700px. A page that outgrows the cap fails here
+// by name, so the fix is a deliberate one — split the capture, or capture a
+// filtered view — rather than a baseline that silently stopped at the cap.
+const MAX_CAPTURE_HEIGHT = 16_000;
+
 async function growViewportToContent(page: Page) {
   for (let pass = 0; pass < 5; pass++) {
     const overflow = await page.evaluate((selector) => {
@@ -120,7 +129,14 @@ async function growViewportToContent(page: Page) {
     if (overflow <= 0) return;
     const size = page.viewportSize();
     if (!size) throw new Error('growViewportToContent: the page has no fixed viewport');
-    await page.setViewportSize({ width: size.width, height: size.height + overflow });
+    const height = size.height + overflow;
+    if (height > MAX_CAPTURE_HEIGHT) {
+      throw new Error(
+        `growViewportToContent: ${page.url()} needs a ${height}px capture, over the ` +
+          `${MAX_CAPTURE_HEIGHT}px cap Chromium can screenshot reliably; split or filter this capture`,
+      );
+    }
+    await page.setViewportSize({ width: size.width, height });
   }
   throw new Error(`growViewportToContent: ${page.url()} still overflows after 5 passes`);
 }

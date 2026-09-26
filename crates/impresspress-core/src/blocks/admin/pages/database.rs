@@ -532,6 +532,39 @@ mod tests {
         test_support::{admin_msg, TestContext},
     };
 
+    /// The visual-baseline suite masks the table-list rows of the two log
+    /// tables every request writes to, by the suffix of their
+    /// `data-db-table` name, because their row counts follow the suite's own
+    /// traffic. Rename either table (or the attribute) and the selector
+    /// silently stops matching: the capture then fails on whatever ran
+    /// before it, not on the page. This pins the spec's selector to the
+    /// tables' constants and to the markup this page renders.
+    #[tokio::test]
+    async fn the_log_table_rows_carry_the_names_the_visual_mask_keys_on() {
+        const SPEC: &str =
+            include_str!("../../../../../impresspress-web/tests/e2e/visual-baseline.spec.ts");
+        let ctx = TestContext::with_admin().await;
+        let parts = browser_request(&ctx, admin_msg("retrieve", "/b/admin/database")).await;
+        assert_eq!(parts.status, 200);
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+
+        for table in [
+            crate::platform_state::request_logs::TABLE,
+            crate::blocks::admin::logs::STORAGE_ACCESS_LOGS_TABLE,
+        ] {
+            let suffix = &table[table.rfind("__").expect("an org__block__name table")..];
+            let selector = format!(r#"li[data-db-table$="{suffix}"]"#);
+            assert!(
+                SPEC.contains(&selector),
+                "visual-baseline.spec.ts no longer masks `{selector}` for {table}"
+            );
+            assert!(
+                html.contains(&format!(r#"<li data-db-table="{table}">"#)),
+                "the database page no longer names the {table} row the way the mask expects: {html}"
+            );
+        }
+    }
+
     /// A failed table listing is a 500, not a database with no tables.
     #[tokio::test]
     async fn a_failed_introspection_is_a_500_not_an_empty_database() {

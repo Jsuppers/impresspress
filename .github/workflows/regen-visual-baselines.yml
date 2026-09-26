@@ -42,9 +42,10 @@ jobs:
     name: Regen visual baselines on ${{ inputs.branch }}
     # The same pinned image as the jobs in `ci-shared.yml` that compare
     # against what this workflow renders (`e2e-visual`, `products-browser`,
-    # `product-examples`): the image supplies the fonts and FreeType, so a
-    # baseline is only valid on the image that rendered it. Move all four
-    # labels together, then regen.
+    # `product-examples`): the Ubuntu release supplies the fonts and
+    # fontconfig (`playwright install --with-deps` installs them through
+    # apt), so a baseline is only valid on the release that rendered it. Move
+    # all four labels together, then regen.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
