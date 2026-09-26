@@ -1980,7 +1980,9 @@ fn a_constant_is_attributed_by_its_full_path() {
     const PRODUCTS_VARIABLES: &str = "crate::blocks::products::repo::variables::TABLE";
     const OFFERS: &str = "crate::blocks::products::repo::offers::TABLE";
     const PRODUCTS_MOD: &str = "pub(crate) use repo::{offers::TABLE as OFFERS_TABLE, purchases::PURCHASES_TABLE};\nmod repo;";
-    let cases: &[(&[(&str, &str)], &str, bool)] = &[
+    /// `(file under src/, source)` pairs: one small crate.
+    type Files<'a> = &'a [(&'a str, &'a str)];
+    let cases: &[(Files, &str, bool)] = &[
         // must not catch: the platform config store's constant next to a
         // products re-export is not products' variables table
         (
