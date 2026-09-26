@@ -1261,7 +1261,14 @@ jobs:
   e2e-visual:
     name: E2E visual baselines (native server)
     needs: e2e-build
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job compares screenshots against
+    # baselines rendered by `regen-visual-baselines.yml`, and the runner
+    # image supplies the fonts and FreeType that paint every glyph. A moving
+    # label would change the render under the committed PNGs with no commit
+    # to point at; a pinned image makes an image upgrade a deliberate edit
+    # here and in that workflow, followed by a regen. The two labels must
+    # match.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -1379,7 +1386,14 @@ jobs:
 
   products-browser:
     name: Products browser lifecycles
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job compares screenshots against
+    # baselines rendered by `regen-visual-baselines.yml`, and the runner
+    # image supplies the fonts and FreeType that paint every glyph. A moving
+    # label would change the render under the committed PNGs with no commit
+    # to point at; a pinned image makes an image upgrade a deliberate edit
+    # here and in that workflow, followed by a regen. The two labels must
+    # match.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -1418,7 +1432,14 @@ jobs:
 
   product-examples:
     name: Products static examples (Playwright)
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job compares screenshots against
+    # baselines rendered by `regen-visual-baselines.yml`, and the runner
+    # image supplies the fonts and FreeType that paint every glyph. A moving
+    # label would change the render under the committed PNGs with no commit
+    # to point at; a pinned image makes an image upgrade a deliberate edit
+    # here and in that workflow, followed by a regen. The two labels must
+    # match.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
