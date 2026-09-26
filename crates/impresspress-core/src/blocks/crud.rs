@@ -744,7 +744,9 @@ mod db_error_tests {
     #[tokio::test]
     async fn a_missing_table_under_strict_schema_is_a_500_not_the_callers_404() {
         const NEVER_CREATED: &str = "impresspress__crudtest__never_created";
-        let ctx = TestContext::new().await;
+        // Run as the block the table would belong to, so the only thing
+        // wrong with each statement is the table it names.
+        let ctx = TestContext::new().await.running_as("impresspress/crudtest");
         ctx.set_strict_schema(true);
 
         let got = get_record(&ctx, NEVER_CREATED, "any-id", "Row")

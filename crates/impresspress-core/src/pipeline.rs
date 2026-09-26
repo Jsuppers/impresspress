@@ -2975,8 +2975,9 @@ mod streaming_audit_tests {
         let _ = out.collect_buffered().await;
     }
 
+    /// Read by the test, not by the router the requests ran as.
     async fn request_log_count(ctx: &TestContext) -> i64 {
-        request_logs::paginated(ctx, 1, 20, "", false)
+        request_logs::paginated(&ctx.fixture(), 1, 20, "", false)
             .await
             .expect("count request_logs")
             .total_count
@@ -3056,7 +3057,9 @@ mod streaming_audit_tests {
     async fn interleaved_requests_queue_their_audit_rows_in_their_own_scopes() {
         use crate::after_response::{scope, AfterResponse};
 
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.register_block("test/yield", Arc::new(YieldingBlock));
         let routes = route("/x/", "test/yield");
         let after_a = AfterResponse::new();
