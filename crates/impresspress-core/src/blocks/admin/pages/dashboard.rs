@@ -276,7 +276,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             html! { (record.email) },
                             // `.text-right` needs a block box to align against,
                             // and the component owns the `<td>`.
-                            html! { div .text-muted .text-right { (created.get(..10).unwrap_or(created)) } },
+                            html! { div .text-muted .text-right { time datetime=(created) { (created.get(..10).unwrap_or(created)) } } },
                         ])
                     }).collect();
                     (components::DataTable::new(&RECENT_USERS_COLUMNS).rows(rows).headless().render())
@@ -595,27 +595,45 @@ mod outage_tests {
         );
     }
 
-    /// "Avg Response" is a latency measured during the run that screenshots
-    /// this page, so the visual-baseline suite masks it. It has to be masked
-    /// by its label text (`.stat-card:has-text("Avg Response") .stat-value`)
-    /// rather than by an attribute, because `components::stat_card` takes its
-    /// value as a plain `&str` and offers no markup slot to hang one on. That
-    /// makes the label part of the mask's contract: rename it and
-    /// the mask silently stops matching, and the tile is compared pixel by
-    /// pixel again with nothing announcing the change.
+    /// A recent user's creation date is a per-run value in the visual-baseline
+    /// capture of this page, which masks dates by the `<time>` element alone.
     #[tokio::test]
-    async fn the_avg_response_tile_keeps_the_label_the_visual_mask_keys_on() {
+    async fn the_recent_users_card_renders_the_created_date_as_a_time_element() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("u-1").await;
+        let html = output_html(dashboard(&ctx, &admin_msg("retrieve", "/b/admin/")).await).await;
+
+        assert!(
+            html.contains(r#"datetime="2026-01-01T00:00:00Z">2026-01-01</time>"#),
+            "the Recent Users date must be a <time>: {html}"
+        );
+    }
+
+    /// Two tiles carry figures the visual-baseline suite masks: "Avg
+    /// Response", a latency measured during the run that screenshots this
+    /// page, and "Requests Today", a count of every request the suite made
+    /// before the capture. Both are masked by label text
+    /// (`.stat-card:has-text("…") .stat-value`) rather than by an attribute,
+    /// because `components::stat_card` takes its value as a plain `&str` and
+    /// offers no markup slot to hang one on. That makes each label part of
+    /// the mask's contract: rename it and the mask silently stops matching,
+    /// and the tile is compared pixel by pixel again with nothing announcing
+    /// the change.
+    #[tokio::test]
+    async fn the_masked_tiles_keep_the_labels_the_visual_masks_key_on() {
         let ctx = TestContext::with_auth().await;
         let html = output_html(dashboard(&ctx, &admin_msg("retrieve", "/b/admin/")).await).await;
 
-        let label = r#"<div class="stat-label">Avg Response</div>"#;
-        let at = html
-            .find(label)
-            .unwrap_or_else(|| panic!("visual-baseline.spec.ts masks this tile by this exact label, which is gone: {html}"));
-        let rest = &html[at + label.len()..];
-        assert!(
-            rest.starts_with(r#"<div class="stat-value">"#),
-            "the masked element is the `.stat-value` that follows the label: {rest:.120}"
-        );
+        for tile in ["Avg Response", "Requests Today"] {
+            let label = format!(r#"<div class="stat-label">{tile}</div>"#);
+            let at = html.find(&label).unwrap_or_else(|| {
+                panic!("visual-baseline.spec.ts masks this tile by this exact label, which is gone: {label} in {html}")
+            });
+            let rest = &html[at + label.len()..];
+            assert!(
+                rest.starts_with(r#"<div class="stat-value">"#),
+                "the masked element is the `.stat-value` that follows the label: {rest:.120}"
+            );
+        }
     }
 }

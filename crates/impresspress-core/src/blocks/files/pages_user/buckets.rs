@@ -69,7 +69,7 @@ pub fn render_buckets_table(rows: &[BucketRow]) -> Markup {
                                 span .badge { "Private" }
                             }
                         }
-                        td data-label="Created" { (r.created_at) }
+                        td data-label="Created" { time datetime=(r.created_at) { (r.created_at) } }
                         td data-label="Objects" { (r.object_count) }
                     }
                 }
@@ -247,6 +247,17 @@ mod tests {
         assert!(html.contains("Private"));
         assert!(html.contains(">12<"));
         assert!(html.contains(r#"href="/b/storage/photos/""#));
+    }
+
+    /// The creation timestamp differs on every visual-baseline run, which
+    /// masks dates by the `<time>` element alone.
+    #[test]
+    fn render_buckets_table_renders_the_created_timestamp_as_a_time_element() {
+        let html = render_buckets_table(&[sample("photos", false, 0)]).into_string();
+        assert!(
+            html.contains(r#"<time datetime="2026-05-06T10:00:00Z">2026-05-06T10:00:00Z</time>"#),
+            "{html}"
+        );
     }
 
     #[test]
