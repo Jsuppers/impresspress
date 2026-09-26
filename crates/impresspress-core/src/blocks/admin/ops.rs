@@ -1831,7 +1831,10 @@ mod tests {
         const EMAIL: &str = "admin@example.com";
         const PASSWORD: &str = "correct-horse-battery";
 
-        let ctx = TestContext::with_auth_and_crypto().await;
+        // Each step runs in the frame production runs it in: auth's Init for
+        // the bootstrap, the admin block for the settings edit, auth-ui for
+        // the login. `ctx` is the test's own, for staging and asserting.
+        let ctx = TestContext::with_auth_and_crypto().await.fixture();
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1856,7 +1859,7 @@ mod tests {
             (BOOTSTRAP_ADMIN_EMAIL_KEY, EMAIL),
             (BOOTSTRAP_ADMIN_PASSWORD_KEY, PASSWORD),
         ]);
-        crate::blocks::auth::bootstrap::run(&ctx, &cfg)
+        crate::blocks::auth::bootstrap::run(&ctx.clone().running_as("wafer-run/auth"), &cfg)
             .await
             .expect("bootstrap the admin user");
 
@@ -1865,7 +1868,7 @@ mod tests {
         let msg = admin_msg("update", "/admin/settings");
         expect_ok(
             update_variable(
-                &ctx,
+                &ctx.clone().running_as(crate::blocks::admin::ADMIN_BLOCK_ID),
                 &msg,
                 BOOTSTRAP_ADMIN_PASSWORD_KEY,
                 VariableUpdate {
@@ -1890,7 +1893,8 @@ mod tests {
         let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
         let resp = crate::test_support::output_json(
             crate::blocks::auth_ui::api::login::handle(
-                &ctx,
+                &ctx.clone()
+                    .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID),
                 wafer_run::InputStream::from_bytes(body.into_bytes()),
             )
             .await,
@@ -2016,7 +2020,8 @@ mod tests {
         // The operator corrects it through the admin API.
         expect_ok(
             update_variable(
-                &ctx,
+                &ctx.fixture()
+                    .running_as(crate::blocks::admin::ADMIN_BLOCK_ID),
                 &admin_msg("update", "/admin/settings"),
                 SESSION_LIFETIME_DAYS_KEY,
                 VariableUpdate {

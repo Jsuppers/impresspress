@@ -251,12 +251,9 @@ mod denial_tests {
     /// `wrap::check_access` the runtime applies. The schema is applied
     /// first, so the refusal is a denial and not a missing table.
     async fn denied_ctx() -> TestContext {
-        TestContext::with_tickets().await.with_wrap(
-            "test/ungranted",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        )
+        TestContext::with_tickets()
+            .await
+            .running_as("test/ungranted")
     }
 
     fn routed(action: &str, path: &str) -> Message {

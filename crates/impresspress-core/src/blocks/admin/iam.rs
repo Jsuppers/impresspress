@@ -1393,23 +1393,29 @@ mod tests {
             auth_ui::api::{login, signup, test_mail_request},
         };
 
-        let ctx = TestContext::with_auth_and_crypto().await;
+        // The sign-up and logins run as auth-ui and the role edits as the
+        // admin block, each in its own frame; `ctx` stages and asserts.
+        let ctx = TestContext::with_auth_and_crypto().await.fixture();
+        let ui = ctx
+            .clone()
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
+        let admin = ctx.clone().running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let creds = serde_json::json!({
             "email": "grantee@example.com",
             "password": "correct-horse-battery",
         });
         let (limiter, msg) = test_mail_request();
-        output_json(signup::handle(&limiter, &ctx, &msg, body_input(creds.clone())).await).await;
+        output_json(signup::handle(&limiter, &ui, &msg, body_input(creds.clone())).await).await;
         let uid = users::find_by_email(&ctx, "grantee@example.com")
             .await
             .expect("user lookup")
             .expect("signup created the user")
             .id;
 
-        let role_id = define_role(&ctx, "editor").await;
+        let role_id = define_role(&admin, "editor").await;
         output_json(
             handle_assign_role(
-                &ctx,
+                &admin,
                 &admin_msg("create", "/b/admin/api/iam/user-roles"),
                 body_input(serde_json::json!({"user_id": uid, "role": "editor"})),
             )
@@ -1443,7 +1449,7 @@ mod tests {
             }
         };
         assert!(
-            roles_in_a_fresh_token(ctx.clone())
+            roles_in_a_fresh_token(ui.clone())
                 .await
                 .contains(&"editor".to_string()),
             "precondition: the grant reaches the token"
@@ -1451,7 +1457,7 @@ mod tests {
 
         let before = users::auth_version(&ctx, &uid).await.expect("auth version");
         let out = handle_delete_role(
-            &ctx,
+            &admin,
             &routed(admin_msg(
                 "delete",
                 &format!("/b/admin/api/iam/roles/{role_id}"),
@@ -1460,7 +1466,7 @@ mod tests {
         .await;
         assert_eq!(output_json(out).await, serde_json::json!({"deleted": true}));
 
-        let after_delete = roles_in_a_fresh_token(ctx.clone()).await;
+        let after_delete = roles_in_a_fresh_token(ui.clone()).await;
         assert!(
             !after_delete.contains(&"editor".to_string()),
             "a token minted after the delete must not carry the role: {after_delete:?}"
@@ -1487,8 +1493,8 @@ mod tests {
             "the audit row says which role went and how many grants went with it"
         );
 
-        define_role(&ctx, "editor").await;
-        let after_recreate = roles_in_a_fresh_token(ctx.clone()).await;
+        define_role(&admin, "editor").await;
+        let after_recreate = roles_in_a_fresh_token(ui.clone()).await;
         assert!(
             !after_recreate.contains(&"editor".to_string()),
             "a new role under the old name must not re-attach the old grant: {after_recreate:?}"

@@ -17,61 +17,6 @@ mod serving;
 mod share;
 pub(crate) mod storage;
 
-/// Test-only: put a fixture on the two `call_block` gates production applies
-/// to this block, sourcing both sides from the declarations the runtime reads.
-///
-/// Every fixture in this block used to leave `caller_requires` empty, which
-/// production reads as "declares no `requires`" — unrestricted. The files
-/// block DOES declare one, so a call to a target missing from it was admitted
-/// in every test and refused on the wire (`PermissionDenied: block '…' not in
-/// requires list`). That is how the share path shipped calling
-/// `wafer-run/crypto` without declaring it.
-///
-/// The gate is applied at the ROOT — [`crate::test_support::TestContext::with_files`]
-/// calls [`test_wrap::as_files_block`] — so it covers every files-block test,
-/// not the handful of fixtures somebody remembered to wrap. Compiled under
-/// `feature = "test-support"` as well as `cfg(test)` because `test_support.rs`
-/// is part of the non-test lib build under that feature.
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) mod test_wrap {
-    use crate::test_support::TestContext;
-
-    /// The deployment's admin block — the WRAP admin identity, and the block
-    /// whose declaration publishes the deployment-wide grants. The id itself
-    /// is owned by the admin block; this is a local name for it, not a second
-    /// copy of the string.
-    pub(crate) const ADMIN_BLOCK: &str = crate::blocks::admin::ADMIN_BLOCK_ID;
-
-    /// `ctx` acting as `impresspress/files`, with this block's OWN declared
-    /// `requires` and the admin block's declared grants.
-    ///
-    /// Neither list is re-typed here: the point of the gate is that the test
-    /// and the runtime read the same declaration, so `requires` comes off
-    /// [`super::FilesBlock`] and the grants off `blocks::admin::AdminBlock`.
-    ///
-    /// Called from `TestContext::with_files()`, which is the only constructor
-    /// files-block tests use — so a new test is on the gate by construction
-    /// and cannot certify a `call_block` production refuses.
-    pub(crate) fn as_files_block(ctx: TestContext) -> TestContext {
-        let requires = wafer_run::Block::info(&super::FilesBlock::new())
-            .call_allowlist()
-            .unwrap_or_default();
-        ctx.with_wrap(
-            super::FilesBlock::BLOCK_NAME,
-            requires,
-            deployment_grants(),
-            ADMIN_BLOCK,
-        )
-    }
-
-    /// The deployment-wide WRAP grants, off the declaration that publishes
-    /// them. A grant is owned by the block that owns the resource, so this
-    /// reads `blocks::admin::AdminBlock` rather than re-listing anything.
-    pub(crate) fn deployment_grants() -> Vec<wafer_run::ResourceGrant> {
-        wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants
-    }
-}
-
 use wafer_run::{BlockInfo, ConfigVar, HttpMethod, InputType, InstanceMode};
 
 /// The config vars this block declares, for `BlockInfo::config_keys` — the

@@ -8,15 +8,22 @@
 //! over a file-backed service, for the tests whose subject is the read/write
 //! connection split only that topology has.
 //!
-//! Additional capabilities (message helpers, auth state, extra block dispatch)
-//! are added in subsequent tasks.
+//! Every `call_block` goes through the gates the runtime applies — call
+//! depth, cancellation, aliases, the caller's `requires`, the target's
+//! interface — and every service op is WRAP-checked against the caller the
+//! runtime would attribute it to and the grants the deployment carries. See
+//! [`TestContext::running_as`] for how a test runs code as a block, and
+//! `parity_tests` for the cases that hold the fixture to a sealed `Wafer`.
 //!
 //! [`source_scan`] is the other half: the shared walk and comment strippers
 //! the crate's source gates are built on, so a gate states its root and its
 //! exemptions instead of hand-rolling a fourth `read_dir` recursion.
 
+mod dispatch;
 #[cfg(test)]
 pub mod htmx;
+#[cfg(test)]
+mod parity_tests;
 pub mod source_scan;
 
 use std::{
@@ -35,8 +42,8 @@ use crate::routing::ExtraRoute;
 
 /// Minimal test context backed by a real in-memory SQLite database.
 ///
-/// Routes `"wafer-run/database"` calls to the production `DatabaseBlock`.
-/// Other named blocks can be registered via `blocks` (unused until Task 6).
+/// Routes `"wafer-run/database"` calls to the production `DatabaseBlock`,
+/// and every other name to the block [`Self::register_block`] put under it.
 ///
 /// `Clone` is shallow — every interior field is already `Arc`/`Mutex`-shared
 /// (or trivially copyable), so a clone produces another handle pointing at
@@ -59,7 +66,7 @@ pub struct TestContext {
     /// database — true once the `variables` table exists (admin migrations)
     /// or a test booted the config service. See [`Self::install_config_block`].
     config_store: bool,
-    /// Placeholder for dynamically registered blocks — populated by Task 6.
+    /// The blocks [`Self::register_block`] registered, by name.
     pub blocks: Arc<Mutex<HashMap<String, Arc<dyn Block>>>>,
     /// `BlockInfo` for every block registered via [`Self::register_block`],
     /// keyed by (and kept in sync with) `blocks`. Backs
@@ -74,37 +81,44 @@ pub struct TestContext {
     /// can return a borrowed slice directly instead of cloning through a
     /// lock guard.
     block_infos: Vec<wafer_run::BlockInfo>,
-    /// WRAP-enforcement caller identity. `None` = WRAP checks skipped (the
-    /// default — keeps existing tests untouched). Set via [`with_wrap`].
-    caller_id: Option<String>,
     /// The block whose code runs on this context — what a block reached
-    /// through [`Context::call_block`] sees as its caller. Set by
-    /// [`Self::running_as`] (and by [`with_wrap`]); a callee's context runs
-    /// as the callee.
+    /// through [`Context::call_block`] sees as its caller. `None` is the
+    /// fixture's own frame, the one test setup runs in (see
+    /// [`dispatch::Caller::Fixture`]). Set by [`Self::running_as`]; a
+    /// callee's context runs as the callee.
     frame: Option<String>,
-    /// The caller a block reached through `call_block` was called by: the
-    /// calling context's [`Self::frame`]. [`Context::caller_id`] answers it
-    /// when the test is not acting as a block through [`with_wrap`], so a
-    /// service that keys on its caller — the crypto block signs a token
-    /// under its caller's derived key — sees the block production would
-    /// attribute the call to, without the test opting into WRAP.
-    calling_block: Option<String>,
-    /// The caller block's own `requires` allowlist — the gate production
-    /// applies to a `call_block` itself, before the callee's handler makes
-    /// any grant check.
+    /// Who called into this frame: what [`Context::caller_id`] answers, and
+    /// the identity a service's WRAP check authorizes — re-pointed on every
+    /// hop, as `RuntimeContext::dispatch_call` re-points `caller_id`.
+    called_by: dispatch::Caller,
+    /// This frame's own `requires` allowlist — the gate production applies
+    /// to a `call_block` itself, before the callee's handler makes any grant
+    /// check.
     ///
     /// `Wafer::make_block_context` installs a block's declared `requires` on
     /// every context that block's code runs in, and
     /// `RuntimeContext::dispatch_call` refuses any target not named in it
-    /// before it looks at capabilities or grants. Empty = undeclared =
-    /// unrestricted, which is exactly what
-    /// `Wafer::resolve_block_requires_uncached` yields for a block with an
-    /// empty or absent list. Set via [`with_wrap`].
-    caller_requires: Vec<String>,
-    /// Grants visible to the WRAP check. Empty unless [`with_wrap`] populates.
-    wrap_grants: Vec<ResourceGrant>,
-    /// Admin block id for the WRAP check (`""` = no admin override).
-    wrap_admin_block: String,
+    /// before it looks at capabilities or grants. `None` = undeclared =
+    /// unrestricted, which is what `Wafer::resolve_block_requires_uncached`
+    /// yields for a block with an empty or absent list, and what the
+    /// fixture's own frame carries.
+    caller_requires: Option<Vec<String>>,
+    /// This frame's nesting depth: `0` for a top-level frame, one more for
+    /// each `call_block` hop. A per-frame value, as in `RuntimeContext`, so
+    /// sibling calls never accumulate.
+    call_depth: u32,
+    /// The cancellation flag every frame of one fixture shares, as every
+    /// sub-context of a runtime dispatch shares its caller's. Set by
+    /// [`Self::cancel`].
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Grants the deployment installs beside the ones blocks declare —
+    /// `ImpresspressBuilder::wrap_grants`, and the operator grants boot loads
+    /// from the database. Added by [`Self::add_deployment_grants`].
+    deployment_grants: Vec<ResourceGrant>,
+    /// Every grant a WRAP check sees, collected by a real `Wafer` on first
+    /// use (see [`dispatch::collect_wrap_grants`]) and reset whenever a
+    /// registration or [`Self::deployment_grants`] changes.
+    wrap_grants: Arc<std::sync::OnceLock<Arc<Vec<ResourceGrant>>>>,
     /// Routes a fixture registered the way a downstream project would, via
     /// `ImpresspressBuilder::add_route`. Fed to [`Self::dispatch`] so a test
     /// exercises the same router path — including its access gate — that the
@@ -233,12 +247,13 @@ impl TestContext {
             config_store: false,
             blocks: Arc::new(Mutex::new(HashMap::new())),
             block_infos: Vec::new(),
-            caller_id: None,
             frame: None,
-            calling_block: None,
-            caller_requires: Vec::new(),
-            wrap_grants: Vec::new(),
-            wrap_admin_block: String::new(),
+            called_by: dispatch::Caller::Fixture,
+            caller_requires: None,
+            call_depth: 0,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deployment_grants: Vec::new(),
+            wrap_grants: Arc::default(),
             extra_routes: Vec::new(),
             storage: None,
             #[cfg(feature = "block-dev")]
@@ -292,96 +307,128 @@ impl TestContext {
         self.register_block("wafer-run/config", block);
     }
 
-    /// Opt the test into the two permission checks production applies to a
-    /// block's calls: the caller's `requires` allowlist, and WRAP.
+    /// This context runs `block`'s code, in the frame `Wafer::run_block`
+    /// gives the block a listener or flow step dispatches to: no caller, and
+    /// `block`'s own declared `requires` allowlist installed — `requires` plus `optional_requires`,
+    /// read off the block this fixture registered under that name, else off
+    /// the built-in block's declaration, else unrestricted for a name no
+    /// block carries (a synthetic caller such as `test/ungranted`).
     ///
-    /// Until called, neither is enforced — this matches pre-existing test
-    /// behaviour. After calling, `call_block` refuses a target not named in
-    /// `requires` (when that list is non-empty), and
-    /// [`Context::check_resource_access`] applies the same WRAP rules the
-    /// production runtime does (own-resource, admin override, grant match,
-    /// and the access each op needs). WRAP is not a `call_block` gate, here
-    /// or in production: the service handler a call reaches authorizes the
-    /// op it decoded through that method — so a grant is exercised only
-    /// behind a handler that authorizes, such as the real
-    /// `wafer-run/database` block this fixture runs.
+    /// A request the router admits reaches its block from
+    /// `impresspress/router`, not from nowhere; a test about that path uses
+    /// [`Self::dispatch`], which routes through the router's frame.
     ///
-    /// `caller_id` is the block id the test is acting as — typically the
-    /// block whose handler is under test.
-    ///
-    /// `requires` is that block's OWN declared allowlist. It is caller-owned
-    /// data, so a test acting as a real block must source it from
-    /// `<Block>::new().info().call_allowlist()` — `requires` plus
-    /// `optional_requires`, what the runtime admits — and never re-list the
-    /// names: the
-    /// point of the gate is that the test and the runtime read the same
-    /// declaration. An empty list means "declares no `requires`", which
-    /// production reads as unrestricted — correct for a synthetic caller
-    /// like `test/ungranted`, and wrong for a real block that declares one.
-    ///
-    /// `grants` is deployment-wide data, not caller-owned: a grant is
-    /// published by the block that OWNS the resource, naming who may reach
-    /// it. Tests should source it from the owning block's
-    /// `info().grants` (or the free function behind it, e.g.
-    /// `blocks::auth::service::auth_grants`) rather than re-listing literals.
-    pub fn with_wrap(
-        mut self,
-        caller_id: &str,
-        requires: Vec<String>,
-        grants: Vec<ResourceGrant>,
-        admin_block: &str,
-    ) -> Self {
-        self.caller_id = Some(caller_id.to_string());
-        self.frame = Some(caller_id.to_string());
-        self.caller_requires = requires;
-        self.wrap_grants = grants;
-        self.wrap_admin_block = admin_block.to_string();
-        self
-    }
-
-    /// This context runs `block`'s code: every block it reaches through
-    /// `call_block` is called by `block`, as `RuntimeContext::dispatch_call`
-    /// attributes it in production. Unlike [`Self::with_wrap`] it opts into
-    /// no WRAP check; it only says who is calling.
+    /// Every block it reaches through `call_block` is called by `block`, and
+    /// every service op those calls make is authorized as `block` against
+    /// the deployment's grants — the same two gates production applies, with
+    /// nothing a test can hand itself: grants are what the blocks declare
+    /// and [`Self::add_deployment_grants`] installs.
     pub fn running_as(mut self, block: &str) -> Self {
+        self.caller_requires = match self.registered(block) {
+            Some(registered) => registered.info().call_allowlist(),
+            None => dispatch::built_in_call_allowlist(block),
+        };
         self.frame = Some(block.to_string());
+        self.called_by = dispatch::Caller::Nobody;
+        self.call_depth = 0;
         self
     }
 
-    /// This context with `name`'s own declared call allowlist installed — the
-    /// sub-context `RuntimeContext::dispatch_call` hands a callee.
+    /// The fixture's own frame over the same database, blocks and config —
+    /// what a test sets up and asserts through when `self` runs as a block.
     ///
-    /// Resolution mirrors `Wafer::resolve_block_requires_uncached`: read the
-    /// registered snapshot's `BlockInfo::call_allowlist` (`requires` plus
-    /// `optional_requires`), and an empty or absent list means unrestricted.
-    /// Here the snapshot is `block_infos`, which `register_block` keeps as a
-    /// mirror of the blocks map.
-    fn for_callee(&self, name: &str) -> Self {
+    /// A test whose subject runs as a block still has to seed rows and read
+    /// back what landed, and those reads are not the block's: the block may
+    /// hold no grant on the table the test inspects. See
+    /// [`dispatch::Caller::Fixture`].
+    pub fn fixture(&self) -> Self {
         let mut ctx = self.clone();
-        ctx.calling_block = self.frame.clone();
-        ctx.frame = Some(name.to_string());
-        ctx.caller_requires = self
-            .block_infos
-            .iter()
-            .find(|b| b.name == name)
-            .and_then(wafer_run::BlockInfo::call_allowlist)
-            .unwrap_or_default();
+        ctx.frame = None;
+        ctx.called_by = dispatch::Caller::Fixture;
+        ctx.caller_requires = None;
+        ctx.call_depth = 0;
         ctx
     }
 
-    /// This context with no `requires` allowlist — the frame the *router*
-    /// runs in.
-    ///
-    /// `routing::route_to_block` is the impresspress router block's code, and
-    /// that block declares no `requires`, so production reaches every routed
-    /// target from an unrestricted frame. A fixture built with
-    /// [`Self::with_wrap`] is impersonating some *other* block, and routing
-    /// through its allowlist would refuse the very block the request is
-    /// addressed to.
-    fn as_router(&self) -> Self {
+    /// Install grants the deployment adds beside the ones its blocks declare
+    /// — what `ImpresspressBuilder::wrap_grants` hands the runtime, or the
+    /// operator grants boot loads from the database. Validated by
+    /// `Wafer::add_wrap_grants`, which refuses a malformed one.
+    pub fn add_deployment_grants(&mut self, grants: Vec<ResourceGrant>) {
+        self.deployment_grants.extend(grants);
+        self.wrap_grants = Arc::default();
+    }
+
+    /// Cancel every frame of this fixture, as the runtime cancels a dispatch
+    /// that timed out or was aborted: [`Context::is_cancelled`] answers
+    /// `true` and every later `call_block` is refused with `Cancelled`.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The block registered under `name`, the database block included.
+    fn registered(&self, name: &str) -> Option<Arc<dyn Block>> {
+        if name == "wafer-run/database" {
+            return Some(self.database_block.clone());
+        }
+        self.blocks
+            .lock()
+            .expect("blocks mutex poisoned")
+            .get(name)
+            .cloned()
+    }
+
+    /// The grant set a WRAP check reads — see [`Self::wrap_grants`].
+    fn deployment_wrap_grants(&self) -> Arc<Vec<ResourceGrant>> {
+        self.wrap_grants
+            .get_or_init(|| {
+                let blocks: Vec<(String, Arc<dyn Block>)> = {
+                    let guard = self.blocks.lock().expect("blocks mutex poisoned");
+                    guard
+                        .iter()
+                        .map(|(name, block)| (name.clone(), block.clone()))
+                        .chain([(
+                            "wafer-run/database".to_string(),
+                            self.database_block.clone(),
+                        )])
+                        .collect()
+                };
+                Arc::new(dispatch::collect_wrap_grants(
+                    &blocks,
+                    &self.deployment_grants,
+                ))
+            })
+            .clone()
+    }
+
+    /// The sub-context `RuntimeContext::dispatch_call` hands `callee`, the
+    /// block registered under `name`: it runs as `name`, is called by this
+    /// frame, carries `callee`'s own declared allowlist — read off the block
+    /// being called, as the runtime reads a block its sealed plan does not
+    /// cover — and sits one level deeper.
+    fn for_callee(&self, name: &str, callee: &dyn Block) -> Self {
         let mut ctx = self.clone();
-        ctx.caller_requires = Vec::new();
+        ctx.called_by = match &self.frame {
+            Some(frame) => dispatch::Caller::Block(frame.clone()),
+            None => dispatch::Caller::Fixture,
+        };
+        ctx.frame = Some(name.to_string());
+        ctx.caller_requires = callee.info().call_allowlist();
+        ctx.call_depth = self.call_depth + 1;
         ctx
+    }
+
+    /// The frame the *router* runs in: `impresspress/router`'s top-level
+    /// context.
+    ///
+    /// `routing::route_to_block` is the impresspress router block's code,
+    /// and that block declares no `requires`, so production reaches every
+    /// routed target from an unrestricted frame — and the routed block sees
+    /// the router as its caller.
+    fn as_router(&self) -> Self {
+        self.clone()
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID)
     }
 
     /// Apply one block's migrations into this fixture through the same gated
@@ -401,9 +448,14 @@ impl TestContext {
         postgres: &[&str],
     ) {
         let sqlite_sql: Vec<&str> = sqlite.iter().map(|(_, sql)| *sql).collect();
-        crate::migration_helper::apply_migrations(self, block_name, &sqlite_sql, postgres)
-            .await
-            .unwrap_or_else(|e| panic!("apply {block_name} migrations in test fixture: {e}"));
+        crate::migration_helper::apply_migrations(
+            &self.fixture(),
+            block_name,
+            &sqlite_sql,
+            postgres,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("apply {block_name} migrations in test fixture: {e}"));
     }
 
     /// Build a `TestContext` with admin + auth block migrations applied.
@@ -488,7 +540,7 @@ impl TestContext {
     /// written as the `0`/`1` INTEGER the migration declares.
     pub async fn seed_auth_user_verified(&self, user_id: &str, email_verified: bool) {
         wafer_core::clients::database::exec_raw(
-            self,
+            &self.fixture(),
             "INSERT INTO wafer_run__auth__users \
              (id, email, display_name, role, email_verified, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -536,22 +588,17 @@ impl TestContext {
     }
 
     /// Build a `TestContext` with admin + auth + files migrations applied,
-    /// **acting as `impresspress/files`** — on the same two `call_block` gates
-    /// production applies to that block.
+    /// **running as `impresspress/files`** — in the frame production gives
+    /// that block (see [`Self::running_as`]).
     ///
-    /// The identity is not decoration. A bare fixture leaves `caller_requires`
-    /// empty, which production reads as "declares no `requires`" —
-    /// unrestricted — so it certifies calls the runtime refuses. That is
-    /// exactly how the share path shipped calling `wafer-run/crypto` without
-    /// declaring it: every test that created a share passed, and the live
-    /// server answered `PermissionDenied: block 'wafer-run/crypto' not in
-    /// requires list`. Wrapping only the two fixtures that hit the bug would
-    /// have left the same blind spot under every other files-block test, so
-    /// the gate goes on the constructor they all share.
-    ///
-    /// Both lists come off the declarations the runtime reads (see
-    /// [`crate::blocks::files::test_wrap::as_files_block`]); nothing is
-    /// re-typed here.
+    /// The frame is not decoration. The fixture's own frame is unrestricted
+    /// and authorized as the admin block, so it certifies calls the runtime
+    /// refuses. That is exactly how the share path shipped calling
+    /// `wafer-run/crypto` without declaring it: every test that created a
+    /// share passed, and the live server answered `PermissionDenied: block
+    /// 'wafer-run/crypto' not in requires list`. The frame goes on the
+    /// constructor every files-block test shares, so none of them can miss
+    /// it.
     #[cfg(feature = "block-files")]
     pub async fn with_files() -> Self {
         let ctx = Self::with_auth().await;
@@ -561,10 +608,12 @@ impl TestContext {
             crate::blocks::files::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        crate::blocks::files::test_wrap::as_files_block(ctx)
+        ctx.running_as(crate::blocks::files::FilesBlock::BLOCK_NAME)
     }
 
-    /// Build a `TestContext` with admin + auth + userportal migrations applied.
+    /// Build a `TestContext` with admin + auth + userportal migrations
+    /// applied, running as `impresspress/userportal` (see
+    /// [`Self::running_as`]); stage and assert through [`Self::fixture`].
     #[cfg(feature = "block-userportal")]
     pub async fn with_userportal() -> Self {
         let ctx = Self::with_auth().await;
@@ -574,10 +623,12 @@ impl TestContext {
             crate::blocks::userportal::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/userportal")
     }
 
-    /// Build a TestContext with admin, auth, and tickets migrations applied.
+    /// Build a TestContext with admin, auth, and tickets migrations applied,
+    /// running as `impresspress/tickets` (see [`Self::running_as`]); stage
+    /// and assert through [`Self::fixture`].
     #[cfg(feature = "block-tickets")]
     pub async fn with_tickets() -> Self {
         let mut ctx = Self::with_auth().await;
@@ -591,10 +642,12 @@ impl TestContext {
             "impresspress/tickets",
             Arc::new(crate::blocks::tickets::TicketsBlock::new()),
         );
-        ctx
+        ctx.running_as("impresspress/tickets")
     }
 
-    /// Build a `TestContext` with admin + auth + vector migrations applied.
+    /// Build a `TestContext` with admin + auth + vector migrations applied,
+    /// running as `impresspress/vector` (see [`Self::running_as`]); stage and
+    /// assert through [`Self::fixture`].
     #[cfg(feature = "block-vector")]
     pub async fn with_vector() -> Self {
         let ctx = Self::with_auth().await;
@@ -604,10 +657,12 @@ impl TestContext {
             crate::blocks::vector::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/vector")
     }
 
-    /// Build a `TestContext` with admin + llm migrations applied.
+    /// Build a `TestContext` with admin + llm migrations applied, running as
+    /// `impresspress/llm` (see [`Self::running_as`]); stage and assert
+    /// through [`Self::fixture`].
     ///
     /// Admin first so the `impresspress__admin__block_settings` tracking
     /// table exists before llm's `apply_if_blessed` upserts its row (the
@@ -622,10 +677,12 @@ impl TestContext {
             crate::blocks::llm::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/llm")
     }
 
-    /// Build a `TestContext` with admin + products migrations applied.
+    /// Build a `TestContext` with admin + products migrations applied,
+    /// running as `impresspress/products` (see [`Self::running_as`]); stage
+    /// and assert through [`Self::fixture`].
     ///
     /// Admin migrations run first so the `impresspress__admin__block_settings`
     /// tracking table exists before products' `apply_if_blessed` upserts its
@@ -648,10 +705,11 @@ impl TestContext {
             "impresspress/products",
             Arc::new(crate::blocks::products::ProductsBlock::new()),
         );
-        ctx
+        ctx.running_as("impresspress/products")
     }
 
-    /// Build a `TestContext` with admin + signal migrations applied.
+    /// Build a `TestContext` with admin + signal migrations applied, running
+    /// as `impresspress/signal` (see [`Self::running_as`]).
     ///
     /// No auth: the signal block has no user and never reads one — every
     /// endpoint is public, so admin-only is enough to let its own
@@ -667,7 +725,7 @@ impl TestContext {
             crate::blocks::signal::migrations::POSTGRES_MIGRATIONS,
         )
         .await;
-        ctx
+        ctx.running_as("impresspress/signal")
     }
 
     /// Build a `TestContext` with admin + dev-sandbox migrations applied, the
@@ -746,7 +804,7 @@ impl TestContext {
         let shared = dev::DevShared::new(control, shell);
         self.dev_shared = Some(shared.clone());
         let block = Arc::new(dev::DevBlock::with_workspace(shared));
-        self.register_block(dev::BLOCK_NAME, block.clone());
+        self.register_block(dev::BLOCK_NAME, block);
         // The workspace store (blobs + `workspace.json`) lives in storage,
         // so the fixture needs a real object store behind the production
         // `wafer-run/storage` block — its handler is what turns the block's
@@ -760,19 +818,13 @@ impl TestContext {
             dev::BLOCK_NAME.to_string(),
             crate::routing::RouteAccess::Admin,
         ));
-        // `requires` comes off the block's own declaration, never a re-listed
-        // copy: `dev::export` reaches storage and the database through
-        // `call_block`, and production refuses any target the block did not
-        // declare before it looks at a single grant.
-        let requires = wafer_run::Block::info(&*block)
-            .call_allowlist()
-            .unwrap_or_default();
-        self.with_wrap(
-            dev::BLOCK_NAME,
-            requires,
-            dev::wrap_grants(),
-            "impresspress/admin",
-        )
+        // The grants the consumer hands `ImpresspressBuilder::wrap_grants`
+        // alongside the block, and the block's own frame — its declared
+        // `requires` included: `dev::export` reaches storage and the database
+        // through `call_block`, and production refuses any target the block
+        // did not declare before it looks at a single grant.
+        self.add_deployment_grants(dev::wrap_grants());
+        self.running_as(dev::BLOCK_NAME)
     }
 
     /// Register a route the way `ImpresspressBuilder::add_route` does, so
@@ -889,6 +941,18 @@ impl TestContext {
     /// of the `put`s can show that.
     pub fn storage_ops(&self) -> Vec<String> {
         self.storage().ops()
+    }
+
+    /// The fixture's database as the platform service handle — the one the
+    /// registered `wafer-run/database` block serves, decorators included.
+    ///
+    /// For a fake backend block that keeps its data in the same database, as
+    /// a real backend reads its own store without going through the
+    /// database block.
+    pub fn database_service(
+        &self,
+    ) -> Arc<dyn wafer_core::interfaces::database::service::DatabaseService> {
+        self.db_service.clone()
     }
 
     /// The fixture's object store as the platform service handle.
@@ -1083,20 +1147,6 @@ impl TestContext {
         self.config_store = true;
     }
 
-    /// The interface the block registered under `name` declares, or `None`
-    /// when this fixture has no such block. See the action gate in
-    /// [`Context::call_block`].
-    fn callee_interface(&self, name: &str) -> Option<String> {
-        if name == "wafer-run/database" {
-            return Some(self.database_block.info().interface);
-        }
-        let block = {
-            let guard = self.blocks.lock().expect("blocks mutex poisoned");
-            guard.get(name).cloned()
-        };
-        block.map(|block| block.info().interface)
-    }
-
     /// Register a block under `name`. Calls to `ctx.call_block(name, ...)`
     /// will route to this block's `handle()`.
     ///
@@ -1120,6 +1170,7 @@ impl TestContext {
             .lock()
             .expect("blocks mutex poisoned")
             .insert(name.to_string(), block);
+        self.wrap_grants = Arc::default();
     }
 
     /// Put a `BlockInfo` into `Context::registered_blocks()` without a block
@@ -2037,29 +2088,32 @@ fn simulated_write_failure() -> wafer_core::interfaces::database::service::Datab
 
 #[async_trait::async_trait]
 impl Context for TestContext {
-    /// Host-side WRAP enforcement (only when the test opted in via
-    /// `with_wrap`). Overrides the fail-closed trait default; mirrors
-    /// `RuntimeContext::check_resource_access` — keyed on `caller_id`, same
-    /// `check_access` callsite shape — so tests see identical permission
-    /// behaviour to production. Without a caller the context is permissive,
-    /// matching the pre-WRAP test default.
+    /// Host-side WRAP enforcement, on every frame: the decision
+    /// `RuntimeContext::check_resource_access` makes — `wafer_block::wrap::check_access`
+    /// keyed on the caller, over every grant the deployment carries (see
+    /// [`dispatch::collect_wrap_grants`]), with `impresspress/admin` as the
+    /// admin block. The caller is this frame's [`dispatch::Caller`]: the
+    /// calling block, the admin block when the test itself called, and
+    /// nobody — refused, as in production — for a top-level frame.
+    ///
+    /// The runtime's second check, the caller's declared resource
+    /// capabilities, has nothing to act on here: no block this crate
+    /// registers declares capabilities, and a block that declares none is
+    /// unrestricted on the native runtime.
     fn check_resource_access(
         &self,
         resource: &str,
         resource_type: wafer_run::ResourceType,
         access: wafer_block::ResourceAccess,
     ) -> Result<(), WaferError> {
-        if let Some(ref caller) = self.caller_id {
-            wafer_block::wrap::check_access(
-                Some(caller.as_str()),
-                resource,
-                access,
-                Some(&resource_type),
-                &self.wrap_grants,
-                &self.wrap_admin_block,
-            )?;
-        }
-        Ok(())
+        wafer_block::wrap::check_access(
+            self.called_by.wrap_identity(),
+            resource,
+            access,
+            Some(&resource_type),
+            &self.deployment_wrap_grants(),
+            crate::blocks::admin::ADMIN_BLOCK_ID,
+        )
     }
 
     /// The same decision as [`Self::check_resource_access`], without the
@@ -2075,120 +2129,100 @@ impl Context for TestContext {
             .is_ok()
     }
 
+    /// `RuntimeContext::dispatch_call`'s gates, in its order: call depth,
+    /// cancellation, alias resolution, the caller's `requires` allowlist,
+    /// the target's registration, and the message's action against the
+    /// target's declared interface — each refusing with the code the runtime
+    /// refuses with. `parity_tests` runs the same calls through a sealed
+    /// `Wafer` to hold the two together.
+    ///
+    /// WRAP is not a `call_block` gate, here or in production: the service
+    /// handler a call reaches authorizes the op it decoded, through
+    /// [`Context::check_resource_access`] on the callee frame below.
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
-        // Gate 1: the caller's own `requires` allowlist (only when the test
-        // opted in via `with_wrap`). `RuntimeContext::dispatch_call` runs this
-        // FIRST — above the capability check and above every grant check — so
-        // a block calling a target it did not declare is refused before
-        // anything looks at what it is allowed to touch.
-        //
-        // This harness omitted the gate for its whole life while its comment
-        // claimed identical permission behaviour to production, so every
-        // cross-block call in the suite ran against a runtime more permissive
-        // than the real one. `blocks::vector`'s contextual-retrieval path was
-        // the bug that found it: four tests certified a call the real runtime
-        // refused.
-        //
-        // Empty = the block declares no `requires` = unrestricted, matching
-        // `Wafer::resolve_block_requires_uncached`'s `.filter(|r| !r.is_empty())`.
-        if !self.caller_requires.is_empty() && !self.caller_requires.iter().any(|r| r == name) {
+        if self.call_depth >= dispatch::MAX_CALL_DEPTH {
             return OutputStream::error(WaferError::new(
-                ErrorCode::PermissionDenied,
-                format!("block '{name}' not in requires list — call_block denied"),
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "call_block depth exceeded maximum of {} (calling '{name}')",
+                    dispatch::MAX_CALL_DEPTH
+                ),
             ));
         }
 
-        // Gate 2: interface action validation, which production runs on EVERY
-        // `call_block` — `RuntimeContext::dispatch_call` checks the message's
-        // action (the `req.action` meta, else the message kind) against the
-        // spec registered for the TARGET block's declared interface. A block
-        // whose interface has no registered spec is skipped, as upstream skips
-        // it (`ActionCheck::UnknownInterface` warns once and proceeds), and so
-        // is a target this fixture cannot resolve to a block.
-        //
-        // The gap this closes is not hypothetical: `blocks::config`'s
-        // `CONFIG_GET_MANY` passed every unit test and was refused by the real
-        // runtime under `config@v1`, which took every settings page with it.
-        if let Some(interface) = self.callee_interface(name) {
-            let action = if msg.action().is_empty() {
-                msg.kind.as_str()
-            } else {
-                msg.action()
-            };
-            if let wafer_run::runtime::validation::ActionCheck::Invalid { message } =
-                wafer_run::runtime::validation::check_action_interface(
-                    name,
-                    &interface,
-                    action,
-                    &interface_specs(),
-                )
-            {
-                return OutputStream::error(WaferError::new(ErrorCode::InvalidArgument, message));
+        if self.is_cancelled() {
+            return OutputStream::error(WaferError::new(
+                ErrorCode::Cancelled,
+                "execution cancelled",
+            ));
+        }
+
+        // The runtime answers a service's short name (`db`, `storage`) for
+        // the block it aliases, from the list the builder installs.
+        let resolved = crate::builder::SERVICE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == name)
+            .map_or(name, |(_, target)| *target);
+
+        // Matched against both the name the caller wrote and the one it
+        // resolves to, so a `requires` entry written either way is honoured.
+        if let Some(requires) = &self.caller_requires {
+            if !requires.iter().any(|r| r == name || r == resolved) {
+                return OutputStream::error(WaferError::new(
+                    ErrorCode::PermissionDenied,
+                    format!("block '{name}' not in requires list — call_block denied"),
+                ));
             }
         }
 
-        // WRAP is not a `call_block` gate. `RuntimeContext::dispatch_call`
-        // reads none of the advisory `wrap.*` metas a client stamps: each
-        // service handler authorizes the op it decoded, through
-        // `check_resource_access` on the context it runs on — here the callee
-        // sub-context below, which carries the same `caller_id` and grants.
-        // So the database handler, not this fixture, decides that a
-        // `database.create` needs `Append` while an `update` needs `Write`.
+        // `NotFound` is reserved for a service saying the thing a request
+        // names does not exist; nothing to dispatch to is `Unimplemented`.
+        let Some(block) = self.registered(resolved) else {
+            return OutputStream::error(WaferError::new(
+                ErrorCode::Unimplemented,
+                format!("block '{name}' is not registered"),
+            ));
+        };
 
-        // The callee runs on a sub-context carrying ITS OWN declared
-        // `requires`, which is what `RuntimeContext::dispatch_call` builds
-        // (`caller_requires: called_requires`). A block's outbound calls are
-        // gated by its own declaration, never by whoever called it — without
-        // this, a block reached through `call_block` would inherit the
-        // caller's allowlist and either be refused for calls it does declare
-        // or admitted for calls it does not.
-        //
-        // The sub-context also runs as the callee, so what IT calls sees the
-        // callee as its caller (`Context::caller_id`), as production
-        // re-points it. The WRAP identity does not move: a test that opted in
-        // through `with_wrap` keeps its grants checked as that block, which
-        // is why a `FailingDbOpContext` cannot reach a nested block's
-        // database calls.
-        let callee = self.for_callee(name);
-
-        match name {
-            "wafer-run/database" => self.database_block.handle(&callee, msg, input).await,
-            other => {
-                // Check the dynamically registered blocks map before giving up.
-                let block = {
-                    let guard = self.blocks.lock().expect("blocks mutex poisoned");
-                    guard.get(other).cloned()
-                };
-                match block {
-                    Some(b) => b.handle(&callee, msg, input).await,
-                    // The runtime's answer for nothing to dispatch to:
-                    // `NotFound` is reserved for a service saying the thing
-                    // a request names does not exist.
-                    None => OutputStream::error(WaferError::new(
-                        ErrorCode::Unimplemented,
-                        format!("block '{other}' not registered in TestContext"),
-                    )),
-                }
-            }
+        // The action is the `req.action` meta, else the message kind, as the
+        // runtime reads it; an interface with no registered spec is skipped.
+        // `blocks::config`'s `CONFIG_GET_MANY` passed every unit test while
+        // this gate was missing and was refused by the real runtime under
+        // `config@v1`, which took every settings page with it.
+        let action = if msg.action().is_empty() {
+            msg.kind.as_str()
+        } else {
+            msg.action()
+        };
+        if let wafer_run::runtime::validation::ActionCheck::Invalid { message } =
+            wafer_run::runtime::validation::check_action_interface(
+                resolved,
+                &block.info().interface,
+                action,
+                &interface_specs(),
+            )
+        {
+            return OutputStream::error(WaferError::new(ErrorCode::Unimplemented, message));
         }
+
+        let callee = self.for_callee(resolved, &*block);
+        block.handle(&callee, msg, input).await
     }
 
-    /// The block identity a test opted into via [`Self::with_wrap`].
+    /// The block that called into this frame, as `RuntimeContext` re-points
+    /// it on every hop: `None` for a top-level frame and for a call the test
+    /// made itself.
     ///
-    /// The same field already backs `check_resource_access`; publishing it
-    /// here is what makes handler code
-    /// that *reads* its caller — the storage handler behind
-    /// `blocks::storage::ImpresspressStorageBlock` namespaces every plain
-    /// folder under `ctx.caller_id()` — behave in a test the way it does in
-    /// production. Without this it saw `None`, filed every
-    /// object under `unknown/…`, and the per-block isolation the storage
-    /// wrapper exists for went untested.
+    /// Handler code that *reads* its caller behaves as in production — the
+    /// storage handler behind `blocks::storage::ImpresspressStorageBlock`
+    /// namespaces every plain folder under it, and the crypto block signs a
+    /// token under its caller's derived key.
     fn caller_id(&self) -> Option<&str> {
-        self.caller_id.as_deref().or(self.calling_block.as_deref())
+        self.called_by.block()
     }
 
     fn is_cancelled(&self) -> bool {
-        false
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
@@ -3243,16 +3277,15 @@ pub fn admin_msg(action: &str, path: &str) -> Message {
 /// write their rows into the same table under their own WRAP identity, so a
 /// test in any block asserts against it the same way.
 ///
-/// `ctx` must be able to read that table — for a fixture built with
-/// [`TestContext::with_wrap`] as a non-admin block, count through an
-/// un-wrapped clone so a missing READ grant cannot be mistaken for a missing
-/// row.
+/// Read from the fixture's own frame ([`TestContext::fixture`]), whatever
+/// block `ctx` runs as, so a missing READ grant on the block under test
+/// cannot be mistaken for a missing row.
 pub async fn audit_rows(
-    ctx: &dyn Context,
+    ctx: &TestContext,
     action: &str,
 ) -> Vec<wafer_core::clients::database::Record> {
     crate::db_read::list_every(
-        ctx,
+        &ctx.fixture(),
         crate::blocks::admin::AUDIT_LOGS_TABLE,
         vec![wafer_block::db::Filter {
             field: "action".to_string(),
@@ -3265,7 +3298,7 @@ pub async fn audit_rows(
 }
 
 /// How many admin audit-log rows carry `action`. See [`audit_rows`].
-pub async fn audit_count(ctx: &dyn Context, action: &str) -> usize {
+pub async fn audit_count(ctx: &TestContext, action: &str) -> usize {
     audit_rows(ctx, action).await.len()
 }
 
@@ -4390,14 +4423,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_wrap_denies_unowned_resource_without_grant() {
+    async fn a_block_frame_is_denied_an_unowned_table_without_a_grant() {
         // Caller "block-x" tries to read auth-owned table; no grants → denied.
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "test/block-x",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("test/block-x");
 
         let result = db::list(&ctx, "wafer_run__auth__users", &ListOptions::default()).await;
 
@@ -4648,7 +4676,7 @@ mod tests {
             .await;
         match refused.collect_buffered().await {
             Err(TerminalNotResponse::Error(e)) => {
-                assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+                assert_eq!(e.code, ErrorCode::Unimplemented, "{e:?}");
                 assert!(e.message.contains("database.teleport"), "{e:?}");
                 assert!(e.message.contains("database@v1"), "{e:?}");
             }
@@ -4698,17 +4726,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_wrap_allows_call_when_grant_matches() {
-        let grants = vec![ResourceGrant::read(
+    async fn a_deployment_grant_admits_the_block_it_names() {
+        let mut ctx = TestContext::with_auth().await;
+        ctx.add_deployment_grants(vec![ResourceGrant::read(
             "test/block-x",
             "wafer_run__auth__users",
-        )];
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "test/block-x",
-            Vec::new(),
-            grants,
-            "impresspress/admin",
-        );
+        )]);
+        let ctx = ctx.running_as("test/block-x");
 
         // Empty users table — listing must succeed (zero rows is success).
         let res = db::list(&ctx, "wafer_run__auth__users", &ListOptions::default())
@@ -4717,15 +4741,92 @@ mod tests {
         assert_eq!(res.records.len(), 0);
     }
 
+    /// A block reached through the router that reads a table it holds no
+    /// grant for is refused, as the runtime refuses it — with no opt-in.
+    ///
+    /// Before the fixture enforced WRAP on every frame this passed silently:
+    /// `dispatch` ran the block with no WRAP check at all, so a block missing
+    /// its grant was certified by every routed test.
     #[tokio::test]
-    async fn without_with_wrap_grants_are_unchecked() {
-        // Default TestContext (no `with_wrap`) keeps WRAP-bypassing legacy
-        // behaviour so existing tests aren't disturbed.
+    async fn a_routed_block_reading_a_table_it_holds_no_grant_for_is_refused() {
+        /// Answers with the outcome of listing `wafer-run/auth`'s users.
+        struct ReadsAuthUsers;
+
+        #[wafer_block::wafer_async_trait]
+        impl Block for ReadsAuthUsers {
+            fn info(&self) -> BlockInfo {
+                BlockInfo::new("test/reader", "0.0.1", "http-handler@v1", "reads users")
+            }
+
+            async fn handle(
+                &self,
+                ctx: &dyn Context,
+                _msg: Message,
+                _input: InputStream,
+            ) -> OutputStream {
+                match db::list(ctx, "wafer_run__auth__users", &ListOptions::default()).await {
+                    Ok(_) => OutputStream::respond(b"read".to_vec()),
+                    Err(e) => OutputStream::error(e),
+                }
+            }
+        }
+
+        let mut ctx = TestContext::with_auth().await;
+        ctx.register_block("test/reader", Arc::new(ReadsAuthUsers));
+        ctx.add_extra_route(crate::routing::ExtraRoute::new(
+            "/b/reader",
+            "test/reader",
+            crate::routing::RouteAccess::Public,
+        ));
+
+        let out = ctx.dispatch(anon_msg("retrieve", "/b/reader")).await;
+        match out.collect_buffered().await {
+            Err(TerminalNotResponse::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::PermissionDenied, "{e:?}");
+            }
+            other => panic!("the ungranted read must be refused, got {other:?}"),
+        }
+    }
+
+    /// The fixture's own frame is test setup: it writes and reads any table,
+    /// as the admin block may.
+    #[tokio::test]
+    async fn the_fixture_frame_is_authorized_as_the_admin_block() {
         let ctx = TestContext::with_auth().await;
         let res = db::list(&ctx, "wafer_run__auth__users", &ListOptions::default())
             .await
-            .expect("call must succeed without with_wrap");
+            .expect("the fixture frame reads any table");
         assert_eq!(res.records.len(), 0);
+        assert!(
+            ctx.running_as("test/block-x")
+                .fixture()
+                .check_resource_access(
+                    "wafer_run__auth__users",
+                    wafer_run::ResourceType::Db,
+                    wafer_block::ResourceAccess::Read,
+                )
+                .is_ok(),
+            "`fixture()` is the fixture frame again"
+        );
+    }
+
+    /// A block's own top-level frame has no caller, and the runtime refuses
+    /// an unattributed resource check; only the frames it calls into carry
+    /// it as their caller.
+    #[tokio::test]
+    async fn a_top_level_block_frame_has_no_caller_to_authorize() {
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
+        assert_eq!(ctx.caller_id(), None);
+        assert!(ctx
+            .check_resource_access(
+                "wafer_run__auth__users",
+                wafer_run::ResourceType::Db,
+                wafer_block::ResourceAccess::Read,
+            )
+            .is_err());
+        db::list(&ctx, "wafer_run__auth__users", &ListOptions::default())
+            .await
+            .expect("the database it calls is called by the block, which owns the table");
     }
 }
 

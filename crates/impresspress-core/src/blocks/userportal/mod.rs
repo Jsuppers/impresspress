@@ -609,7 +609,9 @@ mod table_tests {
     async fn the_branding_form_shows_the_stored_app_name() {
         let ctx = crate::test_support::TestContext::with_userportal().await;
         let app_name = crate::test_support::unique_config_value();
-        wafer_core::clients::config::set(&ctx, APP_NAME_KEY, &app_name)
+        // Staged as the operator would: the shared key is the admin block's
+        // to write, not the portal's.
+        wafer_core::clients::config::set(&ctx.fixture(), APP_NAME_KEY, &app_name)
             .await
             .expect("store the app name");
 

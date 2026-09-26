@@ -321,7 +321,9 @@ const STRIPE_EVENT_BODY: &str = concat!(
 async fn a_stored_stripe_webhook_body_is_not_served_by_the_explorer() {
     use base64ct::{Base64, Encoding};
 
-    let mut ctx = TestContext::with_products().await;
+    // The fixture's own frame: it stages the row, and the explorer request
+    // below is routed, so it runs as the admin block.
+    let mut ctx = TestContext::with_products().await.fixture();
     ctx.register_block("impresspress/admin", std::sync::Arc::new(AdminBlock::new()));
 
     let mut row: HashMap<String, serde_json::Value> = HashMap::new();

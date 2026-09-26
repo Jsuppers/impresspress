@@ -352,14 +352,9 @@ mod contextual_retrieval_tests {
     /// neither, so the permission denial was swallowed at the `.ok()?` and
     /// logged as "no default LLM model configured".
     async fn vector_ctx() -> TestContext {
-        TestContext::with_vector().await.with_wrap(
-            "impresspress/vector",
-            wafer_run::Block::info(&crate::blocks::vector::VectorBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            Vec::new(),
-            "impresspress/admin",
-        )
+        TestContext::with_vector()
+            .await
+            .running_as("impresspress/vector")
     }
 
     /// Output-token budget the stub target publishes. Any positive number:
@@ -571,20 +566,9 @@ mod contextual_retrieval_tests {
     /// its "LLM call failed" degradation: raw chunks, a `warn!` nobody reads,
     /// and a green suite. So this drives the real `impresspress/llm` block
     /// (which is what publishes the budget alongside the target) and the real
-    /// `ProviderLlmService` behind `wafer-run/llm`.
-    ///
-    /// The one test here that does NOT use [`vector_ctx`]: the real llm block
-    /// reads its own `IMPRESSPRESS__LLM__*` variables, which WRAP scopes to
-    /// their owning block, and this harness keeps `caller_id` fixed at the
-    /// outermost caller instead of re-pointing it per hop the way
-    /// `RuntimeContext::dispatch_call` does (the gap `TestContext::call_block`
-    /// documents). Under `vector_ctx` the llm block would therefore read its
-    /// own configuration as `impresspress/vector` and be refused — a harness
-    /// artefact, not a deployment one. One identity has to stand in for the
-    /// whole call tree, so it is the admin block's, which WRAP admits
-    /// everywhere; the allowlist question `vector_ctx` exists for is pinned
-    /// directly by
-    /// `the_block_declares_every_target_contextual_retrieval_reaches`.
+    /// `ProviderLlmService` behind `wafer-run/llm`, each in its own frame:
+    /// the real llm block reads its own `IMPRESSPRESS__LLM__*` variables as
+    /// itself, not as the vector block that called it.
     #[cfg(feature = "llm")]
     #[tokio::test]
     async fn a_contextual_ingest_reaches_an_anthropic_provider() {
@@ -594,12 +578,7 @@ mod contextual_retrieval_tests {
         };
 
         let fake = FakeProvider::anthropic("A report about widget sales.").await;
-        let mut ctx = TestContext::with_vector().await.with_wrap(
-            "impresspress/admin",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        let mut ctx = vector_ctx().await;
         ctx.set_config(DEFAULT_PROVIDER_VAR, fake.backend_id());
         ctx.set_config(DEFAULT_MODEL_VAR, fake.model());
         ctx.set_config(DEFAULT_MAX_TOKENS_VAR, "321");

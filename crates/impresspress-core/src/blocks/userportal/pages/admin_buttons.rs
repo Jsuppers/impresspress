@@ -741,45 +741,16 @@ mod tests {
 
     /// `logs::audit_log` writes the ADMIN block's table, and it runs under
     /// this block's WRAP identity — so the row lands only because the admin
-    /// block declares a grant for `impresspress/userportal` on it. Sourced
-    /// from the admin block's own declaration, never re-listed here: a grant
-    /// dropped from `AdminBlock::info()` has to fail this test rather than
-    /// silently turn every portal-button mutation back into an unrecorded
-    /// one (the write is fire-and-forget, so a denial is a `warn!` and a
-    /// green 200).
+    /// block declares a grant for `impresspress/userportal` on it. The
+    /// fixture carries the grants the deployment's blocks declare and no
+    /// others, so a grant dropped from `AdminBlock::info()` fails this test
+    /// rather than silently turning every portal-button mutation back into
+    /// an unrecorded one (the write is fire-and-forget, so a denial is a
+    /// `warn!` and a green 200).
     #[tokio::test]
     async fn the_admin_grant_is_what_carries_the_row_across_the_block_boundary() {
         let base = ctx_with_userportal().await;
-        let as_portal = |grants| {
-            base.clone().with_wrap(
-                "impresspress/userportal",
-                wafer_run::Block::info(&UserPortalBlock::new())
-                    .call_allowlist()
-                    .unwrap_or_default(),
-                grants,
-                crate::blocks::admin::ADMIN_BLOCK_ID,
-            )
-        };
-
-        let ungranted = as_portal(Vec::new());
-        portal(
-            &ungranted,
-            "create",
-            "/b/userportal/admin/buttons",
-            button_form("Files", "/b/storage/"),
-        )
-        .await
-        .collect_buffered()
-        .await
-        .expect("the create still succeeds — the audit write is fire-and-forget");
-        assert_eq!(
-            audit_rows(&base, "portal_button.create").await.len(),
-            0,
-            "without the grant WRAP refuses the audit write, and nothing says so"
-        );
-
-        let granted =
-            as_portal(wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants);
+        let granted = base.clone().running_as("impresspress/userportal");
         portal(
             &granted,
             "create",

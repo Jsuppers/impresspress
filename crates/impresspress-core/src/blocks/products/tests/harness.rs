@@ -13,7 +13,8 @@ use wafer_run::{ErrorCode, InputStream, Message, OutputStream};
 
 use crate::test_support::TestContext;
 
-/// Build a `TestContext` with the products (and admin) migrations applied.
+/// Build a `TestContext` with the products (and admin) migrations applied,
+/// running as `impresspress/products`.
 pub async fn ctx() -> TestContext {
     TestContext::with_products().await
 }
@@ -29,6 +30,11 @@ pub async fn ctx_with(config: &[(&str, &str)]) -> TestContext {
 
 /// Insert a record directly for test setup, honoring the supplied `id`.
 ///
+/// Written from the fixture's own frame ([`TestContext::fixture`]): the
+/// products frame [`ctx`] runs in holds no grant on the other blocks' tables
+/// a scenario stages (auth users, admin roles), and staging is not the
+/// block's own doing.
+///
 /// Writes through the production database client, so the row must satisfy the
 /// table's schema (NOT NULL columns without a default must be supplied). The
 /// db layer stamps `created_at`/`updated_at` and synthesizes missing optional
@@ -42,12 +48,14 @@ pub async fn seed(
     use wafer_core::clients::database as db;
     let mut data = data;
     data.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-    db::create(ctx, collection, data).await.unwrap_or_else(|e| {
-        panic!(
-            "seed into {collection} failed: {} ({:?})",
-            e.message, e.code
-        )
-    });
+    db::create(&ctx.fixture(), collection, data)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "seed into {collection} failed: {} ({:?})",
+                e.message, e.code
+            )
+        });
 }
 
 // --- Test message builders ---
@@ -147,18 +155,7 @@ pub fn routed(mut msg: Message) -> Message {
 /// never its authorization tier. A test about who may invoke an endpoint
 /// must use this.
 pub async fn dispatch_routed(ctx: &TestContext, msg: Message, input: InputStream) -> OutputStream {
-    use wafer_run::Block;
-
-    let block_infos = vec![super::super::ProductsBlock::new().info()];
-    crate::routing::route_to_block(
-        ctx,
-        msg,
-        input,
-        &crate::features::AllEnabled,
-        &block_infos,
-        &[],
-    )
-    .await
+    ctx.dispatch_with_input(msg, input).await
 }
 
 /// Collect an `OutputStream`'s body and decode it as JSON.

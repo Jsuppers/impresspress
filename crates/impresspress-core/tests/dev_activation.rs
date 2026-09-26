@@ -1225,34 +1225,78 @@ async fn every_generations_response_is_never_cached() {
     }
 }
 
+/// The dev block's own handler for `msg`, run by a block the deployment
+/// grants nothing.
+///
+/// The dev block itself always reaches its ledger — the table is in its own
+/// namespace — so a refused read cannot be staged by routing to it: the
+/// runtime would run the handler as `impresspress/dev`. A block with no
+/// grant running the same handler is what makes `wrap::check_access` refuse.
+async fn as_ungranted_block(
+    ctx: &TestContext,
+    msg: wafer_run::Message,
+    body: serde_json::Value,
+) -> wafer_run::OutputStream {
+    let dev = ctx
+        .blocks
+        .lock()
+        .expect("blocks mutex")
+        .get(impresspress_core::blocks::dev::BLOCK_NAME)
+        .cloned()
+        .expect("the fixture registers the dev block");
+    dev.handle(
+        &ctx.clone().running_as("test/ungranted"),
+        msg,
+        wafer_run::InputStream::from_bytes(serde_json::to_vec(&body).expect("encode body")),
+    )
+    .await
+}
+
+/// The three ledger reads the two tests below refuse.
+async fn denied_ledger_reads(ctx: &TestContext) -> Vec<(&'static str, wafer_run::OutputStream)> {
+    vec![
+        (
+            "the listing",
+            as_ungranted_block(
+                ctx,
+                admin_msg("retrieve", "/b/dev/api/generations"),
+                json!({}),
+            )
+            .await,
+        ),
+        (
+            "one generation",
+            as_ungranted_block(
+                ctx,
+                admin_msg("retrieve", "/b/dev/api/generations/g1"),
+                json!({}),
+            )
+            .await,
+        ),
+        (
+            "a rollback",
+            as_ungranted_block(
+                ctx,
+                admin_msg("create", "/b/dev/api/generations/g1/rollback"),
+                json!({}),
+            )
+            .await,
+        ),
+    ]
+}
+
 /// A WRAP refusal reading the ledger is a **403**, not the 500 the
 /// hand-written `NotFound`/`err_internal` pair produced.
 ///
 /// The ledger is `impresspress__dev__generations`, so a caller reaching it
-/// without dev's own grants is refused by `wrap::check_access`. Both
-/// handlers answered `no_store_error(NotFound, …)` for a missing generation
-/// and `err_internal` for everything else, so an operator whose deployment
-/// had lost the dev block's grant saw an outage.
+/// without a grant is refused by `wrap::check_access`. Both handlers
+/// answered `no_store_error(NotFound, …)` for a missing generation and
+/// `err_internal` for everything else, so a refused read looked like an
+/// outage.
 #[tokio::test]
 async fn a_denied_generations_read_is_403_not_500() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await.with_wrap(
-        "test/ungranted",
-        Vec::new(),
-        Vec::new(),
-        "impresspress/admin",
-    );
-
-    for (label, out) in [
-        ("the listing", dev_get(&ctx, "/b/dev/api/generations").await),
-        (
-            "one generation",
-            dev_get(&ctx, "/b/dev/api/generations/g1").await,
-        ),
-        (
-            "a rollback",
-            dev_post(&ctx, "/b/dev/api/generations/g1/rollback", json!({})).await,
-        ),
-    ] {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    for (label, out) in denied_ledger_reads(&ctx).await {
         assert_eq!(output_http_status(out).await, 403, "{label}");
     }
 }
@@ -1263,24 +1307,8 @@ async fn a_denied_generations_read_is_403_not_500() {
 /// sanitized 500 from `err_internal`; a 403 is not it.
 #[tokio::test]
 async fn a_denied_generations_read_is_still_never_cached() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await.with_wrap(
-        "test/ungranted",
-        Vec::new(),
-        Vec::new(),
-        "impresspress/admin",
-    );
-
-    for (label, out) in [
-        ("the listing", dev_get(&ctx, "/b/dev/api/generations").await),
-        (
-            "one generation",
-            dev_get(&ctx, "/b/dev/api/generations/g1").await,
-        ),
-        (
-            "a rollback",
-            dev_post(&ctx, "/b/dev/api/generations/g1/rollback", json!({})).await,
-        ),
-    ] {
+    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    for (label, out) in denied_ledger_reads(&ctx).await {
         assert_eq!(
             output_http_header(out, "Cache-Control").await.as_deref(),
             Some("no-store"),

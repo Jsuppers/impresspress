@@ -157,12 +157,7 @@ mod typed_client_tests {
 
     #[tokio::test]
     async fn insert_then_validate_round_trips_under_wrap() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0xab_u8; 32];
         insert(&ctx, hash.clone(), &future_iso(3600)).await.unwrap();
         assert!(is_valid(&ctx, &hash).await.unwrap());
@@ -170,24 +165,14 @@ mod typed_client_tests {
 
     #[tokio::test]
     async fn unknown_hash_is_invalid() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0xcd_u8; 32];
         assert!(!is_valid(&ctx, &hash).await.unwrap());
     }
 
     #[tokio::test]
     async fn expired_hash_is_invalid() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0xef_u8; 32];
         insert(&ctx, hash.clone(), &past_iso(3600)).await.unwrap();
         assert!(!is_valid(&ctx, &hash).await.unwrap());
@@ -195,12 +180,7 @@ mod typed_client_tests {
 
     #[tokio::test]
     async fn insert_then_delete_round_trips_under_wrap() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0xff_u8; 32];
         insert(&ctx, hash.clone(), &future_iso(3600)).await.unwrap();
         assert!(is_valid(&ctx, &hash).await.unwrap());
@@ -210,12 +190,7 @@ mod typed_client_tests {
 
     #[tokio::test]
     async fn take_valid_by_hash_consumes_the_row_exactly_once() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0x11_u8; 32];
         insert(&ctx, hash.clone(), &future_iso(3600)).await.unwrap();
 
@@ -249,12 +224,9 @@ mod typed_client_tests {
     /// which is why this one exists.
     #[tokio::test]
     async fn take_valid_by_hash_consumes_the_row_on_a_file_backed_database() {
-        let ctx = TestContext::with_auth_on_disk().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth_on_disk()
+            .await
+            .running_as("wafer-run/auth");
         let hash = vec![0x44_u8; 32];
         insert(&ctx, hash.clone(), &future_iso(3600)).await.unwrap();
 
@@ -277,24 +249,14 @@ mod typed_client_tests {
 
     #[tokio::test]
     async fn take_valid_by_hash_unknown_hash_returns_false() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0x22_u8; 32];
         assert!(!take_valid_by_hash(&ctx, &hash).await.unwrap());
     }
 
     #[tokio::test]
     async fn take_valid_by_hash_does_not_consume_an_expired_row() {
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let hash = vec![0x33_u8; 32];
         insert(&ctx, hash.clone(), &past_iso(3600)).await.unwrap();
 

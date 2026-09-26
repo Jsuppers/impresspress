@@ -235,7 +235,8 @@ impl Context for MigrationTestCtx {
     /// fail-closed trait default (which exists so an enforcing runtime
     /// can never silently fall back to permissive). Mirrors the pre-WRAP
     /// behaviour of this harness; WRAP-behaviour tests use
-    /// `impresspress_core::test_support::TestContext::with_wrap` instead.
+    /// `impresspress_core::test_support::TestContext`, which enforces it on
+    /// every frame, instead.
     fn check_resource_access(
         &self,
         _resource: &str,

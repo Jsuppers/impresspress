@@ -15,6 +15,9 @@ use wafer_run::{
 
 use crate::{features::FeatureConfig, routing::ExtraRoute};
 
+/// The name the router block registers and reports under.
+pub const ROUTER_BLOCK_ID: &str = "impresspress/router";
+
 /// The impresspress router block — dispatches all API requests via the shared
 /// `crate::handle_request()` pipeline.
 pub struct ImpresspressRouterBlock {
@@ -83,7 +86,7 @@ impl ImpresspressRouterBlock {
 impl Block for ImpresspressRouterBlock {
     fn info(&self) -> BlockInfo {
         BlockInfo::new(
-            "impresspress/router",
+            ROUTER_BLOCK_ID,
             "0.0.1",
             "http-handler@v1",
             "Impresspress shared router — delegates to impresspress-core pipeline",

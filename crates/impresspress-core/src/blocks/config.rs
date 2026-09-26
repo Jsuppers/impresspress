@@ -1015,13 +1015,9 @@ mod tests {
         .expect("seed the value");
 
         // Act as the config block itself, on the same gates production
-        // applies: no grants, and the admin block owns the table.
-        let ctx = ctx.with_wrap(
-            "wafer-run/config",
-            Vec::new(),
-            Vec::new(),
-            crate::blocks::admin::ADMIN_BLOCK_ID,
-        );
+        // applies: the admin block owns the table, and grants the config
+        // block nothing on it.
+        let ctx = ctx.running_as("wafer-run/config");
 
         assert_eq!(
             wafer_core::clients::config::get_default(&ctx, KEY, "unset")

@@ -668,12 +668,7 @@ mod db_error_tests {
     /// call it makes is refused by the same `wrap::check_access` the runtime
     /// applies.
     async fn denied_ctx() -> TestContext {
-        TestContext::new().await.with_wrap(
-            "test/ungranted",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        )
+        TestContext::new().await.running_as("test/ungranted")
     }
 
     #[tokio::test]

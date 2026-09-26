@@ -263,23 +263,36 @@ mod tests {
         FolderInfo, ObjectInfo, ObjectList, StorageError, StorageService,
     };
     use wafer_run::{
-        Block as _, ErrorCode, InputStream, Message, OutputStream, ResourceGrant, ResourceType,
+        context::Context as _, ErrorCode, InputStream, Message, OutputStream, ResourceGrant,
+        ResourceType,
     };
 
     use super::{create, ImpresspressStorageBlock, STORAGE_ACCESS_LOGS_TABLE};
     use crate::test_support::{InMemoryStorageService, TestContext};
 
-    const ADMIN: &str = "impresspress/admin";
-
-    /// A context acting as `caller` with `grants`, the admin schema (the
-    /// audit table) migrated, and the admin block's own grants — the one that
-    /// lets any block write a storage access row.
+    /// A context running as `caller`, over the admin schema (the audit
+    /// table), in a deployment that adds `grants` to the ones its blocks
+    /// declare — the admin block's among them, the one that lets any block
+    /// write a storage access row.
     async fn ctx_as(caller: &str, grants: Vec<ResourceGrant>) -> TestContext {
-        let mut all = wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants;
-        all.extend(grants);
-        TestContext::with_admin()
+        let mut ctx = TestContext::with_admin().await;
+        ctx.add_deployment_grants(grants);
+        ctx.running_as(caller)
+    }
+
+    /// `op` from `ctx`'s block to `block`, registered as the deployment's
+    /// `wafer-run/storage`: through `call_block`, so the handler runs in the
+    /// frame the runtime hands a service, called by `ctx`'s block.
+    async fn call(
+        block: &Arc<ImpresspressStorageBlock>,
+        ctx: &TestContext,
+        op: &str,
+        input: InputStream,
+    ) -> OutputStream {
+        let mut ctx = ctx.clone();
+        ctx.register_block("wafer-run/storage", block.clone());
+        ctx.call_block("wafer-run/storage", Message::new(op), input)
             .await
-            .with_wrap(caller, Vec::new(), all, ADMIN)
     }
 
     fn shim() -> (Arc<ImpresspressStorageBlock>, Arc<InMemoryStorageService>) {
@@ -289,14 +302,13 @@ mod tests {
 
     /// Send one encoded request through the shim; `Ok(body)` on success.
     async fn send<T: serde::Serialize>(
-        block: &ImpresspressStorageBlock,
+        block: &Arc<ImpresspressStorageBlock>,
         ctx: &TestContext,
         op: &str,
         req: &T,
     ) -> Result<Vec<u8>, wafer_run::WaferError> {
         let body = wafer_block::codec::encode(req).expect("encode request");
-        block
-            .handle(ctx, Message::new(op), InputStream::from_bytes(body))
+        call(block, ctx, op, InputStream::from_bytes(body))
             .await
             .collect_buffered()
             .await
@@ -323,19 +335,19 @@ mod tests {
     /// The object body of a `storage.get` answer: the handler frames it as an
     /// `ObjectInfo` header chunk, then the body.
     async fn get_body(
-        block: &ImpresspressStorageBlock,
+        block: &Arc<ImpresspressStorageBlock>,
         ctx: &TestContext,
         folder: &str,
         key: &str,
     ) -> Result<Vec<u8>, wafer_run::WaferError> {
         let body = wafer_block::codec::encode(&get(folder, key)).expect("encode request");
-        let out = block
-            .handle(
-                ctx,
-                Message::new(ServiceOp::STORAGE_GET),
-                InputStream::from_bytes(body),
-            )
-            .await;
+        let out = call(
+            block,
+            ctx,
+            ServiceOp::STORAGE_GET,
+            InputStream::from_bytes(body),
+        )
+        .await;
         chunks(out)
             .await
             .map(|c| c.into_iter().skip(1).flatten().collect())
@@ -355,9 +367,10 @@ mod tests {
         Ok(chunks)
     }
 
-    /// `(path, status)` of every storage access row, oldest first.
+    /// `(path, status)` of every storage access row, oldest first, read by
+    /// the test rather than by the block under test.
     async fn audit_rows(ctx: &TestContext) -> Vec<(String, String)> {
-        crate::db_read::list_every(ctx, STORAGE_ACCESS_LOGS_TABLE, Vec::new())
+        crate::db_read::list_every(&ctx.fixture(), STORAGE_ACCESS_LOGS_TABLE, Vec::new())
             .await
             .expect("read storage access logs")
             .into_iter()
@@ -598,9 +611,7 @@ mod tests {
         let body = InputStream::from_stream(futures::stream::iter([Err(
             wafer_run::WaferError::new(ErrorCode::DeadlineExceeded, "request body read timed out"),
         )]));
-        let out = block
-            .handle(&ctx, Message::new(ServiceOp::STORAGE_PUT_STREAMING), body)
-            .await;
+        let out = call(&block, &ctx, ServiceOp::STORAGE_PUT_STREAMING, body).await;
 
         let err = chunks(out).await.expect_err("the upload must fail");
         assert_eq!(err.code, ErrorCode::DeadlineExceeded);
@@ -620,9 +631,7 @@ mod tests {
         let ctx = ctx_as("impresspress/files", Vec::new()).await;
         let (block, _store) = shim();
         for op in ServiceOp::STORAGE_OPS {
-            let out = block
-                .handle(&ctx, Message::new(*op), InputStream::from_bytes(Vec::new()))
-                .await;
+            let out = call(&block, &ctx, op, InputStream::from_bytes(Vec::new())).await;
             if let Err(e) = chunks(out).await {
                 assert!(
                     !e.message.contains("unknown storage operation"),
@@ -797,8 +806,6 @@ mod tests {
     /// receive the prefix as a finished answer.
     #[tokio::test]
     async fn a_stream_with_no_terminal_is_logged_and_answered_as_an_error() {
-        use wafer_run::context::Context as _;
-
         let caller = "impresspress/files";
         let ctx = ctx_as(caller, Vec::new()).await;
         // A stream whose terminal has already been read: what a source that

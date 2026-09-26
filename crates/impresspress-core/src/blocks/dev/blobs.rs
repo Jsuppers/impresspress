@@ -206,17 +206,10 @@ mod tests {
     async fn a_foreign_namespace_is_refused_even_when_the_object_is_there() {
         let ctx = TestContext::with_dev(FakeControl::new()).await;
 
-        // Act as `impresspress/files`: a shallow clone of the fixture with a
-        // different WRAP identity, sharing the same storage block and the
-        // same backing store.
-        let files_block = ctx.clone().with_wrap(
-            "impresspress/files",
-            wafer_run::Block::info(&crate::blocks::files::FilesBlock::new())
-                .call_allowlist()
-                .unwrap_or_default(),
-            Vec::new(),
-            "impresspress/admin",
-        );
+        // Act as `impresspress/files`: a shallow clone of the fixture running
+        // as another block, sharing the same storage block and the same
+        // backing store.
+        let files_block = ctx.clone().running_as("impresspress/files");
         storage::put(
             &files_block,
             "uploads",

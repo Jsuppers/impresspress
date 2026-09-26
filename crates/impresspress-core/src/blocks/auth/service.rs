@@ -245,9 +245,9 @@ async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthEr
 ///
 /// Returned by [`AuthService::grants`], which `AuthBlock::info()` consumes so
 /// the runtime registers them at startup — that is the only non-test caller.
-/// WRAP tests in `blocks::userportal::pages::{sessions, security}` and
-/// `crate::crypto` call it directly to enforce against the real list rather
-/// than re-listing literals (the rule `TestContext::with_wrap` documents).
+/// `test_support::TestContext` collects it the same way, through a real
+/// `Wafer` registration of the auth block, so WRAP tests enforce against the
+/// real list rather than re-listed literals.
 ///
 /// This vec is the source of truth: no document mirrors it, and nothing
 /// derives it. `scripts/audit-wrap-grants.sh` is what keeps it honest — it
@@ -820,12 +820,7 @@ mod tests {
     async fn ensure_active_rejects_disabled_and_deleted() {
         use crate::test_support::TestContext;
 
-        let ctx = TestContext::with_auth().await.with_wrap(
-            "wafer-run/auth",
-            Vec::new(),
-            vec![],
-            "impresspress/admin",
-        );
+        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
 
         let live = users::insert(
             &ctx,

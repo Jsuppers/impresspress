@@ -498,7 +498,7 @@ mod tests {
             }),
         );
         let thread = crate::blocks::messages::service::create_context(
-            &ctx,
+            &ctx.fixture(),
             "user-a",
             "conversation",
             "T",
@@ -567,7 +567,7 @@ mod tests {
         ctx.set_config(DEFAULT_MAX_TOKENS_VAR, &FIXTURE_MAX_TOKENS.to_string());
         ctx.register_block("wafer-run/llm", fake.llm_service_block());
         let thread = crate::blocks::messages::service::create_context(
-            &ctx,
+            &ctx.fixture(),
             "user-a",
             "conversation",
             "T",
@@ -1112,7 +1112,7 @@ mod tests {
             "a refused thread must not be paid for"
         );
         let entries = service::list_entries(
-            &ctx,
+            &ctx.fixture(),
             &thread_id,
             &ListEntriesParams {
                 kind: None,

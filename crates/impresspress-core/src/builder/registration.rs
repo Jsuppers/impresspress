@@ -126,14 +126,12 @@ impl ImpresspressBuilder {
         // 4. Register service blocks
         let config_db = database.clone();
         wafer_core::service_blocks::database::register_with(&mut wafer, database)?;
-        wafer
-            .add_alias("db", "wafer-run/database")
-            .map_err(|e| RuntimeError::Config(format!("add_alias db: {e}")))?;
-
         wafer.register_block("wafer-run/storage", crate::blocks::storage::create(storage))?;
-        wafer
-            .add_alias("storage", "wafer-run/storage")
-            .map_err(|e| RuntimeError::Config(format!("add_alias storage: {e}")))?;
+        for (alias, target) in SERVICE_ALIASES {
+            wafer
+                .add_alias(*alias, *target)
+                .map_err(|e| RuntimeError::Config(format!("add_alias {alias}: {e}")))?;
+        }
 
         // impresspress owns this block: the `variables` table is the config
         // store, so an admin write is visible to the next read instead of after
@@ -165,10 +163,7 @@ impl ImpresspressBuilder {
         //     registered, the router is still installed — its
         //     `claims_backend` returns false for all ids and produces clean
         //     `unknown backend_id` errors via the standard router dispatch.
-        let mut llm_router = wafer_core::interfaces::llm::router::MultiBackendLlmService::new();
-        for grant in llm_router_grants() {
-            llm_router.grant(grant);
-        }
+        let mut llm_router = granted_llm_router();
 
         #[cfg(feature = "llm")]
         let provider_llm_svc = {
@@ -455,8 +450,8 @@ impl ImpresspressBuilder {
             block_infos.clone(),
             extra_routes.clone(),
         );
-        wafer.register_block("impresspress/router", Arc::new(router))?;
-        wafer.add_block_config("impresspress/router", routes_cfg);
+        wafer.register_block(crate::blocks::router::ROUTER_BLOCK_ID, Arc::new(router))?;
+        wafer.add_block_config(crate::blocks::router::ROUTER_BLOCK_ID, routes_cfg);
 
         // The site-main flow names this in a step ahead of the router, so it
         // is registered wherever that flow runs — every target, no feature
@@ -619,6 +614,28 @@ pub fn register_discovered_blocks(
     Ok(())
 }
 
+/// The short names every target's runtime answers for a service block, as
+/// `(alias, target)`: `call_block("db", ..)` reaches `wafer-run/database`.
+///
+/// One list, read by [`ImpresspressBuilder::build`] and by
+/// `test_support::TestContext`, so a test resolves a call the way the runtime
+/// it models does.
+pub(crate) const SERVICE_ALIASES: &[(&str, &str)] = &[
+    ("db", "wafer-run/database"),
+    ("storage", "wafer-run/storage"),
+];
+
+/// The `wafer-run/llm` router with no backend yet, carrying
+/// [`llm_router_grants`]: what `build()` registers backends on, and what
+/// `test_support::TestContext` collects the deployment's grants from.
+pub(crate) fn granted_llm_router() -> wafer_core::interfaces::llm::router::MultiBackendLlmService {
+    let mut router = wafer_core::interfaces::llm::router::MultiBackendLlmService::new();
+    for grant in llm_router_grants() {
+        router.grant(grant);
+    }
+    router
+}
+
 /// Who may use `wafer-run/llm`, declared on its router.
 ///
 /// The llm handler authorizes every op against a model resource in
@@ -649,7 +666,6 @@ mod llm_router_grant_tests {
     use wafer_core::clients::llm::{self, StatusRequest, UnloadModelRequest};
     use wafer_run::ErrorCode;
 
-    use super::llm_router_grants;
     use crate::{
         blocks::llm::{
             provider_admin::ProviderAdmin,
@@ -670,18 +686,14 @@ mod llm_router_grant_tests {
         )
         .with_models(vec!["m".to_string()])])
             .expect("configure");
-        let mut router = wafer_core::interfaces::llm::router::MultiBackendLlmService::new();
+        let mut router = super::granted_llm_router();
         router.register("provider", svc);
-        for grant in llm_router_grants() {
-            router.grant(grant);
-        }
         let block: Arc<dyn wafer_run::Block> = Arc::new(
             wafer_core::service_blocks::llm::LlmBlock::new(Arc::new(router)),
         );
-        let grants = block.info().grants;
         let mut ctx = TestContext::new().await;
         ctx.register_block("wafer-run/llm", block);
-        ctx.with_wrap(caller, Vec::new(), grants, "impresspress/admin")
+        ctx.running_as(caller)
     }
 
     fn status_req() -> StatusRequest {

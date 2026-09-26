@@ -1833,12 +1833,7 @@ mod wrap_denial_tests {
     /// indistinguishable from a corrupt row. `crud::db_error` is the arm that
     /// was missing.
     async fn denied_ctx() -> TestContext {
-        TestContext::with_admin().await.with_wrap(
-            "test/ungranted",
-            Vec::new(),
-            Vec::new(),
-            "impresspress/admin",
-        )
+        TestContext::with_admin().await.running_as("test/ungranted")
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ const PAST_THE_CEILING: i64 = db_read::UNPAGED_LIMIT as i64 + 1;
 /// numbered `ord_000001` upward so `id` ordering is the insertion order.
 async fn seed_orders_past_the_ceiling(ctx: &TestContext, total_cents: i64) {
     db::exec_raw(
-        ctx,
+        &ctx.fixture(),
         "WITH RECURSIVE seq(n) AS ( \
              SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ? \
          ) \
@@ -109,7 +109,7 @@ async fn top_products_cover_every_paid_order_past_the_ceiling() {
     let ctx = ctx().await;
     seed_orders_past_the_ceiling(&ctx, 100).await;
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "WITH RECURSIVE seq(n) AS ( \
              SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ? \
          ) \
@@ -146,7 +146,7 @@ async fn top_products_cover_every_paid_order_past_the_ceiling() {
 async fn suspension_reads_every_product_the_seller_owns() {
     let ctx = ctx().await;
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "WITH RECURSIVE seq(n) AS ( \
              SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ? \
          ) \
@@ -174,7 +174,7 @@ async fn suspension_reads_every_product_the_seller_owns() {
 async fn the_seller_listing_reports_that_it_is_a_prefix() {
     let ctx = ctx().await;
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "WITH RECURSIVE seq(n) AS ( \
              SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ? \
          ) \
@@ -217,7 +217,7 @@ async fn the_seller_listing_reports_that_it_is_a_prefix() {
 async fn money_figures_read_as_integers_where_an_uncast_sum_is_a_float() {
     let ctx = ctx().await;
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "INSERT INTO impresspress__products__purchases \
              (id, user_id, status, currency, total_cents, refunded_total_cents, \
               platform_fee_cents, created_at, updated_at) \
@@ -230,7 +230,7 @@ async fn money_figures_read_as_integers_where_an_uncast_sum_is_a_float() {
     .await
     .expect("seed orders");
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "INSERT INTO impresspress__products__line_items \
              (id, purchase_id, product_id, product_name, quantity, total_minor, \
               created_at, updated_at) \
@@ -294,7 +294,7 @@ async fn money_figures_read_as_integers_where_an_uncast_sum_is_a_float() {
 async fn a_keyset_walk_refuses_a_row_with_no_id() {
     let ctx = ctx().await;
     db::exec_raw(
-        &ctx,
+        &ctx.fixture(),
         "INSERT INTO impresspress__products__products \
              (id, name, status, owner_kind, owner_id, created_at, updated_at) \
          VALUES ('', 'Nameless', 'active', 'user', 'seller_1', \

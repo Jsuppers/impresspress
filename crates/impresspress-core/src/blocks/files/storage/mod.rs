@@ -281,7 +281,7 @@ mod test_helpers {
         crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &[sql], &[])
             .await
             .expect("001 applies");
-        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+        with_storage(ctx.running_as(crate::blocks::files::FilesBlock::BLOCK_NAME))
     }
 
     /// [`ctx_with_storage_handle`] on a database with every files migration
@@ -302,7 +302,7 @@ mod test_helpers {
         crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &sql, &[])
             .await
             .expect("001-003 apply");
-        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+        with_storage(ctx.running_as(crate::blocks::files::FilesBlock::BLOCK_NAME))
     }
 
     /// [`ctx_with_storage_handle`] on a database with every files migration
@@ -323,7 +323,7 @@ mod test_helpers {
         crate::migration_helper::apply_migrations(&ctx, "impresspress/files", &sql, &[])
             .await
             .expect("001-004 apply");
-        with_storage(crate::blocks::files::test_wrap::as_files_block(ctx))
+        with_storage(ctx.running_as(crate::blocks::files::FilesBlock::BLOCK_NAME))
     }
 
     fn with_storage(mut ctx: TestContext) -> (TestContext, Arc<MemStorage>) {
