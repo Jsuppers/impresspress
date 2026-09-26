@@ -356,7 +356,7 @@ pub(in crate::blocks::llm) async fn handle_chat(
                     "llm assistant turn was answered but could not be stored"
                 );
                 // The thread was written to moments ago, so a `NotFound` here is
-                // a missing table rather than the caller's row.
+                // a fault rather than the caller's missing row.
                 return crate::blocks::crud::db_error_internal(error, "Chat reply");
             }
         };

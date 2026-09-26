@@ -547,10 +547,15 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
 /// A refusal a page's read met, as [`crate::blocks::crud::db_error_page`]
 /// classified it: the 403 a WRAP denial becomes and the 429 a quota keeps, as
 /// a styled page for a browser and as the refusal itself for an API caller.
+///
+/// It takes a [`crate::blocks::crud::Refusal`], which only
+/// [`crate::blocks::crud::classify_db_error`] builds, because the API branch
+/// sends the error to the client as it stands.
 pub fn refused_response(
     msg: &wafer_run::Message,
-    error: wafer_run::WaferError,
+    refusal: crate::blocks::crud::Refusal,
 ) -> wafer_run::OutputStream {
+    let error = refusal.into_error();
     let accept = msg.get_meta("http.header.accept");
     if !accept.contains("text/html") || accept.contains("application/json") {
         return wafer_run::OutputStream::error(error);

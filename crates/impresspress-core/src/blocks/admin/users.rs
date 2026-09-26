@@ -45,8 +45,8 @@ pub(super) async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStrea
                 Err(e) => db_error_internal(e, "Could not load the users' roles"),
             }
         }
-        // A `NotFound` from a paginated list is a missing table, not a
-        // missing user — `db_error_internal`, not `db_error`.
+        // A `NotFound` from a paginated list names no user of the caller's —
+        // `db_error_internal`, not `db_error`.
         Err(e) => db_error_internal(e, "Database error"),
     }
 }

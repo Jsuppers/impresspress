@@ -1264,7 +1264,7 @@ pub(super) async fn update_variable(
     let record = match variables::upsert_by_key(ctx, key, patch).await {
         Ok(row) => row,
         // `db_error_internal`, not a bare `err_internal`: an upsert names its
-        // own table, so a `NotFound` is a missing table and a 500 — but a WRAP
+        // own table and no row of the caller's, so a `NotFound` is a 500 — but a WRAP
         // refusal is a 403 and a quota a 429, and forwarding those as 500 is
         // the drift `tests/error_door.rs` exists to stop.
         Err(e) => return Err(db_error_internal(e, "Database error")),

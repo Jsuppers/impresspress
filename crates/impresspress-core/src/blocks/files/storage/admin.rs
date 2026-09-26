@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Three aggregates over tables this endpoint names itself, so a `NotFound`
-/// from any of them is a missing table (a 500), never the caller's row —
+/// from any of them is a 500, never the caller's row —
 /// which is what makes [`db_error_internal`] the right door. Each one used to
 /// fall back to zero, and this is a JSON body an operator's dashboard polls:
 /// `{"total_objects":0,"total_size_bytes":0,"bucket_count":0}` during an

@@ -46,9 +46,9 @@ pub(super) async fn handle_catalog(ctx: &dyn Context, msg: &Message) -> OutputSt
     .await
     {
         Ok(list) => ok_json(&CatalogProductListResponse::from_record_list(&list)),
-        // The table is the block's, not the request's: a `NotFound` here is a
-        // missing table, so it stays a 500 rather than telling the caller
-        // their query found nothing.
+        // The table is the block's, not the request's: a `NotFound` here names
+        // no row of the caller's, so it stays a 500 rather than telling the
+        // caller their query found nothing.
         Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }

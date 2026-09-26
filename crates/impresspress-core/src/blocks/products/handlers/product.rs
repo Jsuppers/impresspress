@@ -262,8 +262,8 @@ pub(super) async fn list_products(
     {
         Ok(list) => ok_json(&ProductListResponse::from_record_list(&list)),
         // `list_page` is told its table by the block, not by the request, so a
-        // `NotFound` from it means the table is missing — a 500, not an empty
-        // page reported as a 404.
+        // `NotFound` from it names no row of the caller's — a 500, not an
+        // empty page reported as a 404.
         Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
@@ -432,7 +432,7 @@ pub(super) async fn handle_create_product(
     }
     match create_product_row(ctx, data).await {
         Ok(record) => product_json(&record),
-        // An insert names no row, so its `NotFound` is a missing table.
+        // An insert names no row of the caller's, so its `NotFound` is a 500.
         Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }
@@ -990,7 +990,7 @@ pub(super) async fn handle_user_create_product(
 
     match create_product_row(ctx, data).await {
         Ok(record) => product_json(&record),
-        // An insert names no row, so its `NotFound` is a missing table.
+        // An insert names no row of the caller's, so its `NotFound` is a 500.
         Err(e) => crud::db_error_internal(e, "Database error"),
     }
 }

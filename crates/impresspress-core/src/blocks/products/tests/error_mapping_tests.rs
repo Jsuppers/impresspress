@@ -281,8 +281,8 @@ async fn provider_operation_list_denial_is_403_not_500() {
 // --- the sibling reads: a list and a create refuse the same way -----------
 
 /// `repo::products::list_page` is told its table by the block, not by the
-/// request, so its `NotFound` stays a 500 (a missing table is a deployment
-/// fault, not an empty result). Its `PermissionDenied` is still a 403.
+/// request, so its `NotFound` stays a 500 (it names no row of the caller's).
+/// Its `PermissionDenied` is still a 403.
 #[tokio::test]
 async fn admin_product_list_denial_is_403_not_500() {
     let ctx = denied().await;
@@ -328,7 +328,7 @@ async fn a_granted_read_of_a_present_product_is_200() {
 // --- reads with no row of the caller's to miss ----------------------------
 //
 // Every read below is addressed by the block — a count, a listing, an insert
-// — so a `NotFound` from it is a missing table and stays a 500. A refusal is
+// — so a `NotFound` from it names no row of the caller's and stays a 500. A refusal is
 // not: each of these sites goes through `crud::db_error_internal`, so a WRAP
 // denial is the door's 403 and a quota keeps its 429. One real route per file,
 // through `ProductsBlock::handle`, with the refusal injected on the one table

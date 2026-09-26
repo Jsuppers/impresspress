@@ -1969,11 +1969,11 @@ fn a_grouped_import_of_the_const_is_naming_it() {
 /// by nothing else the file mentions.
 ///
 /// Each case is a small crate — `(file under src/, source)` pairs — and asks
-/// whether its LAST file names one constant. The must-not-catch cases are
-/// the false attributions the gate once made by matching a qualifier as a
-/// substring anywhere in the file; the must-catch cases include spellings
-/// that carry no qualifier at all (`super::repo::variables`), which that
-/// match could not see.
+/// whether its LAST file names one constant. A file that mentions a door's
+/// block elsewhere — in a re-export, in a string — does not name the door's
+/// constant by doing so, and a file that names the constant through a
+/// relative path (`super::repo::variables`) names it without spelling the
+/// block at all.
 #[test]
 fn a_constant_is_attributed_by_its_full_path() {
     const PLATFORM_VARIABLES: &str = "crate::platform_state::variables::TABLE";

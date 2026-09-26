@@ -375,7 +375,7 @@ pub(crate) fn no_store_db_error(error: WaferError, not_found: &str, context: &st
 /// [`no_store_db_error`] for a call whose `NotFound` is NOT the client's row
 /// — the [`crate::blocks::crud::db_error_internal`] of this pair, and split
 /// for the same reason: a `NotFound` from a listing the block addressed
-/// itself is a missing table, not a generation the caller named.
+/// itself names no generation of the caller's.
 pub(crate) fn no_store_db_error_internal(error: WaferError, context: &str) -> OutputStream {
     seal_no_store(
         crate::blocks::crud::classify_db_error(error, None, context),
