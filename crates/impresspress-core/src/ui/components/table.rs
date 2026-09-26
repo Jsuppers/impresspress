@@ -225,6 +225,51 @@ fn row_class(extra: &str, linked: bool) -> Cow<'_, str> {
     }
 }
 
+/// An identifier for a table cell — a `{org}/{block}` name, a
+/// `{org}__{block}__{name}` table or variable key, a request path — with a
+/// line-break opportunity (`<wbr>`) after each `/` and after each run of `_`,
+/// the points where it reads as separate words. Such an identifier has no
+/// spaces, so without these a long one sets its column's minimum width and
+/// pushes the table past its card; with them it wraps between its words,
+/// never inside one, and only where the column is too narrow for it. The text
+/// content is unchanged: `<wbr>` adds no characters.
+pub fn breakable_id(id: &str) -> Markup {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let bytes = id.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let end = if bytes[i] == b'/' && i > 0 {
+            Some(i + 1)
+        } else if bytes[i] == b'_' {
+            // A run of underscores is one separator; break after all of it.
+            let mut j = i;
+            while j < bytes.len() && bytes[j] == b'_' {
+                j += 1;
+            }
+            Some(j)
+        } else {
+            None
+        };
+        match end {
+            Some(end) if end < bytes.len() => {
+                parts.push(&id[start..end]);
+                start = end;
+                i = end;
+            }
+            Some(end) => i = end,
+            None => i += 1,
+        }
+    }
+    parts.push(&id[start..]);
+    html! {
+        @for (n, part) in parts.iter().enumerate() {
+            @if n > 0 { wbr; }
+            (part)
+        }
+    }
+}
+
 /// `data_table` — caller passes pre-rendered cell markup per row.
 /// Sticky header. Optional row-link via `row_href` closure.
 ///
@@ -519,5 +564,31 @@ mod tests {
              remove entries or lower counts, and when it empties delete the \
              .table / .table-container rules from ui/styles/components/table.css"
         );
+    }
+}
+
+#[cfg(test)]
+mod breakable_id_tests {
+    use super::breakable_id;
+
+    #[test]
+    fn breaks_after_each_slash_and_underscore_run_only() {
+        let cases = [
+            ("impresspress/auth-ui", "impresspress/<wbr>auth-ui"),
+            (
+                "ACME_CO__WIDGETS_MAX",
+                "ACME_<wbr>CO__<wbr>WIDGETS_<wbr>MAX",
+            ),
+            ("acme__widgets__orders", "acme__<wbr>widgets__<wbr>orders"),
+            ("/b/admin/network", "/b/<wbr>admin/<wbr>network"),
+            ("acme__shop__*", "acme__<wbr>shop__<wbr>*"),
+            ("acme___x", "acme___<wbr>x"),
+            ("trailing/", "trailing/"),
+            ("plain", "plain"),
+            ("", ""),
+        ];
+        for (id, want) in cases {
+            assert_eq!(breakable_id(id).into_string(), want, "{id}");
+        }
     }
 }

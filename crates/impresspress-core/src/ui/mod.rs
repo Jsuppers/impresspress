@@ -180,6 +180,25 @@ pub struct NavItem {
     /// `ctx.registered_blocks()` so the nav never links to a route that
     /// would 404. `None` = always shown (backing block is unconditional).
     pub block: Option<&'static str>,
+    /// The path prefix of the pages this item stands for, when that is more
+    /// than its own `href` and the paths below it: the Settings item links to
+    /// `/b/admin/settings/email` but stands for every page under
+    /// `/b/admin/settings`. `None` = the item stands for its `href` alone
+    /// (plus the paths below it, for an `href` without a trailing slash).
+    /// [`sidebar::active_item`] reads it to pick the highlighted item.
+    pub section: Option<&'static str>,
+}
+
+impl NavItem {
+    /// Declare the path prefix this item stands for — see [`NavItem::section`].
+    /// Written without a trailing slash; it covers the prefix itself and every
+    /// path below it.
+    pub fn in_section(self, section: &'static str) -> Self {
+        NavItem {
+            section: Some(section),
+            ..self
+        }
+    }
 }
 
 pub use sidebar::NavGroup;

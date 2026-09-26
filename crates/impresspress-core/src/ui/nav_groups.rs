@@ -12,6 +12,7 @@ fn item(label: &str, href: &str, icon: fn() -> Markup) -> NavItem {
         icon,
         external: false,
         block: None,
+        section: None,
     }
 }
 
@@ -88,14 +89,16 @@ pub fn admin() -> Vec<NavGroup> {
                     "/b/storage/admin/",
                     icons::hard_drive,
                     "impresspress/files",
-                ),
+                )
+                .in_section("/b/storage/admin"),
                 item("Database", "/b/admin/database", icons::server),
                 block_item(
                     "Vector indexes",
                     "/b/vector/",
                     icons::network,
                     "impresspress/vector",
-                ),
+                )
+                .in_section("/b/vector"),
             ],
         },
         NavGroup {
@@ -106,14 +109,16 @@ pub fn admin() -> Vec<NavGroup> {
                     "/b/messages/",
                     icons::file_text,
                     "impresspress/messages",
-                ),
+                )
+                .in_section("/b/messages"),
                 block_item(
                     "Tickets",
                     "/b/tickets/admin/tickets",
                     icons::file_text,
                     "impresspress/tickets",
-                ),
-                block_item("LLM", "/b/llm/", icons::robot, "impresspress/llm"),
+                )
+                .in_section("/b/tickets/admin"),
+                block_item("LLM", "/b/llm/", icons::robot, "impresspress/llm").in_section("/b/llm"),
             ],
         },
         NavGroup {
@@ -123,14 +128,18 @@ pub fn admin() -> Vec<NavGroup> {
                 "/b/products/admin/",
                 icons::shopping_cart,
                 "impresspress/products",
-            )],
+            )
+            .in_section("/b/products/admin")],
         },
         NavGroup {
             label: Some("System".to_string()),
             items: vec![
                 item("Blocks", "/b/admin/blocks", icons::package),
                 item("Logs", "/b/admin/logs", icons::file_text),
-                item("Settings", "/b/admin/settings/email", icons::settings),
+                // The item links to the first settings page but stands for
+                // all of them (Email, Network, Variables, Permissions).
+                item("Settings", "/b/admin/settings/email", icons::settings)
+                    .in_section("/b/admin/settings"),
             ],
         },
     ]
@@ -175,23 +184,27 @@ pub fn portal() -> Vec<NavGroup> {
                     "/b/products/",
                     icons::package,
                     "impresspress/products",
-                ),
+                )
+                .in_section("/b/products"),
                 // Same gate as "Shares" below — both are `/b/storage`-family
                 // paths served by `impresspress/files`.
-                block_item("Files", "/b/storage/", icons::folder, "impresspress/files"),
+                block_item("Files", "/b/storage/", icons::folder, "impresspress/files")
+                    .in_section("/b/storage"),
                 // `/b/cloudstorage/` routes to the files block (see routing.rs).
                 block_item(
                     "Shares",
                     "/b/cloudstorage/",
                     icons::link,
                     "impresspress/files",
-                ),
+                )
+                .in_section("/b/cloudstorage"),
                 block_item(
                     "Legal",
                     "/b/legalpages/admin/privacy",
                     icons::file_text,
                     "impresspress/legalpages",
-                ),
+                )
+                .in_section("/b/legalpages/admin"),
             ],
         },
     ]
