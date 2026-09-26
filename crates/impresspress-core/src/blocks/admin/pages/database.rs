@@ -537,32 +537,43 @@ mod tests {
     /// `data-db-table` name, because their row counts follow the suite's own
     /// traffic. Rename either table (or the attribute) and the selector
     /// silently stops matching: the capture then fails on whatever ran
-    /// before it, not on the page. This pins the spec's selector to the
-    /// tables' constants and to the markup this page renders.
+    /// before it, not on the page. This reads the selectors out of the spec
+    /// and requires each to match a row this page renders.
     #[tokio::test]
     async fn the_log_table_rows_carry_the_names_the_visual_mask_keys_on() {
         const SPEC: &str =
             include_str!("../../../../../impresspress-web/tests/e2e/visual-baseline.spec.ts");
+        const PREFIX: &str = r#"li[data-db-table$=""#;
+        let suffixes: Vec<&str> = SPEC
+            .match_indices(PREFIX)
+            .map(|(at, _)| {
+                let rest = &SPEC[at + PREFIX.len()..];
+                &rest[..rest.find('"').expect("a closed selector")]
+            })
+            .collect();
+        assert_eq!(
+            suffixes,
+            ["__request_logs", "__storage_access_logs"],
+            "visual-baseline.spec.ts no longer masks the two log tables' rows"
+        );
+
         let ctx = TestContext::with_admin()
             .await
             .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let parts = browser_request(&ctx, admin_msg("retrieve", "/b/admin/database")).await;
         assert_eq!(parts.status, 200);
         let html = String::from_utf8(parts.body).expect("UTF-8 body");
-
-        for table in [
-            crate::platform_state::request_logs::TABLE,
-            crate::blocks::admin::logs::STORAGE_ACCESS_LOGS_TABLE,
-        ] {
-            let suffix = &table[table.rfind("__").expect("an org__block__name table")..];
-            let selector = format!(r#"li[data-db-table$="{suffix}"]"#);
-            assert!(
-                SPEC.contains(&selector),
-                "visual-baseline.spec.ts no longer masks `{selector}` for {table}"
-            );
-            assert!(
-                html.contains(&format!(r#"<li data-db-table="{table}">"#)),
-                "the database page no longer names the {table} row the way the mask expects: {html}"
+        for suffix in suffixes {
+            let rows = html
+                .match_indices(r#"<li data-db-table=""#)
+                .filter(|(at, _)| {
+                    let name = &html[at + r#"<li data-db-table=""#.len()..];
+                    name[..name.find('"').unwrap_or(0)].ends_with(suffix)
+                })
+                .count();
+            assert_eq!(
+                rows, 1,
+                "the mask `li[data-db-table$=\"{suffix}\"]` must match exactly one row: {html}"
             );
         }
     }
