@@ -1146,25 +1146,30 @@ mod tests {
     }
 
     /// A D1 handle whose every statement's `first()` rejects with the error
-    /// D1 raises for a table that does not exist (message and result code as
-    /// D1 spells them), and whose `all()` — the introspection reads — answers
-    /// no rows, as SQLite's `PRAGMA table_info` does for a missing table.
-    /// The object is structural: worker-rs calls `prepare`, `bind`, `first`
-    /// and `all` on it by name, exactly as on a real binding.
-    fn missing_table_handle() -> D1Database {
-        let handle = js_sys::Function::new_no_args(
+    /// D1 raises for a table that does not exist — its message as D1 spells
+    /// it, with `cause` attached when `cause` is `Some`, since D1 sets one on
+    /// some rejections and not on others — and whose `all()` (the
+    /// introspection reads) answers no rows, as SQLite's `PRAGMA table_info`
+    /// does for a missing table. The object is structural: worker-rs calls
+    /// `prepare`, `bind`, `first` and `all` on it by name, as on a real
+    /// binding.
+    fn missing_table_handle(cause: Option<&str>) -> D1Database {
+        let handle = js_sys::Function::new_with_args(
+            "cause",
             "const stmt = {
                 bind() { return stmt; },
                 first() {
-                    return Promise.reject(new Error(
-                        'D1_ERROR: no such table: impresspress__d1test__never_created: SQLITE_ERROR'
-                    ));
+                    const message =
+                        'D1_ERROR: no such table: impresspress__d1test__never_created: SQLITE_ERROR';
+                    return Promise.reject(
+                        cause === undefined ? new Error(message) : new Error(message, { cause }),
+                    );
                 },
                 all() { return Promise.resolve({ results: [], success: true, meta: {} }); },
             };
             return { prepare() { return stmt; } };",
         )
-        .call0(&JsValue::NULL)
+        .call1(&JsValue::NULL, &cause.map_or(JsValue::UNDEFINED, JsValue::from_str))
         .expect("the fake binding builds");
         wasm_bindgen::JsCast::unchecked_into::<D1Database>(handle)
     }
@@ -1176,15 +1181,20 @@ mod tests {
     /// caller's 404 ("no such row") when nothing could be read at all.
     #[wasm_bindgen_test]
     async fn a_get_against_a_missing_table_is_a_fault_not_an_absent_row() {
-        forget_isolate_schema();
-        let svc = service(missing_table_handle(), true, "DB");
-        let err = DatabaseService::get(&svc, "impresspress__d1test__never_created", "any-id")
-            .await
-            .expect_err("the statement fails");
-        assert!(
-            matches!(err, DatabaseError::Internal(ref text) if text.contains("no such table")),
-            "a missing table must be Internal, got {err:?}"
-        );
+        for cause in [
+            Some("no such table: impresspress__d1test__never_created: SQLITE_ERROR"),
+            None,
+        ] {
+            forget_isolate_schema();
+            let svc = service(missing_table_handle(cause), true, "DB");
+            let err = DatabaseService::get(&svc, "impresspress__d1test__never_created", "any-id")
+                .await
+                .expect_err("the statement fails");
+            assert!(
+                matches!(err, DatabaseError::Internal(ref text) if text.contains("no such table")),
+                "cause {cause:?}: a missing table must be Internal, got {err:?}"
+            );
+        }
     }
 
     /// **Fails with a per-service cache**: every D1 service in an isolate has
