@@ -78,6 +78,13 @@ fn access_badge(write: GrantWrite) -> Markup {
     }
 }
 
+/// A code-declared grant as the "All" tab words it: the grantee, what it may
+/// do, and whose resource — `block` declared the grant, so the resource is
+/// the owning block's.
+fn code_grant_sentence(grantee: &str, verb: &str, owner: &str, resource: &str) -> String {
+    format!("{grantee} {verb} {owner}'s {resource}")
+}
+
 /// The access a grant confers, as the permissions summary words it.
 fn access_verb(write: GrantWrite) -> &'static str {
     match write {
@@ -96,10 +103,12 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
 
     html! {
         div .card .mt-4 {
-            div .card-header {
-                h3 .card-title { "Grants Declared in Code" }
-                p .text-muted .text-13 {
-                    "These grants are declared in block source code via BlockInfo.grants and cannot be modified here."
+            header .card__head {
+                div {
+                    h3 .card__title { "Grants Declared in Code" }
+                    p .card__subtitle {
+                        "These grants are declared in block source code via BlockInfo.grants and cannot be modified here."
+                    }
                 }
             }
             div .card__body {
@@ -154,15 +163,17 @@ pub(crate) async fn grants_custom_tab(
 
     Ok(html! {
         div .card .mt-4 {
-            div .card-header .flex .items-center .justify-between {
+            header .card__head {
                 div {
-                    h3 .card-title { "Custom Grants" }
-                    p .text-muted .text-13 {
+                    h3 .card__title { "Custom Grants" }
+                    p .card__subtitle {
                         "Add grants for third-party or WASM blocks. These are loaded at startup alongside code-declared grants."
                     }
                 }
-                button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="add-grant-modal" {
-                    (icons::plus()) " Add Grant"
+                div .card__actions {
+                    button .btn .btn--primary .btn--sm data-action="modal-open" data-modal-target="add-grant-modal" {
+                        (icons::plus()) " Add Grant"
+                    }
                 }
             }
             div .card__body {
@@ -449,7 +460,7 @@ async fn permissions_all_tab(
                 grant.grantee.clone()
             };
             let verb = access_verb(grant.write);
-            let sentence = format!("{} {} {}' {}", grantee, verb, block.name, grant.resource);
+            let sentence = code_grant_sentence(&grantee, verb, &block.name, &grant.resource);
             all_rows.push(PermRow {
                 type_label,
                 sentence,
@@ -656,5 +667,40 @@ mod outage_tests {
             output_http_status(settings_page(&ctx, &msg, "permissions").await).await,
             500
         );
+    }
+}
+
+#[cfg(test)]
+mod wording_tests {
+    use crate::{
+        blocks::admin::pages::settings::settings_page,
+        test_support::{admin_msg, output_html, TestContext},
+    };
+
+    /// The "All" tab words a code-declared grant as the grantee, what it may
+    /// do, and the owning block's resource. The possessive was written as a
+    /// bare apostrophe — "impresspress/admin' *" — on every code row.
+    #[tokio::test]
+    async fn a_code_grant_names_its_owner_with_a_possessive() {
+        use wafer_run::Block;
+
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        // The admin block's real declaration, so the rows are the grants it
+        // ships.
+        ctx.register_block_info(
+            crate::blocks::admin::ADMIN_BLOCK_ID,
+            crate::blocks::admin::AdminBlock::new().info(),
+        );
+        let msg = admin_msg("retrieve", "/b/admin/settings/permissions");
+        let html = output_html(settings_page(&ctx, &msg, "permissions").await).await;
+        // The admin block's network grant, whose resource is `*`: a platform
+        // table name here would bypass that table's repo door.
+        assert!(
+            html.contains("All blocks can read impresspress/admin's *"),
+            "{html}"
+        );
+        assert!(!html.contains("impresspress/admin' "), "{html}");
     }
 }

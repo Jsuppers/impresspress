@@ -167,7 +167,8 @@ struct VarRow<'a> {
     auto_generate: bool,
     description: &'a str,
     warning: &'a str,
-    /// Whether to render the "Default" column cell (block-config tables).
+    /// Whether to render the declared default beneath the value
+    /// (block-config tables).
     show_default: bool,
     /// Whether this row offers the delete control.
     ///
@@ -196,80 +197,94 @@ struct VarRow<'a> {
     offer_reset: bool,
 }
 
-/// Build one variable table row's cells, in column order: key (+ optional
-/// name), value cell (masked per SEC-060), optional default column,
-/// description (+ optional warning), and the edit button. Shared by all four
-/// variable tables so the masking policy and edit affordance can't drift
+/// Build one variable table row's cells, in column order against
+/// [`VAR_COLUMNS`]: the variable (key, friendly name, description, pin badge
+/// and warning), its value (masked per SEC-060, with the declared default
+/// beneath it in the block-config tables), and the controls. Shared by every
+/// variable table so the masking policy and edit affordance can't drift
 /// between them. The `<td>`s around these belong to `components::data_table`.
+///
+/// Three columns, not one per field: these tables sit beside the settings
+/// navigation, about 610px wide at a 1280px window, and five columns there
+/// forced the description into a sliver (rows hundreds of pixels tall) and
+/// pushed the controls out of the card. The description reads as part of the
+/// variable it describes, and the default as part of the value.
 fn var_row(row: &VarRow) -> Vec<Markup> {
-    let mut cells = vec![
+    vec![
+        variable_cell(row.key, row.name, row.description, row.pin, row.warning),
         html! {
-            span .font-medium .text-13 {
-                code { (row.key) }
-                @if let Some(name) = row.name {
-                    @if !name.is_empty() {
-                        br;
-                        span .text-muted .text-xs { (name) }
+            div .var-cell {
+                span .text-13 .cell-wrap {
+                    @match &row.value {
+                        ValueState::Masked => code { "********" },
+                        ValueState::Plain(v) => code { (v) },
+                        ValueState::NotSet => span .text-muted { "(not set)" },
+                    }
+                }
+                @if row.show_default {
+                    @match row.default {
+                        Some(d) if !d.is_empty() => span .var-cell__note .cell-wrap {
+                            "Default: " code { (d) }
+                        },
+                        _ => @if row.auto_generate {
+                            span .var-cell__note {
+                                (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { "auto-generated" }))
+                            }
+                        },
                     }
                 }
             }
         },
+        // All three controls share the final cell: the cells are columns
+        // against `VAR_COLUMNS`, so a conditional extra cell would misalign
+        // every row that has no delete control against every row that does.
         html! {
-            span .text-13 {
-                @match &row.value {
-                    ValueState::Masked => code { "********" },
-                    ValueState::Plain(v) => code { (v) },
-                    ValueState::NotSet => span .text-muted { "(not set)" },
+            div .flex .gap-1 {
+                button .btn .btn--sm .btn--ghost
+                    hx-get={"/b/admin/variables/" (row.key) "/edit"}
+                    hx-target="#edit-var-modal"
+                    hx-swap="innerHTML"
+                    title="Edit"
+                    aria-label=(format!("Edit {}", row.key))
+                { (icons::edit()) }
+                @if row.pin.is_some() && row.offer_reset && key_can_be_seeded_from_env(row.key) {
+                    (reset_to_environment_button(row.key))
+                }
+                @if row.deletable {
+                    (delete_button(row.key))
                 }
             }
         },
-    ];
-    if row.show_default {
-        cells.push(html! {
-            span .text-xs {
-                @match row.default {
-                    Some(d) if !d.is_empty() => code .text-muted { (d) },
-                    _ => @if row.auto_generate {
-                        (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { "auto-generated" }))
-                    },
-                }
+    ]
+}
+
+/// The first cell of every variable table: the key, then what an operator
+/// reads to recognise it — the declared friendly name, the description, the
+/// badge saying why the row outranks the environment, and any warning.
+fn variable_cell(
+    key: &str,
+    name: Option<&str>,
+    description: &str,
+    pin: Option<variables::Pin>,
+    warning: &str,
+) -> Markup {
+    html! {
+        div .var-cell {
+            code .var-cell__key .cell-wrap { (key) }
+            @if let Some(name) = name.filter(|name| !name.is_empty()) {
+                span .var-cell__name { (name) }
             }
-        });
+            @if !description.is_empty() {
+                span .var-cell__note { (description) }
+            }
+            @if let Some(pin) = pin {
+                span .var-cell__note { (pin_badge(pin)) }
+            }
+            @if !warning.is_empty() {
+                span .var-warning-note { "Warning: " (warning) }
+            }
+        }
     }
-    cells.push(html! {
-        span .text-xs {
-            (row.description)
-            @if let Some(pin) = row.pin {
-                div .mt-1 { (pin_badge(pin)) }
-            }
-            @if !row.warning.is_empty() {
-                div .var-warning-note {
-                    "Warning: " (row.warning)
-                }
-            }
-        }
-    });
-    // All three controls share the final cell: the cells are columns against
-    // `VAR_COLUMNS`, so a conditional extra cell would misalign every row
-    // that has no delete control against every row that does.
-    cells.push(html! {
-        div .flex .gap-1 {
-            button .btn .btn--sm .btn--ghost
-                hx-get={"/b/admin/variables/" (row.key) "/edit"}
-                hx-target="#edit-var-modal"
-                hx-swap="innerHTML"
-                title="Edit"
-                aria-label=(format!("Edit {}", row.key))
-            { (icons::edit()) }
-            @if row.pin.is_some() && row.offer_reset && key_can_be_seeded_from_env(row.key) {
-                (reset_to_environment_button(row.key))
-            }
-            @if row.deletable {
-                (delete_button(row.key))
-            }
-        }
-    });
-    cells
 }
 
 /// What the per-block tables need from a stored row: the columns they render
@@ -323,20 +338,15 @@ fn config_var_row(
     })
 }
 
-/// Render a titled card wrapping a variable table. `show_default` selects the
-/// column list carrying the "Default" column, to match [`var_row`]'s cells.
-fn var_table(header: Markup, show_default: bool, rows: Vec<Vec<Markup>>) -> Markup {
-    let columns: &[components::TableCol<'static>] = if show_default {
-        &VAR_COLUMNS_WITH_DEFAULT
-    } else {
-        &VAR_COLUMNS
-    };
+/// Render a titled card wrapping a variable table. `header` is the card's
+/// `.card__head` content: the title, and the access line beneath it.
+fn var_table(header: Markup, rows: Vec<Vec<Markup>>) -> Markup {
     html! {
-        div .card .mt-4 {
-            (header)
+        section .card .mt-4 {
+            header .card__head { (header) }
             div .card__body {
                 (components::data_table::<fn(usize) -> Option<String>>(
-                    columns,
+                    &VAR_COLUMNS,
                     rows,
                     None,
                     html! {},
@@ -346,20 +356,16 @@ fn var_table(header: Markup, show_default: bool, rows: Vec<Vec<Markup>>) -> Mark
     }
 }
 
-/// The variable tables' columns, in the two shapes [`var_row`] emits. The
-/// last column is the one that only carries the edit control; it keeps the
-/// 50px width the old `th .w-50` gave it.
-const VAR_COLUMNS: [components::TableCol<'static>; 4] = [
+/// The variable tables' columns, the three [`var_row`] emits. The last column
+/// only carries the controls; it keeps the 50px width the old `th .w-50` gave
+/// it.
+const VAR_COLUMNS: [components::TableCol<'static>; 3] = [
     components::TableCol {
-        label: "Key",
+        label: "Variable",
         width: None,
     },
     components::TableCol {
         label: "Value",
-        width: None,
-    },
-    components::TableCol {
-        label: "Description",
         width: None,
     },
     components::TableCol {
@@ -368,42 +374,15 @@ const VAR_COLUMNS: [components::TableCol<'static>; 4] = [
     },
 ];
 
-const VAR_COLUMNS_WITH_DEFAULT: [components::TableCol<'static>; 5] = [
+/// The "All Variables" tab's columns — the same shape as [`VAR_COLUMNS`], with
+/// an explicitly labelled actions column.
+const ALL_VAR_COLUMNS: [components::TableCol<'static>; 3] = [
     components::TableCol {
-        label: "Key",
+        label: "Variable",
         width: None,
     },
     components::TableCol {
         label: "Value",
-        width: None,
-    },
-    components::TableCol {
-        label: "Default",
-        width: None,
-    },
-    components::TableCol {
-        label: "Description",
-        width: None,
-    },
-    components::TableCol {
-        label: "",
-        width: Some("50px"),
-    },
-];
-
-/// The "All Variables" tab's columns — a flatter listing than the per-block
-/// tables, with an explicitly labelled actions column.
-const ALL_VAR_COLUMNS: [components::TableCol<'static>; 4] = [
-    components::TableCol {
-        label: "Key",
-        width: None,
-    },
-    components::TableCol {
-        label: "Value",
-        width: None,
-    },
-    components::TableCol {
-        label: "Description",
         width: None,
     },
     components::TableCol {
@@ -606,24 +585,13 @@ fn config_all_tab(rows: &[variables::VariableRow], offer_reset: bool) -> Markup 
             // flag alone.
             let masked = ops::is_sensitive_key(key, i64::from(row.sensitive));
             components::TableRow::new(vec![
-                html! { span .font-medium { (key) } },
+                variable_cell(key, None, description, variables::pin_of(row), warning),
                 html! {
-                    @if masked {
-                        code { "********" }
-                    } @else {
-                        code { (row.value) }
-                    }
-                },
-                html! {
-                    @if !description.is_empty() {
-                        span .text-muted { (description) }
-                    }
-                    @if let Some(pin) = variables::pin_of(row) {
-                        div .mt-1 { (pin_badge(pin)) }
-                    }
-                    @if !warning.is_empty() {
-                        div .text-warning-strong .text-xs .mt-1 {
-                            (ui::icons::triangle_alert()) (warning)
+                    span .text-13 .cell-wrap {
+                        @if masked {
+                            code { "********" }
+                        } @else {
+                            code { (row.value) }
                         }
                     }
                 },
@@ -737,17 +705,16 @@ fn config_by_block_tab(
         @if !shared_vars.is_empty() {
             (var_table(
                 html! {
-                    div .card-header {
-                        h3 .card-title {
+                    div {
+                        h3 .card__title {
                             (Badge::new(BadgeVariant::Warning).classes("mr-2").render(html! { "shared" }))
                             " Shared Platform Config"
                         }
-                        p .text-muted .text-xs {
+                        p .card__subtitle {
                             "Any block can read. Only admin can write."
                         }
                     }
                 },
-                true,
                 shared_vars.iter().map(|var| config_var_row(var, &var_map, offer_reset)).collect(),
             ))
         }
@@ -756,8 +723,8 @@ fn config_by_block_tab(
         @for block in &blocks_with_config {
             (var_table(
                 html! {
-                    div .card-header {
-                        h3 .card-title {
+                    div {
+                        h3 .card__title {
                             (Badge::new(BadgeVariant::Info).classes("mr-2").render(html! { (block.name) }))
                             " Configuration"
                         }
@@ -765,7 +732,7 @@ fn config_by_block_tab(
                         // grants are looked up by exact resource pattern via the
                         // `grants_by_resource` map built above — used to be a
                         // cubic `blocks × grants × config_keys` loop per render.
-                        p .text-muted .text-xs {
+                        p .card__subtitle {
                             "Owner: " code { (block.name) }
                             " \u{2014} Admin can read/write all. "
                             @for ck in &block.config_keys {
@@ -789,7 +756,6 @@ fn config_by_block_tab(
                         }
                     }
                 },
-                true,
                 block.config_keys.iter().map(|var| config_var_row(var, &var_map, offer_reset)).collect(),
             ))
         }
@@ -801,17 +767,16 @@ fn config_by_block_tab(
         @if !unowned_vars.is_empty() {
             (var_table(
                 html! {
-                    div .card-header {
-                        h3 .card-title {
+                    div {
+                        h3 .card__title {
                             (Badge::new(BadgeVariant::Secondary).classes("mr-2").render(html! { "unowned" }))
                             " Unowned Variables"
                         }
-                        p .text-muted .text-xs {
+                        p .card__subtitle {
                             "Variables in the database not declared by any block. These may be legacy or manually created."
                         }
                     }
                 },
-                false,
                 unowned_vars.iter().map(|row| {
                     let key = row.key.as_str();
                     // SEC-060: mask via the shared rule. `track_unset` is
