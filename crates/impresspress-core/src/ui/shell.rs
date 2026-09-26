@@ -165,6 +165,7 @@ mod tests {
             icon: crate::ui::icons::package,
             external: false,
             block: None,
+            section: None,
         }
     }
 
