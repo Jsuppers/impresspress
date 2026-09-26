@@ -28,12 +28,18 @@
 //! reach them — and writes the row with a handle that may use them. However
 //! the request spends its budget, its audit row still fits.
 //!
+//! When the request-log policy is `off` no row is written, and
+//! [`audit_row_reservation`] reserves nothing.
+//!
 //! What a deferred task needs is not known up front (a mail send reads the
 //! email block's settings and writes its log), so nothing is reserved for
-//! it. A task runs under its own request's services, on whatever that
-//! request left; every handler that defers does so as its last act, after
-//! one account lookup, so a task has nearly the whole limit — and no other
-//! request can spend it.
+//! it. A task runs under its own request's services, after the audit row is
+//! written and the reservation released, on everything the request and its
+//! row left — and no other request can spend that. How much that is depends
+//! on the handler: forgot-password and resend-verification defer after one
+//! account lookup; signup defers after its settings reads and the
+//! multi-statement account insert, so its verification mail runs on what
+//! those left, which on Workers Free's 50 is still most of the limit.
 
 use std::{
     collections::HashMap,
@@ -55,6 +61,18 @@ use crate::{deferred::DeferredTask, IsolateCell};
 /// only the insert. A column the table lacks would add an `ALTER` each; the
 /// table's migration creates every column the row names, so none is counted.
 pub const AUDIT_ROW_STATEMENTS: u64 = 4;
+
+/// The statements to reserve for a request's audit row under the
+/// request-log policy `policy` (the raw
+/// [`crate::config_vars::REQUEST_LOG_CONFIG_KEY`] value): none when the policy
+/// writes no rows, [`AUDIT_ROW_STATEMENTS`] otherwise.
+pub fn audit_row_reservation(policy: Option<&str>) -> u64 {
+    if crate::pipeline::RequestLogPolicy::parse(policy).writes_rows() {
+        AUDIT_ROW_STATEMENTS
+    } else {
+        0
+    }
+}
 
 /// One queued audit row (table + column map), ready for
 /// `DatabaseService::create_many`.
@@ -88,16 +106,6 @@ impl AfterResponse {
     /// Take every task the request deferred, in the order it deferred them.
     pub fn take_tasks(&self) -> Vec<DeferredTask> {
         self.tasks.take().unwrap_or_default()
-    }
-
-    /// How many deferred tasks are waiting.
-    pub fn pending_tasks(&self) -> usize {
-        let tasks = self.tasks.take();
-        let n = tasks.as_ref().map_or(0, Vec::len);
-        if let Some(tasks) = tasks {
-            self.tasks.set(tasks);
-        }
-        n
     }
 }
 
@@ -309,6 +317,21 @@ mod tests {
             queue_audit_row(row("outside")).is_err(),
             "outside a request the row comes back to be inserted"
         );
+    }
+
+    /// A request whose policy writes no rows reserves nothing; every other
+    /// policy reserves the row's statements.
+    #[test]
+    fn only_a_policy_that_writes_rows_reserves_for_one() {
+        assert_eq!(audit_row_reservation(Some("off")), 0);
+        assert_eq!(audit_row_reservation(Some(" off ")), 0);
+        for policy in [None, Some("all"), Some("errors"), Some("typo")] {
+            assert_eq!(
+                audit_row_reservation(policy),
+                AUDIT_ROW_STATEMENTS,
+                "{policy:?}"
+            );
+        }
     }
 
     /// The slot holds the one row the reservation covers: a second row from

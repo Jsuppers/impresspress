@@ -75,14 +75,17 @@ and signs every user out, once.
   fit what the request has left is refused before it runs, as a 429 whose
   message gives the numbers, instead of failing part-way inside D1. The limit
   is the new Worker var `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, default
-  `1000` (Workers Paid). A value that is not a whole number of at least 1
-  fails every request with an error naming the var. That 429 means the
+  `1000` (Workers Paid). A value that is not a whole number from 5 (one more
+  than the audit-row reservation below) to 1000, D1's maximum, fails every
+  request with an error naming the var, however it was set. That 429 means the
   request did too much: retrying it does the same work and is refused again.
 - Of that limit, each request holds 4 queries back for its own
   `request_logs` row, written after the response, so the row is written
   however much of the budget the request spent: a request's handlers can run
-  46 of Free's 50, 996 of Paid's 1000. The row, and any mail a request sends
-  after its response, run under that request's own budget. Before, a
+  46 of Free's 50, 996 of Paid's 1000. With `IMPRESSPRESS_REQUEST_LOG=off`
+  nothing is held back. The row, and then any mail the request sends after
+  its response (on everything the row left), run under that request's own
+  budget. Before, a
   request wrote the rows and ran the deferred mail of whichever concurrent
   requests had finished before it, charged to its own budget, and lost them
   when that budget was spent.
@@ -112,8 +115,8 @@ or the budget will admit writes D1 then refuses part-way. The generated
 `wrangler.toml` writes it into `[vars]` as
 `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` (`"1000"` when unset); a value set
 through a `wrangler_overrides_path` file still wins, since overrides are
-merged over the generated config. A value above 1000, D1's maximum, fails
-the build. The budget counts D1 queries only, which Cloudflare limits per
+merged over the generated config. A value outside 5 to 1000 fails the
+build, and the Worker refuses one set through an overrides file too. The budget counts D1 queries only, which Cloudflare limits per
 invocation on their own (50 Free, 1,000 Paid). KV and R2 operations are
 subrequests to internal services, a separate limit (1,000 per invocation on
 Free) that the budget neither counts nor spends

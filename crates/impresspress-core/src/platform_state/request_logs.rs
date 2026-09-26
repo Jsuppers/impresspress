@@ -4,8 +4,9 @@
 //!
 //! The pipeline's row ([`NewRequestLog`], borrowed because it is built on
 //! the hot path) and its [`NewRequestLog::to_data`] are the only writer; the
-//! inline/queued switch stays in `pipeline.rs`, which hands the queued row
-//! [`TABLE`] and the map for the platform drain to persist. The readers own
+//! inline/queued switch stays in `pipeline.rs`, which hands a queued row's
+//! [`TABLE`] and map to the request's `after_response` scope, for the
+//! platform to write after the response. The readers own
 //! the list and aggregate shapes the three pages used to build by hand, and
 //! return typed rows and summaries so an alias column is spelled once.
 

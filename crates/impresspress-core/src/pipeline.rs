@@ -845,12 +845,17 @@ impl RequestLogPolicy {
     /// string and an absent key — is [`RequestLogPolicy::All`], so a typo
     /// degrades to today's behaviour rather than silently disabling the audit
     /// trail.
-    fn parse(raw: Option<&str>) -> Self {
+    pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(str::trim).unwrap_or_default() {
             "errors" => Self::Errors,
             "off" => Self::Off,
             _ => Self::All,
         }
+    }
+
+    /// Whether this policy writes any row at all.
+    pub fn writes_rows(self) -> bool {
+        self != Self::Off
     }
 
     fn keeps(self, status_code: i64) -> bool {

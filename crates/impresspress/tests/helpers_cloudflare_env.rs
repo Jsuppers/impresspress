@@ -386,8 +386,9 @@ fn release_assets_exclude_globs_are_compiled_and_kept() {
 
 /// `[cloudflare].d1_queries_per_invocation` is the plan's D1 query limit:
 /// unset is Workers Paid's 1000, a stated number up to 1000 is taken as it
-/// is, and 0 — which the Worker would refuse on every request — or anything
-/// above D1's documented maximum of 1000 is refused here instead.
+/// is, and 0 — at or below the audit-row reservation, which the Worker would
+/// refuse on every request — or anything above D1's documented maximum of
+/// 1000 is refused here instead.
 #[test]
 fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_out_of_range() {
     let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
@@ -422,7 +423,13 @@ fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_out_of_range()
         .resolve(fake_env(&[]))
         .expect_err("D1 runs at most 1000 queries per invocation")
         .to_string();
-    assert!(err.contains("above D1's maximum of 1000"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "from {} to 1000",
+            impresspress_core::config_vars::D1_QUERIES_PER_INVOCATION_MIN
+        )),
+        "{err}"
+    );
 
     let max = FULL_TOML.replace(
         "compatibility_date = \"2026-05-01\"\n",

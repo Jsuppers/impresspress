@@ -44,10 +44,12 @@
 //! thread-local.
 //!
 //! A request's own services report D1's limit less the statements its
-//! [`D1QueryCount`] holds back for the request's audit row
-//! (`impresspress_core::after_response::AUDIT_ROW_STATEMENTS`); the row is
-//! written afterwards through a [`D1QueryCount::released`] handle that may use
-//! them, so it fits however the request spent its budget.
+//! [`D1QueryCount`] reserves for the request's audit row
+//! (`impresspress_core::after_response::AUDIT_ROW_STATEMENTS`, none when the
+//! request-log policy is `off`); the row is written afterwards through a
+//! [`D1QueryCount::for_reserved_work`] handle that may use them, so it fits
+//! however the request spent its budget. Then the reservation is released,
+//! and the request's deferred tasks run on everything the row left.
 //!
 //! The budget counts D1 queries and nothing else. Cloudflare limits D1 queries
 //! per Worker invocation on their own: 50 on Workers Free, 1,000 on Paid (D1's
@@ -129,8 +131,8 @@
 //!   an `Init`: the audit-row write's handle, built per request inside
 //!   `run_with_config` and used from `ctx.wait_until`, and the handle
 //!   `build_runtime` reads `block_settings` through before a runtime exists.
-//!   Neither is ever handed to `set_strict_schema`, so without the seeding a
-//!   drain-only site would run the lazy column-add path on every insert batch,
+//!   Neither is ever handed to `set_strict_schema`, so without the seeding the
+//!   audit-row write would run the lazy column-add path on every insert,
 //!   whatever the deploy configured.
 //!
 //! The cache is the **isolate's**, not the service's ([`isolate_schema_cache`]),
@@ -226,8 +228,7 @@ pub(crate) fn forget_isolate_schema() {
 
 /// The D1 statements one Worker invocation has sent, shared by every
 /// [`D1DatabaseService`] built in that invocation (see the module docs), and
-/// how many of the invocation's statements the services built from this
-/// handle must leave unused.
+/// the statements of the invocation's limit reserved for its audit row.
 ///
 /// Create one at the Worker entry, once per `fetch` or `scheduled`
 /// invocation, and hand a clone to each service built while serving it: the
@@ -237,40 +238,68 @@ pub(crate) fn forget_isolate_schema() {
 /// between two: an isolate interleaves concurrent requests, and each has its
 /// own limit.
 ///
-/// [`holding_back`](Self::holding_back) reserves statements for work that
-/// must fit however the request spends its budget (its audit row), and
-/// [`released`](Self::released) is the handle that work is written with.
+/// [`reserve`](Self::reserve) holds statements back from every service built
+/// from this count, so the request cannot spend them however it spends its
+/// budget; [`for_reserved_work`](Self::for_reserved_work) is the handle the
+/// audit row is written with, which may use them; and
+/// [`release_reservation`](Self::release_reservation) hands whatever the row
+/// did not use back to everything else once it is written or skipped.
 #[derive(Clone, Default)]
 pub struct D1QueryCount {
     sent: Rc<Cell<u64>>,
-    held_back: u64,
+    reserved: Rc<Cell<u64>>,
+    spends_reservation: bool,
 }
 
 impl D1QueryCount {
-    /// A fresh count for a new invocation, holding nothing back.
+    /// A fresh count for a new invocation, reserving nothing.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// This invocation's count, for services that must leave `statements` of
-    /// the invocation's limit unused: they report a limit that much lower
-    /// and refuse any statement past it.
-    pub fn holding_back(&self, statements: u64) -> Self {
-        Self {
-            sent: Rc::clone(&self.sent),
-            held_back: statements,
-        }
+    /// Hold `statements` of the invocation's limit back from every service
+    /// built from this count, other than [`for_reserved_work`] handles: they
+    /// report a limit that much lower and refuse any statement past it.
+    ///
+    /// [`for_reserved_work`]: Self::for_reserved_work
+    pub fn reserve(&self, statements: u64) {
+        self.reserved.set(statements);
     }
 
-    /// This invocation's count with nothing held back: the handle for the
-    /// work the held-back statements are reserved for.
-    pub fn released(&self) -> Self {
-        self.holding_back(0)
+    /// Give the reservation back: every service built from this count may
+    /// use the invocation's whole limit again, less what has been sent.
+    pub fn release_reservation(&self) {
+        self.reserved.set(0);
+    }
+
+    /// This invocation's count, for the work the reservation is for: services
+    /// built from it see the invocation's whole limit.
+    pub fn for_reserved_work(&self) -> Self {
+        Self {
+            spends_reservation: true,
+            ..self.clone()
+        }
     }
 
     /// Statements sent in this invocation so far, through every handle.
     pub fn sent(&self) -> u64 {
         self.sent.get()
+    }
+
+    /// The statements currently reserved, for a test that checks when the
+    /// reservation is released.
+    #[cfg(test)]
+    pub(crate) fn reserved_for_test(&self) -> u64 {
+        self.reserved.get()
+    }
+
+    /// The statements a service built from this handle must leave unused.
+    fn held_back(&self) -> u64 {
+        if self.spends_reservation {
+            0
+        } else {
+            self.reserved.get()
+        }
     }
 
     fn add(&self, statements: usize) {
@@ -436,7 +465,7 @@ impl DbExec for D1DatabaseService {
     /// sent through every D1 service sharing its [`D1QueryCount`].
     fn statement_budget(&self) -> Result<StatementBudget, DatabaseError> {
         Ok(StatementBudget::Limited {
-            limit: self.query_limit.saturating_sub(self.queries.held_back),
+            limit: self.query_limit.saturating_sub(self.queries.held_back()),
             used: self.queries.sent(),
         })
     }
@@ -1406,6 +1435,17 @@ mod tests {
         answer: BatchAnswer,
         batches: Rc<std::cell::RefCell<Vec<Vec<String>>>>,
     ) -> D1Database {
+        batching_d1_with_columns(answer, batches, &[])
+    }
+
+    /// [`batching_d1`] whose lone-statement `all()` — the executor's column
+    /// list, `SELECT name, type AS decl_type FROM pragma_table_info(?1)` —
+    /// answers `columns`, each declared `TEXT`, as a migrated table would.
+    fn batching_d1_with_columns(
+        answer: BatchAnswer,
+        batches: Rc<std::cell::RefCell<Vec<Vec<String>>>>,
+        columns: &'static [&'static str],
+    ) -> D1Database {
         use wasm_bindgen::{closure::Closure, JsCast};
 
         let db = js_sys::Object::new();
@@ -1422,18 +1462,32 @@ mod tests {
             .expect("set bind");
             bind.forget();
             // A lone statement's `all()`: the executor's one read of a table's
-            // declared column types (which columns hold JSON). It answers no
-            // columns, so every value is written and read as it is.
+            // columns and their declared types (which hold JSON). It answers
+            // `columns`, all `TEXT`, so every value is written and read as it
+            // is.
             let all = Closure::<dyn Fn() -> js_sys::Promise>::new(move || {
                 let result = js_sys::Object::new();
                 js_sys::Reflect::set(&result, &JsValue::from_str("success"), &JsValue::TRUE)
                     .expect("set success");
-                js_sys::Reflect::set(
-                    &result,
-                    &JsValue::from_str("results"),
-                    &js_sys::Array::new(),
-                )
-                .expect("set results");
+                let rows = js_sys::Array::new();
+                for column in columns {
+                    let row = js_sys::Object::new();
+                    js_sys::Reflect::set(
+                        &row,
+                        &JsValue::from_str("name"),
+                        &JsValue::from_str(column),
+                    )
+                    .expect("set name");
+                    js_sys::Reflect::set(
+                        &row,
+                        &JsValue::from_str("decl_type"),
+                        &JsValue::from_str("TEXT"),
+                    )
+                    .expect("set decl_type");
+                    rows.push(&row);
+                }
+                js_sys::Reflect::set(&result, &JsValue::from_str("results"), &rows)
+                    .expect("set results");
                 js_sys::Promise::resolve(&JsValue::from(result))
             });
             js_sys::Reflect::set(
@@ -1888,62 +1942,146 @@ mod tests {
     }
 
     /// **The audit row always fits.** A request's own services leave the
-    /// statements held back for its audit row unused — every statement past
-    /// D1's limit less the hold-back is refused before it reaches D1, not only
-    /// multi-statement writes — so however the request spends its budget, the
-    /// released handle still writes the row, from a cold schema cache, within
-    /// [`AUDIT_ROW_STATEMENTS`] statements. Under STRICT_SCHEMA, which every
-    /// generated config sets: this fake D1 answers every column list empty,
-    /// so without it the lazy column-add would `ALTER` in each column a
-    /// migrated table already has.
+    /// statements reserved for its audit row unused — every statement past
+    /// D1's limit less the reservation is refused before it reaches D1, not
+    /// only multi-statement writes — so however the request spends its
+    /// budget, the reserved-work handle still writes the row, from a cold
+    /// schema cache, within [`AUDIT_ROW_STATEMENTS`] statements. Both with
+    /// STRICT_SCHEMA (every generated config) and without it, against a fake
+    /// D1 that lists the table's real columns, so a probe added to either
+    /// path that the reservation does not cover fails here.
     ///
     /// [`AUDIT_ROW_STATEMENTS`]: impresspress_core::after_response::AUDIT_ROW_STATEMENTS
     #[wasm_bindgen_test]
     async fn a_request_that_spends_its_budget_still_has_room_for_its_audit_row() {
         use impresspress_core::after_response::AUDIT_ROW_STATEMENTS;
         const LIMIT: u64 = 10;
-        let strict_schema = true;
+        for strict_schema in [true, false] {
+            let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let d1 = || {
+                batching_d1_with_columns(
+                    BatchAnswer::Succeed,
+                    Rc::clone(&batches),
+                    // `impresspress__admin__request_logs` as the admin block's
+                    // migration 001 creates it.
+                    &[
+                        "id",
+                        "flow_id",
+                        "method",
+                        "path",
+                        "status",
+                        "status_code",
+                        "duration_ms",
+                        "error_message",
+                        "client_ip",
+                        "user_id",
+                        "created_at",
+                        "updated_at",
+                    ],
+                )
+            };
+            let queries = D1QueryCount::new();
+            queries.reserve(AUDIT_ROW_STATEMENTS);
+            forget_isolate_schema();
+            let request = D1DatabaseService::new(d1(), strict_schema, "DB", queries.clone(), LIMIT);
+            let ran = spend_everything(&request).await;
+            assert_eq!(ran, LIMIT - AUDIT_ROW_STATEMENTS, "strict={strict_schema}");
+            assert_eq!(queries.sent(), ran, "the refused statement was not sent");
+
+            let audit = D1DatabaseService::new(
+                d1(),
+                strict_schema,
+                "DB",
+                queries.for_reserved_work(),
+                LIMIT,
+            );
+            // The row exactly as the pipeline queues it.
+            let row = impresspress_core::platform_state::request_logs::NewRequestLog {
+                method: "GET",
+                path: "/",
+                status_code: 200,
+                error_message: "",
+                duration_ms: 1,
+                client_ip: "203.0.113.1",
+                user_id: "",
+            }
+            .to_data();
+            DatabaseService::create_many(
+                &audit,
+                impresspress_core::platform_state::request_logs::TABLE,
+                vec![row],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("strict={strict_schema}: the row fits: {e:?}"));
+            assert!(
+                queries.sent() - ran <= AUDIT_ROW_STATEMENTS,
+                "strict={strict_schema}: the row took {} statements",
+                queries.sent() - ran
+            );
+            assert_eq!(batches.borrow().len(), 1, "the row reached D1");
+        }
+    }
+
+    /// Run `SELECT 1` through `svc` until it is refused; the statements that
+    /// ran. The refusal must be the budget's.
+    async fn spend_everything(svc: &D1DatabaseService) -> u64 {
+        let mut ran = 0;
+        loop {
+            match DatabaseService::query_raw(svc, "SELECT 1", &[]).await {
+                Ok(_) => ran += 1,
+                Err(err) => {
+                    assert!(
+                        matches!(err, DatabaseError::ResourceExhausted(_)),
+                        "{err:?}"
+                    );
+                    return ran;
+                }
+            }
+            assert!(ran <= 1000, "never refused");
+        }
+    }
+
+    /// **What the row leaves goes to the deferred tasks.** Once the audit row
+    /// is written and the reservation released, the request's own services —
+    /// which its deferred tasks run under — may use the invocation's whole
+    /// limit less everything sent, the row's statements included, and not a
+    /// limit still lowered by the reservation.
+    #[wasm_bindgen_test]
+    async fn a_released_reservation_goes_back_to_the_request() {
+        use impresspress_core::after_response::AUDIT_ROW_STATEMENTS;
+        const LIMIT: u64 = 10;
         let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
         let queries = D1QueryCount::new();
+        queries.reserve(AUDIT_ROW_STATEMENTS);
         forget_isolate_schema();
         let request = D1DatabaseService::new(
             batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
-            strict_schema,
+            true,
             "DB",
-            queries.holding_back(AUDIT_ROW_STATEMENTS),
+            queries.clone(),
             LIMIT,
         );
-        let mut ran = 0;
-        let refusal = loop {
-            match DatabaseService::query_raw(&request, "SELECT 1", &[]).await {
-                Ok(_) => ran += 1,
-                Err(err) => break err,
-            }
-            assert!(ran <= LIMIT, "the request was never refused");
-        };
-        assert_eq!(ran, LIMIT - AUDIT_ROW_STATEMENTS);
-        assert!(
-            matches!(refusal, DatabaseError::ResourceExhausted(_)),
-            "{refusal:?}"
-        );
-        assert_eq!(queries.sent(), ran, "the refused statement was not sent");
-
+        let spent = spend_everything(&request).await;
         let audit = D1DatabaseService::new(
             batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
-            strict_schema,
+            true,
             "DB",
-            queries.released(),
+            queries.for_reserved_work(),
             LIMIT,
         );
         DatabaseService::create_many(&audit, "request_logs", rows(1))
             .await
-            .unwrap_or_else(|e| panic!("strict={strict_schema}: the row fits: {e:?}"));
-        assert!(
-            queries.sent() - ran <= AUDIT_ROW_STATEMENTS,
-            "strict={strict_schema}: the row took {} statements",
-            queries.sent() - ran
+            .expect("the row fits");
+        let row = queries.sent() - spent;
+        assert!(row < AUDIT_ROW_STATEMENTS, "a room left over for this test");
+
+        queries.release_reservation();
+        let task = spend_everything(&request).await;
+        assert_eq!(
+            task,
+            LIMIT - spent - row,
+            "the task may use everything the request and its row left"
         );
-        assert_eq!(batches.borrow().len(), 1, "the row reached D1");
     }
 
     /// **Two requests interleaved in one isolate count separately.** Each

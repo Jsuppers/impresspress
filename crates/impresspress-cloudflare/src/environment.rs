@@ -384,8 +384,9 @@ impl CfEnvironment {
     /// `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, or
     /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`] when it is unbound.
     ///
-    /// A bound value that is not a whole number of at least 1 is an error
-    /// naming the var, not the default: a Free-plan deploy that mistyped `50`
+    /// A bound value out of
+    /// [`parse_d1_queries_per_invocation`](impresspress_core::config_vars::parse_d1_queries_per_invocation)'s
+    /// range is an error naming the var, not the default: a Free-plan deploy that mistyped `50`
     /// would otherwise run with the Paid limit and meet D1's own refusal
     /// part-way through a write instead of the budget's up front.
     pub(crate) fn d1_queries_per_invocation(&self) -> Result<u64, String> {
@@ -933,10 +934,11 @@ mod tests {
         );
     }
 
-    /// The D1 query limit: unset is Workers Paid's 1000, a bound number is
-    /// taken as it is (a Free-plan deploy's 50), and anything that is not a
-    /// whole number of at least 1 is an error naming the var rather than a
-    /// silent fallback to the Paid limit.
+    /// The D1 query limit: unset is Workers Paid's 1000, a bound number in
+    /// range is taken as it is (a Free-plan deploy's 50), and anything else —
+    /// not a whole number, at or below the audit-row reservation, above D1's
+    /// maximum — is an error naming the var rather than a silent fallback to
+    /// the Paid limit.
     #[wasm_bindgen_test]
     fn the_d1_query_limit_defaults_to_paid_and_refuses_a_malformed_value() {
         let unbound = RecordingEnv::new(&[]);
@@ -944,7 +946,7 @@ mod tests {
             CfEnvironment::capture(&unbound.env).d1_queries_per_invocation(),
             Ok(D1_QUERIES_PER_INVOCATION_DEFAULT)
         );
-        for (raw, limit) in [("50", 50), (" 50 ", 50), ("1000", 1000), ("1", 1)] {
+        for (raw, limit) in [("50", 50), (" 50 ", 50), ("1000", 1000)] {
             let env = RecordingEnv::new(&[(D1_QUERIES_PER_INVOCATION_KEY, raw)]);
             assert_eq!(
                 CfEnvironment::capture(&env.env).d1_queries_per_invocation(),
@@ -952,7 +954,11 @@ mod tests {
                 "{raw:?}"
             );
         }
-        for raw in ["", "0", "-5", "5O", "fifty", "50.5"] {
+        // Refused from the var itself, not only by the CLI: a
+        // `wrangler_overrides_path` file sets it past the CLI's check. At or
+        // below the audit-row reservation, or above D1's maximum of 1000.
+        let reservation = impresspress_core::after_response::AUDIT_ROW_STATEMENTS.to_string();
+        for raw in ["", "0", "-5", "5O", "fifty", "50.5", "1001", &reservation] {
             let env = RecordingEnv::new(&[(D1_QUERIES_PER_INVOCATION_KEY, raw)]);
             let err = CfEnvironment::capture(&env.env)
                 .d1_queries_per_invocation()

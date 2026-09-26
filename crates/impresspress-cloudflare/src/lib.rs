@@ -109,7 +109,7 @@ pub mod storage;
 use std::{collections::HashMap, sync::Arc};
 
 use impresspress_core::{
-    after_response::{self, AfterResponse, AUDIT_ROW_STATEMENTS},
+    after_response::{self, AfterResponse},
     builder::ImpresspressBuilder,
 };
 pub use services::{
@@ -356,41 +356,56 @@ where
     // Isolate-scoped init — no-op after the first call; consumers with an
     // #[event(start)] handler have already run it.
     init_isolate();
-    // The request's own services — its handlers and the tasks they defer —
-    // leave the statements its audit row needs unused; the row is written
-    // below with the released handle (see `impresspress_core::after_response`).
-    let request_queries = queries.holding_back(AUDIT_ROW_STATEMENTS);
+    // The request's own services leave the statements its audit row needs
+    // unused (none when the policy writes no rows); the row is written below
+    // with a handle that may use them, and then they go to the request's
+    // deferred tasks (see `impresspress_core::after_response`).
+    queries.reserve(after_response::audit_row_reservation(
+        environment.config_value(impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY),
+    ));
     let after = AfterResponse::new();
+    let deferred: std::rc::Rc<std::cell::RefCell<Vec<BoxedTask>>> = std::rc::Rc::default();
+    let collect = std::rc::Rc::clone(&deferred);
     let result = run_inner(
         req,
         &env,
         &environment,
-        &request_queries,
+        &queries,
         &request_config,
         register_blocks,
         register_post_build,
         &after,
-        &|task| ctx.wait_until(task),
+        &move |task| collect.borrow_mut().push(task),
     )
     .await;
 
-    // Write this request's audit row off the response path, through a D1
-    // handle derived from THIS request's Env, from the statements held back
-    // for it: the request cannot have spent them.
-    if let Some(row) = after.take_audit_row() {
-        match make_d1_database_service_concrete(
-            &env,
-            &environment,
-            runner::D1_BINDING,
-            &queries.released(),
-        ) {
-            Ok(db) => ctx.wait_until(async move {
-                if let Err(failure) = after_response::persist_audit_row(db.as_ref(), row).await {
-                    log_audit_row_not_written(failure.table, &failure.error);
+    // This request's post-response work, in one `wait_until`: its audit row
+    // first, through a D1 handle derived from THIS request's Env and allowed
+    // the reserved statements, then its deferred tasks on whatever the row
+    // left.
+    let audit_write =
+        after.take_audit_row().and_then(|row| {
+            match make_d1_database_service_concrete(
+                &env,
+                &environment,
+                runner::D1_BINDING,
+                &queries.for_reserved_work(),
+            ) {
+                Ok(db) => Some(Box::pin(async move {
+                    if let Err(failure) = after_response::persist_audit_row(db.as_ref(), row).await
+                    {
+                        log_audit_row_not_written(failure.table, &failure.error);
+                    }
+                }) as BoxedTask),
+                Err(e) => {
+                    log_audit_row_not_written(row.table, &e.to_string());
+                    None
                 }
-            }),
-            Err(e) => log_audit_row_not_written(row.table, &e.to_string()),
-        }
+            }
+        });
+    let tasks = std::mem::take(&mut *deferred.borrow_mut());
+    if audit_write.is_some() || !tasks.is_empty() {
+        ctx.wait_until(after_response_work(audit_write, queries.clone(), tasks));
     }
 
     retry_pending_config_version(&env, |task| ctx.wait_until(task));
@@ -420,6 +435,23 @@ where
             )
         }
     }
+}
+
+/// A request's post-response work in the order its budget needs: the audit
+/// row (if any) from the reserved statements, then the reservation released,
+/// then the deferred tasks together. Run as tasks alongside the row, a task
+/// would count the row's statements against a limit still lowered by the
+/// reservation, and be refused while the invocation had room.
+async fn after_response_work(
+    audit_write: Option<BoxedTask>,
+    queries: database::D1QueryCount,
+    tasks: Vec<BoxedTask>,
+) {
+    if let Some(write) = audit_write {
+        write.await;
+    }
+    queries.release_reservation();
+    futures::future::join_all(tasks).await;
 }
 
 /// Log an audit row that could not be written, as a structured metric line
@@ -998,7 +1030,40 @@ mod deferred_drain_tests {
             7,
             "it ran, inside the dispatching request's service scope"
         );
-        assert_eq!(after.pending_tasks(), 0);
+        assert!(
+            after.take_tasks().is_empty(),
+            "the task was handed on, not left behind"
+        );
+    }
+
+    /// A request's post-response work runs its audit row to completion,
+    /// then releases the reservation, then runs its deferred tasks — so a
+    /// task never meets a limit still lowered for a row already written.
+    #[wasm_bindgen_test]
+    async fn deferred_tasks_run_after_the_audit_row_with_the_reservation_released() {
+        let queries = database::D1QueryCount::new();
+        queries.reserve(impresspress_core::after_response::AUDIT_ROW_STATEMENTS);
+        let order: Rc<RefCell<Vec<String>>> = Rc::default();
+
+        let (log, count) = (Rc::clone(&order), queries.clone());
+        let audit: BoxedTask = Box::pin(async move {
+            yield_once().await;
+            log.borrow_mut()
+                .push(format!("row, reserved {}", count.reserved_for_test()));
+        });
+        let task = |name: &'static str| {
+            let (log, count) = (Rc::clone(&order), queries.clone());
+            Box::pin(async move {
+                log.borrow_mut()
+                    .push(format!("{name}, reserved {}", count.reserved_for_test()));
+            }) as BoxedTask
+        };
+        after_response_work(Some(audit), queries.clone(), vec![task("a"), task("b")]).await;
+
+        assert_eq!(
+            *order.borrow(),
+            ["row, reserved 4", "a, reserved 0", "b, reserved 0"]
+        );
     }
 
     /// Yield once, so another request's future is polled before this one
