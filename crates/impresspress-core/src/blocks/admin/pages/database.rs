@@ -543,7 +543,9 @@ mod tests {
     async fn the_log_table_rows_carry_the_names_the_visual_mask_keys_on() {
         const SPEC: &str =
             include_str!("../../../../../impresspress-web/tests/e2e/visual-baseline.spec.ts");
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let parts = browser_request(&ctx, admin_msg("retrieve", "/b/admin/database")).await;
         assert_eq!(parts.status, 200);
         let html = String::from_utf8(parts.body).expect("UTF-8 body");

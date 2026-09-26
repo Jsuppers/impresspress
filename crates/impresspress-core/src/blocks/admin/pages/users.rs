@@ -679,7 +679,9 @@ mod tests {
     /// visual-baseline.spec.ts`), so the cell has to render one.
     #[tokio::test]
     async fn the_users_table_renders_the_created_date_as_a_time_element() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("u-1").await;
 
         let parts = crate::blocks::admin::test_support::browser_request(

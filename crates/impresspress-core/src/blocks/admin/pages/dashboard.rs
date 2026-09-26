@@ -604,7 +604,9 @@ mod outage_tests {
     /// capture of this page, which masks dates by the `<time>` element alone.
     #[tokio::test]
     async fn the_recent_users_card_renders_the_created_date_as_a_time_element() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("u-1").await;
         let html = output_html(dashboard(&ctx, &admin_msg("retrieve", "/b/admin/")).await).await;
 
