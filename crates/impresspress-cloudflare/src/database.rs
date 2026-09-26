@@ -41,6 +41,22 @@
 //! concurrent requests, and each has its own D1 limit. So it is never a
 //! thread-local.
 //!
+//! The budget counts D1 statements and nothing else. Workers KV and R2
+//! operations are not D1 queries: they are Workers subrequests, which
+//! Cloudflare counts against the Workers subrequest limits ("A subrequest is
+//! any request a Worker makes using the Fetch API or to Cloudflare services
+//! like R2, KV, or D1"; 50 subrequests per invocation on Workers Free, 1,000
+//! of them to internal services, and 10,000 by default on Paid — Workers
+//! limits page, "Subrequests"). D1's own limits page points its
+//! queries-per-invocation row at those subrequest limits without saying how
+//! the two combine. So on the Free plan the budget's 50 is an upper bound, not
+//! a guarantee: a request that also reads KV or R2 can reach a Cloudflare
+//! limit before the budget refuses anything, and that refusal comes from the
+//! platform part-way through the request, not from the budget up front.
+//!
+//! Sources: <https://developers.cloudflare.com/d1/platform/limits/>,
+//! <https://developers.cloudflare.com/workers/platform/limits/#subrequests>.
+//!
 //! A refusal because the invocation has run out is
 //! [`DatabaseError::ResourceExhausted`], which a client sees as HTTP 429. It
 //! does NOT mean "retry later": the same request retried does the same work
@@ -210,7 +226,7 @@ pub(crate) fn forget_isolate_schema() {
 /// Create one at the Worker entry, once per `fetch` or `scheduled`
 /// invocation, and hand a clone to each service built while serving it: the
 /// request's own services, the runtime build's pre-`Init` handle, the
-/// request-log drain run from `ctx.wait_until`. They all count against the
+/// write of the request's audit rows run from `ctx.wait_until`. They all count against the
 /// one D1 limit. Never keep one past its invocation or share it between two:
 /// an isolate interleaves concurrent requests, and each has its own limit.
 #[derive(Clone, Default)]
