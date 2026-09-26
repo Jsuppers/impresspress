@@ -108,7 +108,10 @@ pub mod storage;
 // that surface is exactly this list.
 use std::{collections::HashMap, sync::Arc};
 
-use impresspress_core::builder::ImpresspressBuilder;
+use impresspress_core::{
+    after_response::{self, AfterResponse},
+    builder::ImpresspressBuilder,
+};
 pub use services::{
     make_config_service, make_console_logger, make_d1_database_service, make_fetch_network_service,
     make_jwt_crypto_service, make_kv_cached_database_service, make_r2_storage_service,
@@ -131,23 +134,19 @@ thread_local! {
     static ISOLATE_INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One-time isolate initialization: selects [`RequestLogMode::Queued`]
-/// (audit rows drain into `ctx.wait_until` off the response path — see
-/// `run`) and [`DeferMode::Queued`] (work a handler defers until after its
-/// response drains into `ctx.wait_until` too — see `dispatch`; spawned any
-/// other way it would be cancelled with the response). Consumers should call
-/// this from their worker's `#[event(start)]` handler; `run()` also invokes
-/// it behind a once-per-isolate guard, so isolates stay correct either way
-/// and repeat calls are no-ops.
+/// One-time isolate initialization: selects [`DeferMode::Queued`] (work a
+/// handler defers until after its response drains into `ctx.wait_until` — see
+/// `dispatch`; spawned any other way it would be cancelled with the
+/// response). Audit rows need no isolate setting: `dispatch` queues each
+/// request's rows in that request's own queue. Consumers should call this
+/// from their worker's `#[event(start)]` handler; `run()` also invokes it
+/// behind a once-per-isolate guard, so isolates stay correct either way and
+/// repeat calls are no-ops.
 ///
-/// [`RequestLogMode::Queued`]: impresspress_core::pipeline::RequestLogMode::Queued
 /// [`DeferMode::Queued`]: impresspress_core::deferred::DeferMode::Queued
 pub fn init_isolate() {
     ISOLATE_INITIALIZED.with(|done| {
         if !done.get() {
-            impresspress_core::pipeline::set_request_log_mode(
-                impresspress_core::pipeline::RequestLogMode::Queued,
-            );
             impresspress_core::deferred::set_mode(impresspress_core::deferred::DeferMode::Queued);
             done.set(true);
         }
@@ -281,8 +280,8 @@ where
     // which are not var reads. See `environment`'s module doc.
     let environment = CfEnvironment::capture(&env);
     // The D1 statements this invocation sends, counted across every D1
-    // service it builds (its request services, a runtime build, the audit-log
-    // drain it hands to `ctx.wait_until`), against D1's per-invocation query
+    // service it builds (its request services, a runtime build, the audit-row
+    // write it hands to `ctx.wait_until`), against D1's per-invocation query
     // limit. Created here, per invocation, and never kept: an isolate
     // interleaves concurrent requests, and each has its own limit. See
     // `database`'s module docs.
@@ -354,9 +353,19 @@ where
         return serve_static_asset_from_r2(&env, key, content_type).await;
     }
 
-    // Isolate-scoped init (request-log mode) — no-op after the first call;
-    // consumers with an #[event(start)] handler have already run it.
+    // Isolate-scoped init — no-op after the first call; consumers with an
+    // #[event(start)] handler have already run it.
     init_isolate();
+    // The request's own services leave the statements its audit row needs
+    // unused (none when the policy writes no rows); the row is written below
+    // with a handle that may use them, and then they go to the request's
+    // deferred tasks (see `impresspress_core::after_response`).
+    queries.reserve(after_response::audit_row_reservation(
+        environment.config_value(impresspress_core::config_vars::REQUEST_LOG_CONFIG_KEY),
+    ));
+    let after = AfterResponse::new();
+    let deferred: std::rc::Rc<std::cell::RefCell<Vec<BoxedTask>>> = std::rc::Rc::default();
+    let collect = std::rc::Rc::clone(&deferred);
     let result = run_inner(
         req,
         &env,
@@ -365,55 +374,38 @@ where
         &request_config,
         register_blocks,
         register_post_build,
-        &|task| ctx.wait_until(task),
+        &after,
+        &move |task| collect.borrow_mut().push(task),
     )
     .await;
 
-    // Persist any audit rows queued during this dispatch off the response
-    // path. Derive the D1 handle from THIS request's Env instead of borrowing
-    // one retained by the isolate-cached runtime.
-    let rows = impresspress_core::pipeline::drain_queued_request_logs();
-    if !rows.is_empty() {
-        match make_d1_database_service_concrete(&env, &environment, runner::D1_BINDING, &queries) {
-            Ok(batch_db) => {
-                ctx.wait_until(async move {
-                    use wafer_core::interfaces::database::service::DatabaseService as _;
-
-                    let mut by_table: std::collections::HashMap<
-                        &'static str,
-                        Vec<std::collections::HashMap<String, serde_json::Value>>,
-                    > = std::collections::HashMap::new();
-                    for row in rows {
-                        by_table.entry(row.table).or_default().push(row.data);
+    // This request's post-response work, in one `wait_until`: its audit row
+    // first, through a D1 handle derived from THIS request's Env and allowed
+    // the reserved statements, then its deferred tasks on whatever the row
+    // left.
+    let audit_write =
+        after.take_audit_row().and_then(|row| {
+            match make_d1_database_service_concrete(
+                &env,
+                &environment,
+                runner::D1_BINDING,
+                &queries.for_reserved_work(),
+            ) {
+                Ok(db) => Some(Box::pin(async move {
+                    if let Err(failure) = after_response::persist_audit_row(db.as_ref(), row).await
+                    {
+                        log_audit_row_not_written(failure.table, &failure.error);
                     }
-                    for (table, rows) in by_table {
-                        let n = rows.len();
-                        if let Err(e) = batch_db.create_many(table, rows).await {
-                            // Structured metric line (not a Server-Timing header:
-                            // this closure runs in `ctx.wait_until`, after the
-                            // response has already been sent). See
-                            // `impresspress_core::metrics`'s module doc.
-                            let rows_str = n.to_string();
-                            let err_str = e.to_string();
-                            worker::console_log!(
-                                "{}",
-                                impresspress_core::metrics::metric_line(
-                                    "audit_log_persist_failed",
-                                    &[("table", table), ("rows", &rows_str), ("error", &err_str)],
-                                )
-                            );
-                        }
-                    }
-                });
+                }) as BoxedTask),
+                Err(e) => {
+                    log_audit_row_not_written(row.table, &e.to_string());
+                    None
+                }
             }
-            Err(e) => worker::console_log!(
-                "{}",
-                impresspress_core::metrics::metric_line(
-                    "audit_log_persist_failed",
-                    &[("error", &e.to_string())],
-                )
-            ),
-        }
+        });
+    let tasks = std::mem::take(&mut *deferred.borrow_mut());
+    if audit_write.is_some() || !tasks.is_empty() {
+        ctx.wait_until(after_response_work(audit_write, queries.clone(), tasks));
     }
 
     retry_pending_config_version(&env, |task| ctx.wait_until(task));
@@ -443,6 +435,36 @@ where
             )
         }
     }
+}
+
+/// A request's post-response work in the order its budget needs: the audit
+/// row (if any) from the reserved statements, then the reservation released,
+/// then the deferred tasks together. Run as tasks alongside the row, a task
+/// would count the row's statements against a limit still lowered by the
+/// reservation, and be refused while the invocation had room.
+async fn after_response_work(
+    audit_write: Option<BoxedTask>,
+    queries: database::D1QueryCount,
+    tasks: Vec<BoxedTask>,
+) {
+    if let Some(write) = audit_write {
+        write.await;
+    }
+    queries.release_reservation();
+    futures::future::join_all(tasks).await;
+}
+
+/// Log an audit row that could not be written, as a structured metric line
+/// (not a Server-Timing header: the write runs in `ctx.wait_until`, after the
+/// response has been sent). See `impresspress_core::metrics`'s module doc.
+fn log_audit_row_not_written(table: &str, error: &str) {
+    worker::console_log!(
+        "{}",
+        impresspress_core::metrics::metric_line(
+            "audit_log_persist_failed",
+            &[("table", table), ("error", error)],
+        )
+    );
 }
 
 /// Worker `scheduled` entry shim: the cron counterpart of [`run`].
@@ -527,24 +549,16 @@ pub async fn run_scheduled_with_config<F, G>(
     impresspress_core::ui::assets::set_base_url_override(environment.asset_base_url());
     init_isolate();
 
-    // WHY THERE IS NO `drain_queued_request_logs` HERE, unlike `run`.
+    // WHY THERE IS NO `after_response` SCOPE HERE, unlike `run`.
     //
-    // `init_isolate` selects `RequestLogMode::Queued` for the whole isolate,
-    // so both entry points arrive with queueing on — but only the request
-    // pipeline enqueues, and the one thing that runs on this path
-    // (`auth.maintenance`, dispatched by `run_block`) does not go through it.
-    // The queue is therefore always empty here, and a drain would be dead
-    // code that reads as if it were load-bearing.
-    //
-    // It stops being empty the day anything on the scheduled path dispatches
-    // through the pipeline: at that point the rows accumulate in a
-    // thread-local nothing empties, on an isolate that may serve fetches for
-    // hours. Add the drain (through `ctx.wait_until`, exactly as `run` does)
-    // in the same change that adds such a dispatch.
-    //
-    // The same holds for `impresspress_core::deferred`'s queue: only the
-    // auth-ui mail handlers defer, and the sweep reaches none of them. A
-    // task queued here would run on the next fetch's drain instead.
+    // Only the request pipeline writes audit rows and only the auth-ui mail
+    // handlers defer, and the one thing that runs on this path
+    // (`auth.maintenance`, dispatched by `run_block`) reaches neither. With no
+    // scope installed, an audit row would be inserted inline, and a deferred
+    // task would be dropped at once with an error line (`deferred::defer`) —
+    // nothing is left in a queue nothing runs. A change that makes this path
+    // defer must install a scope and hand its tasks to `ctx.wait_until`, as
+    // `dispatch` does.
     let cron = event.cron();
     match run_scheduled_inner(
         &env,
@@ -585,21 +599,6 @@ pub async fn run_scheduled_with_config<F, G>(
                 &[("cron", &cron), ("error", &error.to_string())],
             )
         ),
-    }
-
-    // Nothing on this path drains the deferred queue (see the note above), so
-    // anything still in it waits for the next fetch on this isolate — or is
-    // lost with the isolate. Say so rather than let it vanish; a fetch in
-    // flight on this isolate would also drain it, which the line cannot tell.
-    let undrained = impresspress_core::deferred::pending();
-    if undrained > 0 {
-        worker::console_warn!(
-            "{}",
-            impresspress_core::metrics::metric_line(
-                "deferred_tasks_undrained",
-                &[("entry", "scheduled"), ("tasks", &undrained.to_string())],
-            )
-        );
     }
 
     retry_pending_config_version(&env, |task| ctx.wait_until(task));
@@ -748,10 +747,14 @@ async fn dispatch(
     wafer: &wafer_run::Wafer,
     req: worker::Request,
     services: std::rc::Rc<request_services::RequestServices>,
+    after: &std::rc::Rc<AfterResponse>,
     defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>> {
     let deferred_services = std::rc::Rc::clone(&services);
-    let response = request_services::scope(services, async move {
+    // Both scopes are re-entered on every poll, so a request interleaved with
+    // this one neither uses its services nor queues its audit row or
+    // deferred tasks into this one's.
+    let dispatched = after_response::scope(std::rc::Rc::clone(after), async move {
         // 7. Convert request → message; preserve auth header in meta.
         let auth_header = req.headers().get("authorization")?;
         let (mut msg, input) = convert::worker_request_to_message(&req).await?;
@@ -763,9 +766,11 @@ async fn dispatch(
         // poll scope also covers lazily consumed service-backed streams.
         let output = wafer.run("site-main", msg, input).await;
         Ok(convert::output_to_response(output).await?)
-    })
-    .await;
-    for task in impresspress_core::deferred::drain() {
+    });
+    let response = request_services::scope(services, dispatched).await;
+    // This request's deferred tasks, and only its: they run under its own
+    // services and so its own D1 budget.
+    for task in after.take_tasks() {
         defer(Box::pin(request_services::scope(
             std::rc::Rc::clone(&deferred_services),
             task,
@@ -787,6 +792,7 @@ async fn run_inner<F, G>(
     request_config: &HashMap<String, String>,
     register_blocks: F,
     register_post_build: G,
+    after: &std::rc::Rc<AfterResponse>,
     defer: &dyn Fn(BoxedTask),
 ) -> Result<worker::Response, Box<dyn std::error::Error>>
 where
@@ -815,7 +821,7 @@ where
         rt.wafer.config_snapshot(),
         request_config,
     )?;
-    let mut response = dispatch(&rt.wafer, req, services, defer).await?;
+    let mut response = dispatch(&rt.wafer, req, services, after, defer).await?;
 
     // Cheap observability signal (2026-07-16 audit follow-up): one header
     // assembly from a value already computed by `get_or_build`. Gated to
@@ -997,10 +1003,12 @@ mod deferred_drain_tests {
         let sink = Rc::clone(&handed);
         let req = worker::Request::new("https://example.test/anything", worker::Method::Get)
             .expect("request");
+        let after = AfterResponse::new();
         let response = dispatch(
             &wafer,
             req,
             request_services::RequestServices::marker(7),
+            &after,
             &move |task| sink.borrow_mut().push(task),
         )
         .await
@@ -1022,6 +1030,176 @@ mod deferred_drain_tests {
             7,
             "it ran, inside the dispatching request's service scope"
         );
-        assert_eq!(impresspress_core::deferred::pending(), 0);
+        assert!(
+            after.take_tasks().is_empty(),
+            "the task was handed on, not left behind"
+        );
+    }
+
+    /// A request's post-response work runs its audit row to completion,
+    /// then releases the reservation, then runs its deferred tasks — so a
+    /// task never meets a limit still lowered for a row already written.
+    #[wasm_bindgen_test]
+    async fn deferred_tasks_run_after_the_audit_row_with_the_reservation_released() {
+        let queries = database::D1QueryCount::new();
+        queries.reserve(impresspress_core::after_response::AUDIT_ROW_STATEMENTS);
+        let order: Rc<RefCell<Vec<String>>> = Rc::default();
+
+        let (log, count) = (Rc::clone(&order), queries.clone());
+        let audit: BoxedTask = Box::pin(async move {
+            yield_once().await;
+            log.borrow_mut()
+                .push(format!("row, reserved {}", count.reserved_for_test()));
+        });
+        let task = |name: &'static str| {
+            let (log, count) = (Rc::clone(&order), queries.clone());
+            Box::pin(async move {
+                log.borrow_mut()
+                    .push(format!("{name}, reserved {}", count.reserved_for_test()));
+            }) as BoxedTask
+        };
+        after_response_work(Some(audit), queries.clone(), vec![task("a"), task("b")]).await;
+
+        assert_eq!(
+            *order.borrow(),
+            [
+                format!(
+                    "row, reserved {}",
+                    impresspress_core::after_response::AUDIT_ROW_STATEMENTS
+                ),
+                "a, reserved 0".to_string(),
+                "b, reserved 0".to_string(),
+            ]
+        );
+    }
+
+    /// Yield once, so another request's future is polled before this one
+    /// continues.
+    async fn yield_once() {
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    /// Yields, defers one task recording the marker of the service bundle it
+    /// runs under, yields again, then answers: two of these interleaved have
+    /// both deferred before either dispatch finishes.
+    struct DefersBetweenYields(Arc<std::sync::Mutex<Vec<usize>>>);
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for DefersBetweenYields {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new(
+                "test/defers",
+                "0.0.1",
+                "http-handler@v1",
+                "defers between yields",
+            )
+        }
+        async fn handle(
+            &self,
+            _ctx: &dyn wafer_run::context::Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            yield_once().await;
+            let seen = Arc::clone(&self.0);
+            impresspress_core::deferred::defer(async move {
+                seen.lock()
+                    .unwrap()
+                    .push(request_services::current_marker().unwrap_or(0));
+            });
+            yield_once().await;
+            impresspress_core::http::ok_json(&serde_json::json!({ "ok": true }))
+        }
+    }
+
+    /// Two requests interleaved in one isolate each hand `wait_until` their
+    /// own deferred task, and each task runs under the services — and so the
+    /// D1 budget — of the request that deferred it. The request that
+    /// finishes first cannot take, run or pay for the other's task: a mail
+    /// one request deferred is never left to a stranger's budget.
+    #[wasm_bindgen_test]
+    async fn interleaved_requests_each_run_only_their_own_deferred_tasks() {
+        init_isolate();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut wafer = wafer_run::Wafer::new(Arc::new(wafer_run::StaticConfigSource::default()))
+            .expect("Wafer::new");
+        wafer
+            .register_block(
+                "test/defers",
+                Arc::new(DefersBetweenYields(Arc::clone(&seen))),
+            )
+            .expect("register");
+        wafer
+            .add_flow_json(
+                r#"{"id":"site-main","name":"t","version":"0.1.0","description":"t",
+                    "steps":[{"id":"defers","block":"test/defers"}],
+                    "config":{"on_error":"stop"}}"#,
+            )
+            .expect("flow");
+        wafer.seal().await.expect("seal");
+
+        let handed_a: Rc<RefCell<Vec<BoxedTask>>> = Rc::default();
+        let handed_b: Rc<RefCell<Vec<BoxedTask>>> = Rc::default();
+        let (sink_a, sink_b) = (Rc::clone(&handed_a), Rc::clone(&handed_b));
+        let request = || {
+            worker::Request::new("https://example.test/anything", worker::Method::Get)
+                .expect("request")
+        };
+        let (after_a, after_b) = (AfterResponse::new(), AfterResponse::new());
+        let defer_a = move |task| sink_a.borrow_mut().push(task);
+        let defer_b = move |task| sink_b.borrow_mut().push(task);
+        let (a, b) = futures::join!(
+            dispatch(
+                &wafer,
+                request(),
+                request_services::RequestServices::marker(7),
+                &after_a,
+                &defer_a,
+            ),
+            dispatch(
+                &wafer,
+                request(),
+                request_services::RequestServices::marker(8),
+                &after_b,
+                &defer_b,
+            ),
+        );
+        assert_eq!(a.expect("dispatch a").status_code(), 200);
+        assert_eq!(b.expect("dispatch b").status_code(), 200);
+
+        let tasks_a = std::mem::take(&mut *handed_a.borrow_mut());
+        let tasks_b = std::mem::take(&mut *handed_b.borrow_mut());
+        assert_eq!(
+            (tasks_a.len(), tasks_b.len()),
+            (1, 1),
+            "each request hands wait_until its own task, and only its own"
+        );
+        for task in tasks_a {
+            task.await;
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [7],
+            "a's task ran under a's services"
+        );
+        for task in tasks_b {
+            task.await;
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [7, 8],
+            "b's task ran under b's services"
+        );
     }
 }

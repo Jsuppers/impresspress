@@ -451,7 +451,7 @@ mod resend_tests {
             .expect("set token");
 
         let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         let _ = handle_resend(&limiter, &ctx, &msg, body("cooling@example.com"))
             .await
             .collect_buffered()
@@ -518,7 +518,7 @@ mod resend_tests {
         );
 
         let (limiter, request) = crate::blocks::auth_ui::api::test_mail_request();
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         let _ = handle_resend(&limiter, &ctx, &request, body("flagged@example.com"))
             .await
             .collect_buffered()
@@ -630,7 +630,7 @@ mod resend_tests {
         let ctx = TestContext::with_auth_and_crypto().await;
         let id = seed(&ctx, "unproven@example.com", false).await;
         let ctx = CallLog::new(ctx);
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
 
         let unknown =

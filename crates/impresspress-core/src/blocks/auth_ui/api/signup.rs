@@ -554,7 +554,7 @@ mod tests {
             "true",
         );
         let ctx = CallLog::new(ctx);
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
 
         async fn attempt(ctx: &CallLog, email: &str) -> u16 {
             let body = serde_json::json!({"email": email, "password": "correct-horse-battery"})

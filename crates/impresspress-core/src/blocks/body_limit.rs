@@ -107,7 +107,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        pipeline::{set_request_log_mode, RequestLogMode},
         platform_state::request_logs,
         routing::RouteAccess,
         streaming::{BODY_TOO_LARGE_VALUE, META_REQ_BODY_TOO_LARGE},
@@ -146,7 +145,6 @@ mod tests {
     #[tokio::test]
     async fn the_refusal_is_audited_under_its_own_path() {
         let ctx = TestContext::with_admin().await;
-        set_request_log_mode(RequestLogMode::Inline);
         let block = BodyLimitBlock::new(
             Vec::new(),
             Arc::new(vec![ExtraRoute::new(

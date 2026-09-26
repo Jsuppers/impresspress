@@ -214,12 +214,12 @@ impl Context for CallLog {
 }
 
 /// Run the work the handler under test deferred ([`crate::deferred`]), as
-/// the platform would after the response. The test must have selected
-/// [`crate::deferred::DeferMode::Queued`] before calling the handler;
-/// answers how many tasks ran.
+/// the platform would after the response. The test must have called
+/// `crate::deferred::queue_for_test` before calling the handler; answers how
+/// many tasks ran.
 #[cfg(test)]
 pub(crate) async fn run_deferred() -> usize {
-    let tasks = crate::deferred::drain();
+    let tasks = crate::deferred::take_for_test();
     let n = tasks.len();
     for task in tasks {
         task.await;

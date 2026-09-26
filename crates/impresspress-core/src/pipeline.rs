@@ -22,68 +22,6 @@ use crate::{
     ui,
 };
 
-/// How the pipeline persists the per-request audit row.
-///
-/// `Inline` (default; native): `request_logs::insert` awaited on the response path —
-/// today's behavior. `Queued` (Cloudflare): the completed row is pushed to a
-/// thread-local queue; the platform entry drains it after dispatch and
-/// attaches the write to `ctx.wait_until`, so responses stop paying one D1
-/// write of latency. Rows are plain data, so it does not matter which
-/// interleaved request's drain flushes them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestLogMode {
-    Inline,
-    Queued,
-}
-
-/// One queued audit row (table + column map), ready for `DatabaseService::create`.
-pub struct QueuedRequestLog {
-    pub table: &'static str,
-    pub data: std::collections::HashMap<String, serde_json::Value>,
-}
-
-thread_local! {
-    static REQUEST_LOG_MODE: Cell<RequestLogMode> = const { Cell::new(RequestLogMode::Inline) };
-    /// Queued audit rows for this isolate.
-    ///
-    /// [`IsolateCell`](crate::IsolateCell) rather than `RefCell`: this is
-    /// isolate-lifetime state on the request path, and the push below can
-    /// reallocate the `Vec` — a wide enough window for a Cloudflare hard stop
-    /// to land in. A borrow flag stranded that way stays set for the life of
-    /// the isolate and traps every later request that logs. See
-    /// `crate::isolate_cell`.
-    static REQUEST_LOG_QUEUE: crate::IsolateCell<Vec<QueuedRequestLog>> =
-        const { crate::IsolateCell::new() };
-}
-
-/// Select the request-log persistence mode for this thread (isolate).
-/// The Cloudflare target sets it (idempotently) at the top of every request;
-/// native never calls it.
-pub fn set_request_log_mode(mode: RequestLogMode) {
-    REQUEST_LOG_MODE.with(|m| m.set(mode));
-}
-
-fn request_log_mode() -> RequestLogMode {
-    REQUEST_LOG_MODE.with(Cell::get)
-}
-
-fn enqueue_request_log(
-    table: &'static str,
-    data: std::collections::HashMap<String, serde_json::Value>,
-) {
-    REQUEST_LOG_QUEUE.with(|queue| {
-        let mut rows = queue.take().unwrap_or_default();
-        rows.push(QueuedRequestLog { table, data });
-        queue.set(rows);
-    });
-}
-
-/// Take every queued row, clearing the queue. The platform entry calls this
-/// after each dispatch and persists the rows off the response path.
-pub fn drain_queued_request_logs() -> Vec<QueuedRequestLog> {
-    REQUEST_LOG_QUEUE.with(|queue| queue.take().unwrap_or_default())
-}
-
 /// The `AuthLevel` ceiling for this request, used to filter the WebMCP tool
 /// manifest.
 ///
@@ -907,12 +845,17 @@ impl RequestLogPolicy {
     /// string and an absent key — is [`RequestLogPolicy::All`], so a typo
     /// degrades to today's behaviour rather than silently disabling the audit
     /// trail.
-    fn parse(raw: Option<&str>) -> Self {
+    pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(str::trim).unwrap_or_default() {
             "errors" => Self::Errors,
             "off" => Self::Off,
             _ => Self::All,
         }
+    }
+
+    /// Whether this policy writes any row at all.
+    pub fn writes_rows(self) -> bool {
+        self != Self::Off
     }
 
     fn keeps(self, status_code: i64) -> bool {
@@ -1065,18 +1008,20 @@ async fn write_request_log(
         },
         None => row,
     };
-    match request_log_mode() {
-        RequestLogMode::Inline => {
-            // Best-effort: don't fail the request if logging fails — but say
-            // so. The row being optional is the deliberate part; the silence
-            // was not, and a deployment whose audit log has quietly stopped
-            // recording looks exactly like one with no traffic.
-            if let Err(error) = request_logs::insert(ctx, &row).await {
-                tracing::warn!(%error, "request audit row not written");
-            }
-        }
-        RequestLogMode::Queued => {
-            enqueue_request_log(request_logs::TABLE, row.to_data());
+    // Queued when the platform runs this request inside an
+    // `after_response::scope` (Cloudflare: the row is written after the
+    // response, from room held back for it); inserted here otherwise.
+    let queued = crate::after_response::QueuedRequestLog {
+        table: request_logs::TABLE,
+        data: row.to_data(),
+    };
+    if crate::after_response::queue_audit_row(queued).is_err() {
+        // Best-effort: don't fail the request if logging fails — but say
+        // so. The row being optional is the deliberate part; the silence
+        // was not, and a deployment whose audit log has quietly stopped
+        // recording looks exactly like one with no traffic.
+        if let Err(error) = request_logs::insert(ctx, &row).await {
+            tracing::warn!(%error, "request audit row not written");
         }
     }
 }
@@ -2960,9 +2905,6 @@ mod streaming_audit_tests {
     }
 
     async fn drive(ctx: &TestContext, path: &str, routes: &[ExtraRoute]) {
-        // Inline mode so the audit write lands in the DB synchronously (not the
-        // CF wait-until queue), making the row queryable in-test.
-        set_request_log_mode(RequestLogMode::Inline);
         let out = handle_request(
             ctx,
             anon_msg("retrieve", path),
@@ -3009,36 +2951,76 @@ mod streaming_audit_tests {
             "an open-ended SSE stream must skip the request_logs row"
         );
     }
-}
 
-#[cfg(test)]
-mod request_log_mode_tests {
-    use super::{
-        drain_queued_request_logs, enqueue_request_log, request_log_mode, set_request_log_mode,
-        RequestLogMode,
-    };
-    use crate::platform_state::request_logs;
-
-    #[test]
-    fn default_mode_is_inline_and_drain_is_empty() {
-        assert_eq!(request_log_mode(), RequestLogMode::Inline);
-        assert!(drain_queued_request_logs().is_empty());
+    /// Answers after yielding once, so two requests driven together
+    /// interleave inside the handler.
+    struct YieldingBlock;
+    #[async_trait]
+    impl RunBlock for YieldingBlock {
+        fn info(&self) -> BlockInfo {
+            BlockInfo::new("test/yield", "0.0.1", "echo@v1", "yielding probe")
+                .category(BlockCategory::Service)
+        }
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            OutputStream::respond(b"ok".to_vec())
+        }
+        async fn lifecycle(
+            &self,
+            _ctx: &dyn Context,
+            _e: LifecycleEvent,
+        ) -> Result<(), WaferError> {
+            Ok(())
+        }
     }
 
-    #[test]
-    fn queued_mode_accumulates_and_drain_clears() {
-        set_request_log_mode(RequestLogMode::Queued);
-        let mut data = std::collections::HashMap::new();
-        data.insert("path".to_string(), serde_json::json!("/x"));
-        enqueue_request_log(request_logs::TABLE, data.clone());
-        enqueue_request_log(request_logs::TABLE, data);
+    /// Two requests interleaved in one isolate, each run inside its own
+    /// `after_response` scope (as the Cloudflare adapter runs every
+    /// dispatch): each request's audit row lands in its own scope — to be
+    /// written later from the room its own invocation held back — and none
+    /// is inserted inline.
+    #[tokio::test]
+    async fn interleaved_requests_queue_their_audit_rows_in_their_own_scopes() {
+        use crate::after_response::{scope, AfterResponse};
 
-        let drained = drain_queued_request_logs();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].table, request_logs::TABLE);
-        assert!(drain_queued_request_logs().is_empty(), "drain must clear");
+        let mut ctx = TestContext::with_admin().await;
+        ctx.register_block("test/yield", Arc::new(YieldingBlock));
+        let routes = route("/x/", "test/yield");
+        let after_a = AfterResponse::new();
+        let after_b = AfterResponse::new();
 
-        set_request_log_mode(RequestLogMode::Inline); // restore for other tests
+        tokio::join!(
+            scope(std::rc::Rc::clone(&after_a), drive(&ctx, "/x/a", &routes)),
+            scope(std::rc::Rc::clone(&after_b), drive(&ctx, "/x/b", &routes)),
+        );
+
+        let path = |after: &AfterResponse| {
+            let row = after.take_audit_row().expect("the request queued its row");
+            assert_eq!(row.table, request_logs::TABLE);
+            row.data["path"].as_str().unwrap().to_string()
+        };
+        assert_eq!(path(&after_a), "/x/a");
+        assert_eq!(path(&after_b), "/x/b");
+        assert_eq!(
+            request_log_count(&ctx).await,
+            0,
+            "a queued row is not also inserted on the response path"
+        );
     }
 }
 
@@ -3127,7 +3109,6 @@ mod secret_path_redaction_tests {
     /// redaction matches templates itself instead of reading back what
     /// routing bound.
     async fn drive_and_read_rows(path: &str) -> Vec<(String, i64)> {
-        set_request_log_mode(RequestLogMode::Inline);
         let ctx = TestContext::with_admin().await;
         let infos = real_block_infos();
         let out = handle_request(
@@ -3461,7 +3442,6 @@ mod request_log_policy_tests {
 
     /// [`drive`] with a caller-built request, for a test that needs headers.
     async fn drive_msg(ctx: &TestContext, msg: Message) {
-        set_request_log_mode(RequestLogMode::Inline);
         let out = handle_request(
             ctx,
             msg,
@@ -3794,7 +3774,6 @@ mod request_log_policy_tests {
     async fn repro_site_root_is_not_collapsed() {
         let ctx = ctx_with(Some("all")).await;
         reset_request_log_budget_for_test();
-        set_request_log_mode(RequestLogMode::Inline);
         let infos = crate::test_support::real_block_infos();
         let out = handle_request(
             &ctx,
@@ -3917,7 +3896,6 @@ mod oversized_body_tests {
     }
 
     async fn drive(ctx: &TestContext, msg: Message) -> OutputStream {
-        set_request_log_mode(RequestLogMode::Inline);
         handle_request(
             ctx,
             msg,

@@ -48,6 +48,13 @@ pub struct RawCloudflareConfig {
     /// defaults to [`DEFAULT_HEAD_SAMPLING_RATE`] when unset by both toml
     /// and env.
     pub head_sampling_rate: Option<f64>,
+    /// D1 queries one Worker invocation may run on this account's plan:
+    /// 1000 on Workers Paid, 50 on Free. TOML-only, because the value is
+    /// written into the generated config as the Worker var the runtime reads
+    /// ([`impresspress_core::config_vars::D1_QUERIES_PER_INVOCATION_KEY`]);
+    /// defaults to
+    /// [`impresspress_core::config_vars::D1_QUERIES_PER_INVOCATION_DEFAULT`].
+    pub d1_queries_per_invocation: Option<u64>,
     /// Cloudflare cron expressions for the Worker's `scheduled` handler.
     /// TOML-only; defaults to [`wrangler::DEFAULT_CRONS`], which is empty.
     /// Setting it is the second of the two steps that turn the sweep on — the
@@ -177,6 +184,8 @@ impl RawCloudflareConfig {
             .collect::<Result<Vec<_>>>()?;
         let head_sampling_rate =
             resolve_head_sampling_rate(env(HEAD_SAMPLING_RATE_VAR), self.head_sampling_rate)?;
+        let d1_queries_per_invocation =
+            resolve_d1_queries_per_invocation(self.d1_queries_per_invocation)?;
         let crons = resolve_crons(self.crons)?;
         let deploy_smoke_paths = resolve_deploy_smoke_paths(self.deploy_smoke_paths)?;
         Ok(CloudflareConfig {
@@ -197,6 +206,7 @@ impl RawCloudflareConfig {
             },
             wrangler_overrides_path: self.wrangler_overrides_path,
             head_sampling_rate,
+            d1_queries_per_invocation,
             crons,
             deploy_smoke_paths,
         })
@@ -237,6 +247,23 @@ fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) ->
         );
     }
     Ok(rate)
+}
+
+/// Resolve `[cloudflare].d1_queries_per_invocation`: the stated limit, or
+/// Workers Paid's when unset. Checked here with the parser the Worker applies
+/// to the var, so a value out of range — above D1's documented maximum of
+/// 1000 (<https://developers.cloudflare.com/d1/platform/limits/>), or too
+/// small to leave room past the audit-row reservation — fails the build
+/// rather than every request of the deployed Worker.
+fn resolve_d1_queries_per_invocation(toml_val: Option<u64>) -> Result<u64> {
+    use impresspress_core::config_vars::{
+        parse_d1_queries_per_invocation, D1_QUERIES_PER_INVOCATION_DEFAULT,
+    };
+    let Some(limit) = toml_val else {
+        return Ok(D1_QUERIES_PER_INVOCATION_DEFAULT);
+    };
+    parse_d1_queries_per_invocation(&limit.to_string())
+        .map_err(|e| anyhow!("cloudflare.d1_queries_per_invocation = {limit}: {e}"))
 }
 
 /// Resolve `[cloudflare].crons`: an explicit list (empty included, which

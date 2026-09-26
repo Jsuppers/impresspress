@@ -43,8 +43,8 @@ pub fn make_d1_database_service(
 
 /// Concrete-typed variant of [`make_d1_database_service`], for the internal
 /// callers that already hold the request's environment capture: the
-/// audit-log drain in `run()` (one `DatabaseService::create_many` per table,
-/// which reaches D1's native `batch()` through
+/// audit-row write in `run()` (one `DatabaseService::create_many`, which
+/// reaches D1's native `batch()` through
 /// [`DbExec::run_transaction`](wafer_core::interfaces::database::exec::DbExec::run_transaction))
 /// and [`make_kv_cached_database_service_with_backend`], which hands the
 /// concrete handle back beside the decorated one.

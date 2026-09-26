@@ -61,16 +61,13 @@ pub(crate) const CF_LOG_LEVEL_KEY: &str = "IMPRESSPRESS_CF_LOG_LEVEL";
 /// through the dashboard — this list stays short.
 pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth::JWT_SECRET_KEY];
 
-/// Worker var (`env.var`) naming how many D1 queries one Worker invocation may
-/// run: D1's "Queries per Worker invocation" limit for this account's plan.
-/// Every D1 service built in an invocation reports its statement budget
-/// against it (see [`crate::database`]'s module docs). Unset means
-/// [`D1_QUERIES_PER_INVOCATION_DEFAULT`]; a Free-plan deploy sets `50`.
-pub(crate) const D1_QUERIES_PER_INVOCATION_KEY: &str = "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION";
-
-/// D1's per-invocation query limit on Workers Paid, the limit a deploy that
-/// does not set [`D1_QUERIES_PER_INVOCATION_KEY`] runs under.
-pub(crate) const D1_QUERIES_PER_INVOCATION_DEFAULT: u64 = 1000;
+/// The Worker var naming this deploy's D1 query limit and its Workers Paid
+/// default, shared with the CLI that writes it into `wrangler.toml`. Every D1
+/// service built in an invocation reports its statement budget against it
+/// (see [`crate::database`]'s module docs).
+pub(crate) use impresspress_core::config_vars::{
+    D1_QUERIES_PER_INVOCATION_DEFAULT, D1_QUERIES_PER_INVOCATION_KEY,
+};
 
 /// Shared configuration consumed synchronously while the builder constructs
 /// middleware, plus the two operational knobs a deploy sets in
@@ -370,7 +367,7 @@ impl CfEnvironment {
     /// calling [`DatabaseService::set_strict_schema`] at `Init`, from the
     /// database block's `Init` config — only ever reaches the one service a
     /// *Wafer runtime* was built around. Two D1 services are built outside
-    /// any runtime and so are never reached by it: the request-log drain's
+    /// any runtime and so are never reached by it: the audit-row write's
     /// batch handle in
     /// `run_with_config` (constructed per request, used inside
     /// `ctx.wait_until`) and the handle `build_runtime` reads
@@ -387,21 +384,16 @@ impl CfEnvironment {
     /// `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, or
     /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`] when it is unbound.
     ///
-    /// A bound value that is not a whole number of at least 1 is an error
-    /// naming the var, not the default: a Free-plan deploy that mistyped `50`
+    /// A bound value out of
+    /// [`parse_d1_queries_per_invocation`](impresspress_core::config_vars::parse_d1_queries_per_invocation)'s
+    /// range is an error naming the var, not the default: a Free-plan deploy that mistyped `50`
     /// would otherwise run with the Paid limit and meet D1's own refusal
     /// part-way through a write instead of the budget's up front.
     pub(crate) fn d1_queries_per_invocation(&self) -> Result<u64, String> {
         let Some(raw) = self.d1_queries_per_invocation.as_deref() else {
             return Ok(D1_QUERIES_PER_INVOCATION_DEFAULT);
         };
-        match raw.trim().parse::<u64>() {
-            Ok(limit) if limit >= 1 => Ok(limit),
-            _ => Err(format!(
-                "{D1_QUERIES_PER_INVOCATION_KEY} is {raw:?}; it must be a whole number of at \
-                 least 1 (D1 allows 1000 queries per invocation on Workers Paid, 50 on Free)"
-            )),
-        }
+        impresspress_core::config_vars::parse_d1_queries_per_invocation(raw)
     }
 
     /// Bind `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` to the raw string a
@@ -906,7 +898,7 @@ mod tests {
     /// the one `wafer-core` would reach from the same string, because
     /// `handle_lifecycle` re-applies the var from the database block's `Init`
     /// config on the runtime's own service. If the two readings disagreed,
-    /// that service and the request-log drain's handle would run in different
+    /// that service and the audit-row write's handle would run in different
     /// modes off one var.
     ///
     /// `"yes"` and `"on"` are the rows that matter: they are true for
@@ -942,10 +934,11 @@ mod tests {
         );
     }
 
-    /// The D1 query limit: unset is Workers Paid's 1000, a bound number is
-    /// taken as it is (a Free-plan deploy's 50), and anything that is not a
-    /// whole number of at least 1 is an error naming the var rather than a
-    /// silent fallback to the Paid limit.
+    /// The D1 query limit: unset is Workers Paid's 1000, a bound number in
+    /// range is taken as it is (a Free-plan deploy's 50), and anything else —
+    /// not a whole number, at or below the audit-row reservation, above D1's
+    /// maximum — is an error naming the var rather than a silent fallback to
+    /// the Paid limit.
     #[wasm_bindgen_test]
     fn the_d1_query_limit_defaults_to_paid_and_refuses_a_malformed_value() {
         let unbound = RecordingEnv::new(&[]);
@@ -953,7 +946,7 @@ mod tests {
             CfEnvironment::capture(&unbound.env).d1_queries_per_invocation(),
             Ok(D1_QUERIES_PER_INVOCATION_DEFAULT)
         );
-        for (raw, limit) in [("50", 50), (" 50 ", 50), ("1000", 1000), ("1", 1)] {
+        for (raw, limit) in [("50", 50), (" 50 ", 50), ("1000", 1000)] {
             let env = RecordingEnv::new(&[(D1_QUERIES_PER_INVOCATION_KEY, raw)]);
             assert_eq!(
                 CfEnvironment::capture(&env.env).d1_queries_per_invocation(),
@@ -961,7 +954,11 @@ mod tests {
                 "{raw:?}"
             );
         }
-        for raw in ["", "0", "-5", "5O", "fifty", "50.5"] {
+        // Refused from the var itself, not only by the CLI: a
+        // `wrangler_overrides_path` file sets it past the CLI's check. At or
+        // below the audit-row reservation, or above D1's maximum of 1000.
+        let reservation = impresspress_core::after_response::AUDIT_ROW_STATEMENTS.to_string();
+        for raw in ["", "0", "-5", "5O", "fifty", "50.5", "1001", &reservation] {
             let env = RecordingEnv::new(&[(D1_QUERIES_PER_INVOCATION_KEY, raw)]);
             let err = CfEnvironment::capture(&env.env)
                 .d1_queries_per_invocation()

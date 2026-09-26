@@ -543,7 +543,7 @@ async fn forgot_password_reset_token_store_failure_answers_like_an_unregistered_
 
         // The token is stored after the response; queue that work so the
         // store — and its failure — really runs below.
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         let path = "/b/auth/api/forgot-password";
         let unregistered = wire(&failing, path, "nobody@example.com").await;
         let registered = wire(&failing, path, "known@example.com").await;
@@ -578,7 +578,7 @@ async fn resend_verification_token_store_failure_answers_like_an_unregistered_ad
 
         // The token is stored after the response; queue that work so the
         // store — and its failure — really runs below.
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         let path = "/b/auth/api/resend-verification";
         let unregistered = wire(&failing, path, "nobody@example.com").await;
         let registered = wire(&failing, path, "unproven@example.com").await;
