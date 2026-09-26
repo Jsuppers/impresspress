@@ -740,7 +740,9 @@ crate::impresspress_feature_block! {
 /// module in the block so the fixture exists once.
 #[cfg(test)]
 pub(super) async fn test_ctx() -> crate::test_support::TestContext {
-    let ctx = crate::test_support::TestContext::with_admin().await;
+    let ctx = crate::test_support::TestContext::with_admin()
+        .await
+        .running_as(crate::blocks::legalpages::LegalPagesBlock::BLOCK_NAME);
     let sqlite: Vec<&str> = migrations::SQLITE_MIGRATIONS
         .iter()
         .map(|(_, sql)| *sql)
@@ -1536,7 +1538,9 @@ mod table_tests {
     async fn publish_reads_only_the_bound_id() {
         use crate::test_support::{admin_msg, output_is_error, TestContext};
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::legalpages::LegalPagesBlock::BLOCK_NAME);
         let path = "/b/legalpages/api/documents/doc-7/publish";
 
         let unrouted = LegalPagesBlock::new()

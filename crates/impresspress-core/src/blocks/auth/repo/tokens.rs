@@ -264,7 +264,9 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_find_by_token_round_trips() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-1", "u1@example.com").await;
         insert(&ctx, "user-1", "raw-jwt", "fam-1", 0, &future_iso(3600))
             .await
@@ -280,7 +282,9 @@ mod tests {
 
     #[tokio::test]
     async fn raw_token_is_never_stored() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-1", "u1@example.com").await;
         let raw = "secret-refresh-token-do-not-store";
         insert(&ctx, "user-1", raw, "fam-1", 0, &future_iso(3600))
@@ -303,7 +307,9 @@ mod tests {
     async fn rotate_marks_old_revoked_and_keeps_family() {
         // Simulate the refresh handler's rotation: insert v0, then revoke
         // v0 + insert v1 under the same family with generation+1.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-1", "u1@example.com").await;
         insert(&ctx, "user-1", "tok-v0", "fam-1", 0, &future_iso(3600))
             .await
@@ -331,7 +337,9 @@ mod tests {
     async fn reuse_detection_revokes_whole_family() {
         // After rotation, presenting the OLD (revoked) token should reveal
         // a live family — the handler's response is to revoke the family.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-1", "u1@example.com").await;
         insert(&ctx, "user-1", "tok-v0", "fam-1", 0, &future_iso(3600))
             .await
@@ -359,7 +367,9 @@ mod tests {
         // The rotation claim is a compare-and-set, so the second caller to
         // reach an already-revoked row is told it lost — the signal the
         // refresh handler turns into reuse detection.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-1", "u1@example.com").await;
         insert(&ctx, "user-1", "tok-v0", "fam-1", 0, &future_iso(3600))
             .await
@@ -379,7 +389,9 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_all_for_user_invalidates_every_family() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-1", "u1@example.com").await;
         insert(&ctx, "user-1", "tok-a", "fam-a", 0, &future_iso(3600))
             .await

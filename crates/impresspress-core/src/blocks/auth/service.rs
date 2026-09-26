@@ -285,6 +285,11 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         // denies the users-table read and every such request is refused
         // with 403 "Access denied", the same as the blocklist read above.
         wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__users"),
+        // The API-key half of the same step: `blocks::auth::authenticate_api_key`
+        // looks the key up in the router's context on every request bearing
+        // `Authorization: ApiKey …`. Without this grant WRAP denies the read
+        // and every such request is refused with 403 "Access denied".
+        wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__api_keys"),
         // Admin block reads auth tables for the admin dashboards. The
         // wildcard mirrors the legacy AuthBlock grant — admin/pages/users
         // reads users, sessions, AND api_keys (the API-key tab) so the
@@ -585,7 +590,9 @@ mod tests {
     /// snapshot: `extract_creds` reads it synchronously to verify the access
     /// token the request carries.
     async fn with_admin_and_jwt_secret() -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         ctx.set_config(super::super::JWT_SECRET_KEY, TEST_JWT_SECRET);
         ctx
     }
@@ -596,7 +603,11 @@ mod tests {
         // table exists — `apply_if_blessed` requires it to upsert the
         // `current_hash` row. In production `register_all_static_blocks`
         // registers admin first, so its Init runs before auth's.
-        let ctx = Arc::new(TestContext::with_admin().await);
+        let ctx = Arc::new(
+            TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID),
+        );
         let service = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
 
         service
@@ -619,7 +630,11 @@ mod tests {
         // Running init twice must be safe — migrations track applied
         // versions and bootstrap short-circuits when users already exist.
         // Admin pre-applied for the same reason as above.
-        let ctx = Arc::new(TestContext::with_admin().await);
+        let ctx = Arc::new(
+            TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID),
+        );
         let service = AuthServiceImpl::new(BlockState::for_test(ctx.clone()));
 
         service.init(&*ctx).await.expect("first init");
@@ -634,7 +649,13 @@ mod tests {
         // We don't need a context for grants(); construct the service with
         // a stub ctx and inspect the returned vec directly.
         let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-        let ctx = rt.block_on(async { Arc::new(TestContext::new().await) });
+        let ctx = rt.block_on(async {
+            Arc::new(
+                TestContext::new()
+                    .await
+                    .running_as(crate::blocks::auth::AUTH_BLOCK_ID),
+            )
+        });
         let service = AuthServiceImpl::new(BlockState::for_test(ctx));
 
         let grants = service.grants();
@@ -677,7 +698,11 @@ mod tests {
         // to admin via the merged resolver that `require_role` now uses.
         use crate::platform_state::user_roles;
 
-        let ctx = Arc::new(TestContext::with_admin().await);
+        let ctx = Arc::new(
+            TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID),
+        );
         // Apply auth migrations so the `users` table exists.
         AuthServiceImpl::new(BlockState::for_test(ctx.clone()))
             .init(&*ctx)

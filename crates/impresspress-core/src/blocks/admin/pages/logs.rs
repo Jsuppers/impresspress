@@ -332,7 +332,9 @@ mod tests {
     /// Logs page for `query`. Two error rows so a page of one still has a
     /// next page under the filter.
     async fn logs_html(query: &[(&str, &str)]) -> String {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         seed(&ctx, "/served-ok", 200).await;
         seed(&ctx, "/served-missing", 404).await;
         seed(&ctx, "/served-boom", 500).await;
@@ -397,7 +399,9 @@ mod tests {
     /// a test that follows the link itself can catch the two drifting apart.
     #[tokio::test]
     async fn the_dashboard_error_links_filter_the_logs_page() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         seed(&ctx, "/served-ok", 200).await;
         seed(&ctx, "/served-boom", 500).await;
 

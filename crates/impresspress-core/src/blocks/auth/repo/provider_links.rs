@@ -241,7 +241,9 @@ mod typed_client_tests {
     #[tokio::test]
     async fn upsert_inserts_then_updates_under_wrap() {
         // Seed BEFORE enabling WRAP — exec_raw fixture denied otherwise.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let ctx = ctx.running_as("wafer-run/auth");
 
@@ -290,7 +292,9 @@ mod typed_client_tests {
     /// credential sitting in the table.
     #[tokio::test]
     async fn upsert_clears_a_token_an_existing_row_still_holds() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let mut legacy = HashMap::new();
         for (k, v) in [
@@ -339,7 +343,9 @@ mod tests_phase_4 {
 
     #[tokio::test]
     async fn list_for_user_returns_only_caller_links() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         for u in ["user-a", "user-b"] {
             seed_user(&ctx, u).await;
         }

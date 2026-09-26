@@ -479,7 +479,7 @@ async fn every_link_a_products_page_emits_resolves_to_a_declared_row() {
     let (ctx, seeds) = seeded_ctx().await;
     let other_blocks = crate::blocks::all_block_infos();
     let fixture = Fixture {
-        ctx: Arc::new(ctx),
+        ctx,
         site: Site(vec![Arc::new(ProductsBlock::new()) as Arc<dyn Block>]),
         caller: viewer,
         pages: PAGES

@@ -37,6 +37,7 @@ const SECRET: &str = "s3cr3t-jwt-signing-value-0192837465";
 /// then prove by direct SQL that the plaintext really is sitting in `value` —
 /// otherwise a refusal below would be protecting nothing.
 async fn stage_secret_variable(ctx: &TestContext) {
+    let ctx = &ctx.fixture();
     migrations::apply(ctx)
         .await
         .expect("apply admin migrations");
@@ -173,8 +174,10 @@ async fn column_name_masking_has_nothing_to_key_on() {
     let ctx = TestContext::new().await;
     stage_secret_variable(&ctx).await;
 
+    // In the admin block's frame, where `handle_query` makes it.
     let rows = db::query_raw(
-        &ctx,
+        &ctx.clone()
+            .running_as(impresspress_core::blocks::admin::ADMIN_BLOCK_ID),
         "SELECT value AS v FROM impresspress__admin__variables",
         &[],
     )
@@ -193,7 +196,8 @@ async fn column_name_masking_has_nothing_to_key_on() {
     );
 
     let rows = db::query_raw(
-        &ctx,
+        &ctx.clone()
+            .running_as(impresspress_core::blocks::admin::ADMIN_BLOCK_ID),
         "SELECT substr(value, 1, 12) FROM impresspress__admin__variables",
         &[],
     )
@@ -409,7 +413,7 @@ async fn ordinary_tables_are_still_queryable() {
     data.insert("is_system".into(), json!(1));
     data.insert("created_at".into(), json!("2026-01-01T00:00:00Z"));
     data.insert("updated_at".into(), json!("2026-01-01T00:00:00Z"));
-    db::create(&ctx, "impresspress__admin__roles", data)
+    db::create(&ctx.fixture(), "impresspress__admin__roles", data)
         .await
         .expect("stage a roles row");
 

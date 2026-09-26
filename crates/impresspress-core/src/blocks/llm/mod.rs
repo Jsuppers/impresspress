@@ -223,6 +223,9 @@ pub struct LlmBlock {
 }
 
 impl LlmBlock {
+    /// The name the block registers and reports under.
+    pub const BLOCK_NAME: &'static str = "impresspress/llm";
+
     pub fn new(provider_admin: Arc<dyn ProviderAdmin>) -> Self {
         Self { provider_admin }
     }
@@ -760,7 +763,7 @@ fn model_path_schema() -> serde_json::Value {
 impl Block for LlmBlock {
     fn info(&self) -> BlockInfo {
         BlockInfo::new(
-            "impresspress/llm",
+            Self::BLOCK_NAME,
             "0.0.1",
             "http-handler@v1",
             "LLM orchestrator — routes to provider or local backends",
@@ -880,7 +883,7 @@ impl Block for LlmBlock {
         crate::migration_helper::lifecycle_init(
             ctx,
             &event,
-            "impresspress/llm",
+            Self::BLOCK_NAME,
             migrations::SQLITE_MIGRATIONS,
             migrations::POSTGRES_MIGRATIONS,
         )

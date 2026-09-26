@@ -1714,7 +1714,9 @@ mod tests {
         /// A key variable nothing sets.
         const MISSING_KEY_VAR: &str = "IMPRESSPRESS__LLM__TEST_MISSING_KEY";
 
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::llm::LlmBlock::BLOCK_NAME);
         {
             use crate::blocks::llm::migrations;
             let sqlite: Vec<&str> = migrations::SQLITE_MIGRATIONS

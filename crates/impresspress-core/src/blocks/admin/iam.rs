@@ -779,7 +779,9 @@ mod tests {
     /// where the same column comes back as a string.
     #[tokio::test]
     async fn list_roles_publishes_exactly_the_contract_fields() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = crate::test_support::admin_msg("create", "/b/admin/api/iam/roles");
         let created = super::super::ops::create_role(
             &ctx,
@@ -878,7 +880,9 @@ mod tests {
     /// declared, schema-bearing and agent-reachable.
     #[tokio::test]
     async fn delete_role_rejects_deletion_when_guard_read_errors() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = seed_system_role(&ctx).await;
         let failing = FailingGetContext { inner: ctx };
 
@@ -914,7 +918,9 @@ mod tests {
     /// reads them stops matching.
     #[tokio::test]
     async fn update_role_rename_cascades_to_its_assignments() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         let created = output_json(
             handle_create_role(
@@ -963,7 +969,9 @@ mod tests {
     /// invalidates every grant naming the old value — wrote none.
     #[tokio::test]
     async fn update_role_writes_an_audit_row() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = output_json(
             handle_create_role(
                 &ctx,
@@ -1000,7 +1008,9 @@ mod tests {
     #[tokio::test]
     async fn update_role_rejects_mutation_when_guard_read_errors() {
         // Real system role exists in the DB (renaming it would break auth).
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = seed_system_role(&ctx).await;
         let failing = FailingGetContext { inner: ctx };
 
@@ -1042,7 +1052,9 @@ mod tests {
     async fn update_role_still_forbids_system_role_rename_on_success() {
         // Regression guard: the normal (non-erroring) guard-read path must
         // still block a rename of a real system role.
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = seed_system_role(&ctx).await;
 
         let out = handle_update_role(
@@ -1056,7 +1068,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_role_missing_row_returns_not_found() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let out = handle_update_role(
             &ctx,
             &update_role_msg("does-not-exist"),
@@ -1068,7 +1082,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_role_non_system_role_updates_normally() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let data = json_map(serde_json::json!({
             "name": "editor",
             "description": "old",
@@ -1119,7 +1135,9 @@ mod tests {
     /// encoding the backend returned. It must publish the list's projection.
     #[tokio::test]
     async fn create_role_publishes_the_list_projection() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let out = handle_create_role(
             &ctx,
             &admin_msg("create", "/b/admin/api/iam/roles"),
@@ -1148,7 +1166,9 @@ mod tests {
     /// that named a permission which already exists.
     #[tokio::test]
     async fn creating_a_permission_whose_name_is_taken_is_a_conflict() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let permission =
             serde_json::json!({"name": "posts.write", "resource": "posts", "actions": ["write"]});
         let msg = routed(admin_msg("create", "/b/admin/api/iam/permissions"));
@@ -1167,7 +1187,9 @@ mod tests {
     /// schema does not admit is refused rather than written.
     #[tokio::test]
     async fn update_role_publishes_the_list_projection_and_types_permissions() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = output_json(
             handle_create_role(
                 &ctx,
@@ -1208,7 +1230,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_role_reports_deleted() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = output_json(
             handle_create_role(
                 &ctx,
@@ -1235,7 +1259,9 @@ mod tests {
     async fn assign_role_bumps_the_targets_auth_version() {
         use crate::blocks::auth::repo::users;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let uid = users::insert(
             &ctx,
             users::NewUser {
@@ -1279,7 +1305,9 @@ mod tests {
     async fn remove_role_bumps_the_targets_auth_version() {
         use crate::blocks::auth::repo::users;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let uid = users::insert(
             &ctx,
             users::NewUser {
@@ -1344,7 +1372,9 @@ mod tests {
     /// way an admin makes one today.
     #[tokio::test]
     async fn a_rename_onto_a_name_already_held_merges_the_grants() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("holder").await;
         let role_id = define_role(&ctx, "editor").await;
         output_json(
@@ -1509,7 +1539,9 @@ mod tests {
     /// runs only for a role that was found, and never keys on the path id.
     #[tokio::test]
     async fn deleting_a_missing_role_is_not_found_and_revokes_nothing() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         // A grant of a name no role has, as a role deleted before this
         // release left behind.
         user_roles::assign(&ctx, "u-1", "ghost", "")
@@ -1539,7 +1571,9 @@ mod tests {
     /// later created under that name re-attaches to it.
     #[tokio::test]
     async fn assigning_an_undefined_role_is_refused() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("u-1").await;
         let out = handle_assign_role(
             &ctx,
@@ -1573,7 +1607,9 @@ mod tests {
     async fn racing_assigns_leave_one_grant_that_the_revoke_endpoint_removes() {
         use crate::test_support::RendezvousDbOpContext;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("racer").await;
         define_role(&ctx, "auditor").await;
         let gated = RendezvousDbOpContext::new(ctx.clone(), "database.list", user_roles::TABLE, 2);
@@ -1646,7 +1682,9 @@ mod tests {
     async fn a_role_delete_whose_invalidation_fails_can_be_retried() {
         use crate::{blocks::auth::repo::users, test_support::FailingDbOpContext};
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = define_role(&ctx, "editor").await;
         for user in ["u-1", "u-2"] {
             ctx.seed_auth_user(user).await;
@@ -1715,7 +1753,9 @@ mod tests {
     async fn a_rename_onto_another_roles_name_is_a_conflict_that_moves_nothing() {
         use crate::blocks::auth::repo::users;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let editor_id = define_role(&ctx, "editor").await;
         define_role(&ctx, "author").await;
         for (user, role) in [("u-1", "editor"), ("u-2", "author")] {
@@ -1784,7 +1824,9 @@ mod tests {
     async fn a_role_delete_whose_late_revocation_pass_fails_still_reports_the_deletion() {
         use crate::test_support::FailingDbOpContext;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = define_role(&ctx, "editor").await;
         ctx.seed_auth_user("u-1").await;
         output_json(
@@ -1856,7 +1898,9 @@ mod tests {
     async fn a_rename_whose_cascade_stops_part_way_is_audited_and_answered_as_a_rename() {
         use crate::test_support::FailingDbOpContext;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = define_role(&ctx, "editor").await;
         for user in ["u-1", "u-2"] {
             ctx.seed_auth_user(user).await;
@@ -1949,7 +1993,9 @@ mod tests {
     ) -> (TestContext, String, super::super::ops::RoleDeleted) {
         use super::super::test_support::AssignBeforeGrantRead;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let role_id = define_role(&ctx, "editor").await;
         for user in std::iter::once(&"u-1").chain(late) {
             ctx.seed_auth_user(user).await;
@@ -2106,7 +2152,9 @@ mod tests {
     /// had no admin to attribute the change to.
     #[tokio::test]
     async fn creating_a_permission_writes_an_audit_row_naming_it() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         let created = output_json(
             permissions_api(
@@ -2135,7 +2183,9 @@ mod tests {
     /// `{"deleted": true}` and wrote nothing.
     #[tokio::test]
     async fn deleting_a_permission_writes_an_audit_row_naming_it() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = output_json(
             permissions_api(
                 &ctx,
@@ -2172,7 +2222,9 @@ mod tests {
     /// the trail that a permission was removed.
     #[tokio::test]
     async fn a_delete_that_matched_nothing_is_not_audited() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         let out = permissions_api(
             &ctx,

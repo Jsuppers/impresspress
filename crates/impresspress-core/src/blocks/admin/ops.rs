@@ -1309,7 +1309,9 @@ mod tests {
 
     /// Set up a context with the admin schema (variables, roles, audit_logs).
     async fn admin_ctx() -> TestContext {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -2273,7 +2275,11 @@ mod tests {
         use crate::blocks::auth::config::BOOTSTRAP_ADMIN_TOKEN_KEY as KEY;
 
         // Unredeemed: no users yet.
-        let ctx = TestContext::with_admin().await.with_auth_added().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .with_auth_added()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = admin_msg("update", "/admin/settings");
         expect_ok(create_variable(&ctx, &msg, KEY, "tok", None, None, true).await);
         assert!(
@@ -2282,7 +2288,11 @@ mod tests {
         );
 
         // Redeemed: an admin user exists.
-        let ctx = TestContext::with_admin().await.with_auth_added().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .with_auth_added()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("admin_1").await;
         let msg = admin_msg("update", "/admin/settings");
         expect_ok(create_variable(&ctx, &msg, KEY, "tok", None, None, true).await);
@@ -2700,7 +2710,9 @@ mod runtime_key_guard_tests {
     };
 
     async fn admin_ctx() -> TestContext {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");

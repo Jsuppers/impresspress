@@ -112,7 +112,9 @@ mod tests {
         // `with_admin` registers no feature blocks, so every block-bound entry
         // (LLM, Vector, Messages, Products, Tickets) must be absent while the
         // plain admin entries stay.
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         let out = logs_page(&ctx, &admin_msg("retrieve", "/b/admin/logs")).await;
         let html = String::from_utf8(output_body(out).await).expect("utf-8 page");

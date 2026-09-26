@@ -183,7 +183,9 @@ mod tests {
     /// upgrading with `--run-migrations` does.
     #[tokio::test]
     async fn migration_002_repairs_a_database_that_already_holds_a_duplicate_name() {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::files::FilesBlock::BLOCK_NAME);
         crate::migration_helper::apply_migrations(
             &ctx,
             "impresspress/files",

@@ -70,7 +70,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_seeded_row_starts_empty_and_round_trips_a_stamp() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         assert_eq!(
             last_swept_at(&ctx).await.unwrap(),
             "",

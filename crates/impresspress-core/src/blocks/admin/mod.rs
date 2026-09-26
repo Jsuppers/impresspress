@@ -581,6 +581,13 @@ crate::impresspress_feature_block! {
                     super::auth_ui::AUTH_UI_BLOCK_ID,
                     user_roles::TABLE,
                 ),
+                // The pipeline router authenticates an API key by reading its
+                // user's roles (`blocks::auth::authenticate_api_key`), in the
+                // router's own context, on every request that carries one.
+                wafer_run::ResourceGrant::read(
+                    crate::blocks::router::ROUTER_BLOCK_ID,
+                    user_roles::TABLE,
+                ),
                 // Every block may upsert its own migration state into block_settings.
                 wafer_run::ResourceGrant::read_write("*", block_settings::TABLE),
                 // Infrastructure logging: storage wrapper + pipeline write logs
@@ -984,7 +991,9 @@ mod tests {
     /// value arrives decoded, so it has to be encoded again on the way out.
     #[tokio::test]
     async fn the_permissions_redirect_encodes_the_tab_it_carries() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let mut msg = crate::test_support::admin_msg("retrieve", "/b/admin/permissions");
         msg.set_meta("req.query.tab", "r\u{f4}les\r\nX-Injected: 1");
         let out = AdminBlock::new()
@@ -1021,7 +1030,9 @@ mod tests {
     async fn extensions_reports_a_disabled_block_as_disabled() {
         use crate::test_support::{output_json, TestContext};
 
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.register_block_info(
             "impresspress/tickets",
             wafer_run::BlockInfo::new("impresspress/tickets", "1.0.0", "http.handler", "tickets"),
@@ -1090,7 +1101,9 @@ mod tests {
             test_support::{admin_msg, TestContext},
         };
 
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         // The toggle refuses a name that is neither registered nor stored,
         // and refuses a registered block that cannot be disabled — so the
         // fixture has to look like the real files block.
@@ -1193,7 +1206,9 @@ mod wrap_grant_mutation_tests {
 
     #[tokio::test]
     async fn create_wrap_grant_success_persists_and_audits() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = admin_msg("create", "/b/admin/grants/rules");
         let form = "grantee=impresspress%2Ffiles&resource=impresspress__foo__bar&write=on";
         let input = InputStream::from_bytes(form.as_bytes().to_vec());
@@ -1216,7 +1231,9 @@ mod wrap_grant_mutation_tests {
     /// code silently re-rendered the page as if nothing was wrong).
     #[tokio::test]
     async fn create_wrap_grant_rejects_empty_fields_without_persisting() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = admin_msg("create", "/b/admin/grants/rules");
         let input = InputStream::from_bytes(b"grantee=&resource=".to_vec());
 
@@ -1238,7 +1255,9 @@ mod wrap_grant_mutation_tests {
     /// this `NotFound`.
     #[tokio::test]
     async fn delete_wrap_grant_missing_row_errors_without_audit() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = routed(admin_msg("delete", "/b/admin/grants/rules/does-not-exist"));
 
         let out = handle_delete_wrap_grant(&ctx, msg).await;
@@ -1251,7 +1270,9 @@ mod wrap_grant_mutation_tests {
 
     #[tokio::test]
     async fn delete_wrap_grant_success_removes_row_and_audits() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         let record = wrap_grants::create(
             &ctx,
@@ -1311,7 +1332,9 @@ mod delegation_tests {
     }
 
     async fn ctx_with_probe_files_block() -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.register_block(
             ProbeFilesBlock::BLOCK_NAME,
             Arc::new(ProbeFilesBlock::new()),
@@ -2392,7 +2415,7 @@ pub(crate) mod page_link_tests {
         let (ctx, seeds) = seeded_ctx().await;
         let auth_endpoints = AuthUiBlock::new().info().endpoints;
         let fixture = Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             ..super::htmx_contract_tests::fixture().await
         };
 

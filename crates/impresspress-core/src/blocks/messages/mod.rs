@@ -344,7 +344,9 @@ pub(crate) mod test_support {
     /// `TestContext::with_products` and friends apply theirs, after
     /// `with_auth()` so the migration-tracking table exists first.
     pub(crate) async fn ctx_with_messages() -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::messages::MessagesBlock::BLOCK_NAME);
         let sqlite: Vec<&str> = super::migrations::SQLITE_MIGRATIONS
             .iter()
             .map(|(_, sql)| *sql)

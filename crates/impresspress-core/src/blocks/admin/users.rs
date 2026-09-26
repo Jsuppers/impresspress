@@ -186,7 +186,9 @@ mod tests {
     }
 
     async fn users_ctx() -> TestContext {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         // Admin first: the migration runner records its state in
         // `block_settings`, which the admin schema creates.
         crate::blocks::admin::migrations::apply(&ctx)

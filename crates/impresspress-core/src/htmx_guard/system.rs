@@ -41,7 +41,7 @@ fn caller(action: &str, path: &str) -> Message {
 fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
     Box::pin(async {
         Fixture {
-            ctx: Arc::new(TestContext::new().await),
+            ctx: TestContext::new().await,
             site: Site(vec![Arc::new(SystemBlock::new()) as Arc<dyn Block>]),
             caller,
             pages: Vec::new(),

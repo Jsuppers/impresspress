@@ -278,7 +278,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_redirects_to_login() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let msg = anon_msg("retrieve", "/b/userportal/security");
         let resp = security_page(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 302);
@@ -286,7 +288,9 @@ mod tests {
 
     #[tokio::test]
     async fn renders_three_sections() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/security", "user-a");
         let resp = security_page(&ctx, &msg).await;
@@ -304,7 +308,9 @@ mod tests {
 
     #[tokio::test]
     async fn unverified_state_shows_resend_cta() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user_with_verified(&ctx, "user-a", false).await;
         let msg = auth_msg("retrieve", "/b/userportal/security", "user-a");
         let resp = security_page(&ctx, &msg).await;
@@ -322,7 +328,9 @@ mod tests {
 
     #[tokio::test]
     async fn verified_state_hides_resend_cta() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user_with_verified(&ctx, "user-a", true).await;
         let msg = auth_msg("retrieve", "/b/userportal/security", "user-a");
         let resp = security_page(&ctx, &msg).await;
@@ -336,7 +344,9 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_form_posts_to_existing_api() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/security", "user-a");
         let resp = security_page(&ctx, &msg).await;
@@ -439,7 +449,9 @@ mod tests {
 
     #[tokio::test]
     async fn linked_accounts_empty_state() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/security", "user-a");
         let resp = security_page(&ctx, &msg).await;
@@ -449,7 +461,9 @@ mod tests {
 
     #[tokio::test]
     async fn linked_accounts_render_when_present() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         upsert(
             &ctx,
@@ -474,7 +488,9 @@ mod tests {
     /// page lets a user audit and unlink.
     #[tokio::test]
     async fn a_failed_link_read_is_a_500_not_no_linked_accounts() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         link(&ctx, "user-a", "github", "gh-1").await;
         let ctx = ctx.break_list_reads();
@@ -501,7 +517,9 @@ mod tests {
     async fn a_failed_verification_read_is_a_500_not_unverified() {
         use crate::test_support::FailingDbOpContext;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user_with_verified(&ctx, "user-a", true).await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.get", users::TABLE)]);
 
@@ -525,7 +543,9 @@ mod tests {
     #[tokio::test]
     async fn wrap_denies_provider_links_list_to_a_block_without_a_grant() {
         // Seeded from the fixture's own frame — `seed_user` uses raw SQL.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         upsert(
             &ctx,
@@ -553,7 +573,9 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_allows_provider_links_list_with_auth_block_grants() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         upsert(
             &ctx,
@@ -608,7 +630,9 @@ mod tests {
     /// the state that made a squatted account unrecoverable.
     #[tokio::test]
     async fn the_page_offers_an_unlink_for_each_link() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         link(&ctx, "user-a", "github", "gh-1").await;
 
@@ -634,10 +658,12 @@ mod tests {
     /// owner evicting somebody else's provider identity.
     #[tokio::test]
     async fn unlink_removes_the_link_when_a_password_remains() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         link(&ctx, "user-a", "github", "gh-1").await;
-        local_credentials::insert(&ctx, "user-a", "hash", false)
+        local_credentials::insert(&ctx.fixture(), "user-a", "hash", false)
             .await
             .expect("seed password");
 
@@ -657,11 +683,13 @@ mod tests {
     /// and answers exactly like naming one you do not have.
     #[tokio::test]
     async fn unlink_cannot_reach_another_users_link() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         seed_user(&ctx, "user-b").await;
         link(&ctx, "user-b", "github", "gh-b").await;
-        local_credentials::insert(&ctx, "user-a", "hash", false)
+        local_credentials::insert(&ctx.fixture(), "user-a", "hash", false)
             .await
             .expect("seed password");
 
@@ -683,7 +711,9 @@ mod tests {
     /// htmx does not swap a non-2xx — carrying the fix.
     #[tokio::test]
     async fn unlink_refuses_to_remove_the_last_way_in() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         link(&ctx, "user-a", "github", "gh-1").await;
         // No local_credentials row: this account has no password.
@@ -705,7 +735,9 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_is_unauthenticated_without_a_session() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let mut msg = anon_msg("delete", "/b/userportal/security/providers/github");
         msg.set_meta("req.param.provider", "github");
         assert_eq!(output_status(handle_unlink(&ctx, &msg).await).await, 401);

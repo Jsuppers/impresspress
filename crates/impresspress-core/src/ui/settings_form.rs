@@ -590,7 +590,9 @@ mod tests {
 
     #[tokio::test]
     async fn section_description_renders_under_the_heading() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let vars = [var("X__A", "A", InputType::Text)];
         let sections = [
             SettingsSection::new("Checkout", super::super::icons::settings(), &vars)
@@ -771,7 +773,9 @@ mod tests {
 
     #[tokio::test]
     async fn save_settings_rejects_ssrf_url_for_url_typed_var() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let allowed = [var(LOGO_URL_KEY, "Logo", InputType::Url)];
         let out = run_save(
             &ctx,
@@ -792,7 +796,9 @@ mod tests {
     async fn save_settings_surfaces_config_set_failure() {
         // Every config::set fails; a loop that swallowed the error would
         // report success anyway.
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.refuse_config_writes();
         let allowed = [var(APP_NAME_KEY, "App", InputType::Text)];
         let out = run_save(&ctx, &allowed, serde_json::json!({APP_NAME_KEY: "MyApp"})).await;
@@ -809,7 +815,9 @@ mod tests {
 
     #[tokio::test]
     async fn render_sections_never_leaks_a_stored_secret_into_the_html() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(MAILGUN_API_KEY, "key-abcdef0123456789");
         let v = var(MAILGUN_API_KEY, "Mailgun API Key", InputType::Password);
         let sections = [SettingsSection::new(
@@ -834,7 +842,9 @@ mod tests {
 
     #[tokio::test]
     async fn save_settings_leaves_a_sensitive_field_unchanged_on_empty_submit() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         // Registers a real `wafer-run/config` service block (TestContext::set_config)
         // and seeds the current stored secret.
         ctx.set_config("X__API_SECRET", "original-secret");
@@ -885,7 +895,9 @@ mod tests {
     /// `util::is_masked_submission`.
     #[tokio::test]
     async fn save_settings_refuses_the_mask_rather_than_storing_or_dropping_it() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config("X__API_SECRET", "original-secret");
         let allowed = [var("X__API_SECRET", "API Secret", InputType::Password)];
 
@@ -919,7 +931,9 @@ mod tests {
     /// saved.
     #[tokio::test]
     async fn a_refused_mask_writes_nothing_at_all() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "MyApp");
         ctx.set_config("X__API_SECRET", "original-secret");
         // App name first, so it would already be written by the time the mask
@@ -969,8 +983,10 @@ mod tests {
     async fn an_operator_flagged_var_is_refused_before_anything_is_written() {
         use crate::platform_state::variables::{self, NewVariable};
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
@@ -1049,7 +1065,9 @@ mod tests {
     /// form of one such field is a no-op, not a `settings.update`.
     #[tokio::test]
     async fn a_save_that_wrote_nothing_writes_no_audit_row() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config("X__API_SECRET", "original-secret");
         let allowed = [var("X__API_SECRET", "API Secret", InputType::Password)];
 
@@ -1075,9 +1093,11 @@ mod tests {
     async fn a_half_applied_save_audits_the_keys_that_landed() {
         use crate::platform_state::variables::{self, NewVariable};
 
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         variables::insert(
-            &ctx,
+            &ctx.fixture(),
             NewVariable {
                 key: "X__PLAIN_NOTE".to_string(),
                 value: "operator-flagged-value".to_string(),
@@ -1149,8 +1169,10 @@ mod tests {
 
         const BOOT_ONLY: &str = "X__THING_SECRET";
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         // No row for `BOOT_ONLY`; the boot map answers it, and with the mask.
@@ -1238,8 +1260,10 @@ mod tests {
     async fn a_writer_refusal_is_forwarded_as_a_bad_request() {
         use crate::platform_state::variables::{self, NewVariable};
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
@@ -1297,8 +1321,10 @@ mod tests {
     async fn a_plain_field_already_holding_the_mask_does_not_break_the_page() {
         use crate::platform_state::variables::{self, NewVariable};
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
@@ -1388,7 +1414,9 @@ mod tests {
     /// which is the whole page this would otherwise have made unsavable.
     #[tokio::test]
     async fn save_settings_refuses_the_mask_even_for_a_plain_field() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "MyApp");
         let allowed = [var(APP_NAME_KEY, "App Name", InputType::Text)];
 
@@ -1411,7 +1439,9 @@ mod tests {
     async fn save_settings_still_clears_a_non_sensitive_field_on_empty_submit() {
         // Non-sensitive fields keep the pre-existing behavior: an empty
         // submit is a real write (clears the stored value), not "unchanged".
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "MyApp");
         let allowed = [var(APP_NAME_KEY, "App Name", InputType::Text)];
 
@@ -1452,8 +1482,10 @@ mod config_store_reproduction {
     async fn settings_form_save_survives_a_restart() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;

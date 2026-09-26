@@ -805,7 +805,10 @@ mod tests {
     /// requested marketing copy when no config var is set.
     #[tokio::test]
     async fn site_config_load_defaults_auth_headline_and_tagline() {
-        let ctx = crate::test_support::TestContext::new().await;
+        // Read as auth-ui, the block that renders the auth panel.
+        let ctx = crate::test_support::TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let config = SiteConfig::load(&ctx).await.expect("site config");
         assert_eq!(
             config.auth_headline,
@@ -826,6 +829,7 @@ mod tests {
         let mut ctx = crate::test_support::TestContext::new().await;
         ctx.set_config(AUTH_HEADLINE_KEY, "Acme Cloud");
         ctx.set_config(AUTH_TAGLINE_KEY, "Built for Acme.");
+        let ctx = ctx.running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let config = SiteConfig::load(&ctx).await.expect("site config");
         assert_eq!(config.auth_headline, "Acme Cloud");
         assert_eq!(config.auth_tagline, "Built for Acme.");

@@ -691,14 +691,17 @@ mod tests {
         // to add — mimicking the prod schema after a previous successful
         // apply, with the tracking row since gone.
         wafer_core::clients::database::ddl(
-            &ctx,
+            &ctx.fixture(),
             "CREATE TABLE IF NOT EXISTS dup_col_test (id TEXT PRIMARY KEY)",
         )
         .await
         .expect("setup: create table");
-        wafer_core::clients::database::ddl(&ctx, "ALTER TABLE dup_col_test ADD COLUMN name TEXT")
-            .await
-            .expect("setup: add column");
+        wafer_core::clients::database::ddl(
+            &ctx.fixture(),
+            "ALTER TABLE dup_col_test ADD COLUMN name TEXT",
+        )
+        .await
+        .expect("setup: add column");
 
         // Migration SQL re-asserts the same column. Without the fix this
         // statement returns "duplicate column name" and the batch aborts.
@@ -707,9 +710,13 @@ mod tests {
             ALTER TABLE dup_col_test ADD COLUMN name TEXT;\n\
         ";
 
-        apply_if_blessed(&ctx, "test/dup-add-column", migration_sql)
-            .await
-            .expect("benign duplicate ALTER must not abort the batch");
+        apply_if_blessed(
+            &ctx.clone().running_as("test/dup-add-column"),
+            "test/dup-add-column",
+            migration_sql,
+        )
+        .await
+        .expect("benign duplicate ALTER must not abort the batch");
     }
 
     /// Regression guard: only ALTER TABLE ADD COLUMN gets the duplicate

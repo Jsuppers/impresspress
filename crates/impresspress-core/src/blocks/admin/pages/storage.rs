@@ -180,7 +180,10 @@ mod outage_tests {
 
     #[tokio::test]
     async fn a_failing_access_log_read_renders_the_error_page_not_an_empty_log() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let msg = admin_msg("retrieve", "/b/admin/storage");
         assert_eq!(
             output_http_status(storage_page(&ctx, &msg).await).await,

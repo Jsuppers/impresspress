@@ -41,7 +41,9 @@ mod tests {
     /// a client ID that is set but empty is not a configured provider.
     #[tokio::test]
     async fn a_provider_is_listed_only_when_fully_configured() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(OAUTH_GITHUB_CLIENT_ID_KEY, "");
         ctx.set_config(OAUTH_GITHUB_CLIENT_SECRET_KEY, "secret");
         ctx.set_config(OAUTH_REDIRECT_URI_KEY, "https://example.com/cb");
@@ -61,7 +63,9 @@ mod tests {
     /// drops the provider.
     #[tokio::test]
     async fn a_refused_config_read_is_the_classified_denial() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.refuse_config_reads(WaferError::new(
             ErrorCode::PermissionDenied,
             "WRAP: impresspress/auth-ui holds no grant on wafer-run/config",

@@ -268,7 +268,9 @@ mod test_helpers {
     /// that must not depend on the unique index would go untested.
     pub(super) async fn ctx_with_storage_without_the_unique_index() -> (TestContext, Arc<MemStorage>)
     {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::files::FilesBlock::BLOCK_NAME);
         // Selected by basename, not by position: `SQLITE_MIGRATIONS[0]` means
         // "001" only for as long as 001 stays first, and a fixture that
         // silently started applying 002 as well would be the INDEXED case
@@ -288,7 +290,9 @@ mod test_helpers {
     /// but `004_object_claim_id` — a deployment that took this code without
     /// `--run-migrations`, so its objects table has no `claim_id` column.
     pub(super) async fn ctx_with_storage_before_004() -> (TestContext, Arc<MemStorage>) {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::files::FilesBlock::BLOCK_NAME);
         let sql: Vec<&str> = crate::blocks::files::migrations::SQLITE_MIGRATIONS
             .iter()
             .filter(|(basename, _)| *basename != "004_object_claim_id")
@@ -309,7 +313,9 @@ mod test_helpers {
     /// but `005_object_blob_key` — a deployment that took this code without
     /// `--run-migrations`, so its objects table has no `blob_key` column.
     pub(super) async fn ctx_with_storage_before_005() -> (TestContext, Arc<MemStorage>) {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::files::FilesBlock::BLOCK_NAME);
         let sql: Vec<&str> = crate::blocks::files::migrations::SQLITE_MIGRATIONS
             .iter()
             .filter(|(basename, _)| *basename != "005_object_blob_key")

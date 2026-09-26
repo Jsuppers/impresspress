@@ -445,7 +445,10 @@ mod outage_tests {
 
     #[tokio::test]
     async fn a_failing_inbound_summary_renders_the_error_page_not_no_traffic() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let msg = admin_msg("retrieve", "/b/admin/settings/network");
         assert_eq!(
             output_http_status(settings_page(&ctx, &msg, "network").await).await,
@@ -458,7 +461,10 @@ mod outage_tests {
     /// never been called".
     #[tokio::test]
     async fn a_failing_detail_fragment_is_an_error_not_an_empty_table() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let msg = admin_msg("retrieve", "/b/admin/settings/network/detail");
         assert_eq!(
             output_http_status(super::network_inbound_detail(&ctx, &msg).await).await,

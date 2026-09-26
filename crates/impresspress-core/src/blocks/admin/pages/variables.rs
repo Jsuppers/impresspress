@@ -1222,7 +1222,10 @@ mod tests {
     /// which tells the operator every value they set is gone.
     #[tokio::test]
     async fn a_failed_read_is_the_error_page_not_the_defaults() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
 
         for tab in ["", "all"] {
             let mut msg = crate::blocks::admin::test_support::routed(admin_msg(
@@ -1312,7 +1315,9 @@ mod tests {
             crate::blocks::auth::JWT_SECRET_KEY,
             crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY,
         ] {
-            let ctx = TestContext::with_admin().await;
+            let ctx = TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
             assert!(
                 crate::config_vars::is_sensitive_for_storage(key),
                 "{key} must be required-sensitive for this test to mean anything"
@@ -1381,7 +1386,9 @@ mod tests {
     /// a hint saying the variable is always sensitive.
     #[tokio::test]
     async fn an_unrepaired_required_row_still_renders_masked() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = crate::blocks::auth::JWT_SECRET_KEY;
 
         // `into_row` would flag it on the way in, which is the whole point —
@@ -1419,7 +1426,9 @@ mod tests {
     /// modal has to settle the table.
     #[tokio::test]
     async fn an_unrepaired_declaration_only_row_is_masked_in_the_table() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = crate::blocks::auth::config::BOOTSTRAP_ADMIN_PASSWORD_KEY;
         assert!(
             !crate::config_vars::has_sensitive_suffix(key),
@@ -1470,7 +1479,9 @@ mod tests {
     /// An admin context on a deployment that boots from a process environment,
     /// holding one pinned declared key.
     async fn ctx_with_a_pinned_key(key: &str, has_process_env: bool) -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         if has_process_env {
             ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         }
@@ -1531,7 +1542,9 @@ mod tests {
     /// hand it back would be an action with no effect.
     #[tokio::test]
     async fn an_unpinned_row_offers_no_reset_control() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         variables::seed_row_with_flag(&ctx, APP_NAME_KEY, "Seeded", 0).await;
 
@@ -1616,7 +1629,9 @@ mod tests {
     /// same claim and only one of them is about a person.
     #[tokio::test]
     async fn the_page_distinguishes_an_admin_edit_from_an_upgrade_pin() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         let key = APP_NAME_KEY;
         variables::seed_row_with_owner(&ctx, key, "KeptAtUpgrade", variables::PRE_UPGRADE_SENTINEL)
@@ -1750,7 +1765,9 @@ mod tests {
     /// the document either.
     #[tokio::test]
     async fn the_edit_modal_does_not_render_the_stored_secret() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = "MAILER_API_KEY";
         let html = sensitive_row_modal(&ctx, key, "sk-live-realsecret").await;
 
@@ -1785,7 +1802,9 @@ mod tests {
     /// alone". An empty masked field means "not supplied", not "clear it".
     #[tokio::test]
     async fn saving_the_modal_without_retyping_the_secret_keeps_it() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = "MAILER_API_KEY";
         let html = sensitive_row_modal(&ctx, key, "sk-live-realsecret").await;
 
@@ -1810,7 +1829,9 @@ mod tests {
     /// Rotation still works: a value typed into the blank field is written.
     #[tokio::test]
     async fn a_secret_typed_into_the_blank_field_rotates_it() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = "MAILER_API_KEY";
         let html = sensitive_row_modal(&ctx, key, "sk-live-realsecret").await;
 
@@ -1841,7 +1862,9 @@ mod tests {
     /// and drop the admin's edit with a 400.
     #[tokio::test]
     async fn an_operator_flagged_row_is_masked_and_read_back_as_masked() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = "MY_SERVICE_HANDLE";
         assert!(
             !crate::config_vars::is_sensitive_for_storage(key),
@@ -1873,7 +1896,9 @@ mod tests {
     /// rendered, and clearing the field really does clear it.
     #[tokio::test]
     async fn a_plain_variable_still_shows_and_clears_its_value() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = "SITE_MOTTO";
         variables::insert(
             &ctx,
@@ -1950,7 +1975,9 @@ mod tests {
     /// stamps an admin pin — a hand-written marker there would prove nothing
     /// about the state the surface actually produces.
     async fn ctx_with_every_pin_state(has_process_env: bool) -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         if has_process_env {
             ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         }
@@ -2200,7 +2227,9 @@ mod tests {
     /// clear admin edits is the misreading this action must not invite.
     #[tokio::test]
     async fn an_admin_edit_alone_offers_no_bulk_release() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         let msg = admin_msg("update", "/admin/settings");
         assert!(
@@ -2298,7 +2327,9 @@ mod tests {
             !key_can_be_seeded_from_env(key),
             "the fixture's key must be one no env batch can carry, or this proves nothing"
         );
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
         variables::seed_row_with_owner(&ctx, key, "legacy", variables::PRE_UPGRADE_SENTINEL).await;
 
@@ -2347,7 +2378,9 @@ mod tests {
     /// released, is news rather than a failure.
     #[tokio::test]
     async fn a_bulk_release_with_nothing_pinned_succeeds_and_says_so() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(variables::HAS_PROCESS_ENV_CONFIG_KEY, "1");
 
         let trigger =
@@ -2390,7 +2423,9 @@ mod create_form_tests {
     use crate::test_support::{admin_msg, collect_or_panic, TestContext};
 
     async fn admin_ctx() -> TestContext {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");

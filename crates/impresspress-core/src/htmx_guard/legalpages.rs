@@ -50,9 +50,10 @@ fn caller(action: &str, path: &str) -> Message {
 /// editor opens on one.
 async fn fixture() -> Fixture {
     let ctx = TestContext::with_admin().await;
+    // Init runs in the block's own frame.
     LegalPagesBlock::new()
         .lifecycle(
-            &ctx,
+            &ctx.clone().running_as(LegalPagesBlock::BLOCK_NAME),
             LifecycleEvent {
                 event_type: LifecycleType::Init,
                 data: Vec::new(),
@@ -65,7 +66,7 @@ async fn fixture() -> Fixture {
     let listed = crate::test_support::htmx::answer(
         LegalPagesBlock::new()
             .handle(
-                &ctx,
+                &ctx.clone().running_as(LegalPagesBlock::BLOCK_NAME),
                 admin_msg("retrieve", "/b/legalpages/api/documents"),
                 wafer_run::InputStream::empty(),
             )
@@ -79,7 +80,7 @@ async fn fixture() -> Fixture {
         .to_string();
 
     Fixture {
-        ctx: Arc::new(ctx),
+        ctx,
         site: Site(vec![Arc::new(LegalPagesBlock::new()) as Arc<dyn Block>]),
         caller,
         pages: vec![

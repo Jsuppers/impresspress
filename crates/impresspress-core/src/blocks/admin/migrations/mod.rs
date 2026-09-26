@@ -293,7 +293,9 @@ mod user_roles_unique_tests {
 
     #[tokio::test]
     async fn migration_004_collapses_repeated_grants_and_the_index_then_refuses_one() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         migration_helper::apply_migrations(&ctx, ADMIN, &before_004(), &[])
             .await
             .expect("001-003 apply");
@@ -449,7 +451,9 @@ mod variables_block_column_tests {
 
     #[tokio::test]
     async fn migration_002_adds_block_column_and_index() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         migration_helper::apply_migrations(&ctx, ADMIN, &all(), &[])
             .await
             .expect("apply migrations");
@@ -491,7 +495,9 @@ mod variables_block_column_tests {
     /// what populates `block`, not anything the test runs itself.
     #[tokio::test]
     async fn migration_002_backfills_block_on_rows_written_before_it() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(false), &[])
             .await
             .expect("001 applies");
@@ -512,7 +518,9 @@ mod variables_block_column_tests {
     /// without failing the batch or disturbing a derived value.
     #[tokio::test]
     async fn migration_002_survives_a_re_run_of_the_whole_list() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         migration_helper::apply_migrations(&ctx, ADMIN, &up_to_002(false), &[])
             .await
             .expect("001 applies");

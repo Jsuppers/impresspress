@@ -298,7 +298,9 @@ mod verify_tests {
     /// which reads the same table and replaces the token they were holding.
     #[tokio::test]
     async fn an_unreadable_verification_token_is_an_outage_not_a_bad_link() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let token = "raw-verification-token-0123456789";
         let user_id = seed_unverified(&ctx, token).await;
 
@@ -329,7 +331,9 @@ mod verify_tests {
         // The same fixture again, with a database whose reads all fail. The
         // token lookup is the handler's first read, so it is the one that
         // fails.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         seed_unverified(&ctx, token).await;
         let failing = ctx.break_reads();
 
@@ -602,7 +606,9 @@ mod resend_tests {
     /// still answer a registered, unproven address like any other.
     #[tokio::test]
     async fn a_failed_verification_token_draw_answers_what_an_unregistered_address_does() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         seed(&ctx, "unproven@example.com", false).await;
 
         let unregistered = resend_on_the_wire(&ctx, "nobody@example.com").await;
