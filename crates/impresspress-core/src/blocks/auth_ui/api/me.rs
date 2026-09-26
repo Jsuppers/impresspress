@@ -124,7 +124,9 @@ mod tests {
     /// response must be exactly what a subsequent `GET` returns.
     #[tokio::test]
     async fn update_returns_the_same_envelope_as_get() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let user = seed_user(&ctx).await;
 
         let updated = output_json(
@@ -163,7 +165,9 @@ mod tests {
     /// the handler must refuse what the schema refuses.
     #[tokio::test]
     async fn update_rejects_a_body_the_schema_rejects() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let user = seed_user(&ctx).await;
 
         let out = handle_update(
@@ -177,7 +181,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_requires_a_signed_in_caller() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let out = handle_update(
             &ctx,
             &anon_msg("update", "/b/auth/api/me"),
@@ -194,7 +200,9 @@ mod tests {
     /// an outage had happened.
     #[tokio::test]
     async fn an_unreadable_user_row_is_an_outage_not_a_missing_account() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let user = seed_user(&ctx).await;
         // The lookup under test is the handler's first read, so a database
         // whose reads all fail lands on it and on nothing earlier.

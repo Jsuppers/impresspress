@@ -94,7 +94,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_redirects_to_login() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = anon_msg("retrieve", "/b/auth/orgs");
         let resp = handle(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 302);
@@ -102,7 +104,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_redirect_sets_location() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = anon_msg("retrieve", "/b/auth/orgs");
         let resp = handle(&ctx, &msg).await;
         assert_eq!(
@@ -113,7 +117,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_renders_empty_state_copy() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let msg = auth_msg("retrieve", "/b/auth/orgs", "user-a");
         let resp = handle(&ctx, &msg).await;
@@ -124,7 +130,9 @@ mod tests {
 
     #[tokio::test]
     async fn populated_renders_one_row_per_org() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         seed_claimed_org(
             &ctx,
@@ -158,7 +166,9 @@ mod tests {
     async fn a_failed_read_is_a_500_not_the_empty_state() {
         use wafer_run::Block;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let ctx = ctx.break_reads();
         let mut msg = auth_msg("retrieve", "/b/auth/orgs", "user-a");

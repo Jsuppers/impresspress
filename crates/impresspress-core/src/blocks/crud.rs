@@ -744,7 +744,9 @@ mod db_error_tests {
     #[tokio::test]
     async fn a_missing_table_under_strict_schema_is_a_500_not_the_callers_404() {
         const NEVER_CREATED: &str = "impresspress__crudtest__never_created";
-        let ctx = TestContext::new().await;
+        // Run as the block the table would belong to, so the only thing
+        // wrong with each statement is the table it names.
+        let ctx = TestContext::new().await.running_as("impresspress/crudtest");
         ctx.set_strict_schema(true);
 
         let got = get_record(&ctx, NEVER_CREATED, "any-id", "Row")
@@ -829,9 +831,13 @@ mod db_error_tests {
     /// denial and not a blanket refusal.
     #[tokio::test]
     async fn a_granted_read_of_a_missing_row_is_still_404() {
-        let ctx = TestContext::new().await;
+        let mut ctx = TestContext::new().await;
+        ctx.add_deployment_grants(vec![wafer_run::ResourceGrant::read(
+            "test/granted",
+            FOREIGN_TABLE,
+        )]);
         db::ensure_table(
-            &ctx,
+            &ctx.fixture(),
             &wafer_block::wire::database::TableDef {
                 name: FOREIGN_TABLE.to_string(),
                 columns: vec![wafer_block::wire::database::ColumnDef {
@@ -850,9 +856,14 @@ mod db_error_tests {
         )
         .await
         .expect("the ungated fixture creates its table");
-        let out = get_record(&ctx, FOREIGN_TABLE, "no-such-id", "Row")
-            .await
-            .expect_err("the row does not exist");
+        let out = get_record(
+            &ctx.running_as("test/granted"),
+            FOREIGN_TABLE,
+            "no-such-id",
+            "Row",
+        )
+        .await
+        .expect_err("the row does not exist");
         assert_eq!(output_http_status(out).await, 404);
     }
 }

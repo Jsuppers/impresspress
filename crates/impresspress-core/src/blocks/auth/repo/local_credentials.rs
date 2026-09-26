@@ -141,7 +141,9 @@ mod typed_client_tests {
     async fn insert_then_find_round_trip_under_wrap() {
         // Seed user before enabling WRAP so the exec_raw fixture INSERT is not
         // subject to the WRAP check (same pattern as sessions.rs seed helpers).
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let ctx = ctx.running_as("wafer-run/auth");
         insert(&ctx, "user-a", "$argon2id$dummy", false)
@@ -158,7 +160,9 @@ mod typed_client_tests {
     /// digest to compute it.
     #[tokio::test]
     async fn has_password_is_true_only_once_a_credential_exists() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let ctx = ctx.running_as("wafer-run/auth");
 

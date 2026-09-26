@@ -140,7 +140,6 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
         )
         .await;
 
-        let ctx: Arc<dyn wafer_run::context::Context> = Arc::new(ctx);
         Fixture {
             ctx,
             site: Site(vec![Arc::new(ProductsBlock::new()) as Arc<dyn Block>]),

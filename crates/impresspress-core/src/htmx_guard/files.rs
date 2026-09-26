@@ -101,7 +101,7 @@ async fn fixture() -> Fixture {
     repo::quota::seed(&ctx, quota).await.expect("seed quota");
 
     Fixture {
-        ctx: Arc::new(ctx),
+        ctx,
         site: Site(vec![Arc::new(FilesBlock::new()) as Arc<dyn Block>]),
         caller,
         pages: vec![

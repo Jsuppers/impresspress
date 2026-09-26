@@ -140,7 +140,7 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
             .to_string();
 
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![
                 Arc::new(UserPortalBlock::new()) as Arc<dyn Block>,
                 Arc::new(AuthUiBlock::new()),

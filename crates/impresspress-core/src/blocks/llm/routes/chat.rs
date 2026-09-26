@@ -1289,11 +1289,24 @@ mod tests {
     async fn an_entry_posted_as_agent_reaches_the_model_as_an_assistant_turn() {
         use crate::blocks::messages::{service, test_support::ctx_with_messages};
 
-        let ctx = ctx_with_messages().await;
-        let thread =
-            service::create_context(&ctx, "user-a", "conversation", "T", "", "", None, None)
-                .await
-                .expect("create the thread");
+        // The thread is staged by the messages block; the post and the
+        // history read are the llm block's calls into it.
+        let ctx = ctx_with_messages()
+            .await
+            .running_as(crate::blocks::llm::LlmBlock::BLOCK_NAME);
+        let thread = service::create_context(
+            &ctx.clone()
+                .running_as(crate::blocks::messages::MessagesBlock::BLOCK_NAME),
+            "user-a",
+            "conversation",
+            "T",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .expect("create the thread");
 
         // Posted the way the composer posts it: through the messages block's
         // own HTTP surface, not through a repo call that could not see the

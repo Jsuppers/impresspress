@@ -96,7 +96,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_redirects_to_login() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let msg = anon_msg("retrieve", "/b/userportal/profile");
         let resp = profile_page(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 302);
@@ -104,7 +106,9 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_renders_profile_form() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         ctx.seed_auth_user("user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/profile", "user-a");
         let resp = profile_page(&ctx, &msg).await;
@@ -122,7 +126,9 @@ mod tests {
 
     #[tokio::test]
     async fn renders_back_link_to_dashboard() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         ctx.seed_auth_user("user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/profile", "user-a");
         let resp = profile_page(&ctx, &msg).await;
@@ -139,7 +145,9 @@ mod tests {
     /// Save.
     #[tokio::test]
     async fn a_failed_user_read_is_a_500_without_the_form() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         ctx.seed_auth_user("user-a").await;
         let ctx = ctx.break_reads();
 
@@ -161,7 +169,9 @@ mod tests {
     /// profile: same answer as the failed read, for the same reason.
     #[tokio::test]
     async fn a_missing_user_row_is_a_500_without_the_form() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
 
         let (status, html) = crate::blocks::userportal::test_support::browser_request(
             &ctx,
@@ -176,7 +186,9 @@ mod tests {
 
     #[tokio::test]
     async fn shell_chrome_is_absent() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         ctx.seed_auth_user("user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/profile", "user-a");
         let resp = profile_page(&ctx, &msg).await;

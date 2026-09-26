@@ -170,7 +170,9 @@ mod owner_id_backfill_tests {
 
     #[tokio::test]
     async fn migration_002_gives_existing_rows_their_owner() {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::messages::MessagesBlock::BLOCK_NAME);
         let before: Vec<&str> = SQLITE_MIGRATIONS[..SQLITE_MIGRATIONS
             .iter()
             .position(|(name, _)| *name == OWNER_ID)

@@ -1075,7 +1075,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn openapi_title_falls_back_to_impresspress_not_host_derived_127() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         // The exact host shape that produced the bug: an IP:port `Host`
         // header. `host.split('.').next()` on `"127.0.0.1:8093"` yields
         // the literal string `"127"`.
@@ -1090,7 +1092,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn openapi_title_honors_configured_app_name() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "Acme Corp");
         let body = discovery_json(&ctx, "/openapi.json", "127.0.0.1:8093").await;
 
@@ -1099,7 +1103,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn agent_card_name_uses_the_same_configured_project_name() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "Acme Corp");
         let body = discovery_json(&ctx, "/.well-known/agent.json", "127.0.0.1:8093").await;
 
@@ -1111,7 +1117,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn openapi_documents_core_auth_endpoints_with_schemas() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = discovery_json(&ctx, "/openapi.json", "impresspress.example.com").await;
         let paths = &body["paths"];
 
@@ -1199,7 +1207,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn openapi_documents_core_storage_endpoints_with_schemas() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = discovery_json(&ctx, "/openapi.json", "impresspress.example.com").await;
         let paths = &body["paths"];
 
@@ -1252,7 +1262,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn openapi_documents_core_products_endpoints_with_schemas() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = discovery_json(&ctx, "/openapi.json", "impresspress.example.com").await;
         let paths = &body["paths"];
 
@@ -1724,7 +1736,9 @@ mod discovery_tests {
     /// the `dedupe_hash` leak; this closes the discovery-side half.
     #[tokio::test]
     async fn openapi_omits_endpoints_above_the_callers_tier() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let host = "impresspress.example.com";
 
         let anon = discovery_json_as(&ctx, "/openapi.json", host, None).await;
@@ -1765,7 +1779,9 @@ mod discovery_tests {
     async fn openapi_describes_admin_endpoints_to_an_admin() {
         // A real bearer, resolved by step 2 — not pre-set meta, which a
         // step-0 filter would also see. Needs the auth tables.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let bearer = bearer_for_roles(&["admin"]);
         let mut msg = anon_msg("retrieve", "/openapi.json");
         msg.set_meta("http.header.host", "impresspress.example.com");
@@ -1792,7 +1808,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn agent_card_omits_skills_above_the_callers_tier() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let host = "impresspress.example.com";
         fn skill_ids(card: &serde_json::Value) -> Vec<String> {
             card["skills"]
@@ -1827,7 +1845,9 @@ mod discovery_tests {
     /// the same reasoning as the manifest's `no-store`.
     #[tokio::test]
     async fn discovery_documents_are_not_cacheable() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         for path in ["/openapi.json", "/.well-known/agent.json"] {
             let headers = discovery_headers(&ctx, path, "impresspress.example.com").await;
             let cache_control = headers
@@ -1875,7 +1895,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn webmcp_manifest_is_served_and_versioned() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
 
         assert_eq!(body["schema_version"], serde_json::json!(1));
@@ -1887,7 +1909,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn webmcp_manifest_for_anonymous_caller_contains_no_privileged_tools() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
 
         // An unauthenticated request must see Public tools only. Anything
         // requiring a session is recon surface if its name is published
@@ -1917,7 +1941,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn anonymous_manifest_exposes_the_storefront_purchase_path() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
         let names = tool_names(&body);
 
@@ -1950,7 +1976,9 @@ mod discovery_tests {
     /// a query param, so it pins the most contract surface of the six.
     #[tokio::test]
     async fn webmcp_manifest_pins_the_producer_invocation_contract() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
 
         let tool = body["tools"]
@@ -1993,7 +2021,9 @@ mod discovery_tests {
     ///    whose `required` names the fields a guest can always read.
     #[tokio::test]
     async fn webmcp_manifest_pins_the_producer_output_schema_contract() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
 
         let tool = body["tools"]
@@ -2043,7 +2073,9 @@ mod discovery_tests {
     /// `receipt_token`.
     #[tokio::test]
     async fn webmcp_manifest_pins_list_my_purchases_to_the_typed_order_rows() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
 
         let tool = body["tools"]
@@ -2095,7 +2127,9 @@ mod discovery_tests {
     /// on top of that projection, and this pins the two together.
     #[tokio::test]
     async fn webmcp_manifest_pins_list_products_to_the_public_catalog_view() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let body = webmcp_manifest(&ctx, None, &real_block_infos(), &AllEnabled).await;
 
         let tool = body["tools"]
@@ -2164,7 +2198,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn webmcp_manifest_is_not_cacheable() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let headers =
             discovery_headers(&ctx, "/b/webmcp/manifest.json", "impresspress.example.com").await;
 
@@ -2184,7 +2220,9 @@ mod discovery_tests {
     /// hardcode this path and get the same script.
     #[tokio::test]
     async fn webmcp_js_is_served_at_the_stable_path_for_anonymous_callers() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let mut msg = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
         msg.set_meta("http.header.host", "impresspress.example.com");
         let out = handle_request(
@@ -2246,7 +2284,9 @@ mod discovery_tests {
     /// stale/foreign value still gets the full `200`.
     #[tokio::test]
     async fn webmcp_js_stable_path_answers_conditional_get() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let etag = format!("\"{}\"", ui::assets::webmcp_js_hash());
 
         let mut fresh = anon_msg("retrieve", ui::assets::WEBMCP_JS_STABLE_PATH);
@@ -2318,7 +2358,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn webmcp_manifest_reflects_an_authenticated_caller() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
 
         // A valid session for a non-admin user (empty `roles` claim).
         let body = webmcp_manifest(&ctx, Some(&[]), &real_block_infos(), &AllEnabled).await;
@@ -2337,7 +2379,9 @@ mod discovery_tests {
     /// Authenticated.
     #[tokio::test]
     async fn webmcp_manifest_reflects_an_admin_caller() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let mut infos = real_block_infos();
         infos.push(admin_tool_block());
 
@@ -2411,7 +2455,9 @@ mod discovery_tests {
             "list_audit_log",
         ];
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let infos = real_block_infos();
 
         let admin_body = webmcp_manifest(&ctx, Some(&["admin"]), &infos, &AllEnabled).await;
@@ -2475,7 +2521,9 @@ mod discovery_tests {
             }
         }
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let infos = real_block_infos();
 
         let enabled = webmcp_manifest(&ctx, None, &infos, &AllEnabled).await;
@@ -2537,7 +2585,9 @@ mod discovery_tests {
         }
         const STOREFRONT: &str = "/b/products/storefront/config";
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
 
         let enabled = document(&ctx, "/openapi.json", &AllEnabled).await;
         assert!(
@@ -2624,7 +2674,9 @@ mod discovery_tests {
     /// `builder::registration::tests::webmcp_refusals_are_logged_once_at_build`).
     #[tokio::test]
     async fn webmcp_manifest_request_does_not_log_refusals() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let infos = vec![duplicate_tool_name_block()];
 
         // Precondition: this fixture really does trigger a refusal — both
@@ -2704,7 +2756,9 @@ mod csrf_wiring_tests {
     }
 
     async fn ctx_with_probe() -> TestContext {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.register_block("test/csrf-probe", std::sync::Arc::new(DispatchProbeBlock));
         ctx
     }
@@ -2921,8 +2975,9 @@ mod streaming_audit_tests {
         let _ = out.collect_buffered().await;
     }
 
+    /// Read by the test, not by the router the requests ran as.
     async fn request_log_count(ctx: &TestContext) -> i64 {
-        request_logs::paginated(ctx, 1, 20, "", false)
+        request_logs::paginated(&ctx.fixture(), 1, 20, "", false)
             .await
             .expect("count request_logs")
             .total_count
@@ -2930,7 +2985,9 @@ mod streaming_audit_tests {
 
     #[tokio::test]
     async fn streamed_download_with_marker_still_writes_request_log() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.register_block("test/dl", Arc::new(MarkedDownloadBlock));
         drive(&ctx, "/x/dl", &route("/x/dl", "test/dl")).await;
         assert_eq!(
@@ -2942,7 +2999,9 @@ mod streaming_audit_tests {
 
     #[tokio::test]
     async fn open_ended_sse_stream_skips_request_log() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.register_block("test/sse", Arc::new(SseStreamBlock));
         drive(&ctx, "/x/sse", &route("/x/sse", "test/sse")).await;
         assert_eq!(
@@ -2998,7 +3057,9 @@ mod streaming_audit_tests {
     async fn interleaved_requests_queue_their_audit_rows_in_their_own_scopes() {
         use crate::after_response::{scope, AfterResponse};
 
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.register_block("test/yield", Arc::new(YieldingBlock));
         let routes = route("/x/", "test/yield");
         let after_a = AfterResponse::new();
@@ -3109,7 +3170,9 @@ mod secret_path_redaction_tests {
     /// redaction matches templates itself instead of reading back what
     /// routing bound.
     async fn drive_and_read_rows(path: &str) -> Vec<(String, i64)> {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let infos = real_block_infos();
         let out = handle_request(
             &ctx,
@@ -3404,7 +3467,9 @@ mod request_log_policy_tests {
     }
 
     async fn ctx_with(policy: Option<&str>) -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         if let Some(policy) = policy {
             ctx.set_config(REQUEST_LOG_CONFIG_KEY, policy);
         }
@@ -3916,7 +3981,9 @@ mod oversized_body_tests {
     /// no status at all. It is a 413 naming the limit now.
     #[tokio::test]
     async fn a_marked_body_is_refused_with_413_and_the_enforced_limit() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let parts = http_codec::collect_http_response(drive(&ctx, marked(UPLOAD_PATH)).await).await;
 
         assert_eq!(parts.status, 413);
@@ -3936,7 +4003,9 @@ mod oversized_body_tests {
     /// pins the terminal kind at the source.
     #[tokio::test]
     async fn the_refusal_is_an_error_terminal() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
 
         match drive(&ctx, marked(UPLOAD_PATH))
             .await
@@ -3955,7 +4024,9 @@ mod oversized_body_tests {
     /// upload had been turned away.
     #[tokio::test]
     async fn the_refusal_is_logged_with_its_own_status() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let _ = drive(&ctx, marked(UPLOAD_PATH))
             .await
             .collect_buffered()
@@ -3976,7 +4047,9 @@ mod oversized_body_tests {
     /// nothing else, so an ordinary upload cannot be refused by it.
     #[tokio::test]
     async fn an_unmarked_request_is_not_refused() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let status = crate::test_support::output_http_status(
             drive(&ctx, anon_msg("create", UPLOAD_PATH)).await,
         )
@@ -4027,7 +4100,7 @@ mod credential_check_tests {
     /// read this suite makes fail.
     async fn seed_user(ctx: &TestContext) -> String {
         users::insert(
-            ctx,
+            &ctx.fixture(),
             users::NewUser {
                 email: format!("{}@example.com", uuid::Uuid::new_v4()),
                 display_name: "Signed In".into(),
@@ -4113,7 +4186,9 @@ mod credential_check_tests {
     }
 
     async fn signed_in_fixture() -> (TestContext, String) {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         ctx.set_config(crate::blocks::auth::JWT_SECRET_KEY, TEST_JWT_SECRET);
         ctx.register_block(
             crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
@@ -4246,7 +4321,7 @@ mod credential_check_tests {
         let uid = seed_user(ctx).await;
         let raw = format!("sb_test_{}", uuid::Uuid::new_v4().simple());
         api_keys::insert(
-            ctx,
+            &ctx.fixture(),
             api_keys::NewApiKey {
                 user_id: &uid,
                 name: "test-key",

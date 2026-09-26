@@ -90,7 +90,9 @@ mod tests {
         // A save loop that swallowed the error via `let _ = config::set(...)`
         // would return success anyway; the shared `settings_form::save_settings`
         // helper this delegates to must not.
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.refuse_config_writes();
         let msg = anon_msg("create", "/b/admin/email");
         let input = InputStream::from_bytes(serde_json::to_vec(&email_body()).unwrap());
@@ -108,7 +110,9 @@ mod tests {
 
     #[tokio::test]
     async fn save_email_settings_reports_success_when_all_writes_succeed() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         // Registers a real `wafer-run/config` service block so `config::set`
         // succeeds (see `TestContext::set_config`).
         ctx.set_config(MAILGUN_API_KEY, "");
@@ -140,7 +144,9 @@ mod tests {
     /// gets the `Message` the router hands it.
     #[tokio::test]
     async fn saving_the_email_settings_page_audits_the_keys_it_wrote() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         let out = wafer_run::Block::handle(
             &AdminBlock::new(),
@@ -176,7 +182,9 @@ mod tests {
         // attribute in plaintext, readable via page source / devtools — see
         // `settings_form.rs`'s own `password_field_is_masked_with_eye_toggle_
         // and_never_echoes_the_raw_value` test for the same contract).
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(MAILGUN_API_KEY, "super-secret-value");
         let msg = anon_msg("retrieve", "/b/admin/settings/email");
 
@@ -214,7 +222,9 @@ mod tests {
         // The base-URL field keeps its documented default-as-placeholder
         // behavior (was `field.default` in the old hand-rolled render; now
         // sourced from the same `ConfigVar.default` the block declares).
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = anon_msg("retrieve", "/b/admin/settings/email");
 
         let html = settings_body(&ctx, &msg)

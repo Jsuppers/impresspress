@@ -890,7 +890,9 @@ mod lifecycle_and_listing_tests {
     use crate::test_support::TestContext;
 
     async fn ctx() -> TestContext {
-        TestContext::with_auth().await
+        TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID)
     }
 
     async fn seed(ctx: &TestContext, email: &str) -> UserRow {
@@ -1308,20 +1310,26 @@ mod auth_version_tests {
 
     #[tokio::test]
     async fn fresh_user_starts_at_version_zero() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let id = seed(&ctx).await;
         assert_eq!(auth_version(&ctx, &id).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn missing_user_reads_as_version_zero() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         assert_eq!(auth_version(&ctx, "does-not-exist").await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn bump_increments_atomically_and_is_readable() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let id = seed(&ctx).await;
 
         bump_auth_version(&ctx, &id).await.unwrap();
@@ -1338,7 +1346,9 @@ mod auth_version_tests {
 
     #[tokio::test]
     async fn bump_does_not_affect_other_users() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let a = seed(&ctx).await;
         let b = insert(
             &ctx,
@@ -1374,14 +1384,18 @@ mod email_verified_tests {
 
     #[tokio::test]
     async fn unverified_by_default_after_seed() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         assert!(!is_email_verified(&ctx, "user-a").await.unwrap());
     }
 
     #[tokio::test]
     async fn set_then_read_round_trips_true() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         set_email_verified(&ctx, "user-a", true).await.unwrap();
         assert!(is_email_verified(&ctx, "user-a").await.unwrap());
@@ -1389,7 +1403,9 @@ mod email_verified_tests {
 
     #[tokio::test]
     async fn set_then_read_round_trips_false() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         // First flip to true so the false-write isn't a no-op against the
         // default value.
@@ -1400,7 +1416,9 @@ mod email_verified_tests {
 
     #[tokio::test]
     async fn missing_user_returns_false() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         // Doc-claim: missing user → Ok(false). Real DB errors still propagate
         // (verified separately by the per-backend integration tests).
         assert!(!is_email_verified(&ctx, "nonexistent").await.unwrap());

@@ -608,7 +608,9 @@ mod scheduled_maintenance_tests {
 
     #[tokio::test]
     async fn the_scheduled_message_runs_a_sweep_and_its_answer_decodes_to_the_counts() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.seed_auth_user("user-a").await;
         for (family, expires_at) in [("fam-dead", iso(-60)), ("fam-live", iso(3600))] {
             sessions::insert(
@@ -658,7 +660,9 @@ mod scheduled_maintenance_tests {
     /// reported as a failure, never decoded into a pass that removed nothing.
     #[tokio::test]
     async fn an_answer_that_is_not_a_sweep_result_is_a_failure_not_an_empty_pass() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let mut mistyped = Message::new("auth.maintenence");
         mistyped.set_meta("req.action", "retrieve");
         mistyped.set_meta("req.resource", "/b/auth/api/whatever");
@@ -965,7 +969,9 @@ mod oauth_start_limit_tests {
     /// writes a row.
     #[tokio::test]
     async fn oauth_start_is_ip_rate_limited_before_it_writes_state() {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(ENABLE_OAUTH_KEY, "true");
         ctx.set_config(OAUTH_GOOGLE_CLIENT_ID_KEY, "client-id");
         ctx.register_block("impresspress/auth-ui", Arc::new(AuthUiBlock::new()));

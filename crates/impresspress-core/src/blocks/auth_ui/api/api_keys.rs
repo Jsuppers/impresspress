@@ -313,7 +313,9 @@ mod tests {
     /// through `ROUTES`.
     #[tokio::test]
     async fn revoke_reads_only_the_bound_id() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let (owner, key_id) = seed_user_with_key(&ctx).await;
         let path = format!("/b/auth/api/api-keys/{key_id}");
 
@@ -337,7 +339,9 @@ mod tests {
     /// Same contract for `handle_delete`.
     #[tokio::test]
     async fn delete_reads_only_the_bound_id() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let (owner, key_id) = seed_user_with_key(&ctx).await;
         let path = format!("/b/auth/api/api-keys/{key_id}");
 
@@ -362,7 +366,9 @@ mod tests {
     /// revoke they came to perform silently did not happen.
     #[tokio::test]
     async fn revoke_reports_an_unreadable_key_row_as_an_outage() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let (owner, key_id) = seed_user_with_key(&ctx).await;
         let path = format!("/b/auth/api/api-keys/{key_id}");
         // The ownership lookup is the handler's first read, so a database
@@ -383,7 +389,9 @@ mod tests {
     /// was minted with outlived every clock reading there will ever be.
     #[tokio::test]
     async fn create_refuses_an_expiry_that_is_not_a_timestamp() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let owner = seed_user(&ctx).await;
 
         for expires_at in ["never", "2027-01-31", "tomorrow", "0"] {
@@ -451,7 +459,9 @@ mod tests {
     /// something else — most often a timezone the caller did not intend.
     #[tokio::test]
     async fn create_refuses_an_expiry_already_past() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let owner = seed_user(&ctx).await;
         let offset = chrono::FixedOffset::east_opt(9 * 3600).expect("+09:00");
         let past = (chrono::Utc::now() - chrono::Duration::hours(1))
@@ -500,7 +510,9 @@ mod tests {
     /// Same contract for `handle_delete`.
     #[tokio::test]
     async fn delete_reports_an_unreadable_key_row_as_an_outage() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let (owner, key_id) = seed_user_with_key(&ctx).await;
         let path = format!("/b/auth/api/api-keys/{key_id}");
         let failing = ctx.break_reads();

@@ -316,7 +316,9 @@ mod tests {
     /// rather than duplicated.
     #[tokio::test]
     async fn assign_and_list_for_user_round_trip_and_are_idempotent() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = match assign(&ctx, "u-1", "editor", "admin_1")
             .await
             .expect("assign")
@@ -358,7 +360,9 @@ mod tests {
     /// its empty default.
     #[tokio::test]
     async fn assign_by_the_system_leaves_assigned_by_empty() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let Assigned::Created(row) = assign(&ctx, "u-1", "admin", "").await.expect("assign") else {
             panic!("first grant must create the row");
         };
@@ -369,7 +373,9 @@ mod tests {
     /// user in one query, and asks nothing for no users.
     #[tokio::test]
     async fn list_for_users_covers_every_requested_user() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         assign(&ctx, "u-1", "editor", "").await.expect("assign");
         assign(&ctx, "u-1", "auditor", "").await.expect("assign");
         assign(&ctx, "u-2", "editor", "").await.expect("assign");
@@ -391,7 +397,9 @@ mod tests {
     /// A role rename carries every grant naming the old value with it.
     #[tokio::test]
     async fn rename_role_moves_a_grant_and_list_by_role_finds_it() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let Assigned::Created(row) = assign(&ctx, "u-1", "editor", "").await.expect("assign")
         else {
             panic!("first grant must create the row");
@@ -418,7 +426,9 @@ mod tests {
     /// would have returned.
     #[tokio::test]
     async fn list_by_role_returns_every_grant_past_the_unpaged_ceiling() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let past_the_ceiling = i64::from(crate::db_read::UNPAGED_LIMIT) + 1;
         db::exec_raw(
             &ctx,
@@ -452,7 +462,9 @@ mod tests {
     /// prefix as the whole grant list.
     #[tokio::test]
     async fn list_all_reports_that_it_is_a_prefix() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let past_the_ceiling = i64::from(crate::db_read::UNPAGED_LIMIT) + 1;
         db::exec_raw(
             &ctx,
@@ -479,7 +491,9 @@ mod tests {
     /// role's.
     #[tokio::test]
     async fn revoke_role_takes_every_grant_of_that_role_and_nothing_else() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         for (user, role) in [("u-1", "editor"), ("u-2", "editor"), ("u-1", "viewer")] {
             assign(&ctx, user, role, "").await.expect("assign");
         }
@@ -490,7 +504,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_and_remove() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let Assigned::Created(row) = assign(&ctx, "u-1", "editor", "").await.expect("assign")
         else {
             panic!("first grant must create the row");

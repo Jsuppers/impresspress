@@ -348,7 +348,9 @@ mod tests {
 
     #[tokio::test]
     async fn site_config_reads_from_ctx_config_get_with_defaults() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let cfg = site_config(&ctx).await.expect("site config");
 
         assert_eq!(cfg.app_name, DEFAULT_APP_NAME);
@@ -360,7 +362,9 @@ mod tests {
 
     #[tokio::test]
     async fn site_config_picks_auth_logo_when_set() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(AUTH_LOGO_URL_KEY, "https://example.com/auth.png");
         ctx.set_config(LOGO_URL_KEY, "https://example.com/main.png");
 
@@ -370,7 +374,9 @@ mod tests {
 
     #[tokio::test]
     async fn site_config_falls_back_to_logo_url_when_auth_logo_empty() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(LOGO_URL_KEY, "https://example.com/main.png");
 
         let cfg = site_config(&ctx).await.expect("site config");
@@ -379,7 +385,9 @@ mod tests {
 
     #[tokio::test]
     async fn site_config_app_name_override() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "MyApp");
 
         let cfg = site_config(&ctx).await.expect("site config");
@@ -388,7 +396,9 @@ mod tests {
 
     #[tokio::test]
     async fn site_config_embedded_scripts_splits_csv() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(
             EMBEDDED_SCRIPTS_KEY,
             "https://a.example.com/a.js, https://b.example.com/b.js,",
@@ -406,7 +416,9 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_provider_configured_requires_all_three_keys() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(OAUTH_GITHUB_CLIENT_ID_KEY, "id");
         ctx.set_config(OAUTH_GITHUB_CLIENT_SECRET_KEY, "secret");
         assert!(
@@ -427,7 +439,9 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_provider_configured_false_when_missing_any_key() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         assert!(!oauth_provider_configured(&ctx, "github")
             .await
             .expect("config read"));

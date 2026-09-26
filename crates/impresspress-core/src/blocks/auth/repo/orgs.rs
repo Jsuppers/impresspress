@@ -130,14 +130,18 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_name_returns_none_for_missing_org() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let result = find_by_name(&ctx, "nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn find_by_name_returns_inserted_org() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
 
         // Create a user first (foreign key constraint on owner_user_id)
         ctx.seed_auth_user("user-a").await;
@@ -161,7 +165,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_for_user_returns_only_caller_orgs_ordered_by_created_at() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
 
         // Seed users (FK constraint on owner_user_id).
         for user_id in ["user-a", "user-b"] {
@@ -211,7 +217,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_for_user_surfaces_a_read_failure() {
-        let ctx = TestContext::with_auth().await.break_reads();
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID)
+            .break_reads();
         assert!(
             list_for_user(&ctx, "user-a").await.is_err(),
             "a failed read must not look like a user with no orgs"

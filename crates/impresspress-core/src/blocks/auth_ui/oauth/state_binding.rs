@@ -146,13 +146,17 @@ mod tests {
     }
 
     async fn dev_ctx() -> TestContext {
-        TestContext::new().await
+        TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID)
     }
 
     /// A deployment that serves HTTPS — `WAFER_RUN_SHARED__ENVIRONMENT` is
     /// anything but `development`.
     async fn prod_ctx() -> TestContext {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(ENVIRONMENT_KEY, "production");
         ctx
     }

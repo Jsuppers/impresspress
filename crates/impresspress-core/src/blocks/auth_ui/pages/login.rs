@@ -174,7 +174,9 @@ mod tests {
     #[tokio::test]
     async fn signup_link_and_signup_api_read_the_same_truth_table() {
         for enabled in ["1", "true", "YES", " on "] {
-            let mut ctx = TestContext::new().await;
+            let mut ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
             ctx.set_config(ALLOW_SIGNUP_KEY, enabled);
             let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
             assert!(
@@ -189,7 +191,9 @@ mod tests {
             );
         }
         for disabled in ["0", "false", "", "bogus"] {
-            let mut ctx = TestContext::new().await;
+            let mut ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
             ctx.set_config(ALLOW_SIGNUP_KEY, disabled);
             let html = output_html(handle(&ctx, &login_msg(&[])).await).await;
             assert!(
@@ -209,7 +213,9 @@ mod tests {
     /// begin the flow while this page drew no button.
     #[tokio::test]
     async fn oauth_buttons_follow_the_same_truth_table_as_the_oauth_start_handler() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(ENABLE_OAUTH_KEY, "1");
         ctx.set_config(OAUTH_GITHUB_CLIENT_ID_KEY, "gh_id");
         ctx.set_config(OAUTH_GITHUB_CLIENT_SECRET_KEY, "gh_secret");
@@ -252,7 +258,9 @@ mod tests {
     /// ahead of the role-aware `default_redirect` the JSON API returns.
     #[tokio::test]
     async fn renders_safe_redirect_into_hidden_field() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = login_msg(&[("redirect", "/b/userportal/profile")]);
         let html = output_html(handle(&ctx, &msg).await).await;
         assert!(
@@ -266,7 +274,9 @@ mod tests {
     /// dropped rather than rendered.
     #[tokio::test]
     async fn rejects_unsafe_redirect_renders_empty_hidden_field() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = login_msg(&[("redirect", "//evil.com")]);
         let html = output_html(handle(&ctx, &msg).await).await;
         assert!(
@@ -280,7 +290,9 @@ mod tests {
     /// with `?email=...` so they don't have to retype it.
     #[tokio::test]
     async fn prefills_email_from_query_param() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = login_msg(&[("email", "alice@example.com")]);
         let html = output_html(handle(&ctx, &msg).await).await;
         assert!(
@@ -293,7 +305,9 @@ mod tests {
     /// rendered (mirrors the 255-char cap `api/signup.rs` enforces on input).
     #[tokio::test]
     async fn ignores_overlong_email_query_param() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let long_email = format!("{}@example.com", "a".repeat(300));
         let msg = login_msg(&[("email", &long_email)]);
         let html = output_html(handle(&ctx, &msg).await).await;
@@ -305,7 +319,9 @@ mod tests {
     /// bare `<div>`s a screen reader can't tie to the field.
     #[tokio::test]
     async fn email_and_password_labels_are_associated_with_their_inputs() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = login_msg(&[]);
         let html = output_html(handle(&ctx, &msg).await).await;
 
@@ -334,7 +350,9 @@ mod tests {
     /// duplicated by the panel.
     #[tokio::test]
     async fn brand_panel_shows_default_headline_and_tagline_without_duplicating_subtitle() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = login_msg(&[]);
         let html = output_html(handle(&ctx, &msg).await).await;
 
@@ -361,7 +379,9 @@ mod tests {
     /// name (aria-label), since it renders no visible text.
     #[tokio::test]
     async fn password_toggle_button_has_non_empty_aria_label() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = login_msg(&[]);
         let html = output_html(handle(&ctx, &msg).await).await;
 

@@ -426,7 +426,9 @@ async fn bootstrap_admin_insert_denial_is_403_not_500() {
 #[tokio::test]
 async fn orgs_page_read_denial_is_the_403_page_not_a_500() {
     let ctx = denied(
-        TestContext::with_auth().await,
+        TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID),
         vec![("database.list", orgs::TABLE)],
     );
     let mut msg = auth_msg("retrieve", "/b/auth/orgs", "user-a");
@@ -448,7 +450,9 @@ async fn orgs_page_read_denial_is_the_403_page_not_a_500() {
 #[tokio::test]
 async fn orgs_page_read_denial_is_403_for_an_api_caller() {
     let ctx = denied(
-        TestContext::with_auth().await,
+        TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID),
         vec![("database.list", orgs::TABLE)],
     );
     let mut msg = auth_msg("retrieve", "/b/auth/orgs", "user-a");

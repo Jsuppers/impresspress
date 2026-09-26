@@ -164,7 +164,9 @@ mod tests {
     };
 
     async fn ctx_with(stub: StubLlmServiceBlock) -> TestContext {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::llm::LlmBlock::BLOCK_NAME);
         ctx.register_block("wafer-run/llm", Arc::new(stub));
         ctx
     }

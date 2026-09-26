@@ -482,7 +482,9 @@ mod tests {
     /// `list_all` unchanged, `enabled` as a bool from the integer column.
     #[tokio::test]
     async fn upsert_fields_and_list_all_round_trip_every_column() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         upsert_fields(
             &ctx,
             "impresspress/probe",
@@ -529,7 +531,9 @@ mod tests {
     /// about `enabled` preserves whatever it holds.
     #[tokio::test]
     async fn upsert_fields_creates_enabled_and_preserves_the_flag_on_update() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         upsert_fields(
             &ctx,
             "impresspress/probe",
@@ -573,7 +577,9 @@ mod tests {
     /// `is_enabled` defaults to `true` when no row exists.
     #[tokio::test]
     async fn is_enabled_defaults_to_true_when_no_row() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         assert!(
             is_enabled(&ctx, "impresspress/nonexistent")
                 .await
@@ -586,7 +592,9 @@ mod tests {
     /// opposite of whatever this returns, so an outage must be an error.
     #[tokio::test]
     async fn is_enabled_surfaces_read_errors() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let failing = FailingDbOpContext::new(ctx, vec![("database.list", TABLE)]);
         assert!(
             is_enabled(&failing, "impresspress/files").await.is_err(),
@@ -599,7 +607,9 @@ mod tests {
     /// admin-UI toggle. See `plan_seed_decisions` in `features.rs`.
     #[tokio::test]
     async fn set_enabled_marks_row_user_edited() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let name = "impresspress/some-block";
         set_enabled(&ctx, name, false)
             .await
@@ -618,7 +628,9 @@ mod tests {
     /// write true, read back true.
     #[tokio::test]
     async fn set_enabled_round_trip() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let name = "impresspress/some-block";
 
         set_enabled(&ctx, name, false)

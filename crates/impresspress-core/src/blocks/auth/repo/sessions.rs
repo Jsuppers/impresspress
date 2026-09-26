@@ -241,7 +241,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_for_user_returns_only_caller_sessions() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         for user_id in ["user-a", "user-b"] {
             seed_user(&ctx, user_id).await;
         }
@@ -265,7 +267,9 @@ mod tests {
     /// must not hand a user another user's family.
     #[tokio::test]
     async fn find_for_user_refuses_another_users_family() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         for user_id in ["user-a", "user-b"] {
             seed_user(&ctx, user_id).await;
         }
@@ -284,7 +288,9 @@ mod tests {
     /// The property the whole re-key exists for: N refreshes leave one row.
     #[tokio::test]
     async fn touch_updates_the_one_row_and_reports_it() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
@@ -307,7 +313,9 @@ mod tests {
     /// that is the signal issuance uses to insert one instead.
     #[tokio::test]
     async fn touch_reports_zero_for_an_unknown_family() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         assert_eq!(
             touch(&ctx, "fam-missing", "2100-01-01T00:00:00Z")
@@ -319,7 +327,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_and_delete_all_for_user_count_rows() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         for user_id in ["user-a", "user-b"] {
             seed_user(&ctx, user_id).await;
         }
@@ -346,7 +356,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_expired_removes_only_past_rows() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-live"))
             .await
@@ -375,7 +387,9 @@ mod tests {
     /// `insert` round-trips every column the device list renders.
     #[tokio::test]
     async fn insert_round_trips_the_family_and_auth_method() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         insert(
             &ctx,

@@ -491,7 +491,9 @@ mod tests {
     /// A context with the REAL email block registered, configured to admit
     /// `per_recipient` messages to any one address per window.
     async fn ctx_with_email(per_recipient: &str) -> TestContext {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.set_config(RATE_LIMIT_PER_RECIPIENT_MAX, per_recipient);
         ctx.set_config(RATE_LIMIT_WINDOW_SECS, "60");
         ctx.register_block(
@@ -634,7 +636,9 @@ mod tests {
     /// paging: nothing about it clears itself.
     #[tokio::test]
     async fn an_absent_email_block_is_undeliverable_not_rate_limited() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let (limiter, msg) = test_mail_request();
         match send_template_email(
             &limiter,
@@ -722,7 +726,9 @@ mod tests {
             }
         }
 
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.register_block("impresspress/email", Arc::new(SentOk));
         let (limiter, msg) = test_mail_request();
         assert_eq!(

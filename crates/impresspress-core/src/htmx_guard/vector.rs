@@ -48,7 +48,7 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
         assert_eq!(created.status, 200, "seed index: {}", created.body);
 
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![vector]),
             caller: admin_caller,
             pages: vec![Page::at("/b/vector/"), Page::at("/b/vector/docs/")],

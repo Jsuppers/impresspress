@@ -135,7 +135,9 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_take_returns_row_and_deletes() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let expires = iso_plus_seconds(600);
         insert(
             &ctx,
@@ -182,7 +184,9 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn take_consumes_the_row_on_a_file_backed_database() {
-        let ctx = TestContext::with_auth_on_disk().await;
+        let ctx = TestContext::with_auth_on_disk()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let expires = iso_plus_seconds(600);
         insert(
             &ctx,
@@ -213,13 +217,17 @@ mod tests {
 
     #[tokio::test]
     async fn take_returns_none_for_unknown_state_id() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         assert!(take(&ctx, "missing").await.expect("take").is_none());
     }
 
     #[tokio::test]
     async fn take_treats_expired_rows_as_missing() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         // Insert with expires_at in the past.
         let past = iso_plus_seconds(-10);
         insert(
@@ -242,7 +250,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_expired_drops_only_expired_rows() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let past = iso_plus_seconds(-60);
         let future = iso_plus_seconds(600);
         insert(

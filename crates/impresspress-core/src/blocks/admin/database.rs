@@ -445,7 +445,10 @@ mod tests {
     /// A failed listing is a 500, not `[]` — an empty database.
     #[tokio::test]
     async fn a_failed_table_listing_is_a_500_not_an_empty_list() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let out = api(&ctx, "/b/admin/api/database/tables").await;
         assert_eq!(output_http_status(out).await, 500);
     }
@@ -453,7 +456,10 @@ mod tests {
     /// A failed column read is a 500, not a table with no columns.
     #[tokio::test]
     async fn a_failed_column_read_is_a_500_not_no_columns() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let path = format!(
             "/b/admin/api/database/tables/{}/columns",
             crate::blocks::admin::ROLES_TABLE
@@ -465,7 +471,9 @@ mod tests {
     /// A name the backend has no table for is a 404, not an empty column list.
     #[tokio::test]
     async fn an_unknown_table_is_a_404() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let out = api(&ctx, "/b/admin/api/database/tables/no_such_table/columns").await;
         assert_eq!(output_http_status(out).await, 404);
     }
@@ -473,7 +481,9 @@ mod tests {
     /// Control: healthy reads answer the tables with counts and the columns.
     #[tokio::test]
     async fn healthy_reads_answer_tables_and_columns() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let table = crate::blocks::admin::ROLES_TABLE;
 
         let tables = output_json(api(&ctx, "/b/admin/api/database/tables").await).await;

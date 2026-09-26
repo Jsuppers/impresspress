@@ -128,7 +128,9 @@ mod tests {
     /// answer 200 with an `index.html` body.
     #[tokio::test]
     async fn a_marked_request_is_refused_on_any_path() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::body_limit::BLOCK_NAME);
         for path in ["/b/storage/api/buckets/p/objects", "/anything/else", "/"] {
             let out = block()
                 .handle(&ctx, marked(path), InputStream::empty())
@@ -144,7 +146,9 @@ mod tests {
     /// upload needs to see which upload.
     #[tokio::test]
     async fn the_refusal_is_audited_under_its_own_path() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::body_limit::BLOCK_NAME);
         let block = BodyLimitBlock::new(
             Vec::new(),
             Arc::new(vec![ExtraRoute::new(
@@ -163,7 +167,7 @@ mod tests {
             .await;
         let _ = out.collect_buffered().await;
 
-        let rows = request_logs::paginated(&ctx, 1, 20, "", false)
+        let rows = request_logs::paginated(&ctx.fixture(), 1, 20, "", false)
             .await
             .expect("read request_logs")
             .rows;
@@ -178,7 +182,9 @@ mod tests {
     /// a gate, not a handler, so it must not answer anything itself.
     #[tokio::test]
     async fn an_unmarked_request_continues() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::body_limit::BLOCK_NAME);
         let out = block()
             .handle(&ctx, anon_msg("create", "/b/storage"), InputStream::empty())
             .await;

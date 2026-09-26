@@ -112,7 +112,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_short_common_and_control_but_accepts_strong() {
-        let ctx = TestContext::with_auth().await; // password_min_length defaults to 8
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID); // password_min_length defaults to 8
 
         // Too short.
         let e = check(&ctx, "short").await.unwrap_err();

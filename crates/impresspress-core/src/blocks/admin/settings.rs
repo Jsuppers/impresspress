@@ -597,7 +597,9 @@ mod tests {
     /// documented, which is the worst order to do it in.
     #[tokio::test]
     async fn list_masks_every_sensitive_value() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -701,7 +703,9 @@ mod tests {
     /// deleted between starts.
     #[tokio::test]
     async fn second_call_with_matching_snapshot_hash_short_circuits() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
 
         // 1. Run admin migrations so the block_settings + variables tables
         //    exist (with the new seed_defaults_hash column).
@@ -743,7 +747,9 @@ mod tests {
         //    in-memory DB — no variables, no block_settings row), but
         //    pre-populate the config snapshot with the stamped hash. This
         //    mirrors what the production loader does on the next boot.
-        let mut next_ctx = TestContext::new().await;
+        let mut next_ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&next_ctx)
             .await
             .expect("apply admin migrations on next ctx");
@@ -772,7 +778,9 @@ mod tests {
     /// and re-stamps the row.
     #[tokio::test]
     async fn mismatched_snapshot_hash_re_runs_seed() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -838,7 +846,9 @@ mod tests {
     async fn a_failed_seed_write_leaves_the_gate_open_for_the_next_boot() {
         use crate::test_support::FailingDbOpContext;
 
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -899,7 +909,9 @@ mod tests {
     async fn a_failed_variables_read_leaves_the_gate_open() {
         use crate::test_support::FailingDbOpContext;
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -922,7 +934,9 @@ mod tests {
     async fn handle_get_masks_secret_suffix_without_flag() {
         use crate::test_support::{admin_msg, output_json};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -968,7 +982,9 @@ mod tests {
     async fn an_env_supplied_password_var_is_masked_by_the_settings_read_path() {
         use crate::test_support::{admin_msg, output_json};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1021,7 +1037,9 @@ mod tests {
     async fn a_legacy_unflagged_declared_password_row_is_masked_by_every_read_path() {
         use crate::test_support::{admin_msg, output_json};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1084,7 +1102,9 @@ mod tests {
     async fn patching_back_a_masked_value_cannot_overwrite_the_secret() {
         use crate::test_support::{admin_msg, output_http_status, output_json};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1141,7 +1161,9 @@ mod tests {
     async fn an_out_of_range_session_lifetime_is_refused_by_the_settings_api() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1210,7 +1232,9 @@ mod tests {
     async fn patching_without_a_value_leaves_the_stored_value_alone() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1250,7 +1274,9 @@ mod tests {
     async fn a_value_less_patch_never_echoes_the_stored_value() {
         use crate::test_support::{admin_msg, output_json};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1291,7 +1317,9 @@ mod tests {
     async fn a_value_less_patch_on_a_plain_row_does_not_invent_a_mask() {
         use crate::test_support::{admin_msg, output_json};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1358,7 +1386,9 @@ mod tests {
     async fn a_value_less_patch_does_not_create_a_blank_row() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1394,7 +1424,9 @@ mod tests {
     async fn creating_a_masked_key_with_an_empty_value_is_refused() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1455,7 +1487,9 @@ mod tests {
     async fn creating_an_empty_ad_hoc_variable_marked_sensitive_is_allowed() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1487,7 +1521,9 @@ mod tests {
     async fn patching_with_no_fields_at_all_is_refused() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1517,7 +1553,9 @@ mod tests {
     async fn a_non_sensitive_variable_may_hold_the_mask_string() {
         use crate::test_support::{admin_msg, output_http_status};
 
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1558,7 +1596,9 @@ mod tests {
     /// must clear it back to blank so the app-name fallback takes over.
     #[tokio::test]
     async fn seed_defaults_clears_the_removed_builtin_wordmark_url() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1596,7 +1636,9 @@ mod tests {
     /// repaired.
     #[tokio::test]
     async fn stale_wordmark_is_repaired_through_a_prior_releases_stamped_hash() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1643,7 +1685,9 @@ mod tests {
     /// operator's white-label logo is their data and must survive untouched.
     #[tokio::test]
     async fn seed_defaults_keeps_an_operator_configured_logo_url() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1676,7 +1720,9 @@ mod tests {
     /// than blank.
     #[tokio::test]
     async fn seed_defaults_repairs_stale_builtin_logo_and_favicon_urls() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1716,7 +1762,9 @@ mod tests {
     /// idempotent, and must not churn a write on every boot.
     #[tokio::test]
     async fn seed_defaults_leaves_a_current_builtin_logo_url_untouched() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1741,7 +1789,9 @@ mod create_tests {
     use crate::test_support::{admin_msg, collect_or_panic, TestContext};
 
     async fn admin_ctx() -> TestContext {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -1882,7 +1932,9 @@ mod config_store_reproduction {
     async fn patch_settings_reaches_config_readers_without_a_restart() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");

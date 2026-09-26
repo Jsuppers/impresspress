@@ -2078,7 +2078,9 @@ mod tests {
     /// `DatabaseService` contract the 409 rests on, with nothing re-read.
     #[tokio::test]
     async fn a_taken_key_is_already_exists_and_a_conflict() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let new = || NewVariable {
             key: "SITE__TAKEN".into(),
             value: "one".into(),
@@ -2132,8 +2134,12 @@ mod tests {
     /// being told nothing is not that.
     #[tokio::test]
     async fn a_create_whose_echo_carries_no_id_keeps_the_id_that_was_written() {
-        let ctx = crate::test_support::EcholessWriteContext::new(TestContext::with_admin().await)
-            .without_the_id();
+        let ctx = crate::test_support::EcholessWriteContext::new(
+            TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::admin::ADMIN_BLOCK_ID),
+        )
+        .without_the_id();
 
         let row = insert(&ctx, new_var(FROM_KEY))
             .await
@@ -2163,8 +2169,12 @@ mod tests {
     /// `created_at` for a row that has all three.
     #[tokio::test]
     async fn a_partial_echo_does_not_default_the_columns_it_left_out() {
-        let ctx = crate::test_support::EcholessWriteContext::new(TestContext::with_admin().await)
-            .keeping_columns(&["key", "value"]);
+        let ctx = crate::test_support::EcholessWriteContext::new(
+            TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::admin::ADMIN_BLOCK_ID),
+        )
+        .keeping_columns(&["key", "value"]);
 
         let row = insert(&ctx, new_var(FROM_KEY))
             .await
@@ -2192,7 +2202,9 @@ mod tests {
     #[tokio::test]
     async fn a_refused_write_keeps_its_code_through_the_echo_thinning_wrapper() {
         let denied = crate::test_support::FailingDbOpContext::failing_with(
-            TestContext::with_admin().await,
+            TestContext::with_admin()
+                .await
+                .running_as(crate::blocks::admin::ADMIN_BLOCK_ID),
             vec![("database.create", TABLE)],
             WaferError::new(ErrorCode::PermissionDenied, "denied"),
         );
@@ -2210,7 +2222,9 @@ mod tests {
     /// 002 backfills it.
     #[tokio::test]
     async fn insert_and_get_by_key_round_trip_every_column() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let inserted = insert(&ctx, new_var(FROM_KEY)).await.expect("insert");
         assert!(inserted.id.starts_with("var_"), "{}", inserted.id);
         assert_eq!(inserted.key, FROM_KEY);
@@ -2239,7 +2253,9 @@ mod tests {
     /// block's config.
     #[tokio::test]
     async fn a_key_without_a_block_prefix_keeps_the_column_null() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let row = insert(&ctx, new_var(APP_NAME_KEY)).await.expect("insert");
         assert_eq!(row.block, None);
         assert!(
@@ -2250,13 +2266,17 @@ mod tests {
 
     #[tokio::test]
     async fn get_by_key_on_an_absent_key_is_none() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         assert_eq!(get_by_key(&ctx, "NOPE").await.expect("get"), None);
     }
 
     #[tokio::test]
     async fn upsert_by_key_creates_then_updates_one_row() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = upsert_by_key(
             &ctx,
             "SITE_TAGLINE",
@@ -2311,7 +2331,9 @@ mod tests {
     /// this returns, so it is the key's, not the order they were written in.
     #[tokio::test]
     async fn list_all_is_in_key_order_whatever_order_the_rows_were_written_in() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         for key in ["SITE_ZEBRA", "SITE_APPLE", "SITE_MANGO"] {
             insert(&ctx, new_var(key)).await.expect("insert");
         }
@@ -2329,7 +2351,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_the_row_and_delete_by_key_tolerates_absence() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let row = insert(&ctx, new_var("SITE_MOTTO")).await.expect("insert");
         delete(&ctx, &row.id).await.expect("delete");
         assert_eq!(get_by_key(&ctx, "SITE_MOTTO").await.expect("get"), None);
@@ -2587,7 +2611,9 @@ mod boot_tests {
     /// because the gate row is already recorded by this point.
     #[tokio::test]
     async fn an_env_var_beats_the_row_already_in_the_table() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = APP_NAME_KEY;
         // The declared default a previous boot stored, carrying no provenance.
         seed_row_with_owner(&ctx, key, "Impresspress", "").await;
@@ -2851,7 +2877,9 @@ mod boot_tests {
     #[tokio::test]
     async fn a_row_whose_pin_state_cannot_be_read_is_not_overwritten() {
         let key = APP_NAME_KEY;
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
 
         let ctx = ctx.break_list_reads();
@@ -2959,7 +2987,9 @@ mod boot_tests {
     /// re-stamps ownership on every write.
     #[tokio::test]
     async fn reset_to_environment_hands_a_pinned_key_back() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = APP_NAME_KEY;
 
         insert(
@@ -3246,7 +3276,9 @@ mod boot_tests {
     /// must stay reset, or the reset route would not work at all.
     #[tokio::test]
     async fn the_upgrade_transition_does_not_reclaim_a_key_after_a_reset() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = APP_NAME_KEY;
         seed_row_with_owner(&ctx, key, "EditedLongAgo", "").await;
 
@@ -3286,7 +3318,9 @@ mod boot_tests {
     /// path the boot WARN sends operators down.
     #[tokio::test]
     async fn a_reset_is_not_undone_by_a_transition_that_has_not_run_yet() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = APP_NAME_KEY;
 
         // No exports at all, so no gate is recorded.
@@ -3483,7 +3517,9 @@ mod boot_tests {
     /// the shape of advice this module's WARNs exist to stop giving.
     #[tokio::test]
     async fn the_bulk_advice_is_withheld_when_only_an_admin_edit_is_inert() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let key = APP_NAME_KEY;
         seed_row_with_owner(&ctx, key, "AdminChoice", "admin_1").await;
 
@@ -3515,7 +3551,9 @@ mod boot_tests {
     /// to the page that can take it honestly.
     #[tokio::test]
     async fn the_bulk_advice_claims_no_count_the_page_would_contradict() {
-        let ctx = crate::test_support::TestContext::with_admin().await;
+        let ctx = crate::test_support::TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let kept = APP_NAME_KEY;
         let dropped = AUTH_HEADLINE_KEY;
         for key in [kept, dropped] {

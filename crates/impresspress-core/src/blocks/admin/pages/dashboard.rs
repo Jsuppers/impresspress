@@ -523,7 +523,10 @@ mod outage_tests {
 
     #[tokio::test]
     async fn every_failed_read_marks_its_own_tile_and_the_page_still_renders() {
-        let ctx = TestContext::with_auth().await.break_reads();
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let msg = admin_msg("retrieve", "/b/admin/");
 
         assert_eq!(
@@ -572,7 +575,9 @@ mod outage_tests {
     /// three drawn charts, with no marker anywhere.
     #[tokio::test]
     async fn a_healthy_dashboard_carries_no_marker() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let html = output_html(dashboard(&ctx, &admin_msg("retrieve", "/b/admin/")).await).await;
 
         assert!(
@@ -605,7 +610,9 @@ mod outage_tests {
     /// pixel again with nothing announcing the change.
     #[tokio::test]
     async fn the_avg_response_tile_keeps_the_label_the_visual_mask_keys_on() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let html = output_html(dashboard(&ctx, &admin_msg("retrieve", "/b/admin/")).await).await;
 
         let label = r#"<div class="stat-label">Avg Response</div>"#;

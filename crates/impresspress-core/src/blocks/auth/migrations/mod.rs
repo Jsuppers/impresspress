@@ -409,7 +409,9 @@ mod api_key_expiry_tests {
     /// A fixture with the auth schema in place whose operator has opted into
     /// migrations, as `--run-migrations` does.
     async fn upgrading_deployment() -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
         ctx.seed_auth_user("owner").await;
         ctx
@@ -760,7 +762,9 @@ mod re_run_survival_tests {
     };
 
     async fn upgrading_deployment() -> TestContext {
-        let mut ctx = TestContext::with_auth().await;
+        let mut ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         ctx.set_config(migration_helper::RUN_MIGRATIONS_KEY, "1");
         ctx.seed_auth_user("u1").await;
         ctx

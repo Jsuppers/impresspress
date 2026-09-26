@@ -166,7 +166,10 @@ mod tests {
     /// over the stored settings.
     #[tokio::test]
     async fn a_failed_read_renders_no_email_form() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
 
         let parts = crate::blocks::admin::test_support::browser_request(
             &ctx,
@@ -220,7 +223,9 @@ mod tests {
     /// reads swallowed "no such table" into an empty table — the same
     /// swallow this PR removes.
     async fn render_tab(tab: &str) -> String {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let msg = admin_msg("retrieve", &format!("/b/admin/settings/{tab}"));
         output_html(settings_page(&ctx, &msg, tab).await).await
     }
@@ -292,7 +297,9 @@ mod tests {
 
     #[tokio::test]
     async fn permissions_database_subtab_grant_modal_form_is_not_nested() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let mut msg = admin_msg("retrieve", "/b/admin/settings/permissions");
         msg.set_meta("req.query.subtab", "database");
         let html = output_html(settings_page(&ctx, &msg, "permissions").await).await;

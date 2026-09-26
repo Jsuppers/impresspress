@@ -100,7 +100,9 @@ mod tests {
     /// bare `<div>`s a screen reader can't tie to the field.
     #[tokio::test]
     async fn email_and_password_labels_are_associated_with_their_inputs() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = Message::new("http.request");
         let html = output_html(handle(&ctx, &msg).await).await;
 
@@ -127,7 +129,9 @@ mod tests {
     /// name (aria-label), since it renders no visible text.
     #[tokio::test]
     async fn password_toggle_button_has_non_empty_aria_label() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = Message::new("http.request");
         let html = output_html(handle(&ctx, &msg).await).await;
 
@@ -153,7 +157,9 @@ mod tests {
     /// to login copy on every auth page"); this locks that fix in place.
     #[tokio::test]
     async fn brand_panel_tagline_is_signup_appropriate() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = Message::new("http.request");
         let html = output_html(handle(&ctx, &msg).await).await;
 

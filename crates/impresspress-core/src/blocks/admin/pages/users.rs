@@ -685,7 +685,9 @@ mod tests {
     async fn a_failed_row_reread_after_disable_swaps_an_error_row() {
         use crate::platform_state::user_roles;
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.seed_auth_user("u-1").await;
         user_roles::assign(&ctx, "u-1", "admin", "")
             .await
@@ -741,7 +743,9 @@ mod tests {
             test_support::{output_header, FailingDbOpContext},
         };
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let data = crate::util::json_map(serde_json::json!({
             "name": "editor",
             "description": "",
@@ -790,7 +794,9 @@ mod tests {
             test_support::{output_header, FailingDbOpContext},
         };
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let data = crate::util::json_map(serde_json::json!({
             "name": "editor",
             "description": "",

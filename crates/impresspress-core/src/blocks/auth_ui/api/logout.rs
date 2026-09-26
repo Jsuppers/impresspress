@@ -136,7 +136,9 @@ mod tests {
     async fn anonymous_logout_still_succeeds() {
         // No auth.user_id meta at all — nothing to revoke, must still
         // clear the cookie and redirect (existing behavior).
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let msg = crate::test_support::anon_msg("update", "/b/auth/api/logout");
         let out = handle(&ctx, &msg).await;
         assert_eq!(output_status(out).await, 303);
@@ -144,7 +146,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_token_revocation_failure_does_not_report_success() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let failing = FailingDbOpContext::new(ctx, vec![("database.update_where", tokens::TABLE)]);
 
         let msg = auth_msg("update", "/b/auth/api/logout", "user-1");
@@ -158,7 +162,9 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_blocklist_insert_failure_does_not_report_success() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let failing = FailingDbOpContext::new(ctx, vec![("database.create", jwt_blocklist::TABLE)]);
 
         let mut msg = auth_msg("update", "/b/auth/api/logout", "user-1");
@@ -179,7 +185,9 @@ mod tests {
     /// revokes every family, so it must remove every row too.
     #[tokio::test]
     async fn logout_deletes_the_users_session_rows() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         ctx.seed_auth_user("user-1").await;
         ctx.seed_auth_user("user-2").await;
         for (user_id, family) in [
@@ -222,7 +230,9 @@ mod tests {
     /// signed in.
     #[tokio::test]
     async fn session_row_deletion_failure_does_not_report_success() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let failing =
             FailingDbOpContext::new(ctx, vec![("database.delete_where_count", sessions::TABLE)]);
 
@@ -236,7 +246,9 @@ mod tests {
 
     #[tokio::test]
     async fn successful_revocation_still_redirects() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         let mut msg = auth_msg("update", "/b/auth/api/logout", "user-1");
         msg.set_meta(META_AUTH_JTI, "jti-1");
         msg.set_meta(

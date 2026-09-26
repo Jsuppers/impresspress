@@ -126,7 +126,9 @@ mod tests {
     use crate::test_support::TestContext;
 
     async fn ctx() -> TestContext {
-        TestContext::with_auth().await
+        TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID)
     }
 
     /// The behaviour both call sites depend on and neither could test:

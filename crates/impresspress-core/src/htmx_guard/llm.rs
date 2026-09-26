@@ -33,14 +33,18 @@ const OPERATOR_INPUT: &[(&str, &str)] = &[
 
 fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
     Box::pin(async {
-        let mut ctx = ctx_with_messages().await;
+        // The fixture's own frame; each step below runs as the block whose
+        // code it is.
+        let mut ctx = ctx_with_messages().await.fixture();
+        let as_llm =
+            |ctx: &crate::test_support::TestContext| ctx.clone().running_as(LlmBlock::BLOCK_NAME);
         let sqlite: Vec<&str> = crate::blocks::llm::migrations::SQLITE_MIGRATIONS
             .iter()
             .map(|(_, sql)| *sql)
             .collect();
         crate::migration_helper::apply_migrations(
-            &ctx,
-            "impresspress/llm",
+            &as_llm(&ctx),
+            LlmBlock::BLOCK_NAME,
             &sqlite,
             crate::blocks::llm::migrations::POSTGRES_MIGRATIONS,
         )
@@ -62,7 +66,7 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
         create.set_meta("http.header.content-type", "application/json");
         let created = answer(
             llm.handle(
-                &ctx,
+                &as_llm(&ctx),
                 create,
                 wafer_run::InputStream::from_bytes(
                     serde_json::to_vec(&serde_json::json!({
@@ -83,7 +87,7 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
         let thread = output_json(
             messages
                 .handle(
-                    &ctx,
+                    &ctx.clone().running_as(MessagesBlock::BLOCK_NAME),
                     admin_msg("create", "/b/messages/api/contexts"),
                     wafer_run::InputStream::from_bytes(
                         serde_json::to_vec(&serde_json::json!({
@@ -97,12 +101,12 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
         )
         .await;
         let thread_id = thread["id"].as_str().expect("thread id").to_string();
-        repo::settings::insert(&ctx, &thread_id, "probe-provider", "probe-model")
+        repo::settings::insert(&as_llm(&ctx), &thread_id, "probe-provider", "probe-model")
             .await
             .expect("seed override");
 
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![llm, messages]),
             caller: admin_caller,
             pages: vec![

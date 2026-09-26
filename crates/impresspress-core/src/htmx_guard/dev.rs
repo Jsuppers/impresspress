@@ -67,7 +67,7 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
             .to_string();
         let block = Arc::new(DevBlock::with_workspace(ctx.dev_shared()));
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![block as Arc<dyn Block>]),
             caller,
             pages: vec![Page::at("/b/dev")],

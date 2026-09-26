@@ -345,7 +345,9 @@ mod tests {
     /// unchanged, `write` as a [`GrantWrite`] from the integer column.
     #[tokio::test]
     async fn create_and_list_round_trip_every_column() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = create(&ctx, new_grant("db")).await.expect("create");
         assert!(created.id.starts_with("wg_"), "{}", created.id);
         assert_eq!(created.grantee, "impresspress/files");
@@ -376,7 +378,9 @@ mod tests {
     /// into read-only or read-write on the way through.
     #[tokio::test]
     async fn an_append_grant_round_trips_through_the_table() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = create(
             &ctx,
             NewWrapGrant {
@@ -404,7 +408,9 @@ mod tests {
     /// read-only through that decoder — and as append-only through this one.
     #[tokio::test]
     async fn an_append_row_reads_as_read_only_to_a_binary_without_the_column() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = create(
             &ctx,
             NewWrapGrant {
@@ -431,7 +437,9 @@ mod tests {
     /// one fails — so the row is refused here, where [`load`] drops it alone.
     #[tokio::test]
     async fn an_append_grant_not_typed_db_is_refused_as_a_row() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         for resource_type in ["", "storage"] {
             let created = create(
                 &ctx,
@@ -454,7 +462,9 @@ mod tests {
     /// than widened to the wildcard.
     #[tokio::test]
     async fn resource_type_parses_wildcard_and_refuses_typos() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let wildcard = create(&ctx, new_grant("")).await.expect("create");
         assert_eq!(
             wildcard
@@ -469,7 +479,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_the_row_and_reports_a_missing_one() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let created = create(&ctx, new_grant("db")).await.expect("create");
         delete(&ctx, &created.id).await.expect("delete");
         assert!(list(&ctx).await.expect("list").is_empty());
@@ -483,7 +495,9 @@ mod tests {
     /// permissions page renders whatever this returns.
     #[tokio::test]
     async fn list_surfaces_read_errors() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         create(&ctx, new_grant("db")).await.expect("create");
         let failing = FailingDbOpContext::new(ctx, vec![("database.list", TABLE)]);
         assert!(list(&failing).await.is_err());
@@ -659,7 +673,9 @@ mod migration_005_tests {
 
     #[tokio::test]
     async fn migration_005_moves_append_grants_off_the_write_column() {
-        let mut ctx = TestContext::new().await;
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         migration_helper::apply_migrations(&ctx, ADMIN, &before_005(), &[])
             .await
             .expect("001-004 apply");

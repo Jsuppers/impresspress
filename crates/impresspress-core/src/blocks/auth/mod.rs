@@ -381,7 +381,9 @@ mod timing_equalization_tests {
     /// wrong-scheme stand-in.
     #[tokio::test]
     async fn no_crypto_block_yields_no_equalizer() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let cache = OnceLock::new();
 
         assert!(timing_equalization_hash_in(&cache, &ctx).await.is_err());
@@ -564,9 +566,13 @@ mod auth_version_cache_tests {
     use super::*;
     use crate::test_support::TestContext;
 
+    // `current_auth_version` runs in the router's frame, where the pipeline
+    // verifies an access token; the rows it reads are staged and bumped
+    // through the fixture.
+
     async fn seed(ctx: &TestContext) -> String {
         repo::users::insert(
-            ctx,
+            &ctx.fixture(),
             repo::users::NewUser {
                 email: "cache@example.com".into(),
                 display_name: "Cache".into(),
@@ -583,11 +589,15 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn fresh_read_matches_the_stored_column() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed(&ctx).await;
         assert_eq!(current_auth_version(&ctx, &uid).await.unwrap(), 0);
 
-        repo::users::bump_auth_version(&ctx, &uid).await.unwrap();
+        repo::users::bump_auth_version(&ctx.fixture(), &uid)
+            .await
+            .unwrap();
         // Cache was never populated with a stale value for this uid before
         // the bump, so an uncached read must see the new column value.
         invalidate_auth_version_cache(&uid);
@@ -596,7 +606,9 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn cache_hit_serves_stale_value_within_ttl() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed(&ctx).await;
 
         // Populate the cache at version 0.
@@ -605,7 +617,9 @@ mod auth_version_cache_tests {
         // Bump the column directly (bypassing the wrapper, so the cache is
         // NOT invalidated) — simulates a bump landing on another
         // isolate/process that this cache hasn't heard about yet.
-        repo::users::bump_auth_version(&ctx, &uid).await.unwrap();
+        repo::users::bump_auth_version(&ctx.fixture(), &uid)
+            .await
+            .unwrap();
 
         // Still within the TTL window from the first read: the cache must
         // serve the stale (pre-bump) value, not re-read the DB.
@@ -620,14 +634,18 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn expired_cache_entry_is_not_served_past_ttl() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed(&ctx).await;
 
         // Populate the cache at version 0, timestamped at now=1_000.
         assert_eq!(current_auth_version_at(&ctx, &uid, 1_000).await.unwrap(), 0);
 
         // Bump without invalidating (see previous test).
-        repo::users::bump_auth_version(&ctx, &uid).await.unwrap();
+        repo::users::bump_auth_version(&ctx.fixture(), &uid)
+            .await
+            .unwrap();
 
         // Once the TTL has elapsed, the stale cache entry must NOT be served
         // — the read must fall through to the DB and see the bumped value.
@@ -641,14 +659,23 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn bump_auth_version_wrapper_invalidates_immediately() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed(&ctx).await;
 
         // Populate the cache at version 0.
         assert_eq!(current_auth_version(&ctx, &uid).await.unwrap(), 0);
 
-        // The wrapper bumps AND invalidates in one call.
-        bump_auth_version(&ctx, &uid).await.unwrap();
+        // The wrapper bumps AND invalidates in one call — from auth-ui, where
+        // a logout or password change makes it.
+        bump_auth_version(
+            &ctx.fixture()
+                .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID),
+            &uid,
+        )
+        .await
+        .unwrap();
 
         // A read immediately after (well within what would otherwise be the
         // TTL window) must see the new value — proving invalidation, not
@@ -1370,7 +1397,9 @@ pub(crate) mod helpers {
 
         #[tokio::test]
         async fn unset_falls_back_to_default() {
-            let ctx = TestContext::new().await;
+            let ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
             assert_eq!(
                 access_token_lifetime_secs(&ctx).await.expect("config read"),
                 config::ACCESS_TOKEN_LIFETIME_SECS_DEFAULT
@@ -1379,7 +1408,9 @@ pub(crate) mod helpers {
 
         #[tokio::test]
         async fn honors_a_value_under_the_cap() {
-            let mut ctx = TestContext::new().await;
+            let mut ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
             ctx.set_config(ACCESS_TOKEN_LIFETIME_SECS_KEY, "60");
             assert_eq!(
                 access_token_lifetime_secs(&ctx).await.expect("config read"),
@@ -1392,7 +1423,9 @@ pub(crate) mod helpers {
             // P2c: an admin configuring an absurdly long-lived access token
             // must not be able to defeat the belt-and-suspenders backstop —
             // the resolved lifetime never exceeds the hard cap.
-            let mut ctx = TestContext::new().await;
+            let mut ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
             ctx.set_config(
                 ACCESS_TOKEN_LIFETIME_SECS_KEY,
                 &(config::ACCESS_TOKEN_LIFETIME_SECS_MAX * 10).to_string(),
@@ -1647,7 +1680,7 @@ mod api_key_lifecycle_tests {
     async fn seed_user_and_key(ctx: &TestContext, raw_key: &str) -> String {
         let user_id = seed_user(ctx, raw_key).await;
         api_keys::insert(
-            ctx,
+            &ctx.fixture(),
             api_keys::NewApiKey {
                 user_id: &user_id,
                 name: "test-key",
@@ -1661,11 +1694,96 @@ mod api_key_lifecycle_tests {
         user_id
     }
 
+    /// Stands in for `impresspress/router` in a sealed runtime: runs the
+    /// pipeline's API-key step (`pipeline::handle_request` calls
+    /// `authenticate_api_key` on the router's own context) and answers with
+    /// the user it stamped, or the refusal's code.
+    struct RouterProbe(String);
+
+    #[wafer_block::wafer_async_trait]
+    impl wafer_run::Block for RouterProbe {
+        fn info(&self) -> wafer_run::BlockInfo {
+            wafer_run::BlockInfo::new(
+                crate::blocks::router::ROUTER_BLOCK_ID,
+                "0.0.1",
+                "http-handler@v1",
+                "router probe",
+            )
+        }
+
+        async fn handle(
+            &self,
+            ctx: &dyn wafer_run::context::Context,
+            _msg: Message,
+            _input: wafer_run::InputStream,
+        ) -> wafer_run::OutputStream {
+            let mut msg = Message::new("http.request");
+            match authenticate_api_key(ctx, &self.0, &mut msg).await {
+                Ok(()) => wafer_run::OutputStream::respond(
+                    msg.get_meta(META_AUTH_USER_ID).as_bytes().to_vec(),
+                ),
+                Err(e) => wafer_run::OutputStream::error(e),
+            }
+        }
+    }
+
+    /// An API key authenticates on the path production takes it: the
+    /// pipeline, running as `impresspress/router`, in a sealed runtime whose
+    /// grants are the ones `wafer-run/auth` and `impresspress/admin` declare.
+    ///
+    /// The router reads the key's row (`wafer_run__auth__api_keys`) and the
+    /// user's roles (`impresspress__admin__user_roles`), and neither block
+    /// granted it either, so every request carrying an API key was refused
+    /// with 403 — while every test of the key path ran as a frame that held
+    /// the grants the router lacks.
+    #[tokio::test]
+    async fn an_api_key_authenticates_in_the_routers_frame_on_a_sealed_runtime() {
+        let ctx = TestContext::with_auth().await.fixture();
+        let raw_key = "raw-router-key";
+        let uid = seed_user_and_key(&ctx, raw_key).await;
+
+        let mut wafer = wafer_run::Wafer::builder()
+            .disable_inventory()
+            .disable_lockfile()
+            .build()
+            .expect("an empty runtime builds");
+        wafer.set_admin_block(crate::blocks::admin::ADMIN_BLOCK_ID);
+        wafer_core::service_blocks::database::register_with(&mut wafer, ctx.database_service())
+            .expect("the database registers");
+        wafer
+            .register_block(
+                crate::blocks::router::ROUTER_BLOCK_ID,
+                std::sync::Arc::new(RouterProbe(raw_key.to_string())),
+            )
+            .expect("the router probe registers");
+        // The two blocks' declared grants, as the runtime collects them from
+        // their registrations; the blocks themselves need services this
+        // runtime does not carry.
+        let mut declared = crate::blocks::auth::service::auth_grants();
+        declared.extend(wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants);
+        wafer
+            .add_wrap_grants(declared)
+            .expect("the grants are well formed");
+        wafer.seal().await.expect("the runtime seals");
+
+        let out = wafer
+            .run_block(
+                crate::blocks::router::ROUTER_BLOCK_ID,
+                Message::new("http.request"),
+                wafer_run::InputStream::empty(),
+            )
+            .await;
+        match out.collect_buffered().await {
+            Ok(buf) => assert_eq!(String::from_utf8(buf.body).expect("utf-8"), uid),
+            Err(other) => panic!("the key must authenticate as its user, got {other:?}"),
+        }
+    }
+
     /// One user per key, because the tests that seed two keys would otherwise
     /// collide on the unique email.
     async fn seed_user(ctx: &TestContext, tag: &str) -> String {
         users::insert(
-            ctx,
+            &ctx.fixture(),
             users::NewUser {
                 email: format!("{tag}@e.co"),
                 display_name: "Key".into(),
@@ -1680,17 +1798,17 @@ mod api_key_lifecycle_tests {
         .id
     }
 
-    /// A context whose auth block really can read `user_roles`, so a key that
-    /// should authenticate does. Without the grant `get_user_roles` fails and
-    /// `authenticate_api_key` stamps no meta — which is what a rejected key
-    /// looks like too, so an expiry test on this fixture would pass whatever
-    /// the expiry check decided.
-    ///
-    /// The grant is the one the real `impresspress/admin` `BlockInfo`
-    /// declares (`ResourceGrant::read_write(AUTH_BLOCK_ID, user_roles::TABLE)`),
-    /// which the fixture carries as the runtime does.
+    /// The frame `authenticate_api_key` runs in: the pipeline's, which is
+    /// `impresspress/router`'s. The router reads the key, its user and their
+    /// roles under the grants `wafer-run/auth` and `impresspress/admin`
+    /// declare for it; without them every key would be refused and stamp no
+    /// meta — which is what a rejected key looks like too, so an expiry test
+    /// on this fixture would pass whatever the expiry check decided. Rows are
+    /// seeded through [`TestContext::fixture`].
     async fn ctx_that_can_read_roles() -> TestContext {
-        TestContext::with_auth().await.running_as("wafer-run/auth")
+        TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID)
     }
 
     /// Write an `api_keys` row with `expires_at` exactly as given, bypassing
@@ -1711,7 +1829,7 @@ mod api_key_lifecycle_tests {
         data.insert("key_prefix".into(), json!("sb_test"));
         data.insert("created_at".into(), json!("2026-01-01T00:00:00Z"));
         data.insert("expires_at".into(), json!(expires_at));
-        wafer_core::clients::database::create(ctx, api_keys::TABLE, data)
+        wafer_core::clients::database::create(&ctx.fixture(), api_keys::TABLE, data)
             .await
             .expect("seed a legacy api-key row");
         user_id
@@ -1793,10 +1911,10 @@ mod api_key_lifecycle_tests {
 
     #[tokio::test]
     async fn disabled_user_key_is_rejected() {
-        let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
+        let ctx = ctx_that_can_read_roles().await;
         let uid = seed_user_and_key(&ctx, "raw-disabled-key").await;
 
-        users::set_disabled(&ctx, &uid, true)
+        users::set_disabled(&ctx.fixture(), &uid, true)
             .await
             .expect("disable the key's owner");
 

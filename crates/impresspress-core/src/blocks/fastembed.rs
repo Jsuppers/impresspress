@@ -226,7 +226,7 @@ mod tests {
         ServiceOp,
     };
     use wafer_core::interfaces::vector::service::{EmbeddingService, VectorError};
-    use wafer_run::{Block as _, InputStream, Message};
+    use wafer_run::{context::Context as _, Block as _, InputStream, Message};
 
     use super::FastembedBlock;
     use crate::test_support::TestContext;
@@ -264,18 +264,39 @@ mod tests {
         (Arc::new(block), loads)
     }
 
-    /// One `embedding.count_tokens` through the real `handle`.
-    async fn count_tokens(block: &FastembedBlock, ctx: &TestContext) -> u64 {
+    /// A deployment holding `block`, running as the block its declared grant
+    /// admits (`impresspress/vector`): the caller production has.
+    async fn called_by_vector(block: &Arc<FastembedBlock>) -> TestContext {
+        let grantee = block
+            .info()
+            .grants
+            .first()
+            .expect("the block grants its caller")
+            .grantee
+            .clone();
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(FastembedBlock::BLOCK_NAME, block.clone());
+        ctx.running_as(&grantee)
+    }
+
+    /// `op` with `body`, through `call_block` from the vector block's frame,
+    /// so the handler authorizes it as the runtime does.
+    async fn call(ctx: &TestContext, op: &str, body: Vec<u8>) -> wafer_run::OutputStream {
+        ctx.call_block(
+            FastembedBlock::BLOCK_NAME,
+            Message::new(op),
+            InputStream::from_bytes(body),
+        )
+        .await
+    }
+
+    /// One `embedding.count_tokens`, as the vector block sends it.
+    async fn count_tokens(ctx: &TestContext) -> u64 {
         let body = codec::encode(&CountTokensRequest {
             text: "two words".into(),
         })
         .expect("encode");
-        let out = block
-            .handle(
-                ctx,
-                Message::new(ServiceOp::EMBEDDING_COUNT_TOKENS),
-                InputStream::from_bytes(body),
-            )
+        let out = call(ctx, ServiceOp::EMBEDDING_COUNT_TOKENS, body)
             .await
             .collect_buffered()
             .await
@@ -294,12 +315,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_model_loads_off_the_executor() {
         let (block, loads) = slow_block();
-        let ctx = TestContext::new().await;
+        let ctx = called_by_vector(&block).await;
         let done = AtomicBool::new(false);
         let ticks = AtomicUsize::new(0);
 
         let requests = async {
-            let answers = futures::join!(count_tokens(&block, &ctx), count_tokens(&block, &ctx));
+            let answers = futures::join!(count_tokens(&ctx), count_tokens(&ctx));
             done.store(true, Ordering::SeqCst);
             answers
         };
@@ -328,22 +349,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_first_requests_load_the_model_once() {
         let (block, loads) = slow_block();
-        let ctx = TestContext::new().await;
+        let ctx = called_by_vector(&block).await;
 
         let first = tokio::spawn({
-            let (block, ctx) = (block.clone(), ctx.clone());
-            async move { count_tokens(&block, &ctx).await }
+            let ctx = ctx.clone();
+            async move { count_tokens(&ctx).await }
         });
         let second = tokio::spawn({
-            let (block, ctx) = (block.clone(), ctx.clone());
-            async move { count_tokens(&block, &ctx).await }
+            let ctx = ctx.clone();
+            async move { count_tokens(&ctx).await }
         });
         assert_eq!(first.await.expect("first request"), 2);
         assert_eq!(second.await.expect("second request"), 2);
 
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         // And the loaded service is kept: a later request does not load.
-        assert_eq!(count_tokens(&block, &ctx).await, 2);
+        assert_eq!(count_tokens(&ctx).await, 2);
         assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 
@@ -354,21 +375,16 @@ mod tests {
     async fn a_failed_load_is_retried_by_the_next_request() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = attempts.clone();
-        let block = FastembedBlock::with_loader(move || {
+        let block = Arc::new(FastembedBlock::with_loader(move || {
             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err("offline".to_string())
             } else {
                 Ok(Arc::new(Stub) as Arc<dyn EmbeddingService>)
             }
-        });
-        let ctx = TestContext::new().await;
+        }));
+        let ctx = called_by_vector(&block).await;
 
-        let err = block
-            .handle(
-                &ctx,
-                Message::new(ServiceOp::EMBEDDING_COUNT_TOKENS),
-                InputStream::from_bytes(Vec::new()),
-            )
+        let err = call(&ctx, ServiceOp::EMBEDDING_COUNT_TOKENS, Vec::new())
             .await
             .collect_buffered()
             .await
@@ -376,7 +392,7 @@ mod tests {
             .expect_err("the first load fails");
         assert_eq!(err.code, wafer_run::ErrorCode::Internal);
 
-        assert_eq!(count_tokens(&block, &ctx).await, 2);
+        assert_eq!(count_tokens(&ctx).await, 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
@@ -387,20 +403,19 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_request_dropped_mid_load_does_not_cause_a_second_load() {
         let (block, loads) = slow_block();
-        let ctx = TestContext::new().await;
+        let ctx = called_by_vector(&block).await;
 
         // Start the first request and abandon it a third of the way through.
-        let abandoned =
-            tokio::time::timeout(Duration::from_millis(100), count_tokens(&block, &ctx)).await;
+        let abandoned = tokio::time::timeout(Duration::from_millis(100), count_tokens(&ctx)).await;
         assert!(
             abandoned.is_err(),
             "the first request must still be loading"
         );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
 
-        let answers = futures::join!(count_tokens(&block, &ctx), count_tokens(&block, &ctx));
+        let answers = futures::join!(count_tokens(&ctx), count_tokens(&ctx));
         assert_eq!(answers, (2, 2));
-        assert_eq!(count_tokens(&block, &ctx).await, 2);
+        assert_eq!(count_tokens(&ctx).await, 2);
         assert_eq!(
             loads.load(Ordering::SeqCst),
             1,
@@ -414,21 +429,16 @@ mod tests {
     async fn a_panicked_load_is_retried_by_the_next_request() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = attempts.clone();
-        let block = FastembedBlock::with_loader(move || {
+        let block = Arc::new(FastembedBlock::with_loader(move || {
             assert!(
                 counter.fetch_add(1, Ordering::SeqCst) != 0,
                 "first load panics"
             );
             Ok(Arc::new(Stub) as Arc<dyn EmbeddingService>)
-        });
-        let ctx = TestContext::new().await;
+        }));
+        let ctx = called_by_vector(&block).await;
 
-        let err = block
-            .handle(
-                &ctx,
-                Message::new(ServiceOp::EMBEDDING_COUNT_TOKENS),
-                InputStream::from_bytes(Vec::new()),
-            )
+        let err = call(&ctx, ServiceOp::EMBEDDING_COUNT_TOKENS, Vec::new())
             .await
             .collect_buffered()
             .await
@@ -436,7 +446,7 @@ mod tests {
             .expect_err("the first load panics");
         assert_eq!(err.code, wafer_run::ErrorCode::Internal);
 
-        assert_eq!(count_tokens(&block, &ctx).await, 2);
+        assert_eq!(count_tokens(&ctx).await, 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
@@ -447,24 +457,23 @@ mod tests {
     async fn a_load_that_fails_with_nobody_waiting_is_retried() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = attempts.clone();
-        let block = FastembedBlock::with_loader(move || {
+        let block = Arc::new(FastembedBlock::with_loader(move || {
             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                 std::thread::sleep(Duration::from_millis(100));
                 Err("offline".to_string())
             } else {
                 Ok(Arc::new(Stub) as Arc<dyn EmbeddingService>)
             }
-        });
-        let ctx = TestContext::new().await;
+        }));
+        let ctx = called_by_vector(&block).await;
 
-        let abandoned =
-            tokio::time::timeout(Duration::from_millis(20), count_tokens(&block, &ctx)).await;
+        let abandoned = tokio::time::timeout(Duration::from_millis(20), count_tokens(&ctx)).await;
         assert!(abandoned.is_err(), "the only waiter is dropped mid-load");
         // Let the orphaned load fail with nobody listening.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-        assert_eq!(count_tokens(&block, &ctx).await, 2);
+        assert_eq!(count_tokens(&ctx).await, 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
@@ -473,8 +482,8 @@ mod tests {
     #[tokio::test]
     async fn a_successful_load_leaves_no_load_in_flight() {
         let (block, _loads) = slow_block();
-        let ctx = TestContext::new().await;
-        assert_eq!(count_tokens(&block, &ctx).await, 2);
+        let ctx = called_by_vector(&block).await;
+        assert_eq!(count_tokens(&ctx).await, 2);
         assert!(block
             .in_flight
             .lock()

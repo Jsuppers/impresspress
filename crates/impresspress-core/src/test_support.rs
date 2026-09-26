@@ -11,9 +11,11 @@
 //! Every `call_block` goes through the gates the runtime applies — call
 //! depth, cancellation, aliases, the caller's `requires`, the target's
 //! interface — and every service op is WRAP-checked against the caller the
-//! runtime would attribute it to and the grants the deployment carries. See
-//! [`TestContext::running_as`] for how a test runs code as a block, and
-//! `parity_tests` for the cases that hold the fixture to a sealed `Wafer`.
+//! runtime would attribute it to and the grants the deployment carries. A
+//! constructor hands back an unframed context, which the runtime would treat
+//! as an unattributed caller and refuse; a test runs code as a block with
+//! [`TestContext::running_as`] and stages rows with [`TestContext::fixture`].
+//! `parity_tests` holds the fixture to a sealed `Wafer`.
 //!
 //! [`source_scan`] is the other half: the shared walk and comment strippers
 //! the crate's source gates are built on, so a gate states its root and its
@@ -81,12 +83,12 @@ pub struct TestContext {
     /// can return a borrowed slice directly instead of cloning through a
     /// lock guard.
     block_infos: Vec<wafer_run::BlockInfo>,
-    /// The block whose code runs on this context — what a block reached
-    /// through [`Context::call_block`] sees as its caller. `None` is the
-    /// fixture's own frame, the one test setup runs in (see
-    /// [`dispatch::Caller::Fixture`]). Set by [`Self::running_as`]; a
-    /// callee's context runs as the callee.
-    frame: Option<String>,
+    /// Whose code runs on this context — what a block reached through
+    /// [`Context::call_block`] sees as its caller. See [`dispatch::Frame`]:
+    /// a constructor hands back an unframed context, [`Self::running_as`]
+    /// and a callee's context run as a block, and [`Self::fixture`] is test
+    /// setup.
+    frame: dispatch::Frame,
     /// Who called into this frame: what [`Context::caller_id`] answers, and
     /// the identity a service's WRAP check authorizes — re-pointed on every
     /// hop, as `RuntimeContext::dispatch_call` re-points `caller_id`.
@@ -100,8 +102,8 @@ pub struct TestContext {
     /// `RuntimeContext::dispatch_call` refuses any target not named in it
     /// before it looks at capabilities or grants. `None` = undeclared =
     /// unrestricted, which is what `Wafer::resolve_block_requires_uncached`
-    /// yields for a block with an empty or absent list, and what the
-    /// fixture's own frame carries.
+    /// yields for a block with an empty or absent list, and what an unframed
+    /// context and [`Self::fixture`] carry.
     caller_requires: Option<Vec<String>>,
     /// This frame's nesting depth: `0` for a top-level frame, one more for
     /// each `call_block` hop. A per-frame value, as in `RuntimeContext`, so
@@ -247,8 +249,8 @@ impl TestContext {
             config_store: false,
             blocks: Arc::new(Mutex::new(HashMap::new())),
             block_infos: Vec::new(),
-            frame: None,
-            called_by: dispatch::Caller::Fixture,
+            frame: dispatch::Frame::Unframed,
+            called_by: dispatch::Caller::Nobody,
             caller_requires: None,
             call_depth: 0,
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -328,22 +330,25 @@ impl TestContext {
             Some(registered) => registered.info().call_allowlist(),
             None => dispatch::built_in_call_allowlist(block),
         };
-        self.frame = Some(block.to_string());
+        self.frame = dispatch::Frame::Block(block.to_string());
         self.called_by = dispatch::Caller::Nobody;
         self.call_depth = 0;
         self
     }
 
     /// The fixture's own frame over the same database, blocks and config —
-    /// what a test sets up and asserts through when `self` runs as a block.
+    /// what a test stages and asserts through. Authorized as the admin block
+    /// (see [`dispatch::Caller::Fixture`]), so it is reached only by asking
+    /// for it: a constructor hands back an unframed context, which is
+    /// refused every guarded resource, so no code under test runs with the
+    /// fixture's authority unless a test says so here.
     ///
     /// A test whose subject runs as a block still has to seed rows and read
     /// back what landed, and those reads are not the block's: the block may
-    /// hold no grant on the table the test inspects. See
-    /// [`dispatch::Caller::Fixture`].
+    /// hold no grant on the table the test inspects.
     pub fn fixture(&self) -> Self {
         let mut ctx = self.clone();
-        ctx.frame = None;
+        ctx.frame = dispatch::Frame::Fixture;
         ctx.called_by = dispatch::Caller::Fixture;
         ctx.caller_requires = None;
         ctx.call_depth = 0;
@@ -409,11 +414,8 @@ impl TestContext {
     /// cover — and sits one level deeper.
     fn for_callee(&self, name: &str, callee: &dyn Block) -> Self {
         let mut ctx = self.clone();
-        ctx.called_by = match &self.frame {
-            Some(frame) => dispatch::Caller::Block(frame.clone()),
-            None => dispatch::Caller::Fixture,
-        };
-        ctx.frame = Some(name.to_string());
+        ctx.called_by = self.frame.as_caller();
+        ctx.frame = dispatch::Frame::Block(name.to_string());
         ctx.caller_requires = callee.info().call_allowlist();
         ctx.call_depth = self.call_depth + 1;
         ctx
@@ -448,8 +450,9 @@ impl TestContext {
         postgres: &[&str],
     ) {
         let sqlite_sql: Vec<&str> = sqlite.iter().map(|(_, sql)| *sql).collect();
+        // In the block's own frame, as its `lifecycle(Init)` runs them.
         crate::migration_helper::apply_migrations(
-            &self.fixture(),
+            &self.fixture().running_as(block_name),
             block_name,
             &sqlite_sql,
             postgres,
@@ -591,10 +594,10 @@ impl TestContext {
     /// **running as `impresspress/files`** — in the frame production gives
     /// that block (see [`Self::running_as`]).
     ///
-    /// The frame is not decoration. The fixture's own frame is unrestricted
-    /// and authorized as the admin block, so it certifies calls the runtime
-    /// refuses. That is exactly how the share path shipped calling
-    /// `wafer-run/crypto` without declaring it: every test that created a
+    /// The frame is not decoration. A frame other than the files block's
+    /// carries a different allowlist, or none, so it certifies calls the
+    /// runtime refuses the files block. That is exactly how the share path
+    /// shipped calling `wafer-run/crypto` without declaring it: every test that created a
     /// share passed, and the live server answered `PermissionDenied: block
     /// 'wafer-run/crypto' not in requires list`. The frame goes on the
     /// constructor every files-block test shares, so none of them can miss
@@ -3576,8 +3579,10 @@ pub async fn discovery_json_as(
         }
     };
     msg.set_meta("http.header.host", host);
+    // The pipeline is the router block's code.
     let out = crate::pipeline::handle_request(
-        ctx,
+        &ctx.clone()
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID),
         msg,
         InputStream::from_bytes(Vec::new()),
         None,
@@ -4245,7 +4250,7 @@ mod tests {
         let ctx = TestContext::new().await;
 
         db::exec_raw(
-            &ctx,
+            &ctx.fixture(),
             "CREATE TABLE round_trip (id TEXT PRIMARY KEY, name TEXT)",
             &[],
         )
@@ -4253,7 +4258,7 @@ mod tests {
         .expect("create table");
 
         db::exec_raw(
-            &ctx,
+            &ctx.fixture(),
             "INSERT INTO round_trip (id, name) VALUES (?, ?)",
             &[serde_json::json!("r1"), serde_json::json!("alpha")],
         )
@@ -4261,7 +4266,7 @@ mod tests {
         .expect("insert row");
 
         let rows = db::query_raw(
-            &ctx,
+            &ctx.fixture(),
             "SELECT id, name FROM round_trip WHERE id = ?",
             &[serde_json::json!("r1")],
         )
@@ -4354,7 +4359,7 @@ mod tests {
         ctx.seed_auth_user("user-a").await;
 
         db::exec_raw(
-            &ctx,
+            &ctx.fixture(),
             "INSERT INTO wafer_run__auth__orgs (id, name, owner_user_id, is_reserved, created_at) \
              VALUES (?, ?, ?, 0, ?)",
             &[
@@ -4368,7 +4373,7 @@ mod tests {
         .expect("insert org");
 
         let rows = db::query_raw(
-            &ctx,
+            &ctx.fixture(),
             "SELECT name FROM wafer_run__auth__orgs WHERE id = ?",
             &[serde_json::json!("org-1")],
         )
@@ -4504,14 +4509,14 @@ mod tests {
     async fn seeded_ctx() -> TestContext {
         let ctx = TestContext::new().await;
         db::exec_raw(
-            &ctx,
+            &ctx.fixture(),
             "CREATE TABLE filtered_writes (id TEXT PRIMARY KEY, name TEXT, hits INTEGER              DEFAULT 0, created_at TEXT, updated_at TEXT)",
             &[],
         )
         .await
         .expect("create table");
         db::exec_raw(
-            &ctx,
+            &ctx.fixture(),
             "INSERT INTO filtered_writes (id, name, hits) VALUES ('r1', 'alpha', 0)",
             &[],
         )
@@ -4876,10 +4881,17 @@ mod tests {
     }
 
     /// The fixture's own frame is test setup: it writes and reads any table,
-    /// as the admin block may.
+    /// as the admin block may. It is reached only through `fixture()`: what a
+    /// constructor hands back is nobody's code, and is refused.
     #[tokio::test]
     async fn the_fixture_frame_is_authorized_as_the_admin_block() {
-        let ctx = TestContext::with_auth().await;
+        let unframed = TestContext::with_auth().await;
+        let err = db::list(&unframed, "wafer_run__auth__users", &ListOptions::default())
+            .await
+            .expect_err("an unframed context is nobody's code, and is refused");
+        assert_eq!(err.code, ErrorCode::PermissionDenied, "{err:?}");
+
+        let ctx = unframed.fixture();
         let res = db::list(&ctx, "wafer_run__auth__users", &ListOptions::default())
             .await
             .expect("the fixture frame reads any table");

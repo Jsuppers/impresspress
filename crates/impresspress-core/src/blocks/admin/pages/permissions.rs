@@ -633,7 +633,10 @@ mod outage_tests {
 
     #[tokio::test]
     async fn a_failing_grant_read_renders_the_error_page_not_no_custom_grants() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let msg = admin_msg("retrieve", "/b/admin/settings/permissions");
         assert_eq!(
             output_http_status(settings_page(&ctx, &msg, "permissions").await).await,
@@ -643,7 +646,10 @@ mod outage_tests {
 
     #[tokio::test]
     async fn a_failing_grant_read_fails_the_database_subtab_too() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let mut msg = admin_msg("retrieve", "/b/admin/settings/permissions");
         msg.set_meta("req.query.subtab", "database");
         assert_eq!(
