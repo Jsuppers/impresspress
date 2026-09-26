@@ -1661,6 +1661,91 @@ mod api_key_lifecycle_tests {
         user_id
     }
 
+    /// Stands in for `impresspress/router` in a sealed runtime: runs the
+    /// pipeline's API-key step (`pipeline::handle_request` calls
+    /// `authenticate_api_key` on the router's own context) and answers with
+    /// the user it stamped, or the refusal's code.
+    struct RouterProbe(String);
+
+    #[wafer_block::wafer_async_trait]
+    impl wafer_run::Block for RouterProbe {
+        fn info(&self) -> wafer_run::BlockInfo {
+            wafer_run::BlockInfo::new(
+                crate::blocks::router::ROUTER_BLOCK_ID,
+                "0.0.1",
+                "http-handler@v1",
+                "router probe",
+            )
+        }
+
+        async fn handle(
+            &self,
+            ctx: &dyn wafer_run::context::Context,
+            _msg: Message,
+            _input: wafer_run::InputStream,
+        ) -> wafer_run::OutputStream {
+            let mut msg = Message::new("http.request");
+            match authenticate_api_key(ctx, &self.0, &mut msg).await {
+                Ok(()) => wafer_run::OutputStream::respond(
+                    msg.get_meta(META_AUTH_USER_ID).as_bytes().to_vec(),
+                ),
+                Err(e) => wafer_run::OutputStream::error(e),
+            }
+        }
+    }
+
+    /// An API key authenticates on the path production takes it: the
+    /// pipeline, running as `impresspress/router`, in a sealed runtime whose
+    /// grants are the ones `wafer-run/auth` and `impresspress/admin` declare.
+    ///
+    /// The router reads the key's row (`wafer_run__auth__api_keys`) and the
+    /// user's roles (`impresspress__admin__user_roles`), and neither block
+    /// granted it either, so every request carrying an API key was refused
+    /// with 403 — while every test of the key path ran as a frame that held
+    /// the grants the router lacks.
+    #[tokio::test]
+    async fn an_api_key_authenticates_in_the_routers_frame_on_a_sealed_runtime() {
+        let ctx = TestContext::with_auth().await.fixture();
+        let raw_key = "raw-router-key";
+        let uid = seed_user_and_key(&ctx, raw_key).await;
+
+        let mut wafer = wafer_run::Wafer::builder()
+            .disable_inventory()
+            .disable_lockfile()
+            .build()
+            .expect("an empty runtime builds");
+        wafer.set_admin_block(crate::blocks::admin::ADMIN_BLOCK_ID);
+        wafer_core::service_blocks::database::register_with(&mut wafer, ctx.database_service())
+            .expect("the database registers");
+        wafer
+            .register_block(
+                crate::blocks::router::ROUTER_BLOCK_ID,
+                std::sync::Arc::new(RouterProbe(raw_key.to_string())),
+            )
+            .expect("the router probe registers");
+        // The two blocks' declared grants, as the runtime collects them from
+        // their registrations; the blocks themselves need services this
+        // runtime does not carry.
+        let mut declared = crate::blocks::auth::service::auth_grants();
+        declared.extend(wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new()).grants);
+        wafer
+            .add_wrap_grants(declared)
+            .expect("the grants are well formed");
+        wafer.seal().await.expect("the runtime seals");
+
+        let out = wafer
+            .run_block(
+                crate::blocks::router::ROUTER_BLOCK_ID,
+                Message::new("http.request"),
+                wafer_run::InputStream::empty(),
+            )
+            .await;
+        match out.collect_buffered().await {
+            Ok(buf) => assert_eq!(String::from_utf8(buf.body).expect("utf-8"), uid),
+            Err(other) => panic!("the key must authenticate as its user, got {other:?}"),
+        }
+    }
+
     /// One user per key, because the tests that seed two keys would otherwise
     /// collide on the unique email.
     async fn seed_user(ctx: &TestContext, tag: &str) -> String {

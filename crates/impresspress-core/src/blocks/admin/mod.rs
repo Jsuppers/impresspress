@@ -581,6 +581,13 @@ crate::impresspress_feature_block! {
                     super::auth_ui::AUTH_UI_BLOCK_ID,
                     user_roles::TABLE,
                 ),
+                // The pipeline router authenticates an API key by reading its
+                // user's roles (`blocks::auth::authenticate_api_key`), in the
+                // router's own context, on every request that carries one.
+                wafer_run::ResourceGrant::read(
+                    crate::blocks::router::ROUTER_BLOCK_ID,
+                    user_roles::TABLE,
+                ),
                 // Every block may upsert its own migration state into block_settings.
                 wafer_run::ResourceGrant::read_write("*", block_settings::TABLE),
                 // Infrastructure logging: storage wrapper + pipeline write logs

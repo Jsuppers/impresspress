@@ -285,6 +285,11 @@ pub fn auth_grants() -> Vec<wafer_block::types::ResourceGrant> {
         // denies the users-table read and every such request is refused
         // with 403 "Access denied", the same as the blocklist read above.
         wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__users"),
+        // The API-key half of the same step: `blocks::auth::authenticate_api_key`
+        // looks the key up in the router's context on every request bearing
+        // `Authorization: ApiKey …`. Without this grant WRAP denies the read
+        // and every such request is refused with 403 "Access denied".
+        wafer_run::ResourceGrant::read("impresspress/router", "wafer_run__auth__api_keys"),
         // Admin block reads auth tables for the admin dashboards. The
         // wildcard mirrors the legacy AuthBlock grant — admin/pages/users
         // reads users, sessions, AND api_keys (the API-key tab) so the
