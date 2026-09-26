@@ -14,7 +14,7 @@ use impresspress_core::{
 use wafer_core::interfaces::auth::service::{AuthError, AuthService, Role};
 use wafer_run::{context::Context, Message};
 
-use crate::common::MigrationTestCtx;
+use crate::common::{auth_fixture, MintAccessToken};
 
 fn bearer(tok: &str) -> Message {
     let mut m = Message::new("auth.require_role");
@@ -24,7 +24,7 @@ fn bearer(tok: &str) -> Message {
 
 #[tokio::test]
 async fn require_role_user_admin_and_bootstrap_token() {
-    let raw_ctx = Arc::new(MigrationTestCtx::new().await);
+    let raw_ctx = Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     let ctx: Arc<dyn Context> = raw_ctx.clone();
     migrations::apply(ctx.as_ref()).await.expect("migrations");
 
@@ -108,7 +108,7 @@ async fn require_role_user_admin_and_bootstrap_token() {
 /// consulted. [F19]
 #[tokio::test]
 async fn require_role_admin_comes_from_the_roles_table_not_the_token_claim() {
-    let raw_ctx = Arc::new(MigrationTestCtx::new().await);
+    let raw_ctx = Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     let ctx: Arc<dyn Context> = raw_ctx.clone();
     migrations::apply(ctx.as_ref()).await.expect("migrations");
     impresspress_core::blocks::admin::migrations::apply(ctx.as_ref())

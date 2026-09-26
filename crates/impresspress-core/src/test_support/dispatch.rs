@@ -82,6 +82,49 @@ pub(super) fn empty_wafer() -> wafer_run::Wafer {
     wafer
 }
 
+/// Register `block` under `name` the way the runtime does and hand back the
+/// `BlockInfo` it admitted, or panic with the runtime's refusal.
+///
+/// `Wafer::register_block` is the admission every registration path goes
+/// through: the name must be a legal block name, the block must report the
+/// name it is registered under, and its declaration must pass
+/// `BlockInfo::validate` — reserved or foreign config keys, illegal agent
+/// tool names. Each of those is fatal at boot, so a fixture that admitted
+/// them would certify a deployment that never starts.
+pub(super) fn admit(name: &str, block: Arc<dyn Block>) -> wafer_run::BlockInfo {
+    let mut wafer = empty_wafer();
+    let info = block.info();
+    wafer
+        .register_block(name, block)
+        .unwrap_or_else(|e| panic!("the runtime refuses to register {name}: {e}"));
+    info
+}
+
+/// A block that is nothing but its declaration — what
+/// [`super::TestContext::register_block_info`] admits a sandbox guest's
+/// `BlockInfo` through. It is registered only in the throwaway runtime
+/// [`admit`] builds, never dispatched to.
+pub(super) struct Declared(pub(super) wafer_run::BlockInfo);
+
+#[wafer_block::wafer_async_trait]
+impl Block for Declared {
+    fn info(&self) -> wafer_run::BlockInfo {
+        self.0.clone()
+    }
+
+    async fn handle(
+        &self,
+        _ctx: &dyn wafer_run::context::Context,
+        _msg: wafer_run::Message,
+        _input: wafer_run::InputStream,
+    ) -> wafer_run::OutputStream {
+        wafer_run::OutputStream::error(wafer_run::WaferError::new(
+            wafer_run::ErrorCode::Unimplemented,
+            "a declared-only block has no handler",
+        ))
+    }
+}
+
 /// The grants the blocks `ImpresspressBuilder::build` registers declare, as
 /// the runtime collects them, and the names those blocks are registered
 /// under.

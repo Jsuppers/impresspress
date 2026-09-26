@@ -237,7 +237,7 @@ jobs:
       # SQLite only. A dual-backend matrix (sqlite + postgres) for the
       # `wafer_run__auth__*` tables is deferred until a postgres-backed
       # test context lands in wafer-block-postgres — Plan A did not wire
-      # one, and Plans B + C reuse the same MigrationTestCtx shape so
+      # one, and the auth tests' `TestContext` is SQLite-backed too, so
       # the deferral still stands. In particular the partial unique
       # index `orgs(verified_via, verified_ref) WHERE NOT is_reserved`
       # introduced by migration 002 needs a postgres variant before it

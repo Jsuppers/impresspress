@@ -41,7 +41,7 @@ embed-assets = []
 postgres = []
 # Exposes `impresspress_core::test_support::TestContext` (the shared in-memory
 # SQLite + block harness) as part of the public API so the `tests/`
-# integration crates can reuse it instead of hand-rolling a `MigrationTestCtx`.
+# integration crates can reuse it instead of hand-rolling a context of their own.
 # Pulls `wafer-block-sqlite` in as a regular (non-optional) dep — TestContext
 # wires the production `DatabaseBlock` over `SQLiteDatabaseService`. Enabled
 # via the self dev-dependency below; never enabled in production builds.

@@ -1221,7 +1221,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/products",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/products"),
         );
         let out = route_to_block(
             &ctx,
@@ -1262,7 +1262,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/admin",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/admin"),
         );
         let out = route_to_block(
             &ctx,
@@ -1310,7 +1310,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/system",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/system"),
         );
         let out = route_to_block(
             &ctx,
@@ -1379,7 +1379,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "wafer-run/inspector",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("wafer-run/inspector"),
         );
         let out = route_to_block(
             &ctx,
@@ -1418,7 +1418,7 @@ mod tests {
         // Unreachable in fact, not just in the resolver's opinion — even an
         // admin gets a 404.
         let mut ctx = TestContext::new().await;
-        ctx.register_block("test/orphan", std::sync::Arc::new(DispatchProbeBlock));
+        ctx.register_block("test/orphan", DispatchProbeBlock::named("test/orphan"));
         let out = route_to_block(
             &ctx,
             admin_msg("retrieve", ep_path),
@@ -1460,7 +1460,7 @@ mod tests {
         );
 
         let mut ctx = TestContext::new().await;
-        ctx.register_block("test/reports", std::sync::Arc::new(DispatchProbeBlock));
+        ctx.register_block("test/reports", DispatchProbeBlock::named("test/reports"));
         let out = route_to_block(
             &ctx,
             auth_msg("retrieve", ep_path, "user-1"),
@@ -1500,7 +1500,7 @@ mod tests {
 
         // And the router agrees — the whole point of the resolver existing.
         let mut ctx = TestContext::new().await;
-        ctx.register_block("test/pub", std::sync::Arc::new(DispatchProbeBlock));
+        ctx.register_block("test/pub", DispatchProbeBlock::named("test/pub"));
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", ep_path),
@@ -1530,7 +1530,7 @@ mod tests {
         let extra = vec![ExtraRoute::new("/x/", "test/catchall", RouteAccess::Public)];
 
         let mut ctx = TestContext::new().await;
-        ctx.register_block("test/catchall", std::sync::Arc::new(DispatchProbeBlock));
+        ctx.register_block("test/catchall", DispatchProbeBlock::named("test/catchall"));
         let out = route_to_block(
             &ctx,
             anon_msg("retrieve", "/x/anything"),
@@ -1595,7 +1595,8 @@ mod tests {
         #[async_trait::async_trait]
         impl wafer_run::Block for GateEchoBlock {
             fn info(&self) -> wafer_run::BlockInfo {
-                wafer_run::BlockInfo::new("test/gate-echo", "0.0.1", "echo@v1", "gate echo")
+                // Stands in for the files block, so it reports that name.
+                wafer_run::BlockInfo::new("impresspress/files", "0.0.1", "echo@v1", "gate echo")
                     .category(wafer_run::BlockCategory::Service)
             }
             async fn handle(
@@ -1732,7 +1733,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/vector",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/vector"),
         );
         let block_infos = vec![wafer_run::BlockInfo::new(
             "impresspress/vector",
@@ -1783,7 +1784,10 @@ mod tests {
         use crate::test_support::{auth_msg, TestContext};
 
         let mut ctx = TestContext::new().await;
-        ctx.register_block("impresspress/llm", std::sync::Arc::new(DispatchProbeBlock));
+        ctx.register_block(
+            "impresspress/llm",
+            DispatchProbeBlock::named("impresspress/llm"),
+        );
         let block_infos =
             vec![
                 wafer_run::BlockInfo::new("impresspress/llm", "0.0.1", "http-handler@v1", "t")
@@ -1824,7 +1828,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/system",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/system"),
         );
         let block_infos = vec![SystemBlock::new().info()];
 
@@ -1865,7 +1869,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/system",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/system"),
         );
         let block_infos = vec![SystemBlock::new().info()];
 
@@ -1907,7 +1911,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/products",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/products"),
         );
         let block_infos = vec![ProductsBlock::new().info()];
 
@@ -2046,7 +2050,7 @@ mod tests {
         // `restore_endpoint_returns_the_product_to_the_catalog` et al.).
         ctx.register_block(
             "impresspress/products",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/products"),
         );
 
         // 2. A non-admin authenticated caller is rejected — the exact
@@ -2145,7 +2149,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/auth-ui",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/auth-ui"),
         );
         let block_infos = vec![AuthUiBlock::new().info()];
 
@@ -2182,7 +2186,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/auth-ui",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/auth-ui"),
         );
         let block_infos = vec![AuthUiBlock::new().info()];
         let path = "/b/auth/api/api-keys/k-1";
@@ -2233,7 +2237,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/admin",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/admin"),
         );
         let block_infos = crate::blocks::all_block_infos();
 
@@ -2290,7 +2294,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/legalpages",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/legalpages"),
         );
         let block_infos = crate::blocks::all_block_infos();
 
@@ -2375,7 +2379,7 @@ mod tests {
             "impresspress/auth-ui",
             "impresspress/products",
         ] {
-            ctx.register_block(name, std::sync::Arc::new(DispatchProbeBlock));
+            ctx.register_block(name, DispatchProbeBlock::named(name));
         }
         let block_infos = vec![
             SystemBlock::new().info(),
@@ -2421,7 +2425,7 @@ mod tests {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
             "impresspress/legalpages",
-            std::sync::Arc::new(DispatchProbeBlock),
+            DispatchProbeBlock::named("impresspress/legalpages"),
         );
         let block_infos = crate::blocks::all_block_infos();
         let path = "/b/legalpages/admin/does-not-exist";
@@ -2545,12 +2549,20 @@ mod tests {
 
     /// Shared dummy block for the tests above: always dispatches successfully
     /// with a recognizable body, so a test can prove "reached dispatch"
-    /// rather than merely "wasn't denied".
-    struct DispatchProbeBlock;
+    /// rather than merely "wasn't denied". It stands in for whichever block
+    /// it is registered as, and reports that name, as the runtime requires.
+    struct DispatchProbeBlock(String);
+
+    impl DispatchProbeBlock {
+        fn named(name: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self(name.to_string()))
+        }
+    }
+
     #[async_trait::async_trait]
     impl wafer_run::Block for DispatchProbeBlock {
         fn info(&self) -> wafer_run::BlockInfo {
-            wafer_run::BlockInfo::new("test/dispatch-probe", "0.0.1", "echo@v1", "dispatch probe")
+            wafer_run::BlockInfo::new(&self.0, "0.0.1", "echo@v1", "dispatch probe")
                 .category(wafer_run::BlockCategory::Service)
         }
         async fn handle(

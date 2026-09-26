@@ -16,13 +16,15 @@ use impresspress_core::{
         repo::{jwt_blocklist, pats, users},
         service::{hash_token, AuthServiceImpl, BlockState},
     },
-    test_support::seed_user,
+    test_support::{seed_user, TestContext},
 };
 use sha2::{Digest, Sha256};
 use wafer_core::interfaces::auth::service::{AuthError, AuthService};
 use wafer_run::{context::Context, Message};
 
-use crate::common::{sign_access_token_expired, MigrationTestCtx, TEST_ISSUER, TEST_MASTER_SECRET};
+use crate::common::{
+    auth_fixture, sign_access_token_expired, MintAccessToken, TEST_ISSUER, TEST_MASTER_SECRET,
+};
 
 fn msg_with_bearer(token: &str) -> Message {
     let mut m = Message::new("auth.require_user");
@@ -36,8 +38,8 @@ async fn seed_user_id(ctx: &dyn Context, email: &str) -> String {
     seed_user(email).display_name("R").insert(ctx).await.id
 }
 
-async fn fixture() -> (Arc<MigrationTestCtx>, Arc<dyn Context>) {
-    let raw = Arc::new(MigrationTestCtx::new().await);
+async fn fixture() -> (Arc<TestContext>, Arc<dyn Context>) {
+    let raw = Arc::new(auth_fixture(impresspress_core::blocks::auth::AUTH_BLOCK_ID).await);
     let ctx: Arc<dyn Context> = raw.clone();
     migrations::apply(ctx.as_ref()).await.expect("migrations");
     (raw, ctx)

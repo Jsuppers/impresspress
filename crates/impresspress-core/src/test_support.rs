@@ -1154,16 +1154,18 @@ impl TestContext {
     /// in the auth block calls `"impresspress/userportal"` for the buttons
     /// list; tests register a real or fake `UserPortalBlock` so the call
     /// resolves.
+    ///
+    /// Admitted as the runtime admits a block — see [`dispatch::admit`]: a
+    /// block the runtime refuses to register (a name it reports differently,
+    /// a declaration `BlockInfo::validate` rejects) panics here rather than
+    /// running in a fixture production would never boot.
     pub fn register_block(&mut self, name: &str, block: Arc<dyn Block>) {
+        let info = dispatch::admit(name, block.clone());
         // Keep `block_infos` a deduplicated mirror of `blocks`'s keys — a
         // block re-registered under the same name (e.g. `set_config`
         // calling `register_block("wafer-run/config", ..)` again) replaces
-        // its old entry rather than appending a duplicate. The registration
-        // name (not whatever `block.info().name` happens to report) is
-        // authoritative, matching how `blocks` itself is keyed.
+        // its old entry rather than appending a duplicate.
         self.block_infos.retain(|b| b.name != name);
-        let mut info = block.info();
-        info.name = name.to_string();
         self.block_infos.push(info);
 
         self.blocks
@@ -1188,12 +1190,12 @@ impl TestContext {
     /// which is precisely how the sandbox shipped a rule that refused a block
     /// its own agent tool names on recompile.
     ///
-    /// Same de-duplication as `register_block`, and the same authority: the
-    /// name passed in wins over whatever `info.name` says, so a re-registered
-    /// block replaces its entry instead of appending a second one.
-    pub fn register_block_info(&mut self, name: &str, mut info: wafer_run::BlockInfo) {
+    /// Same de-duplication as `register_block`, and the same admission: the
+    /// runtime would refuse to register a block reporting `info`, so the
+    /// fixture refuses to snapshot it.
+    pub fn register_block_info(&mut self, name: &str, info: wafer_run::BlockInfo) {
+        let info = dispatch::admit(name, Arc::new(dispatch::Declared(info)));
         self.block_infos.retain(|b| b.name != name);
-        info.name = name.to_string();
         self.block_infos.push(info);
     }
 
@@ -4786,6 +4788,91 @@ mod tests {
             }
             other => panic!("the ungranted read must be refused, got {other:?}"),
         }
+    }
+
+    /// A block the runtime would refuse to register is refused here too.
+    /// `register_block` used to rename whatever it was handed to the name it
+    /// was registered under and accept any declaration, so a block that
+    /// could never boot passed every unit test.
+    struct Declares(BlockInfo);
+
+    /// A key in the shared namespace, which no block may declare.
+    const RESERVED_PROBE_KEY: &str = "WAFER_RUN_SHARED__PROBE";
+    /// A key in another block's namespace, which `test/declared` may not
+    /// declare.
+    const FOREIGN_PROBE_KEY: &str = "OTHER__BLOCK__KEY";
+
+    #[wafer_block::wafer_async_trait]
+    impl Block for Declares {
+        fn info(&self) -> BlockInfo {
+            self.0.clone()
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &dyn Context,
+            _msg: Message,
+            _input: InputStream,
+        ) -> OutputStream {
+            OutputStream::respond(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "the runtime refuses to register test/declared: block registered as \
+                    'test/declared' reports its name as 'test/other'"
+    )]
+    async fn a_block_reporting_another_name_is_not_registered() {
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "test/declared",
+            Arc::new(Declares(BlockInfo::new(
+                "test/other",
+                "0.0.1",
+                "probe@v1",
+                "misnamed",
+            ))),
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "the runtime refuses to register test/declared: block 'test/declared' \
+                    declares reserved config key"
+        // The key itself is `RESERVED_PROBE_KEY`, which an attribute cannot
+        // name; the variant's own wording is what distinguishes this refusal.
+    )]
+    async fn a_block_declaring_a_reserved_config_key_is_not_registered() {
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "test/declared",
+            Arc::new(Declares(
+                BlockInfo::new("test/declared", "0.0.1", "probe@v1", "reserved key").config_keys(
+                    vec![wafer_run::ConfigVar::new(
+                        RESERVED_PROBE_KEY,
+                        "reserved",
+                        "",
+                    )],
+                ),
+            )),
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "the runtime refuses to register test/declared: block 'test/declared' \
+                    declares config var 'OTHER__BLOCK__KEY', which is outside its own prefix \
+                    'TEST__DECLARED__'"
+    )]
+    async fn a_declared_only_block_is_admitted_the_same_way() {
+        let mut ctx = TestContext::new().await;
+        ctx.register_block_info(
+            "test/declared",
+            BlockInfo::new("test/declared", "0.0.1", "probe@v1", "foreign key").config_keys(vec![
+                wafer_run::ConfigVar::new(FOREIGN_PROBE_KEY, "foreign", ""),
+            ]),
+        );
     }
 
     /// The fixture's own frame is test setup: it writes and reads any table,
