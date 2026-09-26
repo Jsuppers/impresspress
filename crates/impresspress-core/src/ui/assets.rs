@@ -1009,9 +1009,11 @@ mod tests {
         const CALLER_SUPPLIED: &[&str] = &[
             // ui/components/table.rs sets this per-column on the <th>.
             "--col-width",
-            // ui/components/chart.rs sets these per-datapoint: the sparkline's
-            // end-dot offset and each bar's height fraction.
+            // ui/components/chart.rs sets these per-datapoint: the line
+            // chart's endpoint-dot offset, each y-axis label's offset and
+            // each bar's height fraction.
             "--dot-y",
+            "--tick-y",
             "--size",
             // ui/components/chart.rs sets the series colour on the wrapper.
             "--chart-color",
