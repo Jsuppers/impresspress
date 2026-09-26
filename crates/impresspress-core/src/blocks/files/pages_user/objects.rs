@@ -466,7 +466,8 @@ mod tests {
 
     /// SIZE renders via `format_bytes` (not the raw byte count) and the
     /// MODIFIED cell's visible text is humanized while the `<time>` element's
-    /// `datetime` attribute keeps the full raw timestamp.
+    /// `datetime` attribute carries the instant as a valid HTML date-time
+    /// (UTC, milliseconds — HTML allows at most three fraction digits).
     #[test]
     fn render_objects_table_humanizes_size_and_modified() {
         let f1 = ObjectRow {
@@ -483,10 +484,10 @@ mod tests {
         // Size: humanized, not the bare number cell.
         assert!(html.contains(">105 B<"), "size not humanized: {html}");
 
-        // Modified: full raw timestamp preserved in the datetime attribute...
+        // Modified: the instant in the datetime attribute...
         assert!(
-            html.contains(r#"datetime="2026-07-11T19:13:45.123456789+00:00""#),
-            "datetime attr must keep the full timestamp: {html}"
+            html.contains(r#"datetime="2026-07-11T19:13:45.123Z""#),
+            "datetime attr must carry the instant to the millisecond: {html}"
         );
         // ...while the visible text is the humanized form, not the raw string.
         assert!(

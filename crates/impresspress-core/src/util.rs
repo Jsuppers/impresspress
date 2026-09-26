@@ -396,8 +396,8 @@ pub fn format_count(count: i64) -> String {
 /// (UTC, minute precision) instead of the raw nanosecond-resolution string
 /// [`now_rfc3339`] produces. Returns the input unchanged when it doesn't
 /// parse, so a malformed stored value degrades to what we have rather than
-/// hiding the row's timestamp — callers keep the full raw value in the
-/// machine-readable `<time datetime=...>` attribute either way.
+/// hiding the row's timestamp. `ui::components::timestamp` pairs this text
+/// with the machine-readable instant in a `<time datetime=...>`.
 pub fn format_timestamp(rfc3339: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(rfc3339) {
         Ok(dt) => dt
