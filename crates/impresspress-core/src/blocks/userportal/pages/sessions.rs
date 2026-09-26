@@ -18,7 +18,7 @@ use crate::{
     crypto::META_AUTH_FAMILY,
     http::{redirect, ResponseBuilder},
     ui::{
-        components::{badge, BadgeVariant},
+        components::{self, badge, BadgeVariant},
         SiteConfig,
     },
 };
@@ -93,14 +93,14 @@ fn render_table(rows: &[sessions::SessionRow], current_family: Option<&str>) -> 
                         // suite masks `time` so per-run session times don't
                         // make the screenshots unreproducible.
                         td data-label="Started" {
-                            time datetime=(r.created_at) { (r.created_at) }
+                            (components::timestamp(&r.created_at))
                             @if is_current {
                                 " "
                                 (badge(BadgeVariant::Success, "Current session"))
                             }
                         }
-                        td data-label="Last used" { time datetime=(r.last_used_at) { (r.last_used_at) } }
-                        td data-label="Expires" { time datetime=(r.expires_at) { (r.expires_at) } }
+                        td data-label="Last used" { (components::timestamp(&r.last_used_at)) }
+                        td data-label="Expires" { (components::timestamp(&r.expires_at)) }
                         td data-label="" {
                             button .btn .btn--ghost .btn--sm
                                 hx-delete=(format!("/b/userportal/sessions/{}", r.family))

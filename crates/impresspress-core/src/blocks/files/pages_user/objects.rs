@@ -6,8 +6,8 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::files::repo,
-    ui::{self, icons, shell::Crumb, templates::list_page},
-    util::{format_bytes, format_timestamp, url_path_encode},
+    ui::{self, components, icons, shell::Crumb, templates::list_page},
+    util::{format_bytes, url_path_encode},
 };
 
 /// Object as the user sees it (key, size, modified timestamp).
@@ -143,12 +143,7 @@ pub fn render_objects_table(
                             a href=(download_href) { (filename) }
                         }
                         td data-label="Size" { (format_bytes(f.size)) }
-                        // Wrap the timestamp in <time> so the visual-baseline
-                        // mask `[data-relative-time], .relative-time, time`
-                        // catches it. The visible text is humanized to
-                        // minute precision; the `datetime` attr keeps the
-                        // full raw timestamp as the machine-readable form.
-                        td data-label="Modified" { time datetime=(f.modified) { (format_timestamp(&f.modified)) } }
+                        td data-label="Modified" { (components::timestamp(&f.modified)) }
                         td {
                             button .kebab-trigger
                                 type="button"

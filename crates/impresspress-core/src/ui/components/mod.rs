@@ -13,6 +13,7 @@ mod modal;
 mod pagination;
 mod stat;
 mod table;
+mod time;
 
 pub use auth::{alert, auth_panel, oauth_button, AlertVariant};
 pub use avatar::{avatar, CtrlSize};
@@ -26,3 +27,4 @@ pub use modal::modal;
 pub use pagination::pagination;
 pub use stat::stat_card;
 pub use table::{breakable_id, data_table, DataTable, TableCol, TableRow};
+pub use time::timestamp;
