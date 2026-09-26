@@ -4819,7 +4819,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "reports its name as 'test/other'")]
+    #[should_panic(
+        expected = "the runtime refuses to register test/declared: block registered as \
+                    'test/declared' reports its name as 'test/other'"
+    )]
     async fn a_block_reporting_another_name_is_not_registered() {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
@@ -4834,7 +4837,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "the runtime refuses to register test/declared")]
+    #[should_panic(
+        expected = "the runtime refuses to register test/declared: block 'test/declared' \
+                    declares reserved config key"
+        // The key itself is `RESERVED_PROBE_KEY`, which an attribute cannot
+        // name; the variant's own wording is what distinguishes this refusal.
+    )]
     async fn a_block_declaring_a_reserved_config_key_is_not_registered() {
         let mut ctx = TestContext::new().await;
         ctx.register_block(
@@ -4852,7 +4860,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "the runtime refuses to register test/declared")]
+    #[should_panic(
+        expected = "the runtime refuses to register test/declared: block 'test/declared' \
+                    declares config var 'OTHER__BLOCK__KEY', which is outside its own prefix \
+                    'TEST__DECLARED__'"
+    )]
     async fn a_declared_only_block_is_admitted_the_same_way() {
         let mut ctx = TestContext::new().await;
         ctx.register_block_info(
