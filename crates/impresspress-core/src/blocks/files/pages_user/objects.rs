@@ -6,8 +6,8 @@ use wafer_run::{context::Context, Message, OutputStream};
 
 use crate::{
     blocks::files::repo,
-    ui::{self, icons, shell::Crumb, templates::list_page},
-    util::{format_bytes, format_timestamp, url_path_encode},
+    ui::{self, components, icons, shell::Crumb, templates::list_page},
+    util::{format_bytes, url_path_encode},
 };
 
 /// Object as the user sees it (key, size, modified timestamp).
@@ -143,12 +143,7 @@ pub fn render_objects_table(
                             a href=(download_href) { (filename) }
                         }
                         td data-label="Size" { (format_bytes(f.size)) }
-                        // Wrap the timestamp in <time> so the visual-baseline
-                        // mask `[data-relative-time], .relative-time, time`
-                        // catches it. The visible text is humanized to
-                        // minute precision; the `datetime` attr keeps the
-                        // full raw timestamp as the machine-readable form.
-                        td data-label="Modified" { time datetime=(f.modified) { (format_timestamp(&f.modified)) } }
+                        td data-label="Modified" { (components::timestamp(&f.modified)) }
                         td {
                             button .kebab-trigger
                                 type="button"
@@ -471,7 +466,8 @@ mod tests {
 
     /// SIZE renders via `format_bytes` (not the raw byte count) and the
     /// MODIFIED cell's visible text is humanized while the `<time>` element's
-    /// `datetime` attribute keeps the full raw timestamp.
+    /// `datetime` attribute carries the instant as a valid HTML date-time
+    /// (UTC, milliseconds — HTML allows at most three fraction digits).
     #[test]
     fn render_objects_table_humanizes_size_and_modified() {
         let f1 = ObjectRow {
@@ -488,10 +484,10 @@ mod tests {
         // Size: humanized, not the bare number cell.
         assert!(html.contains(">105 B<"), "size not humanized: {html}");
 
-        // Modified: full raw timestamp preserved in the datetime attribute...
+        // Modified: the instant in the datetime attribute...
         assert!(
-            html.contains(r#"datetime="2026-07-11T19:13:45.123456789+00:00""#),
-            "datetime attr must keep the full timestamp: {html}"
+            html.contains(r#"datetime="2026-07-11T19:13:45.123Z""#),
+            "datetime attr must carry the instant to the millisecond: {html}"
         );
         // ...while the visible text is the humanized form, not the raw string.
         assert!(

@@ -9,7 +9,7 @@ use crate::{
     db_read::CappedList,
     ui::{
         self,
-        components::{button, BtnVariant, CtrlSize},
+        components::{self, button, BtnVariant, CtrlSize},
         shell::Crumb,
         templates::list_page,
     },
@@ -69,7 +69,7 @@ pub fn render_buckets_table(rows: &[BucketRow]) -> Markup {
                                 span .badge { "Private" }
                             }
                         }
-                        td data-label="Created" { time datetime=(r.created_at) { (r.created_at) } }
+                        td data-label="Created" { (components::timestamp(&r.created_at)) }
                         td data-label="Objects" { (r.object_count) }
                     }
                 }
@@ -255,7 +255,7 @@ mod tests {
     fn render_buckets_table_renders_the_created_timestamp_as_a_time_element() {
         let html = render_buckets_table(&[sample("photos", false, 0)]).into_string();
         assert!(
-            html.contains(r#"<time datetime="2026-05-06T10:00:00Z">2026-05-06T10:00:00Z</time>"#),
+            html.contains(r#"<time datetime="2026-05-06T10:00:00.000Z">2026-05-06 10:00</time>"#),
             "{html}"
         );
     }
