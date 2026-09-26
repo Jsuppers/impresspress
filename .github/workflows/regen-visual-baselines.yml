@@ -137,11 +137,13 @@ jobs:
         env:
           TEST_PORT: 8093
         # The same package script CI's `e2e-visual` job runs, so the same specs
-        # run in the same order against the same database. It is not enough to
-        # run visual-baseline.spec.ts alone: delegated-actions.spec.ts sorts
-        # first and makes requests of its own, and the admin database and
-        # network pages show counts of those requests, so a baseline rendered
-        # without it never matches CI's render.
+        # run in the same order against the same database. The specs share
+        # that database, so whatever an earlier spec leaves behind reaches a
+        # later capture unless the suite masks it; running visual-baseline.spec.ts
+        # alone would render baselines from a database CI never sees. The
+        # counts that follow the suite's own traffic (request-log figures on
+        # the admin dashboard, database and network pages) are masked or
+        # seeded in the spec — see `volatileMasks` there.
         #
         # `--update-snapshots` overwrites mismatched PNGs in place.
         # Test step succeeds even if snapshots changed; we detect via git diff below.
