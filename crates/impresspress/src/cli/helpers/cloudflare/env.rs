@@ -250,19 +250,28 @@ fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) ->
 }
 
 /// Resolve `[cloudflare].d1_queries_per_invocation`: the stated limit, or
-/// Workers Paid's when unset. A Free-plan deploy that leaves it unset runs
-/// with a budget D1 does not honour, so the value is checked here, where a
-/// mistake fails the build rather than every request of the deployed Worker
-/// (which refuses the same values with the same rule).
+/// Workers Paid's when unset. Checked here, where a mistake fails the build
+/// rather than the deployed Worker: 0 is refused with the rule the Worker
+/// applies, and so is a value above D1's documented maximum of 1000 queries
+/// per invocation (<https://developers.cloudflare.com/d1/platform/limits/>) —
+/// the budget would admit writes D1 then refuses part-way.
 fn resolve_d1_queries_per_invocation(toml_val: Option<u64>) -> Result<u64> {
     use impresspress_core::config_vars::{
         parse_d1_queries_per_invocation, D1_QUERIES_PER_INVOCATION_DEFAULT,
+        D1_QUERIES_PER_INVOCATION_MAX,
     };
-    match toml_val {
-        None => Ok(D1_QUERIES_PER_INVOCATION_DEFAULT),
-        Some(limit) => parse_d1_queries_per_invocation(&limit.to_string())
-            .map_err(|e| anyhow!("cloudflare.d1_queries_per_invocation = {limit}: {e}")),
+    let Some(limit) = toml_val else {
+        return Ok(D1_QUERIES_PER_INVOCATION_DEFAULT);
+    };
+    if limit > D1_QUERIES_PER_INVOCATION_MAX {
+        bail!(
+            "cloudflare.d1_queries_per_invocation = {limit} is above D1's maximum of \
+             {D1_QUERIES_PER_INVOCATION_MAX} queries per Worker invocation (Workers Paid); \
+             Workers Free allows 50"
+        );
     }
+    parse_d1_queries_per_invocation(&limit.to_string())
+        .map_err(|e| anyhow!("cloudflare.d1_queries_per_invocation = {limit}: {e}"))
 }
 
 /// Resolve `[cloudflare].crons`: an explicit list (empty included, which

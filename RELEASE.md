@@ -78,6 +78,14 @@ and signs every user out, once.
   `1000` (Workers Paid). A value that is not a whole number of at least 1
   fails every request with an error naming the var. That 429 means the
   request did too much: retrying it does the same work and is refused again.
+- Of that limit, each request holds 4 queries back for its own
+  `request_logs` row, written after the response, so the row is written
+  however much of the budget the request spent: a request's handlers can run
+  46 of Free's 50, 996 of Paid's 1000. The row, and any mail a request sends
+  after its response, run under that request's own budget. Before, a
+  request wrote the rows and ran the deferred mail of whichever concurrent
+  requests had finished before it, charged to its own budget, and lost them
+  when that budget was spent.
 - Native SQLite and Postgres have no such limit, and now take a
   `create_many` or `batch` of any size (the old fixed cap of 1000 is gone).
 - A dev-sandbox data import (`seed/data.json`) is one transaction: an import
@@ -104,11 +112,13 @@ or the budget will admit writes D1 then refuses part-way. The generated
 `wrangler.toml` writes it into `[vars]` as
 `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` (`"1000"` when unset); a value set
 through a `wrangler_overrides_path` file still wins, since overrides are
-merged over the generated config. The budget counts D1 queries only: KV and
-R2 operations are Workers subrequests, counted against Cloudflare's
-subrequest limits (50 per invocation on Free) and not by the budget, so a
-Free-plan request can still meet a Cloudflare limit before the budget
-refuses it. A user
+merged over the generated config. A value above 1000, D1's maximum, fails
+the build. The budget counts D1 queries only, which Cloudflare limits per
+invocation on their own (50 Free, 1,000 Paid). KV and R2 operations are
+subrequests to internal services, a separate limit (1,000 per invocation on
+Free) that the budget neither counts nor spends
+(<https://developers.cloudflare.com/d1/platform/limits/>,
+<https://developers.cloudflare.com/workers/platform/limits/#subrequests>). A user
 whose password hash was imported from another system at more than 46 MiB:
 reset the password. Nobody else.
 

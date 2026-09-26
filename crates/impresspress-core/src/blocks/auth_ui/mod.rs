@@ -907,7 +907,7 @@ mod outbound_mail_wiring_tests {
         let mut bodies = Vec::new();
         // The send runs after each response; run it, as the platform would,
         // before the next request.
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         for _ in 0..budget + 1 {
             let mut msg = anon_msg("create", "/b/auth/api/forgot-password");
             msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.9");

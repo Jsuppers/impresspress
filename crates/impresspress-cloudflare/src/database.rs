@@ -35,24 +35,28 @@
 //! count against the limit, and `wafer-core` admits every `create_many` and
 //! `batch` against it — in the database handler before the service runs, and
 //! again before the transaction's first statement — so a write the invocation
-//! cannot finish is refused whole instead of failing part-way inside D1.
+//! cannot finish is refused whole instead of failing part-way inside D1. Every
+//! primitive also refuses, before sending, a statement past the reported
+//! limit.
 //!
 //! The counter is the invocation's, not the isolate's: one isolate interleaves
 //! concurrent requests, and each has its own D1 limit. So it is never a
 //! thread-local.
 //!
-//! The budget counts D1 statements and nothing else. Workers KV and R2
-//! operations are not D1 queries: they are Workers subrequests, which
-//! Cloudflare counts against the Workers subrequest limits ("A subrequest is
-//! any request a Worker makes using the Fetch API or to Cloudflare services
-//! like R2, KV, or D1"; 50 subrequests per invocation on Workers Free, 1,000
-//! of them to internal services, and 10,000 by default on Paid — Workers
-//! limits page, "Subrequests"). D1's own limits page points its
-//! queries-per-invocation row at those subrequest limits without saying how
-//! the two combine. So on the Free plan the budget's 50 is an upper bound, not
-//! a guarantee: a request that also reads KV or R2 can reach a Cloudflare
-//! limit before the budget refuses anything, and that refusal comes from the
-//! platform part-way through the request, not from the budget up front.
+//! A request's own services report D1's limit less the statements its
+//! [`D1QueryCount`] holds back for the request's audit row
+//! (`impresspress_core::after_response::AUDIT_ROW_STATEMENTS`); the row is
+//! written afterwards through a [`D1QueryCount::released`] handle that may use
+//! them, so it fits however the request spent its budget.
+//!
+//! The budget counts D1 queries and nothing else. Cloudflare limits D1 queries
+//! per Worker invocation on their own: 50 on Workers Free, 1,000 on Paid (D1's
+//! limits page, "Queries per Worker invocation"). Workers KV and R2 operations
+//! are not D1 queries. The Workers limits page lists them as subrequests to
+//! Cloudflare services, and gives two rows: "Subrequests per invocation" (50
+//! on Free, 10,000 by default on Paid) and "Subrequests to internal services"
+//! (1,000 on Free, the configured limit on Paid) — the row for KV, R2 and D1.
+//! None of those is counted here.
 //!
 //! Sources: <https://developers.cloudflare.com/d1/platform/limits/>,
 //! <https://developers.cloudflare.com/workers/platform/limits/#subrequests>.
@@ -122,7 +126,7 @@
 //!   table-exists probe for a table with no key).
 //!
 //!   Seeding at construction is what covers the D1 services that never reach
-//!   an `Init`: the request-log drain's batch handle, built per request inside
+//!   an `Init`: the audit-row write's handle, built per request inside
 //!   `run_with_config` and used from `ctx.wait_until`, and the handle
 //!   `build_runtime` reads `block_settings` through before a runtime exists.
 //!   Neither is ever handed to `set_strict_schema`, so without the seeding a
@@ -131,7 +135,7 @@
 //!
 //! The cache is the **isolate's**, not the service's ([`isolate_schema_cache`]),
 //! and that is what makes the memoization worth anything: every D1 service is
-//! built per request (`warm_request_services`, the request-log drain handle,
+//! built per request (`warm_request_services`, the audit-row write handle,
 //! `build_runtime`'s pre-`Init` `block_settings` read), and every request runs
 //! `D1ConfigSource::snapshot`, a paged `list` over the variables table. A
 //! per-service cache would be cold for each of them, so each request would pay
@@ -221,31 +225,57 @@ pub(crate) fn forget_isolate_schema() {
 }
 
 /// The D1 statements one Worker invocation has sent, shared by every
-/// [`D1DatabaseService`] built in that invocation (see the module docs).
+/// [`D1DatabaseService`] built in that invocation (see the module docs), and
+/// how many of the invocation's statements the services built from this
+/// handle must leave unused.
 ///
 /// Create one at the Worker entry, once per `fetch` or `scheduled`
 /// invocation, and hand a clone to each service built while serving it: the
-/// request's own services, the runtime build's pre-`Init` handle, the
-/// write of the request's audit rows run from `ctx.wait_until`. They all count against the
-/// one D1 limit. Never keep one past its invocation or share it between two:
-/// an isolate interleaves concurrent requests, and each has its own limit.
+/// request's own services, the runtime build's pre-`Init` handle, the write
+/// of the request's audit row run from `ctx.wait_until`. They all count
+/// against the one D1 limit. Never keep one past its invocation or share it
+/// between two: an isolate interleaves concurrent requests, and each has its
+/// own limit.
+///
+/// [`holding_back`](Self::holding_back) reserves statements for work that
+/// must fit however the request spends its budget (its audit row), and
+/// [`released`](Self::released) is the handle that work is written with.
 #[derive(Clone, Default)]
-pub struct D1QueryCount(Rc<Cell<u64>>);
+pub struct D1QueryCount {
+    sent: Rc<Cell<u64>>,
+    held_back: u64,
+}
 
 impl D1QueryCount {
-    /// A fresh count for a new invocation.
+    /// A fresh count for a new invocation, holding nothing back.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Statements sent in this invocation so far.
+    /// This invocation's count, for services that must leave `statements` of
+    /// the invocation's limit unused: they report a limit that much lower
+    /// and refuse any statement past it.
+    pub fn holding_back(&self, statements: u64) -> Self {
+        Self {
+            sent: Rc::clone(&self.sent),
+            held_back: statements,
+        }
+    }
+
+    /// This invocation's count with nothing held back: the handle for the
+    /// work the held-back statements are reserved for.
+    pub fn released(&self) -> Self {
+        self.holding_back(0)
+    }
+
+    /// Statements sent in this invocation so far, through every handle.
     pub fn sent(&self) -> u64 {
-        self.0.get()
+        self.sent.get()
     }
 
     fn add(&self, statements: usize) {
         let statements = u64::try_from(statements).unwrap_or(u64::MAX);
-        self.0.set(self.0.get().saturating_add(statements));
+        self.sent.set(self.sent.get().saturating_add(statements));
     }
 }
 
@@ -279,7 +309,7 @@ impl D1DatabaseService {
     ///
     /// `strict_schema` is a parameter rather than a `false` default a caller
     /// may later overwrite because not every D1 service reaches a lifecycle
-    /// `Init`: the request-log drain handle and `build_runtime`'s pre-`Init`
+    /// `Init`: the audit-row write handle and `build_runtime`'s pre-`Init`
     /// `block_settings` read are both constructed outside any runtime, and a
     /// default would silently put them on the always-introspect path. Callers
     /// get the verdict from
@@ -311,6 +341,18 @@ impl D1DatabaseService {
             queries,
             query_limit,
         }
+    }
+
+    /// Count `statements` about to be sent, or refuse them — before they
+    /// reach D1 — when they would take the invocation past the limit this
+    /// service reports: D1's own limit less what its [`D1QueryCount`] holds
+    /// back. Refusing single statements too, not only the multi-statement
+    /// writes `wafer-core` admits, is what keeps held-back statements free
+    /// for the work they are reserved for.
+    fn send(&self, statements: usize) -> Result<(), DatabaseError> {
+        DbExec::statement_budget(self)?.admit(statements, "this statement")?;
+        self.queries.add(statements);
+        Ok(())
     }
 
     /// Bind `params` (the JSON form produced by `sea_values_to_json`) to a
@@ -394,7 +436,7 @@ impl DbExec for D1DatabaseService {
     /// sent through every D1 service sharing its [`D1QueryCount`].
     fn statement_budget(&self) -> Result<StatementBudget, DatabaseError> {
         Ok(StatementBudget::Limited {
-            limit: self.query_limit,
+            limit: self.query_limit.saturating_sub(self.queries.held_back),
             used: self.queries.sent(),
         })
     }
@@ -406,7 +448,7 @@ impl DbExec for D1DatabaseService {
         json: &JsonColumns,
     ) -> Result<Vec<Record>, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
-        self.queries.add(1);
+        self.send(1)?;
         let results = stmt.all().await.map_err(db_err)?;
         let rows: Vec<serde_json::Value> = results.results().map_err(db_err)?;
         Ok(rows
@@ -422,7 +464,7 @@ impl DbExec for D1DatabaseService {
         json: &JsonColumns,
     ) -> Result<Record, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
-        self.queries.add(1);
+        self.send(1)?;
         let row = match stmt.first::<serde_json::Value>(None).await {
             Ok(row) => row,
             // A `get`-by-id against a not-yet-created table is "not found",
@@ -440,7 +482,7 @@ impl DbExec for D1DatabaseService {
         params: &[serde_json::Value],
     ) -> Result<i64, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
-        self.queries.add(1);
+        self.send(1)?;
         let result = stmt.run().await.map_err(db_err)?;
         changes(&result)
     }
@@ -477,7 +519,7 @@ impl DbExec for D1DatabaseService {
         params: &[serde_json::Value],
     ) -> Result<i64, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
-        self.queries.add(1);
+        self.send(1)?;
         let row = stmt
             .first::<serde_json::Value>(None)
             .await
@@ -491,7 +533,7 @@ impl DbExec for D1DatabaseService {
         params: &[serde_json::Value],
     ) -> Result<f64, DatabaseError> {
         let stmt = self.prepare_bind(sql, params)?;
-        self.queries.add(1);
+        self.send(1)?;
         let row = stmt
             .first::<serde_json::Value>(None)
             .await
@@ -561,7 +603,7 @@ impl DbExec for D1DatabaseService {
             let (sql, params) = op.sql_params();
             statements.push(self.prepare_bind(sql, params)?);
         }
-        self.queries.add(statements.len());
+        self.send(statements.len())?;
         let results = self.db.batch(statements).await.map_err(db_err)?;
 
         // D1 returns exactly one result per submitted statement, in order. A
@@ -632,7 +674,7 @@ impl DbExec for D1DatabaseService {
             let (sql, params) = op.sql_params();
             statements.push(self.prepare_bind(sql, params)?);
         }
-        self.queries.add(statements.len());
+        self.send(statements.len())?;
         let results = self.db.batch(statements).await.map_err(db_err)?;
         if results.len() != ops.len() {
             return Err(DatabaseError::Internal(format!(
@@ -1272,7 +1314,7 @@ mod tests {
     /// The verdict a D1 service is *born* with is the one the executor reads.
     ///
     /// This is what covers the two services that never reach a lifecycle
-    /// `Init` — the request-log drain handle in `run_with_config` and
+    /// `Init` — the audit-row write handle in `run_with_config` and
     /// `build_runtime`'s pre-`Init` `block_settings` read. Both are built and
     /// dropped inside one request, so `set_strict_schema` is never called on
     /// them and their `SchemaCache` never warms: with strict off,
@@ -1843,6 +1885,65 @@ mod tests {
             .await
             .expect("a fresh invocation has room");
         assert_eq!(batches.borrow().len(), 1);
+    }
+
+    /// **The audit row always fits.** A request's own services leave the
+    /// statements held back for its audit row unused — every statement past
+    /// D1's limit less the hold-back is refused before it reaches D1, not only
+    /// multi-statement writes — so however the request spends its budget, the
+    /// released handle still writes the row, from a cold schema cache, within
+    /// [`AUDIT_ROW_STATEMENTS`] statements. Under STRICT_SCHEMA, which every
+    /// generated config sets: this fake D1 answers every column list empty,
+    /// so without it the lazy column-add would `ALTER` in each column a
+    /// migrated table already has.
+    ///
+    /// [`AUDIT_ROW_STATEMENTS`]: impresspress_core::after_response::AUDIT_ROW_STATEMENTS
+    #[wasm_bindgen_test]
+    async fn a_request_that_spends_its_budget_still_has_room_for_its_audit_row() {
+        use impresspress_core::after_response::AUDIT_ROW_STATEMENTS;
+        const LIMIT: u64 = 10;
+        let strict_schema = true;
+        let batches = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let queries = D1QueryCount::new();
+        forget_isolate_schema();
+        let request = D1DatabaseService::new(
+            batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
+            strict_schema,
+            "DB",
+            queries.holding_back(AUDIT_ROW_STATEMENTS),
+            LIMIT,
+        );
+        let mut ran = 0;
+        let refusal = loop {
+            match DatabaseService::query_raw(&request, "SELECT 1", &[]).await {
+                Ok(_) => ran += 1,
+                Err(err) => break err,
+            }
+            assert!(ran <= LIMIT, "the request was never refused");
+        };
+        assert_eq!(ran, LIMIT - AUDIT_ROW_STATEMENTS);
+        assert!(
+            matches!(refusal, DatabaseError::ResourceExhausted(_)),
+            "{refusal:?}"
+        );
+        assert_eq!(queries.sent(), ran, "the refused statement was not sent");
+
+        let audit = D1DatabaseService::new(
+            batching_d1(BatchAnswer::Succeed, Rc::clone(&batches)),
+            strict_schema,
+            "DB",
+            queries.released(),
+            LIMIT,
+        );
+        DatabaseService::create_many(&audit, "request_logs", rows(1))
+            .await
+            .unwrap_or_else(|e| panic!("strict={strict_schema}: the row fits: {e:?}"));
+        assert!(
+            queries.sent() - ran <= AUDIT_ROW_STATEMENTS,
+            "strict={strict_schema}: the row took {} statements",
+            queries.sent() - ran
+        );
+        assert_eq!(batches.borrow().len(), 1, "the row reached D1");
     }
 
     /// **Two requests interleaved in one isolate count separately.** Each

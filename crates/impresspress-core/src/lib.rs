@@ -50,6 +50,7 @@
     )
 )]
 
+pub mod after_response;
 pub mod blocks;
 pub mod builder;
 pub mod cache;
@@ -80,7 +81,6 @@ pub mod pipeline;
 pub mod platform_state;
 pub mod prepared_plan;
 pub mod release_inventory;
-pub mod request_log_queue;
 pub mod routing;
 pub mod secret_tables;
 pub mod sqlite_text_error;

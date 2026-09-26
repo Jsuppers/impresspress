@@ -367,7 +367,7 @@ impl CfEnvironment {
     /// calling [`DatabaseService::set_strict_schema`] at `Init`, from the
     /// database block's `Init` config — only ever reaches the one service a
     /// *Wafer runtime* was built around. Two D1 services are built outside
-    /// any runtime and so are never reached by it: the request-log drain's
+    /// any runtime and so are never reached by it: the audit-row write's
     /// batch handle in
     /// `run_with_config` (constructed per request, used inside
     /// `ctx.wait_until`) and the handle `build_runtime` reads
@@ -897,7 +897,7 @@ mod tests {
     /// the one `wafer-core` would reach from the same string, because
     /// `handle_lifecycle` re-applies the var from the database block's `Init`
     /// config on the runtime's own service. If the two readings disagreed,
-    /// that service and the request-log drain's handle would run in different
+    /// that service and the audit-row write's handle would run in different
     /// modes off one var.
     ///
     /// `"yes"` and `"on"` are the rows that matter: they are true for

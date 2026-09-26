@@ -1003,15 +1003,14 @@ async fn write_request_log(
         },
         None => row,
     };
-    // Queued when the platform runs this request inside
-    // `request_log_queue::queue_request_logs` (Cloudflare: the write happens
-    // after the response, under this request's own D1 budget); inserted here
-    // otherwise.
-    let queued = crate::request_log_queue::QueuedRequestLog {
+    // Queued when the platform runs this request inside an
+    // `after_response::scope` (Cloudflare: the row is written after the
+    // response, from room held back for it); inserted here otherwise.
+    let queued = crate::after_response::QueuedRequestLog {
         table: request_logs::TABLE,
         data: row.to_data(),
     };
-    if crate::request_log_queue::enqueue(queued).is_err() {
+    if crate::after_response::queue_audit_row(queued).is_err() {
         // Best-effort: don't fail the request if logging fails — but say
         // so. The row being optional is the deliberate part; the silence
         // was not, and a deployment whose audit log has quietly stopped
@@ -2986,36 +2985,32 @@ mod streaming_audit_tests {
     }
 
     /// Two requests interleaved in one isolate, each run inside its own
-    /// request-log queue (as the Cloudflare adapter runs every dispatch): each
-    /// request's audit row lands in its own queue — to be written later under
-    /// its own invocation's D1 budget — and none is inserted inline.
+    /// `after_response` scope (as the Cloudflare adapter runs every
+    /// dispatch): each request's audit row lands in its own scope — to be
+    /// written later from the room its own invocation held back — and none
+    /// is inserted inline.
     #[tokio::test]
-    async fn interleaved_requests_queue_their_audit_rows_in_their_own_queues() {
-        use crate::request_log_queue::{queue_request_logs, RequestLogQueue};
+    async fn interleaved_requests_queue_their_audit_rows_in_their_own_scopes() {
+        use crate::after_response::{scope, AfterResponse};
 
         let mut ctx = TestContext::with_admin().await;
         ctx.register_block("test/yield", Arc::new(YieldingBlock));
         let routes = route("/x/", "test/yield");
-        let queue_a = RequestLogQueue::new();
-        let queue_b = RequestLogQueue::new();
+        let after_a = AfterResponse::new();
+        let after_b = AfterResponse::new();
 
         tokio::join!(
-            queue_request_logs(std::rc::Rc::clone(&queue_a), drive(&ctx, "/x/a", &routes)),
-            queue_request_logs(std::rc::Rc::clone(&queue_b), drive(&ctx, "/x/b", &routes)),
+            scope(std::rc::Rc::clone(&after_a), drive(&ctx, "/x/a", &routes)),
+            scope(std::rc::Rc::clone(&after_b), drive(&ctx, "/x/b", &routes)),
         );
 
-        let paths = |queue: &RequestLogQueue| {
-            queue
-                .take()
-                .into_iter()
-                .map(|row| {
-                    assert_eq!(row.table, request_logs::TABLE);
-                    row.data["path"].as_str().unwrap().to_string()
-                })
-                .collect::<Vec<_>>()
+        let path = |after: &AfterResponse| {
+            let row = after.take_audit_row().expect("the request queued its row");
+            assert_eq!(row.table, request_logs::TABLE);
+            row.data["path"].as_str().unwrap().to_string()
         };
-        assert_eq!(paths(&queue_a), ["/x/a"]);
-        assert_eq!(paths(&queue_b), ["/x/b"]);
+        assert_eq!(path(&after_a), "/x/a");
+        assert_eq!(path(&after_b), "/x/b");
         assert_eq!(
             request_log_count(&ctx).await,
             0,

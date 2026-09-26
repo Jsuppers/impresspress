@@ -805,7 +805,7 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
         "request_logs",
         &[
             // the queued audit row carries the table name for
-            // `request_log_queue::persist` (`create_many`) to write off the
+            // `after_response::persist_audit_row` (`create_many`) to write off the
             // response path; the inline path calls `request_logs::insert`
             "pipeline.rs",
             "blocks/admin/mod.rs",

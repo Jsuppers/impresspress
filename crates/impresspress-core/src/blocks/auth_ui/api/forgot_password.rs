@@ -257,7 +257,7 @@ mod tests {
         );
         with_known_user(&ctx).await;
         let ctx = CallLog::new(ctx);
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
 
         let unregistered = on_the_wire(&ctx, "nobody@example.com").await;
         let unregistered_calls = ctx.take();
@@ -319,7 +319,7 @@ mod tests {
             "precondition: the account has no password"
         );
 
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         on_the_wire(&ctx, "known@example.com").await;
         super::super::run_deferred().await;
         let token = inbox

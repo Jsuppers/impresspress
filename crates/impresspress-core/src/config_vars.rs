@@ -36,6 +36,11 @@ pub const D1_QUERIES_PER_INVOCATION_KEY: &str = "IMPRESSPRESS_D1_QUERIES_PER_INV
 /// not state [`D1_QUERIES_PER_INVOCATION_KEY`] runs under.
 pub const D1_QUERIES_PER_INVOCATION_DEFAULT: u64 = 1000;
 
+/// The most queries D1 runs per Worker invocation on any plan (Workers
+/// Paid's limit): a stated [`D1_QUERIES_PER_INVOCATION_KEY`] above it would
+/// have the budget admit writes D1 then refuses part-way.
+pub const D1_QUERIES_PER_INVOCATION_MAX: u64 = 1000;
+
 /// Parse a [`D1_QUERIES_PER_INVOCATION_KEY`] value: a whole number of at least
 /// 1, surrounding whitespace ignored. The error names the var and both plans'
 /// limits, so the CLI and the worker refuse a mistyped value with the same

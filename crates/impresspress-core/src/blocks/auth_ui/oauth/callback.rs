@@ -1435,7 +1435,7 @@ mod security_regression_tests {
         let (signup_limiter, signup_msg) = crate::blocks::auth_ui::api::test_mail_request();
         // Signup mails its verification link after the response; run it, as
         // the platform would, so the link is in the mail log.
-        crate::deferred::set_mode(crate::deferred::DeferMode::Queued);
+        crate::deferred::queue_for_test();
         let out = crate::blocks::auth_ui::api::signup::handle(
             &signup_limiter,
             ctx,

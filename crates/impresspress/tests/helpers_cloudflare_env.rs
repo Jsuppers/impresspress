@@ -385,11 +385,11 @@ fn release_assets_exclude_globs_are_compiled_and_kept() {
 }
 
 /// `[cloudflare].d1_queries_per_invocation` is the plan's D1 query limit:
-/// unset is Workers Paid's 1000, a stated number is taken as it is, and 0 —
-/// which no plan has, and which the Worker would refuse on every request — is
-/// refused here instead.
+/// unset is Workers Paid's 1000, a stated number up to 1000 is taken as it
+/// is, and 0 — which the Worker would refuse on every request — or anything
+/// above D1's documented maximum of 1000 is refused here instead.
 #[test]
-fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_zero() {
+fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_out_of_range() {
     let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
     assert_eq!(cfg.d1_queries_per_invocation, 1000);
 
@@ -412,5 +412,27 @@ fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_zero() {
         err.contains("cloudflare.d1_queries_per_invocation")
             && err.contains("IMPRESSPRESS_D1_QUERIES_PER_INVOCATION"),
         "{err}"
+    );
+
+    let over = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"\n",
+        "compatibility_date = \"2026-05-01\"\nd1_queries_per_invocation = 1001\n",
+    );
+    let err = parse_str(&over)
+        .resolve(fake_env(&[]))
+        .expect_err("D1 runs at most 1000 queries per invocation")
+        .to_string();
+    assert!(err.contains("above D1's maximum of 1000"), "{err}");
+
+    let max = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"\n",
+        "compatibility_date = \"2026-05-01\"\nd1_queries_per_invocation = 1000\n",
+    );
+    assert_eq!(
+        parse_str(&max)
+            .resolve(fake_env(&[]))
+            .unwrap()
+            .d1_queries_per_invocation,
+        1000
     );
 }
