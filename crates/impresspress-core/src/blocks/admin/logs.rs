@@ -106,6 +106,62 @@ mod tests {
     use super::*;
     use crate::test_support::{admin_msg, output_json, TestContext};
 
+    /// Every block the admin block grants an append on the audit trail
+    /// writes its row there, running as itself. `audit_log` only logs a
+    /// refused write, so a dropped or mistyped grant would leave the action
+    /// unaudited behind a green response; the row is what is asserted.
+    ///
+    /// The grantees come off `AdminBlock::info()`, so a grant added there is
+    /// covered here without editing this test, and one removed fails it.
+    #[tokio::test]
+    async fn every_block_granted_an_audit_append_lands_its_row() {
+        let grantees: Vec<String> =
+            wafer_run::Block::info(&crate::blocks::admin::AdminBlock::new())
+                .grants
+                .into_iter()
+                .filter(|g| {
+                    g.resource == AUDIT_LOGS_TABLE && g.write == wafer_block::GrantWrite::Append
+                })
+                .map(|g| g.grantee)
+                .collect();
+        assert!(
+            grantees.len() >= 4,
+            "userportal, products, legalpages and auth-ui append: {grantees:?}"
+        );
+
+        let ctx = TestContext::with_admin().await;
+        for grantee in &grantees {
+            let action = format!("probe.{grantee}");
+            audit_log(
+                &ctx.clone().running_as(grantee),
+                "user-1",
+                &action,
+                "probe",
+                "",
+            )
+            .await;
+            assert_eq!(
+                crate::test_support::audit_count(&ctx, &action).await,
+                1,
+                "{grantee}'s audit row must land"
+            );
+        }
+
+        // The control: a block with no append grant writes nothing.
+        audit_log(
+            &ctx.clone().running_as("test/ungranted"),
+            "user-1",
+            "probe.ungranted",
+            "probe",
+            "",
+        )
+        .await;
+        assert_eq!(
+            crate::test_support::audit_count(&ctx, "probe.ungranted").await,
+            0
+        );
+    }
+
     /// The audit-log list publishes exactly `AdminAuditLogView`'s fields, and
     /// the `{records, total_count, page, page_size}` envelope the untyped
     /// `RecordList` response already had.

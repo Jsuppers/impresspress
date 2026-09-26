@@ -980,9 +980,13 @@ mod tests {
         .await
         .expect("the admin write lands in the table");
 
-        let site = crate::ui::SiteConfig::load_for_auth(&ctx)
-            .await
-            .expect("site config");
+        // Read as auth-ui, the block whose pages build their chrome from it.
+        let site = crate::ui::SiteConfig::load_for_auth(
+            &ctx.clone()
+                .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID),
+        )
+        .await
+        .expect("site config");
         assert_eq!(
             site.primary_color, saved,
             "the auth pages must render the brand colour an admin saved, not \
@@ -1001,9 +1005,10 @@ mod tests {
     /// the compiled-in default — the exact defect the fix was meant to remove,
     /// still live, with a green test suite behind it.
     ///
-    /// The suite was green because `TestContext` leaves WRAP off unless a test
-    /// opts in, which is the same blind spot that let the files block ship a
-    /// `wafer-run/crypto` call it had not declared. This test opts in.
+    /// The suite was green because `TestContext` did not enforce WRAP on the
+    /// frame a test ran in — the same blind spot that let the files block
+    /// ship a `wafer-run/crypto` call it had not declared. This test runs as
+    /// the config block, which is refused what production refuses it.
     #[tokio::test]
     async fn the_config_block_reads_the_variables_table_under_wrap() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;

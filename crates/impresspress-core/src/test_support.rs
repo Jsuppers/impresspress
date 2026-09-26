@@ -594,9 +594,10 @@ impl TestContext {
     /// **running as `impresspress/files`** — in the frame production gives
     /// that block (see [`Self::running_as`]).
     ///
-    /// The frame is not decoration. A frame with no declared `requires` is
-    /// unrestricted, so it certifies calls the runtime refuses. That is exactly how the share path shipped calling
-    /// `wafer-run/crypto` without declaring it: every test that created a
+    /// The frame is not decoration. A frame other than the files block's
+    /// carries a different allowlist, or none, so it certifies calls the
+    /// runtime refuses the files block. That is exactly how the share path
+    /// shipped calling `wafer-run/crypto` without declaring it: every test that created a
     /// share passed, and the live server answered `PermissionDenied: block
     /// 'wafer-run/crypto' not in requires list`. The frame goes on the
     /// constructor every files-block test shares, so none of them can miss
