@@ -218,7 +218,7 @@ fn single_user_row(record: &UserRow, roles: &[String], current_uid: &str) -> com
                 (components::status_badge("active"))
             }
         },
-        html! { span .text-muted { (created.get(..10).unwrap_or(created)) } },
+        html! { time .text-muted datetime=(created) { (created.get(..10).unwrap_or(created)) } },
         html! {
                 @if is_self {
                     span .text-muted { "(you)" }
@@ -672,6 +672,29 @@ const API_KEY_COLUMNS: [components::TableCol<'static>; 6] = [
 mod tests {
     use super::*;
     use crate::test_support::{admin_msg, TestContext};
+
+    /// A user's creation date is a per-run value wherever the page is
+    /// screenshotted, and the visual-baseline suite masks dates by the
+    /// `<time>` element alone (`crates/impresspress-web/tests/e2e/
+    /// visual-baseline.spec.ts`), so the cell has to render one.
+    #[tokio::test]
+    async fn the_users_table_renders_the_created_date_as_a_time_element() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("u-1").await;
+
+        let parts = crate::blocks::admin::test_support::browser_request(
+            &ctx,
+            admin_msg("retrieve", "/b/admin/users"),
+        )
+        .await;
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+
+        assert_eq!(parts.status, 200, "{html}");
+        assert!(
+            html.contains(r#"datetime="2026-01-01T00:00:00Z">2026-01-01</time>"#),
+            "the Created cell must be a <time>: {html}"
+        );
+    }
 
     /// Disable answers one `<tr>`, swapped over the user's row. When the row
     /// cannot be re-read after the write landed, the answer is an error row

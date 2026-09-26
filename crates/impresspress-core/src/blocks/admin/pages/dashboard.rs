@@ -276,7 +276,7 @@ pub async fn dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
                             html! { (record.email) },
                             // `.text-right` needs a block box to align against,
                             // and the component owns the `<td>`.
-                            html! { div .text-muted .text-right { (created.get(..10).unwrap_or(created)) } },
+                            html! { div .text-muted .text-right { time datetime=(created) { (created.get(..10).unwrap_or(created)) } } },
                         ])
                     }).collect();
                     (components::DataTable::new(&RECENT_USERS_COLUMNS).rows(rows).headless().render())
@@ -592,6 +592,20 @@ mod outage_tests {
         assert!(
             html.contains("chart__plot") && html.contains("charts-css"),
             "both the line charts and the bar chart are plotted: {html}"
+        );
+    }
+
+    /// A recent user's creation date is a per-run value in the visual-baseline
+    /// capture of this page, which masks dates by the `<time>` element alone.
+    #[tokio::test]
+    async fn the_recent_users_card_renders_the_created_date_as_a_time_element() {
+        let ctx = TestContext::with_auth().await;
+        ctx.seed_auth_user("u-1").await;
+        let html = output_html(dashboard(&ctx, &admin_msg("retrieve", "/b/admin/")).await).await;
+
+        assert!(
+            html.contains(r#"datetime="2026-01-01T00:00:00Z">2026-01-01</time>"#),
+            "the Recent Users date must be a <time>: {html}"
         );
     }
 
