@@ -90,7 +90,7 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
         .await
         .expect("seed the verification token");
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![Arc::new(AuthUiBlock::new()) as Arc<dyn Block>]),
             caller,
             pages: vec![

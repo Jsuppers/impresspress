@@ -196,7 +196,9 @@ mod tests {
     /// deployment without it must still answer every address alike.
     #[tokio::test]
     async fn a_failed_reset_token_draw_answers_what_an_unregistered_address_does() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
         with_known_user(&ctx).await;
 
         let unregistered = on_the_wire(&ctx, "nobody@example.com").await;

@@ -660,7 +660,9 @@ mod toggle_feature_tests {
     /// declare it. The real `impresspress/files` declares it, so a fixture
     /// that left it off would model a block the product does not have.
     async fn ctx_with_files_registered() -> TestContext {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.register_block_info(
             "impresspress/files",
             wafer_run::BlockInfo::new("impresspress/files", "1.0.0", "http.handler", "files")
@@ -815,7 +817,9 @@ mod toggle_feature_tests {
     /// marks the row user-owned.
     #[tokio::test]
     async fn toggle_refuses_a_block_that_cannot_be_disabled() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         // `BlockInfo::new` leaves `can_disable` false — the same shape the
         // real admin block registers with.
         ctx.register_block_info(
@@ -938,7 +942,10 @@ mod outage_tests {
 
     #[tokio::test]
     async fn a_failing_block_settings_read_renders_the_error_page_not_all_enabled() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
         let msg = admin_msg("retrieve", "/b/admin/blocks");
         assert_eq!(output_http_status(blocks_page(&ctx, &msg).await).await, 500);
     }

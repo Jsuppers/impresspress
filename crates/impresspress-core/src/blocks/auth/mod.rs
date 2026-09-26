@@ -381,7 +381,9 @@ mod timing_equalization_tests {
     /// wrong-scheme stand-in.
     #[tokio::test]
     async fn no_crypto_block_yields_no_equalizer() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let cache = OnceLock::new();
 
         assert!(timing_equalization_hash_in(&cache, &ctx).await.is_err());
@@ -583,7 +585,9 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn fresh_read_matches_the_stored_column() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let uid = seed(&ctx).await;
         assert_eq!(current_auth_version(&ctx, &uid).await.unwrap(), 0);
 
@@ -596,7 +600,9 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn cache_hit_serves_stale_value_within_ttl() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let uid = seed(&ctx).await;
 
         // Populate the cache at version 0.
@@ -620,7 +626,9 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn expired_cache_entry_is_not_served_past_ttl() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let uid = seed(&ctx).await;
 
         // Populate the cache at version 0, timestamped at now=1_000.
@@ -641,7 +649,9 @@ mod auth_version_cache_tests {
 
     #[tokio::test]
     async fn bump_auth_version_wrapper_invalidates_immediately() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let uid = seed(&ctx).await;
 
         // Populate the cache at version 0.
@@ -1370,7 +1380,9 @@ pub(crate) mod helpers {
 
         #[tokio::test]
         async fn unset_falls_back_to_default() {
-            let ctx = TestContext::new().await;
+            let ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
             assert_eq!(
                 access_token_lifetime_secs(&ctx).await.expect("config read"),
                 config::ACCESS_TOKEN_LIFETIME_SECS_DEFAULT
@@ -1379,7 +1391,9 @@ pub(crate) mod helpers {
 
         #[tokio::test]
         async fn honors_a_value_under_the_cap() {
-            let mut ctx = TestContext::new().await;
+            let mut ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
             ctx.set_config(ACCESS_TOKEN_LIFETIME_SECS_KEY, "60");
             assert_eq!(
                 access_token_lifetime_secs(&ctx).await.expect("config read"),
@@ -1392,7 +1406,9 @@ pub(crate) mod helpers {
             // P2c: an admin configuring an absurdly long-lived access token
             // must not be able to defeat the belt-and-suspenders backstop —
             // the resolved lifetime never exceeds the hard cap.
-            let mut ctx = TestContext::new().await;
+            let mut ctx = TestContext::new()
+                .await
+                .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
             ctx.set_config(
                 ACCESS_TOKEN_LIFETIME_SECS_KEY,
                 &(config::ACCESS_TOKEN_LIFETIME_SECS_MAX * 10).to_string(),

@@ -53,7 +53,7 @@ fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fixture>>> {
         .await;
         assert_eq!(opened.status, 200, "open the room: {}", opened.body);
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![block]),
             caller,
             pages: Vec::new(),

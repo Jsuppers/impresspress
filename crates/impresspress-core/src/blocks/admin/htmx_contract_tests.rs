@@ -38,7 +38,7 @@ pub(crate) fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = Fi
     Box::pin(async {
         let (ctx, seeds) = seeded_ctx().await;
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![
                 Arc::new(AdminBlock::new()) as Arc<dyn Block>,
                 Arc::new(AuthUiBlock::new()),
@@ -124,7 +124,7 @@ async fn revoking_an_api_key_from_the_tab_answers_with_the_tab() {
 
     let (ctx, seeds) = seeded_ctx().await;
     let fixture = Fixture {
-        ctx: Arc::new(ctx.clone()),
+        ctx: ctx.clone(),
         ..fixture().await
     };
     let controls = controls_on(&fixture, Page::at("/b/admin/users").with("tab", "api-keys")).await;

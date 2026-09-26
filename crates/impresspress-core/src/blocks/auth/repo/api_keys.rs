@@ -208,7 +208,9 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_find_by_key_hash_and_id() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let row = insert(
             &ctx,
@@ -234,7 +236,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_revoke_and_delete() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let a = insert(
             &ctx,
@@ -320,7 +324,9 @@ mod tests {
 
     #[tokio::test]
     async fn insert_stores_an_expiry_in_the_one_format_the_column_holds() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_user(&ctx, "user-a").await;
         let row = insert(
             &ctx,

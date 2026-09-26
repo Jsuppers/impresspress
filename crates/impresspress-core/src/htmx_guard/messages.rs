@@ -72,7 +72,7 @@ fn fixture() -> Pin<Box<dyn Future<Output = Fixture>>> {
                 .map(|id| Page::at(format!("/b/messages/contexts/{id}"))),
         );
         Fixture {
-            ctx: Arc::new(ctx),
+            ctx,
             site: Site(vec![messages]),
             caller: admin_caller,
             pages,

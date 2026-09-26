@@ -829,9 +829,13 @@ mod db_error_tests {
     /// denial and not a blanket refusal.
     #[tokio::test]
     async fn a_granted_read_of_a_missing_row_is_still_404() {
-        let ctx = TestContext::new().await;
+        let mut ctx = TestContext::new().await;
+        ctx.add_deployment_grants(vec![wafer_run::ResourceGrant::read(
+            "test/granted",
+            FOREIGN_TABLE,
+        )]);
         db::ensure_table(
-            &ctx,
+            &ctx.fixture(),
             &wafer_block::wire::database::TableDef {
                 name: FOREIGN_TABLE.to_string(),
                 columns: vec![wafer_block::wire::database::ColumnDef {
@@ -850,9 +854,14 @@ mod db_error_tests {
         )
         .await
         .expect("the ungated fixture creates its table");
-        let out = get_record(&ctx, FOREIGN_TABLE, "no-such-id", "Row")
-            .await
-            .expect_err("the row does not exist");
+        let out = get_record(
+            &ctx.running_as("test/granted"),
+            FOREIGN_TABLE,
+            "no-such-id",
+            "Row",
+        )
+        .await
+        .expect_err("the row does not exist");
         assert_eq!(output_http_status(out).await, 404);
     }
 }

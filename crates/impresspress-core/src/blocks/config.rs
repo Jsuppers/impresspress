@@ -713,10 +713,12 @@ mod tests {
     /// default applies.
     #[tokio::test]
     async fn get_many_reads_rows_over_the_boot_map_and_omits_unset_keys() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config("X__BOOT_ONLY", "from-boot");
         let stored = unique_config_value();
-        wafer_core::clients::config::set(&ctx, APP_NAME_KEY, &stored)
+        wafer_core::clients::config::set(&ctx.fixture(), APP_NAME_KEY, &stored)
             .await
             .expect("store a row");
 
@@ -738,7 +740,9 @@ mod tests {
     /// one wafer-core dropped — so it is refused here too.
     #[tokio::test]
     async fn a_get_whose_body_does_not_decode_is_refused_whatever_its_meta() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "from-boot");
         let mut msg = Message::new(ServiceOp::CONFIG_GET);
         msg.set_meta("key", APP_NAME_KEY);
@@ -756,9 +760,11 @@ mod tests {
     /// The `CONFIG_GET` half is a guard on the fallback this keeps.
     #[tokio::test]
     async fn get_many_fails_where_config_get_falls_back() {
-        let mut ctx = TestContext::with_admin().await;
+        let mut ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         ctx.set_config(APP_NAME_KEY, "from-boot");
-        wafer_core::clients::config::set(&ctx, APP_NAME_KEY, "stored")
+        wafer_core::clients::config::set(&ctx.fixture(), APP_NAME_KEY, "stored")
             .await
             .expect("store a row");
         let ctx = ctx.break_reads();
@@ -790,8 +796,10 @@ mod tests {
     async fn an_admin_write_invalidates_an_already_warm_snapshot() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
@@ -799,7 +807,7 @@ mod tests {
         // Warm the snapshot, the way serving one request does.
         let first = unique_config_value();
         variables::upsert_by_key(
-            &ctx,
+            &ctx.fixture(),
             KEY,
             VariablePatch {
                 value: Some(first.clone()),
@@ -872,15 +880,17 @@ mod tests {
     async fn an_admin_write_on_another_worker_reaches_a_warm_snapshot() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
 
         let first = unique_config_value();
         variables::upsert_by_key(
-            &ctx,
+            &ctx.fixture(),
             KEY,
             VariablePatch {
                 value: Some(first.clone()),
@@ -949,8 +959,10 @@ mod tests {
     async fn the_auth_pages_show_branding_saved_after_boot() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
@@ -958,7 +970,7 @@ mod tests {
         // Boot is over; the snapshot the auth pages used to read is now fixed.
         let saved = unique_config_value();
         variables::upsert_by_key(
-            &ctx,
+            &ctx.fixture(),
             KEY,
             VariablePatch {
                 value: Some(saved.clone()),
@@ -996,15 +1008,17 @@ mod tests {
     async fn the_config_block_reads_the_variables_table_under_wrap() {
         const KEY: &str = crate::config_vars::PRIMARY_COLOR_KEY;
 
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service().await;
 
         let saved = unique_config_value();
         variables::upsert_by_key(
-            &ctx,
+            &ctx.fixture(),
             KEY,
             VariablePatch {
                 value: Some(saved.clone()),
@@ -1042,8 +1056,10 @@ mod boot_owned_key_tests {
     const SENSITIVE_UNDECLARED_KEY: &str = "WAFER_RUN_SHARED__AUTH__OAUTH_GOOGLE_CLIENT_SECRET";
 
     async fn booted_with(adapter_values: &[(&str, &str)]) -> TestContext {
-        let mut ctx = TestContext::new().await;
-        crate::blocks::admin::migrations::apply(&ctx)
+        let mut ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        crate::blocks::admin::migrations::apply(&ctx.fixture())
             .await
             .expect("apply admin migrations");
         ctx.boot_config_service_with(adapter_values).await;
@@ -1052,7 +1068,7 @@ mod boot_owned_key_tests {
 
     async fn store_row(ctx: &TestContext, key: &str, value: &str) {
         variables::insert(
-            ctx,
+            &ctx.fixture(),
             NewVariable {
                 key: key.to_string(),
                 value: value.to_string(),
@@ -1128,7 +1144,7 @@ mod boot_owned_key_tests {
             "CONFIG_SET of a runtime-owned key must fail rather than store an unservable row"
         );
         assert!(
-            variables::get_by_key(&ctx, key)
+            variables::get_by_key(&ctx.fixture(), key)
                 .await
                 .expect("read back")
                 .is_none(),
@@ -1150,7 +1166,7 @@ mod boot_owned_key_tests {
             "CONFIG_SET of an out-of-range session lifetime must fail"
         );
         assert!(
-            variables::get_by_key(&ctx, key)
+            variables::get_by_key(&ctx.fixture(), key)
                 .await
                 .expect("read back")
                 .is_none(),

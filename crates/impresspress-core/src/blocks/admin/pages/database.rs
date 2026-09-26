@@ -535,7 +535,10 @@ mod tests {
     /// A failed table listing is a 500, not a database with no tables.
     #[tokio::test]
     async fn a_failed_introspection_is_a_500_not_an_empty_database() {
-        let ctx = TestContext::with_admin().await.break_reads();
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID)
+            .break_reads();
 
         let parts = browser_request(&ctx, admin_msg("retrieve", "/b/admin/database")).await;
 
@@ -548,7 +551,9 @@ mod tests {
     /// empty schema with "0 rows" — and it is the visitor's typo, not a 500.
     #[tokio::test]
     async fn an_unknown_table_says_so() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let mut msg = admin_msg("retrieve", "/b/admin/database");
         msg.set_meta("req.query.table", "no_such_table");
 
@@ -566,7 +571,9 @@ mod tests {
     /// Control: a real table still shows its columns and count.
     #[tokio::test]
     async fn a_real_table_shows_its_schema() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let mut msg = admin_msg("retrieve", "/b/admin/database");
         msg.set_meta("req.query.table", crate::blocks::admin::ROLES_TABLE);
 

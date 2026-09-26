@@ -91,7 +91,7 @@ async fn fixture() -> Fixture {
     .expect("create ticket");
 
     Fixture {
-        ctx: Arc::new(ctx),
+        ctx,
         site: Site(vec![Arc::new(TicketsBlock::new()) as Arc<dyn Block>]),
         caller,
         pages: vec![

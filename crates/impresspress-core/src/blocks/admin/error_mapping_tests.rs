@@ -129,7 +129,9 @@ fn shows_the_denial(html: &str) -> bool {
 /// An admin fixture with a user to act on, a role (`editor`) that user
 /// holds, and the grant's id.
 async fn fixture() -> (TestContext, String) {
-    let ctx = TestContext::with_auth().await;
+    let ctx = TestContext::with_auth()
+        .await
+        .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
     ctx.seed_auth_user(TARGET).await;
     let created = output_json(
         api(

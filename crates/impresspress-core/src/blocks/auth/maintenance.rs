@@ -221,7 +221,9 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_deletes_only_the_expired_rows_in_all_four_tables() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_four_tables(&ctx).await;
 
         let result = sweep(&ctx).await;
@@ -258,7 +260,9 @@ mod tests {
     /// and the pass says so rather than reporting success.
     #[tokio::test]
     async fn a_failing_table_is_named_and_the_others_still_run() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_four_tables(&ctx).await;
         let failing =
             FailingDbOpContext::new(ctx, vec![("database.delete_where_count", tokens::TABLE)]);
@@ -273,7 +277,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_sweep_runs_and_the_second_inside_the_window_is_skipped() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_four_tables(&ctx).await;
 
         let first = sweep_if_due(&ctx).await.expect("no stamp means overdue");
@@ -287,7 +293,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stamp_older_than_the_window_is_due_again() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_four_tables(&ctx).await;
         maintenance::record_sweep(&ctx, &iso(-(SWEEP_INTERVAL_SECS + 60)))
             .await
@@ -311,7 +319,9 @@ mod tests {
     /// would put four deletes on every single login.
     #[tokio::test]
     async fn an_unreadable_stamp_skips_rather_than_sweeps() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         seed_four_tables(&ctx).await;
         let failing = FailingDbOpContext::new(ctx, vec![("database.get", maintenance::TABLE)]);
 

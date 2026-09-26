@@ -350,7 +350,9 @@ mod tests {
     /// the shared contract directly rather than through the meta side effect.
     #[tokio::test]
     async fn verify_access_token_accepts_a_minted_access_jwt() {
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", Some("jti-1"), 3600);
         let claims = verify_access_token(&ctx, &token, secret, "")
@@ -363,7 +365,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_access_token_rejects_a_refresh_jwt() {
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let master = "test-secret";
         let derived = primitives::derive_block_key(
             master.as_bytes(),
@@ -382,7 +386,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_access_token_rejects_a_foreign_issuer() {
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt_with(secret, |claims| {
             claims.insert("sub".to_string(), serde_json::json!("user-a"));
@@ -396,11 +402,13 @@ mod tests {
 
     #[tokio::test]
     async fn verify_access_token_rejects_a_blocklisted_jti() {
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", Some("jti-gone"), 3600);
         crate::blocks::auth::repo::jwt_blocklist::insert(
-            &ctx,
+            &ctx.fixture(),
             crate::blocks::auth::repo::jwt_blocklist::NewBlocklistEntry {
                 jti: "jti-gone",
                 user_id: "user-a",
@@ -417,10 +425,12 @@ mod tests {
 
     #[tokio::test]
     async fn verify_access_token_rejects_a_stale_auth_version() {
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let user = crate::blocks::auth::repo::users::insert(
-            &ctx,
+            &ctx.fixture(),
             crate::blocks::auth::repo::users::NewUser {
                 email: "stale@example.com".into(),
                 display_name: "Stale".into(),
@@ -432,7 +442,7 @@ mod tests {
         )
         .await
         .expect("seed user");
-        crate::blocks::auth::bump_auth_version(&ctx, &user.id)
+        crate::blocks::auth::bump_auth_version(&ctx.fixture(), &user.id)
             .await
             .expect("bump");
 
@@ -456,7 +466,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_sets_the_family_from_the_verified_token() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt_with(secret, |claims| {
             claims.insert("sub".to_string(), serde_json::json!("user-a"));
@@ -474,7 +486,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_leaves_the_family_empty_when_the_token_has_none() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", None, 3600);
         let mut msg = Message::new("http.request");
@@ -504,7 +518,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_rejects_refresh_token() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let master = "test-secret";
         let derived = primitives::derive_block_key(
             master.as_bytes(),
@@ -528,7 +544,9 @@ mod tests {
         // Allow-list: a token with no `type` claim is rejected (the old denylist
         // accepted it).
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let master = "test-secret";
         let derived = primitives::derive_block_key(
             master.as_bytes(),
@@ -551,7 +569,9 @@ mod tests {
         // The master-secret fallback is removed: a token signed with the raw
         // master secret (not the auth-ui-derived key) no longer authenticates.
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let master = "test-secret";
         let mut claims = BTreeMap::new();
         claims.insert("sub".to_string(), serde_json::json!("user-a"));
@@ -569,7 +589,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_sets_user_id_for_valid_access_token() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", Some("jti-1"), 3600);
         let mut msg = Message::new("http.request");
@@ -592,7 +614,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_verifies_token_signed_with_auth_ui_derived_key() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let master = "test-master-secret";
         let derived = primitives::derive_block_key(
             master.as_bytes(),
@@ -623,13 +647,15 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_rejects_blocklisted_jti() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         let token = sign_access_jwt(secret, "user-a", Some("jti-blocked"), 3600);
 
         // Pre-populate the blocklist with the jti.
         crate::blocks::auth::repo::jwt_blocklist::insert(
-            &ctx,
+            &ctx.fixture(),
             crate::blocks::auth::repo::jwt_blocklist::NewBlocklistEntry {
                 jti: "jti-blocked",
                 user_id: "user-a",
@@ -653,10 +679,12 @@ mod tests {
     async fn extract_auth_meta_only_blocks_target_jti_for_user() {
         // Same user, two jti's — only the blocklisted one is rejected.
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let secret = "test-secret";
         crate::blocks::auth::repo::jwt_blocklist::insert(
-            &ctx,
+            &ctx.fixture(),
             crate::blocks::auth::repo::jwt_blocklist::NewBlocklistEntry {
                 jti: "session-1",
                 user_id: "user-a",
@@ -709,7 +737,7 @@ mod tests {
 
     async fn seed_user(ctx: &crate::test_support::TestContext) -> String {
         crate::blocks::auth::repo::users::insert(
-            ctx,
+            &ctx.fixture(),
             crate::blocks::auth::repo::users::NewUser {
                 email: "verify@example.com".into(),
                 display_name: "Verify".into(),
@@ -727,7 +755,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_rejects_token_minted_before_a_bump() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed_user(&ctx).await;
         let secret = "test-secret";
 
@@ -747,7 +777,7 @@ mod tests {
 
         // Password change / disable / soft-delete / role change all funnel
         // through this single call.
-        crate::blocks::auth::bump_auth_version(&ctx, &uid)
+        crate::blocks::auth::bump_auth_version(&ctx.fixture(), &uid)
             .await
             .expect("bump auth_version");
 
@@ -765,11 +795,13 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_accepts_a_token_minted_at_the_current_auth_version() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed_user(&ctx).await;
         let secret = "test-secret";
 
-        crate::blocks::auth::bump_auth_version(&ctx, &uid)
+        crate::blocks::auth::bump_auth_version(&ctx.fixture(), &uid)
             .await
             .expect("bump auth_version");
 
@@ -793,7 +825,9 @@ mod tests {
         // `auth_version` claim at all. It must still authenticate against a
         // freshly migrated user, whose `auth_version` column defaults to 0.
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed_user(&ctx).await;
         let secret = "test-secret";
 
@@ -819,7 +853,9 @@ mod tests {
     #[tokio::test]
     async fn extract_auth_meta_auth_version_read_is_wrap_authorized_for_the_router() {
         use wafer_run::Message;
-        let ctx = crate::test_support::TestContext::with_auth().await;
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
         let uid = seed_user(&ctx).await;
         let secret = "test-secret";
         let token = sign_access_jwt_with_version(secret, &uid, 0, 3600);

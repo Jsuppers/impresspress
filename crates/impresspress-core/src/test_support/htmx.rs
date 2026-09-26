@@ -36,7 +36,7 @@
 
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
 
-use wafer_run::{context::Context, Block, InputStream, Message, OutputStream};
+use wafer_run::{Block, InputStream, Message, OutputStream};
 
 use crate::endpoint_match::{action_for_method, match_template};
 
@@ -409,7 +409,9 @@ impl Page {
 /// its pages reach, who is asking, and the pages — concrete, because they name
 /// the fixture's seeded ids.
 pub struct Fixture {
-    pub ctx: Arc<dyn Context>,
+    /// The deployment the pages run in. Each request runs in the frame of
+    /// the block that serves it, as a routed request does.
+    pub ctx: super::TestContext,
     pub site: Site,
     /// The request message a visitor of these pages sends for
     /// `(action, path)` — their identity and roles.
@@ -476,7 +478,7 @@ pub async fn send(
     };
     let out = block
         .handle(
-            fixture.ctx.as_ref(),
+            &fixture.ctx.clone().running_as(&block.info().name),
             msg,
             InputStream::from_bytes(body.into_bytes()),
         )

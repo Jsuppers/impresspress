@@ -111,7 +111,9 @@ mod tests {
     /// `RecordList` response already had.
     #[tokio::test]
     async fn list_publishes_exactly_the_contract_fields() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -154,7 +156,9 @@ mod tests {
     /// Audit entries written by one request share a millisecond on wasm32.
     #[tokio::test]
     async fn entries_that_tie_on_created_at_page_in_one_stable_order() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");
@@ -204,7 +208,9 @@ mod tests {
     /// derived from.
     #[tokio::test]
     async fn list_applies_the_declared_query_filters() {
-        let ctx = TestContext::new().await;
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         crate::blocks::admin::migrations::apply(&ctx)
             .await
             .expect("apply admin migrations");

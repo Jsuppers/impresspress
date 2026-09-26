@@ -102,7 +102,9 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_contains_returns_true() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let exp = iso_plus_seconds(1800);
         insert(
             &ctx,
@@ -120,13 +122,17 @@ mod tests {
 
     #[tokio::test]
     async fn contains_returns_false_for_unknown_jti() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         assert!(!contains(&ctx, "missing").await.unwrap());
     }
 
     #[tokio::test]
     async fn delete_expired_drops_only_expired_rows() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::auth::AUTH_BLOCK_ID);
         let past = iso_plus_seconds(-60);
         let future = iso_plus_seconds(1800);
         insert(

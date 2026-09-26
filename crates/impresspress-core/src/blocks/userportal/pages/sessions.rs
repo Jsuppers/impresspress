@@ -217,7 +217,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_redirects_to_login() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let msg = anon_msg("retrieve", "/b/userportal/sessions");
         let resp = sessions_page(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 302);
@@ -225,7 +227,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_renders_empty_state() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         let msg = auth_msg("retrieve", "/b/userportal/sessions", "user-a");
         let resp = sessions_page(&ctx, &msg).await;
@@ -235,7 +239,9 @@ mod tests {
 
     #[tokio::test]
     async fn populated_renders_one_row_per_session_with_revoke() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         insert(&ctx, fake_session("user-a", "fam-2")).await.unwrap();
@@ -261,7 +267,9 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_anonymous_returns_401() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let msg = routed(anon_msg("delete", "/b/userportal/sessions/fam-1"));
         let resp = handle_revoke(&ctx, &msg).await;
         assert_eq!(output_status(resp).await, 401);
@@ -273,7 +281,9 @@ mod tests {
     /// its next rotation.
     #[tokio::test]
     async fn revoke_own_session_revokes_the_family_and_deletes_the_row() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         seed_refresh_row(&ctx, "user-a", "fam-1").await;
@@ -298,7 +308,9 @@ mod tests {
     /// been through `ROUTES`.
     #[tokio::test]
     async fn revoke_reads_only_the_bound_family() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         let path = "/b/userportal/sessions/fam-1";
@@ -328,7 +340,9 @@ mod tests {
     /// cannot provide for itself.
     #[tokio::test]
     async fn revoke_other_users_session_is_a_no_op_returning_200() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         for u in ["user-a", "user-b"] {
             seed_user(&ctx, u).await;
         }
@@ -356,7 +370,9 @@ mod tests {
     async fn a_failed_family_revoke_is_a_500_not_a_silent_success() {
         use crate::test_support::{output_is_error, FailingDbOpContext};
 
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         seed_refresh_row(&ctx, "user-a", "fam-1").await;
@@ -378,7 +394,9 @@ mod tests {
     /// sign out that there is nothing to revoke.
     #[tokio::test]
     async fn a_failed_list_read_is_a_500_not_the_empty_state() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         let ctx = ctx.break_reads();
@@ -398,7 +416,9 @@ mod tests {
     /// badge. Other rows do not.
     #[tokio::test]
     async fn current_session_row_gets_badge() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-here"))
             .await
@@ -431,7 +451,9 @@ mod tests {
     /// predates the `family` claim" requirement.
     #[tokio::test]
     async fn no_family_meta_renders_no_badge() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
@@ -451,7 +473,9 @@ mod tests {
     /// token is still live.
     #[tokio::test]
     async fn a_family_with_no_matching_row_renders_no_badge() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
@@ -479,7 +503,9 @@ mod tests {
         // Seeded from the fixture's own frame — `seed_user` uses raw SQL,
         // which WRAP restricts to the admin block. In production, rows are
         // seeded by owner/admin paths; userportal only reads them.
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
@@ -496,7 +522,9 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_allows_sessions_list_with_auth_block_grants() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
 
@@ -513,7 +541,9 @@ mod tests {
     /// `tokens` grant would turn every revoke into a 500.
     #[tokio::test]
     async fn wrap_allows_the_whole_revoke_path_with_auth_block_grants() {
-        let ctx = TestContext::with_auth().await;
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         seed_user(&ctx, "user-a").await;
         insert(&ctx, fake_session("user-a", "fam-1")).await.unwrap();
         seed_refresh_row(&ctx, "user-a", "fam-1").await;

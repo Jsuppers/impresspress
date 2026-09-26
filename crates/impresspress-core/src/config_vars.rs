@@ -1017,7 +1017,9 @@ mod csp_rule_tests {
     /// value and stores nothing, so the next boot still reads the old one.
     #[tokio::test]
     async fn config_set_refuses_a_policy_that_would_break_boot() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let err = wafer_core::clients::config::set(
             &ctx,
             CSP_DIRECTIVES_KEY,
@@ -1059,13 +1061,19 @@ mod truth_table_tests {
     async fn get_bool_reads_the_config_client_and_falls_back_to_the_default() {
         const UNSET_FLAG: &str = "WAFER_RUN_SHARED__UNSET_FLAG";
         const FLAG: &str = "WAFER_RUN_SHARED__FLAG";
+        // Read as a block: any attributable caller may read a shared key.
         let mut ctx = TestContext::new().await;
-        assert!(get_bool(&ctx, UNSET_FLAG, true).await.expect("read"));
-        assert!(!get_bool(&ctx, UNSET_FLAG, false).await.expect("read"));
+        let reader = |ctx: &TestContext| ctx.clone().running_as("impresspress/tickets");
+        assert!(get_bool(&reader(&ctx), UNSET_FLAG, true)
+            .await
+            .expect("read"));
+        assert!(!get_bool(&reader(&ctx), UNSET_FLAG, false)
+            .await
+            .expect("read"));
         ctx.set_config(FLAG, "1");
-        assert!(get_bool(&ctx, FLAG, false).await.expect("read"));
+        assert!(get_bool(&reader(&ctx), FLAG, false).await.expect("read"));
         ctx.set_config(FLAG, "no");
-        assert!(!get_bool(&ctx, FLAG, true).await.expect("read"));
+        assert!(!get_bool(&reader(&ctx), FLAG, true).await.expect("read"));
     }
 
     /// A read the caller is refused is an error, not the flag's default: a

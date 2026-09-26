@@ -18,6 +18,34 @@ use std::{
 
 use wafer_run::{Block, ResourceGrant};
 
+/// Whose code runs on a [`super::TestContext`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Frame {
+    /// What every constructor hands back: nobody's code. A service it calls
+    /// sees no caller, and the runtime refuses an unattributed caller every
+    /// table, key and object a WRAP check guards — so code under test run
+    /// here is refused until the test says whose code it is
+    /// ([`super::TestContext::running_as`]), and setup until the test says
+    /// it is setup ([`super::TestContext::fixture`]).
+    Unframed,
+    /// Test setup: the migrations, seeds and read-backs a test stages and
+    /// asserts through. See [`Caller::Fixture`].
+    Fixture,
+    /// A block's code.
+    Block(String),
+}
+
+impl Frame {
+    /// Who a block this frame calls sees as its caller.
+    pub(super) fn as_caller(&self) -> Caller {
+        match self {
+            Frame::Unframed => Caller::Nobody,
+            Frame::Fixture => Caller::Fixture,
+            Frame::Block(name) => Caller::Block(name.clone()),
+        }
+    }
+}
+
 /// Who called into a [`super::TestContext`] frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Caller {
@@ -26,9 +54,11 @@ pub(super) enum Caller {
     /// A block entered through [`super::TestContext::running_as`] runs here.
     /// A block the router reaches is not top-level: `impresspress/router`
     /// calls it, and [`super::TestContext::dispatch`] routes the same way.
+    /// Also the caller of anything an unframed context ([`Frame::Unframed`])
+    /// calls.
     Nobody,
-    /// The test itself, calling from the fixture's unframed context: the
-    /// migrations, seeds and direct repository calls a test sets up with.
+    /// The test itself, calling from [`Frame::Fixture`]: the migrations,
+    /// seeds and read-backs a test sets up and asserts with.
     ///
     /// No production frame corresponds to this. It is authorized as the
     /// admin block, the one identity WRAP exempts, so fixture setup can

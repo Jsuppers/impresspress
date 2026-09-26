@@ -497,7 +497,9 @@ mod tests {
     /// `paginated`, integers as integers and strings as strings.
     #[tokio::test]
     async fn insert_and_paginated_round_trip_every_column() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         insert(&ctx, &probe(500, 42)).await.expect("insert");
 
         let page = paginated(&ctx, 1, 20, "", false).await.expect("paginated");
@@ -526,14 +528,18 @@ mod tests {
     /// best-effort) what to do with it.
     #[tokio::test]
     async fn insert_surfaces_write_errors() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let failing = FailingDbOpContext::new(ctx, vec![("database.create", TABLE)]);
         assert!(insert(&failing, &probe(200, 1)).await.is_err());
     }
 
     #[tokio::test]
     async fn paginated_filters_on_the_path_and_pages_newest_first() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         seed_at(&ctx, "r1", probe(200, 1), "2026-01-01T00:00:00Z").await;
         seed_at(&ctx, "r2", probe(200, 1), "2026-01-02T00:00:00Z").await;
         let mut other = probe(200, 1);
@@ -556,7 +562,9 @@ mod tests {
     /// composes with the path search, and counts the narrowed set.
     #[tokio::test]
     async fn paginated_errors_only_selects_by_code_not_by_the_stored_label() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         seed_labelled(&ctx, "served_200", 200, "OK", "2026-01-01T00:00:00Z").await;
         seed_labelled(
             &ctx,
@@ -609,7 +617,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_for_path_pages_one_path_newest_first() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         seed_at(&ctx, "r1", probe(200, 1), "2026-01-01T00:00:00Z").await;
         seed_at(&ctx, "r2", probe(200, 2), "2026-01-02T00:00:00Z").await;
         let mut other = probe(200, 3);
@@ -633,7 +643,9 @@ mod tests {
     /// hand-computed expectations for the fixed seed.
     #[tokio::test]
     async fn aggregates_match_per_filter_counts() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let today = chrono::Utc::now().date_naive();
         // Noon timestamps so a stored `...T12:00:00` sorts after `today_start`
         // (`...T00:00:00`) yet buckets to the same day under SQLite's `date()`.
@@ -738,7 +750,9 @@ mod tests {
     /// that was actually sent, with no backfill.
     #[tokio::test]
     async fn every_reader_classifies_a_mislabelled_row_by_its_code() {
-        let ctx = TestContext::with_admin().await;
+        let ctx = TestContext::with_admin()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
         let today = chrono::Utc::now().date_naive();
         let at = format!("{}T12:00:00", today.format("%Y-%m-%d"));
         let today_start = format!("{}T00:00:00", today.format("%Y-%m-%d"));
