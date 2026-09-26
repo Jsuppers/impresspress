@@ -241,10 +241,14 @@ impl From<&repo::buckets::BucketRow> for AdminBucketRow {
 /// Render the admin Buckets table (or empty state).
 ///
 /// The owner-id and date cells are monospaced (as are the shares table's
-/// "Created By" and the quotas table's "User" id cells): a fixed-length value
-/// then has a fixed width, so the columns do not re-flow as the value changes. That matters to the
-/// visual-baseline suite, which masks these per-run values — with a
-/// proportional font a different id moved every column to its right.
+/// "Created By" and the quotas table's "User" id cells), so a fixed-length
+/// value has a fixed width and the columns do not re-flow as it changes.
+/// That matters to the visual-baseline suite, which captures this table and
+/// masks its two per-run values: the date as a `<time>` (the suite masks
+/// every `<time>`) and the owner id by its cell inside a `tr[data-bucket]`
+/// row. With a proportional font a different id moved every column to its
+/// right. The suite captures neither the shares nor the quotas table with
+/// rows, and masks nothing in them.
 pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
     if rows.is_empty() {
         return html! {
@@ -267,7 +271,7 @@ pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
                         td data-label="Public" {
                             (components::status_badge(if r.public { "public" } else { "private" }))
                         }
-                        td data-label="Created" .text-muted .text-sm .font-mono { (r.created_at_short) }
+                        td data-label="Created" .text-muted .text-sm .font-mono { time datetime=(r.created_at_short) { (r.created_at_short) } }
                     }
                 }
             }
@@ -694,6 +698,11 @@ mod tests {
                 "{label} cell is not monospaced: {tag}"
             );
         }
+        // The visual-baseline suite masks dates by the `<time>` element alone.
+        assert!(
+            html.contains(r#"<time datetime="2026-09-25">2026-09-25</time>"#),
+            "the Created date must be a <time>: {html}"
+        );
     }
 
     /// One capped, expiring share row, as the repo decodes it.

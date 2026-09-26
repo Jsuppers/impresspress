@@ -1261,7 +1261,16 @@ jobs:
   e2e-visual:
     name: E2E visual baselines (native server)
     needs: e2e-build
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job compares screenshots against
+    # baselines rendered by `regen-visual-baselines.yml`. Playwright's
+    # Chromium brings its own rasterizer, but the fonts it draws with (and
+    # fontconfig, which picks them) are the Ubuntu release's packages, which
+    # `playwright install --with-deps` installs through apt. `ubuntu-latest`
+    # moves to a new Ubuntu release without a commit here, and with it every
+    # glyph under the committed PNGs; the pin makes that move a deliberate
+    # edit here and in that workflow, followed by a regen. It does not freeze
+    # package updates within the release. The labels must match.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -1379,7 +1388,16 @@ jobs:
 
   products-browser:
     name: Products browser lifecycles
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job compares screenshots against
+    # baselines rendered by `regen-visual-baselines.yml`. Playwright's
+    # Chromium brings its own rasterizer, but the fonts it draws with (and
+    # fontconfig, which picks them) are the Ubuntu release's packages, which
+    # `playwright install --with-deps` installs through apt. `ubuntu-latest`
+    # moves to a new Ubuntu release without a commit here, and with it every
+    # glyph under the committed PNGs; the pin makes that move a deliberate
+    # edit here and in that workflow, followed by a regen. It does not freeze
+    # package updates within the release. The labels must match.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -1418,7 +1436,16 @@ jobs:
 
   product-examples:
     name: Products static examples (Playwright)
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job compares screenshots against
+    # baselines rendered by `regen-visual-baselines.yml`. Playwright's
+    # Chromium brings its own rasterizer, but the fonts it draws with (and
+    # fontconfig, which picks them) are the Ubuntu release's packages, which
+    # `playwright install --with-deps` installs through apt. `ubuntu-latest`
+    # moves to a new Ubuntu release without a commit here, and with it every
+    # glyph under the committed PNGs; the pin makes that move a deliberate
+    # edit here and in that workflow, followed by a regen. It does not freeze
+    # package updates within the release. The labels must match.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
