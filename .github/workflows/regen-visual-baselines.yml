@@ -4,7 +4,7 @@ name: Regen Visual Baselines
 # suite with `--update-snapshots` against a target branch, then commits and
 # pushes any baseline diffs back to that branch.
 #
-# Why this exists: CI's font/AA rendering on ubuntu-latest drifts deterministically
+# Why this exists: CI's font/AA rendering on the pinned runner image drifts deterministically
 # from local Linux renders for content-heavy mobile cards-table baselines
 # (see Phase 5d-C/E handoff). The CI render is the canonical baseline, so when
 # a PR touches UI that lands on a flaky-mobile route, regen from CI here.
@@ -40,7 +40,12 @@ permissions:
 jobs:
   regen:
     name: Regen visual baselines on ${{ inputs.branch }}
-    runs-on: ubuntu-latest
+    # The same pinned image as the jobs in `ci-shared.yml` that compare
+    # against what this workflow renders (`e2e-visual`, `products-browser`,
+    # `product-examples`): the image supplies the fonts and FreeType, so a
+    # baseline is only valid on the image that rendered it. Move all four
+    # labels together, then regen.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
