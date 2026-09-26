@@ -114,12 +114,12 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
             div .card__body {
                 @let rows: Vec<Vec<Markup>> = blocks.iter().flat_map(|block| {
                     block.grants.iter().map(move |grant| vec![
-                        badge(BadgeVariant::Info, &block.name),
+                        Badge::new(BadgeVariant::Info).render(components::breakable_id(&block.name)),
                         html! {
                             @if grant.grantee == "*" {
                                 (badge(BadgeVariant::Warning, "* (all blocks)"))
                             } @else {
-                                code { (grant.grantee) }
+                                code { (components::breakable_id(&grant.grantee)) }
                             }
                         },
                         html! {
@@ -129,7 +129,7 @@ fn grants_code_tab(ctx: &dyn Context) -> Markup {
                                 (Badge::new(BadgeVariant::Secondary).classes("text-11").render(html! { "all" }))
                             }
                         },
-                        html! { code .text-xs { (grant.resource) } },
+                        html! { code .text-xs { (components::breakable_id(&grant.resource)) } },
                         html! {
                             (access_badge(grant.write))
                         },
@@ -188,7 +188,7 @@ pub(crate) async fn grants_custom_tab(
                                 @if grantee == "*" {
                                     (badge(BadgeVariant::Warning, "* (all blocks)"))
                                 } @else {
-                                    code { (grantee) }
+                                    code { (components::breakable_id(grantee)) }
                                 }
                             },
                             html! {
@@ -198,7 +198,7 @@ pub(crate) async fn grants_custom_tab(
                                     (Badge::new(BadgeVariant::Info).classes("text-11").render(html! { (rt) }))
                                 }
                             },
-                            html! { code .text-xs { (grant.resource) } },
+                            html! { code .text-xs { (components::breakable_id(&grant.resource)) } },
                             html! {
                                 (access_badge(grant.write))
                             },

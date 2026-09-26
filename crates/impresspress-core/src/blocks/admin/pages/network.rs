@@ -145,7 +145,7 @@ fn inbound_row(
     components::TableRow::new(vec![
         html! { span .text-muted { (icons::chevron_right()) } },
         html! { span .font-medium { (method.to_uppercase()) } },
-        html! { span .cell-wrap { (path) } },
+        html! { (components::breakable_id(path)) },
         Badge::new(BadgeVariant::Info).render(html! { (cnt) }),
         html! { span .text-muted { span data-volatile-metric { (avg_ms) "ms" } } },
         html! {
