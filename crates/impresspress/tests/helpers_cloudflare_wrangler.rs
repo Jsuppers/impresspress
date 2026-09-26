@@ -7,11 +7,11 @@ use impresspress::cli::helpers::cloudflare::{
     wrangler::{
         generate, generate_candidate_upload, generate_final_upload, generate_triggers,
         generate_upload, generate_upload_with_release, CloudflareConfig, D1Config, R2Config,
-        ASSET_BASE_URL_VAR, DEFAULT_CRONS, PREPARED_APPLICATION_BUILD_SHA256_VAR,
-        PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
-        PREPARED_WAFER_LOCK_IDENTITY_VAR, RELEASE_ASSET_ID_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
-        RELEASE_ASSET_MANIFEST_SHA256_VAR, RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR,
-        SUGGESTED_SWEEP_CRON,
+        ASSET_BASE_URL_VAR, D1_QUERIES_PER_INVOCATION_DEFAULT, D1_QUERIES_PER_INVOCATION_KEY,
+        DEFAULT_CRONS, PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR,
+        PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_WAFER_LOCK_IDENTITY_VAR,
+        RELEASE_ASSET_ID_VAR, RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
+        RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR, SUGGESTED_SWEEP_CRON,
     },
 };
 use impresspress_core::{PreparedRuntimePlan, PreparedRuntimeStructure, WaferLockIdentity};
@@ -36,6 +36,7 @@ fn sample_cfg() -> CloudflareConfig {
         },
         wrangler_overrides_path: None,
         head_sampling_rate: 1.0,
+        d1_queries_per_invocation: D1_QUERIES_PER_INVOCATION_DEFAULT,
         crons: DEFAULT_CRONS.iter().map(|s| s.to_string()).collect(),
         deploy_smoke_paths: vec!["/health".into()],
     }
@@ -167,6 +168,56 @@ fn generate_writes_configured_head_sampling_rate() {
         "generated toml should reflect the configured sampling rate, not a \
          hardcoded 1.0:\n{body}"
     );
+}
+
+/// Golden for the D1 query limit a generated config states. The runtime's
+/// statement budget admits every multi-statement write against this var, so a
+/// Workers Free deploy that ran on the Paid default would be admitted writes
+/// D1 then refuses part-way. Every config that uploads code must carry it —
+/// the Paid default included — along with the note that says it depends on
+/// the plan.
+#[test]
+fn every_generated_config_states_the_d1_query_limit_and_what_it_depends_on() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+
+    assert_eq!(
+        D1_QUERIES_PER_INVOCATION_KEY,
+        "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION"
+    );
+    assert_eq!(D1_QUERIES_PER_INVOCATION_DEFAULT, 1000);
+    let note = "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is D1's per-invocation query limit \
+                for the account's plan: 1000 on Workers Paid, 50 on Workers Free. Set it with \
+                [cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
+
+    for (limit, line) in [
+        (
+            D1_QUERIES_PER_INVOCATION_DEFAULT,
+            "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION = \"1000\"\n",
+        ),
+        (50, "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION = \"50\"\n"),
+    ] {
+        let mut cfg = sample_cfg();
+        cfg.d1_queries_per_invocation = limit;
+        for path in [
+            generate(&cfg, repo_root, &out).unwrap(),
+            generate_upload(&cfg, repo_root, &out).unwrap(),
+        ] {
+            let body = fs::read_to_string(&path).unwrap();
+            assert!(
+                body.contains(line),
+                "{} should state a limit of {limit}:\n{body}",
+                path.display()
+            );
+            assert!(
+                body.contains(note),
+                "{} should say what the limit depends on:\n{body}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// The scheduled sweep is opt-in. A generated config carries an *empty*

@@ -19,6 +19,37 @@ use wafer_run::{ConfigVar, InputType};
 /// `WAFER_RUN_SHARED__*` entry.
 pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 
+/// Worker var naming how many D1 queries one Worker invocation may run: D1's
+/// "Queries per Worker invocation" limit for the account's plan, 1000 on
+/// Workers Paid and 50 on Free
+/// (<https://developers.cloudflare.com/d1/platform/limits/>).
+///
+/// Shared by both sides of a deploy: `impresspress build`/`deploy --target
+/// cloudflare` writes it into the generated `wrangler.toml` `[vars]` from
+/// `impresspress.toml`'s `[cloudflare].d1_queries_per_invocation`, and the
+/// Cloudflare worker reads it once per invocation as the limit every D1
+/// service reports its statement budget against. A deploy-time Worker var,
+/// never a `variables` row.
+pub const D1_QUERIES_PER_INVOCATION_KEY: &str = "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION";
+
+/// D1's per-invocation query limit on Workers Paid: what a deploy that does
+/// not state [`D1_QUERIES_PER_INVOCATION_KEY`] runs under.
+pub const D1_QUERIES_PER_INVOCATION_DEFAULT: u64 = 1000;
+
+/// Parse a [`D1_QUERIES_PER_INVOCATION_KEY`] value: a whole number of at least
+/// 1, surrounding whitespace ignored. The error names the var and both plans'
+/// limits, so the CLI and the worker refuse a mistyped value with the same
+/// words instead of falling back to the Paid limit.
+pub fn parse_d1_queries_per_invocation(raw: &str) -> Result<u64, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(limit) if limit >= 1 => Ok(limit),
+        _ => Err(format!(
+            "{D1_QUERIES_PER_INVOCATION_KEY} is {raw:?}; it must be a whole number of at least 1 \
+             (D1 allows 1000 queries per invocation on Workers Paid, 50 on Free)"
+        )),
+    }
+}
+
 /// What `impresspress__admin__request_logs` keeps: `all` (the default),
 /// `errors`, or `off`. See [`crate::pipeline::RequestLogPolicy`].
 ///

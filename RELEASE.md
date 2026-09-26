@@ -99,8 +99,16 @@ and signs every user out, once.
   serves embeddings there.
 
 **Who has to act.** A Cloudflare deploy on the Workers Free plan: set
-`IMPRESSPRESS_D1_QUERIES_PER_INVOCATION = "50"` in `wrangler.toml`'s
-`[vars]`, or the budget will admit writes D1 then refuses part-way. A user
+`d1_queries_per_invocation = 50` under `[cloudflare]` in `impresspress.toml`,
+or the budget will admit writes D1 then refuses part-way. The generated
+`wrangler.toml` writes it into `[vars]` as
+`IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` (`"1000"` when unset); a value set
+through a `wrangler_overrides_path` file still wins, since overrides are
+merged over the generated config. The budget counts D1 queries only: KV and
+R2 operations are Workers subrequests, counted against Cloudflare's
+subrequest limits (50 per invocation on Free) and not by the budget, so a
+Free-plan request can still meet a Cloudflare limit before the budget
+refuses it. A user
 whose password hash was imported from another system at more than 46 MiB:
 reset the password. Nobody else.
 

@@ -61,16 +61,13 @@ pub(crate) const CF_LOG_LEVEL_KEY: &str = "IMPRESSPRESS_CF_LOG_LEVEL";
 /// through the dashboard — this list stays short.
 pub(crate) const PROTECTED_ENV_KEYS: &[&str] = &[impresspress_core::blocks::auth::JWT_SECRET_KEY];
 
-/// Worker var (`env.var`) naming how many D1 queries one Worker invocation may
-/// run: D1's "Queries per Worker invocation" limit for this account's plan.
-/// Every D1 service built in an invocation reports its statement budget
-/// against it (see [`crate::database`]'s module docs). Unset means
-/// [`D1_QUERIES_PER_INVOCATION_DEFAULT`]; a Free-plan deploy sets `50`.
-pub(crate) const D1_QUERIES_PER_INVOCATION_KEY: &str = "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION";
-
-/// D1's per-invocation query limit on Workers Paid, the limit a deploy that
-/// does not set [`D1_QUERIES_PER_INVOCATION_KEY`] runs under.
-pub(crate) const D1_QUERIES_PER_INVOCATION_DEFAULT: u64 = 1000;
+/// The Worker var naming this deploy's D1 query limit and its Workers Paid
+/// default, shared with the CLI that writes it into `wrangler.toml`. Every D1
+/// service built in an invocation reports its statement budget against it
+/// (see [`crate::database`]'s module docs).
+pub(crate) use impresspress_core::config_vars::{
+    D1_QUERIES_PER_INVOCATION_DEFAULT, D1_QUERIES_PER_INVOCATION_KEY,
+};
 
 /// Shared configuration consumed synchronously while the builder constructs
 /// middleware, plus the two operational knobs a deploy sets in
@@ -395,13 +392,7 @@ impl CfEnvironment {
         let Some(raw) = self.d1_queries_per_invocation.as_deref() else {
             return Ok(D1_QUERIES_PER_INVOCATION_DEFAULT);
         };
-        match raw.trim().parse::<u64>() {
-            Ok(limit) if limit >= 1 => Ok(limit),
-            _ => Err(format!(
-                "{D1_QUERIES_PER_INVOCATION_KEY} is {raw:?}; it must be a whole number of at \
-                 least 1 (D1 allows 1000 queries per invocation on Workers Paid, 50 on Free)"
-            )),
-        }
+        impresspress_core::config_vars::parse_d1_queries_per_invocation(raw)
     }
 
     /// Bind `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` to the raw string a

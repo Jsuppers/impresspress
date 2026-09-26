@@ -383,3 +383,34 @@ fn release_assets_exclude_globs_are_compiled_and_kept() {
     assert!(cfg.r2.release_assets_exclude[0].matches("content/guides/a.state.json"));
     assert!(!cfg.r2.release_assets_exclude[0].matches("content/legal/terms.md"));
 }
+
+/// `[cloudflare].d1_queries_per_invocation` is the plan's D1 query limit:
+/// unset is Workers Paid's 1000, a stated number is taken as it is, and 0 —
+/// which no plan has, and which the Worker would refuse on every request — is
+/// refused here instead.
+#[test]
+fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_zero() {
+    let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
+    assert_eq!(cfg.d1_queries_per_invocation, 1000);
+
+    let free = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"\n",
+        "compatibility_date = \"2026-05-01\"\nd1_queries_per_invocation = 50\n",
+    );
+    let cfg = parse_str(&free).resolve(fake_env(&[])).unwrap();
+    assert_eq!(cfg.d1_queries_per_invocation, 50);
+
+    let zero = FULL_TOML.replace(
+        "compatibility_date = \"2026-05-01\"\n",
+        "compatibility_date = \"2026-05-01\"\nd1_queries_per_invocation = 0\n",
+    );
+    let err = parse_str(&zero)
+        .resolve(fake_env(&[]))
+        .expect_err("0 is not a D1 query limit")
+        .to_string();
+    assert!(
+        err.contains("cloudflare.d1_queries_per_invocation")
+            && err.contains("IMPRESSPRESS_D1_QUERIES_PER_INVOCATION"),
+        "{err}"
+    );
+}

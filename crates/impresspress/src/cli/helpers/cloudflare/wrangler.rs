@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 pub use impresspress_core::{
-    ui::assets::ASSET_BASE_URL_VAR, PREPARED_APPLICATION_BUILD_SHA256_VAR,
-    PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
-    RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
+    config_vars::{D1_QUERIES_PER_INVOCATION_DEFAULT, D1_QUERIES_PER_INVOCATION_KEY},
+    ui::assets::ASSET_BASE_URL_VAR,
+    PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR,
+    PREPARED_PLAN_MODULE_SHA256_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
+    RELEASE_ASSET_MANIFEST_SHA256_VAR,
 };
 
 use super::{
@@ -82,6 +84,13 @@ pub struct CloudflareConfig {
     /// deployment that outgrows 100%-capture traffic doesn't have to reach
     /// for a `wrangler_overrides_path` file to dial it down.
     pub head_sampling_rate: f64,
+    /// D1 queries one Worker invocation may run, written into `[vars]` as
+    /// [`D1_QUERIES_PER_INVOCATION_KEY`], resolved by
+    /// [`super::env::RawCloudflareConfig::resolve`] from `impresspress.toml`'s
+    /// `[cloudflare].d1_queries_per_invocation`, defaulting to
+    /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`] (Workers Paid's 1000). A Workers
+    /// Free deploy sets `50`.
+    pub d1_queries_per_invocation: u64,
     /// Cloudflare cron expressions the Worker's `scheduled` handler runs on,
     /// resolved by [`super::env::RawCloudflareConfig::resolve`] from
     /// `impresspress.toml`'s `[cloudflare].crons`, defaulting to
@@ -454,10 +463,18 @@ fn generate_named(
         }
     };
     let path = out_dir.join(file_name);
-    std::fs::write(&path, format!("{header}{body}"))
+    std::fs::write(&path, format!("{header}{D1_QUERIES_NOTE}{body}"))
         .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
+
+/// What the generated `[vars]` value of [`D1_QUERIES_PER_INVOCATION_KEY`]
+/// means and where it is set, for someone reading the file: the value alone
+/// does not say that it depends on the account's plan.
+const D1_QUERIES_NOTE: &str =
+    "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is D1's per-invocation query \
+limit for the account's plan: 1000 on Workers Paid, 50 on Workers Free. Set it with \
+[cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
 
 fn install_prepared_text_rule(root: &mut toml::map::Map<String, toml::Value>) -> Result<()> {
     let rules = root
@@ -594,6 +611,15 @@ fn base_toml(cfg: &CloudflareConfig, role: ConfigRole) -> toml::Value {
     vars.insert(
         ASSET_BASE_URL_VAR.into(),
         Value::String(resolve_asset_base_url(!cfg.r2.bucket_name.is_empty())),
+    );
+    // D1's per-invocation query limit for this account's plan, which the
+    // runtime's statement budget admits every multi-statement write against.
+    // Always written, the Paid default included, so the generated config
+    // states the limit the Worker will run under instead of leaving it to a
+    // runtime default a Free-plan reader would not know applies to them.
+    vars.insert(
+        D1_QUERIES_PER_INVOCATION_KEY.into(),
+        Value::String(cfg.d1_queries_per_invocation.to_string()),
     );
     root.insert("vars".into(), Value::Table(vars));
 
