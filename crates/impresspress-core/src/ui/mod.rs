@@ -564,8 +564,10 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
 }
 
 /// A refusal a page's read met, as [`crate::blocks::crud::db_error_page`]
-/// classified it: the 403 a WRAP denial becomes and the 429 a quota keeps, as
-/// a styled page for a browser and as the refusal itself for an API caller.
+/// classified it: the 403 a WRAP denial becomes, the 429 a quota keeps and
+/// the database statement budget's refusal (which says reloading will not
+/// help), as a styled page for a browser and as the refusal itself for an
+/// API caller.
 ///
 /// It takes a [`crate::blocks::crud::Refusal`], which only
 /// [`crate::blocks::crud::classify_db_error`] builds, because the API branch
@@ -578,6 +580,30 @@ pub fn refused_response(
     let accept = msg.get_meta("http.header.accept");
     if !accept.contains("text/html") || accept.contains("application/json") {
         return wafer_run::OutputStream::error(error);
+    }
+    let is_statement_budget = matches!(
+        error.detail_code(),
+        Some(
+            wafer_block::wire::database::STATEMENT_BUDGET_EXHAUSTED
+                | wafer_block::wire::database::STATEMENT_BUDGET_EXCEEDS_LIMIT
+        )
+    );
+    if is_statement_budget {
+        // Not "try again later": the same page asks for the same statements.
+        let (status, code) = if error.code == wafer_run::ErrorCode::ResourceExhausted {
+            (429, "429")
+        } else {
+            (400, "400")
+        };
+        return status_response(
+            status,
+            "Too much at once",
+            code,
+            "Too much at once",
+            "This page needs more database work than one request may do, so reloading it \
+             will not help. Please let the site administrator know.",
+            ("Go home", "/"),
+        );
     }
     match error.code {
         wafer_run::ErrorCode::PermissionDenied => status_response(

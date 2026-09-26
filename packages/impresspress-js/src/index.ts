@@ -12,7 +12,13 @@ export * from './services/extensions.service';
 export type { ImpresspressConfig } from './types';
 
 // Export the error type and helpers every service throws/maps
-export { ImpresspressError, isNotFoundError, isUnauthorizedError } from './error';
+export {
+  ImpresspressError,
+  isNotFoundError,
+  isStatementBudgetError,
+  isUnauthorizedError,
+  STATEMENT_BUDGET_DETAIL_CODES,
+} from './error';
 export type { SdkErrorCode } from './error';
 
 // Export the one HTTP client every service shares, and its timeout vocabulary

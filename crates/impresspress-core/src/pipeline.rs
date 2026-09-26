@@ -328,7 +328,7 @@ pub async fn handle_request(
                 caller,
                 effective_auth,
                 &project_name,
-                "",
+                &crate::blocks::errors::openapi_description(),
                 &server_url,
             )
         } else {
@@ -1803,6 +1803,45 @@ mod discovery_tests {
             !admin["paths"]["/b/admin/api/users"].is_null(),
             "an admin must receive the Admin endpoints: {}",
             admin["paths"]
+        );
+    }
+
+    /// The document tells a client which errors it must not retry as they
+    /// stand — the statement budget's two codes — keyed on the `code` field
+    /// the SDK surfaces as `detailCode`.
+    #[tokio::test]
+    async fn openapi_documents_the_error_body_and_the_codes_not_to_retry() {
+        let ctx = TestContext::new()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
+        let mut msg = anon_msg("retrieve", "/openapi.json");
+        msg.set_meta("http.header.host", "impresspress.example.com");
+        let out = handle_request(
+            &ctx,
+            msg,
+            InputStream::from_bytes(Vec::new()),
+            None,
+            TEST_JWT_SECRET,
+            false,
+            &AllEnabled,
+            &real_block_infos(),
+            &[],
+        )
+        .await;
+        let doc: serde_json::Value = serde_json::from_slice(&collect_or_panic(out).await.body)
+            .expect("openapi response is valid JSON");
+        let description = doc["info"]["description"]
+            .as_str()
+            .expect("info.description is a string");
+        for code in [
+            wafer_block::wire::database::STATEMENT_BUDGET_EXHAUSTED,
+            wafer_block::wire::database::STATEMENT_BUDGET_EXCEEDS_LIMIT,
+        ] {
+            assert!(description.contains(code), "{code} missing: {description}");
+        }
+        assert!(
+            description.contains("do not retry it automatically"),
+            "{description}"
         );
     }
 

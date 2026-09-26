@@ -120,9 +120,10 @@ async fn a_signup_past_what_the_invocation_has_left_is_a_429_that_writes_nothing
         inner: sqlite.clone(),
         budget: Arc::clone(&budget),
     });
-    let mut wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
-        .await
-        .expect("build impresspress runtime");
+    let mut wafer =
+        build_native_runtime(&infra, database, &HashMap::new(), Default::default(), false)
+            .await
+            .expect("build impresspress runtime");
     let report = boot(
         &mut wafer,
         &NativeBootHooks,
@@ -184,6 +185,13 @@ async fn a_signup_past_what_the_invocation_has_left_is_a_429_that_writes_nothing
     assert!(
         text.contains("this invocation has 1 of its 1000 left"),
         "the refusal says what the request asked for and what was left: {text}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&parts.body).expect("a JSON error body");
+    assert_eq!(
+        body["code"],
+        wafer_block::wire::database::STATEMENT_BUDGET_EXHAUSTED,
+        "the 429 names the budget, so a client can tell it from a rate limit and not retry: \
+         {text}"
     );
 
     assert_eq!(

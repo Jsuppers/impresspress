@@ -54,7 +54,16 @@ use crate::{
 ///   request has left of D1's per-invocation query limit is refused before it
 ///   runs. That 429 means the request did too much, not "retry later": the
 ///   same request retried does the same work and is refused again, so a
-///   client must not auto-retry it. Its message gives the numbers.
+///   client must not auto-retry it. Its message gives the numbers, and its
+///   detail code — `database.statement_budget_exhausted`, the body's `code` —
+///   is kept, because it is the only thing that tells a client this 429 from
+///   a rate limit's.
+/// - [`ErrorCode::InvalidArgument`] carrying the detail code
+///   `database.statement_budget_exceeds_limit` is the same budget refusing a
+///   write larger than a whole invocation's limit: no invocation can run it,
+///   so it is the client's **400**, with its code, rather than a 500. Any
+///   other `InvalidArgument` from the database is a statement this repo
+///   built wrong, and stays internal (see below).
 /// - [`ErrorCode::AlreadyExists`] is a write that duplicates a primary or
 ///   unique key — a request the database refused, not a fault — so it is a
 ///   **409**. Every `DatabaseService` reports a duplicate this way (see
@@ -66,8 +75,9 @@ use crate::{
 ///   label, the cause is logged, and the client gets the sanitized
 ///   `"Internal server error (ref: <id>)"`.
 ///
-/// Domain classifications a *repo* raises (`InvalidArgument`,
-/// `FailedPrecondition`, `Aborted`) are deliberately NOT here: they mean
+/// Domain classifications a *repo* raises (`InvalidArgument` other than the
+/// statement budget's, `FailedPrecondition`, `Aborted`) are deliberately NOT
+/// here: they mean
 /// different things per block, and the three block-private helpers that map
 /// them (`products/handlers/{sellers,offers,product}.rs`) keep their own arms
 /// and delegate only this tail.
@@ -115,12 +125,16 @@ pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str)
 /// answers a 2xx notice ([`crate::ui::swap_error_response`] and its row
 /// variant, or an alert in the swapped body) and puts this reason in it. It is
 /// classified like every other failed database call: a WRAP denial says access
-/// was denied, a quota says the usage limit and a duplicate key says the entry
-/// already exists, with the denial's own text
+/// was denied, the statement budget says the read needs more database work
+/// than one request may do, another quota says the usage limit and a
+/// duplicate key says the entry already exists, with the denial's own text
 /// (grant and table names) logged, never shown. Anything else is logged under
 /// `context` and said as a fault.
 pub fn db_error_notice(error: wafer_run::WaferError, context: &str) -> &'static str {
     match classify_db_error(error, None, context) {
+        DbFailure::Refused(refusal) if refusal.is_statement_budget() => {
+            "it needs more database work than one request may do"
+        }
         DbFailure::Refused(refusal) if refusal.code() == ErrorCode::ResourceExhausted => {
             "it is over its usage limit right now"
         }
@@ -192,9 +206,17 @@ pub struct Refusal(wafer_run::WaferError);
 
 impl Refusal {
     /// The refusal's code: `NotFound`, `PermissionDenied`,
-    /// `ResourceExhausted` or `AlreadyExists`.
+    /// `ResourceExhausted`, `AlreadyExists`, or `InvalidArgument` for a write
+    /// over the whole statement budget.
     pub fn code(&self) -> ErrorCode {
         self.0.code
+    }
+
+    /// Whether the database's statement budget refused the call: the request
+    /// needs more statements than its invocation has left, or than any
+    /// invocation may run. Retrying it unchanged fails the same way.
+    pub fn is_statement_budget(&self) -> bool {
+        is_statement_budget_refusal(&self.0)
     }
 
     /// The error to answer the client with.
@@ -242,6 +264,14 @@ pub fn classify_db_error(
     let refused = |code, message: &str| {
         DbFailure::Refused(Refusal(wafer_run::WaferError::new(code, message)))
     };
+    if is_statement_budget_refusal(&error) {
+        // Rebuilt from the code, the message and the detail code alone: the
+        // detail code is what a client keys "do not retry this" on.
+        let detail = error.detail_code().unwrap_or_default().to_string();
+        return DbFailure::Refused(Refusal(
+            wafer_run::WaferError::new(error.code, error.message).with_detail_code(detail),
+        ));
+    }
     match (error.code, not_found) {
         (ErrorCode::NotFound, Some(label)) => refused(ErrorCode::NotFound, label),
         (ErrorCode::PermissionDenied, _) => {
@@ -263,6 +293,24 @@ pub fn classify_db_error(
         }
         _ => DbFailure::Internal(Fault(error)),
     }
+}
+
+/// Whether `error` is the database's statement-budget refusal, by the detail
+/// code `wafer-core`'s database handler attaches: `ResourceExhausted` with
+/// `database.statement_budget_exhausted`, or `InvalidArgument` with
+/// `database.statement_budget_exceeds_limit`.
+fn is_statement_budget_refusal(error: &wafer_run::WaferError) -> bool {
+    use wafer_block::wire::database::{STATEMENT_BUDGET_EXCEEDS_LIMIT, STATEMENT_BUDGET_EXHAUSTED};
+    matches!(
+        (error.code, error.detail_code()),
+        (
+            ErrorCode::ResourceExhausted,
+            Some(STATEMENT_BUDGET_EXHAUSTED)
+        ) | (
+            ErrorCode::InvalidArgument,
+            Some(STATEMENT_BUDGET_EXCEEDS_LIMIT)
+        )
+    )
 }
 
 /// What a client is told when its write duplicated a unique key and the route
@@ -688,6 +736,79 @@ mod db_error_tests {
             "Database error",
         );
         assert_eq!(output_http_status(denied).await, 403);
+    }
+
+    /// The statement budget's two refusals reach the client with their
+    /// detail code — the body's `code`, the only thing telling this 429
+    /// from a rate limit's — and the over-the-limit one is the client's 400,
+    /// not a sanitized 500.
+    #[tokio::test]
+    async fn db_error_keeps_the_statement_budget_detail_code() {
+        use wafer_block::wire::database::{
+            STATEMENT_BUDGET_EXCEEDS_LIMIT, STATEMENT_BUDGET_EXHAUSTED,
+        };
+        for (code, detail, status) in [
+            (
+                ErrorCode::ResourceExhausted,
+                STATEMENT_BUDGET_EXHAUSTED,
+                429,
+            ),
+            (
+                ErrorCode::InvalidArgument,
+                STATEMENT_BUDGET_EXCEEDS_LIMIT,
+                400,
+            ),
+        ] {
+            let out = db_error_internal(
+                wafer_err(
+                    code,
+                    "batch runs 2 statements; this invocation has 1 of its 1000 left",
+                )
+                .with_detail_code(detail),
+                "Database error",
+            );
+            match out.collect_buffered().await {
+                Err(wafer_run::TerminalNotResponse::Error(e)) => {
+                    assert_eq!(
+                        wafer_block::http_codec::resolve_error_status(&e),
+                        status,
+                        "{detail}"
+                    );
+                    assert_eq!(e.detail_code(), Some(detail));
+                    assert!(e.message.contains("1 of its 1000 left"), "{}", e.message);
+                }
+                other => panic!("expected an error terminal, got {other:?}"),
+            }
+        }
+
+        // Any other `InvalidArgument` is a statement this repo built wrong.
+        let other = db_error_internal(
+            wafer_err(ErrorCode::InvalidArgument, "bad filter"),
+            "Database error",
+        );
+        assert_eq!(output_http_status(other).await, 500);
+    }
+
+    /// A fragment whose read the budget refused says so, not "access denied"
+    /// or "try later".
+    #[test]
+    fn a_budget_refusal_notice_names_the_budget() {
+        use wafer_block::wire::database::{
+            STATEMENT_BUDGET_EXCEEDS_LIMIT, STATEMENT_BUDGET_EXHAUSTED,
+        };
+        for (code, detail) in [
+            (ErrorCode::ResourceExhausted, STATEMENT_BUDGET_EXHAUSTED),
+            (ErrorCode::InvalidArgument, STATEMENT_BUDGET_EXCEEDS_LIMIT),
+        ] {
+            assert_eq!(
+                db_error_notice(wafer_err(code, "x").with_detail_code(detail), "ctx"),
+                "it needs more database work than one request may do"
+            );
+        }
+        assert_eq!(
+            db_error_notice(wafer_err(ErrorCode::ResourceExhausted, "quota"), "ctx"),
+            "it is over its usage limit right now"
+        );
     }
 
     #[tokio::test]
