@@ -123,9 +123,9 @@ use impresspress_core::test_support::source_scan::{
 /// * `blocks/auth/mod.rs` declares `JWT_SECRET_KEY`, the signing secret no
 ///   `ConfigVar` declares: every adapter seeds it at boot, and it sits at the
 ///   block root beside `AUTH_BLOCK_ID`, where they all reach it.
-/// * `builder/boot.rs`, `migration_helper.rs`, `prepared_plan.rs` and
-///   `ui/assets.rs` declare `IMPRESSPRESS_*` infrastructure keys beside the
-///   code that reads them.
+/// * `builder/boot.rs`, `migration_helper.rs`, `password_pepper.rs`,
+///   `prepared_plan.rs` and `ui/assets.rs` declare `IMPRESSPRESS_*`
+///   infrastructure keys beside the code that reads them.
 const DECLARES_A_CONFIG_KEY: &[&str] = &[
     "blocks/auth/config.rs",
     "blocks/auth/mod.rs",
@@ -142,6 +142,7 @@ const DECLARES_A_CONFIG_KEY: &[&str] = &[
     "config_vars.rs",
     "llm_target.rs",
     "migration_helper.rs",
+    "password_pepper.rs",
     "platform_state/variables.rs",
     "prepared_plan.rs",
     "ui/assets.rs",

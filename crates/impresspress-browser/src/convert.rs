@@ -531,7 +531,11 @@ async fn finalise_capped(collected: CappedCollect) -> Result<web_sys::Response, 
 ///
 /// Leading meta no transport can send is answered with the codec's
 /// `unsendable_response` here, before a status or a byte is committed: once
-/// the body streams, a failure can only abort it.
+/// the body streams, a failure can only abort it. Handed the whole leading
+/// meta, the codec's 500 keeps the terminal's sendable security and CORS
+/// headers (`Content-Security-Policy`, `X-Frame-Options`, …) and drops the
+/// ones describing the body it replaces (`Content-Disposition`,
+/// `Content-Encoding`, cache headers), adding `Cache-Control: no-store`.
 fn build_streaming_response(
     leading_meta: Vec<MetaEntry>,
     first_chunk: Vec<u8>,
@@ -539,7 +543,9 @@ fn build_streaming_response(
 ) -> Result<web_sys::Response, JsValue> {
     let parts = match http_codec::response_meta_parts(&leading_meta) {
         Ok(parts) => parts,
-        Err(invalid) => return parts_to_response(http_codec::unsendable_response(&invalid)),
+        Err(invalid) => {
+            return parts_to_response(http_codec::unsendable_response(&leading_meta, &invalid))
+        }
     };
     let status = http_codec::resolve_status(&leading_meta, 200);
     let headers = Headers::new()?;
@@ -835,6 +841,10 @@ mod response_tests {
     /// transport can send (a CR/LF, here) is answered with the codec's 500
     /// before a status or a byte goes out — never streamed without the entry,
     /// and never with it. Once the body streams, a failure can only abort it.
+    ///
+    /// The 500 keeps the terminal's sendable security headers and drops the
+    /// ones describing the body it replaces, so the error page is served
+    /// under the same frame policy as the page it stands in for.
     #[wasm_bindgen_test]
     async fn a_stream_with_an_unsendable_header_is_a_500_before_it_starts() {
         let stream = OutputStream::from_producer(|sink, _cancel| async move {
@@ -843,6 +853,9 @@ mod response_tests {
                 .await;
             let _ = sink
                 .send_meta(meta(META_RESP_CONTENT_TYPE, "application/pdf"))
+                .await;
+            let _ = sink
+                .send_meta(meta("resp.header.X-Frame-Options", "DENY"))
                 .await;
             let _ = sink
                 .send_meta(meta(
@@ -860,7 +873,17 @@ mod response_tests {
         assert_eq!(
             resp.headers().get("content-disposition").unwrap(),
             None,
-            "none of the refused terminal's headers are sent"
+            "the refused header is never sent"
+        );
+        assert_eq!(
+            resp.headers().get("x-frame-options").unwrap().as_deref(),
+            Some("DENY"),
+            "the terminal's security headers survive on its 500"
+        );
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap().as_deref(),
+            Some("no-store"),
+            "the 500 must not be cached"
         );
     }
 

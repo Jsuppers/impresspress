@@ -52,9 +52,10 @@ async fn a_refused_login_is_answered_with_its_detail_code() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
-        .await
-        .expect("build impresspress runtime");
+    let mut wafer =
+        build_native_runtime(&infra, database, &HashMap::new(), Default::default(), false)
+            .await
+            .expect("build impresspress runtime");
     let report = boot(
         &mut wafer,
         &NativeBootHooks,

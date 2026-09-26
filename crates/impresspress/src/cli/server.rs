@@ -13,7 +13,10 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
-use impresspress_core::builder::{self, ImpresspressBuilder};
+use impresspress_core::{
+    builder::{self, ImpresspressBuilder},
+    password_pepper::{self, PasswordPeppers},
+};
 use impresspress_native::{
     collect_app_env_vars, init_tracing, load_dotenv, register_http_listener,
     register_observability_hooks, serve_until_shutdown, InfraConfig,
@@ -59,6 +62,10 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     // declared ones are seeded into the variables table below).
     let app_env = collect_app_env_vars();
 
+    // 4b. The password pepper, straight from the process environment into the
+    // crypto service and nowhere else — see `password_peppers_from_env`.
+    let password_peppers = password_peppers_from_env(|key| std::env::var(key).ok())?;
+
     // 5. Construct the platform database service up front. Native seeds the
     //    variables / block_settings tables BEFORE the wafer exists because its
     //    immutable crypto service + config snapshot need the JWT secret and the
@@ -76,7 +83,8 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     .context("construct database service")?;
 
     // 5b-7b. Seed, load, and build the runtime (shared with the tests).
-    let mut wafer = build_native_runtime(&infra, database, &app_env, run_migrations).await?;
+    let mut wafer =
+        build_native_runtime(&infra, database, &app_env, password_peppers, run_migrations).await?;
 
     // 8. Native-only: register http-listener.
     //    impresspress dispatches all HTTP traffic through the `site-main` flow
@@ -127,6 +135,10 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 /// `ConfigSource` resolves from, beneath the table (see the `config_source`
 /// call below).
 ///
+/// `password_peppers` go to the crypto service and nowhere else: neither
+/// config surface carries them, so no block can read them
+/// ([`password_peppers_from_env`] says why).
+///
 /// `run()` calls this with the service it built from `infra`; the integration
 /// tests call it with a service they seeded first, so what they exercise is
 /// the runtime the binary builds rather than a copy of these steps.
@@ -134,6 +146,7 @@ pub async fn build_native_runtime(
     infra: &InfraConfig,
     database: Arc<dyn DatabaseService>,
     app_env: &HashMap<String, String>,
+    password_peppers: PasswordPeppers,
     run_migrations: bool,
 ) -> anyhow::Result<Wafer> {
     // Create the admin variables / block_settings tables pre-wafer by running
@@ -308,12 +321,16 @@ pub async fn build_native_runtime(
     // seeder would accept take part (`usable_env_exports`), so one it refuses
     // — a blank value, a runtime-owned key, a value its key's declared rule
     // refuses — cannot reach a block's Init this way instead.
+    tracing::info!("{}", password_pepper::describe(&password_peppers));
+    let crypto = impresspress_native::make_jwt_crypto_service(jwt_secret, password_peppers)
+        .context("construct crypto service")?;
+
     let mut block_config =
         impresspress_core::platform_state::variables::usable_env_exports(app_env);
     block_config.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
     let wafer = with_config
         .config_source(Arc::new(wafer_run::StaticConfigSource::new(block_config)))
-        .crypto(impresspress_native::make_jwt_crypto_service(jwt_secret)?)
+        .crypto(crypto)
         .network(impresspress_native::make_fetch_network_service())
         .logger(impresspress_native::make_tracing_logger())
         .block_settings(features)
@@ -330,6 +347,30 @@ pub async fn build_native_runtime(
         .context("build impresspress runtime")?;
 
     Ok(wafer)
+}
+
+/// Read the password pepper from the process environment (`var` answers
+/// `None` for an unset variable; `run` passes `std::env::var`).
+///
+/// The three `IMPRESSPRESS_PASSWORD_PEPPER_*` variables are infrastructure
+/// keys, and the process environment — or the `.env` file `load_dotenv` reads
+/// into it — is the only place they come from. `collect_app_env_vars` never
+/// collects them (they carry no `__`), so they are never seeded into the
+/// variables table, and they are never put on either config surface:
+/// `blocks::config` serves an infrastructure key from the boot map only, so a
+/// block asking for one through the config client finds nothing. A value that
+/// does not parse fails the boot, naming the variable and never echoing a
+/// key; see `impresspress_core::password_pepper` for the rules and for how to
+/// generate, rotate and require a key.
+pub fn password_peppers_from_env(
+    var: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<PasswordPeppers> {
+    password_pepper::password_peppers(
+        var(password_pepper::PASSWORD_PEPPER_KEY_VAR).as_deref(),
+        var(password_pepper::PASSWORD_PEPPER_PREVIOUS_KEYS_VAR).as_deref(),
+        var(password_pepper::PASSWORD_PEPPER_REQUIRED_VAR).as_deref(),
+    )
+    .map_err(|e| anyhow!("{e}"))
 }
 
 /// The block a native server cannot run without: it binds the socket every

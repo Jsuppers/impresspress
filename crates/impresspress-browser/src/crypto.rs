@@ -32,6 +32,16 @@
 //! from `crypto::hash` rather than hardcoded: a constant argon2id string would
 //! have made every mistyped email pay that price.
 //!
+//! **No pepper.** The native and Cloudflare targets can pepper password hashes
+//! with a key held outside the database (`IMPRESSPRESS_PASSWORD_PEPPER_KEY`).
+//! This target runs in a visitor's browser, where no value can be kept from
+//! the visitor, so a pepper would protect nothing and it holds none: it
+//! writes unpeppered PBKDF2 (which `wafer-block-crypto` never peppers anyway)
+//! and verifies with an empty [`PasswordPeppers`]. A peppered credential
+//! carried in from a server deployment (a dev-sandbox import of its data)
+//! therefore fails here with `CryptoError::Pepper` — the key it names is
+//! missing — never as a wrong password.
+//!
 //! **JWTs.** Signing, verification and the per-block HKDF key derivation for
 //! `sign_for`/`verify_for` delegate to [`Argon2JwtCryptoService`], the same
 //! HS256 engine the native runtime and the Cloudflare Worker use, so tokens
@@ -59,7 +69,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use wafer_block_crypto::{
-    primitives::{self, PasswordScheme, PBKDF2_SHA256_RECOMMENDED_ITERATIONS},
+    primitives::{self, PasswordPeppers, PasswordScheme, PBKDF2_SHA256_RECOMMENDED_ITERATIONS},
     service::Argon2JwtCryptoService,
 };
 use wafer_core::interfaces::crypto::service::{CryptoError, CryptoService};
@@ -122,14 +132,15 @@ impl BrowserCryptoService {
     }
 }
 
+#[wafer_block::wafer_async_trait]
 impl CryptoService for BrowserCryptoService {
     /// Write a new credential under [`PASSWORD_SCHEME`]. The hand-rolled
     /// PBKDF2 body this replaced produced a byte-identical string (same
     /// `$pbkdf2-sha256$i=N$salt$dk` layout, same 16-byte salt, same 32-byte
     /// derived key, same `base64ct` standard alphabet), so no stored
     /// credential moves — see `password_parity`.
-    fn hash(&self, password: &str) -> Result<String, CryptoError> {
-        primitives::hash_password_with(password, PASSWORD_SCHEME)
+    async fn hash(&self, password: &str) -> Result<String, CryptoError> {
+        primitives::hash_password_with(password, PASSWORD_SCHEME, &PasswordPeppers::default())
     }
 
     /// Verify against whichever scheme the **stored hash** names, not the one
@@ -144,28 +155,28 @@ impl CryptoService for BrowserCryptoService {
     /// - it recognised `pbkdf2-sha256` and nothing else, so an argon2id
     ///   credential written by the native or Cloudflare runtime against the
     ///   same workspace could never be verified here.
-    fn compare_hash(&self, password: &str, hash_str: &str) -> Result<(), CryptoError> {
-        primitives::verify_password_any_scheme(password, hash_str)
+    async fn compare_hash(&self, password: &str, hash_str: &str) -> Result<(), CryptoError> {
+        primitives::verify_password_any_scheme(password, hash_str, &PasswordPeppers::default())
     }
 
-    fn sign_for(
+    async fn sign_for(
         &self,
         block_id: &str,
         claims: BTreeMap<String, serde_json::Value>,
         expiry: Duration,
     ) -> Result<String, CryptoError> {
-        self.jwt()?.sign_for(block_id, claims, expiry)
+        self.jwt()?.sign_for(block_id, claims, expiry).await
     }
 
-    fn verify_for(
+    async fn verify_for(
         &self,
         block_id: &str,
         token: &str,
     ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
-        self.jwt()?.verify_for(block_id, token)
+        self.jwt()?.verify_for(block_id, token).await
     }
 
-    fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+    async fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
         primitives::random_bytes(n)
     }
 }
@@ -214,20 +225,25 @@ mod password_parity {
     /// Fixture parity, direction 1: a credential hashed by the OLD browser
     /// code still verifies.
     #[wasm_bindgen_test]
-    fn a_legacy_browser_hash_still_verifies() {
+    async fn a_legacy_browser_hash_still_verifies() {
         svc()
             .compare_hash(LEGACY_PASSWORD, LEGACY_HASH_600K)
+            .await
             .expect("a credential stored by the pre-change browser must still verify");
         svc()
             .compare_hash(LEGACY_PASSWORD, LEGACY_HASH_10K)
+            .await
             .expect("the iteration count comes from the stored string, not from the service");
     }
 
     /// …and still rejects the wrong password, as a mismatch rather than as a
     /// malformed-hash error.
     #[wasm_bindgen_test]
-    fn a_legacy_browser_hash_rejects_the_wrong_password() {
-        match svc().compare_hash("not the password", LEGACY_HASH_10K) {
+    async fn a_legacy_browser_hash_rejects_the_wrong_password() {
+        match svc()
+            .compare_hash("not the password", LEGACY_HASH_10K)
+            .await
+        {
             Err(CryptoError::PasswordMismatch) => {}
             other => panic!("expected PasswordMismatch, got {other:?}"),
         }
@@ -238,14 +254,15 @@ mod password_parity {
     /// not start writing argon2id, which takes minutes in single-threaded
     /// wasm.
     #[wasm_bindgen_test]
-    fn a_new_hash_is_pbkdf2_and_verifies() {
+    async fn a_new_hash_is_pbkdf2_and_verifies() {
         let svc = svc();
-        let hash = svc.hash(LEGACY_PASSWORD).expect("hash");
+        let hash = svc.hash(LEGACY_PASSWORD).await.expect("hash");
         assert!(
             hash.starts_with("$pbkdf2-sha256$i=600000$"),
             "the browser must keep writing PBKDF2 at 600k iterations: {hash}"
         );
         svc.compare_hash(LEGACY_PASSWORD, &hash)
+            .await
             .expect("a freshly written credential must verify");
     }
 
@@ -255,9 +272,9 @@ mod password_parity {
     /// eight bytes verified at 64 bits. Upstream fixed this by deriving a
     /// fixed 32 bytes and refusing anything else as malformed.
     #[wasm_bindgen_test]
-    fn a_truncated_hash_is_refused_instead_of_verifying_at_64_bits() {
+    async fn a_truncated_hash_is_refused_instead_of_verifying_at_64_bits() {
         let truncated = "$pbkdf2-sha256$i=10000$AAECAwQFBgcICQoLDA0ODw==$2flfZcLfnSg=";
-        match svc().compare_hash(LEGACY_PASSWORD, truncated) {
+        match svc().compare_hash(LEGACY_PASSWORD, truncated).await {
             Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("32 bytes"),
                 "the refusal must name the required derived-key length: {msg}"
@@ -272,7 +289,7 @@ mod password_parity {
     /// native and Cloudflare runtimes write. Refusing to verify it locked
     /// such a user out and reported it as a wrong password.
     #[wasm_bindgen_test]
-    fn an_argon2_hash_written_by_another_target_verifies_here() {
+    async fn an_argon2_hash_written_by_another_target_verifies_here() {
         let argon2 = wafer_block_crypto::primitives::hash_password(
             LEGACY_PASSWORD,
             wafer_block_crypto::primitives::Argon2Cost::Constrained,
@@ -280,6 +297,7 @@ mod password_parity {
         .expect("argon2 hash");
         svc()
             .compare_hash(LEGACY_PASSWORD, &argon2)
+            .await
             .expect("an argon2id credential from another target must verify");
     }
 
@@ -287,8 +305,11 @@ mod password_parity {
     /// mismatch: reporting it as a mismatch tells the logs that a user who
     /// cannot possibly sign in keeps mistyping.
     #[wasm_bindgen_test]
-    fn an_unknown_scheme_is_a_malformed_hash_not_a_mismatch() {
-        match svc().compare_hash(LEGACY_PASSWORD, "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA") {
+    async fn an_unknown_scheme_is_a_malformed_hash_not_a_mismatch() {
+        match svc()
+            .compare_hash(LEGACY_PASSWORD, "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA")
+            .await
+        {
             Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("unrecognised password hash scheme"),
                 "unexpected message: {msg}"
@@ -303,12 +324,14 @@ mod password_parity {
     /// bootstrap admin's password. Coupling the two would make first-run
     /// admin creation fail whenever the secret is absent or short.
     #[wasm_bindgen_test]
-    fn hashing_works_before_the_jwt_secret_is_installed() {
+    async fn hashing_works_before_the_jwt_secret_is_installed() {
         let svc = BrowserCryptoService::new(String::new());
         let hash = svc
             .hash(LEGACY_PASSWORD)
+            .await
             .expect("hash without a JWT secret");
         svc.compare_hash(LEGACY_PASSWORD, &hash)
+            .await
             .expect("verify without a JWT secret");
         assert!(
             svc.sign_for(
@@ -316,6 +339,7 @@ mod password_parity {
                 std::collections::BTreeMap::new(),
                 std::time::Duration::from_secs(60)
             )
+            .await
             .is_err(),
             "signing, unlike hashing, must still refuse an empty secret"
         );
