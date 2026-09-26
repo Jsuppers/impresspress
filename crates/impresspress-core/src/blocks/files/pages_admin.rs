@@ -244,7 +244,9 @@ impl From<&repo::buckets::BucketRow> for AdminBucketRow {
 /// "Created By" and the quotas table's "User" id cells): a fixed-length value
 /// then has a fixed width, so the columns do not re-flow as the value changes. That matters to the
 /// visual-baseline suite, which masks these per-run values — with a
-/// proportional font a different id moved every column to its right.
+/// proportional font a different id moved every column to its right. The
+/// date is a `<time>`, which the suite masks wherever it appears; the owner
+/// id is masked by its cell inside a `tr[data-bucket]` row.
 pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
     if rows.is_empty() {
         return html! {
@@ -267,7 +269,7 @@ pub fn render_admin_buckets_table(rows: &[AdminBucketRow]) -> Markup {
                         td data-label="Public" {
                             (components::status_badge(if r.public { "public" } else { "private" }))
                         }
-                        td data-label="Created" .text-muted .text-sm .font-mono { (r.created_at_short) }
+                        td data-label="Created" .text-muted .text-sm .font-mono { time datetime=(r.created_at_short) { (r.created_at_short) } }
                     }
                 }
             }
@@ -694,6 +696,11 @@ mod tests {
                 "{label} cell is not monospaced: {tag}"
             );
         }
+        // The visual-baseline suite masks dates by the `<time>` element alone.
+        assert!(
+            html.contains(r#"<time datetime="2026-09-25">2026-09-25</time>"#),
+            "the Created date must be a <time>: {html}"
+        );
     }
 
     /// One capped, expiring share row, as the repo decodes it.
