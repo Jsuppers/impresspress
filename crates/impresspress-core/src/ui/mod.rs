@@ -1637,7 +1637,9 @@ mod tests {
     ///
     /// - `"…"` / `'…'`, and `\"…\"` / `\'…\'` inside a Rust string holding
     ///   raw HTML — literal text, with a backslash escaping the next
-    ///   character. A placeholder inside it is a splice: `${…}` in a JS
+    ///   character, decoded. A Rust raw string (`r"…"`, `r#"…"#`, any
+    ///   number of `#`s) reads the same, with no escapes. A placeholder
+    ///   inside either is a splice: `${…}` in a JS
     ///   template literal, and `{name}` / `{}` / `{:…}` in a Rust format
     ///   string, where `{{` is one literal `{`. A JSON object never opens
     ///   like a placeholder (`{"` or `{{`), and a
@@ -1654,21 +1656,30 @@ mod tests {
             literal: String::new(),
             spliced: false,
         };
+        if let Some((body, close)) = raw_string_opener(value) {
+            htmx_quoted(&mut out, body, &close, true, false);
+            return Some(out);
+        }
         match value.chars().next()? {
             q @ ('"' | '\'') => {
-                htmx_quoted(&mut out, &value[1..], &q.to_string(), true);
+                htmx_quoted(&mut out, &value[1..], &q.to_string(), true, true);
             }
             '\\' if value[1..].starts_with(['"', '\'']) => {
                 let close = &value[..2];
-                htmx_quoted(&mut out, &value[2..], close, true);
+                htmx_quoted(&mut out, &value[2..], close, true, true);
             }
             '(' | '[' => out.spliced = true,
             '{' => {
                 let mut body = &value[1..];
                 loop {
                     body = body.trim_start();
-                    if let Some(s) = body.strip_prefix('"') {
-                        body = htmx_quoted(&mut out, s, "\"", false);
+                    if let Some((s, close)) = raw_string_opener(body) {
+                        body = htmx_quoted(&mut out, s, &close, false, false);
+                        if out.spliced {
+                            break;
+                        }
+                    } else if let Some(s) = body.strip_prefix('"') {
+                        body = htmx_quoted(&mut out, s, "\"", false, true);
                         if out.spliced {
                             break;
                         }
@@ -1690,24 +1701,75 @@ mod tests {
         Some(out)
     }
 
+    /// When `src` opens a Rust raw string — `r"`, `r#"`, `r##"`, … — the
+    /// text after the opener and the closer that ends it (`"` and as many
+    /// `#`s).
+    fn raw_string_opener(src: &str) -> Option<(&str, String)> {
+        let rest = src.strip_prefix('r')?;
+        let hashes = rest.chars().take_while(|&c| c == '#').count();
+        let body = rest[hashes..].strip_prefix('"')?;
+        Some((body, format!("\"{}", "#".repeat(hashes))))
+    }
+
     /// Read one quoted literal of an [`HtmxValue`] into `out`, from just
     /// after its opener up to `close`, and return what follows the closer —
     /// or `""` once a placeholder splice is met, when `placeholders` says the
-    /// literal is one that can hold them.
+    /// literal is one that can hold them. With `escapes`, a backslash escape
+    /// is decoded to the character it stands for (`\t` is a tab, which htmx's
+    /// trim removes before it tests for `js:`); a raw string has none.
     fn htmx_quoted<'a>(
         out: &mut HtmxValue,
         body: &'a str,
         close: &str,
         placeholders: bool,
+        escapes: bool,
     ) -> &'a str {
-        let mut chars = body.char_indices();
+        let mut chars = body.char_indices().peekable();
         while let Some((at, c)) = chars.next() {
             if body[at..].starts_with(close) {
                 return &body[at + close.len()..];
             }
-            if c == '\\' {
-                if let Some((_, escaped)) = chars.next() {
-                    out.literal.push(escaped);
+            if escapes && c == '\\' {
+                let Some((_, escaped)) = chars.next() else {
+                    break;
+                };
+                match escaped {
+                    'n' => out.literal.push('\n'),
+                    't' => out.literal.push('\t'),
+                    'r' => out.literal.push('\r'),
+                    '0' => out.literal.push('\0'),
+                    'x' | 'u' => {
+                        // `\x41` or `\u{41}`: the hex digits, braces aside.
+                        let mut hex = String::new();
+                        while let Some(&(_, h)) = chars.peek() {
+                            let braced = escaped == 'u' && matches!(h, '{' | '}');
+                            if !(h.is_ascii_hexdigit() || braced)
+                                || (escaped == 'x' && hex.len() == 2)
+                            {
+                                break;
+                            }
+                            chars.next();
+                            if h == '}' {
+                                break;
+                            }
+                            if h != '{' {
+                                hex.push(h);
+                            }
+                        }
+                        if let Some(ch) =
+                            u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                        {
+                            out.literal.push(ch);
+                        }
+                    }
+                    // A line continuation: the newline and the indentation
+                    // after it are not part of the string.
+                    '\n' => {
+                        while chars.peek().is_some_and(|&(_, w)| w.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    other => out.literal.push(other),
                 }
                 continue;
             }
@@ -1766,6 +1828,15 @@ mod tests {
             r#"`<div {hx}trigger="${trigger}">`"#,
             r#""<div {hx}vals=\"js:{a: 1}\">""#,
             r#"<div {hx}trigger=click[ctrlKey]>"#,
+            r##"div {hx}trigger=r#"click[ctrlKey]"#"##,
+            r##"div {hx}vals=r#"js:{a:1}"#"##,
+            r###"div {hx}vals=r##"js:{"a": "#"}"##"###,
+            r#"div {hx}vals=r"javascript:{a:1}""#,
+            r##"div {hx}headers={r#"js:"# (expr)}"##,
+            r#"div {hx}vals="\tjs:{a:1}""#,
+            r#"div {hx}vals="\n  js:{a:1}""#,
+            r#"div {hx}vals="\u{20}js:{a:1}""#,
+            r#"div {hx}vals={"\x20" "js:{a:1}"}"#,
         ] {
             assert!(
                 !htmx_eval_attributes(&fixture(spelling)).is_empty(),
@@ -1787,6 +1858,9 @@ mod tests {
             r#"format!("<div {hx}vals='{{\"id\": {id}}}'>")"#,
             r#""<div {hx}trigger=\"load\">""#,
             r#"<div {hx}trigger=load>"#,
+            r##"div {hx}vals=r#"{"a": 1}"#"##,
+            r##"div {hx}trigger=r#"load"#"##,
+            r#"div {hx}vals="\tjsx""#,
         ] {
             assert!(
                 htmx_eval_attributes(&fixture(innocent)).is_empty(),
