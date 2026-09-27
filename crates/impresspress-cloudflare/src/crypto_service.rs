@@ -19,11 +19,18 @@
 //! credential written by the browser target — a dev-sandbox export, a
 //! workspace opened under two runtimes — verifies here instead of being
 //! reported as a wrong password.
+//!
+//! Passwords are peppered with the [`PasswordPeppers`] the Worker read from
+//! its own secrets (see `CfEnvironment::password_peppers`). The password half
+//! calls the `primitives` with them directly rather than going through
+//! [`Argon2JwtCryptoService::with_password_peppers`], because the JWT engine
+//! is built lazily and fails without a usable JWT secret, and hashing must
+//! not depend on that secret.
 
 use std::{collections::BTreeMap, time::Duration};
 
 use wafer_block_crypto::{
-    primitives::{self, Argon2Cost, PasswordScheme},
+    primitives::{self, Argon2Cost, PasswordPeppers, PasswordScheme},
     service::Argon2JwtCryptoService,
 };
 use wafer_core::interfaces::crypto::service::{CryptoError, CryptoService};
@@ -45,13 +52,17 @@ pub struct ImpresspressCryptoService {
     /// call after the first, so a missing/short secret still fails
     /// consistently rather than only on the first call.
     jwt_engine: std::sync::OnceLock<Result<Argon2JwtCryptoService, String>>,
+    /// The pepper keys new hashes are peppered with and stored hashes are
+    /// verified with, and whether an unpeppered stored hash is refused.
+    peppers: PasswordPeppers,
 }
 
 impl ImpresspressCryptoService {
-    pub fn new(jwt_secret: String) -> Self {
+    pub fn new(jwt_secret: String, peppers: PasswordPeppers) -> Self {
         Self {
             jwt_secret,
             jwt_engine: std::sync::OnceLock::new(),
+            peppers,
         }
     }
 
@@ -74,9 +85,10 @@ impl ImpresspressCryptoService {
 /// ignores it — see [`CryptoService::compare_hash`] below.
 const PASSWORD_SCHEME: PasswordScheme = PasswordScheme::Argon2(Argon2Cost::Constrained);
 
+#[wafer_block::wafer_async_trait]
 impl CryptoService for ImpresspressCryptoService {
-    fn hash(&self, password: &str) -> Result<String, CryptoError> {
-        primitives::hash_password_with(password, PASSWORD_SCHEME)
+    async fn hash(&self, password: &str) -> Result<String, CryptoError> {
+        primitives::hash_password_with(password, PASSWORD_SCHEME, &self.peppers)
     }
 
     /// Verify against whichever scheme the **stored hash** names, not the one
@@ -89,28 +101,28 @@ impl CryptoService for ImpresspressCryptoService {
     /// the logs said the user kept mistyping their password. The shared
     /// dispatcher recognises both schemes and answers a distinct
     /// `MalformedHash` for one it does not know, which is never an accept.
-    fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
-        primitives::verify_password_any_scheme(password, hash)
+    async fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+        primitives::verify_password_any_scheme(password, hash, &self.peppers)
     }
 
-    fn sign_for(
+    async fn sign_for(
         &self,
         block_id: &str,
         claims: BTreeMap<String, serde_json::Value>,
         expiry: Duration,
     ) -> Result<String, CryptoError> {
-        self.jwt()?.sign_for(block_id, claims, expiry)
+        self.jwt()?.sign_for(block_id, claims, expiry).await
     }
 
-    fn verify_for(
+    async fn verify_for(
         &self,
         block_id: &str,
         token: &str,
     ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
-        self.jwt()?.verify_for(block_id, token)
+        self.jwt()?.verify_for(block_id, token).await
     }
 
-    fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+    async fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
         primitives::random_bytes(n)
     }
 }
@@ -123,26 +135,33 @@ mod password_parity {
     use wafer_core::interfaces::crypto::service::{CryptoError, CryptoService};
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use super::ImpresspressCryptoService;
+    use super::{ImpresspressCryptoService, PasswordPeppers};
 
     fn svc() -> ImpresspressCryptoService {
-        ImpresspressCryptoService::new("test-secret-padded-to-32-bytes-or-more".to_string())
+        ImpresspressCryptoService::new(
+            "test-secret-padded-to-32-bytes-or-more".to_string(),
+            PasswordPeppers::default(),
+        )
     }
 
     /// A credential this Worker wrote before the change still verifies, and
     /// this target keeps writing argon2id at the constrained cost — the
     /// Workers Free plan's CPU limit rules out the default one.
     #[wasm_bindgen_test]
-    fn a_worker_written_hash_is_constrained_argon2id_and_verifies() {
+    async fn a_worker_written_hash_is_constrained_argon2id_and_verifies() {
         let svc = svc();
-        let hash = svc.hash("correct horse battery staple").expect("hash");
+        let hash = svc
+            .hash("correct horse battery staple")
+            .await
+            .expect("hash");
         assert!(
             hash.starts_with("$argon2id$v=19$m=4096,t=2,p=1$"),
             "the Worker must keep writing constrained argon2id: {hash}"
         );
         svc.compare_hash("correct horse battery staple", &hash)
+            .await
             .expect("a freshly written credential must verify");
-        match svc.compare_hash("wrong", &hash) {
+        match svc.compare_hash("wrong", &hash).await {
             Err(CryptoError::PasswordMismatch) => {}
             other => panic!("expected PasswordMismatch, got {other:?}"),
         }
@@ -164,12 +183,13 @@ mod password_parity {
     /// — a native account at the default cost included — verifies in the
     /// Worker, and a wrong password against it is a mismatch.
     #[wasm_bindgen_test]
-    fn hashes_up_to_the_memory_ceiling_verify_in_the_worker() {
+    async fn hashes_up_to_the_memory_ceiling_verify_in_the_worker() {
         let svc = svc();
         for hash in KAT_BY_CLASS {
             svc.compare_hash(KAT_PASSWORD, hash)
+                .await
                 .unwrap_or_else(|e| panic!("{hash}: {e:?}"));
-            match svc.compare_hash("wrong", hash) {
+            match svc.compare_hash("wrong", hash).await {
                 Err(CryptoError::PasswordMismatch) => {}
                 other => panic!("{hash}: expected PasswordMismatch, got {other:?}"),
             }
@@ -181,9 +201,9 @@ mod password_parity {
     /// the isolate's memory, and it is refused as a hash this runtime will
     /// not run, never as a wrong password.
     #[wasm_bindgen_test]
-    fn a_hash_above_the_memory_ceiling_is_refused_not_derived() {
+    async fn a_hash_above_the_memory_ceiling_is_refused_not_derived() {
         const OVER_CEILING: &str = "$argon2id$v=19$m=65536,t=3,p=4$AAECAwQFBgcICQoLDA0ODw$ig/1Ydv8lGLja+cEry2Q+/MeqvCw1xexf4oGjq9DiAQ";
-        match svc().compare_hash(KAT_PASSWORD, OVER_CEILING) {
+        match svc().compare_hash(KAT_PASSWORD, OVER_CEILING).await {
             Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("m=65536 exceeds the ceiling of 47104"),
                 "unexpected message: {msg}"
@@ -198,13 +218,14 @@ mod password_parity {
     /// mistyping their password. Fixture: password `correct horse battery
     /// staple`, salt `00..0f`, `i=10000`.
     #[wasm_bindgen_test]
-    fn a_pbkdf2_hash_written_by_the_browser_target_verifies_here() {
+    async fn a_pbkdf2_hash_written_by_the_browser_target_verifies_here() {
         const BROWSER_HASH: &str =
             "$pbkdf2-sha256$i=10000$AAECAwQFBgcICQoLDA0ODw==$2flfZcLfnShdJogjAMpb4p4+1QBVZmODXExi4nBRUCI=";
         svc()
             .compare_hash("correct horse battery staple", BROWSER_HASH)
+            .await
             .expect("a PBKDF2 credential from the browser target must verify");
-        match svc().compare_hash("wrong", BROWSER_HASH) {
+        match svc().compare_hash("wrong", BROWSER_HASH).await {
             Err(CryptoError::PasswordMismatch) => {}
             other => panic!("expected PasswordMismatch, got {other:?}"),
         }
@@ -215,8 +236,11 @@ mod password_parity {
     /// it as one tells the logs that a user who can never sign in keeps
     /// mistyping.
     #[wasm_bindgen_test]
-    fn an_unknown_scheme_is_a_malformed_hash_not_a_mismatch() {
-        match svc().compare_hash("pw", "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA") {
+    async fn an_unknown_scheme_is_a_malformed_hash_not_a_mismatch() {
+        match svc()
+            .compare_hash("pw", "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA")
+            .await
+        {
             Err(CryptoError::MalformedHash(msg)) => assert!(
                 msg.contains("unrecognised password hash scheme"),
                 "unexpected message: {msg}"
@@ -229,10 +253,11 @@ mod password_parity {
     /// Worker constructs this service before config is necessarily complete,
     /// and `jwt()` fails on a missing or short secret by design.
     #[wasm_bindgen_test]
-    fn hashing_works_without_a_usable_jwt_secret() {
-        let svc = ImpresspressCryptoService::new(String::new());
-        let hash = svc.hash("pw").expect("hash without a JWT secret");
+    async fn hashing_works_without_a_usable_jwt_secret() {
+        let svc = ImpresspressCryptoService::new(String::new(), PasswordPeppers::default());
+        let hash = svc.hash("pw").await.expect("hash without a JWT secret");
         svc.compare_hash("pw", &hash)
+            .await
             .expect("verify without a JWT secret");
         assert!(
             svc.sign_for(
@@ -240,6 +265,7 @@ mod password_parity {
                 std::collections::BTreeMap::new(),
                 std::time::Duration::from_secs(60)
             )
+            .await
             .is_err(),
             "signing, unlike hashing, must still refuse an empty secret"
         );

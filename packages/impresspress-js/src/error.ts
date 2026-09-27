@@ -49,12 +49,33 @@ export type SdkErrorCode =
   /** The OAuth popup closed before the flow completed. */
   | "popup_closed";
 
+/**
+ * Detail codes the database attaches when a request needs more database
+ * statements than one request may run (on Cloudflare D1, its per-invocation
+ * query limit). Sent again unchanged, such a request fails the same way, so
+ * it must not be retried automatically — a 429 carrying
+ * `database.statement_budget_exhausted` is NOT a rate limit. Send less per
+ * request instead (fewer rows in one call). See {@link isStatementBudgetError}.
+ */
+export const STATEMENT_BUDGET_DETAIL_CODES = [
+  /** 429: the request asked for more statements than it had left. */
+  "database.statement_budget_exhausted",
+  /** 400: one write is larger than the whole per-request limit. */
+  "database.statement_budget_exceeds_limit",
+] as const;
+
 export class ImpresspressError extends Error {
   /** Coarse wafer error code from the `error` field (e.g. "NotFound"). */
   public readonly code: string;
   /** HTTP status code, or 0 for network/timeout/abort failures. */
   public readonly status: number;
-  /** Fine-grained impresspress error code, when the server attached one. */
+  /**
+   * Fine-grained error code, when the server attached one: an impresspress
+   * code (`"invalid_credentials"`, `"rate_limit_exceeded"`) or a namespaced
+   * runtime code (`"database.statement_budget_exhausted"`). Branch on this
+   * rather than on `status`: two errors can share a status and differ in
+   * whether a retry can succeed.
+   */
   public readonly detailCode?: string;
   /** Raw parsed response body, if any. */
   public readonly data: unknown;
@@ -93,4 +114,18 @@ export function isNotFoundError(error: unknown): error is ImpresspressError {
  */
 export function isUnauthorizedError(error: unknown): error is ImpresspressError {
   return error instanceof ImpresspressError && error.status === 401;
+}
+
+/**
+ * True for the database's statement-budget refusal (see
+ * {@link STATEMENT_BUDGET_DETAIL_CODES}): the request did more database work
+ * than one request may. Do not retry it as it stands — unlike a
+ * `rate_limit_exceeded` 429, waiting does not help.
+ */
+export function isStatementBudgetError(error: unknown): error is ImpresspressError {
+  return (
+    error instanceof ImpresspressError &&
+    error.detailCode !== undefined &&
+    (STATEMENT_BUDGET_DETAIL_CODES as readonly string[]).includes(error.detailCode)
+  );
 }

@@ -223,6 +223,33 @@ pub(crate) fn impresspress_error_code_to_wafer(code: ErrorCode) -> wafer_run::Er
     }
 }
 
+/// The `info.description` of the `/openapi.json` document: how an error
+/// answers, and which ones a client must not retry as they stand.
+///
+/// It lives in the document rather than on each operation because
+/// `wafer_core::discovery::generate_openapi` describes each operation's `200`
+/// only; every route shares this one error shape.
+pub fn openapi_description() -> String {
+    use wafer_block::wire::database::{STATEMENT_BUDGET_EXCEEDS_LIMIT, STATEMENT_BUDGET_EXHAUSTED};
+    let rate_limited = ErrorCode::RateLimitExceeded.as_str();
+    format!(
+        "## Errors\n\n\
+         A failed request is answered with a JSON body \
+         `{{\"error\": \"<class>\", \"message\": \"<text>\"}}`, plus \
+         `\"code\": \"<detail code>\"` when the server can say precisely what \
+         went wrong. `error` is the coarse class (`NotFound`, `ResourceExhausted`, \
+         ...) that sets the HTTP status; branch on `code` when it is present.\n\n\
+         ## Retrying\n\n\
+         - `{STATEMENT_BUDGET_EXHAUSTED}` (429) and \
+         `{STATEMENT_BUDGET_EXCEEDS_LIMIT}` (400): the request needs more database \
+         statements than one request may run. Sent again unchanged it fails the \
+         same way, so do not retry it automatically: send less per request (fewer \
+         rows in one call).\n\
+         - `{rate_limited}` (429): too many requests from this client. Wait the \
+         seconds the `Retry-After` header gives, then retry.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

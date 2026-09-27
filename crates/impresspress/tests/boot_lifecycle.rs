@@ -77,7 +77,7 @@ async fn build_runtime_with_env(
         .await
         .expect("construct sqlite database service");
 
-    let wafer = build_native_runtime(&infra, database.clone(), app_env, false)
+    let wafer = build_native_runtime(&infra, database.clone(), app_env, Default::default(), false)
         .await
         .expect("build impresspress runtime");
 
@@ -317,6 +317,7 @@ async fn a_prepared_plans_grants_reach_the_sealed_runtime() {
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "prepared-grants-test-jwt-secret-value".to_string(),
+                Default::default(),
             )
             .expect("jwt crypto service"),
         )
@@ -381,6 +382,7 @@ async fn a_malformed_deployment_grant_fails_the_build() {
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "malformed-grant-test-jwt-secret-value".to_string(),
+                Default::default(),
             )
             .expect("jwt crypto service"),
         )

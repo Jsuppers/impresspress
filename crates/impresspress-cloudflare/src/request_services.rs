@@ -806,34 +806,35 @@ impl ConfigService for ScopedConfigService {
 #[derive(Default)]
 pub(crate) struct ScopedCryptoService;
 
+#[wafer_block::wafer_async_trait]
 impl CryptoService for ScopedCryptoService {
-    fn hash(&self, password: &str) -> Result<String, CryptoError> {
-        crypto()?.hash(password)
+    async fn hash(&self, password: &str) -> Result<String, CryptoError> {
+        crypto()?.hash(password).await
     }
 
-    fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
-        crypto()?.compare_hash(password, hash)
+    async fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+        crypto()?.compare_hash(password, hash).await
     }
 
-    fn sign_for(
+    async fn sign_for(
         &self,
         block_id: &str,
         claims: BTreeMap<String, serde_json::Value>,
         expiry: Duration,
     ) -> Result<String, CryptoError> {
-        crypto()?.sign_for(block_id, claims, expiry)
+        crypto()?.sign_for(block_id, claims, expiry).await
     }
 
-    fn verify_for(
+    async fn verify_for(
         &self,
         block_id: &str,
         token: &str,
     ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
-        crypto()?.verify_for(block_id, token)
+        crypto()?.verify_for(block_id, token).await
     }
 
-    fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
-        crypto()?.random_bytes(n)
+    async fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+        crypto()?.random_bytes(n).await
     }
 }
 
@@ -1091,7 +1092,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn nested_scope_restores_outer_request_and_then_fails_closed() {
+    async fn nested_scope_restores_outer_request_and_then_fails_closed() {
         let outer = RequestServices::marker(1);
         let inner = RequestServices::marker(2);
         scope_sync(outer, || {
@@ -1101,7 +1102,7 @@ mod tests {
         });
         assert_eq!(marker(), None);
         assert!(ScopedConfigService.get("anything").is_none());
-        assert!(ScopedCryptoService.random_bytes(1).is_err());
+        assert!(ScopedCryptoService.random_bytes(1).await.is_err());
     }
 
     #[wasm_bindgen_test]

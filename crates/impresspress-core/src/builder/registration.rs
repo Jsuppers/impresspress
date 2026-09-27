@@ -115,7 +115,12 @@ impl ImpresspressBuilder {
             crate::config_vars::DEFAULT_CSP_DIRECTIVES,
         );
 
-        // 3. Create runtime
+        // 3. Create runtime. No `init_timeout` cap, and no block of this repo
+        // declares an init budget, so every Init runs as long as it takes: a
+        // block's Init runs its migrations, a retry replays them all from the
+        // start, and a budget shorter than the slowest one on a large database
+        // (admin's and messages' backfills on Postgres) would keep that block
+        // from ever initializing.
         let config_source = self
             .config_source
             .clone()

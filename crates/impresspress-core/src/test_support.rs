@@ -3105,22 +3105,23 @@ impl PinnedMintCrypto {
     }
 }
 
+#[wafer_block::wafer_async_trait]
 impl CryptoService for PinnedMintCrypto {
-    fn hash(&self, password: &str) -> Result<String, CryptoError> {
-        self.inner.hash(password)
+    async fn hash(&self, password: &str) -> Result<String, CryptoError> {
+        self.inner.hash(password).await
     }
 
-    fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
-        self.inner.compare_hash(password, hash)
+    async fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+        self.inner.compare_hash(password, hash).await
     }
 
-    fn sign_for(
+    async fn sign_for(
         &self,
         block_id: &str,
         claims: BTreeMap<String, serde_json::Value>,
         expiry: std::time::Duration,
     ) -> Result<String, CryptoError> {
-        let signed = self.inner.sign_for(block_id, claims, expiry)?;
+        let signed = self.inner.sign_for(block_id, claims, expiry).await?;
         let derived = wafer_block_crypto::primitives::derive_block_key(
             CRYPTO_BLOCK_JWT_SECRET.as_bytes(),
             block_id,
@@ -3128,16 +3129,16 @@ impl CryptoService for PinnedMintCrypto {
         self.pin(signed, derived.as_bytes())
     }
 
-    fn verify_for(
+    async fn verify_for(
         &self,
         block_id: &str,
         token: &str,
     ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
-        self.inner.verify_for(block_id, token)
+        self.inner.verify_for(block_id, token).await
     }
 
-    fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
-        self.inner.random_bytes(n)
+    async fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+        self.inner.random_bytes(n).await
     }
 }
 

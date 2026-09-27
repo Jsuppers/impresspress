@@ -446,32 +446,33 @@ mod tests {
             inner: wafer_block_crypto::service::Argon2JwtCryptoService,
             compared: Arc<Mutex<Vec<String>>>,
         }
+        #[wafer_block::wafer_async_trait]
         impl CryptoService for Recording {
-            fn hash(&self, password: &str) -> Result<String, CryptoError> {
-                self.inner.hash(password)
+            async fn hash(&self, password: &str) -> Result<String, CryptoError> {
+                self.inner.hash(password).await
             }
-            fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+            async fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
                 self.compared.lock().unwrap().push(hash.to_string());
-                self.inner.compare_hash(password, hash)
+                self.inner.compare_hash(password, hash).await
             }
-            fn sign_for(
+            async fn sign_for(
                 &self,
                 block_id: &str,
                 claims: std::collections::BTreeMap<String, serde_json::Value>,
                 expiry: std::time::Duration,
             ) -> Result<String, CryptoError> {
-                self.inner.sign_for(block_id, claims, expiry)
+                self.inner.sign_for(block_id, claims, expiry).await
             }
-            fn verify_for(
+            async fn verify_for(
                 &self,
                 block_id: &str,
                 token: &str,
             ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, CryptoError>
             {
-                self.inner.verify_for(block_id, token)
+                self.inner.verify_for(block_id, token).await
             }
-            fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
-                self.inner.random_bytes(n)
+            async fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+                self.inner.random_bytes(n).await
             }
         }
 

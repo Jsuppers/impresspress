@@ -342,6 +342,8 @@ fn generate_named(
         deep_merge(&mut value, overrides);
     }
 
+    refuse_pepper_keys_in_vars(&value)?;
+
     // Runtime code relies on this exact internal binding name. Restore it
     // after consumer overrides just like the upload-only build invariant
     // below, so a broad override cannot silently disable cache freshness.
@@ -463,8 +465,11 @@ fn generate_named(
         }
     };
     let path = out_dir.join(file_name);
-    std::fs::write(&path, format!("{header}{D1_QUERIES_NOTE}{body}"))
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(
+        &path,
+        format!("{header}{D1_QUERIES_NOTE}{PASSWORD_PEPPER_NOTE}{body}"),
+    )
+    .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -475,6 +480,58 @@ const D1_QUERIES_NOTE: &str =
     "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is D1's per-invocation query \
 limit for the account's plan: 1000 on Workers Paid, 50 on Workers Free. Set it with \
 [cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
+
+/// Where the password pepper goes, for someone reading the file: it is not in
+/// it, and must not be.
+const PASSWORD_PEPPER_NOTE: &str =
+    "# Password pepper (optional): generate a key with `openssl rand -base64 32` and set it \
+with `wrangler secret put IMPRESSPRESS_PASSWORD_PEPPER_KEY`, never in [vars]. Back it up \
+outside Cloudflare: losing it locks out every account whose hash it peppered. \
+IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS (a secret too) holds rotated-out keys; \
+IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED = \"true\" may go in [vars].\n\n";
+
+/// Refuse a config whose `[vars]`, or any `[env.<name>.vars]`, holds a
+/// password pepper key.
+///
+/// A `[vars]` value is plain text: in this file, in the override file it came
+/// from (which a consumer repo commits) and in the Cloudflare dashboard. The
+/// Worker would still read it, so without this check a pepper put there would
+/// work and quietly stop being a secret. The keys are secrets, set with
+/// `wrangler secret put`. The error names the var, never the value.
+fn refuse_pepper_keys_in_vars(value: &toml::Value) -> Result<()> {
+    use impresspress_core::password_pepper::{
+        PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
+    };
+    // The top-level `[vars]`, and each `[env.<name>.vars]`: wrangler does not
+    // inherit `vars` into an environment, so an environment's own table is
+    // where its deploy reads them from.
+    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
+    if let Some(vars) = value.get("vars") {
+        tables.push(("[vars]".to_string(), vars));
+    }
+    if let Some(envs) = value.get("env").and_then(toml::Value::as_table) {
+        for (name, env) in envs {
+            if let Some(vars) = env.get("vars") {
+                tables.push((format!("[env.{name}.vars]"), vars));
+            }
+        }
+    }
+    for (table, vars) in tables {
+        let Some(vars) = vars.as_table() else {
+            continue;
+        };
+        for var in [PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR] {
+            if vars.contains_key(var) {
+                anyhow::bail!(
+                    "{var} is set under {table} in the wrangler overrides, where it is plain \
+                     text (in the file and in the Cloudflare dashboard). Remove it and set it \
+                     with `wrangler secret put {var}`."
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 fn install_prepared_text_rule(root: &mut toml::map::Map<String, toml::Value>) -> Result<()> {
     let rules = root

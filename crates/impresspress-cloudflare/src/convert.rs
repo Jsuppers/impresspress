@@ -182,7 +182,11 @@ fn apply_parts_to_headers(headers: &Headers, parts: &[ResponseMetaPart<'_>]) -> 
 ///
 /// For the same reason, leading meta no transport can send is answered with
 /// the codec's `unsendable_response` here, before a status or a byte is
-/// committed.
+/// committed. Handed the whole leading meta, the codec's 500 keeps the
+/// terminal's sendable security and CORS headers (`Content-Security-Policy`,
+/// `X-Frame-Options`, …) and drops the ones describing the body it replaces
+/// (`Content-Disposition`, `Content-Encoding`, cache headers), adding
+/// `Cache-Control: no-store`.
 fn build_streaming_response(
     leading_meta: Vec<MetaEntry>,
     first_chunk: Vec<u8>,
@@ -190,7 +194,9 @@ fn build_streaming_response(
 ) -> Result<Response> {
     let parts = match http_codec::response_meta_parts(&leading_meta) {
         Ok(parts) => parts,
-        Err(invalid) => return parts_to_response(http_codec::unsendable_response(&invalid)),
+        Err(invalid) => {
+            return parts_to_response(http_codec::unsendable_response(&leading_meta, &invalid))
+        }
     };
     let status = http_codec::resolve_status(&leading_meta, 200);
     let headers = Headers::new();
@@ -379,12 +385,17 @@ mod response_tests {
     /// transport can send (a CR/LF, here) is answered with the codec's 500
     /// before a status or a byte goes out — never streamed without the entry,
     /// and never with it. Once the body streams, a failure can only abort it.
+    ///
+    /// The 500 keeps the terminal's sendable security headers and drops the
+    /// ones describing the body it replaces, so the error page is served
+    /// under the same frame policy as the page it stands in for.
     #[wasm_bindgen_test]
     async fn a_stream_with_an_unsendable_header_is_a_500_before_it_starts() {
         let stream = OutputStream::from_producer(|sink, _cancel| async move {
             for (key, value) in [
                 (META_RESP_STREAM, STREAM_MARKER_VALUE),
                 (META_RESP_CONTENT_TYPE, "application/pdf"),
+                ("resp.header.X-Frame-Options", "DENY"),
                 ("resp.header.Content-Disposition", "inline\r\nX-Injected: 1"),
             ] {
                 let _ = sink
@@ -404,7 +415,23 @@ mod response_tests {
         assert_eq!(
             resp.headers().get("content-disposition").expect("headers"),
             None,
-            "none of the refused terminal's headers are sent"
+            "the refused header is never sent"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-frame-options")
+                .expect("headers")
+                .as_deref(),
+            Some("DENY"),
+            "the terminal's security headers survive on its 500"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .expect("headers")
+                .as_deref(),
+            Some("no-store"),
+            "the 500 must not be cached"
         );
         let body: serde_json::Value =
             serde_json::from_str(&resp.text().await.expect("read body")).expect("a JSON body");

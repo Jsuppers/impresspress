@@ -66,6 +66,90 @@ deploy, so a changed migration applies once, with the same consequences it has
 anywhere else: any edit to the auth migration SQL still re-runs the auth set
 and signs every user out, once.
 
+### wafer-run fa059808: password pepper, statement-budget codes, error headers
+
+**What changes.**
+
+- Password hashes can be **peppered** (optional, off until a key is set):
+  the argon2id output is keyed with HMAC-SHA-256 by a secret held outside
+  the database, so a stolen credential table cannot be cracked offline
+  without the key too. New hashes are written as
+  `$argon2id-hmac-sha256$…,pepper=<key id>$…`; stored hashes keep verifying
+  (see *Who has to act*). The key is read from the process environment on
+  native and from Worker secrets on Cloudflare, straight into the crypto
+  service: it is never a `variables` row, never on either config surface, so
+  no block and no admin page can read it. The browser target holds no pepper
+  (nothing in a visitor's browser is secret), so a peppered hash carried into
+  the dev sandbox cannot be verified there; its sign-in answers 503, not a
+  wrong password.
+- A request refused by the database's statement budget now says so in the
+  error body's `code`: `database.statement_budget_exhausted` on the 429,
+  `database.statement_budget_exceeds_limit` on a write larger than a whole
+  invocation's limit, which is now a 400 (it was a sanitized 500). Neither
+  can succeed if sent again unchanged, so a client must not auto-retry it;
+  `/openapi.json`'s `info.description` says so, and the JS SDK has
+  `isStatementBudgetError`. A page whose read the budget refused no longer
+  says "try again later".
+- On Cloudflare and in the browser, a streamed response whose headers cannot
+  be sent is still answered with a 500, which now keeps the handler's
+  security and CORS headers (`Content-Security-Policy`, `X-Frame-Options`,
+  `X-Content-Type-Options`, …) and is sent `Cache-Control: no-store`.
+- Blocks may declare an init time budget. impresspress declares none and
+  sets no cap, so every Init — which runs the block's migrations — still runs
+  as long as it takes.
+
+**Who has to act.** Nobody, unless you turn the pepper on. To turn it on:
+
+1. Generate a key: `openssl rand -base64 32`. **Back it up outside the
+   deployment**: losing it locks out every account whose hash it peppered.
+2. Set it as `IMPRESSPRESS_PASSWORD_PEPPER_KEY`:
+   - native: in the process environment (a systemd `EnvironmentFile` with
+     mode 0600, the orchestrator's secret store, or `.env`), then restart;
+   - Cloudflare: `openssl rand -base64 32 | npx wrangler secret put
+     IMPRESSPRESS_PASSWORD_PEPPER_KEY --config
+     target/impresspress-cloudflare/wrangler.toml`. **Never under `[vars]`**:
+     a var is plain text in the committed override file and in the
+     dashboard, and the build refuses a pepper key there.
+3. From then on, new and changed passwords are peppered. Existing hashes stay
+   as they are (nothing re-hashes them on sign-in) and keep verifying.
+4. Only once every stored hash is peppered, set
+   `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED=true` (native env, or a Cloudflare
+   `[vars]` entry through `wrangler_overrides_path`); an unpeppered hash is
+   then refused, so nobody who can write the credential table can plant a
+   hash of a password they know. Check first — any user this lists is locked
+   out once it is on (single quotes, so the shell leaves `$argon2id…` alone):
+
+   ```sh
+   # native SQLite
+   sqlite3 data/impresspress.db 'SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash NOT LIKE '"'"'$argon2id-hmac-sha256$%'"'"';'
+   # Cloudflare D1
+   npx wrangler d1 execute <database> --remote --command 'SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash NOT LIKE '"'"'$argon2id-hmac-sha256$%'"'"';'
+   ```
+
+   Reset or recreate those accounts first. While `REQUIRED` is on, a sign-in
+   to an account whose hash is still unpeppered answers 503 rather than a
+   wrong-password 401 (and is logged as a configuration fault with its user
+   id), so someone who knows such an account's password can tell it apart —
+   one more reason to run the scan first. The value must be exactly `true`
+   or `false`; anything else fails the boot (native) or every request
+   (Cloudflare) with an error naming the variable.
+5. To rotate: move the current key into
+   `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` (comma-separated, a secret on
+   Cloudflare) and set a new current key. Old hashes keep verifying with the
+   key they name, and a hash naming a key the deployment no longer holds
+   fails sign-in with a 503. The boot log names each key by its id
+   (`password pepper <id> (previous: [<id>, …])`); before dropping an old
+   key, check no stored hash names its id:
+
+   ```sh
+   sqlite3 data/impresspress.db 'SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash LIKE '"'"'%,pepper=<id>$%'"'"';'
+   ```
+
+   (the same query through `npx wrangler d1 execute … --command '…'` on D1).
+
+A malformed key fails the boot the same way, naming the variable and never
+printing the value.
+
 ### wafer-run e17debe4: D1 statement budget, argon2 ceiling, vector store
 
 **What changes.**

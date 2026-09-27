@@ -245,8 +245,17 @@ pub async fn release_asset_object_key(
 /// It must be at least `wafer_block_crypto::primitives::MIN_JWT_SECRET_LEN`
 /// bytes; a missing/short secret surfaces as an error on each sign/verify
 /// rather than failing worker boot.
-pub fn make_jwt_crypto_service(jwt_secret: String) -> Arc<dyn CryptoService> {
-    Arc::new(crypto_service::ImpresspressCryptoService::new(jwt_secret))
+///
+/// `peppers` are the password pepper keys the Worker read from its secrets
+/// (`CfEnvironment::password_peppers`); new hashes are peppered with the
+/// current one, stored hashes verified with the one they name.
+pub fn make_jwt_crypto_service(
+    jwt_secret: String,
+    peppers: wafer_block_crypto::primitives::PasswordPeppers,
+) -> Arc<dyn CryptoService> {
+    Arc::new(crypto_service::ImpresspressCryptoService::new(
+        jwt_secret, peppers,
+    ))
 }
 
 /// Construct a [`NetworkService`] backed by the CF Worker global `fetch` API.

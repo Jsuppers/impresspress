@@ -404,6 +404,71 @@ zone_name = "wafer.run"
     );
 }
 
+/// A password pepper key is a secret: put under `[vars]` through an override
+/// file it would be plain text in a committed file and in the dashboard, and
+/// the Worker would still read it. The build refuses it, naming the var and
+/// never the value; `REQUIRED`, which is not a secret, may be a var.
+#[test]
+fn a_pepper_key_in_vars_is_refused() {
+    use impresspress_core::password_pepper::{
+        PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
+    };
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+    let overrides_path = repo_root.join("wrangler.overrides.toml");
+    let mut cfg = sample_cfg();
+    cfg.wrangler_overrides_path = Some("wrangler.overrides.toml".into());
+    let key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+
+    for var in [PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR] {
+        fs::write(&overrides_path, format!("[vars]\n{var} = \"{key}\"\n")).unwrap();
+        for result in [
+            generate(&cfg, repo_root, &out),
+            generate_upload(&cfg, repo_root, &out),
+        ] {
+            let err = format!("{:#}", result.expect_err(var));
+            assert!(
+                err.contains(var) && err.contains("wrangler secret put"),
+                "{err}"
+            );
+            assert!(!err.contains(key), "the error echoed the key: {err}");
+        }
+    }
+
+    // An environment's own vars are read by its deploy just the same.
+    fs::write(
+        &overrides_path,
+        format!("[env.staging.vars]\n{PASSWORD_PEPPER_KEY_VAR} = \"{key}\"\n"),
+    )
+    .unwrap();
+    let err = format!(
+        "{:#}",
+        generate(&cfg, repo_root, &out).expect_err("env vars")
+    );
+    assert!(
+        err.contains("[env.staging.vars]") && err.contains(PASSWORD_PEPPER_KEY_VAR),
+        "{err}"
+    );
+    assert!(!err.contains(key), "the error echoed the key: {err}");
+
+    fs::write(
+        &overrides_path,
+        format!("[vars]\n{PASSWORD_PEPPER_REQUIRED_VAR} = \"true\"\n"),
+    )
+    .unwrap();
+    let body = fs::read_to_string(generate(&cfg, repo_root, &out).unwrap()).unwrap();
+    assert!(
+        body.contains(&format!("{PASSWORD_PEPPER_REQUIRED_VAR} = \"true\"")),
+        "{body}"
+    );
+    assert!(
+        body.contains("wrangler secret put IMPRESSPRESS_PASSWORD_PEPPER_KEY"),
+        "the generated file says where the key goes:\n{body}"
+    );
+}
+
 #[test]
 fn generate_upload_uses_prebuilt_artifact_without_build_hook() {
     let tmp = tempdir().unwrap();

@@ -99,6 +99,7 @@ async fn builder(dir: &std::path::Path) -> ImpresspressBuilder {
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "vector-services-test-jwt-secret-value".to_string(),
+                Default::default(),
             )
             .expect("jwt crypto service"),
         )

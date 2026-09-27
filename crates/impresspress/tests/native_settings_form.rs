@@ -65,9 +65,10 @@ async fn the_admin_email_settings_page_renders_its_form_on_the_real_runtime() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer = build_native_runtime(&infra, database, &HashMap::new(), false)
-        .await
-        .expect("build impresspress runtime");
+    let mut wafer =
+        build_native_runtime(&infra, database, &HashMap::new(), Default::default(), false)
+            .await
+            .expect("build impresspress runtime");
     boot(
         &mut wafer,
         &NativeBootHooks,

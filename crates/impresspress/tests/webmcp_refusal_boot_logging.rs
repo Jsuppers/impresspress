@@ -172,6 +172,7 @@ async fn build_runtime_with_extra_blocks(
         .crypto(
             impresspress_native::make_jwt_crypto_service(
                 "webmcp-refusal-boot-logging-test-jwt-secret".to_string(),
+                Default::default(),
             )
             .expect("jwt crypto service"),
         )
