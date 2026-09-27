@@ -208,37 +208,17 @@ pub async fn apply_if_blessed(
         return Ok(());
     }
 
-    for stmt in split_statements(sql) {
-        if !has_executable_content(stmt) {
-            continue;
-        }
-        let trimmed = stmt.trim();
-        if let Err(e) = db::ddl(ctx, trimmed).await {
-            // ALTER TABLE ADD COLUMN is non-idempotent on SQLite/D1 — there's
-            // no `IF NOT EXISTS` syntax for columns. When a previous run
-            // already added the column, re-running raises "duplicate column
-            // name". Treat that as a benign no-op so the rest of the
-            // migration batch (and the final `write_state` stamp) can
-            // still run. Every other DDL failure propagates.
-            let msg = e.to_string();
-            if is_alter_add_column(trimmed) && is_duplicate_column_error(&msg) {
-                tracing::debug!(
-                    block = %block_name,
-                    stmt = %trimmed,
-                    err = %msg,
-                    "ddl: duplicate column, treating as idempotent no-op",
-                );
-                continue;
-            }
+    run_statements(sql, |stmt| db::ddl(ctx, stmt))
+        .await
+        .map_err(|failed| {
             tracing::warn!(
                 block = %block_name,
-                stmt = %trimmed,
-                err = %msg,
+                stmt = %failed.statement,
+                err = %failed.error,
                 "ddl failed",
             );
-            return Err(format!("ddl failed on `{trimmed}`: {e}"));
-        }
-    }
+            format!("ddl failed on `{}`: {}", failed.statement, failed.error)
+        })?;
 
     let new_state = MigrationState {
         current_hash: code_hash.clone(),
@@ -270,23 +250,59 @@ pub async fn apply_ddl_via_service(
     sql_files: &[&str],
 ) -> Result<(), String> {
     for sql in sql_files {
-        for stmt in split_statements(sql) {
-            if !has_executable_content(stmt) {
+        run_statements(sql, |stmt| db.exec_raw(stmt, &[]))
+            .await
+            .map_err(|failed| {
+                format!(
+                    "pre-wafer ddl failed on `{}`: {}",
+                    failed.statement, failed.error
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// A migration statement the database refused, and why.
+struct FailedStatement<'a> {
+    statement: &'a str,
+    error: String,
+}
+
+/// Run each statement of a migration batch through `exec`, in order, stopping
+/// at the first failure.
+///
+/// The one statement loop behind both [`apply_if_blessed`] and
+/// [`apply_ddl_via_service`], so what a replay test proves through the
+/// pre-wafer runner holds for the gated one. `ALTER TABLE ... ADD COLUMN` is
+/// non-idempotent on SQLite/D1, which have no `IF NOT EXISTS` for columns:
+/// when an earlier run already added the column the re-run raises "duplicate
+/// column", and that — only for an `ADD COLUMN` statement — is a benign no-op
+/// so the rest of the batch still runs. Every other failure is returned.
+async fn run_statements<'a, F, Fut, T, E>(
+    sql: &'a str,
+    mut exec: F,
+) -> Result<(), FailedStatement<'a>>
+where
+    F: FnMut(&'a str) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    for stmt in split_statements(sql) {
+        if !has_executable_content(stmt) {
+            continue;
+        }
+        let statement = stmt.trim();
+        if let Err(e) = exec(statement).await {
+            let error = e.to_string();
+            if is_alter_add_column(statement) && is_duplicate_column_error(&error) {
+                tracing::debug!(
+                    stmt = %statement,
+                    err = %error,
+                    "ddl: duplicate column, treating as idempotent no-op",
+                );
                 continue;
             }
-            let trimmed = stmt.trim();
-            if let Err(e) = db.exec_raw(trimmed, &[]).await {
-                let msg = e.to_string();
-                if is_alter_add_column(trimmed) && is_duplicate_column_error(&msg) {
-                    tracing::debug!(
-                        stmt = %trimmed,
-                        err = %msg,
-                        "pre-wafer ddl: duplicate column, treating as idempotent no-op",
-                    );
-                    continue;
-                }
-                return Err(format!("pre-wafer ddl failed on `{trimmed}`: {e}"));
-            }
+            return Err(FailedStatement { statement, error });
         }
     }
     Ok(())

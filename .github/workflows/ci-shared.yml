@@ -298,14 +298,16 @@ jobs:
   # it. A migration wired into `SQLITE_MIGRATIONS` and forgotten in
   # `POSTGRES_MIGRATIONS` compiled clean and failed no test.
   #
-  # No Postgres service container: the `postgres` feature is a pure cfg flag on
-  # impresspress-core (`postgres = []`), and on impresspress-native it only
-  # pulls `wafer-block-postgres` in as a dependency. The migration assertions
-  # are all against embedded SQL text; the one connection attempt is
-  # impresspress-native's `connect_error_does_not_leak_the_password`, which
-  # dials a closed port and needs the connect to fail (it waits out the pool's
-  # 30 s acquire timeout). `postgres-migrations` is where a real server
-  # belongs, and it has one.
+  # The `postgres` feature is a pure cfg flag on impresspress-core
+  # (`postgres = []`), and on impresspress-native it only pulls
+  # `wafer-block-postgres` in as a dependency. The migration assertions in the
+  # main test run are all against embedded SQL text; its one connection
+  # attempt is impresspress-native's `connect_error_does_not_leak_the_password`,
+  # which dials a closed port (1, not the service's) and needs the connect to
+  # fail.
+  #
+  # The service container is for the replay step below, which needs a real
+  # server and this job's postgres-feature build of the migration runner.
   #
   # impresspress-native is built alongside impresspress-core because it holds
   # the only non-test postgres-gated Rust (`make_postgres_database_service`),
@@ -314,6 +316,20 @@ jobs:
   test-postgres:
     name: Tests (postgres feature)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: impresspress_migration_replay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d impresspress_migration_replay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -329,6 +345,18 @@ jobs:
       # than one package is selected.
       - name: Run tests with the postgres feature
         run: cargo test --locked -p impresspress-core -p impresspress-native --features impresspress-core/postgres,impresspress-native/postgres
+
+      # A block re-runs its WHOLE migration set whenever its joined SQL's hash
+      # moves, so every block's `.postgres.sql` set must apply to an empty
+      # database and then apply again over what it built. The test globs the
+      # sets off disk per block (no hand-kept list) and runs them through
+      # `apply_ddl_via_service`, the runner that shares its statement loop
+      # with the gated boot path. It is `#[ignore]`d in the run above because
+      # it needs this server; it refuses a database that is not empty.
+      - name: Every block's PostgreSQL migrations apply fresh, then replay
+        env:
+          IMPRESSPRESS_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/impresspress_migration_replay
+        run: cargo test --locked -p impresspress-native --features impresspress-core/postgres,impresspress-native/postgres --test postgres_migration_replay -- --ignored --nocapture
 
   cloudflare:
     name: Cloudflare wasm32 check
