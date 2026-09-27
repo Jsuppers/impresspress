@@ -113,8 +113,8 @@ use impresspress_core::{
     builder::ImpresspressBuilder,
 };
 pub use services::{
-    make_config_service, make_console_logger, make_d1_database_service, make_fetch_network_service,
-    make_jwt_crypto_service, make_kv_cached_database_service, make_r2_storage_service,
+    make_config_service, make_console_logger, make_crypto_service, make_d1_database_service,
+    make_fetch_network_service, make_kv_cached_database_service, make_r2_storage_service,
     release_asset_object_key,
 };
 use wafer_core::interfaces::storage::service::StorageService;

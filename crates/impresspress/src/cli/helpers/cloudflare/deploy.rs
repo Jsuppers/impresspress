@@ -662,6 +662,28 @@ pub async fn smoke_preview_lockdown(preview_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deploy the password-hasher Worker with plain `wrangler deploy`: it uploads
+/// and activates in one step, and applies the config's Durable Object
+/// migration, which `wrangler versions upload` cannot carry. The hasher has no
+/// preview to verify first — Cloudflare generates none for a Worker that
+/// implements a Durable Object — so what keeps a deploy safe is the protocol's
+/// compatibility rule (`impresspress_password::protocol`): the hasher answers
+/// the live main Worker's requests as well as the new one's.
+pub fn wrangler_deploy_password_hasher(wrangler_toml: &Path) -> Result<()> {
+    let status = Command::new("wrangler")
+        .args(["deploy", "--config"])
+        .arg(wrangler_toml)
+        .status()
+        .context("run wrangler deploy for the password-hasher Worker")?;
+    if !status.success() {
+        bail!(
+            "wrangler deploy of the password-hasher Worker failed (exit {:?})",
+            status.code()
+        );
+    }
+    Ok(())
+}
+
 /// Set a worker secret via `wrangler secret put <NAME> --config <toml>`,
 /// piping the value on stdin (never as an argv arg, which would leak it into
 /// the process table). Stdout/stderr inherit so wrangler's own confirmation

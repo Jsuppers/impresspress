@@ -25,6 +25,12 @@ pub const PREPARED_TEXT_GLOB: &str = "**/*.prepared.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoStageState {
     Built,
+    /// The password-hasher Worker is deployed. Before any version of the main
+    /// Worker is uploaded: every version — the candidate `/_deploy/prepare`
+    /// runs in, the final one verified before promotion — calls whichever
+    /// hasher is deployed, so the one it was built against must already be
+    /// there.
+    PasswordHasherDeployed,
     CandidateUploaded,
     AssetsVerified,
     Prepared,
@@ -51,8 +57,16 @@ impl TwoStageDeploymentGate {
         }
     }
 
+    pub fn password_hasher_deployed(&mut self) -> Result<()> {
+        self.advance(
+            TwoStageState::Built,
+            TwoStageState::PasswordHasherDeployed,
+            "password-hasher deploy",
+        )
+    }
+
     pub fn candidate_uploaded(&mut self, version: &str, wasm_sha256: &str) -> Result<()> {
-        self.expect(TwoStageState::Built, "candidate upload")?;
+        self.expect(TwoStageState::PasswordHasherDeployed, "candidate upload")?;
         self.candidate_version = Some(version.to_string());
         self.wasm_sha256 = Some(wasm_sha256.to_string());
         self.state = TwoStageState::CandidateUploaded;
@@ -602,6 +616,12 @@ mod tests {
     fn two_stage_gate_enforces_order_and_identical_wasm() {
         let mut gate = TwoStageDeploymentGate::new();
         assert!(gate.prepared().is_err());
+        assert!(
+            gate.candidate_uploaded("candidate-1", "wasm-a").is_err(),
+            "no main Worker version before the password hasher it calls is deployed"
+        );
+        gate.password_hasher_deployed().unwrap();
+        assert!(gate.password_hasher_deployed().is_err());
         gate.candidate_uploaded("candidate-1", "wasm-a").unwrap();
         assert!(gate.final_uploaded("final-1", "wasm-a").is_err());
         gate.assets_verified().unwrap();

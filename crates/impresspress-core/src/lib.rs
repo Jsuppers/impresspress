@@ -77,7 +77,6 @@ pub mod log_line;
 pub mod metrics;
 pub mod migration_helper;
 pub mod multipart;
-pub mod password_pepper;
 pub mod pipeline;
 pub mod platform_state;
 pub mod prepared_plan;

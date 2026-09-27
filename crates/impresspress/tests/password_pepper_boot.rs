@@ -19,12 +19,12 @@ use impresspress::cli::server::{build_native_runtime, password_peppers_from_env,
 use impresspress_core::{
     blocks::auth::config::{BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY},
     builder::{boot, GrantSource, InitPolicy},
-    password_pepper::{
-        self, PasswordPeppers, PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
-        PASSWORD_PEPPER_REQUIRED_VAR,
-    },
 };
 use impresspress_native::InfraConfig;
+use impresspress_password::pepper::{
+    self as password_pepper, PasswordPeppers, PASSWORD_PEPPER_KEY_VAR,
+    PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
+};
 use wafer_block::{http_codec, InputStream};
 use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::{Message, Wafer};

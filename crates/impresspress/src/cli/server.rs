@@ -13,14 +13,12 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
-use impresspress_core::{
-    builder::{self, ImpresspressBuilder},
-    password_pepper::{self, PasswordPeppers},
-};
+use impresspress_core::builder::{self, ImpresspressBuilder};
 use impresspress_native::{
     collect_app_env_vars, init_tracing, load_dotenv, register_http_listener,
     register_observability_hooks, serve_until_shutdown, InfraConfig,
 };
+use impresspress_password::pepper::{self as password_pepper, PasswordPeppers};
 use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::Wafer;
 
@@ -362,7 +360,7 @@ pub async fn build_native_runtime(
 /// `blocks::config` serves an infrastructure key from the boot map only, so a
 /// block asking for one through the config client finds nothing. A value that
 /// does not parse fails the boot, naming the variable and never echoing a
-/// key; see `impresspress_core::password_pepper` for the rules and for how to
+/// key; see `impresspress_password::pepper` for the rules and for how to
 /// generate, rotate and require a key.
 pub fn password_peppers_from_env(
     var: impl Fn(&str) -> Option<String>,

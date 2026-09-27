@@ -164,9 +164,13 @@ js-sys = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Crypto (wasm-compatible). JWT + argon2 policy delegates to
-# wafer-block-crypto's pure-Rust primitives — same engine as native.
+# Crypto (wasm-compatible). JWT policy delegates to wafer-block-crypto's
+# pure-Rust primitives — same engine as native. Passwords are hashed by the
+# password-hasher Worker; `impresspress-password` carries the call protocol.
+# Its `durable-object` feature stays OFF here: this Worker binds the class,
+# and a Worker that exports one gets no version preview URLs.
 wafer-block-crypto = { workspace = true }
+impresspress-password = { path = "../impresspress-password" }
 getrandom = { workspace = true, features = ["js"] }
 # uuid needs the "js" feature for wasm (uses js_sys random); inherit v4+v7 from workspace
 uuid = { workspace = true, features = ["js"] }
