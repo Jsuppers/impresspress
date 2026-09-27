@@ -236,13 +236,18 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     // Before the build: does the main Worker exist yet? A site's first deploy
     // creates it (step 0a below); any later one needs the operator's deploy
     // token, and is refused here, not after minutes of building, without it.
+    // An existing Worker missing either deploy secret (a first deploy that
+    // stopped part-way) is given it here.
     let wrangler_cli = first_create::Wrangler::default();
     let placeholder_toml =
         first_create::generate_placeholder(&cfg, &repo_root.join(first_create::FIRST_CREATE_DIR))?;
+    let worker_secrets =
+        first_create::resolve_worker_secrets(|name| std::env::var(name).ok(), random_secret_bytes)?;
     let main_worker = first_create::plan_main_worker(
         &wrangler_cli,
         &placeholder_toml,
         &cfg.worker_name,
+        &worker_secrets,
         std::env::var(token_key).ok(),
     )?;
 
@@ -288,21 +293,16 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     let deploy_token = match main_worker {
         first_create::MainWorkerPlan::Existing { deploy_token } => deploy_token,
         first_create::MainWorkerPlan::Create => {
-            let secrets = first_create::resolve_worker_secrets(
-                |name| std::env::var(name).ok(),
-                random_secret_bytes,
-            )?;
             let deploy_token = first_create::create_main_worker(
                 &wrangler_cli,
                 &placeholder_toml,
                 &cfg.worker_name,
-                &secrets,
+                &worker_secrets,
             )?;
             println!(
                 "-> created Worker {} (a placeholder answering 503 until this deploy promotes)",
                 cfg.worker_name
             );
-            first_create::report_worker_secrets(&secrets);
             deploy_token
         }
     };
@@ -547,9 +547,7 @@ pub async fn deploy_secret(repo_root: &Path) -> Result<()> {
 
     let secrets =
         first_create::resolve_worker_secrets(|name| std::env::var(name).ok(), random_secret_bytes)?;
-    first_create::put_worker_secrets(&first_create::Wrangler::default(), &wrangler_toml, &secrets)?;
-    first_create::report_worker_secrets(&secrets);
-    Ok(())
+    first_create::put_worker_secrets(&first_create::Wrangler::default(), &wrangler_toml, &secrets)
 }
 
 /// 32 random bytes for a generated worker secret (64 hex characters).

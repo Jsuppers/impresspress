@@ -30,7 +30,8 @@ const NOT_FOUND_STDERR: &str = "✘ [ERROR] A request to the Cloudflare API \
 your account. [code: 10007]\n";
 
 /// A stand-in `wrangler` in `dir`. It appends each invocation's arguments,
-/// and for `secret put` the value it read on stdin, to `dir/calls`. Its
+/// and for `secret put` the value it read on stdin, to `dir/calls`; the
+/// names it was given are what `secret list` answers. Its
 /// `deployments status` answer is read from `dir/status` each time: `exists`
 /// succeeds, `absent` fails with Cloudflare's 10007, anything else fails
 /// with an authentication error. `deploy` flips `dir/status` to `exists`.
@@ -52,6 +53,17 @@ case "$1 $2" in
     esac ;;
   "secret put")
     echo "$* <- $(cat)" >> "$dir/calls"
+    echo "$3" >> "$dir/secrets"
+    exit 0 ;;
+  "secret list")
+    echo "$*" >> "$dir/calls"
+    echo 'Fetching secrets...'
+    printf '['
+    sep=''
+    if [ -f "$dir/secrets" ]; then
+      while read -r name; do printf '%s{{"name":"%s","type":"secret_text"}}' "$sep" "$name"; sep=','; done < "$dir/secrets"
+    fi
+    echo ']'
     exit 0 ;;
   deploy*)
     echo "$*" >> "$dir/calls"
@@ -146,12 +158,12 @@ fn a_first_deploy_creates_the_worker_and_the_next_one_needs_its_token() {
     let placeholder =
         generate_placeholder(&sample_cfg(), &tmp.path().join("first-create")).unwrap();
 
+    let secrets = resolve_worker_secrets(|_| None, || Ok([0x5a; 32])).unwrap();
     assert_eq!(
-        plan_main_worker(&wrangler, &placeholder, "site", None).unwrap(),
+        plan_main_worker(&wrangler, &placeholder, "site", &secrets, None).unwrap(),
         MainWorkerPlan::Create
     );
 
-    let secrets = resolve_worker_secrets(|_| None, || Ok([0x5a; 32])).unwrap();
     let token = create_main_worker(&wrangler, &placeholder, "site", &secrets).unwrap();
     assert_eq!(token, "5a".repeat(32));
 
@@ -173,7 +185,8 @@ fn a_first_deploy_creates_the_worker_and_the_next_one_needs_its_token() {
         ]
     );
 
-    let err = plan_main_worker(&wrangler, &placeholder, "site", None)
+    let next = resolve_worker_secrets(|_| None, || Ok([0x77; 32])).unwrap();
+    let err = plan_main_worker(&wrangler, &placeholder, "site", &next, None)
         .unwrap_err()
         .to_string();
     assert!(
@@ -181,10 +194,17 @@ fn a_first_deploy_creates_the_worker_and_the_next_one_needs_its_token() {
         "{err}"
     );
     assert_eq!(
-        plan_main_worker(&wrangler, &placeholder, "site", Some(token.clone())).unwrap(),
+        plan_main_worker(&wrangler, &placeholder, "site", &next, Some(token.clone())).unwrap(),
         MainWorkerPlan::Existing {
             deploy_token: token
         }
+    );
+    let status = format!("deployments status --json --config {config}");
+    let list = format!("secret list --format json --config {config}");
+    assert_eq!(
+        calls(tmp.path()).split_off(5),
+        [status.clone(), list.clone(), status, list],
+        "a Worker that holds both secrets is given neither again"
     );
 }
 

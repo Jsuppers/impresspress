@@ -72,6 +72,8 @@ pub trait WorkerCommands {
     fn deploy(&self, config: &Path) -> Result<()>;
     /// Set secret `name` on `config`'s Worker.
     fn secret_put(&self, config: &Path, name: &str, value: &str) -> Result<()>;
+    /// The NAMES of the secrets `config`'s Worker holds; never a value.
+    fn secret_names(&self, config: &Path) -> Result<Vec<String>>;
 }
 
 /// [`WorkerCommands`] through the `wrangler` CLI.
@@ -162,6 +164,23 @@ impl WorkerCommands for Wrangler {
         }
         Ok(())
     }
+
+    fn secret_names(&self, config: &Path) -> Result<Vec<String>> {
+        let output = Command::new(&self.program)
+            .args(["secret", "list", "--format", "json", "--config"])
+            .arg(config)
+            .output()
+            .context("run wrangler secret list")?;
+        if !output.status.success() {
+            bail!(
+                "wrangler secret list --config {} failed (exit {:?}): {}",
+                config.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        super::password_hasher::parse_secret_names(&String::from_utf8_lossy(&output.stdout))
+    }
 }
 
 /// Write the placeholder Worker's config and module into `dir`, returning
@@ -212,19 +231,35 @@ pub enum MainWorkerPlan {
 /// Ask Cloudflare whether `worker_name` (the Worker `placeholder_config`
 /// names) exists, and decide what this deploy needs.
 ///
-/// An existing Worker needs the token its `/_deploy/*` endpoints were given:
-/// without `deploy_token` this refuses, naming the one command that sets a
-/// new one. An absent Worker needs no token yet; [`create_main_worker`] sets
-/// one.
+/// An existing Worker is first given any of `secrets` it does not hold (by
+/// name; no value is read), so a first deploy that stopped after creating the
+/// Worker but before setting both secrets is finished by the next run rather
+/// than left without a JWT secret. Then it needs the token its `/_deploy/*`
+/// endpoints were given: the one just set, or `deploy_token`, without which
+/// this refuses, naming the one command that sets a new one. An absent Worker
+/// needs no token yet; [`create_main_worker`] sets `secrets`.
 pub fn plan_main_worker(
     commands: &impl WorkerCommands,
     placeholder_config: &Path,
     worker_name: &str,
+    secrets: &[WorkerSecret],
     deploy_token: Option<String>,
 ) -> Result<MainWorkerPlan> {
     let token_key = impresspress_core::config_vars::DEPLOY_TOKEN_KEY;
     if !commands.worker_exists(placeholder_config)? {
         return Ok(MainWorkerPlan::Create);
+    }
+    let held = commands.secret_names(placeholder_config)?;
+    let missing: Vec<WorkerSecret> = secrets
+        .iter()
+        .filter(|secret| !held.iter().any(|name| name == secret.name))
+        .cloned()
+        .collect();
+    put_worker_secrets(commands, placeholder_config, &missing)?;
+    if let Some(set) = missing.iter().find(|secret| secret.name == token_key) {
+        return Ok(MainWorkerPlan::Existing {
+            deploy_token: set.value.clone(),
+        });
     }
     match deploy_token.filter(|token| !token.is_empty()) {
         Some(deploy_token) => Ok(MainWorkerPlan::Existing { deploy_token }),
@@ -270,7 +305,9 @@ pub fn resolve_worker_secrets(
     .collect()
 }
 
-/// Put `secrets` on `config`'s Worker, in order.
+/// Put `secrets` on `config`'s Worker, in order, reporting each as soon as
+/// it is set: a generated deploy token is printed the moment the Worker holds
+/// it, so a later failure cannot lose the only copy.
 pub fn put_worker_secrets(
     commands: &impl WorkerCommands,
     config: &Path,
@@ -278,28 +315,30 @@ pub fn put_worker_secrets(
 ) -> Result<()> {
     for secret in secrets {
         commands.secret_put(config, secret.name, &secret.value)?;
+        report_worker_secret(secret);
     }
     Ok(())
 }
 
-/// Tell the operator what was set. A generated deploy token is printed once,
-/// with the export every later deploy needs; no other value is printed.
-pub fn report_worker_secrets(secrets: &[WorkerSecret]) {
-    let token_key = impresspress_core::config_vars::DEPLOY_TOKEN_KEY;
-    for secret in secrets {
-        let name = secret.name;
-        if !secret.generated {
-            println!("-> set worker secret {name} (from env {name})");
-            continue;
-        }
-        println!("-> generated and set worker secret {name}");
-        if name == token_key {
-            println!(
-                "   IMPORTANT: export this for future `impresspress deploy` runs:\n     \
-                 export {name}={}",
-                secret.value
-            );
-        }
+/// Tell the operator what was set. A generated deploy token is printed, with
+/// the export every later deploy needs; no other value is printed.
+fn report_worker_secret(secret: &WorkerSecret) {
+    let name = secret.name;
+    if !secret.generated {
+        println!("-> set worker secret {name} (from env {name})");
+        return;
+    }
+    println!("-> generated and set worker secret {name}");
+    if name == impresspress_core::config_vars::DEPLOY_TOKEN_KEY {
+        println!(
+            "   IMPORTANT: export this for future `impresspress deploy` runs:\n     \
+             export {name}={}\n   \
+             It is printed here once. If this output is a CI log others can read, rotate it \
+             (npx wrangler secret put {name} --name <worker_name>) and store the \
+             new value as a CI secret; a first deploy with {name} already exported uses that \
+             value and prints nothing.",
+            secret.value
+        );
     }
 }
 
@@ -339,10 +378,18 @@ mod tests {
 
     use super::*;
 
-    /// A [`WorkerCommands`] that records every call and answers
-    /// `worker_exists` from a script, one answer per call.
+    const TOKEN: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
+    const JWT: &str = "WAFER_RUN__AUTH__JWT_SECRET";
+
+    /// A [`WorkerCommands`] that records every call. `worker_exists` answers
+    /// from a script while one is left, then from whether `deploy` has run;
+    /// the secrets it holds are the ones `secret_put` set, and a put of
+    /// `fail_put` fails.
     struct Recorder {
         exists: RefCell<Vec<Result<bool>>>,
+        deployed: RefCell<bool>,
+        held: RefCell<Vec<String>>,
+        fail_put: Option<&'static str>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -350,12 +397,23 @@ mod tests {
         fn answering(exists: Vec<Result<bool>>) -> Self {
             Self {
                 exists: RefCell::new(exists.into_iter().rev().collect()),
+                deployed: RefCell::new(false),
+                held: RefCell::new(Vec::new()),
+                fail_put: None,
                 calls: RefCell::new(Vec::new()),
             }
         }
 
+        /// A Worker that exists and holds `held`.
+        fn existing(held: &[&str]) -> Self {
+            let recorder = Self::answering(Vec::new());
+            *recorder.deployed.borrow_mut() = true;
+            *recorder.held.borrow_mut() = held.iter().map(|name| name.to_string()).collect();
+            recorder
+        }
+
         fn calls(&self) -> Vec<String> {
-            self.calls.borrow().clone()
+            self.calls.take()
         }
     }
 
@@ -364,16 +422,17 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("exists {}", config.display()));
-            self.exists
-                .borrow_mut()
-                .pop()
-                .expect("an existence answer is scripted for every check")
+            match self.exists.borrow_mut().pop() {
+                Some(answer) => answer,
+                None => Ok(*self.deployed.borrow()),
+            }
         }
 
         fn deploy(&self, config: &Path) -> Result<()> {
             self.calls
                 .borrow_mut()
                 .push(format!("deploy {}", config.display()));
+            *self.deployed.borrow_mut() = true;
             Ok(())
         }
 
@@ -381,19 +440,30 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("secret {name}={value} {}", config.display()));
+            if self.fail_put == Some(name) {
+                anyhow::bail!("wrangler secret put {name} failed");
+            }
+            self.held.borrow_mut().push(name.to_string());
             Ok(())
+        }
+
+        fn secret_names(&self, config: &Path) -> Result<Vec<String>> {
+            self.calls
+                .borrow_mut()
+                .push(format!("list {}", config.display()));
+            Ok(self.held.borrow().clone())
         }
     }
 
     fn secrets(token: &str) -> Vec<WorkerSecret> {
         vec![
             WorkerSecret {
-                name: impresspress_core::config_vars::DEPLOY_TOKEN_KEY,
+                name: TOKEN,
                 value: token.into(),
                 generated: true,
             },
             WorkerSecret {
-                name: impresspress_core::blocks::auth::JWT_SECRET_KEY,
+                name: JWT,
                 value: "jwt".into(),
                 generated: true,
             },
@@ -402,32 +472,45 @@ mod tests {
 
     #[test]
     fn an_existing_worker_deploys_with_the_operators_token_and_creates_nothing() {
-        let commands = Recorder::answering(vec![Ok(true)]);
-        let plan =
-            plan_main_worker(&commands, Path::new("p.toml"), "site", Some("tok".into())).unwrap();
+        let commands = Recorder::existing(&[TOKEN, JWT]);
+        let plan = plan_main_worker(
+            &commands,
+            Path::new("p.toml"),
+            "site",
+            &secrets("new"),
+            Some("tok".into()),
+        )
+        .unwrap();
         assert_eq!(
             plan,
             MainWorkerPlan::Existing {
                 deploy_token: "tok".into()
             }
         );
-        assert_eq!(commands.calls(), ["exists p.toml"]);
+        assert_eq!(commands.calls(), ["exists p.toml", "list p.toml"]);
     }
 
-    /// Without the token an existing Worker cannot be prepared; the refusal
-    /// names the one command that sets a new one, and nothing is run.
+    /// Without the token an existing Worker that holds one cannot be
+    /// prepared; the refusal names the one command that sets a new one, and
+    /// nothing is set.
     #[test]
     fn an_existing_worker_without_a_token_is_refused_with_the_command_to_run() {
         for token in [None, Some(String::new())] {
-            let commands = Recorder::answering(vec![Ok(true)]);
-            let err = plan_main_worker(&commands, Path::new("p.toml"), "site", token)
-                .unwrap_err()
-                .to_string();
+            let commands = Recorder::existing(&[TOKEN, JWT]);
+            let err = plan_main_worker(
+                &commands,
+                Path::new("p.toml"),
+                "site",
+                &secrets("new"),
+                token,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 err.contains("npx wrangler secret put IMPRESSPRESS_DEPLOY_TOKEN --name site"),
                 "{err}"
             );
-            assert_eq!(commands.calls(), ["exists p.toml"]);
+            assert_eq!(commands.calls(), ["exists p.toml", "list p.toml"]);
         }
     }
 
@@ -437,9 +520,17 @@ mod tests {
         for token in [None, Some("tok".to_string())] {
             let commands = Recorder::answering(vec![Ok(false)]);
             assert_eq!(
-                plan_main_worker(&commands, Path::new("p.toml"), "site", token).unwrap(),
+                plan_main_worker(
+                    &commands,
+                    Path::new("p.toml"),
+                    "site",
+                    &secrets("new"),
+                    token
+                )
+                .unwrap(),
                 MainWorkerPlan::Create
             );
+            assert_eq!(commands.calls(), ["exists p.toml"]);
         }
     }
 
@@ -448,7 +539,14 @@ mod tests {
     #[test]
     fn a_failed_existence_check_stops_the_deploy() {
         let commands = Recorder::answering(vec![Err(anyhow::anyhow!("not logged in"))]);
-        let err = plan_main_worker(&commands, Path::new("p.toml"), "site", None).unwrap_err();
+        let err = plan_main_worker(
+            &commands,
+            Path::new("p.toml"),
+            "site",
+            &secrets("new"),
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not logged in"), "{err}");
     }
 
@@ -472,6 +570,77 @@ mod tests {
         );
     }
 
+    /// A first deploy that created the Worker and set its deploy token, then
+    /// failed setting the JWT secret, is finished by the next run: the Worker
+    /// exists, so the run lists its secret names, sets the JWT secret it
+    /// lacks — and not the deploy token it holds — and then authenticates with
+    /// the token the operator exported from the first run's output.
+    #[test]
+    fn a_rerun_after_a_failed_secret_write_sets_the_missing_secret() {
+        let mut commands = Recorder::answering(vec![Ok(false)]);
+        commands.fail_put = Some(JWT);
+        let err = create_main_worker(&commands, Path::new("p.toml"), "site", &secrets("first"))
+            .unwrap_err();
+        assert!(err.to_string().contains(JWT), "{err}");
+        assert_eq!(*commands.held.borrow(), [TOKEN]);
+        commands.calls();
+        commands.fail_put = None;
+
+        let plan = plan_main_worker(
+            &commands,
+            Path::new("p.toml"),
+            "site",
+            &secrets("second"),
+            Some("first".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            MainWorkerPlan::Existing {
+                deploy_token: "first".into()
+            }
+        );
+        assert_eq!(
+            commands.calls(),
+            [
+                "exists p.toml",
+                "list p.toml",
+                "secret WAFER_RUN__AUTH__JWT_SECRET=jwt p.toml",
+            ]
+        );
+    }
+
+    /// A Worker that holds no deploy token (the first run stopped right after
+    /// the placeholder deploy) is given one, and the deploy uses it without
+    /// the operator having exported anything.
+    #[test]
+    fn a_worker_without_a_deploy_token_is_given_one_and_the_deploy_uses_it() {
+        let commands = Recorder::existing(&[]);
+        let plan = plan_main_worker(
+            &commands,
+            Path::new("p.toml"),
+            "site",
+            &secrets("new"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            MainWorkerPlan::Existing {
+                deploy_token: "new".into()
+            }
+        );
+        assert_eq!(
+            commands.calls(),
+            [
+                "exists p.toml",
+                "list p.toml",
+                "secret IMPRESSPRESS_DEPLOY_TOKEN=new p.toml",
+                "secret WAFER_RUN__AUTH__JWT_SECRET=jwt p.toml",
+            ]
+        );
+    }
+
     /// A Worker that appeared while the deploy was building is left alone.
     #[test]
     fn a_worker_created_meanwhile_is_never_deployed_over() {
@@ -486,7 +655,7 @@ mod tests {
     #[test]
     fn secrets_come_from_the_environment_when_set_and_are_minted_otherwise() {
         let secrets = resolve_worker_secrets(
-            |name| (name == "IMPRESSPRESS_DEPLOY_TOKEN").then(|| "from-env".to_string()),
+            |name| (name == TOKEN).then(|| "from-env".to_string()),
             || Ok([0xab; 32]),
         )
         .unwrap();
@@ -494,12 +663,12 @@ mod tests {
             secrets,
             [
                 WorkerSecret {
-                    name: "IMPRESSPRESS_DEPLOY_TOKEN",
+                    name: TOKEN,
                     value: "from-env".into(),
                     generated: false,
                 },
                 WorkerSecret {
-                    name: "WAFER_RUN__AUTH__JWT_SECRET",
+                    name: JWT,
                     value: "ab".repeat(32),
                     generated: true,
                 },

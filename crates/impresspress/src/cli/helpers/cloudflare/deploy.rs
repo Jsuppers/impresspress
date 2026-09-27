@@ -461,9 +461,10 @@ pub async fn smoke_authenticated_get(preview_url: &str, token: &str, path: &str)
 /// spread across many. An isolate that lands in a colo whose KV copy is still
 /// stale fails `prepared_generation_matches`, abandons the packaged plan, and
 /// pays a full dynamic runtime build inside its own request budget. On the
-/// free plan that build does not fit in 10 ms of CPU or ~50 subrequests, so it
-/// surfaces as a 500 ("Worker exceeded resource limits" / "Too many
-/// subrequests") rather than the cheap 503 the runtime used to return.
+/// free plan that build does not fit in 10 ms of CPU, so it surfaces as a 500
+/// ("Worker exceeded resource limits", or "Too many subrequests" when its
+/// D1/KV/R2 calls also pass the 1,000 internal-service subrequests an
+/// invocation may make) rather than the cheap 503 the runtime used to return.
 ///
 /// This is a plain WAIT, deliberately not a warm-up: it issues no requests to
 /// the smoke paths, so the burst still measures genuinely cold isolates and
