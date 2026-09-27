@@ -13,6 +13,11 @@
 //!    step 2 gives, but its family is left alone — see [`refuse_not_live`].
 //! 4. The winner inserts a new row under the same family ID with
 //!    `generation + 1` and returns the new access + refresh pair.
+//!
+//! Before the claim, the token's `auth_version` claim is checked against the
+//! account's: a family issued before the account's latest security-relevant
+//! change is refused and revoked, whatever its row says. See the check in
+//! [`handle`].
 
 use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, OutputStream};
@@ -137,6 +142,31 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         return error_response(ErrorCode::AccountDisabled, "Account is disabled");
     }
 
+    // The account version this family was issued against, set by
+    // `generate_tokens` from the row the issuing sign-in read before it
+    // checked anything. Every password change, reset, disable, enable,
+    // soft-delete and role change bumps the account's version after it lands
+    // (`bump_auth_version`), so a family behind it predates one of those and
+    // ends here.
+    //
+    // The row lookup above cannot decide this. A password change revokes the
+    // rows that exist when it runs, and a sign-in that verified the OLD
+    // password can write its row a moment later; a rotation that claimed its
+    // predecessor before the revocation writes its successor after it. Both
+    // rows are live, and both carry the version from before the change.
+    //
+    // A missing claim is `0`, the column's default — the access-token rule
+    // (`crate::crypto::verify_access_token`). A token minted before the claim
+    // existed is accepted only for an account whose version has never moved,
+    // for which `0` is exactly the version it was minted at.
+    let issued_at_version = claims
+        .get(users::AUTH_VERSION_FIELD)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if issued_at_version < user.auth_version {
+        return refuse_stale_family(ctx, &row).await;
+    }
+
     let require_verification = match crate::config_vars::get_bool(
         ctx,
         crate::blocks::auth::config::REQUIRE_VERIFICATION_KEY,
@@ -232,6 +262,31 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
             token_type: TokenType::Bearer,
             expires_in: issued.access_lifetime,
         })
+}
+
+/// Refuse a refresh token whose family was issued before the account's
+/// current `auth_version`, and revoke the family.
+///
+/// The revoke is housekeeping, not the refusal: every token the family could
+/// still mint from carries the same stale version and meets the same check,
+/// so a revoke that fails is logged and the answer stays the same. Revoking
+/// makes the rows say what the check decided, so a later presentation takes
+/// the row-level refusal without reading the account.
+async fn refuse_stale_family(ctx: &dyn Context, row: &tokens::TokenRow) -> OutputStream {
+    tracing::info!(
+        user_id = %row.user_id,
+        family = %row.family,
+        "refresh: family issued before the account's current auth_version; revoking it"
+    );
+    if let Err(e) = tokens::revoke_family(ctx, &row.family).await {
+        tracing::warn!(
+            user_id = %row.user_id,
+            family = %row.family,
+            error = %e,
+            "refresh: could not revoke a stale family; it stays refused by auth_version"
+        );
+    }
+    error_response(ErrorCode::InvalidToken, "Refresh token has been revoked")
 }
 
 /// How a refresh token turned out not to be its family's live generation.
@@ -910,22 +965,223 @@ mod tests {
             "an access token carrying a role removed during its mint must be refused"
         );
 
-        // The control: the next rotation, after the removal, authenticates on
-        // the same route, so the refusal above is the stale version alone.
+        // The successor it handed out was minted at the same version, so the
+        // bump ends its family as well: the next rotation is refused.
         let next_refresh = rotated["refresh_token"]
             .as_str()
             .expect("the rotation handed out a successor");
-        let next = output_json(handle(&auth_ui, refresh_with(next_refresh)).await).await;
-        let mut me = anon_msg("retrieve", "/b/auth/api/me");
-        me.set_meta(
-            "http.header.authorization",
-            format!(
-                "Bearer {}",
-                next["access_token"]
-                    .as_str()
-                    .expect("the next rotation succeeded")
-            ),
+        assert!(
+            output_is_error(
+                handle(&auth_ui, refresh_with(next_refresh)).await,
+                "Unauthenticated"
+            )
+            .await,
+            "a refresh token minted before the removal's bump must be refused"
         );
+
+        // The control: a sign-in after the removal authenticates on the same
+        // route, so the refusal above is the stale version and nothing else.
+        let fresh = ctx.sign_in(EMAIL, PASSWORD).await;
+        let me = fresh.bearer(anon_msg("retrieve", "/b/auth/api/me"));
         assert_eq!(output_http_status(ctx.request(me).await).await, 200);
+    }
+
+    /// The account-changing half of a sign-in race: `change` runs the moment
+    /// `inner`'s next `(op, collection)` call has answered.
+    fn change_after(
+        inner: &TestContext,
+        op: &'static str,
+        collection: &'static str,
+        change: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> crate::test_support::AfterDbOpContext {
+        crate::test_support::AfterDbOpContext::new(inner.clone(), op, collection, change)
+    }
+
+    /// A password change through the real handler, as the signed-in
+    /// `user_id`, from `old` to `new`. Panics unless it succeeds.
+    async fn change_password_now(ctx: TestContext, user_id: String, old: &str, new: &str) {
+        use crate::{
+            blocks::auth_ui::api::change_password,
+            test_support::{auth_msg, output_status},
+        };
+        let msg = auth_msg("update", "/b/auth/api/change-password", &user_id);
+        let body = serde_json::json!({"current_password": old, "new_password": new});
+        let out = change_password::handle(&ctx, &msg, json_input(body)).await;
+        assert_eq!(
+            output_status(out).await,
+            200,
+            "the password change succeeds"
+        );
+    }
+
+    const RACE_EMAIL: &str = "reuse@example.com";
+    const OLD_PASSWORD: &str = "correct-horse-battery";
+    const NEW_PASSWORD: &str = "new-horse-battery-2026";
+
+    fn credentials(password: &str) -> InputStream {
+        json_input(serde_json::json!({"email": RACE_EMAIL, "password": password}))
+    }
+
+    async fn race_user_id(ctx: &TestContext) -> String {
+        users::find_by_email(ctx, RACE_EMAIL)
+            .await
+            .expect("read the account")
+            .expect("the account exists")
+            .id
+    }
+
+    /// Sign in with the OLD password while a password change lands between
+    /// the sign-in's credential read and its refresh-row insert.
+    ///
+    /// The change revokes every refresh row that exists when it runs; this
+    /// sign-in's row does not exist yet, so it is written live afterwards.
+    /// A row-only check lets that token refresh — and keep refreshing — past
+    /// a change whose whole point was ending every session the old password
+    /// opened. The token carries the version read before the old password was
+    /// checked, which the change's bump has passed, so it is refused.
+    #[tokio::test]
+    async fn a_sign_in_racing_a_password_change_leaves_a_refresh_token_that_is_refused() {
+        use crate::blocks::auth::repo::local_credentials;
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        fresh_refresh_token(&ctx).await;
+        let uid = race_user_id(&ctx).await;
+
+        // The credential read is the sign-in's last read before it mints: the
+        // old hash is in hand, the password it checks is the old one.
+        let racing = change_after(
+            &ctx,
+            "database.list",
+            local_credentials::TABLE,
+            change_password_now(ctx.clone(), uid, OLD_PASSWORD, NEW_PASSWORD),
+        );
+        let signed_in = output_json(login::handle(&racing, credentials(OLD_PASSWORD)).await).await;
+        assert!(
+            racing.fired(),
+            "the change must land inside the sign-in: {signed_in}"
+        );
+        let token = signed_in["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the sign-in checked the old password first: {signed_in}"));
+        let family = tokens::find_by_token(&ctx, token)
+            .await
+            .expect("token lookup")
+            .expect("the sign-in wrote its row after the revocation")
+            .family;
+        assert!(
+            tokens::family_has_live_row(&ctx, &family)
+                .await
+                .expect("live-row check"),
+            "the revocation ran before this row existed, so the row alone is live"
+        );
+
+        assert!(
+            output_is_error(handle(&ctx, refresh_with(token)).await, "Unauthenticated").await,
+            "a refresh token from a sign-in that checked the old password must not \
+             outlive the password change"
+        );
+        assert!(
+            !tokens::family_has_live_row(&ctx, &family)
+                .await
+                .expect("live-row check"),
+            "the refused family is revoked"
+        );
+
+        // The control: a sign-in with the new password refreshes, so the
+        // refusal above is the stale version and nothing else.
+        let fresh = output_json(login::handle(&ctx, credentials(NEW_PASSWORD)).await).await;
+        let fresh = fresh["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the new password signs in: {fresh}"));
+        let again = output_http_json(handle(&ctx, refresh_with(fresh)).await).await;
+        assert!(
+            again["refresh_token"].is_string(),
+            "a family issued after the change refreshes: {again}"
+        );
+    }
+
+    /// The same race against an admin disabling the account and enabling it
+    /// again. While disabled the account refuses every refresh; once enabled,
+    /// a family the sign-in wrote after the disable must not be what signs
+    /// the user straight back in.
+    ///
+    /// The hook makes the two writes `admin::ops::set_user_disabled` makes
+    /// for each — the flag, then the bump — because that function is private
+    /// to the admin block.
+    #[tokio::test]
+    async fn a_sign_in_racing_a_disable_leaves_a_refresh_token_that_is_refused() {
+        use crate::blocks::auth::{bump_auth_version, repo::local_credentials};
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        fresh_refresh_token(&ctx).await;
+        let uid = race_user_id(&ctx).await;
+
+        let (admin, holder) = (ctx.clone(), uid.clone());
+        let racing = change_after(
+            &ctx,
+            "database.list",
+            local_credentials::TABLE,
+            async move {
+                for disabled in [true, false] {
+                    users::set_disabled(&admin, &holder, disabled)
+                        .await
+                        .expect("set the disabled flag");
+                    bump_auth_version(&admin, &holder)
+                        .await
+                        .expect("bump auth_version");
+                }
+            },
+        );
+        let signed_in = output_json(login::handle(&racing, credentials(OLD_PASSWORD)).await).await;
+        assert!(
+            racing.fired(),
+            "the disable must land inside the sign-in: {signed_in}"
+        );
+        let token = signed_in["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the sign-in read the account while active: {signed_in}"));
+
+        assert!(
+            output_is_error(handle(&ctx, refresh_with(token)).await, "Unauthenticated").await,
+            "a refresh token from a sign-in that straddled a disable must not \
+             refresh once the account is enabled again"
+        );
+    }
+
+    /// A rotation that has claimed its predecessor when a password change
+    /// lands writes its successor after the change's revocation, so the
+    /// successor row is live. It was minted from the account read before the
+    /// change, and the next rotation refuses it.
+    #[tokio::test]
+    async fn a_rotation_racing_a_password_change_leaves_a_successor_that_is_refused() {
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let token = fresh_refresh_token(&ctx).await;
+        let uid = race_user_id(&ctx).await;
+
+        // The claim is the rotation's last write before its insert.
+        let racing = change_after(
+            &ctx,
+            "database.update_where_count",
+            tokens::TABLE,
+            change_password_now(ctx.clone(), uid, OLD_PASSWORD, NEW_PASSWORD),
+        );
+        let rotated = output_json(handle(&racing, refresh_with(&token)).await).await;
+        assert!(
+            racing.fired(),
+            "the change must land inside the rotation: {rotated}"
+        );
+        let successor = rotated["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the rotation claimed its predecessor first: {rotated}"));
+
+        assert!(
+            output_is_error(
+                handle(&ctx, refresh_with(successor)).await,
+                "Unauthenticated"
+            )
+            .await,
+            "a successor minted from the account as it was before the password \
+             change must not outlive it"
+        );
     }
 }

@@ -475,6 +475,11 @@ mod timing_equalization_tests {
 // soft-delete, or role change takes effect on the very next request instead
 // of waiting out the token's natural expiry.
 //
+// Refresh JWTs embed it too, and `auth_ui::api::refresh` refuses one whose
+// version is behind, reading the column directly rather than through the
+// cache. So every bump also ends the refresh families issued before it: the
+// account signs in again, including after a role change or a re-enable.
+//
 // Reading `auth_version` on every authenticated request would cost a DB read
 // per request, so verification goes through the short-lived
 // process/isolate-local cache below ([`current_auth_version`]) instead of
@@ -648,6 +653,12 @@ fn invalidate_auth_version_cache(user_id: &str) {
 /// token minted across a change fail its first verification: bump only
 /// before the write, and a sign-in reading the version after that bump and
 /// the facts before the write mints the old facts at the new version.
+///
+/// The same holds for the refresh token minted alongside, whose family the
+/// bump ends (`auth_ui::api::refresh`). That is what closes a sign-in racing
+/// a password change: `tokens::revoke_all_for_user` cannot reach a refresh
+/// row written after it runs, but that row's token carries the version read
+/// before the old password was checked, which this bump has passed.
 pub(crate) async fn bump_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
@@ -1078,11 +1089,12 @@ pub(crate) mod helpers {
     /// minted in signs to exactly the predecessor's bytes, and its
     /// `token_hash` collides with the row the rotation has just revoked.
     ///
-    /// Access tokens also carry `grant`'s `auth_version` (P2c) — see the
+    /// Both tokens also carry `grant`'s `auth_version` (P2c) — see the
     /// module-level docs above `current_auth_version` — so a later
-    /// password-change/disable/role-change bump invalidates this token on
-    /// verify instead of only at its natural expiry. [`TokenGrant`] says why
-    /// the version and the roles come in together.
+    /// password-change/disable/role-change bump invalidates the access token
+    /// on verify instead of only at its natural expiry, and ends the refresh
+    /// token's family at its next rotation. [`TokenGrant`] says why the
+    /// version and the roles come in together.
     pub(crate) async fn generate_tokens(
         ctx: &dyn wafer_run::context::Context,
         lifetime: &SessionLifetime,
@@ -1203,6 +1215,17 @@ pub(crate) mod helpers {
         // (`repo::tokens`), and `verify_access_token` refuses anything whose
         // `type` is not `access` before it looks at a `jti` at all.
         refresh_claims.insert("jti".to_string(), serde_json::Value::String(refresh_jti));
+        // The account version this family was issued against, for the same
+        // reason the access token carries it: `auth_ui::api::refresh` refuses
+        // a refresh token whose version the account has moved past. The row
+        // alone cannot say that. `tokens::revoke_all_for_user` only reaches
+        // rows that exist when it runs, and a sign-in that checked the old
+        // password can write its row after that; the version, read before the
+        // check, is behind the bump that follows every revocation.
+        refresh_claims.insert(
+            repo::users::AUTH_VERSION_FIELD.to_string(),
+            serde_json::json!(grant.auth_version),
+        );
 
         let refresh_token =
             crypto::sign(ctx, &refresh_claims, Duration::from_secs(lifetime.ttl_secs))

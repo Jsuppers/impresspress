@@ -20,6 +20,28 @@ bundle that changes them. So whenever a release's code half assumes a data
 repair the migration half performs, it has to be called out here — on native
 the two ship together but only one of them runs by default.
 
+### Refresh tokens end at every `auth_version` bump
+
+**What changes.** A refresh token now carries the account's `auth_version`
+from when its sign-in began, and `/b/auth/api/refresh` refuses (and revokes)
+one the account has moved past. Every bump therefore signs the account's
+devices out at their next refresh, not only a password change or reset: a
+role grant or removal, a role rename or delete that touches the account, a
+disable followed by an enable, and a soft-delete. Before, those bumps retired
+access tokens only and the next refresh minted a fresh one. This closes a
+race: a sign-in that checked the OLD password while a password change ran
+could write its refresh row after the change revoked every row, and that token
+kept refreshing.
+
+No migration. A refresh token issued before this release has no version claim
+and reads as `0`, so it keeps working for an account whose `auth_version` has
+never been bumped; on any other account the next refresh is refused and the
+user signs in again, once.
+
+**Who has to act.** Nobody. Expect users who have had a role, lifecycle or
+password change at any point to be asked to sign in once after the upgrade,
+and users whose role an admin changes to be asked to sign in again.
+
 ### Cloudflare: a new site deploys in one command
 
 **What changes.**
