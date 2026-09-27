@@ -3799,7 +3799,8 @@ mod tests {
     fn guest_subscription_status_schema_omits_the_unset_value() {
         use super::{GuestOrderStatus, SubscriptionStatus};
 
-        let schema = schemars::schema_for!(GuestOrderStatus);
+        // The schema the route publishes, subschemas inlined.
+        let schema = crate::endpoint_match::response_schema_of::<GuestOrderStatus>();
         let published = schema
             .get("properties")
             .and_then(|properties| properties.get("subscription_status"))
