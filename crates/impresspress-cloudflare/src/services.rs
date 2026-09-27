@@ -360,8 +360,9 @@ mod tests {
     }
 
     /// The D1 service reports this deploy's query limit, not a constant: a
-    /// Free-plan deploy's 50 must reach the budget the database handler admits
-    /// writes against, and an unusable value must refuse to build a service.
+    /// lowered limit (50 here) must reach the budget the database handler
+    /// admits writes against, and an unusable value must refuse to build a
+    /// service.
     #[wasm_bindgen_test]
     fn the_service_takes_its_query_limit_from_the_environment() {
         use wafer_core::interfaces::database::service::StatementBudget;
@@ -373,10 +374,10 @@ mod tests {
             other => panic!("a D1 service reports a limited budget: {other:?}"),
         };
 
-        assert_eq!(limit(&empty_environment()), 1000, "unset is Workers Paid");
-        let mut free = empty_environment();
-        free.set_d1_queries_per_invocation_for_test("50");
-        assert_eq!(limit(&free), 50);
+        assert_eq!(limit(&empty_environment()), 1000, "unset is the default");
+        let mut lowered = empty_environment();
+        lowered.set_d1_queries_per_invocation_for_test("50");
+        assert_eq!(limit(&lowered), 50);
 
         let mut malformed = empty_environment();
         malformed.set_d1_queries_per_invocation_for_test("fifty");

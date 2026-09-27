@@ -39,7 +39,7 @@
 //! on the handler: forgot-password and resend-verification defer after one
 //! account lookup; signup defers after its settings reads and the
 //! multi-statement account insert, so its verification mail runs on what
-//! those left, which on Workers Free's 50 is still most of the limit.
+//! those left, which is still most of the limit.
 
 use std::{
     collections::HashMap,

@@ -400,8 +400,9 @@ impl CfEnvironment {
     ///
     /// A bound value out of
     /// [`parse_d1_queries_per_invocation`](impresspress_core::config_vars::parse_d1_queries_per_invocation)'s
-    /// range is an error naming the var, not the default: a Free-plan deploy that mistyped `50`
-    /// would otherwise run with the Paid limit and meet D1's own refusal
+    /// range is an error naming the var, not the default: a deploy that
+    /// lowered it for a smaller `limits.subrequests` and mistyped the number
+    /// would otherwise run with 1000 and meet the platform's own refusal
     /// part-way through a write instead of the budget's up front.
     pub(crate) fn d1_queries_per_invocation(&self) -> Result<u64, String> {
         let Some(raw) = self.d1_queries_per_invocation.as_deref() else {
@@ -965,13 +966,13 @@ mod tests {
         );
     }
 
-    /// The D1 query limit: unset is Workers Paid's 1000, a bound number in
-    /// range is taken as it is (a Free-plan deploy's 50), and anything else —
-    /// not a whole number, at or below the audit-row reservation, above D1's
-    /// maximum — is an error naming the var rather than a silent fallback to
-    /// the Paid limit.
+    /// The D1 query limit: unset is the default 1000, a bound number in range
+    /// is taken as it is (a deploy that lowered it, here to 50), and anything
+    /// else — not a whole number, at or below the audit-row reservation,
+    /// above D1's maximum — is an error naming the var rather than a silent
+    /// fallback to the default.
     #[wasm_bindgen_test]
-    fn the_d1_query_limit_defaults_to_paid_and_refuses_a_malformed_value() {
+    fn the_d1_query_limit_defaults_to_1000_and_refuses_a_malformed_value() {
         let unbound = RecordingEnv::new(&[]);
         assert_eq!(
             CfEnvironment::capture(&unbound.env).d1_queries_per_invocation(),

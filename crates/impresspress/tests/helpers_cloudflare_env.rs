@@ -384,21 +384,21 @@ fn release_assets_exclude_globs_are_compiled_and_kept() {
     assert!(!cfg.r2.release_assets_exclude[0].matches("content/legal/terms.md"));
 }
 
-/// `[cloudflare].d1_queries_per_invocation` is the plan's D1 query limit:
-/// unset is Workers Paid's 1000, a stated number up to 1000 is taken as it
+/// `[cloudflare].d1_queries_per_invocation` is the Worker's D1 query limit:
+/// unset is the default 1000, a stated number up to 1000 is taken as it
 /// is, and 0 — at or below the audit-row reservation, which the Worker would
 /// refuse on every request — or anything above D1's documented maximum of
 /// 1000 is refused here instead.
 #[test]
-fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_out_of_range() {
+fn resolve_d1_queries_per_invocation_defaults_to_1000_and_refuses_out_of_range() {
     let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
     assert_eq!(cfg.d1_queries_per_invocation, 1000);
 
-    let free = FULL_TOML.replace(
+    let lowered = FULL_TOML.replace(
         "compatibility_date = \"2026-05-01\"\n",
         "compatibility_date = \"2026-05-01\"\nd1_queries_per_invocation = 50\n",
     );
-    let cfg = parse_str(&free).resolve(fake_env(&[])).unwrap();
+    let cfg = parse_str(&lowered).resolve(fake_env(&[])).unwrap();
     assert_eq!(cfg.d1_queries_per_invocation, 50);
 
     let zero = FULL_TOML.replace(

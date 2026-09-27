@@ -17,11 +17,11 @@
 //!
 //! ## The per-invocation statement budget
 //!
-//! D1 runs at most a fixed number of queries per Worker invocation: 1000 on
-//! Workers Paid, 50 on the Free plan (D1's limits page, "Queries per Worker
-//! invocation"). A deploy states its plan's number in the
-//! `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` Worker var (default 1000; a
-//! Free-plan deploy sets 50), read once per invocation by
+//! D1 runs at most a fixed number of queries per Worker invocation, 1,000 on
+//! Workers Free and Paid alike (see "Which limit" below). The
+//! `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` Worker var states it (default
+//! 1000; lower only for a Worker whose `limits.subrequests` is lower), read
+//! once per invocation by
 //! [`CfEnvironment::capture`](crate::environment::CfEnvironment::capture).
 //!
 //! Every D1 service built in one invocation shares one [`D1QueryCount`],
@@ -51,14 +51,22 @@
 //! however the request spent its budget. Then the reservation is released,
 //! and the request's deferred tasks run on everything the row left.
 //!
-//! The budget counts D1 queries and nothing else. Cloudflare limits D1 queries
-//! per Worker invocation on their own: 50 on Workers Free, 1,000 on Paid (D1's
-//! limits page, "Queries per Worker invocation"). Workers KV and R2 operations
-//! are not D1 queries. The Workers limits page lists them as subrequests to
-//! Cloudflare services, and gives two rows: "Subrequests per invocation" (50
-//! on Free, 10,000 by default on Paid) and "Subrequests to internal services"
-//! (1,000 on Free, the configured limit on Paid) — the row for KV, R2 and D1.
-//! None of those is counted here.
+//! ### Which limit
+//!
+//! A D1 query is a subrequest to a Cloudflare internal service. The Workers
+//! limits page gives two subrequest rows: "Subrequests per invocation" (50 on
+//! Free, 10,000 by default on Paid), which is `fetch()` to the outside, and
+//! "Subrequests to internal services" (1,000 on Free, the configured limit on
+//! Paid), which is D1, KV and R2. D1's own limits page still says 50 queries
+//! per invocation on Free and 1,000 on Paid, but a Free-plan Worker runs a
+//! fresh database's `/_deploy/prepare` — over 250 D1 queries — in one
+//! invocation, so the internal-services row is the one D1 is held to. The
+//! default of 1,000 is within it on both plans, and within D1's page for Paid.
+//!
+//! The budget counts D1 queries and nothing else. The Workers page puts KV
+//! and R2 operations in that same internal-services row, and neither page
+//! says whether they share one count with D1's queries; none of them is
+//! counted here.
 //!
 //! Sources: <https://developers.cloudflare.com/d1/platform/limits/>,
 //! <https://developers.cloudflare.com/workers/platform/limits/#subrequests>.
@@ -68,8 +76,8 @@
 //! does NOT mean "retry later": the same request retried does the same work
 //! and is refused again, so a client that auto-retries 429s would loop. It
 //! means this request asked for more statements than one invocation may run;
-//! the fix is a smaller request (or, on a plan that allows more, a raised
-//! `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`). A write larger than the whole
+//! the fix is a smaller request (or, where the deploy stated a lowered
+//! `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, a higher one). A write larger than the whole
 //! limit is `InvalidArgument`.
 //!
 //! ## A taken key
