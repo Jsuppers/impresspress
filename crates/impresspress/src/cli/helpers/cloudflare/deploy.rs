@@ -684,6 +684,26 @@ pub fn wrangler_deploy_password_hasher(wrangler_toml: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The NAMES of a Worker's secrets, via `wrangler secret list --format json`
+/// against `wrangler_toml`'s Worker. Wrangler prints names and types only;
+/// no value is ever read.
+pub fn wrangler_secret_names(wrangler_toml: &Path) -> Result<Vec<String>> {
+    let output = Command::new("wrangler")
+        .args(["secret", "list", "--format", "json", "--config"])
+        .arg(wrangler_toml)
+        .output()
+        .context("run wrangler secret list")?;
+    if !output.status.success() {
+        bail!(
+            "wrangler secret list --config {} failed (exit {:?}): {}",
+            wrangler_toml.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    super::password_hasher::parse_secret_names(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Set a worker secret via `wrangler secret put <NAME> --config <toml>`,
 /// piping the value on stdin (never as an argv arg, which would leak it into
 /// the process table). Stdout/stderr inherit so wrangler's own confirmation

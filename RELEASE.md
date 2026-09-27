@@ -52,6 +52,11 @@ the main Worker's `[vars]` as `IMPRESSPRESS_PASSWORD_HASHER_SHARDS`).
   the main Worker release before it as well as its own
   (`impresspress_password::protocol`). `impresspress serve` runs both Workers
   in one `wrangler dev` session.
+- **Deploy every release in turn.** The hasher answers the protocol version
+  of the release before its own, not older ones. Deploying a release that is
+  two protocol versions ahead of the live main Worker makes every password
+  operation on the live site answer 503 from the moment the hasher deploys
+  until the new main Worker is promoted.
 - If the hasher cannot answer (missing binding, Durable Object error,
   unreadable answer), the operation fails: a sign-in answers 503; a sign-up
   or password change fails with a 500. The main Worker never hashes a
@@ -62,8 +67,20 @@ the main Worker's `[vars]` as `IMPRESSPRESS_PASSWORD_HASHER_SHARDS`).
 - Durable Object requests count against the Workers Free plan's daily
   Durable Object allowance: 100,000 requests and 13,000 GB-s of duration a
   day, reset at 00:00 UTC. Every sign-in, sign-up and password change is one
-  request (a failed sign-in for an unknown email is one too). Past either
-  allowance, password operations fail until the reset.
+  request, and so is a failed sign-in for an unknown email: it burns a
+  verification on purpose, so that it takes as long as a wrong password for
+  a real account, and skipping the call would tell an attacker which emails
+  have accounts. Past either allowance, password operations fail (503 on
+  sign-in) until the reset. **The login rate limit does not protect this
+  allowance**: it is 30 requests a minute per IP (`WAFER_RUN_SHARED__RATE_LIMIT_AUTH`), about
+  43,000 a day from one address, so three addresses can spend the whole
+  day's allowance and lock every user out until 00:00 UTC. On a public
+  Free-plan site, add a Cloudflare WAF rate-limiting rule on
+  `/b/auth/api/login` and `/b/auth/api/signup`, or move to Workers Paid,
+  where Durable Object requests are billed rather than capped.
+- The hasher answers any Worker in the same Cloudflare account that binds
+  its class by script name; see `impresspress_password::protocol` ("Who can
+  call it").
 - The main Worker's wasm is about 11 KB smaller (cargo's output, before
   wasm-opt); the hasher Worker is about 470 KB (185 KB gzipped) after
   `worker-build`.
@@ -96,8 +113,14 @@ build refuses them in its `[vars]`. They are the hasher's:
   the hasher on its first run.
 - *An existing site with a pepper:* the hasher must hold the keys before the
   main Worker starts calling it, or every sign-in to a peppered account
-  answers 503 (a pepper fault) and new hashes are written unpeppered. So,
-  after `impresspress build --target cloudflare`:
+  answers 503 (a pepper fault) and new hashes are written unpeppered.
+  `impresspress deploy` checks this: after deploying the hasher it lists
+  both Workers' secret NAMES (never values), and if the main Worker holds
+  `IMPRESSPRESS_PASSWORD_PEPPER_KEY` or `…_PREVIOUS_KEYS` that the hasher
+  does not, it stops before uploading any main Worker version and prints the
+  `wrangler secret put … --name <hasher>` and `wrangler secret delete …
+  --name <worker_name>` commands to run. To do it ahead of time, after
+  `impresspress build --target cloudflare`:
   1. `npx wrangler deploy --config
      target/impresspress-cloudflare/wrangler-password-hasher.toml` (creates
      the hasher; the live main Worker still hashes on its own meanwhile);

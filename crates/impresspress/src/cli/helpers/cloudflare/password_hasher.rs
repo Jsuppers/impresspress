@@ -249,9 +249,151 @@ pub async fn build(repo_root: &Path) -> Result<PathBuf> {
     Ok(dir.join("build/index_bg.wasm"))
 }
 
+/// Refuse to put a main Worker version in front of a hasher that lacks the
+/// pepper the main Worker still holds.
+///
+/// A site that set its pepper before hashing moved to the hasher has the keys
+/// as the MAIN Worker's secrets, which nothing reads any more. Deploying on
+/// would leave every peppered account unable to sign in (a pepper fault, 503)
+/// and — worse, and silently — have every sign-up and password change write
+/// an unpeppered hash. So: for each pepper key secret the main Worker holds,
+/// the hasher must hold one of the same name. Values are never read; the
+/// names come from `wrangler secret list`.
+///
+/// `Ok` carries the names the main Worker still holds that the hasher has
+/// too, which the operator should delete from the main Worker.
+pub fn check_pepper_placement(
+    main_secrets: &[String],
+    hasher_secrets: &[String],
+    main_worker: &str,
+    hasher_worker: &str,
+) -> Result<Vec<&'static str>> {
+    use impresspress_password::pepper::{
+        PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
+    };
+    let holds = |secrets: &[String], name: &str| secrets.iter().any(|s| s == name);
+    let mut leftovers = Vec::new();
+    let mut missing = Vec::new();
+    for name in [PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR] {
+        if holds(main_secrets, name) {
+            if holds(hasher_secrets, name) {
+                leftovers.push(name);
+            } else {
+                missing.push(name);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(leftovers);
+    }
+    let steps: String = missing
+        .iter()
+        .map(|name| {
+            format!(
+                "\n  npx wrangler secret put {name} --name {hasher_worker}   \
+                 # the same value the main Worker holds\n  npx wrangler secret delete {name} \
+                 --name {main_worker}"
+            )
+        })
+        .collect();
+    bail!(
+        "the main Worker {main_worker} holds {} but the password-hasher Worker {hasher_worker} \
+         does not. Passwords are hashed by the hasher now, with its own secrets: deploying on \
+         would lock out every peppered account and write unpeppered hashes for every sign-up \
+         and password change. Nothing of the main Worker has been uploaded. Move the secret(s), \
+         then run the deploy again:{steps}\n(and set [cloudflare.password_hasher].\
+         pepper_required = true in impresspress.toml if the pepper was required)",
+        missing.join(" and ")
+    )
+}
+
+/// The secret names `wrangler secret list --format json` printed: a JSON
+/// array of `{ "name": …, "type": … }`. Wrangler may print a banner first,
+/// so the array is read from its first `[`.
+pub fn parse_secret_names(stdout: &str) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct Secret {
+        name: String,
+    }
+    let start = stdout
+        .find('[')
+        .context("no JSON array in `wrangler secret list` output")?;
+    let secrets: Vec<Secret> =
+        serde_json::from_str(&stdout[start..]).context("parse `wrangler secret list` output")?;
+    Ok(secrets.into_iter().map(|secret| secret.name).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEY: &str = "IMPRESSPRESS_PASSWORD_PEPPER_KEY";
+    const PREVIOUS: &str = "IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS";
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The upgrade gap: the pepper is still the main Worker's and the hasher
+    /// has none. Refused, naming the secret and the exact steps.
+    #[test]
+    fn a_pepper_left_on_the_main_worker_refuses_the_deploy() {
+        for main in [vec![KEY], vec![KEY, PREVIOUS], vec![PREVIOUS]] {
+            let err = check_pepper_placement(
+                &names(&main),
+                &names(&["OTHER"]),
+                "site",
+                "site-password-hasher",
+            )
+            .expect_err("refused");
+            let err = format!("{err:#}");
+            for name in &main {
+                assert!(
+                    err.contains(&format!(
+                        "npx wrangler secret put {name} --name site-password-hasher"
+                    )) && err.contains(&format!("npx wrangler secret delete {name} --name site")),
+                    "{err}"
+                );
+            }
+        }
+        // The key moved but the previous keys did not: still refused.
+        let err = check_pepper_placement(
+            &names(&[KEY, PREVIOUS]),
+            &names(&[KEY]),
+            "site",
+            "site-password-hasher",
+        )
+        .expect_err("previous keys missing");
+        assert!(format!("{err:#}").contains(PREVIOUS));
+    }
+
+    #[test]
+    fn a_pepper_on_the_hasher_or_nowhere_is_fine() {
+        assert!(check_pepper_placement(&[], &[], "m", "h")
+            .unwrap()
+            .is_empty());
+        assert!(check_pepper_placement(
+            &names(&["IMPRESSPRESS_DEPLOY_TOKEN"]),
+            &names(&[KEY]),
+            "m",
+            "h"
+        )
+        .unwrap()
+        .is_empty());
+        // Moved, but not yet deleted from the main Worker: allowed, and named.
+        assert_eq!(
+            check_pepper_placement(&names(&[KEY]), &names(&[KEY]), "m", "h").unwrap(),
+            vec![KEY]
+        );
+    }
+
+    #[test]
+    fn reads_secret_names_from_wrangler_json() {
+        let stdout = "\n ⛅️ wrangler 4.72.0\n[\n  {\n    \"name\": \"IMPRESSPRESS_PASSWORD_PEPPER_KEY\",\n    \"type\": \"secret_text\"\n  }\n]\n";
+        assert_eq!(parse_secret_names(stdout).unwrap(), vec![KEY.to_string()]);
+        assert!(parse_secret_names("[]").unwrap().is_empty());
+        assert!(parse_secret_names("error").is_err());
+    }
 
     fn package(source: Option<&str>) -> MetadataPackage {
         MetadataPackage {

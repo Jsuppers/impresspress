@@ -83,6 +83,9 @@ impl ImpresspressCryptoService {
 
 #[wafer_block::wafer_async_trait]
 impl CryptoService for ImpresspressCryptoService {
+    /// The hash the hasher returns is checked to be argon2id at the cost it is
+    /// meant to write ([`protocol::check_written_hash`]) before it is handed
+    /// back to be stored.
     async fn hash(&self, password: &str) -> Result<String, CryptoError> {
         self.hasher
             .ask(Operation::Hash {
@@ -569,6 +572,27 @@ mod tests {
                 .is_ok(),
             "tokens do not depend on the hasher"
         );
+    }
+
+    /// Defence in depth: a hasher that hands back a hash weaker than the one
+    /// it is meant to write — the 4 MiB preset, say — is not believed, and
+    /// nothing is stored.
+    #[wasm_bindgen_test]
+    async fn a_hash_below_the_written_cost_is_refused() {
+        let weak = wafer_block_crypto::primitives::hash_password(
+            "pw",
+            wafer_block_crypto::primitives::Argon2Cost::Constrained,
+        )
+        .expect("a 4 MiB hash");
+        let fake = FakeHasher::new(Rc::new(move |_| {
+            let answer = protocol::Response {
+                version: protocol::PROTOCOL_VERSION,
+                outcome: Outcome::Hashed { hash: weak.clone() },
+            };
+            (200, serde_json::to_string(&answer).expect("encode"))
+        }));
+        unavailable(fake.service(1).hash("pw").await);
+        assert_eq!(fake.shards.borrow().len(), 1, "the fake was asked");
     }
 
     /// A stub whose `fetch` rejects — the Durable Object threw, or could not

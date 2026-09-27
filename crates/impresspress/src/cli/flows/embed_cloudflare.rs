@@ -273,6 +273,25 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
         cfg.password_hasher.worker_name
     );
 
+    // 0b. A site that set its pepper before hashing moved still has the keys
+    //     on the main Worker, which reads them no longer. Uploading on would
+    //     lock out peppered accounts and write unpeppered hashes, so the
+    //     deploy stops here until they are on the hasher (secret names only).
+    let leftovers = password_hasher::check_pepper_placement(
+        &cf_deploy::wrangler_secret_names(&out_dir.join("wrangler.toml"))?,
+        &cf_deploy::wrangler_secret_names(&hasher_toml)?,
+        &cfg.worker_name,
+        &cfg.password_hasher.worker_name,
+    )?;
+    deployment_gate.pepper_placement_checked()?;
+    for name in leftovers {
+        eprintln!(
+            "-> note: {name} is on the password-hasher Worker and still on {} too, which no \
+             longer reads it; delete it there: npx wrangler secret delete {name} --name {}",
+            cfg.worker_name, cfg.worker_name
+        );
+    }
+
     let candidate_toml = wrangler::generate_candidate_upload(
         &cfg,
         repo_root,

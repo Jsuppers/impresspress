@@ -9,6 +9,9 @@
 //!   that Worker exports.
 
 pub mod hasher;
+
+/// The scheme id of a peppered argon2id hash.
+const PEPPERED_SCHEME_ID: &str = wafer_block_crypto::primitives::ARGON2ID_PEPPERED_ID;
 pub mod pepper;
 pub mod protocol;
 

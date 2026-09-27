@@ -82,18 +82,8 @@ fn bad_request(version: u32, error: &serde_json::Error) -> Response {
     Response {
         version,
         outcome: Outcome::BadRequest {
-            message: format!("{} at column {}", classify(error), error.column()),
+            message: crate::protocol::json_fault(error, "a request"),
         },
-    }
-}
-
-fn classify(error: &serde_json::Error) -> &'static str {
-    use serde_json::error::Category;
-    match error.classify() {
-        Category::Io => "unreadable body",
-        Category::Syntax => "not JSON",
-        Category::Data => "not a request",
-        Category::Eof => "truncated body",
     }
 }
 
@@ -141,6 +131,9 @@ mod tests {
             written.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
             "{written}"
         );
+        // The main Worker's check of what it is handed accepts what this
+        // writes: `WRITTEN_ARGON2_PARAMS` is `PASSWORD_SCHEME`'s cost.
+        crate::protocol::check_written_hash(&written).expect("the written cost");
         verify("correct horse", &written, &peppers).expect("verifies");
         assert!(matches!(
             verify("wrong", &written, &peppers),
@@ -159,6 +152,7 @@ mod tests {
             written.starts_with("$argon2id-hmac-sha256$v=19$m=19456,t=2,p=1,pepper="),
             "{written}"
         );
+        crate::protocol::check_written_hash(&written).expect("the written cost");
         verify("correct horse", &written, &peppers).expect("verifies with the key");
         assert!(matches!(
             verify("correct horse", &written, &PasswordPeppers::default()),

@@ -43,6 +43,23 @@
 //!   raise it once no deployed main Worker sends the old one.
 //! - A version outside that range is answered [`Outcome::UnsupportedVersion`],
 //!   which the main Worker reports as the hasher being unavailable.
+//!
+//! Skipping a release breaks the rule's premise: a hasher two versions ahead
+//! of the live main Worker refuses its requests, and every password operation
+//! on the live site answers 503 from the hasher deploy until the new main
+//! Worker is promoted. Deploy each release in turn when one bumps the
+//! version.
+//!
+//! # Who can call it
+//!
+//! Durable Object bindings are not authenticated beyond the account: any
+//! Worker in the same Cloudflare account can bind [`DURABLE_OBJECT_CLASS`] by
+//! the hasher's script name and ask it to hash or verify. The pepper keeps a
+//! stolen credential table uncrackable offline, but it does not stop a
+//! compromised Worker in the account — the main one included — from checking
+//! password guesses against stored hashes through the hasher, one argon2id
+//! verification per guess, without ever reading the key. Keep the account's
+//! Workers, and who may deploy them, as trusted as the credential table.
 
 use std::ops::RangeInclusive;
 
@@ -241,14 +258,25 @@ pub fn unavailable(reason: impl std::fmt::Display) -> CryptoError {
 impl Response {
     /// Read a response body the hasher sent with status 200.
     pub fn from_body(body: &[u8]) -> Result<Self, CryptoError> {
-        serde_json::from_slice(body)
-            .map_err(|e| unavailable(format!("its answer could not be read: {e}")))
+        serde_json::from_slice(body).map_err(|e| {
+            unavailable(format!(
+                "its answer could not be read ({})",
+                json_fault(&e, "an answer")
+            ))
+        })
     }
 
     /// The answer to a [`Operation::Hash`], as the crypto service returns it.
+    ///
+    /// A hash that is not argon2id at [`WRITTEN_ARGON2_PARAMS`] (peppered or
+    /// not) is refused rather than stored: whatever answered, the Worker
+    /// never keeps a credential weaker than the hasher is meant to write.
     pub fn into_hash(self) -> Result<String, CryptoError> {
         match self.into_answer()? {
-            Outcome::Hashed { hash } => Ok(hash),
+            Outcome::Hashed { hash } => {
+                check_written_hash(&hash)?;
+                Ok(hash)
+            }
             other => Err(unexpected("hash", &other)),
         }
     }
@@ -287,6 +315,50 @@ impl Response {
             other => Ok(other),
         }
     }
+}
+
+/// The argon2id parameters every hash the hasher writes carries: OWASP's
+/// recommended cost, `wafer_block_crypto::primitives::Argon2Cost::Default`.
+/// `hasher`'s tests hold the two equal.
+pub const WRITTEN_ARGON2_PARAMS: &str = "m=19456,t=2,p=1";
+
+/// Check a hash the hasher returned is one it is meant to write: argon2id
+/// (`$argon2id$`) or peppered argon2id (`$argon2id-hmac-sha256$`, whose
+/// parameters end in `,pepper=<id>`), version 19, at exactly
+/// [`WRITTEN_ARGON2_PARAMS`]. The error never contains the hash.
+pub fn check_written_hash(hash: &str) -> Result<(), CryptoError> {
+    let mut fields = hash.split('$');
+    let well_formed = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(""), Some("argon2id"), Some("v=19"), Some(params)) => params == WRITTEN_ARGON2_PARAMS,
+        (Some(""), Some(crate::PEPPERED_SCHEME_ID), Some("v=19"), Some(params)) => params
+            .strip_prefix(WRITTEN_ARGON2_PARAMS)
+            .and_then(|rest| rest.strip_prefix(",pepper="))
+            .is_some_and(|id| !id.is_empty() && !id.contains(',')),
+        _ => false,
+    };
+    // A salt and an output follow the parameters, and nothing after them.
+    let rest: Vec<&str> = fields.collect();
+    if well_formed && rest.len() == 2 && rest.iter().all(|f| !f.is_empty()) {
+        Ok(())
+    } else {
+        Err(unavailable(format!(
+            "it returned a hash that is not argon2id at {WRITTEN_ARGON2_PARAMS}"
+        )))
+    }
+}
+
+/// What was wrong with a JSON body, without any of its contents: serde_json's
+/// own message can quote the value it choked on, which may be a password or a
+/// hash.
+pub(crate) fn json_fault(error: &serde_json::Error, expected: &str) -> String {
+    use serde_json::error::Category;
+    let what = match error.classify() {
+        Category::Io => "unreadable body".to_string(),
+        Category::Syntax => "not JSON".to_string(),
+        Category::Data => format!("not {expected}"),
+        Category::Eof => "truncated body".to_string(),
+    };
+    format!("{what} at column {}", error.column())
 }
 
 fn unexpected(operation: &str, outcome: &Outcome) -> CryptoError {
@@ -370,10 +442,10 @@ mod tests {
             outcome,
         };
         assert_eq!(
-            at(Outcome::Hashed { hash: "h".into() })
+            at(Outcome::Hashed { hash: PLAIN.into() })
                 .into_hash()
                 .unwrap(),
-            "h"
+            PLAIN
         );
         at(Outcome::Verified).into_verify().unwrap();
         assert!(matches!(
@@ -437,5 +509,72 @@ mod tests {
         unavailable_err(at(PROTOCOL_VERSION + 1, Outcome::Verified).into_verify());
         unavailable_err(at(0, Outcome::Verified).into_verify());
         unavailable_err(Response::from_body(b"not json").map(drop));
+    }
+
+    const PLAIN: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
+    const PEPPERED: &str = "$argon2id-hmac-sha256$v=19$m=19456,t=2,p=1,pepper=0011223344556677$c2FsdHNhbHRzYWx0c2FsdA$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
+
+    #[test]
+    fn a_hash_at_the_written_cost_is_kept() {
+        for hash in [PLAIN, PEPPERED] {
+            let answer = Response {
+                version: PROTOCOL_VERSION,
+                outcome: Outcome::Hashed { hash: hash.into() },
+            };
+            assert_eq!(answer.into_hash().unwrap(), hash);
+        }
+    }
+
+    /// Defence in depth: whatever answered, a hash weaker than — or other
+    /// than — what the hasher writes is never handed back to be stored.
+    #[test]
+    fn a_weaker_or_foreign_hash_is_refused() {
+        for hash in [
+            // The 4 MiB preset the Worker used to write.
+            "$argon2id$v=19$m=4096,t=2,p=1$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=19456,t=1,p=1$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=19456,t=2,p=1,x=1$c2FsdA$aGFzaA",
+            "$argon2i$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA",
+            "$argon2id$v=16$m=19456,t=2,p=1$c2FsdA$aGFzaA",
+            "$argon2id-hmac-sha256$v=19$m=4096,t=2,p=1,pepper=00$c2FsdA$aGFzaA",
+            "$argon2id-hmac-sha256$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA",
+            "$argon2id-hmac-sha256$v=19$m=19456,t=2,p=1,pepper=$c2FsdA$aGFzaA",
+            "$pbkdf2-sha256$i=600000$c2FsdA$aGFzaA",
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA",
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA$extra",
+            "plaintext-password",
+            "",
+        ] {
+            let answer = Response {
+                version: PROTOCOL_VERSION,
+                outcome: Outcome::Hashed { hash: hash.into() },
+            };
+            match answer.into_hash() {
+                Err(CryptoError::Other(message)) => {
+                    assert!(message.starts_with(UNAVAILABLE_PREFIX), "{message}");
+                    if !hash.is_empty() {
+                        assert!(!message.contains(hash), "{message}");
+                    }
+                }
+                other => panic!("{hash:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// serde_json's messages can quote the value they choked on; an
+    /// unreadable answer is described without its contents.
+    #[test]
+    fn an_unreadable_answer_never_quotes_its_contents() {
+        for body in [
+            &br#"{"version":1,"outcome":{"kind":"hashed-hunter2-secret"}}"#[..],
+            br#"{"version":"hunter2-secret","outcome":{"kind":"verified"}}"#,
+        ] {
+            match Response::from_body(body) {
+                Err(CryptoError::Other(message)) => {
+                    assert!(!message.contains("hunter2"), "{message}")
+                }
+                other => panic!("expected unavailable, got {other:?}"),
+            }
+        }
     }
 }
