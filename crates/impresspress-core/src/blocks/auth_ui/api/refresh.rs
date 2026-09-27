@@ -986,6 +986,79 @@ mod tests {
         assert_eq!(output_http_status(ctx.request(me).await).await, 200);
     }
 
+    /// A refresh token minted before tokens carried an `auth_version` claim:
+    /// `source`'s claims with that one removed, re-signed, and stored under a
+    /// family of its own so it is a live generation-0 row like the original.
+    async fn claimless_copy_of(ctx: &TestContext, source: &str) -> String {
+        let mut claims = crypto::verify(ctx, source)
+            .await
+            .expect("the source token verifies");
+        claims.remove(users::AUTH_VERSION_FIELD);
+        // The signer sets these itself.
+        for set_by_signer in ["exp", "iat", "nbf"] {
+            claims.remove(set_by_signer);
+        }
+        let family = uuid::Uuid::now_v7().to_string();
+        claims.insert("family".to_string(), serde_json::json!(family));
+        claims.insert(
+            "jti".to_string(),
+            serde_json::json!(uuid::Uuid::now_v7().to_string()),
+        );
+        let token = crypto::sign(ctx, &claims, std::time::Duration::from_secs(3600))
+            .await
+            .expect("sign the claim-less token");
+        let user_id = tokens::find_by_token(ctx, source)
+            .await
+            .expect("token lookup")
+            .expect("the source row")
+            .user_id;
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        tokens::insert(ctx, &user_id, &token, &family, 0, &expires_at)
+            .await
+            .expect("store the claim-less token's row");
+        token
+    }
+
+    /// A refresh token with no `auth_version` claim was issued at version 0,
+    /// the column's default: it refreshes while the account's version has
+    /// never moved, and is refused once it has — a password change, disable
+    /// or role change must end a family minted before the claim existed as
+    /// surely as one minted after.
+    #[tokio::test]
+    async fn a_claimless_refresh_token_is_accepted_at_version_0_and_refused_after_a_bump() {
+        use crate::blocks::auth::bump_auth_version;
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let source = fresh_refresh_token(&ctx).await;
+        let (before, after) = (
+            claimless_copy_of(&ctx, &source).await,
+            claimless_copy_of(&ctx, &source).await,
+        );
+        let uid = race_user_id(&ctx).await;
+        assert_eq!(users::auth_version(&ctx, &uid).await.unwrap(), 0);
+        assert!(
+            !crypto::verify(&ctx, &before)
+                .await
+                .expect("verifies")
+                .contains_key(users::AUTH_VERSION_FIELD),
+            "precondition: the token carries no auth_version claim"
+        );
+
+        let rotated = output_http_json(handle(&ctx, refresh_with(&before)).await).await;
+        assert!(
+            rotated["refresh_token"].is_string(),
+            "a claim-less token refreshes against an account still at version 0: {rotated}"
+        );
+
+        bump_auth_version(&ctx, &uid)
+            .await
+            .expect("bump auth_version");
+        assert!(
+            output_is_error(handle(&ctx, refresh_with(&after)).await, "Unauthenticated").await,
+            "a claim-less token must not outlive the account's first auth_version bump"
+        );
+    }
+
     /// The account-changing half of a sign-in race: `change` runs the moment
     /// `inner`'s next `(op, collection)` call has answered.
     fn change_after(

@@ -5,8 +5,8 @@ use wafer_run::{context::Context, InputStream, OutputStream};
 use crate::{
     blocks::{
         auth::{
-            bump_auth_version, hash_new_password,
-            repo::{local_credentials, tokens, users},
+            end_sessions_after_password_change, hash_new_password,
+            repo::{local_credentials, users},
         },
         auth_ui::contracts::MessageResponse,
         crud,
@@ -89,6 +89,13 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         return crud::db_error_internal(e, "Failed to update password");
     }
 
+    // The credential has changed, so every session the old password opened
+    // must end — this is the account-recovery path, where a session that
+    // survives is the attacker's. It runs before anything below can return,
+    // so no later failure leaves those sessions live; its own failure is
+    // answered once the reset token is spent.
+    let ended = end_sessions_after_password_change(ctx, &user.id).await;
+
     // Clear reset token on the users row.
     if let Err(e) = users::clear_reset_token(ctx, &user.id).await {
         return crud::db_error_internal(e, "Failed to clear reset token");
@@ -119,35 +126,8 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         );
     }
 
-    // Revoke all refresh tokens — invalidate any stolen sessions.
-    // SEC-032/039: mark rows revoked (don't delete) so the reuse-detection
-    // tombstones survive across the password reset.
-    //
-    // The credential row has already been updated at this point, so a
-    // revocation failure must NOT be reported as success — this is the
-    // account-recovery path, so fail-closed here matters even more than in
-    // `change_password`. Same treatment: log it and surface a non-success
-    // response rather than swallowing it with `.ok()`.
-    if let Err(e) = tokens::revoke_all_for_user(ctx, &user.id).await {
-        tracing::error!(
-            user_id = %user.id,
-            error = %e,
-            "password reset but refresh-token revocation failed"
-        );
-        return crud::db_error_internal(e, "Password reset but session revocation failed");
-    }
-
-    // P2c: invalidate already-issued access JWTs too — refresh revocation
-    // alone doesn't touch a still-live access token, which would otherwise
-    // keep authenticating with the old password's blessing until its
-    // natural expiry. Same fail-closed treatment: the credential has
-    // already changed, so a failed bump must not be reported as success.
-    if let Err(e) = bump_auth_version(ctx, &user.id).await {
-        tracing::error!(
-            user_id = %user.id,
-            error = %e,
-            "password reset but auth_version bump failed"
-        );
+    // A reset whose sessions did not end must not be answered as success.
+    if let Err(e) = ended {
         return crud::db_error_internal(e, "Password reset but session invalidation failed");
     }
 
@@ -161,8 +141,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        blocks::auth_ui::api::signup,
-        test_support::{output_is_error, output_json, FailingDbOpContext, TestContext},
+        blocks::{
+            auth::repo::tokens,
+            auth_ui::api::{login, refresh, signup},
+        },
+        test_support::{
+            output_http_status, output_is_error, output_json, FailingDbOpContext, TestContext,
+        },
     };
 
     async fn ctx_with_crypto() -> TestContext {
@@ -231,26 +216,116 @@ mod tests {
         );
     }
 
-    /// A revocation failure must not be reported as success — matches
-    /// `change_password.rs`'s `revocation_failure_does_not_report_success`.
-    /// Proves the `.ok()` swallow at the old `reset_password.rs:83` is gone.
+    /// A refresh token the account holds, from a sign-in through the real
+    /// handler.
+    async fn sign_in(ctx: &TestContext, email: &str, password: &str) -> String {
+        let creds = serde_json::json!({"email": email, "password": password});
+        let signed_in = output_json(
+            login::handle(ctx, InputStream::from_bytes(creds.to_string().into_bytes())).await,
+        )
+        .await;
+        signed_in["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the sign-in succeeded: {signed_in}"))
+            .to_string()
+    }
+
+    /// Whether `token` still refreshes, through the real refresh handler.
+    async fn refreshes(ctx: &TestContext, token: &str) -> bool {
+        let body = serde_json::json!({ "refresh_token": token });
+        let out =
+            refresh::handle(ctx, InputStream::from_bytes(body.to_string().into_bytes())).await;
+        !output_is_error(out, "Unauthenticated").await
+    }
+
+    /// A refresh-row revocation that fails must not keep the account's
+    /// sessions alive — on the recovery path least of all, where a surviving
+    /// session is the attacker's. The `auth_version` bump is what ends them,
+    /// so it runs whatever the revocation did.
     #[tokio::test]
-    async fn revocation_failure_does_not_report_success() {
+    async fn a_failed_revocation_still_ends_every_session() {
         let ctx = ctx_with_crypto().await;
         let user_id = signup_user(&ctx, "erin@example.com", "original-horse-battery1").await;
+        let old_session = sign_in(&ctx, "erin@example.com", "original-horse-battery1").await;
         let token = issue_reset_token(&ctx, &user_id).await;
 
         // Fail only the refresh-token revocation write; the credential
         // update itself (a different `database.update_where` call, against
         // `local_credentials`) still succeeds.
-        let failing = FailingDbOpContext::new(ctx, vec![("database.update_where", tokens::TABLE)]);
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.update_where", tokens::TABLE)]);
+        let status =
+            output_http_status(handle(&failing, body(&token, "new-horse-battery-2026")).await)
+                .await;
+
+        assert!(
+            !tokens::find_by_token(&ctx, &old_session)
+                .await
+                .expect("token lookup")
+                .expect("the row is kept")
+                .revoked,
+            "precondition: the revocation really failed, so the row alone is live"
+        );
+        assert_eq!(
+            users::auth_version(&ctx, &user_id).await.unwrap(),
+            1,
+            "a failed revocation must not skip the auth_version bump"
+        );
+        assert!(
+            !refreshes(&ctx, &old_session).await,
+            "a refresh token the old password opened must not outlive the reset"
+        );
+        assert_eq!(
+            status, 200,
+            "the bump ended every session, so the reset is answered as done"
+        );
+    }
+
+    /// Spending the reset token comes after the password write, and a
+    /// failure there is answered as one — but the sessions the old password
+    /// opened have ended by then.
+    #[tokio::test]
+    async fn a_reset_token_that_cannot_be_spent_still_ends_every_session() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "ella@example.com", "original-horse-battery1").await;
+        let old_session = sign_in(&ctx, "ella@example.com", "original-horse-battery1").await;
+        let token = issue_reset_token(&ctx, &user_id).await;
+
+        // `users::clear_reset_token` is the reset's only `database.update`
+        // on the users table before it returns.
+        let failing = FailingDbOpContext::new(ctx.clone(), vec![("database.update", users::TABLE)]);
+        let out = handle(&failing, body(&token, "new-horse-battery-2026")).await;
+        assert!(
+            output_is_error(out, "Internal").await,
+            "a reset token left unspent is reported"
+        );
+
+        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 1);
+        assert!(
+            !refreshes(&ctx, &old_session).await,
+            "a refresh token the old password opened must not outlive the reset"
+        );
+    }
+
+    /// The bump is the invalidation, so a bump that fails is the failure the
+    /// caller hears about.
+    #[tokio::test]
+    async fn a_failed_bump_is_not_reported_as_success() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "edna@example.com", "original-horse-battery1").await;
+        let token = issue_reset_token(&ctx, &user_id).await;
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.increment_field_where", users::TABLE)],
+        );
 
         let out = handle(&failing, body(&token, "new-horse-battery-2026")).await;
 
         assert!(
             output_is_error(out, "Internal").await,
-            "a revocation failure must not be reported as success"
+            "a reset whose sessions did not end must not report success"
         );
+        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 0);
     }
 
     /// The token lookup collapsed a failed read into "Invalid or expired
@@ -323,7 +398,7 @@ mod tests {
     /// spent, and once the hasher answers the same token resets the password.
     #[tokio::test]
     async fn an_unreachable_password_hasher_is_a_503_and_keeps_the_link() {
-        use crate::test_support::{output_http_status, HasherFault};
+        use crate::test_support::HasherFault;
 
         let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
         let user_id = signup_user(&ctx, "hugo@example.com", "original-horse-battery1").await;
@@ -358,7 +433,7 @@ mod tests {
     /// before and after the `Unavailable` classification by design).
     #[tokio::test]
     async fn a_broken_password_hasher_is_a_500() {
-        use crate::test_support::{output_http_status, HasherFault};
+        use crate::test_support::HasherFault;
 
         let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
         let user_id = signup_user(&ctx, "hana@example.com", "original-horse-battery1").await;

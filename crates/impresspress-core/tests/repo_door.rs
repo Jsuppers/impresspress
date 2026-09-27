@@ -847,6 +847,15 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // that increment to prove a failed invalidation revokes nothing.
             // `break_reads` cannot reach it — the delete's reads succeed.
             "blocks/admin/iam.rs",
+            // Fault injectors: a password change and a reset end sessions by
+            // bumping auth_version after the credential write, and the tests
+            // fail exactly that increment to prove the failure is reported;
+            // the reset's tests also fail its reset-token clear (the users
+            // table's `database.update`) to prove sessions end regardless.
+            // Both are writes after every read succeeded, where
+            // `break_reads` cannot reach.
+            "blocks/auth_ui/api/change_password.rs",
+            "blocks/auth_ui/api/reset_password.rs",
             // A fault injector: the security page reads the provider links
             // and THEN the user's `email_verified` flag, and the branch under
             // test is the flag read. `break_reads` fails the link list first;

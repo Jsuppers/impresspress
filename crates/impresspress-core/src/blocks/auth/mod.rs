@@ -642,7 +642,7 @@ fn invalidate_auth_version_cache(user_id: &str) {
 /// the cache (or vice versa).
 ///
 /// The single call site for every security-relevant mutation: password
-/// change (`auth_ui::api::change_password`), disable/soft-delete
+/// change and reset ([`end_sessions_after_password_change`]), disable/soft-delete
 /// (`admin::ops::{set_user_disabled,delete_user,update_user_fields}`), and
 /// role change (`admin::iam::{handle_assign_role,handle_remove_role,
 /// cascade_role_rename}` and `admin::ops::delete_role`).
@@ -666,6 +666,45 @@ pub(crate) async fn bump_auth_version(
     repo::users::bump_auth_version(ctx, user_id).await?;
     invalidate_auth_version_cache(user_id);
     Ok(())
+}
+
+/// End every session `user_id` holds after its password changed
+/// (`auth_ui::api::{change_password,reset_password}`).
+///
+/// The [`bump_auth_version`] is the invalidation: it retires already-issued
+/// access JWTs (`crate::crypto::verify_access_token`) and every refresh family
+/// issued before it (`auth_ui::api::refresh`), including one whose row a
+/// racing sign-in writes after the revocation below has run. It runs whether
+/// or not that revocation succeeded, and its failure is the one returned: the
+/// credential has already changed, so an account whose version did not move
+/// must not be answered as secured. There is no cross-op transaction primitive
+/// available to block code, so the error is the durable partial-failure
+/// signal.
+///
+/// The revocation marks the rows revoked, keeping them as reuse-detection
+/// tombstones (SEC-032/039), so a later presentation takes the row-level
+/// refusal without reading the account. It is housekeeping, the status
+/// `refresh`'s stale-family refusal gives it too: a failed revocation is
+/// logged, and the bump still refuses every token it left live.
+pub(crate) async fn end_sessions_after_password_change(
+    ctx: &dyn wafer_run::context::Context,
+    user_id: &str,
+) -> Result<(), WaferError> {
+    if let Err(e) = repo::tokens::revoke_all_for_user(ctx, user_id).await {
+        tracing::warn!(
+            user_id = %user_id,
+            error = %e,
+            "password changed but refresh-token revocation failed; \
+             the auth_version bump still refuses those tokens"
+        );
+    }
+    bump_auth_version(ctx, user_id).await.inspect_err(|e| {
+        tracing::error!(
+            user_id = %user_id,
+            error = %e,
+            "password changed but auth_version bump failed"
+        );
+    })
 }
 
 #[cfg(test)]
