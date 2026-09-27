@@ -812,6 +812,14 @@ const IDENT_ALLOWED: &[(&str, &[&str])] = &[
             // `pipeline::credential_check_tests` fails exactly the grants
             // read. `break_reads` would fail the key lookup first.
             "pipeline.rs",
+            // Fault injectors: the token-mint race tests aim
+            // `AfterDbOpContext` at the grants read a sign-in and a refresh
+            // rotation make after the account row, so a role removal commits
+            // between the two; the auth routes' WRAP-denial test refuses the
+            // same read.
+            "blocks/auth_ui/api/login.rs",
+            "blocks/auth_ui/api/refresh.rs",
+            "blocks/auth_ui/tests/error_mapping_tests.rs",
         ],
     ),
     (
