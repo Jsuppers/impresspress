@@ -250,7 +250,7 @@ pub async fn handle_request(
             // so JWTs minted under a different deployment's FRONTEND_URL get
             // rejected even if their HMAC secret matches. [SEC-042] also
             // consults the JWT blocklist via the ctx-aware extractor.
-            let expected_iss = match crate::blocks::auth::helpers::expected_issuer(ctx).await {
+            let expected_iss = match crate::crypto::expected_issuer(ctx).await {
                 Ok(expected_iss) => expected_iss,
                 Err(e) => {
                     return crate::blocks::crud::db_error_internal(

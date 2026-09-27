@@ -21,10 +21,7 @@ use crate::{
     blocks::{
         auth::{
             credential_check_failed,
-            helpers::{
-                expected_issuer, issue_tokens_and_cookie, RoleSource, Rotation, SessionLifetime,
-                TokenGrant,
-            },
+            helpers::{issue_tokens_and_cookie, RoleSource, Rotation, SessionLifetime, TokenGrant},
             repo::{tokens, users},
         },
         auth_ui::contracts::{RefreshRequest, RefreshResponse, TokenType},
@@ -85,7 +82,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     // token minted against a different WAFER_RUN_SHARED__FRONTEND_URL value
     // (e.g. a leaked staging secret) must not refresh into a production
     // access token.
-    let expected_iss = match expected_issuer(ctx).await {
+    let expected_iss = match crate::crypto::expected_issuer(ctx).await {
         Ok(expected_iss) => expected_iss,
         Err(e) => return crud::db_error_internal(e, "Could not read the token issuer"),
     };

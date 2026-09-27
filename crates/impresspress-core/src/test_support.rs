@@ -3977,7 +3977,7 @@ pub fn access_token_for(sub: &str, roles: &[&str]) -> String {
     claims.insert("sub".to_string(), serde_json::json!(sub));
     claims.insert("type".to_string(), serde_json::json!("access"));
     // Must match `expected_issuer`'s default
-    // (`crate::blocks::auth::helpers::expected_issuer`): a `TestContext` has
+    // (`crate::crypto::expected_issuer`): a `TestContext` has
     // no `WAFER_RUN_SHARED__FRONTEND_URL` configured.
     claims.insert(
         "iss".to_string(),
