@@ -8,7 +8,7 @@
 //!
 //! Runtime flavour only (spec 2.1.2): nothing reads these rows before WRAP.
 //! [`assign`] is the single writer — the login-time admin grant
-//! (`ensure_admin_role`) and admin's assign endpoint both go through it, so
+//! (`auth::helpers::TokenGrant::resolve`) and admin's assign endpoint both go through it, so
 //! every row has the same shape. Signup writes no row: the initial role is
 //! the inline `users.role`, and a row here means "granted beyond it" (spec
 //! 2.2.3).
@@ -239,7 +239,7 @@ async fn holds(ctx: &dyn Context, user_id: &str, role: &str) -> Result<bool, Waf
 ///
 /// The unique index over `(user_id, role)` (admin migration 004, where it
 /// has run) is what makes this safe to run concurrently — two logins of the bootstrap admin
-/// both reach it through `ensure_admin_role`. The read first is only the
+/// both reach it through `TokenGrant::resolve`. The read first is only the
 /// cheap answer for the common repeat; two callers can both pass it, and the
 /// insert of whichever comes second is then refused by the index and
 /// reported as [`Assigned::AlreadyAssigned`] rather than as a failure.
@@ -356,7 +356,7 @@ mod tests {
         );
     }
 
-    /// `ensure_admin_role` grants with no admin behind it; the column keeps
+    /// `TokenGrant::resolve` grants with no admin behind it; the column keeps
     /// its empty default.
     #[tokio::test]
     async fn assign_by_the_system_leaves_assigned_by_empty() {

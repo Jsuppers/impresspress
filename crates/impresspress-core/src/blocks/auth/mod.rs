@@ -641,6 +641,13 @@ fn invalidate_auth_version_cache(user_id: &str) {
 /// (`admin::ops::{set_user_disabled,delete_user,update_user_fields}`), and
 /// role change (`admin::iam::{handle_assign_role,handle_remove_role,
 /// cascade_role_rename}` and `admin::ops::delete_role`).
+///
+/// A mutation bumps AFTER its write has landed (a bump before it as well is
+/// harmless). The mint side reads the version before the facts it vouches
+/// for (`helpers::TokenGrant`), and the two orders together are what make a
+/// token minted across a change fail its first verification: bump only
+/// before the write, and a sign-in reading the version after that bump and
+/// the facts before the write mints the old facts at the new version.
 pub(crate) async fn bump_auth_version(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
@@ -804,16 +811,18 @@ pub(crate) mod helpers {
     /// Both reads propagate `Err` instead of swallowing it (SB-3): a WRAP
     /// denial or transient DB error on `user_roles::TABLE` must not look
     /// identical to "user has no roles" — that would silently 403 every
-    /// admin (`AuthServiceImpl::require_role`), re-attempt the admin grant
-    /// on every login (`ensure_admin_role`), and stamp empty roles on
+    /// admin (`AuthServiceImpl::require_role`) and stamp empty roles on
     /// API keys (`authenticate_api_key`). `NotFound` on the inline-role read
     /// is the one case that is genuinely "no role from this source", not a
     /// failure, and stays non-fatal.
     ///
     /// The two reads do not depend on each other, so they are sent together:
-    /// on Cloudflare each is a D1 round trip, and every sign-in and token
-    /// refresh waits on this. When both fail, the inline-role read's error is
-    /// the one returned.
+    /// on Cloudflare each is a D1 round trip. When both fail, the inline-role
+    /// read's error is the one returned.
+    ///
+    /// Not for a token's `roles` claim: a mint resolves its roles through
+    /// [`TokenGrant::resolve`], which orders its reads after the version the
+    /// token carries.
     pub(crate) async fn get_user_roles(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
@@ -822,67 +831,136 @@ pub(crate) mod helpers {
             repo::users::find_by_id(ctx, user_id),
             user_roles::list_for_user(ctx, user_id),
         );
-        let mut roles: Vec<String> = Vec::new();
-        if let Some(user) = user? {
-            if !user.role.is_empty() {
-                roles.push(user.role);
-            }
-        }
-
+        let inline = user?.map(|user| user.role);
         let grants =
             grants.map_err(|e| repo::db_failed("get_user_roles: roles table lookup", e))?;
+        Ok(merge_roles(inline, grants))
+    }
+
+    /// The inline role (when there is one) followed by every granted role it
+    /// does not already name.
+    fn merge_roles(inline: Option<String>, grants: Vec<user_roles::UserRoleRow>) -> Vec<String> {
+        let mut roles: Vec<String> = Vec::new();
+        if let Some(role) = inline.filter(|role| !role.is_empty()) {
+            roles.push(role);
+        }
         for grant in grants {
             if !roles.contains(&grant.role) {
                 roles.push(grant.role);
             }
         }
-        Ok(roles)
+        roles
     }
 
-    /// Resolve user roles, idempotently granting `admin` if the user's email
-    /// matches the configured `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`
-    /// and they don't already have it.
+    /// Where [`TokenGrant::resolve`] takes the token's roles from.
+    #[derive(Clone, Copy)]
+    pub(crate) enum RoleSource<'a> {
+        /// The account's stored roles, as they are.
+        Stored,
+        /// The stored roles, first granting `admin` when `email` matches the
+        /// configured `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` and the
+        /// account does not hold it yet.
+        ///
+        /// This closes a real footgun: roles are normally only assigned at
+        /// signup, so changing the configured admin email after a user
+        /// already exists never elevates them. With this, every sign-in
+        /// re-checks the rule and grants admin once when appropriate.
+        ///
+        /// Intentionally **upgrade-only**: never removes a role, never
+        /// demotes. Unsetting the admin email does not revoke admin from
+        /// anyone — that has to be done explicitly via the admin UI / DB.
+        /// Removing roles silently on sign-in would be an availability
+        /// foot-gun (one typo in env locks everyone out).
+        CheckBootstrapAdmin { email: &'a str },
+    }
+
+    /// What an access token asserts about its account: the roles it carries
+    /// and the `auth_version` it was minted at (P2c). The only input
+    /// [`generate_tokens`] accepts for either claim.
     ///
-    /// This closes a real footgun: roles are normally only assigned at signup,
-    /// so changing the configured admin email after a user already exists
-    /// never elevates them. With this helper, every login re-checks the rule
-    /// and grants admin once when appropriate.
-    ///
-    /// Intentionally **upgrade-only**: never removes a role, never demotes.
-    /// Unsetting the admin email does not revoke admin from anyone — that has
-    /// to be done explicitly via the admin UI / DB. Removing roles silently
-    /// on login would be an availability foot-gun (one typo in env locks
-    /// everyone out).
-    ///
-    /// Propagates the read's own [`wafer_run::WaferError`] (SB-3) when the
-    /// underlying roles read fails — a WRAP denial or DB error must not be
-    /// mistaken for "user has no admin row yet" and drive a grant attempt
-    /// into `user_roles::TABLE`.
-    pub(crate) async fn ensure_admin_role(
+    /// The version must be no newer than the roles. Every role change writes
+    /// first and bumps `auth_version` after (`bump_auth_version` names them
+    /// all), so a token whose roles predate a change also carries a version
+    /// the change's bump has passed, and its first verification refuses it.
+    /// Read the other way round, a change landing between the two reads
+    /// yields the removed role at the NEW version, a token verification
+    /// accepts until it expires. So the version is the one on the account
+    /// row, read before any of this, and the role grants are read after it.
+    pub(crate) struct TokenGrant {
+        auth_version: i64,
+        roles: Vec<String>,
+    }
+
+    impl TokenGrant {
+        /// The grant for `user`, a row this request read in full from the
+        /// database (or the one it just inserted). Its `auth_version` and
+        /// inline role are the row's own; the role grants are read now,
+        /// after it.
+        ///
+        /// Propagates the read's own [`WaferError`] (SB-3): a WRAP denial or
+        /// DB error must not be mistaken for "user has no roles" — nor, with
+        /// [`RoleSource::CheckBootstrapAdmin`], for "no admin grant yet",
+        /// which would drive a grant attempt into `user_roles::TABLE`.
+        pub(crate) async fn resolve(
+            ctx: &dyn wafer_run::context::Context,
+            user: &repo::users::UserRow,
+            source: RoleSource<'_>,
+        ) -> Result<Self, WaferError> {
+            let bootstrap_email = match source {
+                RoleSource::Stored => None,
+                RoleSource::CheckBootstrapAdmin { email } => Some(email),
+            };
+            // Read the bootstrap-admin email before the grants: the common
+            // case in production is "unset", and then there is no grant to
+            // attempt.
+            let admin_email = match bootstrap_email {
+                Some(_) => config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await?,
+                None => String::new(),
+            };
+
+            let grants = user_roles::list_for_user(ctx, &user.id)
+                .await
+                .map_err(|e| repo::db_failed("token roles: roles table lookup", e))?;
+            let mut roles = merge_roles(Some(user.role.clone()), grants);
+
+            if let Some(email) = bootstrap_email {
+                if !admin_email.is_empty()
+                    && email.eq_ignore_ascii_case(&admin_email)
+                    && !roles.iter().any(|r| r == "admin")
+                    && grant_bootstrap_admin(ctx, &user.id, email).await
+                {
+                    roles.push("admin".to_string());
+                }
+            }
+
+            Ok(Self {
+                auth_version: user.auth_version,
+                roles,
+            })
+        }
+
+        /// The roles the token carries.
+        pub(crate) fn roles(&self) -> &[String] {
+            &self.roles
+        }
+
+        /// The roles the token carries, for a response that echoes them.
+        pub(crate) fn into_roles(self) -> Vec<String> {
+            self.roles
+        }
+    }
+
+    /// Grant `admin` to the bootstrap admin, through the table's single
+    /// writer, with no admin behind the grant. A concurrent sign-in of the
+    /// same account can win the insert first; `assign` then answers
+    /// `AlreadyAssigned`, and the user holds admin all the same. `true` when
+    /// the user holds it afterwards. A failed grant is logged, not raised:
+    /// the sign-in goes ahead without `admin`, and the next one tries again.
+    async fn grant_bootstrap_admin(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
         email: &str,
-    ) -> Result<Vec<String>, WaferError> {
-        // Read the bootstrap-admin email *before* the role lookup. The
-        // common case in production is "unset" — early-return then,
-        // skipping the second `db::create` path entirely. Authenticated
-        // routes mint tokens often enough that the saved DB reads accumulate.
-        let admin_email = config_client::get_default(ctx, BOOTSTRAP_ADMIN_EMAIL_KEY, "").await?;
-
-        let mut roles = get_user_roles(ctx, user_id).await?;
-
-        if admin_email.is_empty()
-            || !email.eq_ignore_ascii_case(&admin_email)
-            || roles.iter().any(|r| r == "admin")
-        {
-            return Ok(roles);
-        }
-
-        // Email matches and admin role is missing — grant it, through the
-        // table's single writer, with no admin behind the grant. A concurrent
-        // login of the same account can win the insert between the read above
-        // and this write; `assign` then answers `AlreadyAssigned`, and the
-        // user holds admin all the same.
+    ) -> bool {
         match user_roles::assign(ctx, user_id, "admin", "").await {
             Ok(user_roles::Assigned::Created(_)) => {
                 tracing::info!(
@@ -890,17 +968,17 @@ pub(crate) mod helpers {
                     email = %email,
                     "granted admin role on login (email matches ADMIN_EMAIL)"
                 );
-                roles.push("admin".to_string());
+                true
             }
-            Ok(user_roles::Assigned::AlreadyAssigned) => roles.push("admin".to_string()),
+            Ok(user_roles::Assigned::AlreadyAssigned) => true,
             Err(e) => {
                 tracing::warn!(
                     user_id = %user_id,
                     "failed to grant admin role on login: {e}"
                 );
+                false
             }
         }
-        Ok(roles)
     }
 
     /// Whether new-account registration is allowed
@@ -1000,16 +1078,17 @@ pub(crate) mod helpers {
     /// minted in signs to exactly the predecessor's bytes, and its
     /// `token_hash` collides with the row the rotation has just revoked.
     ///
-    /// Access tokens also carry the user's current `auth_version` (P2c) —
-    /// see the module-level docs above `current_auth_version` — so a later
+    /// Access tokens also carry `grant`'s `auth_version` (P2c) — see the
+    /// module-level docs above `current_auth_version` — so a later
     /// password-change/disable/role-change bump invalidates this token on
-    /// verify instead of only at its natural expiry.
+    /// verify instead of only at its natural expiry. [`TokenGrant`] says why
+    /// the version and the roles come in together.
     pub(crate) async fn generate_tokens(
         ctx: &dyn wafer_run::context::Context,
         lifetime: &SessionLifetime,
         user_id: &str,
         email: &str,
-        roles: &[String],
+        grant: &TokenGrant,
         auth_method: &str,
         family: Option<&str>,
     ) -> std::result::Result<(String, String, String), wafer_run::OutputStream> {
@@ -1051,18 +1130,6 @@ pub(crate) mod helpers {
             .await
             .map_err(wafer_run::OutputStream::error)?;
 
-        // [P2c] Embed the user's *current* auth_version so a subsequent
-        // password-change/disable/role-change bump (`bump_auth_version`)
-        // invalidates this token on verify (`crate::crypto::extract_auth_meta`)
-        // instead of only at its natural expiry. Always read fresh here
-        // (never from `current_auth_version`'s verify-side cache) so a
-        // freshly minted token reflects the true value, not a stale cache
-        // hit — a lookup failure fails the mint closed rather than risk
-        // embedding a version the caller can't vouch for.
-        let auth_version = repo::users::auth_version(ctx, user_id)
-            .await
-            .map_err(|e| crate::blocks::crud::db_error_internal(e, "auth_version lookup failed"))?;
-
         let mut access_claims = BTreeMap::new();
         access_claims.insert(
             "user_id".to_string(),
@@ -1076,7 +1143,7 @@ pub(crate) mod helpers {
             "email".to_string(),
             serde_json::Value::String(email.to_string()),
         );
-        access_claims.insert("roles".to_string(), serde_json::json!(roles));
+        access_claims.insert("roles".to_string(), serde_json::json!(grant.roles));
         access_claims.insert(
             "type".to_string(),
             serde_json::Value::String("access".to_string()),
@@ -1098,7 +1165,7 @@ pub(crate) mod helpers {
         );
         access_claims.insert(
             repo::users::AUTH_VERSION_FIELD.to_string(),
-            serde_json::json!(auth_version),
+            serde_json::json!(grant.auth_version),
         );
 
         let access_token = crypto::sign(
@@ -1460,7 +1527,7 @@ pub(crate) mod helpers {
         lifetime: &SessionLifetime,
         user_id: &str,
         email: &str,
-        roles: &[String],
+        grant: &TokenGrant,
         auth_method: &str,
         rotation: Rotation<'_>,
     ) -> std::result::Result<IssuedLogin, wafer_run::OutputStream> {
@@ -1469,7 +1536,7 @@ pub(crate) mod helpers {
             Rotation::Within { family, generation } => (Some(family), generation),
         };
         let (access_token, refresh_token, issued_family) =
-            generate_tokens(ctx, lifetime, user_id, email, roles, auth_method, family).await?;
+            generate_tokens(ctx, lifetime, user_id, email, grant, auth_method, family).await?;
 
         store_refresh_token(
             ctx,
@@ -1584,7 +1651,7 @@ pub(crate) mod helpers {
             TestContext::with_auth_and_crypto().await
         }
 
-        async fn seed_user(ctx: &TestContext) -> String {
+        async fn seed_user(ctx: &TestContext) -> repo::users::UserRow {
             repo::users::insert(
                 ctx,
                 repo::users::NewUser {
@@ -1598,7 +1665,17 @@ pub(crate) mod helpers {
             )
             .await
             .unwrap()
-            .id
+        }
+
+        /// The grant a sign-in would resolve for `user` as read now.
+        async fn grant_for(ctx: &TestContext, user_id: &str) -> TokenGrant {
+            let user = repo::users::find_by_id(ctx, user_id)
+                .await
+                .expect("read the user row")
+                .expect("the user exists");
+            TokenGrant::resolve(ctx, &user, RoleSource::Stored)
+                .await
+                .expect("resolve the token grant")
         }
 
         /// The access token carries the same `family` the refresh token does.
@@ -1608,7 +1685,7 @@ pub(crate) mod helpers {
         #[tokio::test]
         async fn minted_access_token_carries_the_refresh_family() {
             let ctx = ctx_with_crypto().await;
-            let uid = seed_user(&ctx).await;
+            let uid = seed_user(&ctx).await.id;
 
             let Ok((access_token, refresh_token, family)) = generate_tokens(
                 &ctx,
@@ -1617,7 +1694,7 @@ pub(crate) mod helpers {
                     .expect("session lifetime"),
                 &uid,
                 "mint@example.com",
-                &["user".to_string()],
+                &grant_for(&ctx, &uid).await,
                 "password",
                 None,
             )
@@ -1651,7 +1728,7 @@ pub(crate) mod helpers {
         #[tokio::test]
         async fn minted_refresh_token_carries_a_jti_of_its_own() {
             let ctx = ctx_with_crypto().await;
-            let uid = seed_user(&ctx).await;
+            let uid = seed_user(&ctx).await.id;
 
             let Ok((access_token, refresh_token, _family)) = generate_tokens(
                 &ctx,
@@ -1660,7 +1737,7 @@ pub(crate) mod helpers {
                     .expect("session lifetime"),
                 &uid,
                 "mint@example.com",
-                &["user".to_string()],
+                &grant_for(&ctx, &uid).await,
                 "password",
                 None,
             )
@@ -1693,7 +1770,7 @@ pub(crate) mod helpers {
         #[tokio::test]
         async fn minted_access_token_embeds_the_users_current_auth_version() {
             let ctx = ctx_with_crypto().await;
-            let uid = seed_user(&ctx).await;
+            let uid = seed_user(&ctx).await.id;
 
             // Bump twice before minting — the token must embed 2, not 0.
             bump_auth_version(&ctx, &uid).await.unwrap();
@@ -1706,7 +1783,7 @@ pub(crate) mod helpers {
                     .expect("session lifetime"),
                 &uid,
                 "mint@example.com",
-                &["user".to_string()],
+                &grant_for(&ctx, &uid).await,
                 "password",
                 None,
             )
@@ -1723,7 +1800,7 @@ pub(crate) mod helpers {
                     .get(repo::users::AUTH_VERSION_FIELD)
                     .and_then(|v| v.as_i64()),
                 Some(2),
-                "minted access token must embed the user's current auth_version at mint time"
+                "minted access token must embed the auth_version of the row its grant was read from"
             );
         }
     }
@@ -2065,13 +2142,14 @@ mod api_key_lifecycle_tests {
 // Ok(...)`, so a WRAP-grant regression or transient DB error yielded an
 // empty/partial roles list indistinguishable from "user genuinely has no
 // roles" — silently 403ing every admin (`require_role`), re-inserting a
-// duplicate admin row on every login (`ensure_admin_role`), and stamping
+// duplicate admin row on every login (the bootstrap-admin check now in
+// `TokenGrant::resolve`), and stamping
 // empty roles on API keys (`authenticate_api_key`). These tests pin the
 // fix: a denied/failed roles read is now an `Err`, not an empty `Vec`.
 #[cfg(test)]
 mod get_user_roles_error_surfacing_tests {
-    use super::helpers::{ensure_admin_role, get_user_roles};
-    use crate::test_support::TestContext;
+    use super::helpers::{get_user_roles, RoleSource, TokenGrant};
+    use crate::test_support::{seed_user, TestContext};
 
     #[tokio::test]
     async fn denied_roles_table_read_is_an_error_not_empty_roles() {
@@ -2090,17 +2168,30 @@ mod get_user_roles_error_surfacing_tests {
     }
 
     #[tokio::test]
-    async fn ensure_admin_role_propagates_denied_roles_read_instead_of_inserting() {
-        // If the roles-table read fails, `ensure_admin_role` must not
+    async fn bootstrap_admin_check_propagates_denied_roles_read_instead_of_inserting() {
+        // If the roles-table read fails, the bootstrap-admin check must not
         // silently treat that as "no admin row yet" and insert a duplicate
         // — it must propagate the error and skip the insert entirely.
-        let ctx = TestContext::with_auth().await.running_as("test/ungranted");
+        let mut ctx = TestContext::with_auth().await;
+        ctx.set_config(
+            super::config::BOOTSTRAP_ADMIN_EMAIL_KEY,
+            "admin@example.com",
+        );
+        let user = seed_user("admin@example.com").insert(&ctx.fixture()).await;
+        let ctx = ctx.running_as("test/ungranted");
 
-        let res = ensure_admin_role(&ctx, "some-user-id", "admin@example.com").await;
+        let res = TokenGrant::resolve(
+            &ctx,
+            &user,
+            RoleSource::CheckBootstrapAdmin {
+                email: "admin@example.com",
+            },
+        )
+        .await;
         assert!(
             res.is_err(),
-            "ensure_admin_role must propagate a denied roles read instead of \
-             proceeding to (possibly duplicate-)insert the admin grant"
+            "the bootstrap-admin check must propagate a denied roles read instead \
+             of proceeding to (possibly duplicate-)insert the admin grant"
         );
     }
 }

@@ -487,13 +487,15 @@ async fn sign_in(site: &Site, email: &str, password: &str) -> Cost {
     }
 }
 
-/// A warm sign-in's response waits on six sequential D1 round trips, nine
+/// A warm sign-in's response waits on five sequential D1 round trips, seven
 /// statements: the account by email and its credential (each a row read
 /// plus the `COUNT(*)` `db::get_by_field` sends with it, one `db.batch()`
-/// apiece), its roles (the users row and the role grants, sent together), the
-/// `auth_version` the tokens carry, the refresh-token row and the device-list
-/// row. Everything else it writes — the last-login stamp, the retention
-/// throttle check, the audit row — runs after the response.
+/// apiece), its role grants, the refresh-token row and the device-list row.
+/// The tokens' `auth_version` and inline role are the ones on the account row
+/// read first — the version must be read no later than the roles
+/// (`helpers::TokenGrant`), so the row is not read again for them.
+/// Everything else it writes — the last-login stamp, the retention throttle
+/// check, the audit row — runs after the response.
 ///
 /// On Cloudflare the sign-in route's rate limit adds two more before any of
 /// these (`auth::repo::rate_limits::windowed_increment`, an upsert and its
@@ -506,12 +508,13 @@ async fn sign_in(site: &Site, email: &str, password: &str) -> Cost {
 /// id-policy probe of an insert-only table is kept only once some statement
 /// has shown the table exists, which the first sign-in's inserts do.
 ///
-/// The counts fail on the code before this was fixed: the roles' two reads
-/// ran one after the other, a brand-new login family was first "touched" by
-/// an UPDATE that could match nothing, and the retention throttle read and
-/// the last-login UPDATE ran before the response.
+/// The counts fail on earlier code: the roles' two reads ran one after the
+/// other, a brand-new login family was first "touched" by an UPDATE that could
+/// match nothing, the retention throttle read and the last-login UPDATE ran
+/// before the response, and the users row was read twice more, for the roles
+/// and for the version.
 #[tokio::test]
-async fn a_warm_sign_in_waits_on_six_round_trips() {
+async fn a_warm_sign_in_waits_on_five_round_trips() {
     let site = start().await;
     for _ in 0..2 {
         let cold = sign_in(&site, ADMIN_EMAIL, ADMIN_PASSWORD).await;
@@ -528,25 +531,30 @@ async fn a_warm_sign_in_waits_on_six_round_trips() {
 
     assert_eq!(
         Cost::waves(&warm.response),
-        6,
+        5,
         "sequential D1 round trips before the response\n{trace}"
     );
     assert_eq!(
         Cost::statements(&warm.response),
-        9,
+        7,
         "D1 statements before the response\n{trace}"
     );
 
-    // The security reads stay on the response path: the tokens carry the
-    // account's current `auth_version`, read fresh for the mint.
-    assert!(
+    // The security reads stay on the response path, in order: the account
+    // row (which carries the `auth_version` the tokens embed) is read before
+    // the role grants, so a role change landing between them leaves the
+    // token's version behind the change's bump.
+    let wave_of = |needle: &str| {
         warm.response
             .iter()
-            .filter(|t| t.sql.contains("\"wafer_run__auth__users\" WHERE \"id\""))
-            .count()
-            == 2,
-        "the users row is read for the roles and again, fresh, for the minted \
-         auth_version\n{trace}"
+            .find(|t| t.sql.contains(needle))
+            .map(|t| t.wave)
+            .unwrap_or_else(|| panic!("no {needle} read on the response path\n{trace}"))
+    };
+    assert!(
+        wave_of("FROM \"wafer_run__auth__users\" WHERE \"email\"")
+            < wave_of("FROM \"impresspress__admin__user_roles\""),
+        "the account row must be read before the role grants\n{trace}"
     );
     // The refresh-token row is written before the response: without it the
     // refresh token handed out could never be used.

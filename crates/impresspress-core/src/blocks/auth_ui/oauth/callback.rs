@@ -11,9 +11,8 @@ use crate::{
         auth::{
             config::REQUIRE_VERIFICATION_KEY,
             helpers::{
-                email_domain_allowed, ensure_admin_role, get_user_roles, initial_role_for,
-                issue_tokens_and_cookie, signup_allowed, touch_last_login_after_response, Rotation,
-                SessionLifetime,
+                email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
+                touch_last_login_after_response, RoleSource, Rotation, SessionLifetime, TokenGrant,
             },
             repo::{oauth_pkce, provider_links, users},
         },
@@ -43,18 +42,18 @@ fn refuse(code: ErrorCode, message: &str, clear_binding: &str) -> OutputStream {
     OutputStream::error(err)
 }
 
-/// The local account an OAuth identity resolved to, and the address that
-/// account actually holds.
+/// The local account an OAuth identity resolved to: its row, as the
+/// lifecycle gate read it.
 ///
-/// The address matters on its own: everything downstream that keys on "who is
-/// this" — the session's email claim, the bootstrap-admin comparison — must
-/// read the row's address, not the one the provider reported. They differ
-/// whenever a linked account's address has since changed, and a provider that
-/// asserts nothing (`spec::EmailAssertion::None`) can report any address at
-/// all.
+/// The row's address matters on its own: everything downstream that keys on
+/// "who is this" — the session's email claim, the bootstrap-admin comparison —
+/// must read the row's address, not the one the provider reported. They
+/// differ whenever a linked account's address has since changed, and a
+/// provider that asserts nothing (`spec::EmailAssertion::None`) can report any
+/// address at all. The row's `auth_version` is the one the session's access
+/// token carries (see `TokenGrant`).
 struct ResolvedAccount {
-    id: String,
-    email: String,
+    user: users::UserRow,
 }
 
 pub async fn handle(
@@ -199,7 +198,8 @@ pub async fn handle(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let ResolvedAccount { id: user_id, email } = account;
+    let ResolvedAccount { user } = account;
+    let (user_id, email) = (user.id.clone(), user.email.clone());
 
     // Update last_login_at on the users row (best-effort, after the response).
     touch_last_login_after_response(ctx, &user_id);
@@ -216,13 +216,13 @@ pub async fn handle(
     // A WRAP denial or DB error in either read must not silently resolve to
     // "no roles" — that would 403 an admin or double-grant on the next login
     // (SB-3).
-    let roles_result = if info.email_verified {
-        ensure_admin_role(ctx, &user_id, &email).await
+    let source = if info.email_verified {
+        RoleSource::CheckBootstrapAdmin { email: &email }
     } else {
-        get_user_roles(ctx, &user_id).await
+        RoleSource::Stored
     };
-    let roles = match roles_result {
-        Ok(r) => r,
+    let grant = match TokenGrant::resolve(ctx, &user, source).await {
+        Ok(grant) => grant,
         Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
 
@@ -236,7 +236,7 @@ pub async fn handle(
         &lifetime,
         &user_id,
         &email,
-        &roles,
+        &grant,
         &format!("oauth.{provider}"),
         Rotation::NewFamily,
     )
@@ -269,7 +269,7 @@ pub async fn handle(
     // Role-aware default (#1 onboarding bug fix): a non-admin OAuth login
     // must never default into the admin-only destination above — see
     // `redirect::default_post_login_redirect`.
-    let is_admin = roles.iter().any(|r| r == "admin");
+    let is_admin = grant.roles().iter().any(|r| r == "admin");
     let post_login = default_post_login_redirect(is_admin, &admin_default);
     let redirect_url = format!("{}{}", frontend_url.trim_end_matches('/'), post_login);
 
@@ -819,10 +819,7 @@ async fn resolve_user(
         ));
     }
 
-    Ok(ResolvedAccount {
-        id: user_id,
-        email: account.email,
-    })
+    Ok(ResolvedAccount { user: account })
 }
 
 /// [SEC-036] Validates `WAFER_RUN_SHARED__FRONTEND_URL` before it is used as

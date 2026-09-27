@@ -22,8 +22,8 @@ use crate::{
         auth::{
             credential_check_failed,
             helpers::{
-                ensure_admin_role, expected_issuer, issue_tokens_and_cookie, Rotation,
-                SessionLifetime,
+                expected_issuer, issue_tokens_and_cookie, RoleSource, Rotation, SessionLifetime,
+                TokenGrant,
             },
             repo::{tokens, users},
         },
@@ -152,11 +152,18 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     let email = user.email.clone();
-    // A WRAP denial or DB error here must not silently resolve to "no
-    // roles" — that would 403 an admin or double-grant on the next login
-    // (SB-3).
-    let roles = match ensure_admin_role(ctx, &user_id, &email).await {
-        Ok(r) => r,
+    // The new access token's roles and the `auth_version` of the row read
+    // above (see `TokenGrant`). A WRAP denial or DB error here must not
+    // silently resolve to "no roles" — that would 403 an admin or
+    // double-grant on the next login (SB-3).
+    let grant = match TokenGrant::resolve(
+        ctx,
+        &user,
+        RoleSource::CheckBootstrapAdmin { email: &email },
+    )
+    .await
+    {
+        Ok(grant) => grant,
         Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
 
@@ -204,7 +211,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         &lifetime,
         &user_id,
         &email,
-        &roles,
+        &grant,
         &prior_auth_method,
         Rotation::Within {
             family: &row.family,
@@ -814,5 +821,111 @@ mod tests {
             let out = handle(&failing, refresh_with(&token)).await;
             assert_eq!(output_http_status(out).await, status, "{code:?}");
         }
+    }
+
+    /// The refresh rotation mints a new access token the way a sign-in does,
+    /// so it has the same race to lose: a role removal committing after the
+    /// rotation's grants read has seen the role must leave an access token
+    /// whose first use is refused (see login's
+    /// `a_role_removed_during_sign_in_leaves_a_token_that_is_refused`).
+    #[tokio::test]
+    async fn a_role_removed_during_refresh_leaves_a_token_that_is_refused() {
+        use crate::{
+            blocks::auth::bump_auth_version,
+            platform_state::user_roles,
+            test_support::{anon_msg, output_http_status, AfterDbOpContext},
+        };
+
+        const EMAIL: &str = "demoted@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+        let ctx = TestContext::with_auth()
+            .await
+            .with_admin_added()
+            .await
+            .with_sign_in_added();
+        let uid = ctx.seed_account(EMAIL, PASSWORD, "user").await;
+        user_roles::assign(&ctx.fixture(), &uid, "editor", "")
+            .await
+            .expect("grant editor");
+        let auth_ui = ctx
+            .clone()
+            .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID);
+        let creds = serde_json::json!({"email": EMAIL, "password": PASSWORD});
+        let signed_in = output_json(login::handle(&auth_ui, json_input(creds)).await).await;
+        let refresh_token = signed_in["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the sign-in succeeded: {signed_in}"))
+            .to_string();
+
+        // The admin's removal, landing the moment the rotation's grants read
+        // has answered: the grant goes, then the version is bumped.
+        let (fixture, holder) = (ctx.fixture(), uid.clone());
+        let racing = AfterDbOpContext::new(
+            auth_ui.clone(),
+            "database.list",
+            user_roles::TABLE,
+            async move {
+                let grants = user_roles::list_for_user(&fixture, &holder)
+                    .await
+                    .expect("read the grants");
+                let editor = grants
+                    .iter()
+                    .find(|g| g.role == "editor")
+                    .expect("the editor grant is still there");
+                user_roles::remove(&fixture, &editor.id)
+                    .await
+                    .expect("remove the grant");
+                bump_auth_version(&fixture, &holder)
+                    .await
+                    .expect("bump auth_version");
+            },
+        );
+
+        let rotated = output_json(handle(&racing, refresh_with(&refresh_token)).await).await;
+        assert!(
+            racing.fired(),
+            "the removal must land inside the rotation: {rotated}"
+        );
+        let access = rotated["access_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the rotation succeeded: {rotated}"));
+        let claims = wafer_core::clients::crypto::verify(&auth_ui, access)
+            .await
+            .expect("the minted token's signature verifies");
+        assert!(
+            claims
+                .get("roles")
+                .and_then(|r| r.as_array())
+                .is_some_and(|roles| roles.iter().any(|r| r == "editor")),
+            "the rotation read the grants before the removal, so its token \
+             carries the removed role: {claims:?}"
+        );
+
+        // First use, through the router's verification like any request.
+        let mut me = anon_msg("retrieve", "/b/auth/api/me");
+        me.set_meta("http.header.authorization", format!("Bearer {access}"));
+        assert_eq!(
+            output_http_status(ctx.request(me).await).await,
+            401,
+            "an access token carrying a role removed during its mint must be refused"
+        );
+
+        // The control: the next rotation, after the removal, authenticates on
+        // the same route, so the refusal above is the stale version alone.
+        let next_refresh = rotated["refresh_token"]
+            .as_str()
+            .expect("the rotation handed out a successor");
+        let next = output_json(handle(&auth_ui, refresh_with(next_refresh)).await).await;
+        let mut me = anon_msg("retrieve", "/b/auth/api/me");
+        me.set_meta(
+            "http.header.authorization",
+            format!(
+                "Bearer {}",
+                next["access_token"]
+                    .as_str()
+                    .expect("the next rotation succeeded")
+            ),
+        );
+        assert_eq!(output_http_status(ctx.request(me).await).await, 200);
     }
 }

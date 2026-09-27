@@ -570,7 +570,7 @@ crate::impresspress_feature_block! {
             .grants(vec![
                 wafer_run::ResourceGrant::read_write(super::auth::AUTH_BLOCK_ID, user_roles::TABLE),
                 // auth-ui's login/refresh/OAuth-callback handlers call the
-                // shared `ensure_admin_role`/`get_user_roles` helpers
+                // shared `TokenGrant::resolve`/`get_user_roles` helpers
                 // directly (not via the framework `wafer-run/auth`
                 // service), so WRAP authorizes on their own node_id
                 // ("impresspress/auth-ui"). Without this grant, admin login
@@ -1427,7 +1427,7 @@ mod grant_tests {
     #[test]
     fn admin_block_grants_auth_ui_read_write_on_user_roles() {
         // auth-ui's login/refresh/OAuth-callback handlers call the shared
-        // `ensure_admin_role`/`get_user_roles` helpers directly, so WRAP
+        // `TokenGrant::resolve`/`get_user_roles` helpers directly, so WRAP
         // authorizes on their own node_id ("impresspress/auth-ui"), not the
         // framework `wafer-run/auth` service's. Without this grant, admin
         // login in the native server hits PermissionDenied reading/writing

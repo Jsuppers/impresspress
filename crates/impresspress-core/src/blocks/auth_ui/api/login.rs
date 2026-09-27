@@ -7,8 +7,8 @@ use crate::{
         auth::{
             burn_timing_equalization, check_password,
             helpers::{
-                ensure_admin_role, issue_tokens_and_cookie, touch_last_login_after_response,
-                Rotation, SessionLifetime,
+                issue_tokens_and_cookie, touch_last_login_after_response, RoleSource, Rotation,
+                SessionLifetime, TokenGrant,
             },
             repo::{local_credentials, users},
             PasswordCheck,
@@ -145,12 +145,21 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         return error_response(ErrorCode::EmailNotVerified, "Please verify your email before logging in. Check your inbox for the verification link.");
     }
 
-    // Get roles, granting admin role idempotently when ADMIN_EMAIL matches.
-    // A WRAP denial or DB error here must not silently resolve to "no
-    // roles" — that would 403 an admin or double-grant on the next login
-    // (SB-3).
-    let roles = match ensure_admin_role(ctx, &user.id, &email_lower).await {
-        Ok(r) => r,
+    // The token's roles, granting admin idempotently when ADMIN_EMAIL
+    // matches, and the `auth_version` of the row read above — the version
+    // the checks above passed at. A WRAP denial or DB error here must not
+    // silently resolve to "no roles" — that would 403 an admin or
+    // double-grant on the next login (SB-3).
+    let grant = match TokenGrant::resolve(
+        ctx,
+        &user,
+        RoleSource::CheckBootstrapAdmin {
+            email: &email_lower,
+        },
+    )
+    .await
+    {
+        Ok(grant) => grant,
         Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
     };
 
@@ -164,7 +173,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         &lifetime,
         &user.id,
         &email_lower,
-        &roles,
+        &grant,
         "password",
         Rotation::NewFamily,
     )
@@ -190,6 +199,7 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Ok(admin_default) => admin_default,
         Err(e) => return crud::db_error_internal(e, "Could not read the post-login redirect"),
     };
+    let roles = grant.into_roles();
     let is_admin = roles.iter().any(|r| r == "admin");
     let default_redirect = default_post_login_redirect(is_admin, &admin_default);
 
@@ -645,5 +655,95 @@ mod tests {
         let out = handle(&ctx, InputStream::from_bytes(body.into_bytes())).await;
 
         assert_eq!(output_http_status(out).await, 503);
+    }
+
+    /// A role removal that commits while a sign-in is resolving its token —
+    /// after the grants read has seen the role, before the token is signed —
+    /// must not leave a token that carries the removed role and
+    /// authenticates.
+    ///
+    /// The removal bumps `auth_version` after it lands, as every role change
+    /// does. So the version the token carries has to be one read BEFORE the
+    /// grants: the bump then puts the token behind, and its first use is
+    /// refused. Read after the grants, it is the bumped version, and the
+    /// token authenticates with the removed role until it expires.
+    #[tokio::test]
+    async fn a_role_removed_during_sign_in_leaves_a_token_that_is_refused() {
+        use crate::{
+            blocks::auth::bump_auth_version,
+            platform_state::user_roles,
+            test_support::{anon_msg, AfterDbOpContext},
+        };
+
+        const EMAIL: &str = "demoted@example.com";
+        const PASSWORD: &str = "correct-horse-battery";
+        let ctx = TestContext::with_auth()
+            .await
+            .with_admin_added()
+            .await
+            .with_sign_in_added();
+        let uid = ctx.seed_account(EMAIL, PASSWORD, "user").await;
+        user_roles::assign(&ctx.fixture(), &uid, "editor", "")
+            .await
+            .expect("grant editor");
+
+        // The admin's removal, landing the moment the sign-in's grants read
+        // has answered: the grant goes, then the version is bumped.
+        let (fixture, holder) = (ctx.fixture(), uid.clone());
+        let racing = AfterDbOpContext::new(
+            ctx.clone()
+                .running_as(crate::blocks::auth_ui::AUTH_UI_BLOCK_ID),
+            "database.list",
+            user_roles::TABLE,
+            async move {
+                let grants = user_roles::list_for_user(&fixture, &holder)
+                    .await
+                    .expect("read the grants");
+                let editor = grants
+                    .iter()
+                    .find(|g| g.role == "editor")
+                    .expect("the editor grant is still there");
+                user_roles::remove(&fixture, &editor.id)
+                    .await
+                    .expect("remove the grant");
+                bump_auth_version(&fixture, &holder)
+                    .await
+                    .expect("bump auth_version");
+            },
+        );
+
+        let body = serde_json::json!({"email": EMAIL, "password": PASSWORD}).to_string();
+        let resp =
+            output_json(handle(&racing, InputStream::from_bytes(body.into_bytes())).await).await;
+        assert!(
+            racing.fired(),
+            "the removal must land inside the sign-in: {resp}"
+        );
+        assert!(
+            resp["user"]["roles"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|r| r == "editor")),
+            "the sign-in read the grants before the removal, so its token carries \
+             the removed role: {resp}"
+        );
+        let token = resp["access_token"]
+            .as_str()
+            .expect("the sign-in succeeded")
+            .to_string();
+
+        // First use, through the router's verification like any request.
+        let mut me = anon_msg("retrieve", "/b/auth/api/me");
+        me.set_meta("http.header.authorization", format!("Bearer {token}"));
+        assert_eq!(
+            output_http_status(ctx.request(me).await).await,
+            401,
+            "a token carrying a role removed during its mint must be refused"
+        );
+
+        // The control: a sign-in after the removal authenticates on the same
+        // route, so the refusal above is the stale version and nothing else.
+        let fresh = ctx.sign_in(EMAIL, PASSWORD).await;
+        let me = fresh.bearer(anon_msg("retrieve", "/b/auth/api/me"));
+        assert_eq!(output_http_status(ctx.request(me).await).await, 200);
     }
 }

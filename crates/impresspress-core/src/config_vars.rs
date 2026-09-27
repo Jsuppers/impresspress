@@ -884,7 +884,7 @@ pub fn is_instance_owned_key(key: &str) -> bool {
 /// guessing wrong the other locks the operator out of their own deployment.
 ///
 /// `BOOTSTRAP_ADMIN_EMAIL` is not here either, for a different reason: it stays
-/// live after provisioning — `auth::service::ensure_admin_role` and
+/// live after provisioning — `auth::helpers::TokenGrant::resolve` and
 /// `initial_role_for` read it on every signup and token mint to decide who is
 /// admin — so it is ordinary config, and not sensitive.
 ///
