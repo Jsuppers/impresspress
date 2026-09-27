@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
+use wafer_block_crypto::primitives;
 use wafer_run::context::Context;
 
 use crate::blocks::rate_limit::{ip_bucket, RateLimit, UserRateLimiter};
@@ -131,7 +131,7 @@ pub fn verify_form_token(
     }
     let payload = format!("v1.{issued}.{nonce}");
     let expected = hmac_hex(secret.as_bytes(), payload.as_bytes());
-    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+    if !primitives::constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
         return Err("invalid form token");
     }
     Ok(())
@@ -157,40 +157,9 @@ fn normalize_text(value: &str) -> String {
         .to_lowercase()
 }
 
-/// RFC 2104 HMAC-SHA256 using the already-linked SHA-256 primitive.
+/// Lowercase-hex HMAC-SHA256 of `message` under `secret`.
 fn hmac_hex(secret: &[u8], message: &[u8]) -> String {
-    const BLOCK: usize = 64;
-    let mut key = [0_u8; BLOCK];
-    if secret.len() > BLOCK {
-        key[..32].copy_from_slice(&Sha256::digest(secret));
-    } else {
-        key[..secret.len()].copy_from_slice(secret);
-    }
-    let mut inner_pad = [0x36_u8; BLOCK];
-    let mut outer_pad = [0x5c_u8; BLOCK];
-    for index in 0..BLOCK {
-        inner_pad[index] ^= key[index];
-        outer_pad[index] ^= key[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner);
-    crate::util::hex_encode(&outer.finalize())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
+    crate::util::hex_encode(&primitives::hmac_sha256(secret, message))
 }
 
 #[cfg(test)]
@@ -245,6 +214,58 @@ mod tests {
         );
         let b = dedupe_hash("secret", "identity", "type", "hello", "a report", "/page");
         assert_eq!(a, b);
+    }
+
+    /// RFC 2104 HMAC-SHA256 written out over `sha2`. Stored dedupe hashes and
+    /// outstanding form tokens were computed with this construction, so
+    /// `hmac_hex` must reproduce it byte for byte.
+    fn reference_hmac_hex(secret: &[u8], message: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        const BLOCK: usize = 64;
+        let mut key = [0_u8; BLOCK];
+        if secret.len() > BLOCK {
+            key[..32].copy_from_slice(&Sha256::digest(secret));
+        } else {
+            key[..secret.len()].copy_from_slice(secret);
+        }
+        let mut inner_pad = [0x36_u8; BLOCK];
+        let mut outer_pad = [0x5c_u8; BLOCK];
+        for index in 0..BLOCK {
+            inner_pad[index] ^= key[index];
+            outer_pad[index] ^= key[index];
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        inner.update(message);
+        let inner = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(outer_pad);
+        outer.update(inner);
+        crate::util::hex_encode(&outer.finalize())
+    }
+
+    /// Byte-identical to the reference over random keys and messages, with
+    /// key lengths straddling the 64-byte block (padded, exact, pre-hashed).
+    #[test]
+    fn hmac_matches_the_reference_construction_on_random_inputs() {
+        let mut bytes = [0_u8; 512];
+        for round in 0..2_000_usize {
+            getrandom::getrandom(&mut bytes).expect("os rng");
+            let key_len = match round % 4 {
+                0 => usize::from(bytes[0]) % 64,
+                1 => 64,
+                2 => 65 + usize::from(bytes[0]),
+                _ => usize::from(bytes[0]) + usize::from(bytes[1]),
+            };
+            let message_len = usize::from(bytes[2]) + usize::from(bytes[3]);
+            let key = &bytes[..key_len];
+            let message = &bytes[512 - message_len..];
+            assert_eq!(
+                hmac_hex(key, message),
+                reference_hmac_hex(key, message),
+                "key {key:02x?} message {message:02x?}"
+            );
+        }
     }
 
     #[test]
