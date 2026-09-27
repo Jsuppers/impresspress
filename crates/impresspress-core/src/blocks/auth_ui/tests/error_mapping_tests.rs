@@ -213,18 +213,19 @@ async fn refresh_row_insert_denial_is_403_not_500() {
     );
 }
 
-/// `auth::helpers::generate_tokens` reads the account's `auth_version` to
-/// stamp on the access token. It re-wrapped a failure as a fresh `Internal`,
-/// so a denial there lost its code before any handler saw it. The first
-/// `database.get` on the users table is the role lookup; the second is this
-/// one.
+/// `auth::helpers::TokenGrant::resolve` reads the account's role grants for
+/// the token it mints; a denial there is the deployment's grant, not an
+/// outage, and must not read as "no roles" either.
 #[tokio::test]
-async fn auth_version_read_denial_is_403_not_500() {
+async fn role_grants_read_denial_is_403_not_500() {
     let ctx = TestContext::with_auth_and_crypto().await;
-    signup(&ctx, "version@example.com").await;
-    let ctx = denied(ctx, vec![("database.get", users::TABLE)]).after_passing(1);
+    signup(&ctx, "grants@example.com").await;
+    let ctx = denied(
+        ctx,
+        vec![("database.list", crate::platform_state::user_roles::TABLE)],
+    );
     assert_eq!(
-        status(&ctx, login_msg(), login_body("version@example.com")).await,
+        status(&ctx, login_msg(), login_body("grants@example.com")).await,
         403
     );
 }
