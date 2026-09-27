@@ -8,6 +8,13 @@
 //! would need a full Context plus InputStream/OutputStream scaffolding that
 //! impresspress tests don't build; the registration check alone proves Path B
 //! works in impresspress's build.
+//!
+//! Compiled only with the `wasm` feature: without it the runtime has no
+//! wasm loader, so the lockfile entry has nothing to load it with. CI's core
+//! job runs with `--features block-dev,wasm`.
+
+#![cfg(feature = "wasm")]
+
 // TODO: add a `call_block` dispatch assertion against the loaded block once
 //   impresspress gains a test-context helper that wraps Context.
 

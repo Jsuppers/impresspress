@@ -1353,9 +1353,9 @@ jobs:
       # screenshotted would show up in them.
       #
       # delegated-actions.spec.ts sorts first, which is harmless because it
-      # writes nothing — it filters a list, opens and closes a modal, toggles a password field, and hops
-      # between two products admin tabs, all of which are the browser-side half
-      # of the `data-action` rule that
+      # writes nothing — it filters a list, opens and closes a modal, toggles
+      # a password field, and hops between two products admin tabs, all of
+      # which are the browser-side half of the `data-action` rule that
       # `ui::tests::pages_carry_no_event_handler_attributes` enforces on the
       # markup. Neither that test nor a screenshot can see a listener that
       # stopped firing — or one that started firing twice. The tab-hop case is

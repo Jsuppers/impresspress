@@ -18,7 +18,8 @@
 // the elements they look for are absent, which is exactly what a stub with no
 // `#cmdk` gives them — so loading the whole real file costs nothing and keeps
 // the tests honest about the file as shipped, rather than about an extract of
-// it.
+// it. What the tests drive is section 3 (toasts and the htmx error listeners)
+// and section 5 (htmx after-success effects).
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -118,6 +119,33 @@ function fakeElement(tag) {
 }
 
 /**
+ * An element section 5 can act on: the one that issued a request, or one it
+ * names by id. It is what the sandbox's `Element` constructs, so the section's
+ * `instanceof Element` check admits it, and it records what was done to it.
+ */
+class StubElement {
+  constructor(attributes = {}) {
+    this.attributes = { ...attributes };
+    this.removed = false;
+    this.resets = 0;
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
+  }
+
+  getAttribute(name) {
+    return name in this.attributes ? this.attributes[name] : null;
+  }
+
+  hasAttribute(name) {
+    return name in this.attributes;
+  }
+
+  remove() {
+    this.removed = true;
+  }
+}
+
+/**
  * Load `chrome.js` against a fresh stub document.
  *
  * @param {object} [options]
@@ -129,6 +157,9 @@ function fakeElement(tag) {
  */
 export function loadChrome({ toastContainer = true } = {}) {
   const container = toastContainer ? fakeElement('div') : null;
+  // Elements a test places in the document by id, for section 5 to find.
+  const byId = new Map();
+  let reloads = 0;
   // A clock the test drives. The error listeners suppress a repeat of the same
   // message inside a time window, and "what happens once the window has passed"
   // is not a property a test can assert by waiting five real seconds.
@@ -148,20 +179,26 @@ export function loadChrome({ toastContainer = true } = {}) {
   });
 
   const sandbox = {
-    window: {},
+    window: {
+      location: {
+        reload() {
+          reloads += 1;
+        }
+      }
+    },
     document: {
       body,
-      getElementById: (id) => (id === 'toast-container' ? container : null),
+      getElementById: (id) => (id === 'toast-container' ? container : byId.get(id) || null),
       createElement: (tag) => fakeElement(tag),
       querySelector: () => null,
       querySelectorAll: () => [],
       addEventListener() {},
       documentElement: {}
     },
-    // Section 2 narrows a click target with `instanceof Element`; nothing here
-    // fires a click, so a placeholder constructor is enough to keep the
-    // reference resolvable.
-    Element: class {},
+    // Section 2 narrows a click target with `instanceof Element` (nothing here
+    // fires a click), and section 5 narrows the element that issued a request
+    // the same way — which is the check `StubElement` exists to pass.
+    Element: StubElement,
     // The toast's own 4s auto-dismiss. Tests read the container synchronously,
     // so the timer never needs to fire — but it must not hold Node open either.
     setTimeout: (fn, ms) => {
@@ -214,6 +251,25 @@ export function loadChrome({ toastContainer = true } = {}) {
     fireTransportEvent(type, from = {}) {
       body.dispatchEvent(new StubCustomEvent(type, { detail: responseDetail({}, from) }));
     },
+    /**
+     * An element with `attributes`, placed in the document under `id` when one
+     * is given so `getElementById` finds it.
+     */
+    element(attributes = {}, id = null) {
+      const el = new StubElement(attributes);
+      if (id !== null) byId.set(id, el);
+      return el;
+    },
+    /**
+     * Fire one `htmx:afterRequest`, as htmx does when a request ends. htmx
+     * sets `detail.successful` only for a 2xx it swapped; `elt` is the element
+     * that issued the request.
+     */
+    finishRequest(elt, successful) {
+      body.dispatchEvent(new StubCustomEvent('htmx:afterRequest', { detail: { elt, successful } }));
+    },
+    /** How many times the page asked to reload. */
+    reloads: () => reloads,
     /** Move the clock the error listeners read, in milliseconds. */
     advance(ms) {
       clock += ms;
