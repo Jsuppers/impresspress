@@ -1172,18 +1172,31 @@ async fn the_ledger_publishes_each_generation_with_its_manifest_and_diff() {
 async fn the_generations_api_is_admin_only() {
     let ctx = dev_with_accounts(FakeControl::new()).await;
     let member = signed_in_as(&ctx, "user").await;
-    for msg in [
-        anon_msg("retrieve", "/b/dev/api/generations"),
-        member.bearer(anon_msg("retrieve", "/b/dev/api/generations")),
-        anon_msg("retrieve", "/b/dev/api/generations/g1"),
-        member.bearer(anon_msg("retrieve", "/b/dev/api/generations/g1")),
-        anon_msg("create", "/b/dev/api/generations/g1/rollback"),
-        member.bearer(anon_msg("create", "/b/dev/api/generations/g1/rollback")),
+    // No identity is told to sign in; a member is refused the admin tier.
+    for (msg, status) in [
+        (anon_msg("retrieve", "/b/dev/api/generations"), 401),
+        (
+            member.bearer(anon_msg("retrieve", "/b/dev/api/generations")),
+            403,
+        ),
+        (anon_msg("retrieve", "/b/dev/api/generations/g1"), 401),
+        (
+            member.bearer(anon_msg("retrieve", "/b/dev/api/generations/g1")),
+            403,
+        ),
+        (
+            anon_msg("create", "/b/dev/api/generations/g1/rollback"),
+            401,
+        ),
+        (
+            member.bearer(anon_msg("create", "/b/dev/api/generations/g1/rollback")),
+            403,
+        ),
     ] {
         let path = msg.path().to_string();
         assert_eq!(
             output_http_status(ctx.request(msg).await).await,
-            403,
+            status,
             "{path}"
         );
     }

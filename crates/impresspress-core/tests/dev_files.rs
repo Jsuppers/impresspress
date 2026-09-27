@@ -529,18 +529,22 @@ async fn file_size_quota_is_enforced() {
 async fn the_files_api_is_admin_only() {
     let ctx = dev_with_accounts(FakeControl::new()).await;
     let member = signed_in_as(&ctx, "user").await;
-    for msg in [
-        anon_msg("retrieve", "/b/dev/api/files"),
-        member.bearer(anon_msg("retrieve", "/b/dev/api/files")),
-        anon_msg("create", "/b/dev/api/files/write"),
-        member.bearer(anon_msg("create", "/b/dev/api/files/write")),
-        anon_msg("create", "/b/dev/api/files/read"),
-        anon_msg("create", "/b/dev/api/files/delete"),
+    // No identity is told to sign in; a member is refused the admin tier.
+    for (msg, status) in [
+        (anon_msg("retrieve", "/b/dev/api/files"), 401),
+        (member.bearer(anon_msg("retrieve", "/b/dev/api/files")), 403),
+        (anon_msg("create", "/b/dev/api/files/write"), 401),
+        (
+            member.bearer(anon_msg("create", "/b/dev/api/files/write")),
+            403,
+        ),
+        (anon_msg("create", "/b/dev/api/files/read"), 401),
+        (anon_msg("create", "/b/dev/api/files/delete"), 401),
     ] {
         let path = msg.path().to_string();
         assert_eq!(
             output_http_status(ctx.request(msg).await).await,
-            403,
+            status,
             "{path}"
         );
     }

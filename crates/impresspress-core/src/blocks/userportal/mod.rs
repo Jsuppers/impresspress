@@ -14,7 +14,7 @@ use crate::{
         PRIMARY_COLOR_KEY,
     },
     endpoint_match::{self, EndpointRoute},
-    http::{err_bad_request, err_forbidden, err_not_found, ok_json},
+    http::{err_bad_request, err_forbidden, err_not_found, err_unauthenticated, ok_json},
     ui::{self, components, icons, settings_form},
     util::parse_form_body,
 };
@@ -286,7 +286,7 @@ async fn handle_update_profile(
 ) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
-        return err_forbidden("Not authenticated");
+        return err_unauthenticated("Not authenticated");
     }
 
     let raw = match input.collect_to_bytes().await {
@@ -372,6 +372,32 @@ mod update_profile_csrf_tests {
         assert_eq!(output_status(out).await, 303, "valid token must succeed");
 
         assert_eq!(profile_name(&ctx, "user-1").await, "New Name");
+    }
+
+    /// With no identity the form is told to sign in (401 and its challenge),
+    /// not refused as a forbidden action. The router's gate answers first in
+    /// a deployment; this is the handler's own check behind it.
+    #[tokio::test]
+    async fn an_anonymous_profile_post_is_401() {
+        let ctx = TestContext::with_userportal().await;
+        let msg = crate::test_support::anon_msg("create", "/b/userportal/update-profile");
+
+        let out = handle_update_profile(
+            &ctx,
+            &msg,
+            InputStream::from_bytes(b"name=New+Name".to_vec()),
+        )
+        .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        assert_eq!(parts.status, 401);
+        assert!(
+            parts.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("WWW-Authenticate")
+                    && value == crate::http::WWW_AUTHENTICATE
+            }),
+            "{:?}",
+            parts.headers
+        );
     }
 
     #[tokio::test]

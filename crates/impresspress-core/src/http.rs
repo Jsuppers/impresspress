@@ -9,14 +9,46 @@
 //!
 //! The impresspress-specific additions are [`redirect`], a thin convenience over
 //! [`ResponseBuilder`] for the redirect response shape (status + `Location` +
-//! empty `text/plain` body) used by page handlers, and [`err_unavailable`],
-//! the `503` constructor `wafer_block::response` does not (yet) carry.
+//! empty `text/plain` body) used by page handlers, [`err_unavailable`],
+//! the `503` constructor `wafer_block::response` does not (yet) carry, and
+//! [`err_unauthenticated`], the `401` for a request with no identity, which
+//! carries the [`WWW_AUTHENTICATE`] challenge.
 
 pub use wafer_block::{
     err_bad_request, err_conflict, err_forbidden, err_internal, err_internal_no_cause,
     err_not_found, err_unauthorized, ok_empty, ok_json, ResponseBuilder,
 };
-use wafer_run::{ErrorCode, OutputStream, WaferError};
+use wafer_run::{ErrorCode, MetaEntry, OutputStream, WaferError};
+
+/// The `WWW-Authenticate` challenge every `401` for a missing identity
+/// carries (RFC 9110 §11.6.1): the two schemes the request pipeline accepts
+/// in `Authorization` — an access token (`Bearer`, RFC 6750) and an API key
+/// (`ApiKey`).
+pub const WWW_AUTHENTICATE: &str = r#"Bearer realm="impresspress", ApiKey realm="impresspress""#;
+
+/// `401` — the request has no identity: it carried no credential, or one
+/// that did not verify (malformed, expired, signed out, issued before a
+/// password change or a disable, an API key that matches no live row).
+/// `pipeline::handle_request` treats all of those as anonymous, so by the
+/// time a route checks `msg.user_id()` they are the same answer.
+///
+/// RFC 9110 §15.5.2 requires a `401` to carry a `WWW-Authenticate`
+/// challenge, so this is the constructor for it rather than the bare
+/// `err_unauthorized`. A caller that IS identified but may not do this is a
+/// `403` ([`err_forbidden`]); a credential the server could not check (its
+/// database read failed) is neither, and keeps the status
+/// `blocks::auth::credential_check_failed` gives it.
+pub fn err_unauthenticated(message: &str) -> OutputStream {
+    let mut error = WaferError::new(ErrorCode::Unauthenticated, message);
+    error.meta.push(MetaEntry {
+        key: format!(
+            "{}WWW-Authenticate",
+            wafer_block::meta::META_RESP_HEADER_PREFIX
+        ),
+        value: WWW_AUTHENTICATE.to_string(),
+    });
+    OutputStream::error(error)
+}
 
 /// The row, or the 404 its absence turns into.
 ///

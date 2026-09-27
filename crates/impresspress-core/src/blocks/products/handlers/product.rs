@@ -26,7 +26,7 @@ use crate::{
     },
     http::{
         err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
-        err_unauthorized, ok_json,
+        err_unauthenticated, ok_json,
     },
     util::{enum_column, field_as_string, now_rfc3339, stamp_created, stamp_updated, RecordExt},
 };
@@ -332,7 +332,7 @@ async fn verify_product_owner(
     user_id: &str,
 ) -> Result<wafer_core::clients::database::Record, OutputStream> {
     if user_id.is_empty() {
-        return Err(err_unauthorized("Not authenticated"));
+        return Err(err_unauthenticated("Not authenticated"));
     }
     match repo::products::get(ctx, id).await {
         Ok(record) => {
@@ -372,7 +372,7 @@ async fn verify_deleted_product_owner(
     user_id: &str,
 ) -> Result<wafer_core::clients::database::Record, OutputStream> {
     if user_id.is_empty() {
-        return Err(err_unauthorized("Not authenticated"));
+        return Err(err_unauthenticated("Not authenticated"));
     }
     match repo::products::get_deleted(ctx, id).await {
         Ok(record) => {
@@ -861,7 +861,7 @@ async fn seller_moderation_required(ctx: &dyn Context) -> Result<bool, wafer_run
 pub(super) async fn handle_user_list_products(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
-        return err_unauthorized("Not authenticated");
+        return err_unauthenticated("Not authenticated");
     }
 
     let query = ProductListQuery::from_message(msg);
@@ -892,7 +892,7 @@ pub(super) async fn handle_user_create_product(
 ) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
-        return err_unauthorized("Not authenticated");
+        return err_unauthenticated("Not authenticated");
     }
 
     // The unsettable-field refusal happens inside `read_write_body`, and so

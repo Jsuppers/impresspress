@@ -21,7 +21,7 @@ use impresspress_core::{
     blocks::{admin::AdminBlock, auth::repo::users, userportal::UserPortalBlock},
     test_support::{anon_msg, api_key_header, Session, TestContext},
 };
-use wafer_block::http_codec::collect_http_response;
+use wafer_block::http_codec::{collect_http_response, HttpResponseParts};
 use wafer_run::{InputStream, Message};
 
 const PASSWORD: &str = "correct-horse-battery-staple";
@@ -40,21 +40,35 @@ async fn signed_in(ctx: &TestContext, email: &str, role: &str) -> Session {
     ctx.sign_in(email, PASSWORD).await
 }
 
-/// Status and body of `msg` sent through the preamble with `body`.
-async fn send(ctx: &TestContext, msg: Message, body: &str) -> (u16, String) {
+/// The HTTP response `msg` sent through the preamble with `body` comes to.
+async fn respond(ctx: &TestContext, msg: Message, body: &str) -> HttpResponseParts {
     let out = ctx
         .request_with_input(msg, InputStream::from_bytes(body.as_bytes().to_vec()))
         .await;
-    let parts = collect_http_response(out).await;
+    collect_http_response(out).await
+}
+
+/// Status and body of `msg` sent through the preamble with `body`.
+async fn send(ctx: &TestContext, msg: Message, body: &str) -> (u16, String) {
+    let parts = respond(ctx, msg, body).await;
     (
         parts.status,
         String::from_utf8_lossy(&parts.body).into_owned(),
     )
 }
 
+/// The value of response header `name`, matched case-insensitively.
+fn header<'a>(parts: &'a HttpResponseParts, name: &str) -> Option<&'a str> {
+    parts
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 /// `GET /b/auth/api/me` with `session`'s bearer token.
-async fn me(ctx: &TestContext, session: &Session) -> (u16, String) {
-    send(
+async fn me(ctx: &TestContext, session: &Session) -> HttpResponseParts {
+    respond(
         ctx,
         session.bearer(anon_msg("retrieve", "/b/auth/api/me")),
         "",
@@ -65,9 +79,16 @@ async fn me(ctx: &TestContext, session: &Session) -> (u16, String) {
 /// The router's answer to an API caller with no identity on an
 /// authenticated route (`routing::check_access` →
 /// `ui::unauthenticated_response`): what a credential the preamble refused
-/// comes to.
-fn assert_anonymous((status, body): (u16, String)) {
-    assert_eq!(status, 403, "{body}");
+/// comes to. `401` with the challenge — the status a client reads as "sign
+/// in" — never the `403` that means "signed in, but not allowed".
+fn assert_anonymous(parts: &HttpResponseParts) {
+    let body = String::from_utf8_lossy(&parts.body);
+    assert_eq!(parts.status, 401, "{body}");
+    assert_eq!(
+        header(parts, "WWW-Authenticate"),
+        Some(r#"Bearer realm="impresspress", ApiKey realm="impresspress""#),
+        "{body}"
+    );
     assert!(body.contains("authentication required"), "{body}");
 }
 
@@ -107,7 +128,7 @@ async fn a_cross_site_cookie_post_is_refused_before_the_admin_form_runs() {
 
     assert_eq!(status, 403, "{body}");
     assert!(!is_disabled(&ctx, &member.user_id).await);
-    assert_eq!(me(&ctx, &member).await.0, 200);
+    assert_eq!(me(&ctx, &member).await.status, 200);
 }
 
 /// With no Fetch-Metadata, `Origin` or `Referer` there is no evidence the
@@ -133,7 +154,7 @@ async fn a_same_origin_click_disables_the_account_and_its_live_token() {
     let ctx = deployment().await;
     let admin = signed_in(&ctx, "admin@example.com", "admin").await;
     let member = signed_in(&ctx, "member@example.com", "user").await;
-    assert_eq!(me(&ctx, &member).await.0, 200, "precondition");
+    assert_eq!(me(&ctx, &member).await.status, 200, "precondition");
 
     let mut msg = disable_click(&admin, &member.user_id);
     msg.set_meta("http.header.sec-fetch-site", "same-origin");
@@ -141,7 +162,7 @@ async fn a_same_origin_click_disables_the_account_and_its_live_token() {
 
     assert_eq!(status, 200, "{body}");
     assert!(is_disabled(&ctx, &member.user_id).await);
-    assert_anonymous(me(&ctx, &member).await);
+    assert_anonymous(&me(&ctx, &member).await);
 }
 
 /// The profile form's `csrf_token` field, as `GET /b/userportal/profile`
@@ -229,7 +250,7 @@ async fn a_cross_site_profile_post_is_refused_even_with_the_token() {
 async fn a_signed_out_access_token_is_refused() {
     let ctx = deployment().await;
     let member = signed_in(&ctx, "member@example.com", "user").await;
-    assert_eq!(me(&ctx, &member).await.0, 200, "precondition");
+    assert_eq!(me(&ctx, &member).await.status, 200, "precondition");
 
     let (status, body) = send(
         &ctx,
@@ -239,7 +260,7 @@ async fn a_signed_out_access_token_is_refused() {
     .await;
     assert_eq!(status, 303, "{body}");
 
-    assert_anonymous(me(&ctx, &member).await);
+    assert_anonymous(&me(&ctx, &member).await);
 }
 
 /// An API key authenticates as its owner with its owner's roles — not
@@ -294,13 +315,104 @@ async fn an_unknown_api_key_is_anonymous() {
     let ctx = deployment().await;
 
     assert_anonymous(
-        send(
+        &respond(
             &ctx,
             api_key_header(anon_msg("retrieve", "/b/auth/api/me"), "sb_not-a-key"),
             "",
         )
         .await,
     );
+}
+
+/// An API call carrying no credential at all is told to sign in: the
+/// `401` the SDK's `getUser()` reads as "signed out" and returns `null` for.
+#[tokio::test]
+async fn an_anonymous_api_call_is_401_with_a_challenge() {
+    let ctx = deployment().await;
+
+    assert_anonymous(&respond(&ctx, anon_msg("retrieve", "/b/auth/api/me"), "").await);
+    assert_anonymous(&respond(&ctx, anon_msg("retrieve", "/b/admin/api/iam/roles"), "").await);
+}
+
+/// The response the JS SDK's `getUser()` test replays
+/// (`packages/impresspress-js/test/anonymous-me.response.json`), as the
+/// server sends it to an SDK call with no session: status, the two headers
+/// the SDK reads, and the body byte for byte. The SDK test is only worth
+/// what this keeps true — its mock is these bytes, not a guess at them.
+#[tokio::test]
+async fn the_sdk_fixture_is_what_an_anonymous_me_answers() {
+    let ctx = deployment().await;
+    let parts = respond(&ctx, anon_msg("retrieve", "/b/auth/api/me"), "").await;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/impresspress-js/test/anonymous-me.response.json"
+    );
+    let fixture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read the SDK fixture"))
+            .expect("the SDK fixture is JSON");
+    let actual = serde_json::json!({
+        "status": parts.status,
+        "headers": {
+            "content-type": header(&parts, "Content-Type"),
+            "www-authenticate": header(&parts, "WWW-Authenticate"),
+        },
+        "body": String::from_utf8_lossy(&parts.body),
+    });
+    assert_eq!(
+        actual,
+        fixture,
+        "the SDK fixture no longer matches the server; write this into it:\n{}",
+        serde_json::to_string_pretty(&actual).expect("serialize")
+    );
+}
+
+/// A signed-in member on an admin route is identified and not permitted:
+/// `403`, with no challenge, because signing in again would not help.
+#[tokio::test]
+async fn a_signed_in_member_on_an_admin_route_is_403() {
+    let ctx = deployment().await;
+    let member = signed_in(&ctx, "member@example.com", "user").await;
+
+    let parts = respond(
+        &ctx,
+        member.bearer(anon_msg("retrieve", "/b/admin/api/iam/roles")),
+        "",
+    )
+    .await;
+    let body = String::from_utf8_lossy(&parts.body);
+    assert_eq!(parts.status, 403, "{body}");
+    assert_eq!(header(&parts, "WWW-Authenticate"), None, "{body}");
+}
+
+/// A browser page is still sent to the login form, with a return path, when
+/// the visitor has no session or the one its cookie carries was signed out.
+#[tokio::test]
+async fn an_anonymous_page_request_is_sent_to_login() {
+    let ctx = deployment().await;
+    let member = signed_in(&ctx, "member@example.com", "user").await;
+    let (status, body) = send(
+        &ctx,
+        member.bearer(anon_msg("create", "/b/auth/api/logout")),
+        "",
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+
+    for msg in [
+        anon_msg("retrieve", "/b/userportal/profile"),
+        member.cookie(anon_msg("retrieve", "/b/userportal/profile")),
+    ] {
+        let mut msg = msg;
+        msg.set_meta("http.header.accept", "text/html");
+        let parts = respond(&ctx, msg, "").await;
+        assert_eq!(parts.status, 302);
+        assert_eq!(
+            header(&parts, "Location"),
+            Some("/b/auth/login?redirect=%2Fb%2Fuserportal%2Fprofile")
+        );
+        assert_eq!(header(&parts, "WWW-Authenticate"), None);
+    }
 }
 
 /// `request` sends what the wire carries; a message whose caller a test

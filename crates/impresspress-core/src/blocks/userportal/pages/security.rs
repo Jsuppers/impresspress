@@ -209,6 +209,7 @@ pub async fn handle_unlink(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if user_id.is_empty() {
         return ResponseBuilder::new()
             .status(401)
+            .set_header("WWW-Authenticate", crate::http::WWW_AUTHENTICATE)
             .body(b"unauthenticated".to_vec(), "text/plain");
     }
     let provider = msg.var("provider").to_string();
@@ -740,6 +741,16 @@ mod tests {
             .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let mut msg = anon_msg("delete", "/b/userportal/security/providers/github");
         msg.set_meta("req.param.provider", "github");
-        assert_eq!(output_status(handle_unlink(&ctx, &msg).await).await, 401);
+        let resp = handle_unlink(&ctx, &msg).await;
+        let parts = wafer_block::http_codec::collect_http_response(resp).await;
+        assert_eq!(parts.status, 401);
+        assert!(
+            parts.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("WWW-Authenticate")
+                    && value == crate::http::WWW_AUTHENTICATE
+            }),
+            "{:?}",
+            parts.headers
+        );
     }
 }

@@ -23,7 +23,7 @@ use wafer_core::clients::database::{self as db, Record, RecordList};
 use wafer_run::{context::Context, ErrorCode, InputStream, Message, OutputStream};
 
 use crate::{
-    http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthorized},
+    http::{err_bad_request, err_conflict, err_internal, err_not_found, err_unauthenticated},
     util::{field_as_string, stamp_created, stamp_updated},
 };
 
@@ -581,7 +581,7 @@ pub async fn verify_owner(
     not_found_label: &str,
 ) -> Result<Record, OutputStream> {
     if user_id.is_empty() {
-        return Err(err_unauthorized("Not authenticated"));
+        return Err(err_unauthenticated("Not authenticated"));
     }
     match db::get(ctx, collection, id).await {
         Ok(record) => {

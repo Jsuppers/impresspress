@@ -20,6 +20,31 @@ bundle that changes them. So whenever a release's code half assumes a data
 repair the migration half performs, it has to be called out here — on native
 the two ship together but only one of them runs by default.
 
+### API: a request with no identity is 401, not 403
+
+**What changes.** An API call (any `Accept` that is not an HTML page) to a
+protected route without a working credential — none at all, or one that did
+not verify: expired, signed out, issued before a password change or a
+disable, an API key that matches no row — is now answered `401` with
+`WWW-Authenticate: Bearer realm="impresspress", ApiKey realm="impresspress"`
+and the JSON body `{"error":"Unauthenticated","message":"authentication
+required"}`. It was `403` with `"error":"PermissionDenied"`. The handlers'
+own identity checks behind the router (products, files, the shared owner
+check, the user portal's profile form, the sessions and linked-accounts
+buttons) answer `401` too, with the same challenge; the profile form's was a
+`403`.
+
+- `403` now means only "identified, but not allowed": a signed-in user
+  without the admin role on an admin route, a CSRF origin refusal, a WRAP
+  denial. A credential the server could not check because its database read
+  failed keeps its `503` (or the `403`/`429` a WRAP refusal or quota gives
+  it); that is not "signed out".
+- Browser pages are unchanged: a page request with no session is still
+  redirected to `/b/auth/login?redirect=…`.
+- The JS SDK already treated `401` as "signed out" (`getUser()` resolves
+  `null`); against earlier servers it threw on an anonymous call instead. A
+  client of your own that read `403` as "sign in again" should read `401`.
+
 ### Cloudflare: passwords are hashed by a password-hasher Worker
 
 **What changes.** The main Worker no longer hashes or verifies passwords.

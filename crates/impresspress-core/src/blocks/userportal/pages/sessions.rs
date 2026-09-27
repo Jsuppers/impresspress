@@ -140,6 +140,7 @@ pub async fn handle_revoke(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if user_id.is_empty() {
         return ResponseBuilder::new()
             .status(401)
+            .set_header("WWW-Authenticate", crate::http::WWW_AUTHENTICATE)
             .body(b"unauthenticated".to_vec(), "text/plain");
     }
     let family = msg.var("family").to_string();
@@ -272,7 +273,16 @@ mod tests {
             .running_as(crate::blocks::userportal::UserPortalBlock::BLOCK_NAME);
         let msg = routed(anon_msg("delete", "/b/userportal/sessions/fam-1"));
         let resp = handle_revoke(&ctx, &msg).await;
-        assert_eq!(output_status(resp).await, 401);
+        let parts = wafer_block::http_codec::collect_http_response(resp).await;
+        assert_eq!(parts.status, 401);
+        assert!(
+            parts.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("WWW-Authenticate")
+                    && value == crate::http::WWW_AUTHENTICATE
+            }),
+            "{:?}",
+            parts.headers
+        );
     }
 
     /// [B12] The point of the change: revoking a device signs it out. The

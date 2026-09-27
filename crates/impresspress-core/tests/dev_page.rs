@@ -169,7 +169,7 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
     ] {
         assert_eq!(
             output_http_status(ctx.request(anon_msg("retrieve", path)).await).await,
-            403,
+            401,
             "{path} must be admin-only like the page it belongs to"
         );
         assert_eq!(
