@@ -102,24 +102,51 @@ command `wrangler triggers deploy`"*. `impresspress deploy` now runs that
 command after promotion, so the schedule does reach the live Worker; if you
 deploy by hand with `wrangler versions upload`, you have to run it yourself.
 
-The first admin. The auth block grants the `admin` role to whoever signs up
-with the email in `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL`
-(`blocks/auth/mod.rs`, `initial_role_for`) — but on Workers that shared
-variable, like every `WAFER_RUN_SHARED__*` variable, currently has no read
-path (impresspress#78), so setting it in D1 does nothing. Until #78 is fixed:
-sign up, then promote the row directly and log in again:
+## The first admin
+
+The same bootstrap `impresspress serve` runs from the process environment
+(`auth::bootstrap`): with `WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL` and
+`..._PASSWORD` set, the auth block's `Init` creates that account as the admin
+when there are no accounts yet, and does nothing once there are. On Workers
+the two are Worker secrets, which `src/lib.rs` hands to
+`impresspress_cloudflare::run_with_config` as request config
+(`bootstrap_admin_config`); a `WAFER_RUN_SHARED__*` key is otherwise read from
+D1's variables table, which nobody can edit before there is an admin.
+
+Set them before the deploy that first runs `/_deploy/prepare` on the
+database — the first deploy, or any later one while there are no accounts:
 
 ```sh
-curl -X POST https://<worker>.workers.dev/b/auth/api/signup -H 'Content-Type: application/json' \
-  -d '{"email":"<you@example.com>","password":"<password>","name":"Admin"}'
-wrangler d1 execute impresspress-webmcp-demo --remote --command \
-  "UPDATE wafer_run__auth__users SET role = 'admin' WHERE email = '<you@example.com>';"
+npx wrangler secret put WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL --name impresspress-webmcp-demo
+npx wrangler secret put WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD --name impresspress-webmcp-demo
+impresspress deploy --target cloudflare --release
 ```
 
-For the same reason `WAFER_RUN_SHARED__ENVIRONMENT`, `FRONTEND_URL` and
-`APP_NAME` edits made in the admin UI do not reach the Worker yet; the demo
-runs on their defaults (`development`: discovery documents carry
-`Access-Control-Allow-Origin: *`, cookies are not `Secure`).
+On a site's first deploy the Worker does not exist yet, so run that deploy
+first (it creates the Worker; the database gets no accounts from it), then the
+three commands above. Sign in at `/b/auth/login` with that email and password.
+
+Then delete both secrets and deploy again. The password is spent once the
+account exists, but while the email is set, an account with that address is
+granted the admin role at signup and again at every login
+(`auth::initial_role_for`, `ensure_admin_role`):
+
+```sh
+npx wrangler secret delete WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL --name impresspress-webmcp-demo
+npx wrangler secret delete WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_PASSWORD --name impresspress-webmcp-demo
+impresspress deploy --target cloudflare --release
+```
+
+Further admins are granted in the admin UI (`/b/admin`), which records them
+in `impresspress__admin__user_roles`; editing the database by hand is not a
+supported way to change a role.
+
+`WAFER_RUN_SHARED__ENVIRONMENT`, `FRONTEND_URL` and `APP_NAME` edits made in
+the admin UI do not reach the Worker yet: on Workers a shared variable's D1
+row belongs to no block's config (`impresspress-cloudflare`'s
+`config_source.rs`). The demo runs on their defaults (`development`:
+discovery documents carry `Access-Control-Allow-Origin: *`, cookies are not
+`Secure`).
 
 Stripe keys are entered afterwards in the admin UI (`/b/admin/variables`).
 Without a Stripe key the `start_checkout` tool returns an error result rather
