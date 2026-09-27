@@ -20,7 +20,7 @@ pub const TABLE: &str = "wafer_run__auth__users";
 /// counter (P2c: CODE_REVIEW_2026-07-16, "Access JWTs outlive account and
 /// role changes"). Kept as a single constant so the users-table column
 /// (migration `009_auth_version`), the access-JWT claim
-/// (`blocks::auth::helpers::generate_tokens`), and the verify-side cache key
+/// (`blocks::auth::helpers::generate_tokens`, from [`UserRow::auth_version`]), and the verify-side cache key
 /// (`blocks::auth::current_auth_version`) can't drift onto different
 /// literals.
 pub const AUTH_VERSION_FIELD: &str = "auth_version";
@@ -59,6 +59,12 @@ pub struct UserRow {
     pub last_login_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// The row's [`AUTH_VERSION_FIELD`], read with the rest of it. A token
+    /// minted for this account carries this value, not one read later: it is
+    /// the version the facts on this row were current at
+    /// (`blocks::auth::helpers::TokenGrant`). `0` when the read did not carry
+    /// the column, which only makes a token minted from it stale sooner.
+    pub auth_version: i64,
 }
 
 impl UserRow {
@@ -124,6 +130,7 @@ fn row_from(id: String, m: &HashMap<String, Value>) -> Result<UserRow, WaferErro
         last_login_at: map_opt_str(m, "last_login_at"),
         created_at: map_str(m, "created_at"),
         updated_at: map_str(m, "updated_at"),
+        auth_version: m.i64_field(AUTH_VERSION_FIELD),
     })
 }
 

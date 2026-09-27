@@ -1589,7 +1589,7 @@ mod tests {
     /// `database.list` of the grants table; the handler's role-definition
     /// lookup is on another table and passes through) until each has made
     /// it — the interleaving two concurrent bootstrap-admin logins produce
-    /// through `ensure_admin_role`, and two admins clicking "assign" at once
+    /// through `TokenGrant::resolve`, and two admins clicking "assign" at once
     /// through this handler. Without the unique index both inserts land, and
     /// `handle_remove_role` then deletes one of them, answers
     /// `{"deleted": true}`, and the twin keeps the role live.

@@ -61,7 +61,7 @@ const SQL_003_POSTGRES: &str = include_str!("003_block_settings_seed_hash.postgr
 // 004 makes `user_roles` hold at most one grant per `(user_id, role)`.
 //
 // `platform_state::user_roles::assign` is a read-then-insert, and the login
-// path runs it concurrently: `auth::helpers::ensure_admin_role` grants `admin`
+// path runs it concurrently: `auth::helpers::TokenGrant::resolve` grants `admin`
 // on every login of the bootstrap-admin address that does not already hold
 // it, so two logins racing on a fresh account could both find no grant and
 // both insert one. A duplicate is not harmless. `get_user_roles` folds the

@@ -2773,6 +2773,118 @@ impl Context for RendezvousDbOpContext {
     }
 }
 
+/// Wraps a [`TestContext`] and runs a one-shot `hook` right after the first
+/// `"wafer-run/database"` call whose `(msg.action(), request.collection)` is
+/// `(op, collection)` has answered, before that answer reaches the caller.
+///
+/// That is a write committed at one exact point in the caller's sequence of
+/// reads — after the matched read, before whatever it reads next — which is
+/// the interleaving a race between a request and a concurrent mutation needs
+/// forced rather than hoped for. The hook runs once; later matching calls
+/// pass straight through. [`Self::fired`] says whether the point was reached.
+///
+/// `#[cfg(test)]` for the reason [`RendezvousDbOpContext`] gives.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct AfterDbOpContext {
+    inner: TestContext,
+    op: &'static str,
+    collection: &'static str,
+    /// Taken by the first matching call; shared across clones, so a
+    /// handler's `clone_arc` sees the same one-shot.
+    hook: Arc<Mutex<Option<futures::future::BoxFuture<'static, ()>>>>,
+}
+
+#[cfg(test)]
+impl AfterDbOpContext {
+    /// Wrap `inner`, running `hook` after the first `(op, collection)` call.
+    pub fn new(
+        inner: TestContext,
+        op: &'static str,
+        collection: &'static str,
+        hook: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            inner,
+            op,
+            collection,
+            hook: Arc::new(Mutex::new(Some(Box::pin(hook)))),
+        }
+    }
+
+    /// Whether a matching call has been made and the hook has run.
+    pub fn fired(&self) -> bool {
+        self.hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Context for AfterDbOpContext {
+    fn check_resource_access(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> Result<(), WaferError> {
+        self.inner
+            .check_resource_access(resource, resource_type, access)
+    }
+
+    fn resource_access_admitted(
+        &self,
+        resource: &str,
+        resource_type: wafer_run::ResourceType,
+        access: wafer_block::ResourceAccess,
+    ) -> bool {
+        self.inner
+            .resource_access_admitted(resource, resource_type, access)
+    }
+
+    async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
+        if !(name == "wafer-run/database" && msg.action() == self.op) {
+            return self.inner.call_block(name, msg, input).await;
+        }
+        let bytes = match input.collect_to_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return OutputStream::error(e),
+        };
+        let matches = wafer_block::codec::decode::<CollectionPeek>(&bytes)
+            .map(|p| p.collection == self.collection)
+            .unwrap_or(false);
+        let out = self
+            .inner
+            .call_block(name, msg, InputStream::from_bytes(bytes))
+            .await;
+        if matches {
+            let hook = self.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(hook) = hook {
+                hook.await;
+            }
+        }
+        out
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn registered_blocks(&self) -> &[BlockInfo] {
+        self.inner.registered_blocks()
+    }
+
+    fn config_get(&self, key: &str) -> Option<&str> {
+        self.inner.config_get(key)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Context> {
+        Arc::new(self.clone())
+    }
+}
+
 /// Wraps a [`Context`] and re-decodes every `database.aggregate` result the
 /// way PostgreSQL and `wafer-block-postgres` would type it: an uncast `Sum`,
 /// `SumWhere` or `Avg` comes back as a JSON float, everything else as the

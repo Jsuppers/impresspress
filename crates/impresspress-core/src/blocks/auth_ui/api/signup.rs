@@ -11,7 +11,7 @@ use crate::{
             hash_new_password,
             helpers::{
                 email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
-                Rotation, SessionLifetime,
+                RoleSource, Rotation, SessionLifetime, TokenGrant,
             },
             repo::users,
         },
@@ -209,8 +209,6 @@ pub async fn handle(
         Err(e) => return crud::db_error_internal(e, "Failed to create account"),
     };
 
-    let roles = vec![role.to_string()];
-
     // `None` exactly when verification is required (resolved above).
     let Some(lifetime) = lifetime else {
         // After the response: see above. The body cannot carry a send
@@ -235,6 +233,13 @@ pub async fn handle(
             .json(&pending_verification(email_lower));
     };
 
+    // The new account's roles, as stored, and the `auth_version` of the row
+    // just inserted (see `TokenGrant`).
+    let grant = match TokenGrant::resolve(ctx, &user, RoleSource::Stored).await {
+        Ok(grant) => grant,
+        Err(e) => return crud::db_error_internal(e, "Failed to resolve user roles"),
+    };
+
     // Mint tokens, persist the refresh + session rows, build the cookie
     // (only when email verification is NOT required) — this is the
     // auto-login path: a brand-new user is fully signed in by the time this
@@ -244,7 +249,7 @@ pub async fn handle(
         &lifetime,
         &user.id,
         &email_lower,
-        &roles,
+        &grant,
         "password",
         Rotation::NewFamily,
     )
@@ -262,6 +267,7 @@ pub async fn handle(
         Ok(admin_default) => admin_default,
         Err(e) => return crud::db_error_internal(e, "Could not read the post-login redirect"),
     };
+    let roles = grant.into_roles();
     let is_admin = roles.iter().any(|r| r == "admin");
     let default_redirect = default_post_login_redirect(is_admin, &admin_default);
 

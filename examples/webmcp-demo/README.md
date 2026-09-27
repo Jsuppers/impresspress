@@ -129,7 +129,7 @@ three commands above. Sign in at `/b/auth/login` with that email and password.
 Then delete both secrets and deploy again. The password is spent once the
 account exists, but while the email is set, an account with that address is
 granted the admin role at signup and again at every login
-(`auth::initial_role_for`, `ensure_admin_role`):
+(`auth::initial_role_for`, `auth::helpers::TokenGrant::resolve`):
 
 ```sh
 npx wrangler secret delete WAFER_RUN_SHARED__AUTH__BOOTSTRAP_ADMIN_EMAIL --name impresspress-webmcp-demo
