@@ -425,6 +425,13 @@ jobs:
       - name: Clippy impresspress-password's Durable Object (wasm32)
         run: cargo clippy --locked -p impresspress-password --features durable-object --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      # The webmcp demo Worker, in the shape the deploy CLI builds it
+      # (`--no-default-features --features target-cloudflare`). Its Worker
+      # code is behind that feature and the crate is wasm32-only, so no other
+      # step compiles it.
+      - name: Clippy the webmcp demo Worker (wasm32)
+        run: cargo clippy --locked -p impresspress-webmcp-demo --target wasm32-unknown-unknown --no-default-features --features target-cloudflare --all-targets -- -D warnings
+
       # Compile-time DatabaseService conformance assertions (wafer-run #319
       # shared suite) for the D1 + KV-cached adapters. Off-by-default feature so
       # the ~1.3k-line suite never enters the production Worker wasm; this step
