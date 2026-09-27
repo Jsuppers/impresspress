@@ -2777,6 +2777,7 @@ name = "impresspress-webmcp-demo"
 version = "0.1.0"
 dependencies = [
  "impresspress-cloudflare",
+ "impresspress-core",
  "wasm-bindgen",
  "worker",
 ]
