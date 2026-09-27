@@ -1,6 +1,6 @@
 //! Integration tests for `impresspress_core::builder::boot` over a real,
 //! file-backed SQLite `DatabaseService`, built through the same
-//! `impresspress::cli::server::build_native_runtime` the binary uses.
+//! `impresspress_server::build_native_runtime` the binary uses.
 //!
 //! `boot` is the one post-`build()` lifecycle for every target; these tests
 //! drive it under [`InitPolicy::Reported`], the policy `/_deploy/init` uses,
@@ -16,9 +16,9 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, BootHooks, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
+use impresspress_server::{build_native_runtime, AppHooks, NativeBootHooks};
 use wafer_core::interfaces::database::service::DatabaseService;
 use wafer_run::{InputStream, Message, Wafer};
 
@@ -77,9 +77,16 @@ async fn build_runtime_with_env(
         .await
         .expect("construct sqlite database service");
 
-    let wafer = build_native_runtime(&infra, database.clone(), app_env, Default::default(), false)
-        .await
-        .expect("build impresspress runtime");
+    let wafer = build_native_runtime(
+        &infra,
+        database.clone(),
+        app_env,
+        Default::default(),
+        false,
+        AppHooks::none(),
+    )
+    .await
+    .expect("build impresspress runtime");
 
     (wafer, database)
 }

@@ -12,7 +12,7 @@ use wafer_core::interfaces::network::service::{NetworkLimits, NetworkService};
 /// `…__REQUEST_TIMEOUT_SECS`, `…__STREAM_TIMEOUT_SECS`) are the
 /// `wafer-run/network` block's declared config: the block reads them from its
 /// `lifecycle(Init)` config, which native resolves from the variables table
-/// and then the process environment (`cli::server::build_native_runtime`), and
+/// and then the process environment (`impresspress_server::build_native_runtime`), and
 /// applies them through `NetworkService::configure`. An invalid value fails
 /// that block's Init, naming the key.
 pub fn make_fetch_network_service() -> Arc<dyn NetworkService> {

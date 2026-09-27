@@ -491,7 +491,7 @@ fn structural_config_inputs(
 ///   CF run exclusively through `/_deploy/init` — a production deploy and
 ///   local `impresspress serve --target cloudflare` both POST it (see
 ///   `cli/flows/embed_cloudflare.rs`). Request-path builds never migrate;
-///   there is no worker env var to honor here, unlike native `server.rs`'s
+///   there is no worker env var to honor here, unlike native `impresspress_server::build_native_runtime`'s
 ///   `--run-migrations` flag, which is a real per-boot CLI choice.
 ///
 /// Both surfaces are assembled in ONE `RuntimeConfig`: the async

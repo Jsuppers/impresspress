@@ -10,8 +10,8 @@
 
 use std::{collections::HashMap, path::Path};
 
-use impresspress::cli::server::{boot_native, build_native_runtime};
 use impresspress_native::{register_http_listener, InfraConfig, ListenerEnv};
+use impresspress_server::{boot_native, build_native_runtime, AppHooks};
 
 fn infra_for(db_path: &Path, storage_root: &Path, listener: ListenerEnv) -> InfraConfig {
     InfraConfig {
@@ -41,10 +41,16 @@ async fn boot_with(listener: ListenerEnv) -> anyhow::Result<()> {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer =
-        build_native_runtime(&infra, database, &HashMap::new(), Default::default(), false)
-            .await
-            .expect("build impresspress runtime");
+    let mut wafer = build_native_runtime(
+        &infra,
+        database,
+        &HashMap::new(),
+        Default::default(),
+        false,
+        AppHooks::none(),
+    )
+    .await
+    .expect("build impresspress runtime");
     register_http_listener(&mut wafer, &infra.listen, "site-main", &infra.listener);
     boot_native(&mut wafer).await.map(|_| ())
 }
