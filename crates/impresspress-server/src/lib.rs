@@ -131,10 +131,43 @@ pub async fn run(
     .context("construct database service")?;
 
     // 5b-7b. Seed, load, and build the runtime (shared with the tests).
-    let mut wafer = build_native_runtime(
+    let wafer = start_native(
         &infra,
         database,
         &app_env,
+        password_peppers,
+        run_migrations,
+        listener_flow,
+        hooks,
+    )
+    .await?;
+
+    // 13. Wait for shutdown signal, then graceful shutdown
+    serve_until_shutdown(&wafer)
+        .await
+        .context("await shutdown signal")?;
+    tracing::info!("impresspress shutdown complete");
+
+    Ok(())
+}
+
+/// Build the runtime ([`build_native_runtime`]), point the HTTP listener at
+/// `listener_flow`, boot it and bind its socket: everything [`run`] does
+/// between reading its environment and serving until shutdown. The runtime
+/// it returns is serving on `infra.listen`.
+pub async fn start_native(
+    infra: &InfraConfig,
+    database: Arc<dyn DatabaseService>,
+    app_env: &HashMap<String, String>,
+    password_peppers: PasswordPeppers,
+    run_migrations: bool,
+    listener_flow: &str,
+    hooks: AppHooks,
+) -> anyhow::Result<Arc<Wafer>> {
+    let mut wafer = build_native_runtime(
+        infra,
+        database,
+        app_env,
         password_peppers,
         run_migrations,
         hooks,
@@ -168,14 +201,7 @@ pub async fn run(
     wafer.run_start_lifecycle().await;
     let wafer = wafer.bind_all();
     tracing::info!("WAFER runtime started — all blocks resolved");
-
-    // 13. Wait for shutdown signal, then graceful shutdown
-    serve_until_shutdown(&wafer)
-        .await
-        .context("await shutdown signal")?;
-    tracing::info!("impresspress shutdown complete");
-
-    Ok(())
+    Ok(wafer)
 }
 
 /// Build the native runtime over an already-constructed platform database
