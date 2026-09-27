@@ -151,7 +151,7 @@ test.describe("SaaS: Products", () => {
 test.describe("SaaS: Admin", () => {
   test("admin endpoints require auth", async ({ request }) => {
     const res = await request.get("/b/admin/api/users");
-    expect(res.status()).toBe(403);
+    expect(res.status()).toBe(401);
   });
 
   test("GET /b/admin/api/settings accessible with token", async ({
