@@ -923,7 +923,7 @@ async fn the_export_routes_are_admin_only() {
     let control = FakeControl::new();
     let ctx = shop_instance(&control).await;
     for path in ["/b/dev/api/export", "/b/dev/api/export/manifest"] {
-        let status = output_http_status(ctx.dispatch_resolved(anon_msg("retrieve", path)).await).await;
+        let status = output_http_status(ctx.request(anon_msg("retrieve", path)).await).await;
         assert!(
             status == 401 || status == 403,
             "{path} answered an anonymous caller with {status}"
@@ -942,8 +942,13 @@ async fn the_export_routes_are_admin_only() {
 async fn an_exported_seed_imports_into_a_fresh_instance() {
     let a_control = FakeControl::new();
     let a = shop_instance(&a_control).await;
-    let archive =
-        entries(output_body(a.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export")).await).await);
+    let archive = entries(
+        output_body(
+            a.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
+                .await,
+        )
+        .await,
+    );
 
     let manifest: SeedManifest =
         serde_json::from_slice(&archive["seed/manifest.json"]).expect("a seed manifest");
@@ -1102,8 +1107,13 @@ async fn a_data_snapshot_over_the_import_limit_is_refused_at_export_and_one_at_i
     assert_eq!(data_json_len(&a).await, seed::MAX_DATA_BYTES);
 
     // At the limit: exported, and imported by a fresh instance.
-    let archive =
-        entries(output_body(a.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export")).await).await);
+    let archive = entries(
+        output_body(
+            a.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
+                .await,
+        )
+        .await,
+    );
     let manifest: SeedManifest =
         serde_json::from_slice(&archive["seed/manifest.json"]).expect("a seed manifest");
     let b_control = FakeControl::new();

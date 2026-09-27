@@ -893,7 +893,8 @@ async fn the_sql_editor_does_not_prefill_a_query_it_will_refuse() {
     let mut msg = admin_msg("retrieve", "/b/admin/database");
     msg.set_meta("req.query.table", table);
     msg.set_meta("req.query.tab", "sql");
-    let parts = wafer_block::http_codec::collect_http_response(ctx.dispatch_resolved(msg).await).await;
+    let parts =
+        wafer_block::http_codec::collect_http_response(ctx.dispatch_resolved(msg).await).await;
     let page = String::from_utf8_lossy(&parts.body).into_owned();
 
     // The panel really rendered — without this the two assertions below pass
@@ -916,7 +917,8 @@ async fn the_sql_editor_does_not_prefill_a_query_it_will_refuse() {
     let mut msg = admin_msg("retrieve", "/b/admin/database");
     msg.set_meta("req.query.table", "impresspress__admin__roles");
     msg.set_meta("req.query.tab", "sql");
-    let parts = wafer_block::http_codec::collect_http_response(ctx.dispatch_resolved(msg).await).await;
+    let parts =
+        wafer_block::http_codec::collect_http_response(ctx.dispatch_resolved(msg).await).await;
     let page = String::from_utf8_lossy(&parts.body).into_owned();
     assert!(
         page.contains("SELECT * FROM impresspress__admin__roles LIMIT 100;"),

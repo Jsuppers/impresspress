@@ -319,14 +319,22 @@ mod access_tests {
     use super::*;
     use crate::{
         endpoint_match::action_for_method,
-        test_support::{admin_msg, auth_msg, output_http_status, TestContext},
+        test_support::{anon_msg, output_http_status, Session, TestContext},
     };
 
-    /// A context that routes `/b/vector/*` to the real block.
+    /// A context that routes `/b/vector/*` to the real block and can sign
+    /// people in, so each request below presents a real token.
     async fn ctx() -> TestContext {
-        let mut ctx = TestContext::with_vector().await;
+        let mut ctx = TestContext::with_vector().await.with_sign_in_added();
         ctx.register_block("impresspress/vector", Arc::new(VectorBlock::new()));
         ctx
+    }
+
+    async fn signed_in(ctx: &TestContext, role: &str) -> Session {
+        let email = format!("{role}@example.com");
+        ctx.seed_account(&email, "correct-horse-battery-staple", role)
+            .await;
+        ctx.sign_in(&email, "correct-horse-battery-staple").await
     }
 
     /// An index is a deployment-wide resource with no owner column, so
@@ -368,17 +376,18 @@ mod access_tests {
     }
 
     /// The declaration above, enforced: every route the block serves refuses
-    /// a logged-in non-admin, driven through `routing::route_to_block` --
+    /// a logged-in non-admin, driven through the router block and the
+    /// pipeline — the credential resolved as production resolves it, then
     /// the router's own gate, not a copy of it.
     #[tokio::test]
     async fn every_route_refuses_a_non_admin_session() {
         let ctx = ctx().await;
+        let member = signed_in(&ctx, "user").await;
         for row in ROUTES {
             let path = concrete_path(row.template);
             let action = action_for_method(row.method);
             assert_eq!(
-                output_http_status(ctx.dispatch_resolved(auth_msg(action, &path, "u-not-admin")).await)
-                    .await,
+                output_http_status(ctx.request(member.bearer(anon_msg(action, &path))).await).await,
                 403,
                 "{action} {path} must not be reachable by a logged-in non-admin"
             );
@@ -392,9 +401,11 @@ mod access_tests {
     #[tokio::test]
     async fn an_admin_still_reaches_the_api() {
         let ctx = ctx().await;
+        let admin = signed_in(&ctx, "admin").await;
         for path in ["/b/vector/api/indexes", "/b/vector/api/stats"] {
             assert_eq!(
-                output_http_status(ctx.dispatch_resolved(admin_msg("retrieve", path)).await).await,
+                output_http_status(ctx.request(admin.bearer(anon_msg("retrieve", path))).await)
+                    .await,
                 200,
                 "{path} must still serve an admin"
             );

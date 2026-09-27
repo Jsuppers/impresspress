@@ -2750,10 +2750,15 @@ mod discovery_tests {
     }
 }
 
-/// End-to-end proof that `handle_request` actually wires
+/// End-to-end proof that the request path actually wires
 /// `crate::csrf::enforce_origin_policy` in — not just that the policy
 /// function itself is correct (covered exhaustively in `crate::csrf`'s own
-/// tests). Uses `extra_routes` to reach a dispatch-probe block the same way
+/// tests). Each request goes through `TestContext::request`: the router block
+/// takes the credential off the cookie or the `Authorization` header and says
+/// which, and `handle_request` verifies it and applies the policy. The
+/// session is a real one, signed in through the login route, so the
+/// cookie-vs-header distinction is the router's own, not a flag a test sets.
+/// Uses `extra_routes` to reach a dispatch-probe block the same way
 /// `routing::tests::extra_routes_honor_the_feature_gate` does, since the
 /// built-in `ROUTES` table has no test-only entry.
 #[cfg(test)]
@@ -2763,9 +2768,8 @@ mod csrf_wiring_tests {
 
     use super::*;
     use crate::{
-        features::AllEnabled,
         routing::{ExtraRoute, RouteAccess},
-        test_support::{auth_msg, TestContext},
+        test_support::{anon_msg, Session, TestContext},
     };
 
     struct DispatchProbeBlock;
@@ -2775,15 +2779,17 @@ mod csrf_wiring_tests {
             BlockInfo::new("test/csrf-probe", "0.0.1", "echo@v1", "csrf wiring probe")
                 .category(BlockCategory::Service)
         }
+        /// Answers with the identity the pipeline resolved.
         async fn handle(
             &self,
             _ctx: &dyn Context,
-            _msg: Message,
+            msg: Message,
             _input: InputStream,
         ) -> OutputStream {
-            ResponseBuilder::new()
-                .status(200)
-                .body(b"DISPATCHED".to_vec(), "text/plain")
+            ResponseBuilder::new().status(200).body(
+                format!("DISPATCHED as {:?}", msg.user_id()).into_bytes(),
+                "text/plain",
+            )
         }
         async fn lifecycle(
             &self,
@@ -2794,40 +2800,39 @@ mod csrf_wiring_tests {
         }
     }
 
-    async fn ctx_with_probe() -> TestContext {
-        let mut ctx = TestContext::new()
-            .await
-            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
-        ctx.register_block("test/csrf-probe", std::sync::Arc::new(DispatchProbeBlock));
-        ctx
+    fn dispatched_as(user_id: &str) -> Vec<u8> {
+        format!("DISPATCHED as {user_id:?}").into_bytes()
     }
 
-    fn extra_route() -> Vec<ExtraRoute> {
-        vec![ExtraRoute::new(
+    /// A fixture that signs people in, with the probe mounted at
+    /// `/x/csrf-probe`, and a signed-in user.
+    async fn ctx_with_probe() -> (TestContext, Session) {
+        let mut ctx = TestContext::with_auth().await.with_sign_in_added();
+        ctx.register_block("test/csrf-probe", std::sync::Arc::new(DispatchProbeBlock));
+        ctx.add_extra_route(ExtraRoute::new(
             "/x/csrf-probe",
             "test/csrf-probe",
             RouteAccess::Public,
-        )]
+        ));
+        ctx.seed_account("user-1@example.com", "correct-horse-battery", "user")
+            .await;
+        let session = ctx
+            .sign_in("user-1@example.com", "correct-horse-battery")
+            .await;
+        (ctx, session)
+    }
+
+    fn probe_post(fetch_site: &str) -> Message {
+        let mut msg = anon_msg("create", "/x/csrf-probe");
+        msg.set_meta("http.header.sec-fetch-site", fetch_site);
+        msg
     }
 
     #[tokio::test]
     async fn cookie_authenticated_cross_site_post_is_rejected_before_dispatch() {
-        let ctx = ctx_with_probe().await;
-        let mut msg = auth_msg("create", "/x/csrf-probe", "user-1");
-        msg.set_meta("http.header.sec-fetch-site", "cross-site");
+        let (ctx, session) = ctx_with_probe().await;
 
-        let out = handle_request(
-            &ctx,
-            msg,
-            InputStream::empty(),
-            None, // no Authorization header — this credential came from the cookie
-            "test-secret",
-            true, // cookie_authenticated
-            &AllEnabled,
-            &[],
-            &extra_route(),
-        )
-        .await;
+        let out = ctx.request(session.cookie(probe_post("cross-site"))).await;
 
         assert!(
             crate::test_support::output_is_error(out, "PermissionDenied").await,
@@ -2837,57 +2842,56 @@ mod csrf_wiring_tests {
 
     #[tokio::test]
     async fn cookie_authenticated_same_origin_post_is_dispatched() {
-        let ctx = ctx_with_probe().await;
-        let mut msg = auth_msg("create", "/x/csrf-probe", "user-1");
-        msg.set_meta("http.header.sec-fetch-site", "same-origin");
+        let (ctx, session) = ctx_with_probe().await;
 
-        let out = handle_request(
-            &ctx,
-            msg,
-            InputStream::empty(),
-            None,
-            "test-secret",
-            true,
-            &AllEnabled,
-            &[],
-            &extra_route(),
-        )
-        .await;
+        let out = ctx.request(session.cookie(probe_post("same-origin"))).await;
 
         let buf = out
             .collect_buffered()
             .await
             .expect("same-origin cookie-authenticated POST must reach dispatch");
-        assert_eq!(buf.body, b"DISPATCHED");
+        assert_eq!(buf.body, dispatched_as(&session.user_id));
     }
 
     #[tokio::test]
     async fn bearer_authenticated_cross_site_post_is_not_blocked() {
-        // cookie_authenticated=false: this credential came from a real
-        // `Authorization: Bearer` header, not the cookie fallback — never
-        // CSRF-able, so the cross-site Sec-Fetch-Site value is irrelevant.
-        let ctx = ctx_with_probe().await;
-        let mut msg = auth_msg("create", "/x/csrf-probe", "user-1");
-        msg.set_meta("http.header.sec-fetch-site", "cross-site");
+        // A real `Authorization: Bearer` header, not the cookie fallback —
+        // never CSRF-able, so the cross-site Sec-Fetch-Site value is
+        // irrelevant.
+        let (ctx, session) = ctx_with_probe().await;
 
-        let out = handle_request(
-            &ctx,
-            msg,
-            InputStream::empty(),
-            None,
-            "test-secret",
-            false, // cookie_authenticated
-            &AllEnabled,
-            &[],
-            &extra_route(),
-        )
-        .await;
+        let out = ctx.request(session.bearer(probe_post("cross-site"))).await;
 
         let buf = out
             .collect_buffered()
             .await
             .expect("Bearer-authenticated cross-site POST must not be blocked");
-        assert_eq!(buf.body, b"DISPATCHED");
+        assert_eq!(buf.body, dispatched_as(&session.user_id));
+    }
+
+    /// A header wins over the cookie: the router resolves the credential
+    /// from `Authorization` when both are present, so a cross-site page
+    /// cannot make its cookie count by also sending a header it cannot know.
+    /// What it can send is a header that does not verify; the cookie is then
+    /// ignored, the request is anonymous, and there is no session to ride.
+    #[tokio::test]
+    async fn a_cookie_does_not_ride_along_with_a_bogus_header() {
+        let (ctx, session) = ctx_with_probe().await;
+
+        let mut msg = session.cookie(probe_post("cross-site"));
+        msg.set_meta("http.header.authorization", "Bearer not-a-token");
+        let out = ctx.request(msg).await;
+
+        // Dispatched (the probe is Public) — as nobody.
+        let buf = out
+            .collect_buffered()
+            .await
+            .expect("an anonymous request to a public route is dispatched");
+        assert_eq!(
+            buf.body,
+            dispatched_as(""),
+            "the cookie must not have signed it"
+        );
     }
 }
 

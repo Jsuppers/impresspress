@@ -152,8 +152,14 @@ pub fn routed(mut msg: Message) -> Message {
 ///
 /// `dispatch` above enters the block *below* the layer that enforces a
 /// declared endpoint's `AuthLevel`, so it can prove a handler's behaviour but
-/// never its authorization tier. A test about who may invoke an endpoint
-/// must use this.
+/// never its authorization tier. A test about which tier may invoke an
+/// endpoint must use this.
+///
+/// The caller is the one the message's `auth.*` meta names, taken as
+/// resolved ([`TestContext::dispatch_resolved_with_input`]): these tests are
+/// about the tier and ownership rules given a caller, keyed to the fixture's
+/// seeded owner ids. How a token or key becomes that caller is the request
+/// preamble's, driven by `TestContext::request` in `tests/request_preamble.rs`.
 pub async fn dispatch_routed(ctx: &TestContext, msg: Message, input: InputStream) -> OutputStream {
     ctx.dispatch_resolved_with_input(msg, input).await
 }

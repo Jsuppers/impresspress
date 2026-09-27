@@ -165,7 +165,11 @@ mod owner_id_backfill_tests {
     }
 
     async fn status_as(ctx: &TestContext, path: &str, user: &str) -> u16 {
-        output_http_status(ctx.dispatch_resolved(auth_msg("retrieve", path, user)).await).await
+        output_http_status(
+            ctx.dispatch_resolved(auth_msg("retrieve", path, user))
+                .await,
+        )
+        .await
     }
 
     #[tokio::test]

@@ -11,12 +11,12 @@ use impresspress_core::{
         activation::{self, ActivationIntent},
         blobs, gc, paths,
         repo::generations::GenerationCause,
-        test_support::{dev_post, FakeControl, FakeShell},
+        test_support::{dev_post, dev_with_accounts, signed_in_as, FakeControl, FakeShell},
         workspace, DevBlock, DevShared,
     },
     test_support::{
-        admin_msg, anon_msg, auth_msg, output_http_header, output_http_status, output_json,
-        output_status, HeldGet, TestContext,
+        admin_msg, anon_msg, output_http_header, output_http_status, output_json, output_status,
+        HeldGet, TestContext,
     },
 };
 use serde_json::json;
@@ -527,18 +527,19 @@ async fn file_size_quota_is_enforced() {
 
 #[tokio::test]
 async fn the_files_api_is_admin_only() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let ctx = dev_with_accounts(FakeControl::new()).await;
+    let member = signed_in_as(&ctx, "user").await;
     for msg in [
         anon_msg("retrieve", "/b/dev/api/files"),
-        auth_msg("retrieve", "/b/dev/api/files", "u1"),
+        member.bearer(anon_msg("retrieve", "/b/dev/api/files")),
         anon_msg("create", "/b/dev/api/files/write"),
-        auth_msg("create", "/b/dev/api/files/write", "u1"),
+        member.bearer(anon_msg("create", "/b/dev/api/files/write")),
         anon_msg("create", "/b/dev/api/files/read"),
         anon_msg("create", "/b/dev/api/files/delete"),
     ] {
         let path = msg.path().to_string();
         assert_eq!(
-            output_http_status(ctx.dispatch_resolved(msg).await).await,
+            output_http_status(ctx.request(msg).await).await,
             403,
             "{path}"
         );

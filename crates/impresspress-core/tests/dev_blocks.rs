@@ -895,9 +895,7 @@ async fn the_staging_and_removal_routes_are_admin_only() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
 
     for path in ["/b/dev/api/builds/stage", "/b/dev/api/blocks/hello/remove"] {
-        let out = ctx
-            .dispatch_resolved_json(anon_msg("create", path), &json!({}))
-            .await;
+        let out = ctx.request_json(anon_msg("create", path), &json!({})).await;
         let status = impresspress_core::test_support::output_http_status(out).await;
         assert!(
             status == 401 || status == 403,

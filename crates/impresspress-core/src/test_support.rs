@@ -5021,7 +5021,9 @@ mod tests {
             crate::routing::RouteAccess::Public,
         ));
 
-        let out = ctx.dispatch_resolved(anon_msg("retrieve", "/b/reader")).await;
+        let out = ctx
+            .dispatch_resolved(anon_msg("retrieve", "/b/reader"))
+            .await;
         match out.collect_buffered().await {
             Err(TerminalNotResponse::Error(e)) => {
                 assert_eq!(e.code, ErrorCode::PermissionDenied, "{e:?}");

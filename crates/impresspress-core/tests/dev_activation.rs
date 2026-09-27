@@ -17,13 +17,14 @@ use impresspress_core::{
             generations::{self, GenerationCause, GenerationStatus, NewGeneration},
             runtime_state::{self, ActivationPhase, RuntimeState},
         },
-        test_support::{dev_get, dev_post, dev_status, FakeControl},
+        test_support::{
+            dev_get, dev_post, dev_status, dev_with_accounts, signed_in_as, FakeControl,
+        },
         workspace::FileEntry,
         WAFER_GUEST_VERSION,
     },
     test_support::{
-        admin_msg, anon_msg, auth_msg, output_http_header, output_http_status, output_json,
-        TestContext,
+        admin_msg, anon_msg, output_http_header, output_http_status, output_json, TestContext,
     },
 };
 use serde_json::json;
@@ -1169,18 +1170,19 @@ async fn the_ledger_publishes_each_generation_with_its_manifest_and_diff() {
 
 #[tokio::test]
 async fn the_generations_api_is_admin_only() {
-    let ctx = TestContext::with_dev(FakeControl::new()).await;
+    let ctx = dev_with_accounts(FakeControl::new()).await;
+    let member = signed_in_as(&ctx, "user").await;
     for msg in [
         anon_msg("retrieve", "/b/dev/api/generations"),
-        auth_msg("retrieve", "/b/dev/api/generations", "u1"),
+        member.bearer(anon_msg("retrieve", "/b/dev/api/generations")),
         anon_msg("retrieve", "/b/dev/api/generations/g1"),
-        auth_msg("retrieve", "/b/dev/api/generations/g1", "u1"),
+        member.bearer(anon_msg("retrieve", "/b/dev/api/generations/g1")),
         anon_msg("create", "/b/dev/api/generations/g1/rollback"),
-        auth_msg("create", "/b/dev/api/generations/g1/rollback", "u1"),
+        member.bearer(anon_msg("create", "/b/dev/api/generations/g1/rollback")),
     ] {
         let path = msg.path().to_string();
         assert_eq!(
-            output_http_status(ctx.dispatch_resolved(msg).await).await,
+            output_http_status(ctx.request(msg).await).await,
             403,
             "{path}"
         );
