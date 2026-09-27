@@ -298,6 +298,12 @@ pub async fn build_native_runtime(
         );
     }
 
+    // The crypto service, with the password pepper `run()` read from the
+    // process environment: the one place the pepper goes.
+    tracing::info!("{}", password_pepper::describe(&password_peppers));
+    let crypto = impresspress_native::make_jwt_crypto_service(jwt_secret, password_peppers)
+        .context("construct crypto service")?;
+
     let (with_config, ()) = runtime_config.install(
         ImpresspressBuilder::new()
             .database(database)
@@ -321,10 +327,6 @@ pub async fn build_native_runtime(
     // seeder would accept take part (`usable_env_exports`), so one it refuses
     // — a blank value, a runtime-owned key, a value its key's declared rule
     // refuses — cannot reach a block's Init this way instead.
-    tracing::info!("{}", password_pepper::describe(&password_peppers));
-    let crypto = impresspress_native::make_jwt_crypto_service(jwt_secret, password_peppers)
-        .context("construct crypto service")?;
-
     let mut block_config =
         impresspress_core::platform_state::variables::usable_env_exports(app_env);
     block_config.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));

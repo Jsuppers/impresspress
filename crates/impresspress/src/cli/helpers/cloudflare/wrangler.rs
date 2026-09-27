@@ -490,7 +490,8 @@ outside Cloudflare: losing it locks out every account whose hash it peppered. \
 IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS (a secret too) holds rotated-out keys; \
 IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED = \"true\" may go in [vars].\n\n";
 
-/// Refuse a config whose `[vars]` holds a password pepper key.
+/// Refuse a config whose `[vars]`, or any `[env.<name>.vars]`, holds a
+/// password pepper key.
 ///
 /// A `[vars]` value is plain text: in this file, in the override file it came
 /// from (which a consumer repo commits) and in the Cloudflare dashboard. The
@@ -501,16 +502,32 @@ fn refuse_pepper_keys_in_vars(value: &toml::Value) -> Result<()> {
     use impresspress_core::password_pepper::{
         PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
     };
-    let Some(vars) = value.get("vars").and_then(toml::Value::as_table) else {
-        return Ok(());
-    };
-    for var in [PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR] {
-        if vars.contains_key(var) {
-            anyhow::bail!(
-                "{var} is set under [vars] in the wrangler overrides, where it is plain text \
-                 (in the file and in the Cloudflare dashboard). Remove it and set it with \
-                 `wrangler secret put {var}`."
-            );
+    // The top-level `[vars]`, and each `[env.<name>.vars]`: wrangler does not
+    // inherit `vars` into an environment, so an environment's own table is
+    // where its deploy reads them from.
+    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
+    if let Some(vars) = value.get("vars") {
+        tables.push(("[vars]".to_string(), vars));
+    }
+    if let Some(envs) = value.get("env").and_then(toml::Value::as_table) {
+        for (name, env) in envs {
+            if let Some(vars) = env.get("vars") {
+                tables.push((format!("[env.{name}.vars]"), vars));
+            }
+        }
+    }
+    for (table, vars) in tables {
+        let Some(vars) = vars.as_table() else {
+            continue;
+        };
+        for var in [PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR] {
+            if vars.contains_key(var) {
+                anyhow::bail!(
+                    "{var} is set under {table} in the wrangler overrides, where it is plain \
+                     text (in the file and in the Cloudflare dashboard). Remove it and set it \
+                     with `wrangler secret put {var}`."
+                );
+            }
         }
     }
     Ok(())

@@ -161,7 +161,9 @@ pub(crate) async fn burn_timing_equalization(
             );
             Ok(())
         }
-        Comparison::Failed(e) => Err(credential_check_failed(e, CONTEXT)),
+        Comparison::Failed(e) | Comparison::PepperFault(e) => {
+            Err(credential_check_failed(e, CONTEXT))
+        }
     }
 }
 
@@ -185,12 +187,23 @@ pub(crate) enum PasswordCheck {
 /// (see [`MALFORMED_HASH_PREFIX`]): the account cannot sign in with a password
 /// until the hash is replaced, so it is logged at error level with the user id
 /// (never the hash) for an operator to find and reset, and the caller decides
-/// what the requester is told. Every other failure says nothing about the
-/// password or the stored hash — the call refused by WRAP, the service
-/// unreachable, or the crypto service's own fault while checking (an `Internal`
-/// such as a failed offload to its blocking pool) — and is `Err`, logged and
-/// classified by [`credential_check_failed`] (a refusal keeps its 403 or 429,
-/// anything else is a 503).
+/// what the requester is told.
+///
+/// A stored hash the configured password pepper cannot check
+/// (`CryptoError::Pepper`, see [`PEPPER_FAULT_PREFIX`]) — a peppered hash
+/// naming a key the deployment no longer holds, or an unpeppered hash while
+/// `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` is on — is a configuration fault:
+/// it does not go away by itself, and the fix is the pepper keys or that
+/// account's password. It is logged at error level with the user id and
+/// answered `Err` as a 503, the same answer a transient fault gets, so the
+/// requester learns nothing about which accounts hold which kind of hash.
+///
+/// Every other failure says nothing about the password or the stored hash —
+/// the call refused by WRAP, the service unreachable, or the crypto service's
+/// own fault while checking (an `Internal` such as a failed offload to its
+/// blocking pool) — and is `Err`, logged and classified by
+/// [`credential_check_failed`] (a refusal keeps its 403 or 429, anything else
+/// is a 503).
 pub(crate) async fn check_password(
     ctx: &dyn wafer_run::context::Context,
     user_id: &str,
@@ -208,9 +221,27 @@ pub(crate) async fn check_password(
             );
             Ok(PasswordCheck::Unverifiable(e))
         }
+        Comparison::PepperFault(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "stored password hash cannot be checked with the configured password pepper \
+                 (the key it names is not configured, or a pepper is required and it has \
+                 none); this is a configuration fault, not a temporary one: restore the key \
+                 it names in IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS, or turn \
+                 IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED off, or reset this account's \
+                 password"
+            );
+            Err(credential_check_unavailable())
+        }
         Comparison::Failed(e) => Err(credential_check_failed(e, "auth: password check")),
     }
 }
+
+/// How a `CryptoError::Pepper` reads once it has crossed the wire: like
+/// [`MALFORMED_HASH_PREFIX`], an `ErrorCode::Internal` told apart only by the
+/// variant's `Display`. Pinned by `malformed_hash_prefix_tests`.
+const PEPPER_FAULT_PREFIX: &str = "password pepper: ";
 
 /// How a `CryptoError::MalformedHash` reads once it has crossed the wire.
 ///
@@ -226,6 +257,7 @@ enum Comparison {
     Matches,
     DoesNotMatch,
     MalformedHash(WaferError),
+    PepperFault(WaferError),
     Failed(WaferError),
 }
 
@@ -239,6 +271,12 @@ fn classify_comparison(result: Result<(), WaferError>) -> Comparison {
         {
             Comparison::MalformedHash(e)
         }
+        Err(e)
+            if e.code == wafer_run::ErrorCode::Internal
+                && e.message.starts_with(PEPPER_FAULT_PREFIX) =>
+        {
+            Comparison::PepperFault(e)
+        }
         Err(e) => Comparison::Failed(e),
     }
 }
@@ -247,7 +285,25 @@ fn classify_comparison(result: Result<(), WaferError>) -> Comparison {
 mod malformed_hash_prefix_tests {
     use wafer_core::interfaces::crypto::service::CryptoError;
 
-    use super::{classify_comparison, Comparison, MALFORMED_HASH_PREFIX};
+    use super::{classify_comparison, Comparison, MALFORMED_HASH_PREFIX, PEPPER_FAULT_PREFIX};
+
+    /// Likewise for a pepper fault, which would otherwise be logged as a
+    /// transient failure with no user id.
+    #[test]
+    fn the_pepper_prefix_is_how_a_pepper_fault_displays() {
+        let shown = CryptoError::Pepper("key 0011 is not configured".to_string()).to_string();
+        assert!(
+            shown.starts_with(PEPPER_FAULT_PREFIX),
+            "{shown:?} no longer starts with {PEPPER_FAULT_PREFIX:?}"
+        );
+        assert!(matches!(
+            classify_comparison(Err(wafer_run::WaferError::new(
+                wafer_run::ErrorCode::Internal,
+                shown
+            ))),
+            Comparison::PepperFault(_)
+        ));
+    }
 
     /// The prefix is the variant's own `Display`; a rewording upstream would
     /// otherwise turn every malformed hash into a 503 without a sound.
@@ -527,12 +583,17 @@ pub(crate) fn credential_check_failed(error: WaferError, context: &str) -> Wafer
         DbFailure::Refused(refusal) => refusal.into_error(),
         DbFailure::Internal(fault) => {
             tracing::error!(context = %context, error = %fault, "credential check failed");
-            WaferError::new(
-                wafer_run::ErrorCode::Unavailable,
-                "Authentication is temporarily unavailable",
-            )
+            credential_check_unavailable()
         }
     }
+}
+
+/// The 503 a credential check that could not decide is answered with.
+fn credential_check_unavailable() -> WaferError {
+    WaferError::new(
+        wafer_run::ErrorCode::Unavailable,
+        "Authentication is temporarily unavailable",
+    )
 }
 
 /// Drop `user_id`'s cached `auth_version` entry, if any.

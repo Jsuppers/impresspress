@@ -275,9 +275,41 @@ async fn config_get(wafer: &Wafer, key: &str) -> String {
     String::from_utf8(parts.body).expect("utf-8 answer")
 }
 
-/// Every event the build and boot log, rendered with all its fields.
+/// Events logged on this thread while a [`capture_logs`] guard is held,
+/// each rendered with all its fields.
+///
+/// One process-wide subscriber, installed once, rather than a
+/// `set_default` per test: `tracing` caches whether a call site is enabled
+/// across threads, so a scoped subscriber in one test can miss events while
+/// another test runs without one. The tests run on current-thread runtimes,
+/// so the thread the test holds the guard on is the thread its events are
+/// logged on.
 #[derive(Clone, Default)]
 struct LogCapture(Arc<Mutex<Vec<String>>>);
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<LogCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start capturing this thread's events; capture stops when the guard drops.
+fn capture_logs() -> (LogCapture, CaptureGuard) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(ThreadCapture)
+            .expect("no other global subscriber in this test binary");
+    });
+    let logs = LogCapture::default();
+    CAPTURE.with(|c| *c.borrow_mut() = Some(logs.clone()));
+    (logs, CaptureGuard)
+}
+
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE.with(|c| *c.borrow_mut() = None);
+    }
+}
 
 struct FieldVisitor<'a>(&'a mut String);
 
@@ -288,7 +320,9 @@ impl tracing::field::Visit for FieldVisitor<'_> {
     }
 }
 
-impl tracing::Subscriber for LogCapture {
+struct ThreadCapture;
+
+impl tracing::Subscriber for ThreadCapture {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -298,9 +332,13 @@ impl tracing::Subscriber for LogCapture {
     fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        let mut line = String::new();
-        event.record(&mut FieldVisitor(&mut line));
-        self.0.lock().expect("log capture poisoned").push(line);
+        CAPTURE.with(|c| {
+            if let Some(logs) = c.borrow().as_ref() {
+                let mut line = String::new();
+                event.record(&mut FieldVisitor(&mut line));
+                logs.0.lock().expect("log capture poisoned").push(line);
+            }
+        });
     }
     fn enter(&self, _span: &tracing::span::Id) {}
     fn exit(&self, _span: &tracing::span::Id) {}
@@ -328,8 +366,7 @@ async fn a_required_pepper_hashes_passwords_and_is_readable_nowhere() {
     .expect("a well-formed pepper");
     let key_id = peppers.current().expect("a current key").id().to_string();
 
-    let logs = LogCapture::default();
-    let guard = tracing::subscriber::set_default(logs.clone());
+    let (logs, guard) = capture_logs();
     let (wafer, database) = start(&db_path, &storage_root, peppers).await;
     drop(guard);
 
@@ -408,10 +445,48 @@ async fn an_unpeppered_hash_verifies_until_the_pepper_is_required() {
     ]))
     .expect("a well-formed pepper");
     let (wafer, _) = start(&db_path, &storage_root, required).await;
-    assert_ne!(
+    assert_eq!(
         login(&wafer, ADMIN_PASSWORD).await,
-        200,
-        "a required pepper must refuse an unpeppered hash"
+        503,
+        "a required pepper refuses an unpeppered hash with the same 503 as any \
+         check that could not decide, never as a wrong password"
+    );
+}
+
+/// A peppered hash whose key the deployment no longer holds cannot be
+/// checked: the login is a 503 (not a wrong password, which would send the
+/// user to reset a password that is right), and the operator log names the
+/// account and says it is a configuration fault.
+#[tokio::test]
+async fn a_peppered_hash_whose_key_is_gone_is_a_503_logged_as_a_config_fault() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("password_pepper_key_gone.sqlite3");
+    let storage_root = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    let with_key = password_peppers_from_env(process_env(&[(PASSWORD_PEPPER_KEY_VAR, KEY)]))
+        .expect("a well-formed pepper");
+    let (wafer, database) = start(&db_path, &storage_root, with_key).await;
+    assert!(stored_hash(&database)
+        .await
+        .starts_with("$argon2id-hmac-sha256$"));
+    drop(wafer);
+
+    // The key was replaced without being kept as a previous key.
+    let other_key =
+        password_peppers_from_env(process_env(&[(PASSWORD_PEPPER_KEY_VAR, PREVIOUS_KEY)]))
+            .expect("a well-formed pepper");
+    let (wafer, _) = start(&db_path, &storage_root, other_key).await;
+    let (logs, guard) = capture_logs();
+    let status = login(&wafer, ADMIN_PASSWORD).await;
+    drop(guard);
+    assert_eq!(status, 503);
+
+    let logs = logs.0.lock().expect("log capture poisoned").clone();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("user_id=") && line.contains("configuration fault")),
+        "the pepper fault must be logged with the account and as a config fault: {logs:#?}"
     );
 }
 

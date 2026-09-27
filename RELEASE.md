@@ -80,8 +80,8 @@ and signs every user out, once.
   service: it is never a `variables` row, never on either config surface, so
   no block and no admin page can read it. The browser target holds no pepper
   (nothing in a visitor's browser is secret), so a peppered hash carried into
-  the dev sandbox cannot be verified there; it fails as an internal error,
-  not as a wrong password.
+  the dev sandbox cannot be verified there; its sign-in answers 503, not a
+  wrong password.
 - A request refused by the database's statement budget now says so in the
   error body's `code`: `database.statement_budget_exhausted` on the 429,
   `database.statement_budget_exceeds_limit` on a write larger than a whole
@@ -117,18 +117,35 @@ and signs every user out, once.
    `[vars]` entry through `wrangler_overrides_path`); an unpeppered hash is
    then refused, so nobody who can write the credential table can plant a
    hash of a password they know. Check first — any user this lists is locked
-   out once it is on:
-   `SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash
-   NOT LIKE '$argon2id-hmac-sha256$%';`
-   (native SQLite: `sqlite3 data/impresspress.db`; D1:
-   `npx wrangler d1 execute <database> --remote --command "…"`). Reset or
-   recreate those accounts first. The value must be exactly `true` or
-   `false`; anything else fails the boot (native) or every request
+   out once it is on (single quotes, so the shell leaves `$argon2id…` alone):
+
+   ```sh
+   # native SQLite
+   sqlite3 data/impresspress.db 'SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash NOT LIKE '"'"'$argon2id-hmac-sha256$%'"'"';'
+   # Cloudflare D1
+   npx wrangler d1 execute <database> --remote --command 'SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash NOT LIKE '"'"'$argon2id-hmac-sha256$%'"'"';'
+   ```
+
+   Reset or recreate those accounts first. While `REQUIRED` is on, a sign-in
+   to an account whose hash is still unpeppered answers 503 rather than a
+   wrong-password 401 (and is logged as a configuration fault with its user
+   id), so someone who knows such an account's password can tell it apart —
+   one more reason to run the scan first. The value must be exactly `true`
+   or `false`; anything else fails the boot (native) or every request
    (Cloudflare) with an error naming the variable.
 5. To rotate: move the current key into
    `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` (comma-separated, a secret on
    Cloudflare) and set a new current key. Old hashes keep verifying with the
-   key they name; drop an old key only once no stored hash names it.
+   key they name, and a hash naming a key the deployment no longer holds
+   fails sign-in with a 503. The boot log names each key by its id
+   (`password pepper <id> (previous: [<id>, …])`); before dropping an old
+   key, check no stored hash names its id:
+
+   ```sh
+   sqlite3 data/impresspress.db 'SELECT user_id FROM wafer_run__auth__local_credentials WHERE password_hash LIKE '"'"'%,pepper=<id>$%'"'"';'
+   ```
+
+   (the same query through `npx wrangler d1 execute … --command '…'` on D1).
 
 A malformed key fails the boot the same way, naming the variable and never
 printing the value.

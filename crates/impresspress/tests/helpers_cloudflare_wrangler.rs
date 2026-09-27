@@ -437,6 +437,22 @@ fn a_pepper_key_in_vars_is_refused() {
         }
     }
 
+    // An environment's own vars are read by its deploy just the same.
+    fs::write(
+        &overrides_path,
+        format!("[env.staging.vars]\n{PASSWORD_PEPPER_KEY_VAR} = \"{key}\"\n"),
+    )
+    .unwrap();
+    let err = format!(
+        "{:#}",
+        generate(&cfg, repo_root, &out).expect_err("env vars")
+    );
+    assert!(
+        err.contains("[env.staging.vars]") && err.contains(PASSWORD_PEPPER_KEY_VAR),
+        "{err}"
+    );
+    assert!(!err.contains(key), "the error echoed the key: {err}");
+
     fs::write(
         &overrides_path,
         format!("[vars]\n{PASSWORD_PEPPER_REQUIRED_VAR} = \"true\"\n"),

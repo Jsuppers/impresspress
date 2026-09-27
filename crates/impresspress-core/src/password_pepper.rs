@@ -82,33 +82,30 @@ pub fn password_peppers(
             ))
         }
     };
-    let current = key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            PepperKey::from_base64(value).map_err(|e| format!("{PASSWORD_PEPPER_KEY_VAR}: {e}"))
-        })
-        .transpose()?;
-    let previous = match previous_keys.map(str::trim).filter(|list| !list.is_empty()) {
-        None => Vec::new(),
-        Some(list) => list
-            .split(',')
-            .enumerate()
-            .map(|(i, entry)| {
-                let which = format!("{PASSWORD_PEPPER_PREVIOUS_KEYS_VAR} entry {}", i + 1);
-                if entry.trim().is_empty() {
-                    return Err(format!("{which}: empty entry"));
-                }
-                PepperKey::from_base64(entry).map_err(|e| format!("{which}: {e}"))
-            })
-            .collect::<Result<_, _>>()?,
+    PasswordPeppers::from_config(key, previous_keys, required).map_err(name_the_variable)
+}
+
+/// `PasswordPeppers::from_config`'s error, with the setting it names spelled
+/// as the variable an operator sets. `from_config` labels a fault in one key
+/// `current key: …` or `previous key <n>: …`; a fault in the combination
+/// (required without a key, previous keys without a current one, a key given
+/// twice) carries no label and names all three.
+fn name_the_variable(error: wafer_core::interfaces::crypto::service::CryptoError) -> String {
+    use wafer_core::interfaces::crypto::service::CryptoError;
+    let message = match error {
+        CryptoError::Pepper(message) => message,
+        other => other.to_string(),
     };
-    PasswordPeppers::new(current, previous, required).map_err(|e| {
-        format!(
-            "password pepper ({PASSWORD_PEPPER_KEY_VAR}, {PASSWORD_PEPPER_PREVIOUS_KEYS_VAR}, \
-             {PASSWORD_PEPPER_REQUIRED_VAR}): {e}"
-        )
-    })
+    if let Some(rest) = message.strip_prefix("current key: ") {
+        return format!("{PASSWORD_PEPPER_KEY_VAR}: {rest}");
+    }
+    if let Some(rest) = message.strip_prefix("previous key ") {
+        return format!("{PASSWORD_PEPPER_PREVIOUS_KEYS_VAR} entry {rest}");
+    }
+    format!(
+        "password pepper ({PASSWORD_PEPPER_KEY_VAR}, {PASSWORD_PEPPER_PREVIOUS_KEYS_VAR}, \
+         {PASSWORD_PEPPER_REQUIRED_VAR}): {message}"
+    )
 }
 
 /// One line for a boot log: whether a pepper is configured, the ids of its
