@@ -155,7 +155,7 @@ pub fn routed(mut msg: Message) -> Message {
 /// never its authorization tier. A test about who may invoke an endpoint
 /// must use this.
 pub async fn dispatch_routed(ctx: &TestContext, msg: Message, input: InputStream) -> OutputStream {
-    ctx.dispatch_with_input(msg, input).await
+    ctx.dispatch_resolved_with_input(msg, input).await
 }
 
 /// Collect an `OutputStream`'s body and decode it as JSON.

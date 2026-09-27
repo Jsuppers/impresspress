@@ -793,7 +793,7 @@ async fn list_generations(ctx: &TestContext, limit: Option<u32>) -> serde_json::
     if let Some(limit) = limit {
         msg.set_meta("req.query.limit", limit.to_string());
     }
-    output_json(ctx.dispatch(msg).await).await
+    output_json(ctx.dispatch_resolved(msg).await).await
 }
 
 /// Write `site/index.html` `count` times from version `from`, chaining the
@@ -1180,7 +1180,7 @@ async fn the_generations_api_is_admin_only() {
     ] {
         let path = msg.path().to_string();
         assert_eq!(
-            output_http_status(ctx.dispatch(msg).await).await,
+            output_http_status(ctx.dispatch_resolved(msg).await).await,
             403,
             "{path}"
         );

@@ -34,12 +34,12 @@ use crate::test_support::{admin_msg, output_json, TestContext};
 /// this is how each of the six `dev_*.rs` integration files opened every
 /// request it makes.
 pub async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
+    ctx.dispatch_resolved_json(admin_msg("create", path), &body).await
 }
 
 /// `GET` a `/b/dev` route as an admin, through the router.
 pub async fn dev_get(ctx: &TestContext, path: &str) -> OutputStream {
-    ctx.dispatch(admin_msg("retrieve", path)).await
+    ctx.dispatch_resolved(admin_msg("retrieve", path)).await
 }
 
 /// The `/b/dev/api/status` projection — the generation, the block set and the

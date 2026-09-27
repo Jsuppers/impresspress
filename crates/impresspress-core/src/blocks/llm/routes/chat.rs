@@ -1091,7 +1091,7 @@ mod tests {
         let mut refused = Vec::new();
         for path in paths {
             let out = ctx
-                .dispatch_with_input(
+                .dispatch_resolved_with_input(
                     crate::test_support::auth_msg("create", path, "user-b"),
                     chat_body(&thread_id),
                 )
@@ -1134,7 +1134,7 @@ mod tests {
         let mut failed = Vec::new();
         for path in paths {
             let out = ctx
-                .dispatch_with_input(
+                .dispatch_resolved_with_input(
                     crate::test_support::auth_msg("create", path, "user-a"),
                     chat_body(&thread_id),
                 )

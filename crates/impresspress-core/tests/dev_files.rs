@@ -83,7 +83,7 @@ async fn write_then_list_then_read_round_trips_with_hashes() {
     let sha = w["sha256"].as_str().expect("sha256").to_string();
     assert_eq!(sha.len(), 64);
 
-    let l = output_json(ctx.dispatch(list_msg(Some("site/"))).await).await;
+    let l = output_json(ctx.dispatch_resolved(list_msg(Some("site/"))).await).await;
     assert_eq!(l["files"][0]["path"], "site/index.html");
     assert_eq!(l["files"][0]["sha256"], serde_json::json!(sha));
     assert_eq!(l["files"][0]["size"], 11);
@@ -304,7 +304,7 @@ async fn a_path_that_clashes_with_an_existing_file_or_directory_is_rejected() {
     write_new(&ctx, "site/blogroll", "ok").await;
 
     // Nothing the refusals touched went missing.
-    let l = output_json(ctx.dispatch(list_msg(Some("site/"))).await).await;
+    let l = output_json(ctx.dispatch_resolved(list_msg(Some("site/"))).await).await;
     let paths: Vec<&str> = l["files"]
         .as_array()
         .expect("files")
@@ -346,7 +346,7 @@ async fn paths_outside_site_and_blocks_are_rejected() {
 async fn a_space_inside_a_segment_is_a_legitimate_path() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let sha = write_new(&ctx, "site/my page.html", "<p>ok</p>").await;
-    let l = output_json(ctx.dispatch(list_msg(None)).await).await;
+    let l = output_json(ctx.dispatch_resolved(list_msg(None)).await).await;
     assert_eq!(l["files"][0]["path"], "site/my page.html");
     assert_eq!(l["files"][0]["sha256"], serde_json::json!(sha));
 }
@@ -362,7 +362,7 @@ async fn the_listing_is_sorted_by_path_and_filtered_by_prefix() {
     write_new(&ctx, "site/a.css", "a{}").await;
     write_new(&ctx, "blocks/hello/src/lib.rs", "fn main() {}").await;
 
-    let all = output_json(ctx.dispatch(list_msg(None)).await).await;
+    let all = output_json(ctx.dispatch_resolved(list_msg(None)).await).await;
     let paths: Vec<&str> = all["files"]
         .as_array()
         .expect("files array")
@@ -374,7 +374,7 @@ async fn the_listing_is_sorted_by_path_and_filtered_by_prefix() {
         vec!["blocks/hello/src/lib.rs", "site/a.css", "site/z.css"]
     );
 
-    let site = output_json(ctx.dispatch(list_msg(Some("site/"))).await).await;
+    let site = output_json(ctx.dispatch_resolved(list_msg(Some("site/"))).await).await;
     let paths: Vec<&str> = site["files"]
         .as_array()
         .expect("files array")
@@ -401,7 +401,7 @@ async fn delete_with_matching_hash_removes_the_entry_and_keeps_the_blob_for_hist
     .await;
     assert_eq!(output_status(out).await, 200);
 
-    let l = output_json(ctx.dispatch(list_msg(None)).await).await;
+    let l = output_json(ctx.dispatch_resolved(list_msg(None)).await).await;
     assert!(l["files"].as_array().expect("files array").is_empty());
 
     // The blob outlives the manifest entry: an earlier generation still
@@ -436,7 +436,7 @@ async fn delete_with_a_stale_hash_is_a_conflict() {
     .await;
     assert_eq!(body["current_sha256"], serde_json::json!(sha));
 
-    let l = output_json(ctx.dispatch(list_msg(None)).await).await;
+    let l = output_json(ctx.dispatch_resolved(list_msg(None)).await).await;
     assert_eq!(l["files"].as_array().expect("files array").len(), 1);
 }
 
@@ -538,7 +538,7 @@ async fn the_files_api_is_admin_only() {
     ] {
         let path = msg.path().to_string();
         assert_eq!(
-            output_http_status(ctx.dispatch(msg).await).await,
+            output_http_status(ctx.dispatch_resolved(msg).await).await,
             403,
             "{path}"
         );
@@ -552,7 +552,7 @@ async fn every_files_response_is_never_cached() {
 
     // One request per assertion: reading an `OutputStream` consumes it.
     assert_eq!(
-        output_http_header(ctx.dispatch(list_msg(None)).await, "Cache-Control")
+        output_http_header(ctx.dispatch_resolved(list_msg(None)).await, "Cache-Control")
             .await
             .as_deref(),
         Some("no-store"),
@@ -869,7 +869,7 @@ async fn a_file_with_no_known_extension_reads_back_as_text() {
     ] {
         write_new(&ctx, path, body).await;
 
-        let listed = output_json(ctx.dispatch(list_msg(Some(path))).await).await;
+        let listed = output_json(ctx.dispatch_resolved(list_msg(Some(path))).await).await;
         assert_eq!(
             listed["files"][0]["content_type"], "application/octet-stream",
             "{path} stores as octet-stream"
@@ -1195,7 +1195,7 @@ async fn a_listing_answers_from_the_manifest_a_racing_write_has_not_replaced() {
 
     let hold = ctx.hold_next_storage_get("impresspress/dev", workspace::FOLDER, workspace::KEY);
 
-    let list = ctx.dispatch(list_msg(None));
+    let list = ctx.dispatch_resolved(list_msg(None));
     let racer = async {
         once_parked(&hold).await;
         let write = output_json(

@@ -1345,7 +1345,7 @@ mod access_tests {
 
         assert_eq!(
             output_http_status(
-                ctx.dispatch_with_input(
+                ctx.dispatch_resolved_with_input(
                     auth_msg("create", "/b/llm/api/config", "u-not-admin"),
                     override_body("someone-elses-thread"),
                 )
@@ -1371,7 +1371,7 @@ mod access_tests {
         let ctx = ctx().await;
 
         let created = output_json(
-            ctx.dispatch_with_input(
+            ctx.dispatch_resolved_with_input(
                 admin_msg("create", "/b/llm/api/config"),
                 override_body("t1"),
             )
@@ -1382,7 +1382,7 @@ mod access_tests {
 
         assert_eq!(
             output_http_status(
-                ctx.dispatch(auth_msg(
+                ctx.dispatch_resolved(auth_msg(
                     "delete",
                     &format!("/b/llm/api/config/{id}"),
                     "u-not-admin",
@@ -1411,7 +1411,7 @@ mod access_tests {
         let ctx = ctx().await;
         assert_eq!(
             output_http_status(
-                ctx.dispatch(auth_msg("retrieve", "/b/llm/api/config", "u-not-admin"))
+                ctx.dispatch_resolved(auth_msg("retrieve", "/b/llm/api/config", "u-not-admin"))
                     .await
             )
             .await,

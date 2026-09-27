@@ -85,7 +85,7 @@ fn b64(bytes: &[u8]) -> String {
 /// component, and importing them was where it broke.
 async fn seed_shop(ctx: &TestContext) {
     let product = output_json(
-        ctx.dispatch_json(
+        ctx.dispatch_resolved_json(
             admin_msg("create", "/b/products/api/admin/products"),
             &json!({
                 "name": "Custom print",
@@ -107,7 +107,7 @@ async fn seed_shop(ctx: &TestContext) {
     // `tests/e2e/fixtures/shop-fixture.ts` uses — a flat price would exercise
     // neither `offer_components` nor the typed-variable columns.
     let offer = output_json(
-        ctx.dispatch_json(
+        ctx.dispatch_resolved_json(
             admin_msg(
                 "create",
                 &format!("/b/products/api/admin/products/{product_id}/offers"),
@@ -142,7 +142,7 @@ async fn seed_shop(ctx: &TestContext) {
         .to_string();
 
     let published = output_json(
-        ctx.dispatch_json(
+        ctx.dispatch_resolved_json(
             admin_msg(
                 "create",
                 &format!("/b/products/api/admin/products/{product_id}/offers/{offer_id}/publish"),
@@ -155,7 +155,7 @@ async fn seed_shop(ctx: &TestContext) {
     assert_eq!(published["status"], "active", "{published}");
 
     let live = output_json(
-        ctx.dispatch_json(
+        ctx.dispatch_resolved_json(
             admin_msg(
                 "update",
                 &format!("/b/products/api/admin/products/{product_id}"),
@@ -267,7 +267,7 @@ async fn export_zip_contains_shell_seed_sources_and_data_with_dev_off() {
     // not as a `resp.header.*` entry.
     assert_eq!(
         output_http_header(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await,
             "content-type"
         )
@@ -276,7 +276,7 @@ async fn export_zip_contains_shell_seed_sources_and_data_with_dev_off() {
         Some("application/zip")
     );
     assert!(output_http_header(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
         "content-disposition"
     )
@@ -285,7 +285,7 @@ async fn export_zip_contains_shell_seed_sources_and_data_with_dev_off() {
     .starts_with("attachment; filename=\"impresspress-site-"));
 
     let declared: u64 = output_http_header(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
         "X-Export-Bytes",
     )
@@ -294,7 +294,7 @@ async fn export_zip_contains_shell_seed_sources_and_data_with_dev_off() {
     .parse()
     .expect("a byte count");
     let bytes = output_body(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
     )
     .await;
@@ -417,7 +417,7 @@ async fn the_compiler_tree_and_the_deployments_own_seed_are_never_copied() {
     .await;
 
     let bytes = output_body(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
     )
     .await;
@@ -456,7 +456,7 @@ async fn a_shell_whose_sw_js_has_no_dev_marker_is_refused() {
     .await;
 
     let status = output_http_status(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
     )
     .await;
@@ -481,7 +481,7 @@ async fn a_shell_that_cannot_be_listed_is_refused() {
     .await;
 
     let status = output_http_status(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
     )
     .await;
@@ -502,12 +502,12 @@ async fn two_exports_of_the_same_generation_are_identical() {
     let control = FakeControl::new();
     let ctx = shop_instance(&control).await;
     let first = output_body(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
     )
     .await;
     let second = output_body(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
             .await,
     )
     .await;
@@ -525,13 +525,13 @@ async fn the_readme_is_dated_by_the_generation_not_the_download() {
     let ctx = shop_instance(&control).await;
     let archive = entries(
         output_body(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await,
         )
         .await,
     );
     let status = output_json(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/status"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/status"))
             .await,
     )
     .await;
@@ -556,7 +556,7 @@ async fn the_exported_sw_drops_the_compiler_bypass_and_keeps_the_seed_one() {
     let ctx = shop_instance(&control).await;
     let archive = entries(
         output_body(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await,
         )
         .await,
@@ -604,7 +604,7 @@ async fn a_shell_with_no_compiler_bypass_is_exported_unchanged() {
 
     let archive = entries(
         output_body(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await,
         )
         .await,
@@ -635,7 +635,7 @@ async fn the_readme_says_whether_each_blocks_sources_match_its_artifact() {
     // guess in either direction.
     let archive = entries(
         output_body(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await,
         )
         .await,
@@ -676,7 +676,7 @@ async fn a_recorded_source_digest_is_compared_against_the_workspace() {
     // builds it. Restated here rather than reached for, because the whole
     // point of the check is that two independent computations of it agree.
     let listed = output_json(
-        ctx.dispatch({
+        ctx.dispatch_resolved({
             let mut msg = admin_msg("retrieve", "/b/dev/api/files");
             msg.set_meta("req.query.prefix", "blocks/hello/");
             msg
@@ -723,7 +723,7 @@ async fn a_recorded_source_digest_is_compared_against_the_workspace() {
     let readme = text(
         &entries(
             output_body(
-                ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                     .await,
             )
             .await,
@@ -760,7 +760,7 @@ async fn a_recorded_source_digest_is_compared_against_the_workspace() {
     let readme = text(
         &entries(
             output_body(
-                ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+                ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                     .await,
             )
             .await,
@@ -790,7 +790,7 @@ async fn export_manifest_previews_the_archive_without_building_it() {
     .await;
 
     let m = output_json(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export/manifest"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export/manifest"))
             .await,
     )
     .await;
@@ -814,7 +814,7 @@ async fn the_manifest_describes_the_archive_entry_for_entry() {
 
     let manifest: ExportManifest = serde_json::from_value(
         output_json(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export/manifest"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export/manifest"))
                 .await,
         )
         .await,
@@ -822,7 +822,7 @@ async fn the_manifest_describes_the_archive_entry_for_entry() {
     .expect("an ExportManifest");
     let entries = entries(
         output_body(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await,
         )
         .await,
@@ -860,7 +860,7 @@ async fn exporting_a_fresh_instance_is_refused() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     assert_eq!(
         output_http_status(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
                 .await
         )
         .await,
@@ -868,7 +868,7 @@ async fn exporting_a_fresh_instance_is_refused() {
     );
     assert_eq!(
         output_http_status(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/export/manifest"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export/manifest"))
                 .await
         )
         .await,
@@ -897,14 +897,14 @@ async fn a_blob_freed_mid_export_is_a_named_refusal_rather_than_a_500() {
         .expect("free the blob the site manifest names");
 
     let out = ctx
-        .dispatch(admin_msg("retrieve", "/b/dev/api/export"))
+        .dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export"))
         .await;
     assert_eq!(output_http_status(out).await, 409);
 
     // The same answer on the manifest endpoint, and on the non-HTTP callers:
     // one wording, so an agent that retries on one retries on the other.
     let out = ctx
-        .dispatch(admin_msg("retrieve", "/b/dev/api/export/manifest"))
+        .dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export/manifest"))
         .await;
     assert_eq!(output_http_status(out).await, 409);
     let error = impresspress_core::blocks::dev::export::build(&ctx, ctx.dev_shared().as_ref())
@@ -923,7 +923,7 @@ async fn the_export_routes_are_admin_only() {
     let control = FakeControl::new();
     let ctx = shop_instance(&control).await;
     for path in ["/b/dev/api/export", "/b/dev/api/export/manifest"] {
-        let status = output_http_status(ctx.dispatch(anon_msg("retrieve", path)).await).await;
+        let status = output_http_status(ctx.dispatch_resolved(anon_msg("retrieve", path)).await).await;
         assert!(
             status == 401 || status == 403,
             "{path} answered an anonymous caller with {status}"
@@ -943,7 +943,7 @@ async fn an_exported_seed_imports_into_a_fresh_instance() {
     let a_control = FakeControl::new();
     let a = shop_instance(&a_control).await;
     let archive =
-        entries(output_body(a.dispatch(admin_msg("retrieve", "/b/dev/api/export")).await).await);
+        entries(output_body(a.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export")).await).await);
 
     let manifest: SeedManifest =
         serde_json::from_slice(&archive["seed/manifest.json"]).expect("a seed manifest");
@@ -1103,7 +1103,7 @@ async fn a_data_snapshot_over_the_import_limit_is_refused_at_export_and_one_at_i
 
     // At the limit: exported, and imported by a fresh instance.
     let archive =
-        entries(output_body(a.dispatch(admin_msg("retrieve", "/b/dev/api/export")).await).await);
+        entries(output_body(a.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/export")).await).await);
     let manifest: SeedManifest =
         serde_json::from_slice(&archive["seed/manifest.json"]).expect("a seed manifest");
     let b_control = FakeControl::new();
@@ -1130,7 +1130,7 @@ async fn a_data_snapshot_over_the_import_limit_is_refused_at_export_and_one_at_i
         let before = a.storage_reads().len();
         let shell_before = a_shell.fetches();
         let refused = wafer_block::http_codec::collect_http_response(
-            a.dispatch(admin_msg("retrieve", path)).await,
+            a.dispatch_resolved(admin_msg("retrieve", path)).await,
         )
         .await;
         // Refused before the runtime or any stored content was read: the

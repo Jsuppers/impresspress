@@ -114,7 +114,7 @@ async fn active_generation_ctx(rebuilds: u64) -> (TestContext, String) {
 async fn status_reports_no_generation_on_a_fresh_instance() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let out = ctx
-        .dispatch(admin_msg("retrieve", "/b/dev/api/status"))
+        .dispatch_resolved(admin_msg("retrieve", "/b/dev/api/status"))
         .await;
     assert_eq!(output_status(out).await, 200);
 
@@ -227,7 +227,7 @@ async fn status_is_admin_only() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     assert_eq!(
         output_http_status(
-            ctx.dispatch(anon_msg("retrieve", "/b/dev/api/status"))
+            ctx.dispatch_resolved(anon_msg("retrieve", "/b/dev/api/status"))
                 .await
         )
         .await,
@@ -235,7 +235,7 @@ async fn status_is_admin_only() {
     );
     assert_eq!(
         output_http_status(
-            ctx.dispatch(auth_msg("retrieve", "/b/dev/api/status", "u1"))
+            ctx.dispatch_resolved(auth_msg("retrieve", "/b/dev/api/status", "u1"))
                 .await
         )
         .await,
@@ -255,13 +255,13 @@ async fn every_response_is_never_cached() {
     // header claim cannot be satisfied by an unexpected response shape.
     for (path, expected_status) in [("/b/dev/api/status", 200), ("/b/dev/nope", 404)] {
         assert_eq!(
-            output_http_status(ctx.dispatch(admin_msg("retrieve", path)).await).await,
+            output_http_status(ctx.dispatch_resolved(admin_msg("retrieve", path)).await).await,
             expected_status,
             "{path}"
         );
         assert_eq!(
             output_http_header(
-                ctx.dispatch(admin_msg("retrieve", path)).await,
+                ctx.dispatch_resolved(admin_msg("retrieve", path)).await,
                 "Cache-Control"
             )
             .await

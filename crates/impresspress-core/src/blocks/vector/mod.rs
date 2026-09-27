@@ -377,7 +377,7 @@ mod access_tests {
             let path = concrete_path(row.template);
             let action = action_for_method(row.method);
             assert_eq!(
-                output_http_status(ctx.dispatch(auth_msg(action, &path, "u-not-admin")).await)
+                output_http_status(ctx.dispatch_resolved(auth_msg(action, &path, "u-not-admin")).await)
                     .await,
                 403,
                 "{action} {path} must not be reachable by a logged-in non-admin"
@@ -394,7 +394,7 @@ mod access_tests {
         let ctx = ctx().await;
         for path in ["/b/vector/api/indexes", "/b/vector/api/stats"] {
             assert_eq!(
-                output_http_status(ctx.dispatch(admin_msg("retrieve", path)).await).await,
+                output_http_status(ctx.dispatch_resolved(admin_msg("retrieve", path)).await).await,
                 200,
                 "{path} must still serve an admin"
             );

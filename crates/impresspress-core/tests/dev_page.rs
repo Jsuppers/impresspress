@@ -43,7 +43,7 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
     // `/b/dev` route), so this is the same 302 any admin page answers.
     assert_eq!(
         output_http_status(
-            ctx.dispatch(navigation(anon_msg("retrieve", "/b/dev")))
+            ctx.dispatch_resolved(navigation(anon_msg("retrieve", "/b/dev")))
                 .await
         )
         .await,
@@ -52,7 +52,7 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
     // Signed in but not an admin is a genuine refusal, not a login problem.
     assert_eq!(
         output_http_status(
-            ctx.dispatch(navigation(auth_msg("retrieve", "/b/dev", "u1")))
+            ctx.dispatch_resolved(navigation(auth_msg("retrieve", "/b/dev", "u1")))
                 .await
         )
         .await,
@@ -67,7 +67,7 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
         ("cache-control", "no-store"),
     ] {
         assert_eq!(
-            output_http_header(ctx.dispatch(admin_msg("retrieve", "/b/dev")).await, header)
+            output_http_header(ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev")).await, header)
                 .await
                 .as_deref(),
             Some(expected),
@@ -75,7 +75,7 @@ async fn dev_page_is_admin_only_cross_origin_isolated_and_uncached() {
         );
     }
 
-    let html = output_html(ctx.dispatch(admin_msg("retrieve", "/b/dev")).await).await;
+    let html = output_html(ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev")).await).await;
     for id in [
         "dev-guide",
         "dev-files",
@@ -122,7 +122,7 @@ async fn other_pages_are_not_cross_origin_isolated() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     assert_eq!(
         output_http_header(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/api/status"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/status"))
                 .await,
             "cross-origin-opener-policy"
         )
@@ -151,18 +151,18 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
         ),
     ] {
         assert_eq!(
-            output_http_status(ctx.dispatch(anon_msg("retrieve", path)).await).await,
+            output_http_status(ctx.dispatch_resolved(anon_msg("retrieve", path)).await).await,
             403,
             "{path} must be admin-only like the page it belongs to"
         );
         assert_eq!(
-            output_http_status(ctx.dispatch(admin_msg("retrieve", path)).await).await,
+            output_http_status(ctx.dispatch_resolved(admin_msg("retrieve", path)).await).await,
             200,
             "{path}"
         );
         assert_eq!(
             output_http_header(
-                ctx.dispatch(admin_msg("retrieve", path)).await,
+                ctx.dispatch_resolved(admin_msg("retrieve", path)).await,
                 "content-type"
             )
             .await
@@ -176,7 +176,7 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
         // rebuild the way the hashed `/b/static/*` bundle is.
         assert_eq!(
             output_http_header(
-                ctx.dispatch(admin_msg("retrieve", path)).await,
+                ctx.dispatch_resolved(admin_msg("retrieve", path)).await,
                 "cache-control"
             )
             .await
@@ -188,7 +188,7 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
 
     assert_eq!(
         output_html(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/static/dev.js"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/static/dev.js"))
                 .await
         )
         .await,
@@ -196,7 +196,7 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
     );
     assert_eq!(
         output_html(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/static/dev.css"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/static/dev.css"))
                 .await
         )
         .await,
@@ -204,7 +204,7 @@ async fn the_page_assets_are_served_admin_only_and_revalidated() {
     );
     assert_eq!(
         output_html(
-            ctx.dispatch(admin_msg("retrieve", "/b/dev/static/compiler-adapter.js"))
+            ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/static/compiler-adapter.js"))
                 .await
         )
         .await,
@@ -225,7 +225,7 @@ async fn the_page_assets_answer_conditional_get() {
     ] {
         let etag = format!("\"{hash}\"");
         assert_eq!(
-            output_http_header(ctx.dispatch(admin_msg("retrieve", path)).await, "etag")
+            output_http_header(ctx.dispatch_resolved(admin_msg("retrieve", path)).await, "etag")
                 .await
                 .as_deref(),
             Some(etag.as_str()),
@@ -235,14 +235,14 @@ async fn the_page_assets_answer_conditional_get() {
         let mut fresh = admin_msg("retrieve", path);
         fresh.set_meta("http.header.if-none-match", &etag);
         assert_eq!(
-            output_http_status(ctx.dispatch(fresh).await).await,
+            output_http_status(ctx.dispatch_resolved(fresh).await).await,
             304,
             "{path}: a matching If-None-Match must produce a 304"
         );
         let mut fresh_body = admin_msg("retrieve", path);
         fresh_body.set_meta("http.header.if-none-match", &etag);
         assert_eq!(
-            output_html(ctx.dispatch(fresh_body).await).await,
+            output_html(ctx.dispatch_resolved(fresh_body).await).await,
             "",
             "{path}: a 304 must carry no body"
         );
@@ -250,7 +250,7 @@ async fn the_page_assets_answer_conditional_get() {
         let mut stale = admin_msg("retrieve", path);
         stale.set_meta("http.header.if-none-match", "\"not-the-current-hash\"");
         assert_eq!(
-            output_http_status(ctx.dispatch(stale).await).await,
+            output_http_status(ctx.dispatch_resolved(stale).await).await,
             200,
             "{path}: a mismatching If-None-Match must fall through to the full response"
         );

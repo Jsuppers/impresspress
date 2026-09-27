@@ -835,7 +835,7 @@ async fn removing_a_block_rebuilds_without_it_and_keeps_its_source() {
     // query would match no route template.
     let mut list = admin_msg("retrieve", "/b/dev/api/files");
     list.set_meta("req.query.prefix", "blocks/hello/");
-    let l = output_json(ctx.dispatch(list).await).await;
+    let l = output_json(ctx.dispatch_resolved(list).await).await;
     assert_eq!(l["files"].as_array().expect("files").len(), 1);
 
     let status = dev_status(&ctx).await;
@@ -896,7 +896,7 @@ async fn the_staging_and_removal_routes_are_admin_only() {
 
     for path in ["/b/dev/api/builds/stage", "/b/dev/api/blocks/hello/remove"] {
         let out = ctx
-            .dispatch_json(anon_msg("create", path), &json!({}))
+            .dispatch_resolved_json(anon_msg("create", path), &json!({}))
             .await;
         let status = impresspress_core::test_support::output_http_status(out).await;
         assert!(
