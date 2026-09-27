@@ -504,7 +504,7 @@ mod tests {
                 Rc::new(|_| (500, "internal error".into()))
             }),
             ("an unreadable answer", || {
-                Rc::new(|_| (200, "<html>maintenance</html>".into()))
+                Rc::new(|_| (200, "Service temporarily unavailable (maintenance)".into()))
             }),
             ("a newer protocol only", || {
                 Rc::new(|_| {

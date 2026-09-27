@@ -436,6 +436,6 @@ mod tests {
         // trusted, even one that says "verified".
         unavailable_err(at(PROTOCOL_VERSION + 1, Outcome::Verified).into_verify());
         unavailable_err(at(0, Outcome::Verified).into_verify());
-        unavailable_err(Response::from_body(b"<html>").map(drop));
+        unavailable_err(Response::from_body(b"not json").map(drop));
     }
 }
