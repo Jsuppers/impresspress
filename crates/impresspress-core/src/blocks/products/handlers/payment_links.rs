@@ -24,6 +24,27 @@ fn preset_id(msg: &Message) -> Result<&str, OutputStream> {
     crud::path_var(msg, "preset_id", "Missing preset ID")
 }
 
+/// What a failed preset create or update answers.
+///
+/// Migration 005's `impresspress__products__checkout_presets_slug_uniq` —
+/// `(offer_id, slug)`, partial on `slug <> ''` — is the presets table's one
+/// caller-chosen unique key, and both writes set the request's slug on the
+/// offer the route names. So a refused duplicate is that slug being taken on
+/// this offer; a request with an empty slug cannot collide at all.
+fn preset_write_error(
+    error: wafer_run::WaferError,
+    request: &CheckoutPresetRequest,
+) -> OutputStream {
+    if request.slug.is_empty() {
+        return offers::domain_error(error);
+    }
+    crud::taken_key_or(
+        error,
+        crud::TakenKey::new("checkout preset", "slug", &request.slug),
+        offers::domain_error,
+    )
+}
+
 /// The `{link_id}` segment, or the 400 an unbound segment turns into.
 fn link_id(msg: &Message) -> Result<&str, OutputStream> {
     crud::path_var(msg, "link_id", "Missing payment link ID")
@@ -106,7 +127,7 @@ pub(super) async fn create_preset(
     };
     match checkout_presets::create(ctx, offer_id, msg.user_id(), &request).await {
         Ok(preset) => ok_json(&preset),
-        Err(error) => offers::domain_error(error),
+        Err(error) => preset_write_error(error, &request),
     }
 }
 
@@ -130,7 +151,7 @@ pub(super) async fn update_preset(
     };
     match checkout_presets::update(ctx, offer_id, preset_id, &request).await {
         Ok(preset) => ok_json(&preset),
-        Err(error) => offers::domain_error(error),
+        Err(error) => preset_write_error(error, &request),
     }
 }
 

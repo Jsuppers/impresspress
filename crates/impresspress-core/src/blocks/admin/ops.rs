@@ -49,7 +49,7 @@ use crate::{
             bump_auth_version,
             repo::users::{self, AdminUserPatch, UserRow},
         },
-        crud::{db_error, db_error_internal, taken_key_or_db_error},
+        crud::{db_error, db_error_internal, taken_key_or_db_error, TakenKey},
     },
     http::{err_bad_request, err_forbidden},
     platform_state::{
@@ -291,9 +291,7 @@ pub(super) async fn create_role(
         Err(e) => {
             return Err(taken_key_or_db_error(
                 e,
-                &format!(
-                    "A role named \"{name}\" already exists. Edit that role, or pick another name."
-                ),
+                TakenKey::new("role", "name", name),
                 "Database error",
             ))
         }
@@ -1044,10 +1042,7 @@ pub(super) async fn create_variable(
         Err(e) => {
             return Err(taken_key_or_db_error(
                 e,
-                &format!(
-                    "A variable named \"{key}\" already exists. Edit that variable, or pick \
-                     another key."
-                ),
+                TakenKey::new("variable", "key", key),
                 "Database error",
             ))
         }

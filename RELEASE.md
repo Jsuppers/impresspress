@@ -860,7 +860,8 @@ therefore create a bucket under a name someone else already held — every
 backend's `create_folder` is idempotent, so nothing refused it — and the row
 they got granted them read, overwrite and delete access to the first owner's
 objects. Bucket names are now unique, and creating one that is taken answers
-`409` with "A bucket named … already exists."
+`409` with "A bucket with the name "…" already exists. Choose a different
+name."
 
 **The repair.** Migration `002_bucket_name_unique` deletes duplicate bucket rows
 before creating the index, keeping the **earliest** row for each name (by
@@ -1739,6 +1740,22 @@ changed migration on the first boot of the bundle that carries it (see
 "Browser: migrations run once per change" above), so the repair and the index
 land there too. The role-delete revocation and the assign-endpoint check do
 not depend on the index and apply everywhere.
+
+### API: a duplicate names the field that is taken
+
+**What changes.** A write refused because a unique value is taken still answers
+`409` with `"error":"AlreadyExists"`, but its `message` now names the record,
+the field and the value in one wording on every route: `A <record> with the
+<field> "<value>" already exists. Choose a different <field>.` Routes that
+used to say only "A record with the same key already exists" — LLM provider
+create and update (`name`), product create and update on both the admin and
+the seller API (`slug`), checkout preset create and update (`slug`), and
+ticket type create (`key`) — now say which value is taken; roles,
+permissions, variables and buckets, which already named it, now use the same
+sentence. Restoring a product whose slug another live product took says so
+the same way, followed by "Rename or delete that product, then restore this
+one." A client that matched on the old message text must match on the `409`
+status or the `AlreadyExists` code instead.
 
 ## The release workflow has never produced a release
 

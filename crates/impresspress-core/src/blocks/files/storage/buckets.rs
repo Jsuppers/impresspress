@@ -87,10 +87,7 @@ pub(in crate::blocks::files) async fn handle_create_bucket(
         Err(e) => {
             return crud::taken_key_or_db_error(
                 e,
-                &format!(
-                    "A bucket named \"{}\" already exists. Pick another name.",
-                    body.name
-                ),
+                crud::TakenKey::new("bucket", "name", &body.name),
                 "Failed to create bucket",
             )
         }
@@ -278,6 +275,22 @@ mod integration_tests {
             output_http_status(taken).await,
             409,
             "a bucket name someone else holds is a conflict, not a second owner",
+        );
+        let told = crate::test_support::output_http_json(
+            handle_create_bucket(
+                &ctx,
+                &create_bucket_msg("mallory"),
+                create_bucket_body("assets", false),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            told["message"],
+            serde_json::json!(
+                "A bucket with the name \"assets\" already exists. Choose a different name."
+            ),
+            "the refusal names the field and the value, and nothing of the schema",
         );
         assert!(
             repo::buckets::find_owned(&ctx, "assets", "mallory")

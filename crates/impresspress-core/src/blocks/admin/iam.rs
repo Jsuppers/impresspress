@@ -166,10 +166,7 @@ pub(super) async fn handle_update_role(
             Some(new_name) => {
                 return crud::taken_key_or_db_error(
                     e,
-                    &format!(
-                        "A role named \"{new_name}\" already exists. Rename this role to \
-                         another name."
-                    ),
+                    crud::TakenKey::new("role", "name", new_name),
                     "Database error",
                 )
             }
@@ -437,11 +434,7 @@ pub(super) async fn handle_create_permission(
         // `crud::db_error_internal` inside the helper takes care of.
         Err(e) => crate::blocks::crud::taken_key_or_db_error(
             e,
-            &format!(
-                "A permission named \"{}\" already exists. Edit that permission, or pick \
-                     another name.",
-                body.name
-            ),
+            crate::blocks::crud::TakenKey::new("permission", "name", &body.name),
             "Database error",
         ),
     }

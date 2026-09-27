@@ -567,10 +567,10 @@ pub fn server_error_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
 }
 
 /// A refusal a page's read met, as [`crate::blocks::crud::db_error_page`]
-/// classified it: the 403 a WRAP denial becomes, the 429 a quota keeps and
-/// the database statement budget's refusal (which says reloading will not
-/// help), as a styled page for a browser and as the refusal itself for an
-/// API caller.
+/// classified it: the 403 a WRAP denial becomes, the 429 a quota keeps, the
+/// database statement budget's refusal (which says reloading will not help)
+/// and the 409 a duplicate key is, as a styled page for a browser and as the
+/// refusal itself for an API caller.
 ///
 /// It takes a [`crate::blocks::crud::Refusal`], which only
 /// [`crate::blocks::crud::classify_db_error`] builds, because the API branch
@@ -623,6 +623,15 @@ pub fn refused_response(
             "429",
             "Too many requests",
             "This page is over its usage limit right now. Please try again later.",
+            ("Go home", "/"),
+        ),
+        wafer_run::ErrorCode::AlreadyExists => status_response(
+            409,
+            "Conflict",
+            "409",
+            "Already exists",
+            "This page tried to write an entry that already exists, so reloading it will not \
+             help. Please let the site administrator know.",
             ("Go home", "/"),
         ),
         _ => wafer_run::OutputStream::error(error),
@@ -821,6 +830,59 @@ mod tests {
             auth_headline: String::new(),
             auth_tagline: String::new(),
         }
+    }
+
+    /// A duplicate key a page's read met is the styled 409 page for a
+    /// browser, in the same shape as the 403 and 429 refusal pages, and the
+    /// sanitized 409 JSON for an API caller. Neither carries the driver's
+    /// text, which names the table and the column.
+    #[tokio::test]
+    async fn a_duplicate_on_a_page_is_the_styled_409() {
+        let driver = || {
+            wafer_run::WaferError::new(
+                wafer_run::ErrorCode::AlreadyExists,
+                "UNIQUE constraint failed: impresspress__admin__roles.name",
+            )
+        };
+        let request = |accept: &str| {
+            let mut msg = Message::new("http.request");
+            msg.set_meta("http.header.accept", accept);
+            msg
+        };
+
+        let page = wafer_block::http_codec::collect_http_response(
+            crate::blocks::crud::db_error_page(&request("text/html"), driver(), "test page"),
+        )
+        .await;
+        let html = String::from_utf8_lossy(&page.body);
+        assert_eq!(page.status, 409, "{html}");
+        let content_type = page
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or_default();
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        assert!(
+            html.contains("Already exists") && html.contains("Go home"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("impresspress__admin"),
+            "schema leaked: {html}"
+        );
+
+        let api = wafer_block::http_codec::collect_http_response(
+            crate::blocks::crud::db_error_page(&request("application/json"), driver(), "test page"),
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&api.body).unwrap_or_default();
+        assert_eq!(api.status, 409, "{json}");
+        assert_eq!(
+            json["message"],
+            serde_json::json!(crate::blocks::crud::DUPLICATE_KEY),
+            "{json}"
+        );
     }
 
     /// A toast travels in the `HX-Trigger` header, and the HTTP codec answers

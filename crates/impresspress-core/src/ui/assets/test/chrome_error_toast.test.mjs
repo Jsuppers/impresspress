@@ -45,14 +45,14 @@ test('a 409 surfaces the message the server wrote, as an error toast', () => {
     status: 409,
     responseText: envelope(
       'AlreadyExists',
-      'A variable named "SITE_MOTTO" already exists. Edit that variable, or pick another key.'
+      'A variable with the key "SITE_MOTTO" already exists. Choose a different key.'
     )
   });
 
   assert.deepEqual(page.toasts(), [
     {
       kind: 'error',
-      text: 'A variable named "SITE_MOTTO" already exists. Edit that variable, or pick another key.'
+      text: 'A variable with the key "SITE_MOTTO" already exists. Choose a different key.'
     }
   ]);
 });
@@ -153,16 +153,16 @@ test('a retry the OPERATOR asked for is never suppressed', () => {
   // repeat a person asked for is a new fact; only the page repeating itself is
   // noise.
   const page = loadChrome();
-  const refused = envelope('AlreadyExists', 'A variable named "SITE_MOTTO" already exists.');
+  const refused = envelope('AlreadyExists', 'A variable with the key "SITE_MOTTO" already exists.');
   for (let i = 0; i < 3; i += 1) {
     page.respondWithError({ status: 409, responseText: refused }, { user: true });
     page.advance(3000);
   }
 
   assert.deepEqual(page.toasts(), [
-    { kind: 'error', text: 'A variable named "SITE_MOTTO" already exists.' },
-    { kind: 'error', text: 'A variable named "SITE_MOTTO" already exists.' },
-    { kind: 'error', text: 'A variable named "SITE_MOTTO" already exists.' }
+    { kind: 'error', text: 'A variable with the key "SITE_MOTTO" already exists.' },
+    { kind: 'error', text: 'A variable with the key "SITE_MOTTO" already exists.' },
+    { kind: 'error', text: 'A variable with the key "SITE_MOTTO" already exists.' }
   ]);
 });
 

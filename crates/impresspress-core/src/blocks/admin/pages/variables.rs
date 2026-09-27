@@ -2449,9 +2449,10 @@ mod create_form_tests {
         let body = crate::test_support::output_http_json(refused().await).await;
         assert_eq!(body["error"], serde_json::json!("AlreadyExists"));
         let message = body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("SITE_MOTTO") && message.contains("already exists"),
-            "the toast has only this to show the operator: {message:?}",
+        assert_eq!(
+            message,
+            "A variable with the key \"SITE_MOTTO\" already exists. Choose a different key.",
+            "the toast has only this to show the operator",
         );
     }
 
