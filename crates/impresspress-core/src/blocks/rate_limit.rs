@@ -314,7 +314,7 @@ pub enum BackendCheckOutcome {
     Allowed(u32),
     /// Over the limit. Caller should return `Err(retry_after_secs)`.
     Limited(u64),
-    /// The upsert or the read-back against the D1 backend failed.
+    /// The counter's upsert against the D1 backend failed.
     /// Availability is preserved — the request is still allowed — but this
     /// is a distinct, logged decision, never an unlabeled `count = 0` allow.
     /// Regression target for the 2026-07-10 incident where a missing
@@ -327,12 +327,10 @@ pub enum BackendCheckOutcome {
 /// counter `auth::repo::rate_limits::windowed_increment` reported, without
 /// touching the backend itself.
 ///
-/// A failure of that call — the upsert or the read-back; its error names
-/// which — fails open for availability, but loudly: it emits a
+/// A failure of that call — the upsert, or an answer without the counter
+/// row — fails open for availability, but loudly: it emits a
 /// `tracing::warn!` and returns [`BackendCheckOutcome::FailedOpen`] instead
-/// of silently deriving `count = 0` from an empty/absent row set. An empty
-/// read-back is `Ok(0)`, which is a real "no requests in this window yet"
-/// and stays a normal allow.
+/// of silently deriving `count = 0` from an absent row.
 pub fn decide_rate_limit(
     count: Result<i64, WaferError>,
     key: &str,
@@ -982,9 +980,8 @@ mod tests {
     fn rate_limit_decision_is_explicit_when_the_backend_fails() {
         // Regression for the CF incident where a missing `rate_limits` table
         // left limiting silently inert for weeks. A backend failure — the
-        // upsert or the read-back; `windowed_increment`'s error names which —
-        // must be a logged, explicit fail-open, not an unlabeled count=0
-        // allow.
+        // upsert, or an answer without the counter row — must be a logged,
+        // explicit fail-open, not an unlabeled count=0 allow.
         let upsert = decide_rate_limit(
             Err(wafer_error("rate_limits windowed upsert: D1 down")),
             "k",
@@ -992,13 +989,15 @@ mod tests {
             60,
         );
         assert!(matches!(upsert, BackendCheckOutcome::FailedOpen { .. }));
-        let read_back = decide_rate_limit(
-            Err(wafer_error("rate_limits count read-back: D1 down")),
+        let no_row = decide_rate_limit(
+            Err(wafer_error(
+                "rate_limits windowed upsert answered no counter row: None",
+            )),
             "k",
             5,
             60,
         );
-        assert!(matches!(read_back, BackendCheckOutcome::FailedOpen { .. }));
+        assert!(matches!(no_row, BackendCheckOutcome::FailedOpen { .. }));
     }
 
     #[test]
@@ -1011,15 +1010,6 @@ mod tests {
     fn rate_limit_decision_limits_over_limit() {
         let outcome = decide_rate_limit(Ok(6), "k", 5, 60);
         assert_eq!(outcome, BackendCheckOutcome::Limited(60));
-    }
-
-    #[test]
-    fn rate_limit_decision_treats_a_zero_count_as_success_not_failure() {
-        // No row yet for this window (first request) is a legitimate empty
-        // result, which `windowed_increment` reports as `Ok(0)` — must stay a
-        // normal `Allowed`, not `FailedOpen`.
-        let outcome = decide_rate_limit(Ok(0), "k", 5, 60);
-        assert_eq!(outcome, BackendCheckOutcome::Allowed(5));
     }
 
     #[test]
