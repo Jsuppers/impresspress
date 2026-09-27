@@ -5845,3 +5845,121 @@ async fn seller_writes_onto_a_taken_slug_are_a_409_naming_the_slug() {
     );
     expect_widget_slug_taken(dispatch(&ctx, msg, input).await).await;
 }
+
+/// The message a write was refused with, or `None` if it was not refused
+/// as `InvalidArgument`.
+async fn invalid_argument_message(out: wafer_run::OutputStream) -> Option<String> {
+    use wafer_run::streams::output::TerminalNotResponse;
+    match out.collect_buffered().await {
+        Err(TerminalNotResponse::Error(e)) if e.code == ErrorCode::InvalidArgument => {
+            Some(e.message)
+        }
+        _ => None,
+    }
+}
+
+/// Every product create and update — admin and seller — holds a slug to
+/// the grammar the edit forms' `pattern` and `maxlength` state. Those are
+/// browser hints; the API is reachable without them, so the server has to
+/// refuse the same slugs, with a 400 that says why, and write nothing.
+#[tokio::test]
+async fn every_product_write_refuses_a_slug_outside_the_grammar() {
+    let ctx = user_products_ctx().await;
+    let bad = [
+        ("Has Spaces", "lowercase letters"),
+        ("UPPER", "lowercase letters"),
+        ("double--hyphen", "single hyphens"),
+        ("-leading", "single hyphens"),
+        ("trailing-", "single hyphens"),
+        ("caf\u{e9}", "lowercase letters"),
+        (&*"a".repeat(161), "at most 160"),
+    ];
+
+    let (create, create_input) = admin_create_msg(
+        "/b/products/api/admin/products",
+        serde_json::json!({ "name": "Admin", "slug": "admin-original" }),
+    );
+    let admin_id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .expect("admin create with a valid slug")
+        .to_string();
+    let (create, create_input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({ "name": "Seller", "slug": "seller-original" }),
+    );
+    let seller_id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .expect("seller create with a valid slug")
+        .to_string();
+
+    for (slug, says) in bad {
+        let body = serde_json::json!({ "name": "Refused", "slug": slug });
+        let writes = [
+            (
+                "admin create",
+                admin_create_msg("/b/products/api/admin/products", body.clone()),
+            ),
+            (
+                "seller create",
+                create_msg("/b/products/api/products", "user_1", body.clone()),
+            ),
+            ("admin update", {
+                let (mut msg, input) = request_msg(
+                    "update",
+                    &format!("/b/products/api/admin/products/{admin_id}"),
+                    "admin_1",
+                    body.clone(),
+                );
+                msg.set_meta("auth.user_roles", "admin");
+                (msg, input)
+            }),
+            (
+                "seller update",
+                update_msg(
+                    &format!("/b/products/api/products/{seller_id}"),
+                    "user_1",
+                    body.clone(),
+                ),
+            ),
+        ];
+        for (path, (msg, input)) in writes {
+            let message = invalid_argument_message(dispatch(&ctx, msg, input).await)
+                .await
+                .unwrap_or_else(|| panic!("{path} must refuse the slug {slug:?} with a 400"));
+            assert!(
+                message.contains("slug") && message.contains(says),
+                "{path}, slug {slug:?}: {message}"
+            );
+        }
+    }
+
+    for (id, slug) in [
+        (&admin_id, "admin-original"),
+        (&seller_id, "seller-original"),
+    ] {
+        let kept = super::super::repo::products::get(&ctx, id).await.unwrap();
+        assert_eq!(crate::util::RecordExt::str_field(&kept, "slug"), slug);
+        assert_ne!(
+            crate::util::RecordExt::str_field(&kept, "name"),
+            "Refused",
+            "a refused update must apply none of its fields"
+        );
+    }
+    let rows = super::super::repo::products::list_all_including_deleted(&ctx, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "a refused create must write no row");
+
+    // The bounds are inclusive, and empty means no web address.
+    let longest = "a".repeat(160);
+    for slug in [longest.as_str(), "a1-b2-c3", ""] {
+        let (msg, input) = update_msg(
+            &format!("/b/products/api/products/{seller_id}"),
+            "user_1",
+            serde_json::json!({ "slug": slug }),
+        );
+        let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(body["slug"], slug, "{slug:?} must be accepted: {body}");
+    }
+}

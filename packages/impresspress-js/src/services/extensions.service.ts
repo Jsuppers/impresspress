@@ -546,8 +546,8 @@ export interface GuestOrderStatus {
   status: string;
   reconciliation_status: string;
   amounts: MoneyBreakdown;
-  /** Absent for a one-time order. */
-  subscription_status?: SubscriptionStatus;
+  /** Absent for a one-time order rather than `""`. */
+  subscription_status?: Exclude<SubscriptionStatus, "">;
   subscription_current_period_end?: string;
   subscription_cancel_at_period_end: boolean;
   paid_at?: string;

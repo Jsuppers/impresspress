@@ -288,8 +288,27 @@ async fn create_product_row(
     repo::products::get(ctx, &created.id).await
 }
 
+/// A product write body: what [`read_write_body`] decodes and checks.
+trait ProductWriteBody: serde::de::DeserializeOwned {
+    fn check(&self) -> Result<(), String>;
+}
+
+impl ProductWriteBody for CreateProductRequest {
+    fn check(&self) -> Result<(), String> {
+        CreateProductRequest::check(self)
+    }
+}
+
+impl ProductWriteBody for UpdateProductRequest {
+    fn check(&self) -> Result<(), String> {
+        UpdateProductRequest::check(self)
+    }
+}
+
 /// Read a caller-supplied write body once, refuse it if it names an internal
-/// column, and only then project it onto the typed request `T`.
+/// column, and only then project it onto the typed request `T` and refuse it
+/// if a field breaks its rule (`T::check`: the slug grammar). Every admin and
+/// seller create and update reads its body here, so none skips the check.
 ///
 /// Both halves are load-bearing and neither subsumes the other. The typed
 /// request is what decides which columns a write may SET — an unsettable
@@ -305,9 +324,7 @@ async fn create_product_row(
 /// is inserted, for the reason given above `reject_unsettable_fields`:
 /// handlers that legitimately write one of these fields do so afterwards
 /// from their own computed value.
-async fn read_write_body<T: serde::de::DeserializeOwned>(
-    input: InputStream,
-) -> Result<T, OutputStream> {
+async fn read_write_body<T: ProductWriteBody>(input: InputStream) -> Result<T, OutputStream> {
     let raw = input
         .collect_to_bytes()
         .await
@@ -315,7 +332,12 @@ async fn read_write_body<T: serde::de::DeserializeOwned>(
     let named: HashMap<String, serde_json::Value> =
         serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
     reject_unsettable_fields(&named)?;
-    serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))
+    let request: T =
+        serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
+    request
+        .check()
+        .map_err(|message| err_bad_request(&message))?;
+    Ok(request)
 }
 
 /// Fetch a product and verify the caller may act on it ([`is_owned_by`]),

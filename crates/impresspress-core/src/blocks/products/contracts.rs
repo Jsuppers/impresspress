@@ -963,6 +963,23 @@ impl SubscriptionStatus {
         matches!(self, Self::Unset)
     }
 
+    /// Schema of a field that is omitted rather than sent as
+    /// [`Self::Unset`]: this type's own schema without the value `Unset`
+    /// serialises to, since that value never reaches the wire.
+    pub fn set_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let mut schema = <Self as schemars::JsonSchema>::json_schema(generator);
+        if let Some(values) = schema
+            .get_mut("enum")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            values.retain(|value| {
+                serde_json::from_value::<Self>(value.clone())
+                    .map_or(true, |status| !status.is_unset())
+            });
+        }
+        schema
+    }
+
     /// Whether the subscription can never become live again.
     ///
     /// Stripe issues a new subscription id for a resubscription, so a
@@ -1002,6 +1019,7 @@ pub struct GuestOrderStatus {
     pub amounts: MoneyBreakdown,
     /// Stripe subscription lifecycle state; absent for a one-time order.
     #[serde(default, skip_serializing_if = "SubscriptionStatus::is_unset")]
+    #[schemars(schema_with = "SubscriptionStatus::set_schema")]
     pub subscription_status: SubscriptionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
@@ -2104,6 +2122,39 @@ impl ProductListQuery {
     }
 }
 
+/// Longest product slug, in bytes. The wizard derives a slug from the name
+/// and cuts it to this length, and both edit forms cap their input at it.
+pub const PRODUCT_SLUG_MAX_LEN: usize = 160;
+
+/// The product slug grammar, as the published schema and the edit forms'
+/// `pattern` state it. The empty alternative is the column default: a
+/// product with no web address.
+pub const PRODUCT_SLUG_PATTERN: &str = "^(?:[a-z0-9]+(?:-[a-z0-9]+)*)?$";
+
+/// Refuse a product slug outside [`PRODUCT_SLUG_PATTERN`] or longer than
+/// [`PRODUCT_SLUG_MAX_LEN`], with the message the caller is shown.
+pub fn check_product_slug(slug: &str) -> Result<(), String> {
+    if slug.len() > PRODUCT_SLUG_MAX_LEN {
+        return Err(format!(
+            "slug must be at most {PRODUCT_SLUG_MAX_LEN} characters"
+        ));
+    }
+    let well_formed = slug.is_empty()
+        || slug.split('-').all(|run| {
+            !run.is_empty()
+                && run
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        });
+    if !well_formed {
+        return Err(
+            "slug may contain only lowercase letters, numbers, and single hyphens between them"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 // The write requests are closed field lists too, and that is the point: the
 // column-map path they replace wrote every key it was sent. On the seller
 // create path that included `seller_account_id`, `stripe_product_id`,
@@ -2121,7 +2172,10 @@ pub struct CreateProductRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Web address of the product: lowercase letters and digits in runs
+    /// joined by single hyphens, at most 160 characters. Empty means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = PRODUCT_SLUG_MAX_LEN), regex(pattern = PRODUCT_SLUG_PATTERN))]
     pub slug: Option<String>,
     /// ISO 4217 currency. A seller product defaults to the platform default
     /// currency when omitted.
@@ -2166,6 +2220,12 @@ impl CreateProductRequest {
     pub fn into_columns(self) -> HashMap<String, Value> {
         columns(&self)
     }
+
+    /// Refuse a request whose fields break a rule the column type cannot
+    /// state; the message names the field.
+    pub fn check(&self) -> Result<(), String> {
+        self.slug.as_deref().map_or(Ok(()), check_product_slug)
+    }
 }
 
 /// `PATCH /b/products/api/admin/products/{id}` and
@@ -2178,7 +2238,10 @@ pub struct UpdateProductRequest {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Web address of the product: lowercase letters and digits in runs
+    /// joined by single hyphens, at most 160 characters. Empty means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = PRODUCT_SLUG_MAX_LEN), regex(pattern = PRODUCT_SLUG_PATTERN))]
     pub slug: Option<String>,
     /// ISO 4217 currency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2218,6 +2281,12 @@ impl UpdateProductRequest {
     /// The columns this request writes: only the fields that were sent.
     pub fn into_columns(self) -> HashMap<String, Value> {
         columns(&self)
+    }
+
+    /// Refuse a request whose fields break a rule the column type cannot
+    /// state; the message names the field.
+    pub fn check(&self) -> Result<(), String> {
+        self.slug.as_deref().map_or(Ok(()), check_product_slug)
     }
 }
 
@@ -3720,5 +3789,49 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(condition, Condition::All { .. }));
+    }
+
+    /// The guest receipt omits `subscription_status` for a one-time order
+    /// rather than sending `""`, so its published enum lists every status
+    /// but that one: a client generated from the schema must not handle a
+    /// value the server never sends.
+    #[test]
+    fn guest_subscription_status_schema_omits_the_unset_value() {
+        use super::{GuestOrderStatus, SubscriptionStatus};
+
+        let schema = schemars::schema_for!(GuestOrderStatus);
+        let published = schema
+            .get("properties")
+            .and_then(|properties| properties.get("subscription_status"))
+            .and_then(|field| field.get("enum"))
+            .expect("subscription_status publishes an enum");
+        let sent: Vec<serde_json::Value> = SubscriptionStatus::ALL
+            .iter()
+            .filter(|status| !status.is_unset())
+            .map(|status| serde_json::to_value(status).unwrap())
+            .collect();
+        assert_eq!(published, &serde_json::Value::Array(sent));
+    }
+
+    #[test]
+    fn product_slug_grammar() {
+        use super::{check_product_slug, PRODUCT_SLUG_MAX_LEN};
+
+        for good in ["", "a", "a1-b2", "0", &"z".repeat(PRODUCT_SLUG_MAX_LEN)] {
+            assert_eq!(check_product_slug(good), Ok(()), "{good:?}");
+        }
+        for bad in [
+            "-",
+            "a-",
+            "-a",
+            "a--b",
+            "A",
+            "a b",
+            "a_b",
+            "caf\u{e9}",
+            &"z".repeat(PRODUCT_SLUG_MAX_LEN + 1),
+        ] {
+            assert!(check_product_slug(bad).is_err(), "{bad:?}");
+        }
     }
 }
