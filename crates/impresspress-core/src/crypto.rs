@@ -36,6 +36,25 @@ pub const META_AUTH_EXP: &str = "auth.exp";
 /// putting a family on the request itself.
 pub const META_AUTH_FAMILY: &str = "auth.family";
 
+/// [SEC-038] The canonical JWT `iss` value for this deployment: the issuer
+/// every token it mints carries, and the one [`verify_access_token`] is
+/// handed to reject any other.
+///
+/// `WAFER_RUN_SHARED__FRONTEND_URL` doubles as the issuer: it's the only
+/// per-deployment URL admins reliably set, and treating it as the issuer
+/// means a token minted in dev (`http://localhost:5173`) won't validate
+/// against a production secret if one leaks between environments.
+pub async fn expected_issuer(
+    ctx: &dyn wafer_run::context::Context,
+) -> Result<String, wafer_run::WaferError> {
+    wafer_core::clients::config::get_default(
+        ctx,
+        crate::config_vars::FRONTEND_URL_KEY,
+        "http://localhost:5173",
+    )
+    .await
+}
+
 /// The claims of a verified access token, in the shape both consumers need.
 ///
 /// Produced by [`verify_access_token`] and nowhere else: a value of this type

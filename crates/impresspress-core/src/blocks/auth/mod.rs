@@ -811,7 +811,7 @@ pub(crate) mod helpers {
     use super::*;
     use crate::{
         blocks::auth::config::{ALLOWED_EMAIL_DOMAINS_KEY, BOOTSTRAP_ADMIN_EMAIL_KEY},
-        config_vars::{ALLOW_SIGNUP_KEY, ENVIRONMENT_KEY, FRONTEND_URL_KEY},
+        config_vars::{ALLOW_SIGNUP_KEY, ENVIRONMENT_KEY},
     };
 
     /// Resolve `user_id`'s merged role set: the inline `users.role` (the
@@ -1138,7 +1138,7 @@ pub(crate) mod helpers {
         // reject tokens minted by a different deployment (e.g. a sibling
         // env's leaked secret) instead of trusting any signature with the
         // same HMAC key.
-        let issuer = expected_issuer(ctx)
+        let issuer = crate::crypto::expected_issuer(ctx)
             .await
             .map_err(wafer_run::OutputStream::error)?;
 
@@ -1233,18 +1233,6 @@ pub(crate) mod helpers {
                 .map_err(wafer_run::OutputStream::error)?;
 
         Ok((access_token, refresh_token, family))
-    }
-
-    /// [SEC-038] Resolve the canonical JWT `iss` value for this deployment.
-    ///
-    /// `WAFER_RUN_SHARED__FRONTEND_URL` doubles as the issuer: it's the only
-    /// per-deployment URL admins reliably set, and treating it as the issuer
-    /// means a token minted in dev (`http://localhost:5173`) won't validate
-    /// against a production secret if one leaks between environments.
-    pub(crate) async fn expected_issuer(
-        ctx: &dyn wafer_run::context::Context,
-    ) -> Result<String, WaferError> {
-        config_client::get_default(ctx, FRONTEND_URL_KEY, "http://localhost:5173").await
     }
 
     /// Persist a freshly minted refresh token.

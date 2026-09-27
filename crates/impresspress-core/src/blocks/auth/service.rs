@@ -212,7 +212,7 @@ enum Creds {
 /// to accept in a branch of its own was issued by nothing.
 ///
 /// The secret comes from the config snapshot (`ctx.config_get`, the pattern
-/// `csrf.rs` uses) and the issuer from `helpers::expected_issuer`, so this
+/// `csrf.rs` uses) and the issuer from `crypto::expected_issuer`, so this
 /// service applies exactly the deployment's own token policy — the same two
 /// values `pipeline.rs` passes to `extract_auth_meta`.
 async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthError> {
@@ -223,7 +223,7 @@ async fn extract_creds(ctx: &dyn Context, msg: &Message) -> Result<Creds, AuthEr
         .config_get(super::JWT_SECRET_KEY)
         .unwrap_or("")
         .to_string();
-    let expected_iss = super::helpers::expected_issuer(ctx)
+    let expected_iss = crate::crypto::expected_issuer(ctx)
         .await
         .map_err(|e| backend_error(e, "auth: read the token issuer"))?;
     // A check that could not be completed is already classified for the
