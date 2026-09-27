@@ -61,6 +61,9 @@ pub struct AccessClaims {
     /// `family` — the refresh-rotation family this login belongs to, or `""`
     /// on a token minted before the claim existed.
     pub family: String,
+    /// `auth_method` — how the session was established (`"password"`,
+    /// `"oauth.github"`, …), or `""` on a token that does not carry it.
+    pub auth_method: String,
 }
 
 /// Verify an access token: `Ok(Some(claims))` when it authenticates,
@@ -197,6 +200,11 @@ pub async fn verify_access_token(
         exp: claims.get("exp").and_then(|v| v.as_i64()),
         family: claims
             .get("family")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        auth_method: claims
+            .get("auth_method")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
@@ -361,6 +369,33 @@ mod tests {
             .expect("a freshly minted access token must verify");
         assert_eq!(claims.sub.as_deref(), Some("user-a"));
         assert_eq!(claims.jti, "jti-1");
+    }
+
+    /// The session's `auth_method` claim reaches the caller: a consumer that
+    /// gates on how the user signed in (an OAuth-only admin action) reads it
+    /// here rather than re-verifying the token itself.
+    #[tokio::test]
+    async fn verify_access_token_returns_the_auth_method() {
+        let ctx = crate::test_support::TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::router::ROUTER_BLOCK_ID);
+        let secret = "test-secret";
+        let token = sign_access_jwt_with(secret, |claims| {
+            claims.insert("sub".to_string(), serde_json::json!("user-a"));
+            claims.insert("auth_method".to_string(), serde_json::json!("oauth.github"));
+        });
+        let claims = verify_access_token(&ctx, &token, secret, "")
+            .await
+            .expect("the check completes")
+            .expect("the token verifies");
+        assert_eq!(claims.auth_method, "oauth.github");
+
+        let without = sign_access_jwt(secret, "user-a", None, 3600);
+        let claims = verify_access_token(&ctx, &without, secret, "")
+            .await
+            .expect("the check completes")
+            .expect("the token verifies");
+        assert_eq!(claims.auth_method, "");
     }
 
     #[tokio::test]
