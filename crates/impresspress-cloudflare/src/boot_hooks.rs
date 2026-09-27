@@ -437,9 +437,13 @@ mod boot_hook_tests {
             unreachable!()
         }
 
-        async fn upsert(&self, collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
+        async fn upsert(
+            &self,
+            collection: &str,
+            _spec: UpsertSpec,
+        ) -> Result<Option<Record>, DatabaseError> {
             self.note(format!("upsert {collection}"));
-            Ok(0)
+            Ok(None)
         }
 
         async fn aggregate(

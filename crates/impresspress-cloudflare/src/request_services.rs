@@ -566,7 +566,11 @@ impl DatabaseService for ScopedDatabaseService {
             .await
     }
 
-    async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        spec: UpsertSpec,
+    ) -> Result<Option<Record>, DatabaseError> {
         self.current()?.upsert(collection, spec).await
     }
 

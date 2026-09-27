@@ -542,8 +542,9 @@ impl DbExec for D1DatabaseService {
     /// It stays a distinct trait method rather than riding on `run_fetch`
     /// at the call site because the *contract* differs — a statement with
     /// side effects that also returns rows — and the shared
-    /// [`DbExec::take_where`] now routes through it: the day this adapter
-    /// grows read-replica routing, only this delegation changes.
+    /// [`DbExec::create`], [`DbExec::take_where`] and [`DbExec::upsert`]
+    /// route through it: the day this adapter grows read-replica routing,
+    /// only this delegation changes.
     async fn run_execute_returning(
         &self,
         sql: &str,
@@ -855,7 +856,11 @@ impl DatabaseService for D1DatabaseService {
         DbExec::increment_field_where(self, collection, col, delta, filters).await
     }
 
-    async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        spec: UpsertSpec,
+    ) -> Result<Option<Record>, DatabaseError> {
         DbExec::upsert(self, collection, spec).await
     }
 

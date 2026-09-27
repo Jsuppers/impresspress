@@ -472,7 +472,11 @@ impl DatabaseService for KvCachedD1DatabaseService {
         self.inner.take_where(collection, filters).await
     }
 
-    async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        spec: UpsertSpec,
+    ) -> Result<Option<Record>, DatabaseError> {
         if cache_key::classify_table(collection).is_some() {
             return Err(DatabaseError::Internal(format!(
                 "upsert not supported on cached table `{collection}` \
@@ -1068,7 +1072,11 @@ mod tests {
             unreachable!()
         }
 
-        async fn upsert(&self, _collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
+        async fn upsert(
+            &self,
+            _collection: &str,
+            _spec: UpsertSpec,
+        ) -> Result<Option<Record>, DatabaseError> {
             unreachable!()
         }
 

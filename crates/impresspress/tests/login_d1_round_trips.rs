@@ -487,39 +487,38 @@ async fn sign_in(site: &Site, email: &str, password: &str) -> Cost {
     }
 }
 
-/// A warm sign-in's response waits on five sequential D1 round trips, seven
-/// statements: the account by email and its credential (each a row read
-/// plus the `COUNT(*)` `db::get_by_field` sends with it, one `db.batch()`
-/// apiece), its role grants, the refresh-token row and the device-list row.
+/// A warm sign-in's response waits on five sequential D1 round trips, five
+/// statements: the account by email, its credential, its role grants, the
+/// refresh-token row and the device-list row. Each lookup is the one
+/// `SELECT … LIMIT 1` `db::get_by_field` sends, with no `COUNT(*)` beside it.
 /// The tokens' `auth_version` and inline role are the ones on the account row
 /// read first — the version must be read no later than the roles
 /// (`helpers::TokenGrant`), so the row is not read again for them.
 /// Everything else it writes — the last-login stamp, the retention throttle
 /// check, the audit row — runs after the response.
 ///
-/// On Cloudflare the sign-in route's rate limit adds two more before any of
-/// these (`auth::repo::rate_limits::windowed_increment`, an upsert and its
-/// read-back). That limiter is D1-backed only on wasm32; the native one this
-/// runtime uses keeps its counters in memory, so they are not counted here.
+/// On Cloudflare the sign-in route's rate limit adds one more before any of
+/// these (`auth::repo::rate_limits::windowed_increment`, one upsert that
+/// returns the counter). That limiter is D1-backed only on wasm32; the native
+/// one this runtime uses keeps its counters in memory, so it is not counted
+/// here.
 ///
-/// "Warm" is the third sign-in in the process: the first fills the caches a
-/// Worker isolate holds (schema facts, the config snapshot, the
-/// timing-equalization hash) and runs the hourly retention pass, and the
-/// id-policy probe of an insert-only table is kept only once some statement
-/// has shown the table exists, which the first sign-in's inserts do.
+/// "Warm" is the second sign-in in the process: the first fills the caches a
+/// Worker isolate holds (schema facts, including the id source of every table
+/// it creates into, the config snapshot, the timing-equalization hash) and
+/// runs the hourly retention pass.
 ///
 /// The counts fail on earlier code: the roles' two reads ran one after the
 /// other, a brand-new login family was first "touched" by an UPDATE that could
 /// match nothing, the retention throttle read and the last-login UPDATE ran
-/// before the response, and the users row was read twice more, for the roles
-/// and for the version.
+/// before the response, the users row was read twice more, for the roles
+/// and for the version, each lookup carried an unread `COUNT(*)`, and the
+/// second create into an insert-only table probed its id source again.
 #[tokio::test]
 async fn a_warm_sign_in_waits_on_five_round_trips() {
     let site = start().await;
-    for _ in 0..2 {
-        let cold = sign_in(&site, ADMIN_EMAIL, ADMIN_PASSWORD).await;
-        assert_eq!(cold.status, 200);
-    }
+    let cold = sign_in(&site, ADMIN_EMAIL, ADMIN_PASSWORD).await;
+    assert_eq!(cold.status, 200);
 
     let warm = sign_in(&site, ADMIN_EMAIL, ADMIN_PASSWORD).await;
     assert_eq!(warm.status, 200);
@@ -536,8 +535,23 @@ async fn a_warm_sign_in_waits_on_five_round_trips() {
     );
     assert_eq!(
         Cost::statements(&warm.response),
-        7,
+        5,
         "D1 statements before the response\n{trace}"
+    );
+    // A lookup is its `SELECT … LIMIT 1` alone: no total nothing reads.
+    assert!(
+        !warm.response.iter().any(|t| t.sql.contains("COUNT(*)")),
+        "a sign-in reads no totals\n{trace}"
+    );
+    // The first sign-in's creates cached every id source this one needs, the
+    // audit row's insert-only table included.
+    assert!(
+        !warm
+            .response
+            .iter()
+            .chain(&warm.after)
+            .any(|t| t.sql.contains("id_policy")),
+        "a warm sign-in probes no table's id source\n{trace}"
     );
 
     // The security reads stay on the response path, in order: the account
