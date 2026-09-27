@@ -84,10 +84,15 @@ the main Worker's `[vars]` as `IMPRESSPRESS_PASSWORD_HASHER_SHARDS`).
   two protocol versions ahead of the live main Worker makes every password
   operation on the live site answer 503 from the moment the hasher deploys
   until the new main Worker is promoted.
-- If the hasher cannot answer (missing binding, Durable Object error,
-  unreadable answer), the operation fails: a sign-in answers 503; a sign-up
-  or password change fails with a 500. The main Worker never hashes a
-  password itself instead.
+- If the hasher cannot answer (missing binding, Durable Object error or
+  non-200 status, an answer that does not parse or is in a protocol version
+  the main Worker does not speak), the operation fails with a retryable 503
+  "Authentication is temporarily unavailable": sign-in, sign-up, password
+  change, password reset and bootstrap-token redemption alike, and nothing is
+  written — a reset link or bootstrap token still works on the retry. If the
+  hasher answers readably but wrongly (a hash weaker than it is meant to
+  write, an outcome for another operation), a sign-in answers 503 and the
+  others a 500. The main Worker never hashes a password itself instead.
 - Each password operation adds a round trip to the Durable Object, about
   60-100 ms of wall time, on top of the hash itself. An instance runs one
   request at a time; shards spread a burst across instances.
@@ -97,8 +102,8 @@ the main Worker's `[vars]` as `IMPRESSPRESS_PASSWORD_HASHER_SHARDS`).
   request, and so is a failed sign-in for an unknown email: it burns a
   verification on purpose, so that it takes as long as a wrong password for
   a real account, and skipping the call would tell an attacker which emails
-  have accounts. Past either allowance, password operations fail (503 on
-  sign-in) until the reset. **The login rate limit does not protect this
+  have accounts. Past either allowance, password operations fail
+  with a 503 until the reset. **The login rate limit does not protect this
   allowance**: it is 30 requests a minute per IP (`WAFER_RUN_SHARED__RATE_LIMIT_AUTH`), about
   43,000 a day from one address, so three addresses can spend the whole
   day's allowance and lock every user out until 00:00 UTC. On a public
@@ -162,6 +167,33 @@ build refuses them in its `[vars]`. They are the hasher's:
   back in the main Worker, at the old cost and with the main Worker's own
   secrets: keep the pepper secrets on it until you no longer need that
   rollback.
+
+### wafer-run abecd3f3: a password hasher that is down is a 503
+
+**What changes.** Setting a password — sign-up, change-password,
+reset-password, bootstrap-token redemption — answers `503` "Authentication
+is temporarily unavailable" when the crypto service reports that the backend
+doing the hashing cannot be reached (`CryptoError::Unavailable`, which the
+crypto block answers `ErrorCode::Unavailable`). It was a sanitized `500`.
+Any other hashing failure is still a `500`; sign-in's `503` is unchanged.
+Nothing is written first, so a retry succeeds: the reset link is not spent,
+and a bootstrap token is now checked and the password hashed before the token
+is consumed, so an outage no longer burns it.
+
+- On Cloudflare the password-hasher Worker's client reports a missing
+  binding, a failed Durable Object call, a non-200 status, an unparseable
+  answer and a protocol-version mismatch as `Unavailable`. A readable answer
+  it must not act on (a hash weaker than the hasher writes, an outcome for
+  another operation, the hasher refusing to read the request) is a fault,
+  a `500` outside sign-in.
+- Native and browser hash in process and never report `Unavailable`, so
+  nothing changes there.
+- `CryptoError` gained the `Unavailable` variant and is not
+  `#[non_exhaustive]`: an embedder with its own `CryptoService` or an
+  exhaustive `match` on `CryptoError` needs an arm for it.
+
+**Who has to act.** No one; a client that retries on `503` now retries
+these requests too.
 
 ### WRAP grants: append-only has a column of its own (admin migration 005)
 

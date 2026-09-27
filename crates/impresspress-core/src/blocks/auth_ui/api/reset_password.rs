@@ -1,19 +1,18 @@
 //! POST /b/auth/api/reset-password — relocated from auth/login.rs in Task 5.
 
-use wafer_core::clients::crypto;
 use wafer_run::{context::Context, InputStream, OutputStream};
 
 use crate::{
     blocks::{
         auth::{
-            bump_auth_version,
+            bump_auth_version, hash_new_password,
             repo::{local_credentials, tokens, users},
         },
         auth_ui::contracts::MessageResponse,
         crud,
         errors::{error_response, ErrorCode},
     },
-    http::{err_bad_request, err_internal, ok_json},
+    http::{err_bad_request, ok_json},
     util::sha256_hex,
 };
 
@@ -80,9 +79,9 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
     }
 
     // Hash new password
-    let new_hash = match crypto::hash(ctx, &body.new_password).await {
-        Ok(h) => h,
-        Err(e) => return err_internal("Hash failed", e),
+    let new_hash = match hash_new_password(ctx, &body.new_password).await {
+        Ok(hash) => hash,
+        Err(response) => return response,
     };
 
     // Update credential row (typed path, no password_hash on users table).
@@ -317,5 +316,57 @@ mod tests {
             Some(users::proof::EMAIL_TOKEN),
             "the reset must record the proof its link demonstrates"
         );
+    }
+
+    /// A password hasher that cannot be reached is a 503 the caller may
+    /// retry with the same link: nothing is written, the reset token is not
+    /// spent, and once the hasher answers the same token resets the password.
+    #[tokio::test]
+    async fn an_unreachable_password_hasher_is_a_503_and_keeps_the_link() {
+        use crate::test_support::{output_http_status, HasherFault};
+
+        let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
+        let user_id = signup_user(&ctx, "hugo@example.com", "original-horse-battery1").await;
+        let stored = local_credentials::find_by_user_id(&ctx, &user_id)
+            .await
+            .unwrap()
+            .expect("credential")
+            .password_hash;
+        let token = issue_reset_token(&ctx, &user_id).await;
+        hasher.fail_hash(Some(HasherFault::Unreachable));
+
+        let out = handle(&ctx, body(&token, "new-horse-battery-2026")).await;
+
+        assert_eq!(output_http_status(out).await, 503);
+        assert_eq!(
+            local_credentials::find_by_user_id(&ctx, &user_id)
+                .await
+                .unwrap()
+                .expect("credential")
+                .password_hash,
+            stored,
+            "the stored password is untouched"
+        );
+        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 0);
+
+        hasher.fail_hash(None);
+        let json = output_json(handle(&ctx, body(&token, "new-horse-battery-2026")).await).await;
+        assert_eq!(json["message"], "Password reset successfully");
+    }
+
+    /// Guard: a hashing fault retrying does not fix stays a 500 (passes
+    /// before and after the `Unavailable` classification by design).
+    #[tokio::test]
+    async fn a_broken_password_hasher_is_a_500() {
+        use crate::test_support::{output_http_status, HasherFault};
+
+        let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
+        let user_id = signup_user(&ctx, "hana@example.com", "original-horse-battery1").await;
+        let token = issue_reset_token(&ctx, &user_id).await;
+        hasher.fail_hash(Some(HasherFault::Broken));
+
+        let out = handle(&ctx, body(&token, "new-horse-battery-2026")).await;
+
+        assert_eq!(output_http_status(out).await, 500);
     }
 }

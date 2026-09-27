@@ -8,6 +8,7 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use crate::{
     blocks::{
         auth::{
+            hash_new_password,
             helpers::{
                 email_domain_allowed, initial_role_for, issue_tokens_and_cookie, signup_allowed,
                 Rotation, SessionLifetime,
@@ -121,9 +122,9 @@ pub async fn handle(
     // So the hash, the token draw and the write happen on both paths, the
     // write is what finds out the address is taken, and the mail — the one
     // slow step only a new account has — goes out after the response.
-    let password_hash = match crypto::hash(ctx, &body.password).await {
-        Ok(h) => h,
-        Err(e) => return err_internal("Failed to hash password", e),
+    let password_hash = match hash_new_password(ctx, &body.password).await {
+        Ok(hash) => hash,
+        Err(response) => return response,
     };
 
     let require_verification = match crate::config_vars::get_bool(
@@ -611,5 +612,66 @@ mod tests {
                 .any(|call| call == "impresspress/email email.send_template"),
             "the deferred task is the verification mail: {deferred:?}"
         );
+    }
+
+    async fn signup_status(ctx: &TestContext, email: &str, password: &str) -> u16 {
+        let body = serde_json::json!({"email": email, "password": password}).to_string();
+        let (limiter, msg) = crate::blocks::auth_ui::api::test_mail_request();
+        let out = handle(
+            &limiter,
+            ctx,
+            &msg,
+            InputStream::from_bytes(body.into_bytes()),
+        )
+        .await;
+        crate::test_support::output_http_status(out).await
+    }
+
+    /// A password hasher that cannot be reached is an outage the caller may
+    /// retry: a 503, before any account is written, so the retry succeeds.
+    #[tokio::test]
+    async fn an_unreachable_password_hasher_is_a_503_and_writes_no_account() {
+        use crate::test_support::HasherFault;
+
+        let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
+        hasher.fail_hash(Some(HasherFault::Unreachable));
+
+        assert_eq!(
+            signup_status(&ctx, "ivy@example.com", "correct-horse-battery").await,
+            503
+        );
+        assert!(
+            users::find_by_email(&ctx, "ivy@example.com")
+                .await
+                .unwrap()
+                .is_none(),
+            "a sign-up the hasher could not serve writes no account"
+        );
+
+        hasher.fail_hash(None);
+        let resp = signup(&ctx, "ivy@example.com", "correct-horse-battery").await;
+        assert!(
+            resp["access_token"].is_string(),
+            "the retry signs up: {resp}"
+        );
+    }
+
+    /// Guard: a hashing fault retrying does not fix stays a 500 (passes
+    /// before and after the `Unavailable` classification by design).
+    #[tokio::test]
+    async fn a_broken_password_hasher_is_a_500() {
+        use crate::test_support::HasherFault;
+
+        let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
+        hasher.fail_hash(Some(HasherFault::Broken));
+
+        assert_eq!(
+            signup_status(&ctx, "jay@example.com", "correct-horse-battery").await,
+            500
+        );
+        assert!(users::find_by_email(&ctx, "jay@example.com")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

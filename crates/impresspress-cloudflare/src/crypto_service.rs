@@ -26,9 +26,14 @@
 //!
 //! When the hasher cannot answer — the binding is missing, the Durable Object
 //! errors or is unreachable, or it answers something this Worker cannot read
-//! — the operation fails ([`protocol::unavailable`]), and a login answers
-//! 503. This Worker never hashes or verifies a password itself instead: a
-//! fallback would write hashes at a cost its CPU limit allows, silently.
+//! — the operation fails as `CryptoError::Unavailable`
+//! ([`protocol::unavailable`]), and a sign-in, sign-up, password change,
+//! password reset or bootstrap-token redemption answers 503. When it answers
+//! readably but wrongly — an outcome for another operation, or a hash weaker
+//! than it is meant to write — the operation fails as a fault
+//! ([`protocol::misanswered`]): a sign-in still answers 503, the others 500. This Worker never hashes or verifies a
+//! password itself instead: a fallback would write hashes at a cost its CPU
+//! limit allows, silently.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -349,11 +354,21 @@ mod tests {
 
     fn unavailable(result: Result<impl std::fmt::Debug, CryptoError>) {
         match result {
-            Err(CryptoError::Other(message)) => assert!(
+            Err(CryptoError::Unavailable(message)) => assert!(
                 message.starts_with(protocol::UNAVAILABLE_PREFIX),
                 "{message}"
             ),
             other => panic!("expected the hasher to be unavailable, got {other:?}"),
+        }
+    }
+
+    fn misanswered(result: Result<impl std::fmt::Debug, CryptoError>) {
+        match result {
+            Err(CryptoError::Other(message)) => assert!(
+                message.starts_with(protocol::MISANSWERED_PREFIX),
+                "{message}"
+            ),
+            other => panic!("expected the hasher to have misanswered, got {other:?}"),
         }
     }
 
@@ -496,8 +511,9 @@ mod tests {
     }
 
     /// **Never a weaker hash.** When the hasher cannot answer, `hash` and
-    /// `compare_hash` fail as unavailable. A fallback to hashing in this
-    /// Worker would return a hash (and a verdict) here, and fail this test.
+    /// `compare_hash` fail as unavailable; when it answers another question,
+    /// as a fault. A fallback to hashing in this Worker would return a hash
+    /// (and a verdict) here, and fail this test.
     #[wasm_bindgen_test]
     async fn a_failing_hasher_fails_the_operation_and_nothing_is_hashed_locally() {
         // Stored with the 4 MiB preset, which a local fallback would accept.
@@ -535,14 +551,16 @@ mod tests {
             // The fake must outlive the service: its stubs call back into it.
             let fake = FakeHasher::new(answer());
             let svc = fake.service(1);
-            match svc.hash("pw").await {
-                Err(CryptoError::Other(message)) => assert!(
-                    message.starts_with(protocol::UNAVAILABLE_PREFIX),
-                    "{case}: {message}"
-                ),
-                other => panic!("{case}: expected unavailable, got {other:?}"),
-            }
-            if case != "an answer to another question" {
+            if case == "an answer to another question" {
+                misanswered(svc.hash("pw").await);
+            } else {
+                match svc.hash("pw").await {
+                    Err(CryptoError::Unavailable(message)) => assert!(
+                        message.starts_with(protocol::UNAVAILABLE_PREFIX),
+                        "{case}: {message}"
+                    ),
+                    other => panic!("{case}: expected unavailable, got {other:?}"),
+                }
                 unavailable(svc.compare_hash(KAT_PASSWORD, STORED).await);
             }
             assert!(
@@ -576,7 +594,8 @@ mod tests {
 
     /// Defence in depth: a hasher that hands back a hash weaker than the one
     /// it is meant to write — the 4 MiB preset, say — is not believed, and
-    /// nothing is stored.
+    /// nothing is stored. It is a fault, not an outage: asking again gets the
+    /// same hash.
     #[wasm_bindgen_test]
     async fn a_hash_below_the_written_cost_is_refused() {
         let weak = wafer_block_crypto::primitives::hash_password(
@@ -591,7 +610,7 @@ mod tests {
             };
             (200, serde_json::to_string(&answer).expect("encode"))
         }));
-        unavailable(fake.service(1).hash("pw").await);
+        misanswered(fake.service(1).hash("pw").await);
         assert_eq!(fake.shards.borrow().len(), 1, "the fake was asked");
     }
 

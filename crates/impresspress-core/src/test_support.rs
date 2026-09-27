@@ -3256,6 +3256,107 @@ impl CryptoService for PinnedMintCrypto {
     }
 }
 
+/// How [`FaultyHasher`] fails a password operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HasherFault {
+    /// The backend doing the hashing cannot be reached, as a password-hasher
+    /// Worker whose Durable Object does not answer reports it:
+    /// `CryptoError::Unavailable`.
+    Unreachable,
+    /// The hashing itself failed, a fault retrying does not fix:
+    /// `CryptoError::HashError`.
+    Broken,
+}
+
+impl HasherFault {
+    fn error(self) -> CryptoError {
+        match self {
+            Self::Unreachable => {
+                CryptoError::Unavailable("password hasher unavailable: fake outage".to_string())
+            }
+            Self::Broken => CryptoError::HashError("fake hashing fault".to_string()),
+        }
+    }
+}
+
+/// The production crypto service, except that `hash` and `compare_hash` fail
+/// with a [`HasherFault`] once one is set for them. Registered behind the
+/// real `wafer-run/crypto` block
+/// ([`TestContext::with_auth_and_faulty_hasher`]), so the error reaches the
+/// handler through the block's own `CryptoError` → `ErrorCode` mapping, as a
+/// failing Cloudflare password hasher's does.
+pub struct FaultyHasher {
+    inner: wafer_block_crypto::service::Argon2JwtCryptoService,
+    hash_fault: std::sync::Mutex<Option<HasherFault>>,
+    compare_fault: std::sync::Mutex<Option<HasherFault>>,
+}
+
+impl FaultyHasher {
+    /// Make every later `hash` fail with `fault` (`None` heals it).
+    pub fn fail_hash(&self, fault: Option<HasherFault>) {
+        *self.hash_fault.lock().unwrap_or_else(|e| e.into_inner()) = fault;
+    }
+
+    /// Make every later `compare_hash` fail with `fault` (`None` heals it).
+    pub fn fail_compare(&self, fault: Option<HasherFault>) {
+        *self.compare_fault.lock().unwrap_or_else(|e| e.into_inner()) = fault;
+    }
+}
+
+#[wafer_block::wafer_async_trait]
+impl CryptoService for FaultyHasher {
+    async fn hash(&self, password: &str) -> Result<String, CryptoError> {
+        let fault = *self.hash_fault.lock().unwrap_or_else(|e| e.into_inner());
+        match fault {
+            Some(fault) => Err(fault.error()),
+            None => self.inner.hash(password).await,
+        }
+    }
+
+    async fn compare_hash(&self, password: &str, hash: &str) -> Result<(), CryptoError> {
+        let fault = *self.compare_fault.lock().unwrap_or_else(|e| e.into_inner());
+        match fault {
+            Some(fault) => Err(fault.error()),
+            None => self.inner.compare_hash(password, hash).await,
+        }
+    }
+
+    async fn sign_for(
+        &self,
+        block_id: &str,
+        claims: BTreeMap<String, serde_json::Value>,
+        expiry: std::time::Duration,
+    ) -> Result<String, CryptoError> {
+        self.inner.sign_for(block_id, claims, expiry).await
+    }
+
+    async fn verify_for(
+        &self,
+        block_id: &str,
+        token: &str,
+    ) -> Result<BTreeMap<String, serde_json::Value>, CryptoError> {
+        self.inner.verify_for(block_id, token).await
+    }
+
+    async fn random_bytes(&self, n: usize) -> Result<Vec<u8>, CryptoError> {
+        self.inner.random_bytes(n).await
+    }
+}
+
+impl TestContext {
+    /// [`TestContext::with_auth_and_crypto`] over a [`FaultyHasher`], which
+    /// works until the test sets a fault on it.
+    pub async fn with_auth_and_faulty_hasher() -> (Self, Arc<FaultyHasher>) {
+        let hasher = Arc::new(FaultyHasher {
+            inner: real_crypto_service(),
+            hash_fault: std::sync::Mutex::new(None),
+            compare_fault: std::sync::Mutex::new(None),
+        });
+        let ctx = Self::with_auth_and_crypto_service(hasher.clone()).await;
+        (ctx, hasher)
+    }
+}
+
 /// Seed an account through the production `repo::users::insert`.
 ///
 /// Every auth test that needs a user wants the same row: an unverified
