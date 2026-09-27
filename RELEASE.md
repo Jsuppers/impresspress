@@ -27,12 +27,14 @@ protected route without a working credential — none at all, or one that did
 not verify: expired, signed out, issued before a password change or a
 disable, an API key that matches no row — is now answered `401` with
 `WWW-Authenticate: Bearer realm="impresspress", ApiKey realm="impresspress"`
-and the JSON body `{"error":"Unauthenticated","message":"authentication
-required"}`. It was `403` with `"error":"PermissionDenied"`. The handlers'
-own identity checks behind the router (products, files, the shared owner
-check, the user portal's profile form, the sessions and linked-accounts
-buttons) answer `401` too, with the same challenge; the profile form's was a
-`403`.
+and the JSON body `{"code":"not_authenticated","error":"Unauthenticated",
+"message":"authentication required"}`. It was `403` with `"error":"PermissionDenied"`. The handlers'
+own identity checks behind the router (`/b/auth/api/me`, change-password,
+API keys, products, files, the shared owner check, the user portal's profile
+form, the sessions and linked-accounts buttons) answer `401` too, with the
+same challenge; the profile form's was a `403`. A `401` about a credential
+that is not an `Authorization` scheme (a wrong password at login, a
+bootstrap or refresh token, a webhook signature) carries no challenge.
 
 - `403` now means only "identified, but not allowed": a signed-in user
   without the admin role on an admin route, a CSRF origin refusal, a WRAP

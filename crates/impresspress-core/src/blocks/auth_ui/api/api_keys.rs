@@ -48,10 +48,7 @@ fn parse_expiry(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc
 pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id();
     if user_id.is_empty() {
-        return crate::blocks::errors::error_response(
-            crate::blocks::errors::ErrorCode::NotAuthenticated,
-            "Authentication required",
-        );
+        return crate::http::err_unauthenticated("Authentication required");
     }
     match api_keys::list_for_user(ctx, user_id).await {
         Ok(rows) => {
@@ -95,10 +92,7 @@ pub async fn handle_list(ctx: &dyn Context, msg: &Message) -> OutputStream {
 pub async fn handle_create(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let user_id = msg.user_id();
     if user_id.is_empty() {
-        return crate::blocks::errors::error_response(
-            crate::blocks::errors::ErrorCode::NotAuthenticated,
-            "Authentication required",
-        );
+        return crate::http::err_unauthenticated("Authentication required");
     }
 
     let raw = match input.collect_to_bytes().await {

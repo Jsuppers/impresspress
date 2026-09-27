@@ -20,9 +20,9 @@ pub use wafer_block::{
 };
 use wafer_run::{ErrorCode, MetaEntry, OutputStream, WaferError};
 
-/// The `WWW-Authenticate` challenge every `401` for a missing identity
-/// carries (RFC 9110 §11.6.1): the two schemes the request pipeline accepts
-/// in `Authorization` — an access token (`Bearer`, RFC 6750) and an API key
+/// The `WWW-Authenticate` challenge [`err_unauthenticated`] carries
+/// (RFC 9110 §11.6.1): the two schemes the request pipeline accepts in
+/// `Authorization` — an access token (`Bearer`, RFC 6750) and an API key
 /// (`ApiKey`).
 pub const WWW_AUTHENTICATE: &str = r#"Bearer realm="impresspress", ApiKey realm="impresspress""#;
 
@@ -32,14 +32,24 @@ pub const WWW_AUTHENTICATE: &str = r#"Bearer realm="impresspress", ApiKey realm=
 /// `pipeline::handle_request` treats all of those as anonymous, so by the
 /// time a route checks `msg.user_id()` they are the same answer.
 ///
-/// RFC 9110 §15.5.2 requires a `401` to carry a `WWW-Authenticate`
-/// challenge, so this is the constructor for it rather than the bare
-/// `err_unauthorized`. A caller that IS identified but may not do this is a
-/// `403` ([`err_forbidden`]); a credential the server could not check (its
+/// Every JSON refusal for an empty `msg.user_id()` answers with this: the
+/// router's gate for an API caller and each handler's own check behind it.
+/// (The user portal's two htmx buttons, sessions revoke and provider unlink,
+/// answer `text/plain` for the swap and set [`WWW_AUTHENTICATE`] themselves.)
+/// It carries the [`WWW_AUTHENTICATE`] challenge RFC 9110 §15.5.2 requires
+/// on a `401`, and the detail code `not_authenticated`
+/// ([`crate::blocks::errors::ErrorCode::NotAuthenticated`]).
+///
+/// It is for a missing identity only. A `401` about a credential that is not
+/// an `Authorization` scheme — a wrong password at login, a bootstrap token,
+/// a refresh token, a webhook signature — is answered by its own handler
+/// without the challenge. A caller that IS identified but may not do this is
+/// a `403` ([`err_forbidden`]); a credential the server could not check (its
 /// database read failed) is neither, and keeps the status
 /// `blocks::auth::credential_check_failed` gives it.
 pub fn err_unauthenticated(message: &str) -> OutputStream {
-    let mut error = WaferError::new(ErrorCode::Unauthenticated, message);
+    let mut error = WaferError::new(ErrorCode::Unauthenticated, message)
+        .with_detail_code(crate::blocks::errors::ErrorCode::NotAuthenticated.as_str());
     error.meta.push(MetaEntry {
         key: format!(
             "{}WWW-Authenticate",

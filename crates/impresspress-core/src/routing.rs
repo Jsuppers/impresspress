@@ -604,7 +604,8 @@ pub fn feature_gate_name(block_name: &str) -> &str {
 }
 
 /// Enforce a route's [`RouteAccess`] tier against the request. Returns
-/// `Some(refusal)` when the caller fails the tier, or `None` to proceed. Shared by the built-in and extra-route dispatch loops.
+/// `Some(refusal)` when the caller fails the tier, or `None` to proceed.
+/// Shared by the built-in and extra-route dispatch loops.
 fn check_access(access: RouteAccess, msg: &Message) -> Option<OutputStream> {
     match access {
         RouteAccess::Public => None,

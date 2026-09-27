@@ -78,7 +78,7 @@ fn refused(msg: &Message, code: ErrorCode, reason: &str) -> OutputStream {
 pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> OutputStream {
     let user_id = msg.user_id();
     if user_id.is_empty() {
-        return error_response(ErrorCode::NotAuthenticated, "Not authenticated");
+        return crate::http::err_unauthenticated("Not authenticated");
     }
 
     #[derive(serde::Deserialize)]

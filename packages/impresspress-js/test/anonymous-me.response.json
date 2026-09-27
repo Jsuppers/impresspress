@@ -4,5 +4,5 @@
     "content-type": "application/json",
     "www-authenticate": "Bearer realm=\"impresspress\", ApiKey realm=\"impresspress\""
   },
-  "body": "{\"error\":\"Unauthenticated\",\"message\":\"authentication required\"}"
+  "body": "{\"code\":\"not_authenticated\",\"error\":\"Unauthenticated\",\"message\":\"authentication required\"}"
 }
