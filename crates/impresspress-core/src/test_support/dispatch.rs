@@ -1,15 +1,17 @@
 //! What [`super::TestContext`] needs to dispatch a `call_block` the way
-//! `wafer_run::context::RuntimeContext` does: who a frame's caller is, the
-//! runtime's call-depth ceiling, and the WRAP grant set a deployment runs
-//! with.
+//! `wafer_run::context::RuntimeContext` does: who a frame's caller is, and
+//! the WRAP grant set a deployment runs with. The admission gates themselves
+//! are not here: `TestContext::call_block` runs the runtime's own
+//! `wafer_run::runtime::call_gates::admit_call`.
 //!
-//! The grant set is not assembled here. A real [`wafer_run::Wafer`] collects
-//! it — the registration functions `ImpresspressBuilder::build` calls, then
-//! `Wafer::register_block` for each block the fixture registered and
-//! `Wafer::add_wrap_grants` for the deployment's own — so a grant the runtime
-//! rejects (a typed Network grant from a non-admin block, a malformed
-//! resource) is missing here too, and the fixture never honours one
-//! production would refuse.
+//! The grant set is not assembled here either. A real [`wafer_run::Wafer`]
+//! collects it — the registration functions `ImpresspressBuilder::build`
+//! calls, then `Wafer::register_block` for each block the fixture registered
+//! and `Wafer::add_wrap_grants` for the deployment's own. A grant the runtime
+//! rejects (a typed Network grant from a non-admin block, a namespace grant
+//! on a resource the block does not own, a malformed resource) is refused
+//! here as boot refuses it: [`refuse_rejected_grants`] panics with the
+//! runtime's own `GrantsRejected` text.
 
 use std::{
     collections::HashSet,
@@ -93,13 +95,6 @@ impl Caller {
     }
 }
 
-/// `wafer_run`'s `DEFAULT_MAX_CALL_DEPTH`, which the crate does not export.
-///
-/// Not a second opinion: `parity_tests::the_call_depth_ceiling_is_the_runtimes`
-/// drives the same recursion through a sealed `Wafer` and through the
-/// fixture and fails if the two stop at different depths.
-pub(super) const MAX_CALL_DEPTH: u32 = 16;
-
 /// An empty runtime: no linked-in blocks, no lockfile, the admin block set
 /// as `ImpresspressBuilder::build` sets it.
 pub(super) fn empty_wafer() -> wafer_run::Wafer {
@@ -121,13 +116,32 @@ pub(super) fn empty_wafer() -> wafer_run::Wafer {
 /// `BlockInfo::validate` — reserved or foreign config keys, illegal agent
 /// tool names. Each of those is fatal at boot, so a fixture that admitted
 /// them would certify a deployment that never starts.
+///
+/// The same goes for its grant declarations: a grant `Wafer::seal` would
+/// refuse boot over is refused here ([`refuse_rejected_grants`]).
 pub(super) fn admit(name: &str, block: Arc<dyn Block>) -> wafer_run::BlockInfo {
     let mut wafer = empty_wafer();
     let info = block.info();
     wafer
         .register_block(name, block)
         .unwrap_or_else(|e| panic!("the runtime refuses to register {name}: {e}"));
+    refuse_rejected_grants(&wafer);
     info
+}
+
+/// Panic with the runtime's own refusal if `wafer` holds a grant declaration
+/// `Wafer::seal` would refuse boot over (`RuntimeError::GrantsRejected`):
+/// the runtime leaves such a grant out of `Wafer::wrap_grants` and refuses
+/// to start, so a fixture that only collected the accepted grants would run
+/// a deployment production never boots.
+fn refuse_rejected_grants(wafer: &wafer_run::Wafer) {
+    let rejected = wafer.rejected_grants();
+    if !rejected.is_empty() {
+        panic!(
+            "the runtime refuses to boot: {}",
+            wafer_run::RuntimeError::GrantsRejected(rejected.to_vec())
+        );
+    }
 }
 
 /// A block that is nothing but its declaration — what
@@ -181,6 +195,7 @@ fn built_in() -> &'static (Vec<ResourceGrant>, HashSet<String>) {
             Arc::new(crate::builder::granted_llm_router()),
         )
         .expect("the llm router registers");
+        refuse_rejected_grants(&wafer);
         let names = wafer.block_names().into_iter().collect();
         (wafer.wrap_grants().to_vec(), names)
     })
@@ -216,6 +231,7 @@ pub(super) fn collect_wrap_grants(
                 .unwrap_or_else(|e| panic!("the runtime refuses to register {name}: {e}"));
         }
     }
+    refuse_rejected_grants(&wafer);
     wafer
         .add_wrap_grants(grants.to_vec())
         .unwrap_or_else(|e| panic!("the runtime refuses the deployment's grants: {e}"));

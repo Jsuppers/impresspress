@@ -1,20 +1,22 @@
-//! [`TestContext`] dispatches a `call_block` as a sealed runtime does.
+//! [`TestContext`] answers what a sealed runtime's frame answers.
 //!
-//! Each case builds the same blocks twice — in a real, sealed
-//! [`wafer_run::Wafer`] with the aliases and admin block
+//! The gates a `call_block` passes are not re-stated in the fixture: both
+//! run `wafer_run::runtime::call_gates::admit_call`. What the fixture still
+//! supplies itself is the frame that function reads — its depth, its alias
+//! table, the caller's `requires` and capabilities — and what happens after
+//! admission: the callee's frame, and the WRAP check a service makes against
+//! the caller that frame names. Each case builds the same blocks twice — in
+//! a real, sealed [`wafer_run::Wafer`] with the aliases and admin block
 //! `ImpresspressBuilder::build` installs, and in a [`TestContext`] — enters
 //! the same block in both with the same message, and asserts both answer
-//! identically. The fixture re-states what `RuntimeContext::dispatch_call`
-//! does because the runtime keeps that code private; these cases are what
-//! hold the two together, and every one of them fails against a fixture
-//! that skipped the gate it exercises.
+//! identically, so a frame answer that drifts from the runtime's fails here.
 
 use std::sync::Arc;
 
 use wafer_block::{codec, common::ServiceOp, wire::database::CountRequest};
 use wafer_run::{
-    context::Context, streams::output::TerminalNotResponse, Block, BlockInfo, InputStream, Message,
-    OutputStream, ResourceGrant,
+    context::Context, streams::output::TerminalNotResponse, Block, BlockCapabilities, BlockInfo,
+    InputStream, Message, OutputStream, ResourceGrant,
 };
 
 use super::TestContext;
@@ -56,6 +58,7 @@ struct Probe {
     name: &'static str,
     requires: Vec<String>,
     grants: Vec<ResourceGrant>,
+    capabilities: Option<BlockCapabilities>,
 }
 
 impl Probe {
@@ -64,7 +67,18 @@ impl Probe {
             name,
             requires: Vec::new(),
             grants: Vec::new(),
+            capabilities: None,
         }
+    }
+
+    /// Unrestricted, except that it may `call_block` only `targets`.
+    fn may_call_only(mut self, targets: &[&str]) -> Self {
+        let mut caps = BlockCapabilities::unrestricted();
+        caps.callable_blocks = wafer_block::capabilities::Allowlist::Only(
+            targets.iter().map(|t| (*t).to_string()).collect(),
+        );
+        self.capabilities = Some(caps);
+        self
     }
 
     fn requires(mut self, targets: &[&str]) -> Self {
@@ -103,6 +117,10 @@ impl Block for Probe {
         BlockInfo::new(self.name, "0.0.1", "probe@v1", "parity probe")
             .requires(self.requires.clone())
             .grants(self.grants.clone())
+    }
+
+    fn block_capabilities(&self) -> Option<BlockCapabilities> {
+        self.capabilities.clone()
     }
 
     async fn handle(&self, ctx: &dyn Context, msg: Message, _input: InputStream) -> OutputStream {
@@ -202,6 +220,8 @@ async fn run_both(probes: Vec<Probe>, entry: &str, hops: &[Hop]) -> (String, Str
     (runtime, fixture)
 }
 
+/// Each callee frame sits one level deeper than its caller, from `0` at the
+/// entry, so the shared depth gate stops the same recursion at the same hop.
 #[tokio::test]
 async fn the_call_depth_ceiling_is_the_runtimes() {
     let hops: Vec<Hop> = (0..40).map(|_| Hop::to("test/deep")).collect();
@@ -213,6 +233,7 @@ async fn the_call_depth_ceiling_is_the_runtimes() {
     assert_eq!(fixture, runtime, "the fixture stops at the same depth");
 }
 
+/// The frame carries the entry block's declared allowlist.
 #[tokio::test]
 async fn a_target_missing_from_requires_is_refused() {
     let (runtime, fixture) = run_both(
@@ -229,6 +250,8 @@ async fn a_target_missing_from_requires_is_refused() {
     assert_eq!(fixture, runtime);
 }
 
+/// The fixture's alias table ([`crate::builder::SERVICE_ALIASES`]) resolves
+/// a short name to the block the builder aliases it to.
 #[tokio::test]
 async fn an_alias_resolves_before_the_requires_check() {
     let (runtime, fixture) = run_both(
@@ -244,31 +267,38 @@ async fn an_alias_resolves_before_the_requires_check() {
     assert_eq!(fixture, runtime);
 }
 
+/// The frame carries the capabilities of the block it runs as, so a call
+/// its `callable_blocks` leaves out is refused — a gate the fixture had no
+/// copy of before it ran the runtime's.
 #[tokio::test]
-async fn an_action_outside_the_targets_interface_is_unimplemented() {
+async fn a_target_the_callers_capabilities_leave_out_is_refused() {
     let (runtime, fixture) = run_both(
-        vec![Probe::new("test/a")],
+        vec![
+            Probe::new("test/a").may_call_only(&["test/c"]),
+            Probe::new("test/b"),
+            Probe::new("test/c"),
+        ],
         "test/a",
-        &[Hop {
-            target: "wafer-run/database".to_string(),
-            op: "probe.hop".to_string(),
-            collection: None,
-        }],
+        &[Hop::to("test/b")],
     )
     .await;
-    assert_eq!(runtime, "Unimplemented@0");
+    assert_eq!(runtime, "PermissionDenied@0");
     assert_eq!(fixture, runtime);
 }
 
+/// ... and admits one it lists.
 #[tokio::test]
-async fn an_unregistered_target_is_unimplemented() {
+async fn a_target_the_callers_capabilities_list_is_admitted() {
     let (runtime, fixture) = run_both(
-        vec![Probe::new("test/a")],
+        vec![
+            Probe::new("test/a").may_call_only(&["test/c"]),
+            Probe::new("test/c"),
+        ],
         "test/a",
-        &[Hop::to("test/nowhere")],
+        &[Hop::to("test/c")],
     )
     .await;
-    assert_eq!(runtime, "Unimplemented@0");
+    assert_eq!(runtime, "ok");
     assert_eq!(fixture, runtime);
 }
 
@@ -323,9 +353,10 @@ async fn a_nested_call_is_authorized_as_the_block_that_makes_it() {
     assert_eq!(fixture, runtime);
 }
 
-/// A cancelled dispatch refuses every further call. The runtime cancels on
-/// a deadline or an abort, neither of which a top-level `run_block` exposes,
-/// so this pins the fixture against the runtime's code for it.
+/// [`TestContext::cancel`] sets the flag the shared cancellation gate reads,
+/// so every later call is refused. The runtime cancels on a deadline or an
+/// abort, neither of which a top-level `run_block` exposes, so this case has
+/// no runtime half.
 #[tokio::test]
 async fn a_cancelled_fixture_refuses_further_calls() {
     let mut ctx = TestContext::new().await;
