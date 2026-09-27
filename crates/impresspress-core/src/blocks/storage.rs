@@ -25,15 +25,16 @@
 
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use wafer_block::{codec, stream::StreamEvent, wire::storage as wire, ServiceOp};
 use wafer_core::{
     clients::database as db,
     interfaces::storage::{handler::resolve_folder, service::StorageService},
 };
 use wafer_run::{
-    context::Context, streams::output::TerminalNotResponse, Block, BlockInfo, InputStream,
-    LifecycleEvent, Message, OutputStream, WaferError,
+    context::Context,
+    streams::output::{SinkSendError, TerminalNotResponse},
+    Block, BlockInfo, ErrorCode, InputStream, LifecycleEvent, Message, OutputStream, WaferError,
 };
 
 use super::admin::STORAGE_ACCESS_LOGS_TABLE;
@@ -171,8 +172,14 @@ impl Block for ImpresspressStorageBlock {
 /// answered with an `Error` terminal: the bytes forwarded so far may be a
 /// truncated prefix, so neither the log nor the caller may take them for a
 /// finished answer.
+///
+/// So is a `Halt` that follows forwarded body events: the sink refuses a
+/// `Halt` after a `Chunk` or `Meta` (it would replace a body the caller has
+/// partly received), so the request was not served. The refusal is decided
+/// here, before the terminal is sent, so the log row is written first and the
+/// caller gets the same explicit `Error` as the no-terminal path.
 fn forward_logged(
-    inner: OutputStream,
+    inner: impl Stream<Item = StreamEvent> + Send + Unpin + 'static,
     ctx: Arc<dyn Context>,
     caller: String,
     kind: String,
@@ -183,12 +190,15 @@ fn forward_logged(
         let mut inner = inner;
         let log = |status: String| log_storage_access(ctx.as_ref(), &caller, &kind, &path, status);
         let ok = || format!("OK ({}ms)", now_millis().saturating_sub(start));
+        let mut body_forwarded = false;
         while let Some(ev) = inner.next().await {
             match ev {
                 StreamEvent::Chunk(bytes) => {
+                    body_forwarded = true;
                     let _ = sink.send_chunk(bytes).await;
                 }
                 StreamEvent::Meta(entry) => {
+                    body_forwarded = true;
                     let _ = sink.send_meta(entry).await;
                 }
                 StreamEvent::Complete { meta } => {
@@ -207,6 +217,15 @@ fn forward_logged(
                 }
                 StreamEvent::Continue(m) => {
                     let _ = sink.continue_with(m).await;
+                    return;
+                }
+                StreamEvent::Halt { .. } if body_forwarded => {
+                    let error = WaferError::new(
+                        ErrorCode::Internal,
+                        SinkSendError::BodyAlreadySent("Halt").to_string(),
+                    );
+                    let _ = log(format!("ERROR: {}", error.message)).await;
+                    let _ = sink.error(error).await;
                     return;
                 }
                 StreamEvent::Halt { body, meta } => {
@@ -831,6 +850,48 @@ mod tests {
         assert!(
             rows[0].1.starts_with("ERROR: "),
             "a stream with no terminal must not be logged as served: {rows:?}"
+        );
+    }
+
+    /// A `Halt` after forwarded body bytes is refused by the sink, so the
+    /// request was not served: the access log records an error, not `OK`,
+    /// and the caller is answered with an explicit `Error` terminal.
+    #[tokio::test]
+    async fn a_halt_after_body_bytes_is_logged_and_answered_as_an_error() {
+        use wafer_block::stream::StreamEvent;
+
+        let caller = "impresspress/files";
+        let ctx = ctx_as(caller, Vec::new()).await;
+        let inner = futures::stream::iter([
+            StreamEvent::Chunk(b"prefix".to_vec()),
+            StreamEvent::Halt {
+                body: b"whole".to_vec(),
+                meta: Vec::new(),
+            },
+        ]);
+
+        let out = super::forward_logged(
+            inner,
+            ctx.clone_arc(),
+            caller.to_string(),
+            ServiceOp::STORAGE_GET.to_string(),
+            "impresspress/files/f/k".to_string(),
+            crate::util::now_millis(),
+        );
+
+        let err = chunks(out)
+            .await
+            .expect_err("a refused Halt must reach the caller as an error");
+        assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+        assert!(
+            err.message.contains("Halt terminal cannot follow"),
+            "the caller is told why, not handed the sink's dropped-terminal error: {err:?}"
+        );
+        let rows = audit_rows(&ctx).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].1.starts_with("ERROR: ") && rows[0].1.contains("Halt"),
+            "a refused Halt must not be logged as served: {rows:?}"
         );
     }
 }
