@@ -216,9 +216,9 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// RFC 2104 HMAC-SHA256 over `sha2`, the construction `hmac_hex` used
-    /// before it delegated to `primitives::hmac_sha256`. Stored dedupe hashes
-    /// and issued form tokens were computed with it, so the two must agree.
+    /// RFC 2104 HMAC-SHA256 written out over `sha2`. Stored dedupe hashes and
+    /// outstanding form tokens were computed with this construction, so
+    /// `hmac_hex` must reproduce it byte for byte.
     fn reference_hmac_hex(secret: &[u8], message: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         const BLOCK: usize = 64;
