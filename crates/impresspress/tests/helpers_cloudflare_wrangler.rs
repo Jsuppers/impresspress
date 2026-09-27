@@ -411,6 +411,45 @@ zone_name = "wafer.run"
     );
 }
 
+/// The bootstrap-admin email and password are an admin login: a consumer
+/// that forwards them to the auth block creates the first admin from them.
+/// Under `[vars]` they would be plain text in a committed override file and
+/// in the dashboard, so the build refuses each, in `[vars]` and in an
+/// environment's own vars, naming where it goes and never echoing the value.
+#[test]
+fn a_bootstrap_admin_credential_in_the_main_workers_vars_is_refused() {
+    use impresspress_core::blocks::auth::config::{
+        BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY,
+    };
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+    let overrides_path = repo_root.join("wrangler.overrides.toml");
+    let mut cfg = sample_cfg();
+    cfg.wrangler_overrides_path = Some("wrangler.overrides.toml".into());
+    let value = "correct-horse-battery-staple";
+
+    for var in [BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY] {
+        for table in ["[vars]", "[env.staging.vars]"] {
+            fs::write(&overrides_path, format!("{table}\n{var} = \"{value}\"\n")).unwrap();
+            for result in [
+                generate(&cfg, repo_root, &out),
+                generate_upload(&cfg, repo_root, &out),
+            ] {
+                let err = format!("{:#}", result.expect_err(var));
+                assert!(
+                    err.contains(var)
+                        && err.contains(table)
+                        && err.contains(&format!("wrangler secret put {var} --name wafer-site`")),
+                    "{err}"
+                );
+                assert!(!err.contains(value), "the error echoed the value: {err}");
+            }
+        }
+    }
+}
+
 /// The pepper belongs to the password-hasher Worker, and the main Worker
 /// reads none of its settings. Put under the main Worker's `[vars]` through an
 /// override file, a key would be plain text in a committed file and in the

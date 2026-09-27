@@ -371,7 +371,7 @@ fn generate_named(
         deep_merge(&mut value, overrides);
     }
 
-    refuse_pepper_keys_in_vars(&value, &cfg.password_hasher.worker_name)?;
+    refuse_secrets_in_vars(&value, cfg)?;
 
     // The crypto service reaches the hasher through this exact binding name,
     // so a consumer override that replaced `[durable_objects]` (to bind its
@@ -650,18 +650,29 @@ in impresspress.toml.\n\n"
 }
 
 /// Refuse a config whose `[vars]`, or any `[env.<name>.vars]`, holds a
-/// password pepper setting.
+/// password pepper setting or a bootstrap-admin credential.
 ///
-/// The main Worker does not read them: the pepper belongs to the
-/// password-hasher Worker. A key put here would be plain text — in this file,
-/// in the override file it came from (which a consumer repo commits) and in
-/// the Cloudflare dashboard — and would pepper nothing, and a `REQUIRED` here
-/// would require nothing. The error names the var and where it goes, never the
-/// value.
-fn refuse_pepper_keys_in_vars(value: &toml::Value, hasher_worker_name: &str) -> Result<()> {
+/// A value there is plain text — in this file, in the override file it came
+/// from (which a consumer repo commits) and in the Cloudflare dashboard.
+///
+/// - The pepper settings: the main Worker does not read them, because the
+///   pepper belongs to the password-hasher Worker. A key put here would
+///   pepper nothing, and a `REQUIRED` here would require nothing.
+/// - The bootstrap-admin email and password: a consumer that forwards them
+///   to the auth block (the webmcp demo reads them with `Env::secret`, which
+///   returns a `[vars]` entry of the same name as well) creates the first
+///   admin from them, so the pair is an admin login and goes in as Worker
+///   secrets.
+///
+/// The error names the var and where it goes, never the value.
+fn refuse_secrets_in_vars(value: &toml::Value, cfg: &CloudflareConfig) -> Result<()> {
+    use impresspress_core::blocks::auth::config::{
+        BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY,
+    };
     use impresspress_password::pepper::{
         PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
     };
+    let hasher_worker_name = &cfg.password_hasher.worker_name;
     // The top-level `[vars]`, and each `[env.<name>.vars]`: wrangler does not
     // inherit `vars` into an environment, so an environment's own table is
     // where its deploy reads them from.
@@ -698,6 +709,17 @@ fn refuse_pepper_keys_in_vars(value: &toml::Value, hasher_worker_name: &str) -> 
                  hashing. Remove it and set [cloudflare.password_hasher].pepper_required in \
                  impresspress.toml."
             );
+        }
+        for var in [BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY] {
+            if vars.contains_key(var) {
+                anyhow::bail!(
+                    "{var} is set under {table} in the wrangler overrides, where it is plain \
+                     text (in the file and in the Cloudflare dashboard), and together with its \
+                     pair it is a login to the first admin account. Remove it and set it with \
+                     `wrangler secret put {var} --name {worker_name}`.",
+                    worker_name = cfg.worker_name,
+                );
+            }
         }
     }
     Ok(())
