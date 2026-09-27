@@ -855,7 +855,11 @@ impl DatabaseService for D1DatabaseService {
         DbExec::increment_field_where(self, collection, col, delta, filters).await
     }
 
-    async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        spec: UpsertSpec,
+    ) -> Result<Option<Record>, DatabaseError> {
         DbExec::upsert(self, collection, spec).await
     }
 

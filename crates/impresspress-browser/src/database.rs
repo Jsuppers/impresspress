@@ -780,7 +780,7 @@ wafer_core::forward_database_service! {
             .await
         }
 
-        async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+        async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<Option<Record>, DatabaseError> {
             self.with_flush(DbExec::upsert(self, collection, spec))
                 .await
         }

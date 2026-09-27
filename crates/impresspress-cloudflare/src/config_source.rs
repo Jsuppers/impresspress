@@ -515,7 +515,7 @@ mod tests {
             unreachable!()
         }
 
-        async fn upsert(&self, _c: &str, _s: UpsertSpec) -> Result<i64, DatabaseError> {
+        async fn upsert(&self, _c: &str, _s: UpsertSpec) -> Result<Option<Record>, DatabaseError> {
             unreachable!()
         }
         async fn aggregate(

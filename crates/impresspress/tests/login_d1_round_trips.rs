@@ -488,10 +488,10 @@ async fn sign_in(site: &Site, email: &str, password: &str) -> Cost {
     }
 }
 
-/// A warm sign-in's response waits on five sequential D1 round trips, seven
-/// statements: the account by email and its credential (each a row read
-/// plus the `COUNT(*)` `db::get_by_field` sends with it, one `db.batch()`
-/// apiece), its role grants, the refresh-token row and the device-list row.
+/// A warm sign-in's response waits on five sequential D1 round trips, one
+/// statement each: the account by email and its credential (a single row
+/// read apiece — `db::get_by_field` sends no `COUNT(*)`), its role grants,
+/// the refresh-token row and the device-list row.
 /// The tokens' `auth_version` and inline role are the ones on the account row
 /// read first — the version must be read no later than the roles
 /// (`helpers::TokenGrant`), so the row is not read again for them.
@@ -537,7 +537,7 @@ async fn a_warm_sign_in_waits_on_five_round_trips() {
     );
     assert_eq!(
         Cost::statements(&warm.response),
-        7,
+        5,
         "D1 statements before the response\n{trace}"
     );
 
