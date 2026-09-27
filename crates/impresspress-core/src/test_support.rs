@@ -8,14 +8,16 @@
 //! over a file-backed service, for the tests whose subject is the read/write
 //! connection split only that topology has.
 //!
-//! Every `call_block` goes through the gates the runtime applies — call
-//! depth, cancellation, aliases, the caller's `requires`, the target's
-//! interface — and every service op is WRAP-checked against the caller the
-//! runtime would attribute it to and the grants the deployment carries. A
+//! Every `call_block` goes through the runtime's own admission
+//! (`wafer_run::runtime::call_gates::admit_call`: call depth, cancellation,
+//! aliases, the caller's `requires` and capabilities, registration, the
+//! target's interface), and every service op is WRAP-checked against the
+//! caller the runtime would attribute it to and the grants the deployment
+//! carries — a registration whose grants boot would reject is refused. A
 //! constructor hands back an unframed context, which the runtime would treat
 //! as an unattributed caller and refuse; a test runs code as a block with
 //! [`TestContext::running_as`] and stages rows with [`TestContext::fixture`].
-//! `parity_tests` holds the fixture to a sealed `Wafer`.
+//! `parity_tests` holds the frame's answers to a sealed `Wafer`'s.
 //!
 //! [`source_scan`] is the other half: the shared walk and comment strippers
 //! the crate's source gates are built on, so a gate states its root and its
@@ -407,16 +409,16 @@ impl TestContext {
             .clone()
     }
 
-    /// The sub-context `RuntimeContext::dispatch_call` hands `callee`, the
-    /// block registered under `name`: it runs as `name`, is called by this
-    /// frame, carries `callee`'s own declared allowlist — read off the block
-    /// being called, as the runtime reads a block its sealed plan does not
-    /// cover — and sits one level deeper.
-    fn for_callee(&self, name: &str, callee: &dyn Block) -> Self {
+    /// The sub-context `RuntimeContext::dispatch_call` hands the block
+    /// registered under `name`: it runs as `name`, is called by this frame,
+    /// carries the callee's own declared allowlist `requires` — what
+    /// [`admit_call`](wafer_run::runtime::call_gates::admit_call) read off
+    /// the callee — and sits one level deeper.
+    fn for_callee(&self, name: &str, requires: Option<Arc<Vec<String>>>) -> Self {
         let mut ctx = self.clone();
         ctx.called_by = self.frame.as_caller();
         ctx.frame = dispatch::Frame::Block(name.to_string());
-        ctx.caller_requires = callee.info().call_allowlist();
+        ctx.caller_requires = requires.map(Arc::unwrap_or_clone);
         ctx.call_depth = self.call_depth + 1;
         ctx
     }
@@ -2134,84 +2136,31 @@ impl Context for TestContext {
             .is_ok()
     }
 
-    /// `RuntimeContext::dispatch_call`'s gates, in its order: call depth,
-    /// cancellation, alias resolution, the caller's `requires` allowlist,
-    /// the target's registration, and the message's action against the
-    /// target's declared interface — each refusing with the code the runtime
-    /// refuses with. `parity_tests` runs the same calls through a sealed
-    /// `Wafer` to hold the two together.
+    /// `RuntimeContext::dispatch_call` as far as the callee's handler: the
+    /// runtime's own admission, [`wafer_run::runtime::call_gates::admit_call`],
+    /// over this frame (see the [`CallFrame`](wafer_run::runtime::call_gates::CallFrame)
+    /// impl below) — call depth, cancellation, the caller's `requires`, its
+    /// `call_block` capability, registration and the interface action, each
+    /// refusing with the runtime's code and text — then the callee's handler
+    /// on the sub-context the runtime would build ([`Self::for_callee`]).
+    ///
+    /// Not modelled: the lazy `lifecycle(Init)` the runtime runs on a callee
+    /// between admission and its handler. It is not an admission gate — the
+    /// runtime runs it against its own init slots after `admit_call` — and a
+    /// fixture does a block's Init work (its migrations, its seeds) explicitly
+    /// in setup (e.g. [`Self::with_auth`]), so a test states the
+    /// schema it runs against.
     ///
     /// WRAP is not a `call_block` gate, here or in production: the service
     /// handler a call reaches authorizes the op it decoded, through
     /// [`Context::check_resource_access`] on the callee frame below.
     async fn call_block(&self, name: &str, msg: Message, input: InputStream) -> OutputStream {
-        if self.call_depth >= dispatch::MAX_CALL_DEPTH {
-            return OutputStream::error(WaferError::new(
-                ErrorCode::ResourceExhausted,
-                format!(
-                    "call_block depth exceeded maximum of {} (calling '{name}')",
-                    dispatch::MAX_CALL_DEPTH
-                ),
-            ));
-        }
-
-        if self.is_cancelled() {
-            return OutputStream::error(WaferError::new(
-                ErrorCode::Cancelled,
-                "execution cancelled",
-            ));
-        }
-
-        // The runtime answers a service's short name (`db`, `storage`) for
-        // the block it aliases, from the list the builder installs.
-        let resolved = crate::builder::SERVICE_ALIASES
-            .iter()
-            .find(|(alias, _)| *alias == name)
-            .map_or(name, |(_, target)| *target);
-
-        // Matched against both the name the caller wrote and the one it
-        // resolves to, so a `requires` entry written either way is honoured.
-        if let Some(requires) = &self.caller_requires {
-            if !requires.iter().any(|r| r == name || r == resolved) {
-                return OutputStream::error(WaferError::new(
-                    ErrorCode::PermissionDenied,
-                    format!("block '{name}' not in requires list — call_block denied"),
-                ));
-            }
-        }
-
-        // `NotFound` is reserved for a service saying the thing a request
-        // names does not exist; nothing to dispatch to is `Unimplemented`.
-        let Some(block) = self.registered(resolved) else {
-            return OutputStream::error(WaferError::new(
-                ErrorCode::Unimplemented,
-                format!("block '{name}' is not registered"),
-            ));
+        let admitted = match wafer_run::runtime::call_gates::admit_call(self, name, &msg) {
+            Ok(admitted) => admitted,
+            Err(refusal) => return OutputStream::error(refusal),
         };
-
-        // The action is the `req.action` meta, else the message kind, as the
-        // runtime reads it; an interface with no registered spec is skipped.
-        // `blocks::config`'s `CONFIG_GET_MANY` passed every unit test while
-        // this gate was missing and was refused by the real runtime under
-        // `config@v1`, which took every settings page with it.
-        let action = if msg.action().is_empty() {
-            msg.kind.as_str()
-        } else {
-            msg.action()
-        };
-        if let wafer_run::runtime::validation::ActionCheck::Invalid { message } =
-            wafer_run::runtime::validation::check_action_interface(
-                resolved,
-                &block.info().interface,
-                action,
-                &interface_specs(),
-            )
-        {
-            return OutputStream::error(WaferError::new(ErrorCode::Unimplemented, message));
-        }
-
-        let callee = self.for_callee(resolved, &*block);
-        block.handle(&callee, msg, input).await
+        let callee = self.for_callee(admitted.resolved, admitted.requires);
+        admitted.block.handle(&callee, msg, input).await
     }
 
     /// The block that called into this frame, as `RuntimeContext` re-points
@@ -3225,12 +3174,78 @@ impl<'a> SeedUser<'a> {
 /// sets — `wafer_block::interfaces::all()` at construction, plus whatever
 /// `register_interface` adds, which in this repo is that one spec — keyed by
 /// interface name, as `check_action_interface` reads them.
-fn interface_specs() -> HashMap<String, wafer_block::InterfaceSpec> {
-    wafer_block::interfaces::all()
-        .into_iter()
-        .chain([crate::blocks::config::interface_spec()])
-        .map(|spec| (spec.name.clone(), spec))
-        .collect()
+fn interface_specs() -> &'static HashMap<String, wafer_block::InterfaceSpec> {
+    static SPECS: std::sync::OnceLock<HashMap<String, wafer_block::InterfaceSpec>> =
+        std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        wafer_block::interfaces::all()
+            .into_iter()
+            .chain([crate::blocks::config::interface_spec()])
+            .map(|spec| (spec.name.clone(), spec))
+            .collect()
+    })
+}
+
+/// What [`wafer_run::runtime::call_gates::admit_call`] reads about a
+/// [`TestContext`] frame — the answers a `RuntimeContext` gives from its own
+/// fields, given here from the fixture's.
+impl wafer_run::runtime::call_gates::CallFrame for TestContext {
+    fn call_depth(&self) -> u32 {
+        self.call_depth
+    }
+
+    /// The ceiling every context the runtime builds starts with.
+    fn max_call_depth(&self) -> u32 {
+        wafer_run::runtime::call_gates::DEFAULT_MAX_CALL_DEPTH
+    }
+
+    /// A fixture sets no deadline; a test models a timed-out dispatch with
+    /// [`TestContext::cancel`].
+    fn deadline(&self) -> Option<wafer_run::platform::Instant> {
+        None
+    }
+
+    fn cancellation(&self) -> &std::sync::atomic::AtomicBool {
+        &self.cancelled
+    }
+
+    /// The service short names (`db`, `storage`) the builder installs as
+    /// aliases, from the same list ([`crate::builder::SERVICE_ALIASES`]).
+    fn canonicalize<'a>(&'a self, name: &'a str) -> &'a str {
+        crate::builder::SERVICE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == name)
+            .map_or(name, |(_, target)| *target)
+    }
+
+    fn caller_requires(&self) -> Option<&[String]> {
+        self.caller_requires.as_deref()
+    }
+
+    /// The capabilities of the block whose code runs on this frame, read off
+    /// the block the fixture registered under that name, as the runtime reads
+    /// them off the block it runs as. The fixture's own frame and an unframed
+    /// one run no block's code, so no capability limits them.
+    fn caller_capabilities(&self) -> Option<wafer_run::BlockCapabilities> {
+        match &self.frame {
+            dispatch::Frame::Block(name) => self
+                .registered(name)
+                .and_then(|block| block.block_capabilities()),
+            dispatch::Frame::Unframed | dispatch::Frame::Fixture => None,
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn Block>> {
+        self.registered(name)
+    }
+
+    fn interface_specs(&self) -> &HashMap<String, wafer_block::InterfaceSpec> {
+        interface_specs()
+    }
+
+    /// The runtime logs a warning and admits the call; so does the fixture,
+    /// without the log.
+    fn unknown_interface(&self, _resolved: &str, _interface: &str) {}
 }
 
 /// Build an anonymous request `Message`. No `auth.user_id` meta set.
@@ -4878,6 +4893,45 @@ mod tests {
             BlockInfo::new("test/declared", "0.0.1", "probe@v1", "foreign key").config_keys(vec![
                 wafer_run::ConfigVar::new(FOREIGN_PROBE_KEY, "foreign", ""),
             ]),
+        );
+    }
+
+    /// A grant boot rejects is refused at registration, with the runtime's
+    /// own `GrantsRejected` text: the runtime leaves it out of the grant set
+    /// and refuses to start, so a fixture that dropped it silently would run
+    /// a deployment production never boots.
+    #[tokio::test]
+    #[should_panic(
+        expected = "the runtime refuses to boot: 1 typed grant(s) rejected:\n  - block \
+                               `test/declared`: typed Network grants may only be declared by the \
+                               admin block"
+    )]
+    async fn a_block_declaring_a_typed_grant_it_may_not_is_not_registered() {
+        let mut ctx = TestContext::new().await;
+        ctx.register_block(
+            "test/declared",
+            Arc::new(Declares(
+                BlockInfo::new("test/declared", "0.0.1", "probe@v1", "typed grant")
+                    .grants(vec![ResourceGrant::read("*", "https://example.com")
+                        .typed(wafer_run::ResourceType::Network)]),
+            )),
+        );
+    }
+
+    /// The same refusal for a namespace grant on a table another block owns,
+    /// through the declared-only path sandbox guests take.
+    #[tokio::test]
+    #[should_panic(
+        expected = "the runtime refuses to boot: 1 typed grant(s) rejected:\n  - block \
+                               `test/declared`: resource `other__block__rows` is owned by \
+                               `other/block`, not by declaring block"
+    )]
+    async fn a_declared_only_block_granting_what_it_does_not_own_is_not_registered() {
+        let mut ctx = TestContext::new().await;
+        ctx.register_block_info(
+            "test/declared",
+            BlockInfo::new("test/declared", "0.0.1", "probe@v1", "foreign grant")
+                .grants(vec![ResourceGrant::read("*", "other__block__rows")]),
         );
     }
 
