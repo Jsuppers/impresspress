@@ -12,7 +12,8 @@ use crate::{
             config::REQUIRE_VERIFICATION_KEY,
             helpers::{
                 email_domain_allowed, ensure_admin_role, get_user_roles, initial_role_for,
-                issue_tokens_and_cookie, signup_allowed, Rotation, SessionLifetime,
+                issue_tokens_and_cookie, signup_allowed, touch_last_login_after_response, Rotation,
+                SessionLifetime,
             },
             repo::{oauth_pkce, provider_links, users},
         },
@@ -200,10 +201,8 @@ pub async fn handle(
     };
     let ResolvedAccount { id: user_id, email } = account;
 
-    // Update last_login_at on the users row (best-effort).
-    if let Err(e) = users::touch_last_login(ctx, &user_id).await {
-        tracing::warn!("Failed to update last_login_at: {e}");
-    }
+    // Update last_login_at on the users row (best-effort, after the response).
+    touch_last_login_after_response(ctx, &user_id);
 
     // Bootstrap-admin promotion needs BOTH halves to be true, and neither is
     // free. The address compared is the ACCOUNT's, never the one the provider

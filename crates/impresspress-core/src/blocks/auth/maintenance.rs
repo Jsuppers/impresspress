@@ -9,9 +9,10 @@
 //!
 //! Two entry points, both of which exist on every platform today:
 //!
-//! 1. [`sweep_if_due`], called from `helpers::issue_tokens_and_cookie`. Every
-//!    deployment logs people in, so no operator has to remember anything and
-//!    no scheduler has to exist. Throttled to [`SWEEP_INTERVAL_SECS`] through
+//! 1. [`sweep_if_due`], deferred by `helpers::issue_tokens_and_cookie` to run
+//!    after the sign-in's response ([`crate::deferred`]). Every deployment
+//!    logs people in, so no operator has to remember anything and no
+//!    scheduler has to exist. Throttled to [`SWEEP_INTERVAL_SECS`] through
 //!    the `repo::maintenance` singleton, so a login storm costs one pass.
 //! 2. The `auth.maintenance` message kind on `impresspress/auth-ui`, mirroring
 //!    `tickets.maintenance`, for an operator or a future cron to force a pass.
