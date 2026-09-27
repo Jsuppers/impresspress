@@ -556,6 +556,7 @@ async fn api_keys_tab(ctx: &dyn Context) -> Result<Markup, WaferError> {
     // view, not one account's (`api_keys::list_for_user` is what the
     // userportal and the auth-ui CRUD endpoints use).
     let list = api_keys::list_recent(ctx, 100).await?;
+    let now = chrono::Utc::now();
 
     Ok(html! {
         div .flex .items-center .justify-between .mb-4 {
@@ -568,21 +569,32 @@ async fn api_keys_tab(ctx: &dyn Context) -> Result<Markup, WaferError> {
         @let rows: Vec<Vec<Markup>> = list.iter().map(|record| {
             let user_id = record.user_id.as_str();
             let created = record.created_at.as_str();
-            let revoked = record.revoked_at.as_deref().unwrap_or("");
+            // A key authenticates only while it is neither revoked nor past
+            // its expiry — the two checks `auth` makes before it accepts one
+            // — so the badge names whichever of them retired it.
+            let retired = if record.is_revoked() {
+                Some("revoked")
+            } else if record.is_expired(now) {
+                Some("expired")
+            } else {
+                None
+            };
             vec![
                 html! { code { (record.key_prefix) "..." } },
                 html! { (record.name) },
                 html! { span .text-muted { (user_id.get(..8).unwrap_or(user_id)) } },
                 html! { span .text-muted { (created.get(..10).unwrap_or(created)) } },
                 html! {
-                    @if revoked.is_empty() {
-                        (components::status_badge("active"))
+                    @if let Some(reason) = retired {
+                        (components::badge(components::BadgeVariant::Danger, reason))
                     } @else {
-                        (components::status_badge("disabled"))
+                        (components::status_badge("active"))
                     }
                 },
                 html! {
-                    @if revoked.is_empty() {
+                    // Only a live key has anything left to revoke: an expiry
+                    // is set once, at creation, and never moves.
+                    @if retired.is_none() {
                         // This block's own route, answered with
                         // this tab re-rendered: see
                         // `handle_revoke_api_key`.
@@ -696,6 +708,78 @@ mod tests {
             html.contains(r#"datetime="2026-01-01T00:00:00Z">2026-01-01</time>"#),
             "the Created cell must be a <time>: {html}"
         );
+    }
+
+    /// A key the auth block would refuse is not shown as active. Revoked and
+    /// expired are both dead keys, each badged with its own reason, and
+    /// neither offers a Revoke button — only the live key does.
+    #[tokio::test]
+    async fn the_api_keys_tab_badges_each_dead_key_with_why() {
+        let ctx = TestContext::with_auth()
+            .await
+            .running_as(crate::blocks::admin::ADMIN_BLOCK_ID);
+        ctx.seed_auth_user("u-1").await;
+        let seed = ctx.fixture();
+        let hour = chrono::Duration::hours(1);
+        for (prefix, expires_at) in [
+            ("ipk_live", Some(chrono::Utc::now() + hour)),
+            ("ipk_expired", Some(chrono::Utc::now() - hour)),
+            ("ipk_revoked", None),
+        ] {
+            let key = api_keys::insert(
+                &seed,
+                api_keys::NewApiKey {
+                    user_id: "u-1",
+                    name: prefix,
+                    key_hash: prefix,
+                    key_prefix: prefix,
+                    expires_at,
+                },
+            )
+            .await
+            .expect("seed a key");
+            if prefix == "ipk_revoked" {
+                api_keys::revoke(&seed, &key.id).await.expect("revoke");
+            }
+        }
+
+        let mut msg = admin_msg("retrieve", "/b/admin/users");
+        msg.set_meta("req.query.tab", "api-keys");
+        let parts = crate::blocks::admin::test_support::browser_request(&ctx, msg).await;
+        let html = String::from_utf8(parts.body).expect("UTF-8 body");
+        assert_eq!(parts.status, 200, "{html}");
+
+        let row = |prefix: &str| -> String {
+            html.split("<tr")
+                .find(|row| row.contains(&format!("<code>{prefix}...</code>")))
+                .unwrap_or_else(|| panic!("no row for {prefix}: {html}"))
+                .to_owned()
+        };
+        for (prefix, badge, revocable) in [
+            (
+                "ipk_live",
+                r#"<span class="badge badge-success">active</span>"#,
+                true,
+            ),
+            (
+                "ipk_expired",
+                r#"<span class="badge badge-danger">expired</span>"#,
+                false,
+            ),
+            (
+                "ipk_revoked",
+                r#"<span class="badge badge-danger">revoked</span>"#,
+                false,
+            ),
+        ] {
+            let row = row(prefix);
+            assert!(row.contains(badge), "{prefix} must render {badge}: {row}");
+            assert_eq!(
+                row.contains("Revoke this API key?"),
+                revocable,
+                "{prefix}: a Revoke button only on a live key: {row}"
+            );
+        }
     }
 
     /// Disable answers one `<tr>`, swapped over the user's row. When the row
