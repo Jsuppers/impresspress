@@ -585,18 +585,11 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     ),
     (
         "auth_ui/api/signup.rs",
-        &[
-            Tail {
-                label: "Failed to hash password",
-                count: 1,
-                why: "crypto: hashing the new password",
-            },
-            Tail {
-                label: "Failed to generate verification token",
-                count: 1,
-                why: "crypto: drawing the verification token",
-            },
-        ],
+        &[Tail {
+            label: "Failed to generate verification token",
+            count: 1,
+            why: "crypto: drawing the verification token",
+        }],
     ),
     (
         "auth_ui/api/api_keys.rs",
@@ -608,26 +601,20 @@ const INVENTORIED_TAILS: &[(&str, &[Tail])] = &[
     ),
     (
         "auth_ui/api/change_password.rs",
-        &[
-            Tail {
-                label: "Hash failed",
-                count: 1,
-                why: "crypto: hashing the new password",
-            },
-            Tail {
-                label: "Stored password hash could not be checked",
-                count: 1,
-                why: "crypto: the Internal a stored hash it cannot check gets; every \
+        &[Tail {
+            label: "Stored password hash could not be checked",
+            count: 1,
+            why: "crypto: the Internal a stored hash it cannot check gets; every \
                       other compare_hash failure is classified by check_password",
-            },
-        ],
+        }],
     ),
     (
-        "auth_ui/api/reset_password.rs",
+        "auth/mod.rs",
         &[Tail {
-            label: "Hash failed",
+            label: "Failed to hash password",
             count: 1,
-            why: "crypto: hashing the new password",
+            why: "crypto: `hash_new_password` hashing a password being set; an \
+                  unreachable hasher is a 503 first",
         }],
     ),
     (

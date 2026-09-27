@@ -590,6 +590,32 @@ pub(crate) fn credential_check_failed(error: WaferError, context: &str) -> Wafer
     }
 }
 
+/// Hash a password being set (sign-up, a password change or reset, a
+/// bootstrap admin), or the response a failed hash is answered with.
+///
+/// `ErrorCode::Unavailable` is the crypto service reporting that the backend
+/// doing the hashing cannot be reached right now (`CryptoError::Unavailable`;
+/// on Cloudflare, the password-hasher Worker's Durable Object not
+/// answering). Every caller hashes before it writes anything, so the request
+/// is sound and may succeed when retried: it is logged and answered with the
+/// retryable 503 a credential check that could not decide gets. Any other
+/// failure is the server's fault and a sanitized 500.
+pub(crate) async fn hash_new_password(
+    ctx: &dyn wafer_run::context::Context,
+    password: &str,
+) -> Result<String, wafer_run::OutputStream> {
+    match crypto::hash(ctx, password).await {
+        Ok(hash) => Ok(hash),
+        Err(e) if e.code == wafer_run::ErrorCode::Unavailable => {
+            tracing::warn!(error = %e, "password hashing unavailable");
+            Err(wafer_run::OutputStream::error(
+                credential_check_unavailable(),
+            ))
+        }
+        Err(e) => Err(crate::http::err_internal("Failed to hash password", e)),
+    }
+}
+
 /// The 503 a credential check that could not decide is answered with.
 fn credential_check_unavailable() -> WaferError {
     WaferError::new(

@@ -626,4 +626,23 @@ mod tests {
             "a transient fault must not be logged as an account needing a reset: {events:?}"
         );
     }
+
+    /// Sign-in keeps its 503 when the password hasher cannot be reached,
+    /// driven through the real crypto block's `CryptoError::Unavailable`
+    /// mapping: never "invalid credentials".
+    #[tokio::test]
+    async fn an_unreachable_password_hasher_is_a_503() {
+        use crate::test_support::HasherFault;
+
+        let (ctx, hasher) = TestContext::with_auth_and_faulty_hasher().await;
+        signup_user(&ctx, "kim@example.com", "correct-horse-battery").await;
+        hasher.fail_compare(Some(HasherFault::Unreachable));
+
+        let body =
+            serde_json::json!({"email": "kim@example.com", "password": "correct-horse-battery"})
+                .to_string();
+        let out = handle(&ctx, InputStream::from_bytes(body.into_bytes())).await;
+
+        assert_eq!(output_http_status(out).await, 503);
+    }
 }

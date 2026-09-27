@@ -58,6 +58,18 @@ pub(crate) async fn bootstrap_with_email_password(
     password: &str,
 ) -> Result<(), WaferError> {
     let hash = crypto::hash(ctx, password).await?;
+    create_admin(ctx, email, &hash).await
+}
+
+/// Create the verified admin account `email` whose password hashes to
+/// `password_hash`, the account and its credential in one write. The
+/// redemption route (`auth_ui::api::bootstrap`) hashes first itself, so a
+/// crypto outage is answered before the single-use token is spent.
+pub(crate) async fn create_admin(
+    ctx: &dyn Context,
+    email: &str,
+    password_hash: &str,
+) -> Result<(), WaferError> {
     // Stored as signup stores it. `BOOTSTRAP_ADMIN_EMAIL` is whatever the
     // operator typed, and a mixed-case row is one no login finds (they look
     // the normalized address up) and one signup does not see as taken.
@@ -81,7 +93,7 @@ pub(crate) async fn bootstrap_with_email_password(
             email_verified: true,
             verification_token_hash: None,
         },
-        &hash,
+        password_hash,
     )
     .await
     .map_err(bootstrap_failed)?;
