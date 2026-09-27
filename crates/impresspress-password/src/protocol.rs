@@ -243,16 +243,39 @@ pub enum Outcome {
 }
 
 /// The prefix of every error that means the hasher could not be asked or
-/// did not answer the question; see [`unavailable`].
+/// gave no answer this Worker can read; see [`unavailable`].
 pub const UNAVAILABLE_PREFIX: &str = "password hasher unavailable: ";
 
-/// The error an operation fails with when the hasher could not answer it.
+/// The error an operation fails with when the hasher could not answer it:
+/// the binding is not usable, the Durable Object call failed, it answered a
+/// status other than 200 or a body that does not parse, or it speaks another
+/// protocol version.
 ///
-/// `CryptoError::Other`, which the crypto block reports as an internal error,
-/// so a login answers 503 (`impresspress_core::blocks::auth::check_password`)
-/// and nothing about the stored credential is inferred from it.
+/// `CryptoError::Unavailable`, which the crypto block answers with
+/// `ErrorCode::Unavailable`: the request was sound and may succeed when
+/// retried, so a sign-in, sign-up, password change, password reset or
+/// bootstrap-token redemption answers 503, and nothing about the stored
+/// credential is inferred from it.
 pub fn unavailable(reason: impl std::fmt::Display) -> CryptoError {
-    CryptoError::Other(format!("{UNAVAILABLE_PREFIX}{reason}"))
+    CryptoError::Unavailable(format!("{UNAVAILABLE_PREFIX}{reason}"))
+}
+
+/// The prefix of every error that means the hasher answered in this Worker's
+/// protocol, but with something it must not act on; see [`misanswered`].
+pub const MISANSWERED_PREFIX: &str = "password hasher misanswered: ";
+
+/// The error an operation fails with when the hasher answered, readably, with
+/// something other than an answer to the question: an outcome that belongs
+/// to another operation, a refusal to read the request, or a hash other than
+/// the one it is meant to write.
+///
+/// `CryptoError::Other`, which the crypto block answers with
+/// `ErrorCode::Internal`: retrying the same request gets the same answer, so
+/// it is a fault, not an outage. A sign-in still answers it 503
+/// (`impresspress_core::blocks::auth::check_password` does not tell the two
+/// apart), and nothing about the stored credential is inferred from it.
+pub fn misanswered(reason: impl std::fmt::Display) -> CryptoError {
+    CryptoError::Other(format!("{MISANSWERED_PREFIX}{reason}"))
 }
 
 impl Response {
@@ -310,7 +333,7 @@ impl Response {
                  {PROTOCOL_VERSION}"
             ))),
             Outcome::BadRequest { message } => {
-                Err(unavailable(format!("it refused the request: {message}")))
+                Err(misanswered(format!("it refused the request: {message}")))
             }
             other => Ok(other),
         }
@@ -341,7 +364,7 @@ pub fn check_written_hash(hash: &str) -> Result<(), CryptoError> {
     if well_formed && rest.len() == 2 && rest.iter().all(|f| !f.is_empty()) {
         Ok(())
     } else {
-        Err(unavailable(format!(
+        Err(misanswered(format!(
             "it returned a hash that is not argon2id at {WRITTEN_ARGON2_PARAMS}"
         )))
     }
@@ -374,7 +397,7 @@ fn unexpected(operation: &str, outcome: &Outcome) -> CryptoError {
         Outcome::UnsupportedVersion { .. } => "unsupported_version",
         Outcome::BadRequest { .. } => "bad_request",
     };
-    unavailable(format!(
+    misanswered(format!(
         "it answered a {operation} request with a {kind} outcome"
     ))
 }
@@ -471,21 +494,31 @@ mod tests {
         }
     }
 
-    /// Anything that is not an answer to the question asked is the hasher
-    /// being unavailable — never a match, a mismatch or a hash.
-    #[test]
-    fn a_non_answer_is_unavailable() {
-        let unavailable_err = |result: Result<(), CryptoError>| match result {
-            Err(CryptoError::Other(message)) => {
+    fn assert_unavailable(result: Result<(), CryptoError>) {
+        match result {
+            Err(CryptoError::Unavailable(message)) => {
                 assert!(message.starts_with(UNAVAILABLE_PREFIX), "{message}")
             }
             other => panic!("expected the hasher to be unavailable, got {other:?}"),
-        };
+        }
+    }
+
+    fn assert_misanswered(result: Result<(), CryptoError>) {
+        match result {
+            Err(CryptoError::Other(message)) => {
+                assert!(message.starts_with(MISANSWERED_PREFIX), "{message}")
+            }
+            other => panic!("expected the hasher to have misanswered, got {other:?}"),
+        }
+    }
+
+    /// An answer this Worker cannot read — not JSON, or in a protocol version
+    /// it does not speak — is the hasher being unavailable, which the crypto
+    /// block answers 503: never a match, a mismatch or a hash.
+    #[test]
+    fn an_unreadable_answer_is_unavailable() {
         let at = |version, outcome| Response { version, outcome };
-        unavailable_err(at(1, Outcome::Hashed { hash: "h".into() }).into_verify());
-        unavailable_err(at(1, Outcome::Verified).into_hash().map(drop));
-        unavailable_err(at(1, Outcome::Mismatch).into_hash().map(drop));
-        unavailable_err(
+        assert_unavailable(
             at(
                 1,
                 Outcome::UnsupportedVersion {
@@ -495,7 +528,23 @@ mod tests {
             )
             .into_verify(),
         );
-        unavailable_err(
+        // A verdict written in a version this build does not speak is not
+        // trusted, even one that says "verified".
+        assert_unavailable(at(PROTOCOL_VERSION + 1, Outcome::Verified).into_verify());
+        assert_unavailable(at(0, Outcome::Verified).into_verify());
+        assert_unavailable(Response::from_body(b"not json").map(drop));
+    }
+
+    /// A readable answer that does not answer the question asked is a fault,
+    /// which the crypto block answers 500 — also never a match, a mismatch
+    /// or a hash.
+    #[test]
+    fn an_answer_to_another_question_is_a_fault() {
+        let at = |version, outcome| Response { version, outcome };
+        assert_misanswered(at(1, Outcome::Hashed { hash: "h".into() }).into_verify());
+        assert_misanswered(at(1, Outcome::Verified).into_hash().map(drop));
+        assert_misanswered(at(1, Outcome::Mismatch).into_hash().map(drop));
+        assert_misanswered(
             at(
                 1,
                 Outcome::BadRequest {
@@ -504,11 +553,6 @@ mod tests {
             )
             .into_verify(),
         );
-        // A verdict written in a version this build does not speak is not
-        // trusted, even one that says "verified".
-        unavailable_err(at(PROTOCOL_VERSION + 1, Outcome::Verified).into_verify());
-        unavailable_err(at(0, Outcome::Verified).into_verify());
-        unavailable_err(Response::from_body(b"not json").map(drop));
     }
 
     const PLAIN: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
@@ -551,7 +595,7 @@ mod tests {
             };
             match answer.into_hash() {
                 Err(CryptoError::Other(message)) => {
-                    assert!(message.starts_with(UNAVAILABLE_PREFIX), "{message}");
+                    assert!(message.starts_with(MISANSWERED_PREFIX), "{message}");
                     if !hash.is_empty() {
                         assert!(!message.contains(hash), "{message}");
                     }
@@ -570,7 +614,7 @@ mod tests {
             br#"{"version":"hunter2-secret","outcome":{"kind":"verified"}}"#,
         ] {
             match Response::from_body(body) {
-                Err(CryptoError::Other(message)) => {
+                Err(CryptoError::Unavailable(message)) => {
                     assert!(!message.contains("hunter2"), "{message}")
                 }
                 other => panic!("expected unavailable, got {other:?}"),
