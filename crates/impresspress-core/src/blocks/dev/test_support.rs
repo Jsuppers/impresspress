@@ -22,24 +22,57 @@ use super::{
     paths, seed,
     seed::{SeedFetch, SeedFile},
 };
-use crate::test_support::{admin_msg, output_json, TestContext};
+use crate::test_support::{admin_msg, output_json, Session, TestContext};
 
 // ---------------------------------------------------------------------------
 // Reaching the block
 // ---------------------------------------------------------------------------
 
-/// `POST` a JSON body to a `/b/dev` route as an admin, through the router.
+/// A [`TestContext::with_dev`] fixture that can also sign people in — auth's
+/// schema and [`TestContext::with_sign_in_added`] on top — for a test about
+/// who may reach `/b/dev`, which sends real credentials through
+/// [`TestContext::request`].
+pub async fn dev_with_accounts(control: Arc<dyn RuntimeControl>) -> TestContext {
+    TestContext::with_admin()
+        .await
+        .with_auth_added()
+        .await
+        .with_dev_added(control)
+        .await
+        .with_sign_in_added()
+}
+
+/// The password every account [`signed_in_as`] seeds signs in with.
+const ACCOUNT_PASSWORD: &str = "correct-horse-battery-staple";
+
+/// Seed an account with `role` on a [`dev_with_accounts`] fixture and sign it
+/// in through the login route.
+///
+/// Not `admin@example.com`: the workspace guide prints that address as the
+/// local credentials, so a page assertion on it must not be satisfied by the
+/// signed-in operator's own email.
+pub async fn signed_in_as(ctx: &TestContext, role: &str) -> Session {
+    let email = format!("{role}-account@example.com");
+    ctx.seed_account(&email, ACCOUNT_PASSWORD, role).await;
+    ctx.sign_in(&email, ACCOUNT_PASSWORD).await
+}
+
+/// `POST` a JSON body to a `/b/dev` route as an admin, through the router,
+/// the admin taken as already resolved ([`TestContext::dispatch_resolved`]).
 ///
 /// Every `/b/dev` API is admin-only and takes its argument as a JSON body, so
 /// this is how each of the six `dev_*.rs` integration files opened every
-/// request it makes.
+/// request it makes. What these requests exercise is the block behind the
+/// gate; who may pass the gate is asked with [`dev_with_accounts`].
 pub async fn dev_post(ctx: &TestContext, path: &str, body: serde_json::Value) -> OutputStream {
-    ctx.dispatch_json(admin_msg("create", path), &body).await
+    ctx.dispatch_resolved_json(admin_msg("create", path), &body)
+        .await
 }
 
-/// `GET` a `/b/dev` route as an admin, through the router.
+/// `GET` a `/b/dev` route as an admin, through the router — the admin taken
+/// as already resolved, as [`dev_post`].
 pub async fn dev_get(ctx: &TestContext, path: &str) -> OutputStream {
-    ctx.dispatch(admin_msg("retrieve", path)).await
+    ctx.dispatch_resolved(admin_msg("retrieve", path)).await
 }
 
 /// The `/b/dev/api/status` projection — the generation, the block set and the

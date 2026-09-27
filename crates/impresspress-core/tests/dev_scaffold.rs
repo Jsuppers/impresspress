@@ -169,7 +169,7 @@ async fn an_unknown_template_is_refused() {
     assert_eq!(output_http_status(refused).await, 400);
     // Nothing was written.
     let listed = output_json(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/files"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/files"))
             .await,
     )
     .await;
@@ -273,7 +273,7 @@ async fn scaffolding_activates_nothing() {
 async fn reference_returns_the_authoring_guide() {
     let ctx = TestContext::with_dev(FakeControl::new()).await;
     let body = output_json(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/reference"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/reference"))
             .await,
     )
     .await;

@@ -67,7 +67,7 @@ async fn write_file(
 /// The `storage` half of `GET /b/dev/api/status`.
 async fn storage_of(ctx: &TestContext) -> serde_json::Value {
     let status = output_json(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/status"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/status"))
             .await,
     )
     .await;
@@ -810,7 +810,7 @@ async fn retention_keeps_the_serving_generation_and_its_blobs_under_a_run_of_fai
 
     let live_blob = write_file(&ctx, "site/index.html", "live", None).await;
     let active = output_json(
-        ctx.dispatch(admin_msg("retrieve", "/b/dev/api/status"))
+        ctx.dispatch_resolved(admin_msg("retrieve", "/b/dev/api/status"))
             .await,
     )
     .await["active_generation"]["id"]

@@ -3,8 +3,10 @@
 //!
 //! Both explorer surfaces — `POST /b/admin/api/database/query` (JSON) and
 //! `POST /b/admin/database/query` (the SSR SQL editor) — are driven here
-//! through `TestContext::dispatch*`, which is the production request path
-//! (`routing::route_to_block`, access gate included). Rows are staged in the
+//! through `TestContext::dispatch_resolved*` — the production request path
+//! from `routing::route_to_block` on, access gate included, with the admin
+//! caller taken as already resolved: this file is about what the explorer
+//! answers an admin, not about who is one. Rows are staged in the
 //! real tables through the real migrations, so a passing assertion is about
 //! the endpoint an operator reaches, not about a helper it happens to call.
 //!
@@ -86,7 +88,7 @@ async fn explorer_ctx() -> TestContext {
 /// `(http status, response body as text)`.
 async fn run_json(ctx: &TestContext, query: &str) -> (u16, String) {
     let out = ctx
-        .dispatch_json(
+        .dispatch_resolved_json(
             admin_msg("create", "/b/admin/api/database/query"),
             &json!({ "query": query }),
         )
@@ -259,7 +261,7 @@ async fn the_ssr_sql_editor_refuses_the_same_queries() {
     let mut msg = admin_msg("create", "/b/admin/database/query");
     msg.set_meta("req.content_type", "application/x-www-form-urlencoded");
     let out = ctx
-        .dispatch_with_input(
+        .dispatch_resolved_with_input(
             msg,
             wafer_run::InputStream::from_bytes(body.as_bytes().to_vec()),
         )
@@ -422,7 +424,7 @@ async fn ordinary_tables_are_still_queryable() {
     assert!(body.contains("admin"), "body: {body}");
 
     let value = output_http_json(
-        ctx.dispatch_json(
+        ctx.dispatch_resolved_json(
             admin_msg("create", "/b/admin/api/database/query"),
             &json!({ "query": "SELECT 1 AS one" }),
         )
@@ -432,7 +434,7 @@ async fn ordinary_tables_are_still_queryable() {
     assert_eq!(value["row_count"], json!(1));
     assert_eq!(
         output_http_status(
-            ctx.dispatch_json(
+            ctx.dispatch_resolved_json(
                 admin_msg("create", "/b/admin/api/database/query"),
                 &json!({ "query": "SELECT 1 AS one" }),
             )
@@ -891,7 +893,8 @@ async fn the_sql_editor_does_not_prefill_a_query_it_will_refuse() {
     let mut msg = admin_msg("retrieve", "/b/admin/database");
     msg.set_meta("req.query.table", table);
     msg.set_meta("req.query.tab", "sql");
-    let parts = wafer_block::http_codec::collect_http_response(ctx.dispatch(msg).await).await;
+    let parts =
+        wafer_block::http_codec::collect_http_response(ctx.dispatch_resolved(msg).await).await;
     let page = String::from_utf8_lossy(&parts.body).into_owned();
 
     // The panel really rendered — without this the two assertions below pass
@@ -914,7 +917,8 @@ async fn the_sql_editor_does_not_prefill_a_query_it_will_refuse() {
     let mut msg = admin_msg("retrieve", "/b/admin/database");
     msg.set_meta("req.query.table", "impresspress__admin__roles");
     msg.set_meta("req.query.tab", "sql");
-    let parts = wafer_block::http_codec::collect_http_response(ctx.dispatch(msg).await).await;
+    let parts =
+        wafer_block::http_codec::collect_http_response(ctx.dispatch_resolved(msg).await).await;
     let page = String::from_utf8_lossy(&parts.body).into_owned();
     assert!(
         page.contains("SELECT * FROM impresspress__admin__roles LIMIT 100;"),

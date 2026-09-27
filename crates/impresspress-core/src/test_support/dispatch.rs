@@ -55,7 +55,8 @@ pub(super) enum Caller {
     /// the block a listener or flow step dispatches to, which has no caller.
     /// A block entered through [`super::TestContext::running_as`] runs here.
     /// A block the router reaches is not top-level: `impresspress/router`
-    /// calls it, and [`super::TestContext::dispatch`] routes the same way.
+    /// calls it, and [`super::TestContext::dispatch_resolved`] routes the same
+    /// way.
     /// Also the caller of anything an unframed context ([`Frame::Unframed`])
     /// calls.
     Nobody,
@@ -66,7 +67,7 @@ pub(super) enum Caller {
     /// admin block, the one identity WRAP exempts, so fixture setup can
     /// write any table; code whose permissions are under test must run in a
     /// block's frame instead — [`super::TestContext::running_as`], a routed
-    /// [`super::TestContext::dispatch`], or a block reached through
+    /// [`super::TestContext::dispatch_resolved`], or a block reached through
     /// `call_block`.
     Fixture,
     /// The block whose frame made the call.

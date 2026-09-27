@@ -124,10 +124,10 @@ pub struct TestContext {
     /// registration or [`Self::deployment_grants`] changes.
     wrap_grants: Arc<std::sync::OnceLock<Arc<Vec<ResourceGrant>>>>,
     /// Routes a fixture registered the way a downstream project would, via
-    /// `ImpresspressBuilder::add_route`. Fed to [`Self::dispatch`] so a test
-    /// exercises the same router path — including its access gate — that the
-    /// consumer's registration produces, instead of calling a block's
-    /// `handle()` past the gate.
+    /// `ImpresspressBuilder::add_route`. Fed to [`Self::dispatch_resolved`]
+    /// and [`Self::request`] so a test exercises the same router path —
+    /// including its access gate — that the consumer's registration
+    /// produces, instead of calling a block's `handle()` past the gate.
     extra_routes: Vec<ExtraRoute>,
     /// The object store behind the registered `wafer-run/storage` block, when
     /// a constructor installed one. Kept so [`Self::storage_get`] and
@@ -320,7 +320,8 @@ impl TestContext {
     ///
     /// A request the router admits reaches its block from
     /// `impresspress/router`, not from nowhere; a test about that path uses
-    /// [`Self::dispatch`], which routes through the router's frame.
+    /// [`Self::dispatch_resolved`] or [`Self::request`], which route through
+    /// the router's frame.
     ///
     /// Every block it reaches through `call_block` is called by `block`, and
     /// every service op those calls make is authorized as `block` against
@@ -833,7 +834,7 @@ impl TestContext {
     }
 
     /// Register a route the way `ImpresspressBuilder::add_route` does, so
-    /// [`Self::dispatch`] routes through it.
+    /// [`Self::dispatch_resolved`] and [`Self::request`] route through it.
     pub fn add_extra_route(&mut self, route: ExtraRoute) {
         self.extra_routes.push(route);
     }
@@ -982,25 +983,33 @@ impl TestContext {
     }
 
     /// Route `msg` through [`crate::routing::route_to_block`] using this
-    /// context's registered `BlockInfo`s and extra routes.
+    /// context's registered `BlockInfo`s and extra routes, taking the
+    /// identity already on `msg` as resolved.
     ///
-    /// This is the whole request path a block sees in production minus the
-    /// pipeline's auth/CSRF preamble: in particular the router's access gate
-    /// runs, so a test can assert that an admin-only route rejects an
-    /// anonymous or non-admin caller without the block containing any
-    /// role check of its own.
-    pub async fn dispatch(&self, msg: Message) -> OutputStream {
-        self.dispatch_with_input(msg, InputStream::empty()).await
+    /// The layer BELOW the request preamble: nothing here reads a credential.
+    /// The `auth.*` meta [`auth_msg`] / [`admin_msg`] inject is believed as
+    /// it stands, the pipeline's JWT/API-key check never runs, and neither
+    /// does the CSRF origin policy. What does run is the router's access
+    /// gate, so a test of a block's behaviour behind the gate — or of the
+    /// gate given a caller — belongs here. A test about who a request IS —
+    /// a token, a cookie, an API key, a revocation, a cross-site form — uses
+    /// [`Self::request`], which resolves the caller the way production does.
+    pub async fn dispatch_resolved(&self, msg: Message) -> OutputStream {
+        self.dispatch_resolved_with_input(msg, InputStream::empty())
+            .await
     }
 
-    /// [`Self::dispatch`] for a request that carries a body.
+    /// [`Self::dispatch_resolved`] for a request that carries a body.
     ///
-    /// `dispatch` exists for the reads; a `POST`/`PATCH` handler reads its
-    /// body off the `InputStream`, which `dispatch` hands it empty. Routing a
-    /// write by calling the block's `handle()` directly would skip the
-    /// router's access gate — the very thing `dispatch` exists to exercise —
-    /// so the body belongs on this path, not on a second one.
-    pub async fn dispatch_with_input(&self, msg: Message, input: InputStream) -> OutputStream {
+    /// A `POST`/`PATCH` handler reads its body off the `InputStream`, which
+    /// `dispatch_resolved` hands it empty. Routing a write by calling the
+    /// block's `handle()` directly would skip the router's access gate, so
+    /// the body belongs on this path, not on a second one.
+    pub async fn dispatch_resolved_with_input(
+        &self,
+        msg: Message,
+        input: InputStream,
+    ) -> OutputStream {
         // Routed from the router's frame, not the fixture's block identity —
         // see [`Self::as_router`].
         let router = self.as_router();
@@ -1015,12 +1024,163 @@ impl TestContext {
         .await
     }
 
-    /// [`Self::dispatch_with_input`] with `body` serialized as the JSON
-    /// request body.
-    pub async fn dispatch_json<T: serde::Serialize>(&self, msg: Message, body: &T) -> OutputStream {
+    /// [`Self::dispatch_resolved_with_input`] with `body` serialized as the
+    /// JSON request body.
+    pub async fn dispatch_resolved_json<T: serde::Serialize>(
+        &self,
+        msg: Message,
+        body: &T,
+    ) -> OutputStream {
         let bytes = serde_json::to_vec(body).expect("serialize test request body");
-        self.dispatch_with_input(msg, InputStream::from_bytes(bytes))
+        self.dispatch_resolved_with_input(msg, InputStream::from_bytes(bytes))
             .await
+    }
+
+    /// Send `msg` through the production request path: the router block's
+    /// own [`crate::blocks::router::ImpresspressRouterBlock`] `handle`, built
+    /// over this fixture's `BlockInfo`s and extra routes the way
+    /// `builder::registration` builds it.
+    ///
+    /// That is the whole preamble a deployment runs before any block: the
+    /// router picks the credential off the `Authorization` header or the
+    /// `auth_token` cookie and records which, then
+    /// [`crate::pipeline::handle_request`] verifies it — a JWT's signature,
+    /// issuer, blocklist entry and `auth_version`; an API key's row, owner
+    /// and roles — writes the `auth.*` meta from what verified, applies the
+    /// CSRF origin policy to a cookie-authenticated write, routes, and logs.
+    ///
+    /// `msg` carries what the wire carries — `req.*` and `http.header.*`
+    /// meta, as [`anon_msg`] builds and [`Session::bearer`] /
+    /// [`Session::cookie`] / [`api_key_header`] extend. A message that
+    /// already carries `auth.*` meta is refused with a panic: the adapters
+    /// never produce one, and a test that pre-resolved its caller is about
+    /// the layer [`Self::dispatch_resolved`] drives.
+    ///
+    /// The router verifies against this fixture's
+    /// `WAFER_RUN__AUTH__JWT_SECRET`, as the builder hands it the booted
+    /// config's; [`Self::with_sign_in_added`] sets it to the secret the
+    /// registered crypto block signs with.
+    pub async fn request(&self, msg: Message) -> OutputStream {
+        self.request_with_input(msg, InputStream::empty()).await
+    }
+
+    /// [`Self::request`] for a request that carries a body.
+    pub async fn request_with_input(&self, msg: Message, input: InputStream) -> OutputStream {
+        if let Some(injected) = msg.meta.iter().find(|m| m.key.starts_with("auth.")) {
+            panic!(
+                "TestContext::request sends what the wire carries, and {:?} is not \
+                 something a client can send: the pipeline writes the auth.* meta. \
+                 Authenticate with a Session or an API key, or use dispatch_resolved \
+                 for a test about the layer below the preamble.",
+                injected.key
+            );
+        }
+        let jwt_secret = self
+            .config
+            .get(crate::blocks::auth::JWT_SECRET_KEY)
+            .cloned()
+            .unwrap_or_default();
+        let router = crate::blocks::router::ImpresspressRouterBlock::with_extra_routes(
+            Arc::new(std::sync::RwLock::new(jwt_secret)),
+            Arc::new(crate::features::AllEnabled),
+            self.block_infos.clone(),
+            self.extra_routes.clone(),
+        );
+        router.handle(&self.as_router(), msg, input).await
+    }
+
+    /// [`Self::request_with_input`] with `body` serialized as the JSON
+    /// request body.
+    pub async fn request_json<T: serde::Serialize>(&self, msg: Message, body: &T) -> OutputStream {
+        let bytes = serde_json::to_vec(body).expect("serialize test request body");
+        self.request_with_input(msg, InputStream::from_bytes(bytes))
+            .await
+    }
+
+    /// Make this fixture able to sign people in the way a deployment does:
+    /// a real `wafer-run/crypto` block, `WAFER_RUN__AUTH__JWT_SECRET` set to
+    /// the secret it signs with — one secret for signing, verifying and the
+    /// CSRF form token, as `builder::registration` wires one — and the
+    /// production `impresspress/auth-ui` block registered, so
+    /// [`Self::sign_in`] and [`Session::create_api_key`] reach its real
+    /// routes through [`Self::request`].
+    ///
+    /// PRECONDITION: auth's migrations have run ([`Self::with_auth`] or
+    /// [`Self::with_auth_added`]).
+    pub fn with_sign_in_added(mut self) -> Self {
+        self.register_block(
+            "wafer-run/crypto",
+            Arc::new(wafer_core::service_blocks::crypto::CryptoBlock::new(
+                Arc::new(real_crypto_service()),
+            )),
+        );
+        self.set_config(crate::blocks::auth::JWT_SECRET_KEY, CRYPTO_BLOCK_JWT_SECRET);
+        self.register_block(
+            crate::blocks::auth_ui::AUTH_UI_BLOCK_ID,
+            Arc::new(crate::blocks::auth_ui::AuthUiBlock::new()),
+        );
+        self
+    }
+
+    /// Seed an account that can sign in with `password`: a user row whose
+    /// inline role is `role`, and a password credential hashed by the
+    /// registered crypto block. Returns the user id.
+    ///
+    /// Staged as fixture data; the credential it yields is minted by
+    /// [`Self::sign_in`], through the login route.
+    pub async fn seed_account(&self, email: &str, password: &str, role: &str) -> String {
+        let fixture = self.fixture();
+        let user = seed_user(email).role(role).insert(&fixture).await;
+        let hash = wafer_core::clients::crypto::hash(&fixture, password)
+            .await
+            .expect("hash the fixture password");
+        crate::blocks::auth::repo::local_credentials::insert(&fixture, &user.id, &hash, false)
+            .await
+            .expect("seed the fixture password");
+        user.id
+    }
+
+    /// Sign in through `POST /b/auth/api/login` over [`Self::request`] and
+    /// keep what the response hands a client: the access token from the body
+    /// and the `auth_token` cookie from its `Set-Cookie`.
+    ///
+    /// Needs [`Self::with_sign_in_added`] and an account from
+    /// [`Self::seed_account`]; panics unless the login answers 200.
+    pub async fn sign_in(&self, email: &str, password: &str) -> Session {
+        let mut msg = anon_msg("create", "/b/auth/api/login");
+        msg.set_meta(wafer_block::meta::META_REQ_CLIENT_IP, "203.0.113.50");
+        let out = self
+            .request_json(
+                msg,
+                &serde_json::json!({ "email": email, "password": password }),
+            )
+            .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+        assert_eq!(parts.status, 200, "sign-in as {email} failed: {body}");
+        let cookie = parts
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .find_map(|(_, value)| {
+                value
+                    .split(';')
+                    .next()
+                    .and_then(|pair| pair.trim().strip_prefix("auth_token="))
+                    .map(str::to_string)
+            })
+            .expect("the login response sets the auth_token cookie");
+        Session {
+            user_id: body["user"]["id"]
+                .as_str()
+                .expect("the login response names the user")
+                .to_string(),
+            access_token: body["access_token"]
+                .as_str()
+                .expect("the login response carries an access token")
+                .to_string(),
+            cookie,
+        }
     }
 
     /// Install a `wafer-run/config` service block seeded the way a real boot
@@ -3248,6 +3408,65 @@ impl wafer_run::runtime::call_gates::CallFrame for TestContext {
     fn unknown_interface(&self, _resolved: &str, _interface: &str) {}
 }
 
+/// A signed-in session, as [`TestContext::sign_in`] took it off a real login
+/// response. Attach it to a wire message with [`Self::bearer`] or
+/// [`Self::cookie`] and send that through [`TestContext::request`].
+#[derive(Clone, Debug)]
+pub struct Session {
+    /// The signed-in user's id, as the login response named it.
+    pub user_id: String,
+    /// The access token from the login response body.
+    pub access_token: String,
+    /// The `auth_token` cookie value from the login response's `Set-Cookie`.
+    pub cookie: String,
+}
+
+impl Session {
+    /// `msg` with this session's access token in an `Authorization: Bearer`
+    /// header — how an API client presents it, and a credential the CSRF
+    /// origin policy exempts.
+    pub fn bearer(&self, mut msg: Message) -> Message {
+        msg.set_meta(
+            "http.header.authorization",
+            format!("Bearer {}", self.access_token),
+        );
+        msg
+    }
+
+    /// `msg` with this session's `auth_token` cookie — how a browser presents
+    /// it, and what the CSRF origin policy guards.
+    pub fn cookie(&self, mut msg: Message) -> Message {
+        msg.set_meta("http.header.cookie", format!("auth_token={}", self.cookie));
+        msg
+    }
+
+    /// Create an API key through `POST /b/auth/api/api-keys` over
+    /// [`TestContext::request`], as this session, and return the raw key the
+    /// response reveals once. Present it with [`api_key_header`].
+    pub async fn create_api_key(&self, ctx: &TestContext, name: &str) -> String {
+        let out = ctx
+            .request_json(
+                self.bearer(anon_msg("create", "/b/auth/api/api-keys")),
+                &serde_json::json!({ "name": name }),
+            )
+            .await;
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+        assert_eq!(parts.status, 200, "API key creation failed: {body}");
+        body["key"]
+            .as_str()
+            .expect("the create response reveals the key")
+            .to_string()
+    }
+}
+
+/// `msg` with `key` in an `Authorization: ApiKey` header — the form
+/// `pipeline::handle_request` resolves through the API-key table.
+pub fn api_key_header(mut msg: Message, key: &str) -> Message {
+    msg.set_meta("http.header.authorization", format!("ApiKey {key}"));
+    msg
+}
+
 /// Build an anonymous request `Message`. No `auth.user_id` meta set.
 pub fn anon_msg(action: &str, path: &str) -> Message {
     let mut m = Message::new("http.request");
@@ -4802,7 +5021,9 @@ mod tests {
             crate::routing::RouteAccess::Public,
         ));
 
-        let out = ctx.dispatch(anon_msg("retrieve", "/b/reader")).await;
+        let out = ctx
+            .dispatch_resolved(anon_msg("retrieve", "/b/reader"))
+            .await;
         match out.collect_buffered().await {
             Err(TerminalNotResponse::Error(e)) => {
                 assert_eq!(e.code, ErrorCode::PermissionDenied, "{e:?}");

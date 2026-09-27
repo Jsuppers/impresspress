@@ -919,7 +919,7 @@ mod outbound_mail_wiring_tests {
                 .expect("serialize body");
             bodies.push(
                 output_json(
-                    ctx.dispatch_with_input(msg, InputStream::from_bytes(body))
+                    ctx.dispatch_resolved_with_input(msg, InputStream::from_bytes(body))
                         .await,
                 )
                 .await,
@@ -979,7 +979,7 @@ mod oauth_start_limit_tests {
         let budget = RateLimit::AUTH.max_requests as usize;
         for n in 0..budget {
             let status = output_http_status(
-                ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                ctx.dispatch_resolved_with_input(start_msg(), InputStream::empty())
                     .await,
             )
             .await;
@@ -989,7 +989,7 @@ mod oauth_start_limit_tests {
             );
         }
         let status = output_http_status(
-            ctx.dispatch_with_input(start_msg(), InputStream::empty())
+            ctx.dispatch_resolved_with_input(start_msg(), InputStream::empty())
                 .await,
         )
         .await;
@@ -1015,14 +1015,14 @@ mod oauth_start_limit_tests {
 
         for _ in 0..=RateLimit::AUTH.max_requests {
             output_http_status(
-                ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                ctx.dispatch_resolved_with_input(start_msg(), InputStream::empty())
                     .await,
             )
             .await;
         }
         assert_eq!(
             output_http_status(
-                ctx.dispatch_with_input(start_msg(), InputStream::empty())
+                ctx.dispatch_resolved_with_input(start_msg(), InputStream::empty())
                     .await,
             )
             .await,
@@ -1038,7 +1038,7 @@ mod oauth_start_limit_tests {
         }))
         .expect("serialize body");
         let status = output_http_status(
-            ctx.dispatch_with_input(login, InputStream::from_bytes(body))
+            ctx.dispatch_resolved_with_input(login, InputStream::from_bytes(body))
                 .await,
         )
         .await;

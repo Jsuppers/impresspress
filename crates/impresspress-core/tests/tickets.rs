@@ -548,7 +548,7 @@ async fn analyses_posted_through_the_route_are_append_only() {
     let mut posted = Vec::new();
     for (summary, priority) in [("First pass", "high"), ("Second pass", "low")] {
         let out = ctx
-            .dispatch_json(
+            .dispatch_resolved_json(
                 admin_msg("create", &path),
                 &serde_json::json!({
                     "source": "triage-agent",
@@ -575,7 +575,7 @@ async fn analyses_posted_through_the_route_are_append_only() {
         );
     }
 
-    let listed = output_json(ctx.dispatch(admin_msg("retrieve", &path)).await).await;
+    let listed = output_json(ctx.dispatch_resolved(admin_msg("retrieve", &path)).await).await;
     let records = listed["records"].as_array().expect("records array");
     assert_eq!(records.len(), 2, "both analyses are kept: {listed}");
     let first = records

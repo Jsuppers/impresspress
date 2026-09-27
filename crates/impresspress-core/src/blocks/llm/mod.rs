@@ -1309,16 +1309,28 @@ mod access_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_support::{admin_msg, auth_msg, output_http_status, output_json, TestContext};
+    use crate::test_support::{anon_msg, output_http_status, output_json, Session, TestContext};
 
-    /// A context that routes `/b/llm/*` to the real block.
+    /// A context that routes `/b/llm/*` to the real block and can sign people
+    /// in, so each request below presents a real token.
     async fn ctx() -> TestContext {
-        let mut ctx = TestContext::with_llm().await;
+        let mut ctx = TestContext::with_llm()
+            .await
+            .with_auth_added()
+            .await
+            .with_sign_in_added();
         ctx.register_block(
             "impresspress/llm",
             Arc::new(LlmBlock::new(Arc::new(provider_admin::NoopProviderAdmin))),
         );
         ctx
+    }
+
+    async fn signed_in(ctx: &TestContext, role: &str) -> Session {
+        let email = format!("{role}@example.com");
+        ctx.seed_account(&email, "correct-horse-battery-staple", role)
+            .await;
+        ctx.sign_in(&email, "correct-horse-battery-staple").await
     }
 
     fn override_body(thread_id: &str) -> InputStream {
@@ -1337,16 +1349,17 @@ mod access_tests {
     /// any thread — one they cannot even read — to any configured backend.
     /// The write is admin-only, enforced by the router.
     ///
-    /// Driven through `dispatch` (i.e. `routing::route_to_block`), so the
-    /// access gate is the one production runs.
+    /// Driven through `TestContext::request` with a real token, so both the
+    /// credential check and the access gate are the ones production runs.
     #[tokio::test]
     async fn a_non_admin_cannot_pin_a_thread_to_a_backend() {
         let ctx = ctx().await;
+        let member = signed_in(&ctx, "user").await;
 
         assert_eq!(
             output_http_status(
-                ctx.dispatch_with_input(
-                    auth_msg("create", "/b/llm/api/config", "u-not-admin"),
+                ctx.request_with_input(
+                    member.bearer(anon_msg("create", "/b/llm/api/config")),
                     override_body("someone-elses-thread"),
                 )
                 .await
@@ -1369,10 +1382,12 @@ mod access_tests {
     #[tokio::test]
     async fn a_non_admin_cannot_delete_an_override() {
         let ctx = ctx().await;
+        let admin = signed_in(&ctx, "admin").await;
+        let member = signed_in(&ctx, "user").await;
 
         let created = output_json(
-            ctx.dispatch_with_input(
-                admin_msg("create", "/b/llm/api/config"),
+            ctx.request_with_input(
+                admin.bearer(anon_msg("create", "/b/llm/api/config")),
                 override_body("t1"),
             )
             .await,
@@ -1382,12 +1397,8 @@ mod access_tests {
 
         assert_eq!(
             output_http_status(
-                ctx.dispatch(auth_msg(
-                    "delete",
-                    &format!("/b/llm/api/config/{id}"),
-                    "u-not-admin",
-                ))
-                .await
+                ctx.request(member.bearer(anon_msg("delete", &format!("/b/llm/api/config/{id}"),)))
+                    .await
             )
             .await,
             403,
@@ -1409,9 +1420,10 @@ mod access_tests {
     #[tokio::test]
     async fn the_config_read_is_still_open_to_any_logged_in_caller() {
         let ctx = ctx().await;
+        let member = signed_in(&ctx, "user").await;
         assert_eq!(
             output_http_status(
-                ctx.dispatch(auth_msg("retrieve", "/b/llm/api/config", "u-not-admin"))
+                ctx.request(member.bearer(anon_msg("retrieve", "/b/llm/api/config")))
                     .await
             )
             .await,
