@@ -5963,3 +5963,155 @@ async fn every_product_write_refuses_a_slug_outside_the_grammar() {
         assert_eq!(body["slug"], slug, "{slug:?} must be accepted: {body}");
     }
 }
+
+/// Store `slug` on product `id` beneath the API's check, as a row written
+/// before the grammar was enforced (or restored from a data snapshot) has it.
+async fn store_legacy_slug(ctx: &crate::test_support::TestContext, id: &str, slug: &str) {
+    super::super::repo::products::update_live(
+        ctx,
+        id,
+        HashMap::from([("slug".to_string(), serde_json::json!(slug))]),
+    )
+    .await
+    .expect("store the legacy slug");
+}
+
+/// A stored slug outside the grammar does not lock its product: the edit
+/// form sends the slug back with every save, and an update that leaves it
+/// unchanged is accepted on both tiers. Changing it is held to the grammar,
+/// including changing it to a different invalid value.
+#[tokio::test]
+async fn an_unchanged_legacy_slug_does_not_block_an_edit() {
+    let ctx = user_products_ctx().await;
+    let (create, create_input) = admin_create_msg(
+        "/b/products/api/admin/products",
+        serde_json::json!({ "name": "Admin shirt" }),
+    );
+    let admin_id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (create, create_input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({ "name": "Seller shirt" }),
+    );
+    let seller_id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    store_legacy_slug(&ctx, &admin_id, "My Shirt").await;
+    store_legacy_slug(&ctx, &seller_id, "My Shirt").await;
+
+    let admin_patch = |body: serde_json::Value| {
+        let (mut msg, input) = request_msg(
+            "update",
+            &format!("/b/products/api/admin/products/{admin_id}"),
+            "admin_1",
+            body,
+        );
+        msg.set_meta("auth.user_roles", "admin");
+        (msg, input)
+    };
+    let seller_patch = |body: serde_json::Value| {
+        update_msg(
+            &format!("/b/products/api/products/{seller_id}"),
+            "user_1",
+            body,
+        )
+    };
+
+    // What the manager form sends: every field, the slug unchanged.
+    for (tier, (msg, input)) in [
+        (
+            "admin",
+            admin_patch(serde_json::json!({ "name": "Renamed", "slug": "My Shirt" })),
+        ),
+        (
+            "seller",
+            seller_patch(serde_json::json!({ "name": "Renamed", "slug": "My Shirt" })),
+        ),
+    ] {
+        let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(body["name"], "Renamed", "{tier}: {body}");
+        assert_eq!(body["slug"], "My Shirt", "{tier}: {body}");
+    }
+
+    for (tier, (msg, input)) in [
+        (
+            "admin",
+            admin_patch(serde_json::json!({ "slug": "Other Shirt" })),
+        ),
+        (
+            "seller",
+            seller_patch(serde_json::json!({ "slug": "Other Shirt" })),
+        ),
+    ] {
+        let message = invalid_argument_message(dispatch(&ctx, msg, input).await)
+            .await
+            .unwrap_or_else(|| panic!("{tier}: a changed slug is held to the grammar"));
+        assert!(message.contains("slug"), "{tier}: {message}");
+    }
+
+    for (tier, (msg, input)) in [
+        (
+            "admin",
+            admin_patch(serde_json::json!({ "slug": "my-shirt" })),
+        ),
+        (
+            "seller",
+            seller_patch(serde_json::json!({ "slug": "my-shirt" })),
+        ),
+    ] {
+        let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+        assert_eq!(body["slug"], "my-shirt", "{tier}: {body}");
+    }
+}
+
+/// A duplicate writes its slug without the API's check, so the slug has to
+/// be valid by construction — from a legacy source slug, and from one whose
+/// cut for the `-copy-` suffix lands just after a hyphen.
+#[tokio::test]
+async fn a_duplicates_slug_is_always_in_the_grammar() {
+    use super::super::contracts::{check_product_slug, PRODUCT_SLUG_MAX_LEN};
+
+    let ctx = ctx().await;
+    let hyphen_at_cut = format!("{}-{}", "a".repeat(145), "b".repeat(14));
+    let hyphen_at_140 = format!("{}-{}", "a".repeat(139), "b".repeat(20));
+    assert_eq!(check_product_slug(&hyphen_at_cut), Ok(()));
+    assert_eq!(check_product_slug(&hyphen_at_140), Ok(()));
+    for (stored, expected_base) in [
+        ("My Shirt", "my-shirt".to_string()),
+        ("--", "product".to_string()),
+        (hyphen_at_cut.as_str(), "a".repeat(145)),
+        (
+            hyphen_at_140.as_str(),
+            format!("{}-{}", "a".repeat(139), "b".repeat(6)),
+        ),
+    ] {
+        let (create, create_input) = admin_create_msg(
+            "/b/products/api/admin/products",
+            serde_json::json!({ "name": "Source" }),
+        );
+        let id = output_to_json(dispatch(&ctx, create, create_input).await).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store_legacy_slug(&ctx, &id, stored).await;
+
+        let (msg, input) = admin_create_msg(
+            &format!("/b/products/api/admin/products/{id}/duplicate"),
+            serde_json::json!({}),
+        );
+        let duplicated = output_to_json(dispatch(&ctx, msg, input).await).await;
+        let slug = duplicated["product"]["slug"]
+            .as_str()
+            .unwrap_or_else(|| panic!("duplicate of {stored:?}: {duplicated}"));
+        assert_eq!(check_product_slug(slug), Ok(()), "{stored:?} -> {slug:?}");
+        assert!(slug.len() <= PRODUCT_SLUG_MAX_LEN, "{slug:?}");
+        assert!(
+            slug.starts_with(&format!("{expected_base}-copy-")),
+            "{stored:?} -> {slug:?}"
+        );
+    }
+}

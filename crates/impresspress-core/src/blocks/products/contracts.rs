@@ -2155,6 +2155,22 @@ pub fn check_product_slug(slug: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `value` brought into the product slug grammar, at most `max_len` bytes:
+/// ASCII letters lowercased, every run of anything else one hyphen, no
+/// hyphen at either end. Empty when `value` has no ASCII letter or digit.
+pub fn slug_from(value: &str, max_len: usize) -> String {
+    let mut slug = String::new();
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.truncate(max_len);
+    slug.trim_end_matches('-').to_string()
+}
+
 // The write requests are closed field lists too, and that is the point: the
 // column-map path they replace wrote every key it was sent. On the seller
 // create path that included `seller_account_id`, `stripe_product_id`,
@@ -2220,12 +2236,6 @@ impl CreateProductRequest {
     pub fn into_columns(self) -> HashMap<String, Value> {
         columns(&self)
     }
-
-    /// Refuse a request whose fields break a rule the column type cannot
-    /// state; the message names the field.
-    pub fn check(&self) -> Result<(), String> {
-        self.slug.as_deref().map_or(Ok(()), check_product_slug)
-    }
 }
 
 /// `PATCH /b/products/api/admin/products/{id}` and
@@ -2281,12 +2291,6 @@ impl UpdateProductRequest {
     /// The columns this request writes: only the fields that were sent.
     pub fn into_columns(self) -> HashMap<String, Value> {
         columns(&self)
-    }
-
-    /// Refuse a request whose fields break a rule the column type cannot
-    /// state; the message names the field.
-    pub fn check(&self) -> Result<(), String> {
-        self.slug.as_deref().map_or(Ok(()), check_product_slug)
     }
 }
 

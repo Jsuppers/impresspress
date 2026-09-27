@@ -18,8 +18,9 @@ use crate::{
         products::{
             config::{DEFAULT_CURRENCY, SELLER_MODERATION_REQUIRED},
             contracts::{
-                ApprovalStatus, CreateProductRequest, ProductDuplicateResponse, ProductListQuery,
-                ProductListResponse, ProductStatus, ProductView, UpdateProductRequest,
+                check_product_slug, slug_from, ApprovalStatus, CreateProductRequest,
+                ProductDuplicateResponse, ProductListQuery, ProductListResponse, ProductStatus,
+                ProductView, UpdateProductRequest, PRODUCT_SLUG_MAX_LEN,
             },
             repo::{self, offers as offer_repo},
         },
@@ -288,27 +289,8 @@ async fn create_product_row(
     repo::products::get(ctx, &created.id).await
 }
 
-/// A product write body: what [`read_write_body`] decodes and checks.
-trait ProductWriteBody: serde::de::DeserializeOwned {
-    fn check(&self) -> Result<(), String>;
-}
-
-impl ProductWriteBody for CreateProductRequest {
-    fn check(&self) -> Result<(), String> {
-        CreateProductRequest::check(self)
-    }
-}
-
-impl ProductWriteBody for UpdateProductRequest {
-    fn check(&self) -> Result<(), String> {
-        UpdateProductRequest::check(self)
-    }
-}
-
 /// Read a caller-supplied write body once, refuse it if it names an internal
-/// column, and only then project it onto the typed request `T` and refuse it
-/// if a field breaks its rule (`T::check`: the slug grammar). Every admin and
-/// seller create and update reads its body here, so none skips the check.
+/// column, and only then project it onto the typed request `T`.
 ///
 /// Both halves are load-bearing and neither subsumes the other. The typed
 /// request is what decides which columns a write may SET — an unsettable
@@ -324,7 +306,9 @@ impl ProductWriteBody for UpdateProductRequest {
 /// is inserted, for the reason given above `reject_unsettable_fields`:
 /// handlers that legitimately write one of these fields do so afterwards
 /// from their own computed value.
-async fn read_write_body<T: ProductWriteBody>(input: InputStream) -> Result<T, OutputStream> {
+async fn read_write_body<T: serde::de::DeserializeOwned>(
+    input: InputStream,
+) -> Result<T, OutputStream> {
     let raw = input
         .collect_to_bytes()
         .await
@@ -332,12 +316,53 @@ async fn read_write_body<T: ProductWriteBody>(input: InputStream) -> Result<T, O
     let named: HashMap<String, serde_json::Value> =
         serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
     reject_unsettable_fields(&named)?;
-    let request: T =
-        serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))?;
-    request
-        .check()
-        .map_err(|message| err_bad_request(&message))?;
-    Ok(request)
+    serde_json::from_slice(&raw).map_err(|e| err_bad_request(&format!("Invalid body: {e}")))
+}
+
+/// The row a product write replaces, for [`refuse_new_invalid_slug`].
+enum SlugOwner<'a> {
+    /// A create: there is no stored slug.
+    New,
+    /// An update of this row, already read by the handler.
+    Row(&'a db::Record),
+    /// An update of the row with this id, read only if it is needed.
+    Id(&'a str),
+}
+
+/// Refuse a write that sets a slug outside the grammar
+/// ([`check_product_slug`]), with a 400 that states it.
+///
+/// An update that sends back the slug its row already holds sets nothing,
+/// so it is accepted whatever that slug is. A stored slug can break the
+/// grammar — the column accepted any text until the API enforced it, and a
+/// data-snapshot import restores rows as they were exported — and the edit
+/// form sends the slug with every save. Refusing it would make the product
+/// uneditable until it was renamed, and renaming changes its public address.
+/// The row is read only when the sent slug breaks the grammar.
+async fn refuse_new_invalid_slug(
+    ctx: &dyn Context,
+    slug: Option<&str>,
+    owner: SlugOwner<'_>,
+) -> Result<(), OutputStream> {
+    let Some(slug) = slug else {
+        return Ok(());
+    };
+    let Err(message) = check_product_slug(slug) else {
+        return Ok(());
+    };
+    let unchanged = match owner {
+        SlugOwner::New => false,
+        SlugOwner::Row(row) => row.str_field("slug") == slug,
+        SlugOwner::Id(id) => match repo::products::get(ctx, id).await {
+            Ok(row) => row.str_field("slug") == slug,
+            Err(e) => return Err(crud::db_error(e, "Product not found", "Database error")),
+        },
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(err_bad_request(&message))
+    }
 }
 
 /// Fetch a product and verify the caller may act on it ([`is_owned_by`]),
@@ -434,6 +459,11 @@ pub(super) async fn handle_create_product(
         Ok(request) => request,
         Err(response) => return response,
     };
+    if let Err(response) =
+        refuse_new_invalid_slug(ctx, request.slug.as_deref(), SlugOwner::New).await
+    {
+        return response;
+    }
     let mut data = request.into_columns();
     stamp_created(&mut data);
     // `or_insert`, and it always inserts: none of these five is a field of
@@ -474,6 +504,11 @@ pub(super) async fn handle_update_product(
         Ok(request) => request,
         Err(response) => return response,
     };
+    if let Err(response) =
+        refuse_new_invalid_slug(ctx, request.slug.as_deref(), SlugOwner::Id(id)).await
+    {
+        return response;
+    }
     let mut data = request.into_columns();
     stamp_updated(&mut data);
     // A soft-deleted product must go through `restore` before it is editable
@@ -759,12 +794,21 @@ fn copied_name(source: &wafer_core::clients::database::Record) -> String {
     format!("{base} copy")
 }
 
+/// The copy's slug: the source's, brought into the grammar
+/// ([`slug_from`]) and cut short enough for the `-copy-` suffix, or
+/// `product` when nothing of it survives. Valid whatever the source holds,
+/// because the duplicate writes it without [`refuse_new_invalid_slug`].
 fn copied_slug(source: &wafer_core::clients::database::Record) -> String {
-    let base = source.str_field("slug");
-    let base = if base.is_empty() { "product" } else { base };
-    let base = base.chars().take(140).collect::<String>();
-    let suffix = uuid::Uuid::now_v7().to_string();
-    format!("{base}-copy-{}", &suffix[..8])
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let suffix = &suffix[suffix.len() - 8..];
+    let tail = format!("-copy-{suffix}");
+    let base = slug_from(source.str_field("slug"), PRODUCT_SLUG_MAX_LEN - tail.len());
+    let base = if base.is_empty() {
+        "product".to_string()
+    } else {
+        base
+    };
+    format!("{base}{tail}")
 }
 
 async fn duplicate_product(ctx: &dyn Context, msg: &Message, owner_only: bool) -> OutputStream {
@@ -959,6 +1003,11 @@ pub(super) async fn handle_user_create_product(
         Ok(request) => request,
         Err(response) => return response,
     };
+    if let Err(response) =
+        refuse_new_invalid_slug(ctx, request.slug.as_deref(), SlugOwner::New).await
+    {
+        return response;
+    }
     if let Err(response) = seller_policy::ensure_product_capacity(ctx, &user_id).await {
         return response;
     }
@@ -1071,6 +1120,11 @@ pub(super) async fn handle_user_update_product(
         Ok(request) => request,
         Err(response) => return response,
     };
+    if let Err(response) =
+        refuse_new_invalid_slug(ctx, request.slug.as_deref(), SlugOwner::Row(&current)).await
+    {
+        return response;
+    }
     // The ownership, moderation and provider columns the untyped path had to
     // strip here are not fields of `UpdateProductRequest`, so they cannot
     // arrive; `read_write_body` above is what REFUSES a body naming one
