@@ -13,8 +13,8 @@ use crate::{
             contracts::{
                 ApprovalStatus, FulfillmentKind, GuestOrderStatus, MoneyBreakdown, OrderStatus,
                 PricingPreviewRequest, ProductStatus, ReconciliationStatus, StorefrontConfig,
-                StorefrontOffer, StorefrontProduct, StripeMode, VariableVisibility,
-                COMMERCE_SCHEMA_VERSION,
+                StorefrontOffer, StorefrontProduct, StripeMode, SubscriptionStatus,
+                VariableVisibility, COMMERCE_SCHEMA_VERSION,
             },
             offer_pricing,
             repo::{offers, payment_links, products, purchases},
@@ -130,10 +130,14 @@ pub(crate) async fn handle_guest_order_status(ctx: &dyn Context, msg: &Message) 
             Ok(currency) => currency,
             Err(error) => return err_internal("Order has invalid currency", error),
         };
-    let subscription_status = optional_nonempty(&order, "subscription_status");
-    let state = OrderStatus::from_record(&order)
-        .and_then(|status| Ok((status, ReconciliationStatus::from_record(&order)?)));
-    let (status, reconciliation_status) = match state {
+    let state = OrderStatus::from_record(&order).and_then(|status| {
+        Ok((
+            status,
+            ReconciliationStatus::from_record(&order)?,
+            SubscriptionStatus::from_record(&order)?,
+        ))
+    });
+    let (status, reconciliation_status, subscription_status) = match state {
         Ok(state) => state,
         Err(error) => return err_internal("Order row is outside the contract", error),
     };

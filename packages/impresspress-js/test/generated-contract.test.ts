@@ -9,6 +9,10 @@ import type {
 import type { Extension, ShareRecord } from "../src/services/extensions.service";
 import type { CloudStorageExtension } from "../src/services/extensions.service";
 import type {
+  GuestOrderStatus,
+  PlatformSubscriptionResponse,
+} from "../src/services/extensions.service";
+import type {
   IAMRole,
   IAMRoleListResponse,
   IAMRoleUpdateResponse,
@@ -108,6 +112,16 @@ type _BucketListFits = ServerFits<
   Json200<"/b/storage/api/buckets", "get">
 >;
 
+// ── products ──────────────────────────────────────────────────────────────
+type _GuestOrderStatusFits = ServerFits<
+  GuestOrderStatus,
+  Json200<"/b/products/orders/{id}/status", "get">
+>;
+type _SubscriptionFits = ServerFits<
+  PlatformSubscriptionResponse,
+  Json200<"/b/products/subscription", "get">
+>;
+
 /**
  * The type-level assertions above are the real content of this file; the
  * runtime cases below only stop a bundler or a future `skipLibCheck` sweep
@@ -133,6 +147,8 @@ describe("the SDK's exported types accept what the server publishes", () => {
       | _QuotaFits
       | _ShareCreatedFits
       | _BucketListFits
+      | _GuestOrderStatusFits
+      | _SubscriptionFits
     > = [];
     expect(witnesses).toHaveLength(0);
   });

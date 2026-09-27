@@ -291,9 +291,12 @@ impl RecordExt for Record {
 /// as [`ErrorCode::Internal`](wafer_run::ErrorCode::Internal) naming the row,
 /// the column and the value — the three things an operator needs to go and
 /// look at the row — and is never mapped onto a variant. An absent column, a
-/// SQL `NULL` and an empty string all read as `""`, which is not a variant of
-/// anything, so all three are refused here; a column that legitimately holds
-/// `""` wants [`enum_column_or`] and a typed fallback.
+/// SQL `NULL` and an empty string all read as `""`. That is refused unless
+/// `T` names `""` as a variant (`#[serde(rename = "")]`), which an enum does
+/// when its column's `NOT NULL DEFAULT ''` is itself a state, e.g.
+/// `products::contracts::SubscriptionStatus::Unset`. A column that is empty
+/// on some rows without `""` being a state of its enum wants
+/// [`enum_column_or`] and a typed fallback.
 pub fn enum_column<T: serde::de::DeserializeOwned>(
     record: &Record,
     column: &str,
@@ -1004,6 +1007,29 @@ mod tests {
             "colour"
         )
         .is_err());
+    }
+
+    /// An enum that names `""` as a variant reads the empty column as that
+    /// variant: the column default is one of its states, not missing data.
+    #[test]
+    fn enum_column_reads_an_empty_column_as_a_variant_named_empty() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Tint {
+            #[serde(rename = "")]
+            Unset,
+            #[serde(rename = "red")]
+            Red,
+        }
+        for empty in [serde_json::json!(""), serde_json::json!(null)] {
+            assert_eq!(
+                enum_column::<Tint>(&coloured(empty), "colour").unwrap(),
+                Tint::Unset
+            );
+        }
+        assert_eq!(
+            enum_column::<Tint>(&coloured(serde_json::json!("red")), "colour").unwrap(),
+            Tint::Red
+        );
     }
 
     /// The fallback is a typed variant, so a caller cannot supply a default
