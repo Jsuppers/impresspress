@@ -704,34 +704,7 @@ pub fn wrangler_secret_names(wrangler_toml: &Path) -> Result<Vec<String>> {
     super::password_hasher::parse_secret_names(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Set a worker secret via `wrangler secret put <NAME> --config <toml>`,
-/// piping the value on stdin (never as an argv arg, which would leak it into
-/// the process table). Stdout/stderr inherit so wrangler's own confirmation
-/// shows through. One-time provisioning helper behind `impresspress deploy secret`.
-pub fn wrangler_secret_put(wrangler_toml: &Path, name: &str, value: &str) -> Result<()> {
-    let mut child = Command::new("wrangler")
-        .args(["secret", "put", name, "--config"])
-        .arg(wrangler_toml)
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("spawn wrangler secret put")?;
-    child
-        .stdin
-        .take()
-        .context("wrangler secret put stdin unavailable")?
-        .write_all(value.as_bytes())
-        .context("write secret value to wrangler stdin")?;
-    let status = child.wait().context("wait for wrangler secret put")?;
-    if !status.success() {
-        bail!(
-            "wrangler secret put {name} failed (exit {:?})",
-            status.code()
-        );
-    }
-    Ok(())
-}
-
-/// Resolve a secret value for `impresspress deploy secret`: reuse a caller-provided
+/// Resolve a worker secret's value (see `first_create::resolve_worker_secrets`): reuse a caller-provided
 /// value (from the same-named env var) when present and non-empty, otherwise
 /// generate one by hex-encoding `random_bytes`. Returns `(value, generated)`
 /// where `generated` is `true` when the value was freshly minted (so the CLI

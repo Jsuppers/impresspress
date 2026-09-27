@@ -20,6 +20,39 @@ bundle that changes them. So whenever a release's code half assumes a data
 repair the migration half performs, it has to be called out here — on native
 the two ship together but only one of them runs by default.
 
+### Cloudflare: a new site deploys in one command
+
+**What changes.**
+
+- `impresspress deploy --target cloudflare` creates a site's main Worker
+  itself. Before it builds, it asks Cloudflare whether the Worker exists
+  (`wrangler deployments status`). When it does not, then after deploying the
+  password-hasher Worker it deploys a placeholder under the main Worker's name
+  that answers every request with a 503, sets `IMPRESSPRESS_DEPLOY_TOKEN` and
+  `WAFER_RUN__AUTH__JWT_SECRET` on it (each from the same-named environment
+  variable when set, otherwise generated), prints a generated deploy token
+  once with the `export` line later deploys need, and continues through
+  `/_deploy/prepare`, verification and promotion, which replaces the
+  placeholder. No plain `wrangler deploy` of either Worker and no
+  `impresspress deploy secret` is needed first any more.
+- A deploy to a Worker that exists still needs `IMPRESSPRESS_DEPLOY_TOKEN`,
+  and without it now stops before the build, naming the command that sets a
+  new one (`npx wrangler secret put IMPRESSPRESS_DEPLOY_TOKEN --name
+  <worker_name>`).
+- D1 runs 1,000 queries per invocation on Workers Free, not 50: a Free-plan
+  Worker runs a fresh database's `/_deploy/prepare`, over 250 D1 queries, in
+  one invocation, and the Workers limits page caps subrequests to internal
+  services (D1, KV, R2) at 1,000 on Free. D1's own limits page still says 50.
+  `/_deploy/prepare` applies every pending migration in one invocation, so a
+  new site whose `[cloudflare].d1_queries_per_invocation` was 50 could never
+  finish its first deploy.
+
+**Who has to act.** A Cloudflare deploy that set
+`d1_queries_per_invocation = 50` on the advice of the D1 statement budget
+note below: remove the line, so the Worker runs on the default 1000. Keep a
+lower value only if the Worker's `limits.subrequests` is below 1,000, and
+then no lower than a fresh database's migrations need. Nobody else.
+
 ### API: a request with no identity is 401, not 403
 
 **What changes.** An API call (any `Accept` that is not an HTML page) to a
@@ -136,11 +169,8 @@ build refuses them in its `[vars]`. They are the hasher's:
 
 **Who has to act.**
 
-- *A new site:* create the hasher before the main Worker's one-time first
-  `wrangler deploy`, since the binding names its script:
-  `npx wrangler deploy --config
-  target/impresspress-cloudflare/wrangler-password-hasher.toml`, then the main
-  Worker as before.
+- *A new site:* nothing; `impresspress deploy` creates the hasher, then the
+  main Worker (see "Cloudflare: a new site deploys in one command").
 - *An existing site without a pepper:* nothing; `impresspress deploy` creates
   the hasher on its first run.
 - *An existing site with a pepper:* the hasher must hold the keys before the

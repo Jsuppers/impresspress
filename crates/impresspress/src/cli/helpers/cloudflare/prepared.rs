@@ -31,6 +31,10 @@ enum TwoStageState {
     /// hasher is deployed, so the one it was built against must already be
     /// there.
     PasswordHasherDeployed,
+    /// The main Worker exists with its deploy secrets: already there, or just
+    /// created as a placeholder (`first_create`). The pepper check lists its
+    /// secrets and every upload targets it, so both need it to exist.
+    MainWorkerReady,
     /// Neither Worker's secrets leave the pepper behind on the main Worker
     /// (`password_hasher::check_pepper_placement`).
     PepperPlacementChecked,
@@ -68,9 +72,17 @@ impl TwoStageDeploymentGate {
         )
     }
 
-    pub fn pepper_placement_checked(&mut self) -> Result<()> {
+    pub fn main_worker_ready(&mut self) -> Result<()> {
         self.advance(
             TwoStageState::PasswordHasherDeployed,
+            TwoStageState::MainWorkerReady,
+            "main Worker creation check",
+        )
+    }
+
+    pub fn pepper_placement_checked(&mut self) -> Result<()> {
+        self.advance(
+            TwoStageState::MainWorkerReady,
             TwoStageState::PepperPlacementChecked,
             "pepper placement check",
         )
@@ -637,6 +649,8 @@ mod tests {
             gate.candidate_uploaded("candidate-1", "wasm-a").is_err(),
             "no main Worker version before the pepper's placement is checked"
         );
+        assert!(gate.pepper_placement_checked().is_err());
+        gate.main_worker_ready().unwrap();
         gate.pepper_placement_checked().unwrap();
         gate.candidate_uploaded("candidate-1", "wasm-a").unwrap();
         assert!(gate.final_uploaded("final-1", "wasm-a").is_err());

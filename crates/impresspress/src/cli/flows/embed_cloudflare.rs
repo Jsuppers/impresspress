@@ -6,7 +6,8 @@ use std::path::Path;
 use anyhow::{bail, Result};
 
 use crate::cli::helpers::cloudflare::{
-    assets, build as cf_build, deploy as cf_deploy, env, password_hasher, profile_check, wrangler,
+    assets, build as cf_build, deploy as cf_deploy, env, first_create, password_hasher,
+    profile_check, wrangler,
 };
 
 pub async fn build(repo_root: &Path, release: bool) -> Result<()> {
@@ -231,12 +232,19 @@ async fn wait_and_run_local_init(
 pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     let cfg = env::load(repo_root)?;
     let token_key = impresspress_core::config_vars::DEPLOY_TOKEN_KEY;
-    let deploy_token = std::env::var(token_key).map_err(|_| {
-        anyhow::anyhow!(
-            "{token_key} is not set. Provision it with `impresspress deploy secret` \
-             (or `wrangler secret put {token_key}`) and export it for deploys."
-        )
-    })?;
+
+    // Before the build: does the main Worker exist yet? A site's first deploy
+    // creates it (step 0a below); any later one needs the operator's deploy
+    // token, and is refused here, not after minutes of building, without it.
+    let wrangler_cli = first_create::Wrangler::default();
+    let placeholder_toml =
+        first_create::generate_placeholder(&cfg, &repo_root.join(first_create::FIRST_CREATE_DIR))?;
+    let main_worker = first_create::plan_main_worker(
+        &wrangler_cli,
+        &placeholder_toml,
+        &cfg.worker_name,
+        std::env::var(token_key).ok(),
+    )?;
 
     build(repo_root, release).await?;
 
@@ -272,6 +280,33 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
         "-> deployed password-hasher Worker {}",
         cfg.password_hasher.worker_name
     );
+
+    // 0a. The main Worker. `wrangler versions upload` cannot create one, so
+    //     a site's first deploy creates it here as a placeholder that answers
+    //     503, with the deploy token and JWT secret its `/_deploy/*`
+    //     endpoints need; the final version promoted below replaces it.
+    let deploy_token = match main_worker {
+        first_create::MainWorkerPlan::Existing { deploy_token } => deploy_token,
+        first_create::MainWorkerPlan::Create => {
+            let secrets = first_create::resolve_worker_secrets(
+                |name| std::env::var(name).ok(),
+                random_secret_bytes,
+            )?;
+            let deploy_token = first_create::create_main_worker(
+                &wrangler_cli,
+                &placeholder_toml,
+                &cfg.worker_name,
+                &secrets,
+            )?;
+            println!(
+                "-> created Worker {} (a placeholder answering 503 until this deploy promotes)",
+                cfg.worker_name
+            );
+            first_create::report_worker_secrets(&secrets);
+            deploy_token
+        }
+    };
+    deployment_gate.main_worker_ready()?;
 
     // 0b. A site that set its pepper before hashing moved still has the keys
     //     on the main Worker, which reads them no longer. Uploading on would
@@ -492,11 +527,14 @@ pub async fn deploy(repo_root: &Path, release: bool) -> Result<()> {
     Ok(())
 }
 
-/// `impresspress deploy secret`: provision the one-time-per-environment worker
-/// secrets (`IMPRESSPRESS_DEPLOY_TOKEN` + the auth JWT secret) via
-/// `wrangler secret put`. Each value is taken from the same-named env var when
-/// set, otherwise a fresh 32-byte hex token is generated. Requires the
-/// generated `wrangler.toml` (run `impresspress build --target cloudflare` first).
+/// `impresspress deploy secret`: set the worker secrets the deploy funnel
+/// needs (`IMPRESSPRESS_DEPLOY_TOKEN` + the auth JWT secret) via `wrangler
+/// secret put`. Each value is taken from the same-named env var when set,
+/// otherwise a fresh 32-byte hex token is generated — for the JWT secret that
+/// signs every user out. `impresspress deploy` sets both itself when it
+/// creates a site's Worker; this is for setting them again. Requires the
+/// generated `wrangler.toml` (run `impresspress build --target cloudflare`
+/// first).
 pub async fn deploy_secret(repo_root: &Path) -> Result<()> {
     let out_dir = repo_root.join("target/impresspress-cloudflare");
     let wrangler_toml = out_dir.join("wrangler.toml");
@@ -507,32 +545,18 @@ pub async fn deploy_secret(repo_root: &Path) -> Result<()> {
         );
     }
 
-    let deploy_token_key = impresspress_core::config_vars::DEPLOY_TOKEN_KEY;
-    for name in [
-        deploy_token_key,
-        impresspress_core::blocks::auth::JWT_SECRET_KEY,
-    ] {
-        // 32 random bytes → 64 hex chars. getrandom is already a dependency
-        // (used for variable seeding); no new crate for randomness.
-        let mut buf = [0u8; 32];
-        getrandom::getrandom(&mut buf).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
-        let (value, generated) = cf_deploy::resolve_secret(std::env::var(name).ok(), &buf);
-
-        cf_deploy::wrangler_secret_put(&wrangler_toml, name, &value)?;
-
-        if generated {
-            println!("-> generated and set worker secret {name}");
-            if name == deploy_token_key {
-                println!(
-                    "   IMPORTANT: export this for future `impresspress deploy` runs:\n     \
-                     export {name}={value}"
-                );
-            }
-        } else {
-            println!("-> set worker secret {name} (from env {name})");
-        }
-    }
+    let secrets =
+        first_create::resolve_worker_secrets(|name| std::env::var(name).ok(), random_secret_bytes)?;
+    first_create::put_worker_secrets(&first_create::Wrangler::default(), &wrangler_toml, &secrets)?;
+    first_create::report_worker_secrets(&secrets);
     Ok(())
+}
+
+/// 32 random bytes for a generated worker secret (64 hex characters).
+fn random_secret_bytes() -> Result<[u8; 32]> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    Ok(buf)
 }
 
 #[cfg(test)]

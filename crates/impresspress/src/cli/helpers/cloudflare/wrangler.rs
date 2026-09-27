@@ -307,8 +307,7 @@ pub fn generate_triggers(
 /// able to actually turn it off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfigRole {
-    /// `wrangler dev`, and the one-time first `wrangler deploy` that creates
-    /// the Worker. Compiles the crate; applies worker-level settings.
+    /// `wrangler dev`. Compiles the crate; applies worker-level settings.
     Build,
     /// `wrangler versions upload`. Consumes an already-built artifact and
     /// applies no worker-level setting.

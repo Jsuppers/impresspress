@@ -50,20 +50,25 @@ Then, from this directory, with the wafer-run `[patch]` the workspace uses
 ```sh
 export CLOUDFLARE_ACCOUNT_ID=<account id from `wrangler whoami`>
 export IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID=<id from `wrangler d1 create`>
-export IMPRESSPRESS_DEPLOY_TOKEN=<any random string>
 
-impresspress build --target cloudflare       # both Workers + their generated configs
-
-# First deploy only. `impresspress deploy` uses `wrangler versions upload`,
-# which cannot create a Worker (Cloudflare error 10007) — create it once with
-# a plain deploy of the artifact the build just produced. The password-hasher
-# Worker first: the main Worker's Durable Object binding names its script.
-wrangler deploy --config target/impresspress-cloudflare/wrangler-password-hasher.toml
-wrangler deploy --config target/impresspress-cloudflare/wrangler.toml
-
-impresspress deploy --target cloudflare secret   # IMPRESSPRESS_DEPLOY_TOKEN + JWT secret, once
-impresspress deploy --target cloudflare          # atomic versioned deploy, runs /_deploy/prepare
+impresspress deploy --target cloudflare --release
 ```
+
+That is the whole first deploy. `impresspress deploy` finds that the account
+has no Worker by this name yet (`wrangler versions upload`, which every deploy
+ships the site with, cannot create one), so after deploying the
+password-hasher Worker it creates the main Worker as a placeholder answering
+503, sets its `IMPRESSPRESS_DEPLOY_TOKEN` and JWT secret, and carries on
+through `/_deploy/prepare`, verification and promotion. It prints the
+generated deploy token once; export it for every later deploy:
+
+```sh
+export IMPRESSPRESS_DEPLOY_TOKEN=<the printed token>
+impresspress deploy --target cloudflare --release
+```
+
+To choose the values instead, export `IMPRESSPRESS_DEPLOY_TOKEN` (and
+`WAFER_RUN__AUTH__JWT_SECRET`) before the first deploy; it sets those.
 
 ## The scheduled sweep is opt-in — two steps
 
