@@ -124,6 +124,8 @@ toml = "1"
 
 [dev-dependencies]
 tempfile = "3"
+wafer-block-sqlite = { workspace = true }
+wafer-sql-utils = { workspace = true }
 # `block-dev` for the test targets only: `tests/seed_bypass_prefix.rs` asserts
 # that the bundler's service-worker bypass prefix and the dev block's own seed
 # URL root are the same string, and the latter lives behind that feature. Not

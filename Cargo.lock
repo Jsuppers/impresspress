@@ -2578,8 +2578,10 @@ dependencies = [
  "tracing",
  "uuid",
  "wafer-block",
+ "wafer-block-sqlite",
  "wafer-core",
  "wafer-run",
+ "wafer-sql-utils",
 ]
 
 [[package]]

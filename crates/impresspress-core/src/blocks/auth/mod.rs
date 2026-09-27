@@ -809,20 +809,28 @@ pub(crate) mod helpers {
     /// API keys (`authenticate_api_key`). `NotFound` on the inline-role read
     /// is the one case that is genuinely "no role from this source", not a
     /// failure, and stays non-fatal.
+    ///
+    /// The two reads do not depend on each other, so they are sent together:
+    /// on Cloudflare each is a D1 round trip, and every sign-in and token
+    /// refresh waits on this. When both fail, the inline-role read's error is
+    /// the one returned.
     pub(crate) async fn get_user_roles(
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
     ) -> Result<Vec<String>, WaferError> {
+        let (user, grants) = futures::join!(
+            repo::users::find_by_id(ctx, user_id),
+            user_roles::list_for_user(ctx, user_id),
+        );
         let mut roles: Vec<String> = Vec::new();
-        if let Some(user) = repo::users::find_by_id(ctx, user_id).await? {
+        if let Some(user) = user? {
             if !user.role.is_empty() {
                 roles.push(user.role);
             }
         }
 
-        let grants = user_roles::list_for_user(ctx, user_id)
-            .await
-            .map_err(|e| repo::db_failed("get_user_roles: roles table lookup", e))?;
+        let grants =
+            grants.map_err(|e| repo::db_failed("get_user_roles: roles table lookup", e))?;
         for grant in grants {
             if !roles.contains(&grant.role) {
                 roles.push(grant.role);
@@ -1336,16 +1344,21 @@ pub(crate) mod helpers {
     /// Shared token-issuance tail for every login flow (password login, signup,
     /// bootstrap redemption, OAuth callback, and refresh rotation).
     ///
-    /// [B12] Record this login family on the userportal device list: touch
-    /// the row it already has, or insert one when it has none.
+    /// [B12] Record this login family on the userportal device list.
     ///
-    /// Touch-then-insert rather than a branch on whether the caller passed a
-    /// family, because "no row" is not the same question as "new family". A
-    /// family can lose its row — migration 012 drops the pre-B12 table and
-    /// re-runs whenever any auth migration changes the block's SQL hash, and
-    /// the sweeper removes rows whose expiry has passed. Without the fallback
-    /// such a device would rotate its tokens forever while never appearing on
-    /// the list again.
+    /// A family `generate_tokens` has just minted (`rotation` is
+    /// [`Rotation::NewFamily`]) is random and was drawn a moment ago, so no
+    /// row can carry it yet: its row is inserted outright. Touching first
+    /// would be a guaranteed no-op, and on Cloudflare it is a D1 write the
+    /// sign-in would wait on.
+    ///
+    /// A rotation within an established family touches the row it already
+    /// has, and inserts one only when it has none, because "no row" is not
+    /// the same question as "new family". A family can lose its row —
+    /// migration 012 drops the pre-B12 table and re-runs whenever any auth
+    /// migration changes the block's SQL hash, and the sweeper removes rows
+    /// whose expiry has passed. Without the fallback such a device would
+    /// rotate its tokens forever while never appearing on the list again.
     ///
     /// Best-effort by design: a failure here loses a list entry, not a
     /// session, and must not turn a successful login into a 500.
@@ -1353,38 +1366,62 @@ pub(crate) mod helpers {
         ctx: &dyn wafer_run::context::Context,
         user_id: &str,
         family: &str,
+        rotation: Rotation<'_>,
         auth_method: &str,
         expires_at: &str,
     ) {
         use super::repo::sessions;
 
-        match sessions::touch(ctx, family, expires_at).await {
-            Ok(0) => {
-                if let Err(e) = sessions::insert(
-                    ctx,
-                    sessions::NewSession {
-                        family: family.to_string(),
-                        user_id: user_id.to_string(),
-                        auth_method: auth_method.to_string(),
-                        expires_at: expires_at.to_string(),
-                    },
-                )
-                .await
-                {
+        if let Rotation::Within { .. } = rotation {
+            match sessions::touch(ctx, family, expires_at).await {
+                Ok(0) => {}
+                Ok(_) => return,
+                Err(e) => {
                     tracing::warn!(
                         user_id = %user_id,
-                        auth_method = %auth_method,
-                        "failed to persist session row for login: {e}"
+                        family = %family,
+                        "failed to touch session row on rotation: {e}"
                     );
+                    return;
                 }
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                user_id = %user_id,
-                family = %family,
-                "failed to touch session row on rotation: {e}"
-            ),
         }
+        if let Err(e) = sessions::insert(
+            ctx,
+            sessions::NewSession {
+                family: family.to_string(),
+                user_id: user_id.to_string(),
+                auth_method: auth_method.to_string(),
+                expires_at: expires_at.to_string(),
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                user_id = %user_id,
+                auth_method = %auth_method,
+                "failed to persist session row for login: {e}"
+            );
+        }
+    }
+
+    /// Stamp `user_id`'s `last_login_at` after the response has gone out.
+    ///
+    /// Bookkeeping, not part of the sign-in: nothing the caller answers with
+    /// reads it, and a failed stamp is logged rather than turning a sign-in
+    /// into an error. Run after the response ([`crate::deferred`]) because on
+    /// Cloudflare it is a D1 write the sign-in would otherwise wait on.
+    pub(crate) fn touch_last_login_after_response(
+        ctx: &dyn wafer_run::context::Context,
+        user_id: &str,
+    ) {
+        let ctx = ctx.clone_arc();
+        let user_id = user_id.to_string();
+        crate::deferred::defer(async move {
+            if let Err(e) = repo::users::touch_last_login(&*ctx, &user_id).await {
+                tracing::warn!(user_id = %user_id, "failed to update last_login_at: {e}");
+            }
+        });
     }
 
     /// The rotation family an issuance belongs to, and the refresh-row
@@ -1450,17 +1487,25 @@ pub(crate) mod helpers {
             ctx,
             user_id,
             &issued_family,
+            rotation,
             auth_method,
             &lifetime.expires_at,
         )
         .await;
 
         // [B12] Retention runs from here because it is the one path every
-        // deployment exercises on its own — the Cloudflare Worker has no
-        // `scheduled` handler yet (Phase 4) and no operator has to remember to
-        // POST anything. It is throttled to at most once an hour, so a login
-        // storm costs one sweep.
-        super::maintenance::sweep_if_due(ctx).await;
+        // deployment exercises on its own: no operator has to remember to POST
+        // anything, and a deployment with no cron still prunes. It is
+        // throttled to at most once an hour, so a login storm costs one sweep.
+        //
+        // After the response, not before it: the throttle check alone is a
+        // database read, and a due pass is four deletes, none of which the
+        // tokens being handed out depend on. On Cloudflare every one of them
+        // is a D1 round trip the sign-in would otherwise wait on.
+        let sweep_ctx = ctx.clone_arc();
+        crate::deferred::defer(async move {
+            super::maintenance::sweep_if_due(&*sweep_ctx).await;
+        });
 
         let access_lifetime = access_token_lifetime_secs(ctx)
             .await

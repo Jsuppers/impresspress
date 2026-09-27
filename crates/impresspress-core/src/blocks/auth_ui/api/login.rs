@@ -6,7 +6,10 @@ use crate::{
     blocks::{
         auth::{
             burn_timing_equalization, check_password,
-            helpers::{ensure_admin_role, issue_tokens_and_cookie, Rotation, SessionLifetime},
+            helpers::{
+                ensure_admin_role, issue_tokens_and_cookie, touch_last_login_after_response,
+                Rotation, SessionLifetime,
+            },
             repo::{local_credentials, users},
             PasswordCheck,
         },
@@ -171,12 +174,10 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         Err(r) => return r,
     };
 
-    // Update last login. Best-effort: the sign-in has already succeeded
-    // and the tokens are already minted, so a failed bookkeeping write is
-    // logged, not returned.
-    if let Err(e) = users::touch_last_login(ctx, &user.id).await {
-        tracing::warn!("Failed to update last login time: {e}");
-    }
+    // Update last login, after the response. Best-effort: the sign-in has
+    // already succeeded and the tokens are already minted, so a failed
+    // bookkeeping write is logged, not returned.
+    touch_last_login_after_response(ctx, &user.id);
 
     // Role-aware post-login default (#1 onboarding bug fix). The login PAGE
     // is rendered before credentials are known, so it cannot pick between
