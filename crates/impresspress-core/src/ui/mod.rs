@@ -1545,7 +1545,8 @@ mod tests {
     }
 
     /// Every htmx attribute in `src` whose value htmx would compile with
-    /// `new Function`, as `(line number, snippet)`.
+    /// `new Function`, or whose value this scan cannot rule out as one, as
+    /// `(line number, snippet)`.
     ///
     /// Four shapes, and they are every place htmx 2 evaluates attribute text:
     ///
@@ -1558,10 +1559,20 @@ mod tests {
     ///   evaluated.
     ///
     /// The attribute name is matched with its `data-` twin (`data-hx-on…`),
-    /// which htmx reads identically. For the last two shapes the value is read
-    /// from its opener — `"`, `'`, maud's `(` or `{` — up to the matching
-    /// closer, so a maud expression that builds the value is inspected too,
-    /// as far as its literal text shows it.
+    /// which htmx reads identically. The first two are flagged whatever the
+    /// value. The last two turn on the value's text, which is only known as
+    /// far as it is literal — see [`htmx_value`] for how a value is read and
+    /// where a splice begins — so the rule for them is: flag unless the
+    /// literal text PROVES the value safe.
+    ///
+    /// - `hx-vals` / `hx-headers`: htmx trims the value and tests its prefix.
+    ///   Flagged when the literal text before the first splice, trimmed,
+    ///   starts with `js:`/`javascript:`, or when a splice follows a literal
+    ///   prefix that is still the start of one of them — the empty prefix
+    ///   included, so `hx-vals=(expr)` is flagged and
+    ///   `hx-vals={"{\"id\": " (id) "}"}` is not.
+    /// - `hx-trigger`: flagged when the literal text holds a `[` or the value
+    ///   has any splice at all, because a `[` can arrive anywhere in it.
     fn htmx_eval_attributes(src: &str) -> Vec<(usize, String)> {
         let mut found = Vec::new();
         let mut flag = |i: usize| {
@@ -1571,20 +1582,6 @@ mod tests {
                 .map(|c| if c == '\n' { ' ' } else { c })
                 .collect();
             found.push((src[..i].matches('\n').count() + 1, snippet));
-        };
-        // The value of the attribute whose name ends at `after`, or `None` for
-        // a bare attribute or one that is not followed by `=`.
-        let value_at = |after: usize| -> Option<&str> {
-            let rest = src[after..].trim_start().strip_prefix('=')?.trim_start();
-            let open = rest.chars().next()?;
-            let close = match open {
-                '"' | '\'' => open,
-                '(' => ')',
-                '{' => '}',
-                _ => return None,
-            };
-            let body = &rest[1..];
-            Some(body.find(close).map_or(body, |end| &body[..end]))
         };
         for (i, _) in src.match_indices("hx-") {
             let before = src[..i].strip_suffix("data-").unwrap_or(&src[..i]);
@@ -1604,11 +1601,15 @@ mod tests {
             let after = i + 3 + name_len;
             let hit = match name {
                 "vars" => true,
-                "vals" | "headers" => value_at(after).is_some_and(|v| {
-                    let v = v.trim_start().trim_start_matches(['"', '\'']).trim_start();
-                    v.starts_with("js:") || v.starts_with("javascript:")
+                "vals" | "headers" => htmx_value(&src[after..]).is_some_and(|v| {
+                    let known = v.literal.trim_start();
+                    ["js:", "javascript:"].iter().any(|eval| {
+                        known.starts_with(eval) || (v.spliced && eval.starts_with(known))
+                    })
                 }),
-                "trigger" => value_at(after).is_some_and(|v| v.contains('[')),
+                "trigger" => {
+                    htmx_value(&src[after..]).is_some_and(|v| v.spliced || v.literal.contains('['))
+                }
                 _ => name == "on" || name.starts_with("on-") || name.starts_with("on:"),
             };
             if hit {
@@ -1616,6 +1617,119 @@ mod tests {
             }
         }
         found
+    }
+
+    /// An attribute value as far as its source text shows it.
+    #[derive(Debug)]
+    struct HtmxValue {
+        /// The value's literal text, unescaped, up to its first splice.
+        literal: String,
+        /// Whether a splice — text only known at run time — follows
+        /// `literal`. What comes after the first splice is not read: neither
+        /// rule in [`htmx_eval_attributes`] could clear a value on it.
+        spliced: bool,
+    }
+
+    /// The value of the attribute whose name `rest` follows, or `None` for a
+    /// bare attribute or one not followed by `=`.
+    ///
+    /// The value's opener decides how it is read:
+    ///
+    /// - `"…"` / `'…'`, and `\"…\"` / `\'…\'` inside a Rust string holding
+    ///   raw HTML — literal text, with a backslash escaping the next
+    ///   character. A placeholder inside it is a splice: `${…}` in a JS
+    ///   template literal, and `{name}` / `{}` / `{:…}` in a Rust format
+    ///   string, where `{{` is one literal `{`. A JSON object never opens
+    ///   like a placeholder (`{"` or `{{`), and a
+    ///   literal that only looks like a placeholder is over-matched rather
+    ///   than guessed at.
+    /// - maud's `(expr)` and `[option]` — a splice from the first character.
+    /// - maud's `{…}` — its string literals are literal text and anything
+    ///   else (a `(expr)` splice, an `@if`) is a splice.
+    /// - anything else — an unquoted HTML value, literal up to whitespace,
+    ///   `>` or a quote.
+    fn htmx_value(rest: &str) -> Option<HtmxValue> {
+        let value = rest.trim_start().strip_prefix('=')?.trim_start();
+        let mut out = HtmxValue {
+            literal: String::new(),
+            spliced: false,
+        };
+        match value.chars().next()? {
+            q @ ('"' | '\'') => {
+                htmx_quoted(&mut out, &value[1..], &q.to_string(), true);
+            }
+            '\\' if value[1..].starts_with(['"', '\'']) => {
+                let close = &value[..2];
+                htmx_quoted(&mut out, &value[2..], close, true);
+            }
+            '(' | '[' => out.spliced = true,
+            '{' => {
+                let mut body = &value[1..];
+                loop {
+                    body = body.trim_start();
+                    if let Some(s) = body.strip_prefix('"') {
+                        body = htmx_quoted(&mut out, s, "\"", false);
+                        if out.spliced {
+                            break;
+                        }
+                    } else if body.starts_with('}') || body.is_empty() {
+                        break;
+                    } else {
+                        out.spliced = true;
+                        break;
+                    }
+                }
+            }
+            _ => {
+                out.literal = value
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && !matches!(c, '>' | '"' | '\''))
+                    .collect();
+            }
+        }
+        Some(out)
+    }
+
+    /// Read one quoted literal of an [`HtmxValue`] into `out`, from just
+    /// after its opener up to `close`, and return what follows the closer —
+    /// or `""` once a placeholder splice is met, when `placeholders` says the
+    /// literal is one that can hold them.
+    fn htmx_quoted<'a>(
+        out: &mut HtmxValue,
+        body: &'a str,
+        close: &str,
+        placeholders: bool,
+    ) -> &'a str {
+        let mut chars = body.char_indices();
+        while let Some((at, c)) = chars.next() {
+            if body[at..].starts_with(close) {
+                return &body[at + close.len()..];
+            }
+            if c == '\\' {
+                if let Some((_, escaped)) = chars.next() {
+                    out.literal.push(escaped);
+                }
+                continue;
+            }
+            let next = body[at + c.len_utf8()..].chars().next();
+            if placeholders && c == '{' && next == Some('{') {
+                // A format string's escaped brace: one literal `{`.
+                chars.next();
+                out.literal.push(c);
+                continue;
+            }
+            let placeholder = (c == '$' && next == Some('{'))
+                || (c == '{'
+                    && next.is_some_and(|n| {
+                        n.is_ascii_alphanumeric() || matches!(n, '_' | '}' | ':')
+                    }));
+            if placeholders && placeholder {
+                out.spliced = true;
+                return "";
+            }
+            out.literal.push(c);
+        }
+        ""
     }
 
     /// The detector sees every eval-shaped htmx attribute, and none of the
@@ -1638,6 +1752,20 @@ mod tests {
             r#"div {hx}trigger="click[ctrlKey]""#,
             r#"div {hx}trigger = "every 2s [ready()]""#,
             "div\n    {hx}on--after-request=(body)",
+            // Values built by an expression: what they hold is only known at
+            // run time, so the literal text has to prove them safe or they
+            // are flagged.
+            r#"div {hx}trigger=(trigger)"#,
+            r#"div {hx}trigger=[maybe_trigger]"#,
+            r#"div {hx}trigger={"every " (secs) "s"}"#,
+            r#"div {hx}vals=(format!("js:{{a: {n}}}"))"#,
+            r#"div {hx}vals=(vals)"#,
+            r#"div {hx}headers={(prefix) "{}"}"#,
+            r#"div {hx}vals={"  j" (rest)}"#,
+            r#"format!("<div {hx}vals='{vals}'>")"#,
+            r#"`<div {hx}trigger="${trigger}">`"#,
+            r#""<div {hx}vals=\"js:{a: 1}\">""#,
+            r#"<div {hx}trigger=click[ctrlKey]>"#,
         ] {
             assert!(
                 !htmx_eval_attributes(&fixture(spelling)).is_empty(),
@@ -1654,6 +1782,11 @@ mod tests {
             r#"div data-reload-on-success"#,
             r#"// {hx}on--after-request="x()""#,
             r#"/// {hx}vars="a:1""#,
+            // A splice after a literal prefix that already decides the value.
+            r#"div {hx}vals={"{\"id\": " (id) "}"}"#,
+            r#"format!("<div {hx}vals='{{\"id\": {id}}}'>")"#,
+            r#""<div {hx}trigger=\"load\">""#,
+            r#"<div {hx}trigger=load>"#,
         ] {
             assert!(
                 htmx_eval_attributes(&fixture(innocent)).is_empty(),
