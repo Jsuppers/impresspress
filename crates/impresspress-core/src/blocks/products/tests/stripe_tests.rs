@@ -4891,6 +4891,56 @@ async fn seller_offer_checkout_fails_closed_when_connect_charges_are_disabled() 
     );
 }
 
+/// A checkout preset's slug is unique per offer (migration 005's
+/// `checkout_presets_slug_uniq`): creating a second preset under a slug the
+/// offer already has, or renaming one onto it, is a 409 that says which slug —
+/// not the generic "same key" that leaves the admin to guess, nor anything of
+/// the index or the table.
+#[tokio::test]
+async fn a_taken_preset_slug_is_a_409_naming_the_slug() {
+    let ctx = ctx().await;
+    let offer_id = seed_active_offer(&ctx, "product_presets", "").await;
+    let presets =
+        format!("/b/products/api/admin/products/product_presets/offers/{offer_id}/presets");
+    let preset = |name: &str, slug: &str| serde_json::json!({"name": name, "slug": slug, "inputs": {"pages": 4}});
+    let expect_taken = |out: wafer_run::OutputStream| async move {
+        let parts = wafer_block::http_codec::collect_http_response(out).await;
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+        assert_eq!(parts.status, 409, "{body}");
+        assert_eq!(
+            body["message"],
+            serde_json::json!(
+                "A checkout preset with the slug \"four-pages\" already exists. \
+                 Choose a different slug."
+            ),
+            "{body}"
+        );
+        let text = body.to_string();
+        assert!(
+            !text.contains("impresspress__products") && !text.contains("UNIQUE"),
+            "schema leaked: {text}"
+        );
+    };
+
+    let (msg, input) = admin_create_msg(&presets, preset("Four pages", "four-pages"));
+    output_to_json(dispatch(&ctx, msg, input).await).await;
+
+    let (msg, input) = admin_create_msg(&presets, preset("Four again", "four-pages"));
+    expect_taken(dispatch(&ctx, msg, input).await).await;
+
+    let (msg, input) = admin_create_msg(&presets, preset("Eight pages", "eight-pages"));
+    let other = output_to_json(dispatch(&ctx, msg, input).await).await;
+    let other_id = other["id"].as_str().expect("preset id");
+    let (mut msg, input) = request_msg(
+        "update",
+        &format!("{presets}/{other_id}"),
+        "admin_1",
+        preset("Eight pages", "four-pages"),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    expect_taken(dispatch(&ctx, msg, input).await).await;
+}
+
 #[tokio::test]
 async fn admin_preset_payment_link_lifecycle_reuses_and_exposes_only_safe_url() {
     let mut ctx = ctx_with(&[

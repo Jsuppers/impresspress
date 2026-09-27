@@ -25,8 +25,7 @@ use crate::{
         },
     },
     http::{
-        err_bad_request, err_conflict, err_forbidden, err_internal, err_not_found,
-        err_unauthenticated, ok_json,
+        err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthenticated, ok_json,
     },
     util::{enum_column, field_as_string, now_rfc3339, stamp_created, stamp_updated, RecordExt},
 };
@@ -430,10 +429,13 @@ pub(super) async fn handle_create_product(
     ] {
         data.entry(key.to_string()).or_insert(value);
     }
+    let slug = written_slug(&data);
     match create_product_row(ctx, data).await {
         Ok(record) => product_json(&record),
         // An insert names no row of the caller's, so its `NotFound` is a 500.
-        Err(e) => crud::db_error_internal(e, "Database error"),
+        Err(e) => slug_write_error(e, slug.as_deref(), |e| {
+            crud::db_error_internal(e, "Database error")
+        }),
     }
 }
 
@@ -460,9 +462,10 @@ pub(super) async fn handle_update_product(
     // to the dead row and answers 200 — precisely the outcome this guard
     // exists to prevent. `NotFound` matches the response every other admin
     // product endpoint gives for a soft-deleted row.
+    let slug = written_slug(&data);
     match repo::products::update_live(ctx, id, data).await {
         Ok(record) => product_json(&record),
-        Err(e) => write_error(e, "Database error"),
+        Err(e) => slug_write_error(e, slug.as_deref(), |e| write_error(e, "Database error")),
     }
 }
 
@@ -608,10 +611,40 @@ const RESTORE_FAILED: &str = "Database error";
 /// advice is what makes the response actionable, which is the whole reason
 /// this is not a 500.
 fn slug_taken(slug: &str) -> OutputStream {
-    err_conflict(&format!(
-        "Another product already uses the slug \"{slug}\". Rename or delete that \
-         product, then restore this one."
-    ))
+    crud::TakenKey::new("product", "slug", slug)
+        .conflict_with("Rename or delete that product, then restore this one.")
+}
+
+/// The slug a product write sets, when the unique index can refuse it.
+///
+/// Migration 005's `impresspress__products__products_owner_slug_uniq` is the
+/// products table's one caller-chosen unique key — `(owner_kind, owner_id,
+/// slug)`, partial on `slug <> ''` and `deleted_at IS NULL` — and no
+/// create or update route lets a caller set the owner or `deleted_at`. So a
+/// write that sets a non-empty slug and is refused as a duplicate collided on
+/// that slug, and a write that sets none cannot collide at all.
+fn written_slug(data: &HashMap<String, serde_json::Value>) -> Option<String> {
+    data.get("slug")
+        .and_then(serde_json::Value::as_str)
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_string)
+}
+
+/// What a product write that set `slug` answers when it failed: the named
+/// 409 for a duplicate (see [`written_slug`]), `otherwise` for the rest.
+fn slug_write_error(
+    error: wafer_run::WaferError,
+    slug: Option<&str>,
+    otherwise: impl FnOnce(wafer_run::WaferError) -> OutputStream,
+) -> OutputStream {
+    match slug {
+        Some(slug) => crud::taken_key_or(
+            error,
+            crud::TakenKey::new("product", "slug", slug),
+            otherwise,
+        ),
+        None => otherwise(error),
+    }
 }
 
 /// What [`restore_slug_conflict`] found. Three answers, not two: "no
@@ -988,10 +1021,13 @@ pub(super) async fn handle_user_create_product(
         return response;
     }
 
+    let slug = written_slug(&data);
     match create_product_row(ctx, data).await {
         Ok(record) => product_json(&record),
         // An insert names no row of the caller's, so its `NotFound` is a 500.
-        Err(e) => crud::db_error_internal(e, "Database error"),
+        Err(e) => slug_write_error(e, slug.as_deref(), |e| {
+            crud::db_error_internal(e, "Database error")
+        }),
     }
 }
 
@@ -1090,9 +1126,12 @@ pub(super) async fn handle_user_update_product(
     // ownership check above is a separate read, and the validation between it
     // and this write only widens the window a concurrent delete can land in.
     // The write itself has to be the thing that tests liveness.
+    let slug = written_slug(&data);
     match repo::products::update_live(ctx, &id, data).await {
         Ok(record) => product_json(&record),
-        Err(error) => write_error(error, "Database error"),
+        Err(error) => {
+            slug_write_error(error, slug.as_deref(), |e| write_error(e, "Database error"))
+        }
     }
 }
 

@@ -67,10 +67,10 @@ use crate::{
 /// - [`ErrorCode::AlreadyExists`] is a write that duplicates a primary or
 ///   unique key — a request the database refused, not a fault — so it is a
 ///   **409**. Every `DatabaseService` reports a duplicate this way (see
-///   [`taken_key_or_db_error`]). The driver's own text names the table and the
+///   [`taken_key_or`]). The driver's own text names the table and the
 ///   column, which is schema, so it is logged and the client is told only
-///   [`DUPLICATE_KEY`]; a route that knows which key it wrote says so through
-///   [`taken_key_or_db_error`] instead.
+///   [`DUPLICATE_KEY`]; a route that knows which key it wrote names it through
+///   [`taken_key_or`] instead.
 /// - Everything else is an internal failure: `context` is the fixed log
 ///   label, the cause is logged, and the client gets the sanitized
 ///   `"Internal server error (ref: <id>)"`.
@@ -103,9 +103,9 @@ pub fn db_error_internal(error: wafer_run::WaferError, context: &str) -> OutputS
 /// A page whose read failed is never drawn from defaults (see
 /// [`crate::ui::server_error_response`]), and what it answers instead is
 /// classified here like every other failed database call: a WRAP denial is
-/// the 403 page and a quota the 429 page ([`crate::ui::refused_response`]), a
-/// duplicate key keeps its 409, anything else is logged under `context` and
-/// answered with the styled 500. An API caller (an `Accept` without
+/// the 403 page, a quota the 429 page and a duplicate key the 409 page
+/// ([`crate::ui::refused_response`]), anything else is logged under `context`
+/// and answered with the styled 500. An API caller (an `Accept` without
 /// `text/html`) gets the same statuses as JSON.
 pub fn db_error_page(msg: &Message, error: wafer_run::WaferError, context: &str) -> OutputStream {
     match classify_db_error(error, None, context) {
@@ -314,7 +314,7 @@ fn is_statement_budget_refusal(error: &wafer_run::WaferError) -> bool {
 }
 
 /// What a client is told when its write duplicated a unique key and the route
-/// did not name the key (see [`classify_db_error`]).
+/// did not name the key (see [`classify_db_error`] and [`TakenKey`]).
 pub const DUPLICATE_KEY: &str = "A record with the same key already exists";
 
 /// [`DbFailure`] as the response every caller but `blocks::dev` wants.
@@ -329,9 +329,64 @@ fn seal(failure: DbFailure, context: &str) -> OutputStream {
 // Duplicate natural keys
 // ---------------------------------------------------------------------------
 
-/// What a failed write against a table with a UNIQUE natural key —
-/// `variables.key`, `roles.name`, `permissions.name`, `buckets.name` —
-/// answers when the caller can say which key was taken.
+/// The user-facing unique field a write set, and the value it set: what a
+/// duplicate of it is called when the database refuses the write.
+///
+/// Every table a route writes a caller-chosen unique value into has one such
+/// natural key — `variables.key`, `roles.name`, `permissions.name`,
+/// `buckets.name`, `providers.name`, a product's `slug`, a checkout preset's
+/// `slug`, a ticket type's `key` — so a route that gets `AlreadyExists` back
+/// from that write knows which field clashed without asking the database. The
+/// driver's own text (table, column, index) is never read for it: it is
+/// schema, and not every adapter spells it the same way.
+///
+/// One sentence for every such refusal, built here from the three words the
+/// route supplies, so no two routes word the same fact differently:
+/// `A role with the name "admin" already exists.`
+#[derive(Debug, Clone, Copy)]
+pub struct TakenKey<'a> {
+    record: &'a str,
+    field: &'a str,
+    value: &'a str,
+}
+
+impl<'a> TakenKey<'a> {
+    /// `record` is what the row is called ("role", "checkout preset"),
+    /// `field` the unique field's user-facing name ("name", "slug"), and
+    /// `value` what the write tried to set it to.
+    pub const fn new(record: &'a str, field: &'a str, value: &'a str) -> Self {
+        Self {
+            record,
+            field,
+            value,
+        }
+    }
+
+    /// The fact the 409 states: which record, which field, which value.
+    pub fn taken(&self) -> String {
+        let Self {
+            record,
+            field,
+            value,
+        } = self;
+        format!("A {record} with the {field} \"{value}\" already exists.")
+    }
+
+    /// The 409 for a write whose value is taken, with `remedy` after the fact
+    /// — what the caller can do about it.
+    pub fn conflict_with(&self, remedy: &str) -> OutputStream {
+        err_conflict(&format!("{} {remedy}", self.taken()))
+    }
+
+    /// The 409 for a write that tried to set the value itself: the fact, and
+    /// the remedy that every such write shares.
+    pub fn conflict(&self) -> OutputStream {
+        self.conflict_with(&format!("Choose a different {}.", self.field))
+    }
+}
+
+/// What a failed write that set `key` answers: [`TakenKey::conflict`] when the
+/// database refused it as a duplicate, `otherwise(error)` for anything else.
 ///
 /// The write's own error is the whole answer. Every `DatabaseService` this
 /// workspace runs on reports a write that duplicates a primary or unique key
@@ -344,21 +399,37 @@ fn seal(failure: DbFailure, context: &str) -> OutputStream {
 /// pinned by a test in its own crate. So nothing here re-reads the key to
 /// find out what the write meant.
 ///
-/// [`classify_db_error`] already answers a duplicate as a 409, with a generic
-/// message because it cannot know which key a route wrote. This is the same
-/// 409 with `conflict` as its message — "a role named X already exists" —
-/// for the routes that do know. Anything else is [`db_error_internal`]'s,
-/// under the caller's own `context` ("Failed to create bucket"), so an
-/// operator reading the log still knows which write failed.
-pub fn taken_key_or_db_error(
+/// [`classify_db_error`] already answers a duplicate as a 409, with the
+/// generic [`DUPLICATE_KEY`] because it cannot know which key a route wrote.
+/// This is the same 409 naming the field, for the routes that do know.
+/// `otherwise` is the route's own mapping for every other failure — a
+/// `NotFound` that is the caller's 404, a domain refusal — which must still
+/// end in `crud`'s classification of a database failure.
+pub fn taken_key_or(
     error: wafer_run::WaferError,
-    conflict: &str,
-    context: &str,
+    key: TakenKey<'_>,
+    otherwise: impl FnOnce(wafer_run::WaferError) -> OutputStream,
 ) -> OutputStream {
     if error.code == ErrorCode::AlreadyExists {
-        return err_conflict(conflict);
+        tracing::info!(
+            error = %error,
+            "database refused a write that duplicates a unique key",
+        );
+        return key.conflict();
     }
-    db_error_internal(error, context)
+    otherwise(error)
+}
+
+/// [`taken_key_or`] for a write with no failure of its own to classify: any
+/// other error is [`db_error_internal`]'s, under the caller's own `context`
+/// ("Failed to create bucket"), so an operator reading the log still knows
+/// which write failed.
+pub fn taken_key_or_db_error(
+    error: wafer_run::WaferError,
+    key: TakenKey<'_>,
+    context: &str,
+) -> OutputStream {
+    taken_key_or(error, key, |error| db_error_internal(error, context))
 }
 
 /// Response body of every CRUD delete.
@@ -1049,7 +1120,9 @@ mod path_var_tests {
 mod tests {
     use wafer_run::{streams::output::TerminalNotResponse, ErrorCode, WaferError};
 
-    use super::{db_error, db_error_internal, taken_key_or_db_error, DUPLICATE_KEY};
+    use super::{
+        db_error, db_error_internal, taken_key_or, taken_key_or_db_error, TakenKey, DUPLICATE_KEY,
+    };
 
     /// A duplicate key is a 409 from both doors, with the driver's text —
     /// which names the table and the column — replaced. Folded into the
@@ -1084,21 +1157,40 @@ mod tests {
         }
     }
 
-    /// A route that knows the key says which: the same 409, its own words.
+    /// A route that knows the key says which: the same 409, naming the
+    /// record, the field and the value, and nothing of the driver's text.
     #[tokio::test]
-    async fn a_duplicate_key_is_the_callers_named_conflict() {
+    async fn a_duplicate_key_is_the_named_field_conflict() {
         let out = taken_key_or_db_error(
-            WaferError::new(ErrorCode::AlreadyExists, "duplicate key"),
-            "TAKEN already exists",
+            WaferError::new(
+                ErrorCode::AlreadyExists,
+                "UNIQUE constraint failed: impresspress__admin__roles.name",
+            ),
+            TakenKey::new("role", "name", "editor"),
             "Database error",
         );
         match out.collect_buffered().await {
             Err(TerminalNotResponse::Error(e)) => {
                 assert_eq!(e.code, ErrorCode::AlreadyExists);
-                assert_eq!(e.message, "TAKEN already exists");
+                assert_eq!(
+                    e.message,
+                    "A role with the name \"editor\" already exists. Choose a different name."
+                );
             }
             other => panic!("expected the named 409, got {other:?}"),
         }
+    }
+
+    /// `taken_key_or` hands every other failure to the route's own mapping,
+    /// untouched, so a route's 404 stays its 404.
+    #[tokio::test]
+    async fn taken_key_or_leaves_other_failures_to_the_route() {
+        let out = taken_key_or(
+            WaferError::new(ErrorCode::NotFound, "no row"),
+            TakenKey::new("role", "name", "editor"),
+            |error| db_error(error, "Role not found", "Database error"),
+        );
+        assert_eq!(crate::test_support::output_http_status(out).await, 404);
     }
 
     /// Nothing but `AlreadyExists` is a duplicate. An `Internal` is a fault
@@ -1109,14 +1201,14 @@ mod tests {
     async fn only_already_exists_is_a_conflict() {
         let internal = taken_key_or_db_error(
             WaferError::new(ErrorCode::Internal, "disk I/O error"),
-            "TAKEN already exists",
+            TakenKey::new("role", "name", "editor"),
             "Database error",
         );
         assert_eq!(crate::test_support::output_http_status(internal).await, 500);
 
         let denied = taken_key_or_db_error(
             WaferError::new(ErrorCode::PermissionDenied, "denied"),
-            "TAKEN already exists",
+            TakenKey::new("role", "name", "editor"),
             "Database error",
         );
         assert_eq!(crate::test_support::output_http_status(denied).await, 403);

@@ -2101,7 +2101,7 @@ mod tests {
 
         let out = crate::blocks::crud::taken_key_or_db_error(
             refused,
-            "SITE__TAKEN already exists",
+            crate::blocks::crud::TakenKey::new("variable", "key", "SITE__TAKEN"),
             "Database error",
         );
         assert_eq!(crate::test_support::output_http_status(out).await, 409);

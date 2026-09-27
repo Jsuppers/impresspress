@@ -573,29 +573,100 @@ async fn an_unreadable_thread_list_fails_the_chat_page() {
     );
 }
 
+/// What a provider write whose name another provider holds is told: the
+/// name, the field, and nothing of the driver's text.
+const MAIN_TAKEN: &str =
+    "A provider with the name \"main\" already exists. Choose a different name.";
+
+/// Asserts `out` is the named 409 for the name `main`, with no schema in it.
+async fn expect_main_taken(out: OutputStream) {
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+    assert_eq!(parts.status, 409, "{body}");
+    assert_eq!(body["message"], serde_json::json!(MAIN_TAKEN), "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains(PROVIDERS_TABLE) && !text.contains("UNIQUE"),
+        "schema leaked: {text}"
+    );
+}
+
 /// A second provider under a name the first holds is refused by the
 /// `providers.name` UNIQUE index, and every backend reports that refusal as
-/// `AlreadyExists`. `crud::db_error_internal` answers it as the 409 it is —
-/// not "Internal server error" for an admin who re-typed a name — and the
-/// driver's text, which names the table and the column, stays in the log.
+/// `AlreadyExists`. The route answers the 409 naming the taken name — not
+/// "Internal server error" for an admin who re-typed a name, nor a generic
+/// "same key" that leaves them to guess which field — and the driver's text,
+/// which names the table and the column, stays in the log.
 #[tokio::test]
-async fn a_duplicate_provider_name_is_a_409_not_a_500() {
+async fn a_duplicate_provider_name_is_a_409_naming_the_name() {
     let (ctx, _) = with_a_provider().await;
 
-    let out = api(
-        &ctx,
-        admin_msg("create", "/b/llm/api/providers"),
-        r#"{"name":"main","protocol":"open_ai","endpoint":"https://api.openai.com/v1"}"#,
+    expect_main_taken(
+        api(
+            &ctx,
+            admin_msg("create", "/b/llm/api/providers"),
+            r#"{"name":"main","protocol":"open_ai","endpoint":"https://api.openai.com/v1"}"#,
+        )
+        .await,
     )
     .await;
-    let parts = wafer_block::http_codec::collect_http_response(out).await;
-    let body = String::from_utf8_lossy(&parts.body);
-    assert_eq!(parts.status, 409, "{body}");
-    assert!(body.contains(crate::blocks::crud::DUPLICATE_KEY), "{body}");
-    assert!(!body.contains(PROVIDERS_TABLE), "schema leaked: {body}");
 
     let rows = wafer_core::clients::database::count(&ctx, PROVIDERS_TABLE, &[])
         .await
         .expect("count providers");
     assert_eq!(rows, 1, "the refused create must not have written a row");
+}
+
+/// The admin page's "Add provider" form posts form-encoded fields to the same
+/// route; its 409 is the JSON envelope `chrome.js`'s error toast reads the
+/// message out of, so the operator sees which name is taken.
+#[tokio::test]
+async fn the_add_provider_form_is_told_which_name_is_taken() {
+    let (ctx, _) = with_a_provider().await;
+
+    let mut msg = admin_msg("create", "/b/llm/api/providers");
+    msg.set_meta("http.header.accept", "text/html");
+    msg.set_meta("http.header.hx-request", "true");
+    let out = block()
+        .handle(
+            &ctx,
+            msg,
+            InputStream::from_bytes(
+                b"name=main&protocol=open_ai&endpoint=https%3A%2F%2Fapi.openai.com%2Fv1".to_vec(),
+            ),
+        )
+        .await;
+    expect_main_taken(out).await;
+}
+
+/// Renaming a provider onto a name another provider holds is the same named
+/// 409, and the renamed row keeps its name.
+#[tokio::test]
+async fn renaming_a_provider_onto_a_taken_name_is_a_409_naming_the_name() {
+    let (ctx, _) = with_a_provider().await;
+    let other = output_json(
+        api(
+            &ctx,
+            admin_msg("create", "/b/llm/api/providers"),
+            r#"{"name":"backup","protocol":"open_ai","endpoint":"https://api.openai.com/v1"}"#,
+        )
+        .await,
+    )
+    .await;
+    let other_id = other["id"].as_str().expect("provider id");
+
+    expect_main_taken(
+        api(
+            &ctx,
+            admin_msg("update", &format!("/b/llm/api/providers/{other_id}")),
+            r#"{"name":"main"}"#,
+        )
+        .await,
+    )
+    .await;
+
+    let stored = wafer_core::clients::database::get(&ctx, PROVIDERS_TABLE, other_id)
+        .await
+        .expect("the renamed provider");
+    assert_eq!(crate::util::RecordExt::str_field(&stored, "name"), "backup");
 }

@@ -718,3 +718,80 @@ async fn grant_count_denial_past_the_cap_is_403() {
     );
     report(misses);
 }
+
+/// Asserts `out` is a 409 whose message is exactly `message`, with nothing of
+/// the driver's text (table, column, index) in the body.
+async fn expect_named_conflict(out: OutputStream, message: &str, route: &str) {
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+    assert_eq!(parts.status, 409, "{route}: {body}");
+    assert_eq!(
+        body["message"],
+        serde_json::json!(message),
+        "{route}: {body}"
+    );
+    let text = body.to_string();
+    assert!(
+        !text.contains("impresspress__admin") && !text.contains("UNIQUE"),
+        "{route}: schema leaked: {text}"
+    );
+}
+
+/// Every admin write that sets a unique name or key says which one is taken,
+/// in the one sentence `crud::TakenKey` builds — the record, the field and the
+/// value — so no two routes word the same refusal differently.
+#[tokio::test]
+async fn every_taken_name_or_key_is_a_409_naming_it() {
+    let (ctx, _) = fixture().await;
+
+    let role = r#"{"name":"auditor"}"#;
+    output_json(api(&ctx, "create", "/b/admin/api/iam/roles", role).await).await;
+    expect_named_conflict(
+        api(&ctx, "create", "/b/admin/api/iam/roles", role).await,
+        "A role with the name \"auditor\" already exists. Choose a different name.",
+        "POST /b/admin/api/iam/roles",
+    )
+    .await;
+
+    let other = output_json(
+        api(
+            &ctx,
+            "create",
+            "/b/admin/api/iam/roles",
+            r#"{"name":"reviewer"}"#,
+        )
+        .await,
+    )
+    .await;
+    let other_id = other["id"].as_str().expect("role id");
+    expect_named_conflict(
+        api(
+            &ctx,
+            "update",
+            &format!("/b/admin/api/iam/roles/{other_id}"),
+            role,
+        )
+        .await,
+        "A role with the name \"auditor\" already exists. Choose a different name.",
+        "PATCH /b/admin/api/iam/roles/{id}",
+    )
+    .await;
+
+    let permission = r#"{"name":"reports.read","resource":"reports","actions":["read"]}"#;
+    output_json(api(&ctx, "create", "/b/admin/api/iam/permissions", permission).await).await;
+    expect_named_conflict(
+        api(&ctx, "create", "/b/admin/api/iam/permissions", permission).await,
+        "A permission with the name \"reports.read\" already exists. Choose a different name.",
+        "POST /b/admin/api/iam/permissions",
+    )
+    .await;
+
+    let variable = r#"{"key":"SITE_MOTTO","value":"one"}"#;
+    output_json(api(&ctx, "create", "/b/admin/api/settings", variable).await).await;
+    expect_named_conflict(
+        api(&ctx, "create", "/b/admin/api/settings", variable).await,
+        "A variable with the key \"SITE_MOTTO\" already exists. Choose a different key.",
+        "POST /b/admin/api/settings",
+    )
+    .await;
+}

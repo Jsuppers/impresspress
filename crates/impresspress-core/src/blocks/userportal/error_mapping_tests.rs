@@ -220,6 +220,7 @@ async fn branding_settings_refusal_is_the_refusal_page() {
     for (code, status, copy) in [
         (ErrorCode::PermissionDenied, 403, "Go home"),
         (ErrorCode::ResourceExhausted, 429, "over its usage limit"),
+        (ErrorCode::AlreadyExists, 409, "Already exists"),
     ] {
         let ctx = RefusingConfig {
             inner: TestContext::with_userportal().await,
@@ -233,6 +234,10 @@ async fn branding_settings_refusal_is_the_refusal_page() {
         .await;
         assert_eq!(got, status, "{code:?}: {html}");
         assert!(html.contains(copy), "{code:?}: {html}");
+        assert!(
+            html.contains("Go home"),
+            "the styled page, {code:?}: {html}"
+        );
         assert!(!html.contains("<form"), "{code:?}: {html}");
     }
 }

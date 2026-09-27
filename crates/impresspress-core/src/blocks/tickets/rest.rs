@@ -164,10 +164,18 @@ pub async fn create_type(ctx: &dyn Context, input: InputStream) -> OutputStream 
         Ok(value) => value,
         Err(response) => return response,
     };
+    // `types.key` is UNIQUE and the one unique value this write sets, so a
+    // refused duplicate is that key being taken.
+    let key = body.key.clone();
     match service::create_type(ctx, body).await {
         Ok(record) => ResponseBuilder::new()
             .status(201)
             .json(&TicketTypeView::from_record(&record)),
+        Err(service::ServiceError::Db(error)) => crud::taken_key_or(
+            error,
+            crud::TakenKey::new("ticket type", "key", &key),
+            |error| service_error(service::ServiceError::Db(error)),
+        ),
         Err(error) => service_error(error),
     }
 }
@@ -308,6 +316,35 @@ mod denial_tests {
             ))))
             .await,
             500
+        );
+    }
+
+    /// `types.key` is UNIQUE: creating a second ticket type under a key one
+    /// already has is a 409 naming the key, with nothing of the driver's
+    /// text in it.
+    #[tokio::test]
+    async fn a_taken_type_key_is_a_409_naming_the_key() {
+        let ctx = TestContext::with_tickets().await;
+        let body = || InputStream::from_bytes(br#"{"key":"billing","title":"Billing"}"#.to_vec());
+        assert_eq!(
+            output_http_status(create_type(&ctx, body()).await).await,
+            201
+        );
+
+        let parts =
+            wafer_block::http_codec::collect_http_response(create_type(&ctx, body()).await).await;
+        let json: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+        assert_eq!(parts.status, 409, "{json}");
+        assert_eq!(
+            json["message"],
+            serde_json::json!(
+                "A ticket type with the key \"billing\" already exists. Choose a different key."
+            ),
+        );
+        let text = json.to_string();
+        assert!(
+            !text.contains("impresspress__tickets") && !text.contains("UNIQUE"),
+            "schema leaked: {text}"
         );
     }
 

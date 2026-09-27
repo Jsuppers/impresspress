@@ -394,9 +394,17 @@ pub(in crate::blocks::llm) async fn create_provider(
     let mut data = config_to_row(&cfg);
     crate::util::stamp_created(&mut data);
 
+    // `providers.name` is UNIQUE, and the name is the one unique value this
+    // write sets: a duplicate is that name being taken.
     let record = match db::create(ctx, PROVIDERS_TABLE, data).await {
         Ok(r) => r,
-        Err(e) => return crud::db_error_internal(e, "Database error"),
+        Err(e) => {
+            return crud::taken_key_or_db_error(
+                e,
+                crud::TakenKey::new("provider", "name", &cfg.name),
+                "Database error",
+            )
+        }
     };
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {
@@ -500,9 +508,15 @@ pub(in crate::blocks::llm) async fn update_provider(
     let mut data = config_to_row(&cfg);
     crate::util::stamp_updated(&mut data);
 
+    // The row is rewritten whole, so `providers.name` is always among the
+    // values set; a duplicate is a rename onto a name another provider holds.
     let record = match db::update(ctx, PROVIDERS_TABLE, &id, data).await {
         Ok(r) => r,
-        Err(e) => return crud::db_error(e, "Provider not found", "Database error"),
+        Err(e) => {
+            return crud::taken_key_or(e, crud::TakenKey::new("provider", "name", &cfg.name), |e| {
+                crud::db_error(e, "Provider not found", "Database error")
+            })
+        }
     };
 
     if let Err(e) = reload_provider_service(ctx, block.provider_admin.as_ref()).await {

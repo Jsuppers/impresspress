@@ -2043,7 +2043,7 @@ async fn restore_reports_a_conflict_when_the_slug_is_reclaimed_before_the_retry(
 /// a slug question at all. Only `AlreadyExists` sends a failed restore to the
 /// collision probe; any other failure is the write's own error, against a
 /// correlation id — never a 409 blaming a slug, which for a product with no
-/// slug would be `Another product already uses the slug ""`.
+/// slug would be `A product with the slug "" already exists`.
 #[tokio::test]
 async fn restore_of_a_slugless_product_reports_the_write_failure_not_a_slug_conflict() {
     let ctx = ctx().await;
@@ -5718,4 +5718,130 @@ async fn a_product_create_whose_group_read_fails_is_a_fault_not_a_missing_group(
         500,
         "a group read that failed is a server fault, not a missing group"
     );
+}
+
+// ============================================================
+// Named slug conflicts
+// ============================================================
+
+/// What a product write whose slug a live product of the same owner holds is
+/// told: the field and the value, nothing of the index or the table.
+const WIDGET_SLUG_TAKEN: &str =
+    "A product with the slug \"widget\" already exists. Choose a different slug.";
+
+/// Asserts `out` is the named 409 for the slug `widget`, with no schema text.
+async fn expect_widget_slug_taken(out: wafer_run::OutputStream) {
+    let parts = wafer_block::http_codec::collect_http_response(out).await;
+    let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap_or_default();
+    assert_eq!(parts.status, 409, "{body}");
+    assert_eq!(
+        body["message"],
+        serde_json::json!(WIDGET_SLUG_TAKEN),
+        "{body}"
+    );
+    let text = body.to_string();
+    assert!(
+        !text.contains("impresspress__products") && !text.contains("UNIQUE"),
+        "schema leaked: {text}"
+    );
+}
+
+/// A product id from a create that must succeed.
+async fn created_id(
+    ctx: &crate::test_support::TestContext,
+    msg: (wafer_run::Message, wafer_run::InputStream),
+) -> String {
+    let body = output_to_json(dispatch(ctx, msg.0, msg.1).await).await;
+    body["id"].as_str().expect("created product id").to_string()
+}
+
+/// An admin creating a second platform product under a slug a live one holds
+/// is refused by migration 005's owner/slug index, and told which slug.
+#[tokio::test]
+async fn admin_create_with_a_taken_slug_is_a_409_naming_the_slug() {
+    let ctx = ctx().await;
+    let body = serde_json::json!({"name": "Widget", "slug": "widget"});
+    created_id(
+        &ctx,
+        admin_create_msg("/b/products/api/admin/products", body.clone()),
+    )
+    .await;
+
+    let (msg, input) = admin_create_msg("/b/products/api/admin/products", body);
+    expect_widget_slug_taken(dispatch(&ctx, msg, input).await).await;
+}
+
+/// Changing a product's slug onto one another live product holds is the same
+/// named 409, and the product keeps its own slug.
+#[tokio::test]
+async fn admin_update_onto_a_taken_slug_is_a_409_naming_the_slug() {
+    let ctx = ctx().await;
+    created_id(
+        &ctx,
+        admin_create_msg(
+            "/b/products/api/admin/products",
+            serde_json::json!({"name": "Widget", "slug": "widget"}),
+        ),
+    )
+    .await;
+    let other = created_id(
+        &ctx,
+        admin_create_msg(
+            "/b/products/api/admin/products",
+            serde_json::json!({"name": "Gadget", "slug": "gadget"}),
+        ),
+    )
+    .await;
+
+    let (mut msg, input) = request_msg(
+        "update",
+        &format!("/b/products/api/admin/products/{other}"),
+        "admin_1",
+        serde_json::json!({"slug": "widget"}),
+    );
+    msg.set_meta("auth.user_roles", "admin");
+    expect_widget_slug_taken(dispatch(&ctx, msg, input).await).await;
+
+    let (msg, input) = admin_get_msg(&format!("/b/products/api/admin/products/{other}"));
+    let stored = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(stored["slug"], "gadget");
+}
+
+/// A seller's own create and update meet the same index, scoped to their own
+/// products, and get the same named 409.
+#[tokio::test]
+async fn seller_writes_onto_a_taken_slug_are_a_409_naming_the_slug() {
+    let ctx = user_products_ctx().await;
+    created_id(
+        &ctx,
+        create_msg(
+            "/b/products/api/products",
+            "user_1",
+            serde_json::json!({"name": "Widget", "slug": "widget"}),
+        ),
+    )
+    .await;
+
+    let (msg, input) = create_msg(
+        "/b/products/api/products",
+        "user_1",
+        serde_json::json!({"name": "Widget again", "slug": "widget"}),
+    );
+    expect_widget_slug_taken(dispatch(&ctx, msg, input).await).await;
+
+    let other = created_id(
+        &ctx,
+        create_msg(
+            "/b/products/api/products",
+            "user_1",
+            serde_json::json!({"name": "Gadget", "slug": "gadget"}),
+        ),
+    )
+    .await;
+    let (msg, input) = update_msg(
+        &format!("/b/products/api/products/{other}"),
+        "user_1",
+        serde_json::json!({"slug": "widget"}),
+    );
+    expect_widget_slug_taken(dispatch(&ctx, msg, input).await).await;
 }
