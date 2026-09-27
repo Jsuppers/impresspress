@@ -5946,10 +5946,10 @@ async fn every_product_write_refuses_a_slug_outside_the_grammar() {
             "a refused update must apply none of its fields"
         );
     }
-    let rows = super::super::repo::products::list_all_including_deleted(&ctx, Vec::new())
+    let rows = super::super::repo::products::count(&ctx, &[])
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2, "a refused create must write no row");
+    assert_eq!(rows, 2, "a refused create must write no row");
 
     // The bounds are inclusive, and empty means no web address.
     let longest = "a".repeat(160);
