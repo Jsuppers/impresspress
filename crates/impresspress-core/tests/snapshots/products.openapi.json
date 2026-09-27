@@ -829,6 +829,9 @@
                   ]
                 },
                 "slug": {
+                  "description": "Web address of the product: lowercase letters and digits in runs\njoined by single hyphens, at most 160 characters. Empty means none.",
+                  "maxLength": 160,
+                  "pattern": "^(?:[a-z0-9]+(?:-[a-z0-9]+)*)?$",
                   "type": [
                     "string",
                     "null"
@@ -1462,6 +1465,9 @@
                   ]
                 },
                 "slug": {
+                  "description": "Web address of the product: lowercase letters and digits in runs\njoined by single hyphens, at most 160 characters. Empty means none.",
+                  "maxLength": 160,
+                  "pattern": "^(?:[a-z0-9]+(?:-[a-z0-9]+)*)?$",
                   "type": [
                     "string",
                     "null"
@@ -8709,6 +8715,9 @@
                   ]
                 },
                 "slug": {
+                  "description": "Web address of the product: lowercase letters and digits in runs\njoined by single hyphens, at most 160 characters. Empty means none.",
+                  "maxLength": 160,
+                  "pattern": "^(?:[a-z0-9]+(?:-[a-z0-9]+)*)?$",
                   "type": [
                     "string",
                     "null"
@@ -9342,6 +9351,9 @@
                   ]
                 },
                 "slug": {
+                  "description": "Web address of the product: lowercase letters and digits in runs\njoined by single hyphens, at most 160 characters. Empty means none.",
+                  "maxLength": 160,
+                  "pattern": "^(?:[a-z0-9]+(?:-[a-z0-9]+)*)?$",
                   "type": [
                     "string",
                     "null"
@@ -15916,7 +15928,6 @@
                   "subscription_status": {
                     "description": "Stripe subscription lifecycle state; absent for a one-time order.",
                     "enum": [
-                      "",
                       "incomplete",
                       "incomplete_expired",
                       "trialing",

@@ -627,7 +627,7 @@ pub fn refused_response(
         ),
         wafer_run::ErrorCode::AlreadyExists => status_response(
             409,
-            "Conflict",
+            "Already exists",
             "409",
             "Already exists",
             "This page tried to write an entry that already exists, so reloading it will not \
@@ -867,6 +867,9 @@ mod tests {
             html.contains("Already exists") && html.contains("Go home"),
             "{html}"
         );
+        // The tab names the same thing the heading does, as on the 403 and
+        // 429 pages.
+        assert!(html.contains("<title>Already exists — "), "{html}");
         assert!(
             !html.contains("impresspress__admin"),
             "schema leaked: {html}"

@@ -17,6 +17,7 @@ use super::{
         AmountRule, ApprovalStatus, CommerceAnalytics, ManagedOffer, OfferStatus, OfferSyncStatus,
         ProductStatus, SellerAccount, SellerFailureSummary, SellerStatus, StripeConnectionState,
         StripeConnectionStatus, StripeEventType, VariableDefinition, VariableKind,
+        PRODUCT_SLUG_MAX_LEN, PRODUCT_SLUG_PATTERN,
     },
     money, repo, stripe_provider,
 };
@@ -1099,7 +1100,7 @@ pub async fn product_wizard(ctx: &dyn Context, msg: &Message, admin: bool) -> Ou
                             div .products-form-grid {
                                 div .form-group {
                                     label .form-label for="wizard-slug" { "Web address" }
-                                    input #wizard-slug .form-input type="text" maxlength="160" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="Generated from the product name";
+                                    input #wizard-slug .form-input type="text" maxlength=(PRODUCT_SLUG_MAX_LEN) pattern=(PRODUCT_SLUG_PATTERN) placeholder="Generated from the product name";
                                     p .text-muted .text-sm { "Leave blank to create this automatically." }
                                 }
                                 div .form-group {
@@ -1788,7 +1789,11 @@ pub async fn product_manager(
                         summary { "More product details (optional)" }
                         div .products-advanced__body {
                             div .products-form-grid {
-                                div .form-group { label .form-label for="manager-product-slug" { "Web address" } input #manager-product-slug .form-input type="text" maxlength="160" value=(product.str_field("slug")); }
+                                // No `pattern`: a stored slug may break the grammar, and a
+                                // `pattern` would block every save of such a product, even one
+                                // that leaves the slug alone. The server refuses a changed slug
+                                // outside the grammar; `maxlength` binds only what is typed.
+                                div .form-group { label .form-label for="manager-product-slug" { "Web address" } input #manager-product-slug .form-input type="text" maxlength=(PRODUCT_SLUG_MAX_LEN) value=(product.str_field("slug")); }
                                 div .form-group { label .form-label for="manager-product-image" { "Image URL" } input #manager-product-image .form-input type="url" value=(product.str_field("image_url")); }
                                 div .form-group {
                                     label .form-label for="manager-product-fulfillment" { "How it is delivered" }

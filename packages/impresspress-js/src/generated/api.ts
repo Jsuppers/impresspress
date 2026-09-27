@@ -4473,6 +4473,10 @@ export interface paths {
                         product_template_id?: string | null;
                         /** @description Id of a product the buyer must already own before checkout. */
                         requires?: string | null;
+                        /**
+                         * @description Web address of the product: lowercase letters and digits in runs
+                         *     joined by single hyphens, at most 160 characters. Empty means none.
+                         */
                         slug?: string | null;
                         /**
                          * @description Initial publication state. Defaults to `draft`; a seller product is
@@ -4790,6 +4794,10 @@ export interface paths {
                         product_template_id?: string | null;
                         /** @description Id of a product the buyer must already own before checkout. */
                         requires?: string | null;
+                        /**
+                         * @description Web address of the product: lowercase letters and digits in runs
+                         *     joined by single hyphens, at most 160 characters. Empty means none.
+                         */
                         slug?: string | null;
                         /**
                          * @description Publication state. A seller may set `draft`, `active` or `archived`;
@@ -8383,6 +8391,10 @@ export interface paths {
                         product_template_id?: string | null;
                         /** @description Id of a product the buyer must already own before checkout. */
                         requires?: string | null;
+                        /**
+                         * @description Web address of the product: lowercase letters and digits in runs
+                         *     joined by single hyphens, at most 160 characters. Empty means none.
+                         */
                         slug?: string | null;
                         /**
                          * @description Initial publication state. Defaults to `draft`; a seller product is
@@ -8700,6 +8712,10 @@ export interface paths {
                         product_template_id?: string | null;
                         /** @description Id of a product the buyer must already own before checkout. */
                         requires?: string | null;
+                        /**
+                         * @description Web address of the product: lowercase letters and digits in runs
+                         *     joined by single hyphens, at most 160 characters. Empty means none.
+                         */
                         slug?: string | null;
                         /**
                          * @description Publication state. A seller may set `draft`, `active` or `archived`;
@@ -12005,7 +12021,7 @@ export interface paths {
                              * @description Stripe subscription lifecycle state; absent for a one-time order.
                              * @enum {string}
                              */
-                            subscription_status?: "" | "incomplete" | "incomplete_expired" | "trialing" | "active" | "past_due" | "unpaid" | "paused" | "canceled";
+                            subscription_status?: "incomplete" | "incomplete_expired" | "trialing" | "active" | "past_due" | "unpaid" | "paused" | "canceled";
                         };
                     };
                 };

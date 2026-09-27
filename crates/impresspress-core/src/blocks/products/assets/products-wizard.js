@@ -17,7 +17,7 @@ function productWizardShowError(message,focus){
 }
 function productWizardClearError(){var error=wizardById('product-wizard-error');error.textContent='';error.hidden=true}
 function productWizardSlug(value){
-  return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,160);
+  return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,160).replace(/-+$/,'');
 }
 function productWizardTemplateChanged(){
   var subscription=productWizardIsSubscription();
