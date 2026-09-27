@@ -1041,13 +1041,18 @@ impl TestContext {
     /// over this fixture's `BlockInfo`s and extra routes the way
     /// `builder::registration` builds it.
     ///
-    /// That is the whole preamble a deployment runs before any block: the
-    /// router picks the credential off the `Authorization` header or the
-    /// `auth_token` cookie and records which, then
+    /// That is the request preamble up from the router: it picks the
+    /// credential off the `Authorization` header or the `auth_token` cookie
+    /// and records which, then
     /// [`crate::pipeline::handle_request`] verifies it — a JWT's signature,
     /// issuer, blocklist entry and `auth_version`; an API key's row, owner
     /// and roles — writes the `auth.*` meta from what verified, applies the
     /// CSRF origin policy to a cookie-authenticated write, routes, and logs.
+    /// It is not the whole of what a deployment runs: in the `site-main` flow
+    /// ([`crate::flows::site_main`]) the `security-headers`, `cors`,
+    /// `readonly-guard` and `body-limit` steps run before the router and do
+    /// not run here, so a header they add or a request they refuse is not
+    /// something this path can show.
     ///
     /// `msg` carries what the wire carries — `req.*` and `http.header.*`
     /// meta, as [`anon_msg`] builds and [`Session::bearer`] /
