@@ -178,11 +178,10 @@ fn generate_writes_configured_head_sampling_rate() {
 }
 
 /// Golden for the D1 query limit a generated config states. The runtime's
-/// statement budget admits every multi-statement write against this var, so a
-/// Workers Free deploy that ran on the Paid default would be admitted writes
+/// statement budget admits every multi-statement write against this var, so
+/// a Worker that ran on a limit above its platform's would be admitted writes
 /// D1 then refuses part-way. Every config that uploads code must carry it —
-/// the Paid default included — along with the note that says it depends on
-/// the plan.
+/// the default included — along with the note that says when to change it.
 #[test]
 fn every_generated_config_states_the_d1_query_limit_and_what_it_depends_on() {
     let tmp = tempdir().unwrap();
@@ -195,8 +194,9 @@ fn every_generated_config_states_the_d1_query_limit_and_what_it_depends_on() {
         "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION"
     );
     assert_eq!(D1_QUERIES_PER_INVOCATION_DEFAULT, 1000);
-    let note = "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is D1's per-invocation query limit \
-                for the account's plan: 1000 on Workers Paid, 50 on Workers Free. Set it with \
+    let note = "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is how many D1 queries one \
+                invocation may run: 1000 on Workers Free and Paid alike. Lower it only for a \
+                Worker whose limits.subrequests is lower, with \
                 [cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
 
     for (limit, line) in [

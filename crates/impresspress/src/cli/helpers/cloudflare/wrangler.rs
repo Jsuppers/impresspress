@@ -88,8 +88,7 @@ pub struct CloudflareConfig {
     /// [`D1_QUERIES_PER_INVOCATION_KEY`], resolved by
     /// [`super::env::RawCloudflareConfig::resolve`] from `impresspress.toml`'s
     /// `[cloudflare].d1_queries_per_invocation`, defaulting to
-    /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`] (Workers Paid's 1000). A Workers
-    /// Free deploy sets `50`.
+    /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`] (1000, which every plan allows).
     pub d1_queries_per_invocation: u64,
     /// Cloudflare cron expressions the Worker's `scheduled` handler runs on,
     /// resolved by [`super::env::RawCloudflareConfig::resolve`] from
@@ -308,8 +307,7 @@ pub fn generate_triggers(
 /// able to actually turn it off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfigRole {
-    /// `wrangler dev`, and the one-time first `wrangler deploy` that creates
-    /// the Worker. Compiles the crate; applies worker-level settings.
+    /// `wrangler dev`. Compiles the crate; applies worker-level settings.
     Build,
     /// `wrangler versions upload`. Consumes an already-built artifact and
     /// applies no worker-level setting.
@@ -631,11 +629,11 @@ fn install_password_hasher_binding(
 
 /// What the generated `[vars]` value of [`D1_QUERIES_PER_INVOCATION_KEY`]
 /// means and where it is set, for someone reading the file: the value alone
-/// does not say that it depends on the account's plan.
+/// does not say when to change it.
 const D1_QUERIES_NOTE: &str =
-    "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is D1's per-invocation query \
-limit for the account's plan: 1000 on Workers Paid, 50 on Workers Free. Set it with \
-[cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
+    "# IMPRESSPRESS_D1_QUERIES_PER_INVOCATION is how many D1 queries one \
+invocation may run: 1000 on Workers Free and Paid alike. Lower it only for a Worker whose \
+limits.subrequests is lower, with [cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
 
 /// Where the password pepper goes, for someone reading either Worker's file:
 /// it is in neither, and it belongs to the password-hasher Worker.
@@ -841,11 +839,10 @@ fn base_toml(cfg: &CloudflareConfig, role: ConfigRole) -> toml::Value {
         ASSET_BASE_URL_VAR.into(),
         Value::String(resolve_asset_base_url(!cfg.r2.bucket_name.is_empty())),
     );
-    // D1's per-invocation query limit for this account's plan, which the
-    // runtime's statement budget admits every multi-statement write against.
-    // Always written, the Paid default included, so the generated config
-    // states the limit the Worker will run under instead of leaving it to a
-    // runtime default a Free-plan reader would not know applies to them.
+    // D1's per-invocation query limit, which the runtime's statement budget
+    // admits every multi-statement write against. Always written, the
+    // default included, so the generated config states the limit the Worker
+    // will run under instead of leaving it to a runtime default.
     vars.insert(
         D1_QUERIES_PER_INVOCATION_KEY.into(),
         Value::String(cfg.d1_queries_per_invocation.to_string()),

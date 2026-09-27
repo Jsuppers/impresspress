@@ -20,6 +20,44 @@ bundle that changes them. So whenever a release's code half assumes a data
 repair the migration half performs, it has to be called out here — on native
 the two ship together but only one of them runs by default.
 
+### Cloudflare: a new site deploys in one command
+
+**What changes.**
+
+- `impresspress deploy --target cloudflare` creates a site's main Worker
+  itself. Before it builds, it asks Cloudflare whether the Worker exists
+  (`wrangler deployments status`). When it does not, then after deploying the
+  password-hasher Worker it deploys a placeholder under the main Worker's name
+  that answers every request with a 503, sets `IMPRESSPRESS_DEPLOY_TOKEN` and
+  `WAFER_RUN__AUTH__JWT_SECRET` on it (each from the same-named environment
+  variable when set, otherwise generated), prints a generated deploy token
+  once with the `export` line later deploys need, and continues through
+  `/_deploy/prepare`, verification and promotion, which replaces the
+  placeholder. No plain `wrangler deploy` of either Worker and no
+  `impresspress deploy secret` is needed first any more.
+- A deploy to a Worker that exists first sets whichever of those two secrets
+  the Worker does not hold (it lists secret names, never values), so a first
+  deploy that stopped part-way is finished by running it again. A generated
+  deploy token is printed as soon as it is set; if that output is a CI log
+  others can read, rotate it, or export the token before the first deploy.
+- A deploy to a Worker that holds its deploy token still needs
+  `IMPRESSPRESS_DEPLOY_TOKEN`, and without it now stops before the build,
+  naming the command that sets a new one (`npx wrangler secret put
+  IMPRESSPRESS_DEPLOY_TOKEN --name <worker_name>`).
+- D1 runs 1,000 queries per invocation on Workers Free, not 50: a Free-plan
+  Worker runs a fresh database's `/_deploy/prepare`, over 250 D1 queries, in
+  one invocation, and the Workers limits page caps subrequests to internal
+  services (D1, KV, R2) at 1,000 on Free. D1's own limits page still says 50.
+  `/_deploy/prepare` applies every pending migration in one invocation, so a
+  new site whose `[cloudflare].d1_queries_per_invocation` was 50 could never
+  finish its first deploy.
+
+**Who has to act.** A Cloudflare deploy that set
+`d1_queries_per_invocation = 50` on the advice of the D1 statement budget
+note below: remove the line, so the Worker runs on the default 1000. Keep a
+lower value only if the Worker's `limits.subrequests` is below 1,000, and
+then no lower than a fresh database's migrations need. Nobody else.
+
 ### API: a request with no identity is 401, not 403
 
 **What changes.** An API call (any `Accept` that is not an HTML page) to a
@@ -136,11 +174,8 @@ build refuses them in its `[vars]`. They are the hasher's:
 
 **Who has to act.**
 
-- *A new site:* create the hasher before the main Worker's one-time first
-  `wrangler deploy`, since the binding names its script:
-  `npx wrangler deploy --config
-  target/impresspress-cloudflare/wrangler-password-hasher.toml`, then the main
-  Worker as before.
+- *A new site:* nothing; `impresspress deploy` creates the hasher, then the
+  main Worker (see "Cloudflare: a new site deploys in one command").
 - *An existing site without a pepper:* nothing; `impresspress deploy` creates
   the hasher on its first run.
 - *An existing site with a pepper:* the hasher must hold the keys before the
@@ -335,14 +370,15 @@ printing the value.
   fit what the request has left is refused before it runs, as a 429 whose
   message gives the numbers, instead of failing part-way inside D1. The limit
   is the new Worker var `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION`, default
-  `1000` (Workers Paid). A value that is not a whole number from 5 (one more
+  `1000`, which Workers Free and Paid both allow (see "Cloudflare: a new site
+  deploys in one command" above). A value that is not a whole number from 5 (one more
   than the audit-row reservation below) to 1000, D1's maximum, fails every
   request with an error naming the var, however it was set. That 429 means the
   request did too much: retrying it does the same work and is refused again.
 - Of that limit, each request holds 4 queries back for its own
   `request_logs` row, written after the response, so the row is written
   however much of the budget the request spent: a request's handlers can run
-  46 of Free's 50, 996 of Paid's 1000. With `IMPRESSPRESS_REQUEST_LOG=off`
+  996 of the default 1000. With `IMPRESSPRESS_REQUEST_LOG=off`
   nothing is held back. The row, and then any mail the request sends after
   its response (on everything the row left), run under that request's own
   budget. Before, a
@@ -369,17 +405,16 @@ printing the value.
   an injected embedding service, since `impresspress/fastembed` already
   serves embeddings there.
 
-**Who has to act.** A Cloudflare deploy on the Workers Free plan: set
-`d1_queries_per_invocation = 50` under `[cloudflare]` in `impresspress.toml`,
-or the budget will admit writes D1 then refuses part-way. The generated
-`wrangler.toml` writes it into `[vars]` as
-`IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` (`"1000"` when unset); a value set
-through a `wrangler_overrides_path` file still wins, since overrides are
-merged over the generated config. A value outside 5 to 1000 fails the
-build, and the Worker refuses one set through an overrides file too. The budget counts D1 queries only, which Cloudflare limits per
-invocation on their own (50 Free, 1,000 Paid). KV and R2 operations are
-subrequests to internal services, a separate limit (1,000 per invocation on
-Free) that the budget neither counts nor spends
+**Who has to act.** Nobody on Cloudflare: leave
+`d1_queries_per_invocation` unset. An earlier version of this note told
+Workers Free deploys to set it to `50`; that makes a fresh database's first
+deploy fail, and is corrected in "Cloudflare: a new site deploys in one
+command" above. The generated `wrangler.toml` writes the limit into `[vars]`
+as `IMPRESSPRESS_D1_QUERIES_PER_INVOCATION` (`"1000"` when unset); a value
+set through a `wrangler_overrides_path` file still wins, since overrides are
+merged over the generated config. A value outside 5 to 1000 fails the build,
+and the Worker refuses one set through an overrides file too. The budget
+counts D1 queries only, not KV or R2 operations
 (<https://developers.cloudflare.com/d1/platform/limits/>,
 <https://developers.cloudflare.com/workers/platform/limits/#subrequests>). A user
 whose password hash was imported from another system at more than 46 MiB:

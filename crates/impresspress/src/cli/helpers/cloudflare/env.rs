@@ -48,8 +48,11 @@ pub struct RawCloudflareConfig {
     /// defaults to [`DEFAULT_HEAD_SAMPLING_RATE`] when unset by both toml
     /// and env.
     pub head_sampling_rate: Option<f64>,
-    /// D1 queries one Worker invocation may run on this account's plan:
-    /// 1000 on Workers Paid, 50 on Free. TOML-only, because the value is
+    /// D1 queries one Worker invocation may run: 1000 on Workers Free and
+    /// Paid alike, lower only for a Worker whose `limits.subrequests` is
+    /// lower (see
+    /// [`impresspress_core::config_vars::D1_QUERIES_PER_INVOCATION_KEY`]).
+    /// TOML-only, because the value is
     /// written into the generated config as the Worker var the runtime reads
     /// ([`impresspress_core::config_vars::D1_QUERIES_PER_INVOCATION_KEY`]);
     /// defaults to
@@ -273,7 +276,7 @@ fn resolve_head_sampling_rate(env_val: Option<String>, toml_val: Option<f64>) ->
 }
 
 /// Resolve `[cloudflare].d1_queries_per_invocation`: the stated limit, or
-/// Workers Paid's when unset. Checked here with the parser the Worker applies
+/// the default 1000 when unset. Checked here with the parser the Worker applies
 /// to the var, so a value out of range — above D1's documented maximum of
 /// 1000 (<https://developers.cloudflare.com/d1/platform/limits/>), or too
 /// small to leave room past the audit-row reservation — fails the build

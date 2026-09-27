@@ -19,10 +19,20 @@ use wafer_run::{ConfigVar, InputType};
 /// `WAFER_RUN_SHARED__*` entry.
 pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 
-/// Worker var naming how many D1 queries one Worker invocation may run: D1's
-/// "Queries per Worker invocation" limit for the account's plan, 1000 on
-/// Workers Paid and 50 on Free
-/// (<https://developers.cloudflare.com/d1/platform/limits/>).
+/// Worker var naming how many D1 queries one Worker invocation may run.
+///
+/// D1 queries are subrequests to a Cloudflare internal service, and the
+/// Workers limits page caps those at 1,000 per invocation on Workers Free and
+/// at the Worker's configured subrequest limit on Paid
+/// (<https://developers.cloudflare.com/workers/platform/limits/#subrequests>).
+/// D1's own limits page still lists 50 for Free
+/// (<https://developers.cloudflare.com/d1/platform/limits/>), but a Free-plan
+/// Worker runs a fresh database's `/_deploy/prepare` — over 250 D1 queries —
+/// in one invocation, so 50 is not what D1 enforces there.
+/// The default, [`D1_QUERIES_PER_INVOCATION_DEFAULT`], therefore fits every
+/// plan. A lower value is for a Worker whose `limits.subrequests` is set
+/// below 1,000, and it bounds `/_deploy/prepare` too, which applies every
+/// pending migration in one invocation.
 ///
 /// Shared by both sides of a deploy: `impresspress build`/`deploy --target
 /// cloudflare` writes it into the generated `wrangler.toml` `[vars]` from
@@ -32,13 +42,15 @@ pub const DEPLOY_TOKEN_KEY: &str = "IMPRESSPRESS_DEPLOY_TOKEN";
 /// never a `variables` row.
 pub const D1_QUERIES_PER_INVOCATION_KEY: &str = "IMPRESSPRESS_D1_QUERIES_PER_INVOCATION";
 
-/// D1's per-invocation query limit on Workers Paid: what a deploy that does
-/// not state [`D1_QUERIES_PER_INVOCATION_KEY`] runs under.
+/// The D1 queries per invocation a deploy that does not state
+/// [`D1_QUERIES_PER_INVOCATION_KEY`] runs under: 1,000, which Workers Free
+/// and Workers Paid both allow.
 pub const D1_QUERIES_PER_INVOCATION_DEFAULT: u64 = 1000;
 
-/// The most queries D1 runs per Worker invocation on any plan (Workers
-/// Paid's limit): a stated [`D1_QUERIES_PER_INVOCATION_KEY`] above it would
-/// have the budget admit writes D1 then refuses part-way.
+/// The most D1 queries per invocation a deploy may state: D1's limits page
+/// gives 1,000 for Workers Paid, so a stated
+/// [`D1_QUERIES_PER_INVOCATION_KEY`] above it could have the budget admit
+/// writes D1 then refuses part-way.
 pub const D1_QUERIES_PER_INVOCATION_MAX: u64 = 1000;
 
 /// The fewest queries per invocation a deploy may state: more than a
@@ -63,8 +75,9 @@ pub fn parse_d1_queries_per_invocation(raw: &str) -> Result<u64, String> {
         }
         _ => Err(format!(
             "{D1_QUERIES_PER_INVOCATION_KEY} is {raw:?}; it must be a whole number from \
-             {D1_QUERIES_PER_INVOCATION_MIN} to {D1_QUERIES_PER_INVOCATION_MAX} (D1 allows \
-             1000 queries per invocation on Workers Paid, 50 on Free)"
+             {D1_QUERIES_PER_INVOCATION_MIN} to {D1_QUERIES_PER_INVOCATION_MAX} (D1 runs at most \
+             1000 queries per invocation; leave it unset unless the Worker's \
+             limits.subrequests is lower)"
         )),
     }
 }
@@ -1274,6 +1287,12 @@ mod d1_queries_per_invocation_tests {
             let err = parse_d1_queries_per_invocation(&raw).expect_err(&raw);
             assert!(
                 err.contains(D1_QUERIES_PER_INVOCATION_KEY),
+                "{raw:?}: {err}"
+            );
+            // The refusal points at the default rather than at a per-plan
+            // number: 1000 is what D1 allows on Workers Free and Paid alike.
+            assert!(
+                err.contains("leave it unset") && !err.contains("50 on Free"),
                 "{raw:?}: {err}"
             );
         }

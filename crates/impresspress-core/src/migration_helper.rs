@@ -751,4 +751,65 @@ mod tests {
             "expected `ddl failed` in error string, got: {err}"
         );
     }
+
+    /// `/_deploy/prepare` applies every block's pending migrations in ONE
+    /// Worker invocation, so on a fresh database the statement count of every
+    /// SQLite migration file the crate ships has to fit well inside D1's
+    /// per-invocation query limit ([`D1_QUERIES_PER_INVOCATION_DEFAULT`]),
+    /// with the funnel's seeds, migration stamps and config reads in what is
+    /// left. Half the limit is that line.
+    ///
+    /// Read from the files rather than the blocks' `SQLITE_MIGRATIONS`
+    /// constants so the count covers every block whatever features this test
+    /// is built with. If this fails, the funnel has to apply migrations over
+    /// more than one invocation before the migration that crossed the line
+    /// ships; raising the threshold would only move where a first deploy
+    /// breaks.
+    ///
+    /// A guard: it passes on the shipped migrations by design, and fails only
+    /// when they grow past the line.
+    ///
+    /// [`D1_QUERIES_PER_INVOCATION_DEFAULT`]: crate::config_vars::D1_QUERIES_PER_INVOCATION_DEFAULT
+    #[test]
+    fn a_fresh_databases_migrations_fit_half_of_one_d1_invocation() {
+        let blocks = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blocks");
+        let mut total = 0usize;
+        let mut per_block = Vec::new();
+        for block in std::fs::read_dir(&blocks).expect("read src/blocks") {
+            let dir = block.expect("block entry").path().join("migrations");
+            let Ok(files) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut count = 0usize;
+            for file in files {
+                let path = file.expect("migration entry").path();
+                let is_sqlite = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".sqlite.sql"));
+                if !is_sqlite {
+                    continue;
+                }
+                let sql = std::fs::read_to_string(&path).expect("read migration");
+                count += split_statements(&sql)
+                    .into_iter()
+                    .filter(|stmt| has_executable_content(stmt))
+                    .count();
+            }
+            total += count;
+            per_block.push((dir, count));
+        }
+        let limit = crate::config_vars::D1_QUERIES_PER_INVOCATION_DEFAULT as usize;
+        assert!(
+            total > 0,
+            "no SQLite migration found under {}",
+            blocks.display()
+        );
+        assert!(
+            total <= limit / 2,
+            "a fresh database's migrations are {total} statements, more than half of the \
+             {limit} D1 queries `/_deploy/prepare` may run in its one invocation: \
+             {per_block:?}"
+        );
+    }
 }
