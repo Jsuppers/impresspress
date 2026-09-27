@@ -1,16 +1,19 @@
-//! Server-boot body lifted from the previous `main.rs`.
+//! The native impresspress server: the boot body the `impresspress` binary
+//! runs, as a library a downstream native site runs too.
 //!
-//! `run()` is invoked by the sealed × native flow (and by the bare-`impresspress`
-//! shortcut path in `main.rs`). It constructs the database service, seeds the
-//! admin variables / block_settings tables pre-wafer through the shared
-//! `impresspress_core` seeders, builds the WAFER runtime, registers the HTTP
-//! listener, and runs the `serve_until_shutdown` loop.
+//! [`run`] constructs the database service, seeds the admin variables /
+//! block_settings tables pre-wafer through the shared `impresspress_core`
+//! seeders, builds the WAFER runtime, registers the HTTP listener, and runs
+//! the `serve_until_shutdown` loop. A consumer adds its own blocks, config
+//! and flows through [`AppHooks`] — the same two hooks
+//! `impresspress_cloudflare::run` takes — and names the flow the listener
+//! dispatches to.
 //!
 //! The runtime construction itself lives in [`build_native_runtime`], shared
-//! with the integration tests in `tests/` so the runtime they exercise is the
-//! one the binary builds.
+//! with the integration tests so the runtime they exercise is the one the
+//! binary builds.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, error::Error, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use impresspress_core::builder::{self, ImpresspressBuilder};
@@ -19,14 +22,56 @@ use impresspress_native::{
     register_observability_hooks, serve_until_shutdown, InfraConfig,
 };
 use impresspress_password::pepper::{self as password_pepper, PasswordPeppers};
-use wafer_core::interfaces::database::service::DatabaseService;
+use wafer_core::interfaces::{
+    database::service::DatabaseService, storage::service::StorageService,
+};
 use wafer_run::Wafer;
 
-use crate::cli::server_config::filter_to_declared_keys;
+/// The hook that configures the [`ImpresspressBuilder`] before `build()`:
+/// the consumer's blocks, routes and block settings.
+pub type RegisterBlocks =
+    Box<dyn FnOnce(ImpresspressBuilder) -> Result<ImpresspressBuilder, Box<dyn Error>>>;
 
-/// Boot the native server end-to-end. The body mirrors the previous
-/// `main()` exactly; the signature is `pub async fn run()` so the new
-/// dispatcher can `await` it as the sealed × native flow.
+/// The hook that runs on the built runtime before boot: the consumer's
+/// post-build blocks, block configs and flows. It is handed the platform
+/// storage service.
+pub type RegisterPostBuild =
+    Box<dyn FnOnce(&mut Wafer, Arc<dyn StorageService>) -> Result<(), Box<dyn Error>>>;
+
+/// What a consumer adds to the native runtime, in the shape
+/// `impresspress_cloudflare::run` takes: `register_blocks` runs on the
+/// builder after the platform services, config and block settings are
+/// installed, and `register_post_build` on the built runtime.
+pub struct AppHooks {
+    /// Runs on the builder, just before `build()`.
+    pub register_blocks: RegisterBlocks,
+    /// Runs on the built runtime, before the listener is registered and the
+    /// runtime boots.
+    pub register_post_build: RegisterPostBuild,
+}
+
+impl AppHooks {
+    /// No consumer additions: the runtime impresspress itself serves.
+    pub fn none() -> Self {
+        Self {
+            register_blocks: Box::new(Ok),
+            register_post_build: Box::new(|_, _| Ok(())),
+        }
+    }
+}
+
+/// The flow impresspress dispatches all HTTP traffic through
+/// (`crates/impresspress-core/src/flows/site_main.rs`).
+pub const IMPRESSPRESS_LISTENER_FLOW: &str = "site-main";
+
+mod declared_keys;
+pub use declared_keys::filter_to_declared_keys;
+
+/// Boot the native server end-to-end and serve until shutdown.
+///
+/// `listener_flow` is the flow the HTTP listener dispatches every request to
+/// ([`IMPRESSPRESS_LISTENER_FLOW`] for impresspress itself); `hooks` add the
+/// consumer's blocks and flows.
 ///
 /// `run_migrations` mirrors `impresspress serve --run-migrations`. When `true`
 /// the boot path stamps `IMPRESSPRESS_RUN_MIGRATIONS=1` into the config
@@ -34,7 +79,12 @@ use crate::cli::server_config::filter_to_declared_keys;
 /// instead of the prior `std::env::set_var` smuggle. Rust 2024 makes
 /// process-env mutation `unsafe`, and the smuggle leaked into any child
 /// process the boot path might spawn — neither was the right channel.
-pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
+pub async fn run(
+    repo_root: &Path,
+    run_migrations: bool,
+    listener_flow: &str,
+    hooks: AppHooks,
+) -> anyhow::Result<()> {
     // 1. Load .env file (before reading any env vars). Anchored to
     // `repo_root` so the boot path doesn't depend on the process cwd —
     // mutating cwd globally would leak into anything else this binary
@@ -81,13 +131,18 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
     .context("construct database service")?;
 
     // 5b-7b. Seed, load, and build the runtime (shared with the tests).
-    let mut wafer =
-        build_native_runtime(&infra, database, &app_env, password_peppers, run_migrations).await?;
+    let mut wafer = build_native_runtime(
+        &infra,
+        database,
+        &app_env,
+        password_peppers,
+        run_migrations,
+        hooks,
+    )
+    .await?;
 
-    // 8. Native-only: register http-listener.
-    //    impresspress dispatches all HTTP traffic through the `site-main` flow
-    //    (see crates/impresspress-core/src/flows/site_main.rs).
-    register_http_listener(&mut wafer, &infra.listen, "site-main", &infra.listener);
+    // 8. Native-only: register http-listener on the consumer's flow.
+    register_http_listener(&mut wafer, &infra.listen, listener_flow, &infra.listener);
 
     // 9. Register observability hooks
     register_observability_hooks(&mut wafer);
@@ -137,6 +192,10 @@ pub async fn run(repo_root: &Path, run_migrations: bool) -> anyhow::Result<()> {
 /// config surface carries them, so no block can read them
 /// ([`password_peppers_from_env`] says why).
 ///
+/// `hooks.register_blocks` runs on the builder once the platform services,
+/// config and block settings are installed, and `hooks.register_post_build`
+/// on the built runtime, with the platform storage service.
+///
 /// `run()` calls this with the service it built from `infra`; the integration
 /// tests call it with a service they seeded first, so what they exercise is
 /// the runtime the binary builds rather than a copy of these steps.
@@ -146,6 +205,7 @@ pub async fn build_native_runtime(
     app_env: &HashMap<String, String>,
     password_peppers: PasswordPeppers,
     run_migrations: bool,
+    hooks: AppHooks,
 ) -> anyhow::Result<Wafer> {
     // Create the admin variables / block_settings tables pre-wafer by running
     // admin's migration-file SQL through the service (migration-file-runner
@@ -305,7 +365,7 @@ pub async fn build_native_runtime(
     let (with_config, ()) = runtime_config.install(
         ImpresspressBuilder::new()
             .database(database)
-            .storage(storage),
+            .storage(storage.clone()),
         |map| {
             let svc = wafer_core::service_blocks::config::EnvConfigService::new();
             (builder::fill_config_service(Arc::new(svc), map), ())
@@ -328,7 +388,7 @@ pub async fn build_native_runtime(
     let mut block_config =
         impresspress_core::platform_state::variables::usable_env_exports(app_env);
     block_config.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let wafer = with_config
+    let builder = with_config
         .config_source(Arc::new(wafer_run::StaticConfigSource::new(block_config)))
         .crypto(crypto)
         .network(impresspress_native::make_fetch_network_service())
@@ -342,9 +402,12 @@ pub async fn build_native_runtime(
         // Where `impresspress/fastembed`'s ONNX model is cached (the
         // `block-fastembed` feature, which `native-embedding` implies).
         // Ignored when the feature is off.
-        .model_cache_dir(&infra.model_cache_dir)
-        .build()
-        .context("build impresspress runtime")?;
+        .model_cache_dir(&infra.model_cache_dir);
+    let builder = (hooks.register_blocks)(builder)
+        .map_err(|e| anyhow!("register the application's blocks: {e}"))?;
+    let mut wafer = builder.build().context("build impresspress runtime")?;
+    (hooks.register_post_build)(&mut wafer, storage)
+        .map_err(|e| anyhow!("register the application's post-build blocks: {e}"))?;
 
     Ok(wafer)
 }

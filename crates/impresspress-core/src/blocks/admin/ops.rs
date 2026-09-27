@@ -599,7 +599,7 @@ async fn bump_each(
 /// The JWT secret is deliberately NOT refused, and the asymmetry is worth
 /// stating because it is target-dependent:
 ///
-/// - on native, `seed_and_load` runs `seed_jwt_secret` and `cli/server.rs`
+/// - on native, `seed_and_load` runs `seed_jwt_secret` and `impresspress_server::build_native_runtime`
 ///   takes the boot map's secret from the loaded vars, so this row IS the next
 ///   boot's signing key. Editing it is a real operator action — the row even
 ///   carries "Rotating this secret invalidates every issued session" — and

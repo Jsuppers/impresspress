@@ -822,7 +822,7 @@ pub fn is_internal_key(key: &str) -> bool {
 ///
 /// The last of those is defence in depth rather than the thing standing
 /// between the process environment and the table: on native
-/// `cli::server_config::filter_to_declared_keys` drops every undeclared key
+/// `impresspress_server::filter_to_declared_keys` drops every undeclared key
 /// before `seed_and_load` sees it, and no runtime-owned key is declared, so
 /// the refusal has already happened upstream. It is still made here for a
 /// caller that assembles its own batch.

@@ -1,7 +1,7 @@
 //! Sealed × native: prebuilt server bin already on PATH (this CLI binary).
 //! `build` runs block discovery + frontend asset prep into the runtime's
 //! storage path. `serve` does `build` then boots the in-process server
-//! using cwd's .env via `cli::server::run`.
+//! using cwd's .env via `impresspress_server::run`.
 
 use std::path::Path;
 
@@ -45,5 +45,11 @@ pub async fn serve(
     run_migrations: bool,
 ) -> Result<()> {
     build(repo_root, release).await?;
-    crate::cli::server::run(repo_root, run_migrations).await
+    impresspress_server::run(
+        repo_root,
+        run_migrations,
+        impresspress_server::IMPRESSPRESS_LISTENER_FLOW,
+        impresspress_server::AppHooks::none(),
+    )
+    .await
 }

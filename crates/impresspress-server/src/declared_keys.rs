@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+/// Keep the env vars whose key some block or shared `ConfigVar` declares.
 pub fn filter_to_declared_keys(env_vars: HashMap<String, String>) -> Vec<(String, String)> {
     // `config_vars::is_declared_key` owns this rule, over a memoized set.
     // This used to re-derive it by hand — `all_block_infos()` +
@@ -87,6 +88,4 @@ mod tests {
 // Block-settings loading + the #222 hash-gate seed are handled by the shared
 // `impresspress_core::platform_state::block_settings::load_and_seed`, and admin-created
 // WRAP grants by `impresspress_core::platform_state::wrap_grants::load`, both over
-// the platform `DatabaseService` (see `server.rs::build_native_runtime`). The
-// previous native-only readers opened `IMPRESSPRESS_DB_PATH` as a SQLite file
-// directly, which no other target does and which finds nothing on Postgres.
+// the platform `DatabaseService` (see `build_native_runtime`).

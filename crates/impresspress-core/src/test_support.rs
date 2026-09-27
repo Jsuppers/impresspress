@@ -1199,7 +1199,7 @@ impl TestContext {
     /// Calling it a second time models a process restart against the same
     /// database.
     ///
-    /// NOT a full boot. `cli/server.rs` additionally publishes
+    /// NOT a full boot. `impresspress_server::build_native_runtime` additionally publishes
     /// `BLOCK_SETTINGS_CONFIG_KEY` and `RUN_MIGRATIONS_KEY` to both surfaces,
     /// passes the declared-key filtered process environment into
     /// `seed_and_load` rather than `&[]`, installs a `ConfigSource` (the
@@ -1239,7 +1239,7 @@ impl TestContext {
 
     /// Run the production boot seeder
     /// ([`crate::platform_state::variables::seed_and_load`]) over this
-    /// fixture's database with `env_vars` — the batch `cli/server.rs` builds
+    /// fixture's database with `env_vars` — the batch `impresspress_server::build_native_runtime` builds
     /// from the process environment and hands it on native.
     ///
     /// The way to model "an operator set this in the deployment environment"

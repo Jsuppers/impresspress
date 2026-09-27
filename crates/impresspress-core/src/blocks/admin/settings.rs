@@ -1921,7 +1921,7 @@ mod config_store_reproduction {
     /// `ops::update_variable` → `variables::upsert_by_key`, which writes the
     /// `variables` table and stops there. Every block instead reads through
     /// `wafer_core::clients::config::get_default`, served by an
-    /// `EnvConfigService` that `cli/server.rs` seeds from that table exactly
+    /// `EnvConfigService` that `impresspress_server::build_native_runtime` seeds from that table exactly
     /// once at boot. Nothing rejoins the two surfaces, so an admin who
     /// changes the site's primary colour through the documented endpoint
     /// keeps seeing the old one until the process restarts.

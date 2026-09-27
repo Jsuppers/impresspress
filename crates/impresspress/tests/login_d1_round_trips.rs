@@ -35,7 +35,6 @@ use std::{
     },
 };
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::{
     after_response::{self, AfterResponse},
     blocks::auth::{
@@ -47,6 +46,7 @@ use impresspress_core::{
 };
 use impresspress_native::InfraConfig;
 use impresspress_password::pepper::PasswordPeppers;
+use impresspress_server::{build_native_runtime, AppHooks, NativeBootHooks};
 use wafer_block::{http_codec, InputStream};
 use wafer_block_sqlite::service::SQLiteDatabaseService;
 use wafer_core::interfaces::database::{
@@ -359,6 +359,7 @@ async fn start() -> Site {
         &app_env,
         PasswordPeppers::default(),
         false,
+        AppHooks::none(),
     )
     .await
     .expect("build impresspress runtime");

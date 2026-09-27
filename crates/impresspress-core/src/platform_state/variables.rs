@@ -479,7 +479,7 @@ pub const ENV_PRECEDENCE_TRANSITION_KEY: &str = "IMPRESSPRESS__ADMIN__ENV_PRECED
 /// Internal, adapter-injected key: `"1"` when this deployment boots from a
 /// process environment, absent otherwise.
 ///
-/// Published by the NATIVE runtime only (`cli::server::build_native_runtime`),
+/// Published by the NATIVE runtime only (`impresspress_server::build_native_runtime`),
 /// which is the only target that hands [`seed_and_load`] a non-empty
 /// `env_vars`: Cloudflare never calls it at all, and the browser calls it with
 /// `&[]`. Every pin this module records exists to resist a process environment,
@@ -612,7 +612,7 @@ pub async fn reset_to_environment(ctx: &dyn Context, key: &str) -> Result<(), Wa
 /// next restart"). A surface must not render a control whose action is inert.
 ///
 /// Derived from the production gate rather than restated:
-/// `cli::server_config::filter_to_declared_keys` — the filter in front of
+/// `impresspress_server::filter_to_declared_keys` — the filter in front of
 /// [`seed_and_load`] on native — keeps exactly
 /// [`crate::config_vars::is_declared_key`], so a key outside it never reaches
 /// the seeder whatever the environment says. `WAFER_RUN__AUTH__JWT_SECRET` is
@@ -1127,7 +1127,7 @@ async fn seed_one_secret(
 /// they are never variables-table config, and `blocks::config` would not serve
 /// such a row anyway. On native they are already gone before this runs —
 /// `collect_app_env_vars` drops every key without `__`, and
-/// `cli::server_config::filter_to_declared_keys` drops every undeclared key —
+/// `impresspress_server::filter_to_declared_keys` drops every undeclared key —
 /// so this guard is defence in depth for a caller that assembles its own
 /// batch, not the thing standing between the process environment and the
 /// table. (The same check does stand between the environment and native's
@@ -1270,7 +1270,7 @@ pub async fn seed_and_load(
         // (`VariablePatch::into_new` on a create, `NewVariable::into_row` on
         // top of it), which is strictly more than this loop could assert.
         // Native filters this batch to declared keys before it gets here
-        // (`cli::server_config::filter_to_declared_keys`), so the
+        // (`impresspress_server::filter_to_declared_keys`), so the
         // undeclared-key default `into_new` applies is not what seeds a row on
         // this path.
         match set_with_row(db, key, value, "", "", None, None, existing).await {
@@ -1385,7 +1385,7 @@ pub(crate) fn log_refused_env_value(key: &str, value: &str, reason: &str) {
 /// JWT_SECRET is not declared as an `auto_generate: true` `ConfigVar` by the
 /// auth block (a wafer-run config-keys gap noted in the auth block module), so
 /// the auto-gen loop above never seeds it. Seed it here so the strict
-/// empty-secret boot check (native `server.rs`) can't trip on a fresh DB and
+/// empty-secret boot check (native `impresspress_server::build_native_runtime`) can't trip on a fresh DB and
 /// the browser/CF crypto can pick up a real key. Idempotent.
 async fn seed_jwt_secret(db: &Arc<dyn DatabaseService>) {
     let key = crate::blocks::auth::JWT_SECRET_KEY;
@@ -1705,7 +1705,7 @@ async fn pin_at_upgrade(db: &Arc<dyn DatabaseService>, row: &VariableRow) -> boo
 ///   the control.
 /// - PER KEY, [`key_can_be_seeded_from_env`]. This line does not check it, and
 ///   on the native path it does not have to: every key the loop saw came
-///   through `cli::server_config::filter_to_declared_keys`, which is the
+///   through `impresspress_server::filter_to_declared_keys`, which is the
 ///   predicate that mirrors. A caller assembling its own batch (the case this
 ///   module's runtime-owned guard is documented for, and what its unit tests
 ///   do) can get a count here for a key the page would offer no control for — a

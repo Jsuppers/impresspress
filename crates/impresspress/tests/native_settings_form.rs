@@ -23,9 +23,9 @@
 
 use std::{collections::HashMap, path::Path};
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
+use impresspress_server::{build_native_runtime, AppHooks, NativeBootHooks};
 use wafer_run::{InputStream, Message};
 
 /// Native reads the admin-created grants out of the platform database and
@@ -65,10 +65,16 @@ async fn the_admin_email_settings_page_renders_its_form_on_the_real_runtime() {
     let database = impresspress_native::make_database_service(&infra.db_type, &infra.db_path, None)
         .await
         .expect("construct sqlite database service");
-    let mut wafer =
-        build_native_runtime(&infra, database, &HashMap::new(), Default::default(), false)
-            .await
-            .expect("build impresspress runtime");
+    let mut wafer = build_native_runtime(
+        &infra,
+        database,
+        &HashMap::new(),
+        Default::default(),
+        false,
+        AppHooks::none(),
+    )
+    .await
+    .expect("build impresspress runtime");
     boot(
         &mut wafer,
         &NativeBootHooks,

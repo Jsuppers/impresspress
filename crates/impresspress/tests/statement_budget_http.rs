@@ -23,9 +23,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use impresspress::cli::server::{build_native_runtime, NativeBootHooks};
 use impresspress_core::builder::{boot, GrantSource, InitPolicy};
 use impresspress_native::InfraConfig;
+use impresspress_server::{build_native_runtime, AppHooks, NativeBootHooks};
 use wafer_block::{http_codec, InputStream};
 use wafer_core::interfaces::database::service::{DatabaseError, DatabaseService, StatementBudget};
 
@@ -120,10 +120,16 @@ async fn a_signup_past_what_the_invocation_has_left_is_a_429_that_writes_nothing
         inner: sqlite.clone(),
         budget: Arc::clone(&budget),
     });
-    let mut wafer =
-        build_native_runtime(&infra, database, &HashMap::new(), Default::default(), false)
-            .await
-            .expect("build impresspress runtime");
+    let mut wafer = build_native_runtime(
+        &infra,
+        database,
+        &HashMap::new(),
+        Default::default(),
+        false,
+        AppHooks::none(),
+    )
+    .await
+    .expect("build impresspress runtime");
     let report = boot(
         &mut wafer,
         &NativeBootHooks,

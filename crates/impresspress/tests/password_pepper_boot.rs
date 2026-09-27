@@ -15,7 +15,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use impresspress::cli::server::{build_native_runtime, password_peppers_from_env, NativeBootHooks};
 use impresspress_core::{
     blocks::auth::config::{BOOTSTRAP_ADMIN_EMAIL_KEY, BOOTSTRAP_ADMIN_PASSWORD_KEY},
     builder::{boot, GrantSource, InitPolicy},
@@ -24,6 +23,9 @@ use impresspress_native::InfraConfig;
 use impresspress_password::pepper::{
     self as password_pepper, PasswordPeppers, PASSWORD_PEPPER_KEY_VAR,
     PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
+};
+use impresspress_server::{
+    build_native_runtime, password_peppers_from_env, AppHooks, NativeBootHooks,
 };
 use wafer_block::{http_codec, InputStream};
 use wafer_core::interfaces::database::service::DatabaseService;
@@ -119,9 +121,16 @@ async fn start(
         ],
     )
     .await;
-    let mut wafer = build_native_runtime(&infra, database.clone(), &app_env(), peppers, false)
-        .await
-        .expect("build impresspress runtime");
+    let mut wafer = build_native_runtime(
+        &infra,
+        database.clone(),
+        &app_env(),
+        peppers,
+        false,
+        AppHooks::none(),
+    )
+    .await
+    .expect("build impresspress runtime");
     wafer
         .register_block(PROBE, Arc::new(ConfigProbe))
         .expect("register the config probe");
