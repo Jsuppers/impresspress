@@ -919,9 +919,12 @@ pub enum ProviderPaymentStatus {
 // included — is refused by `enum_column` as a data fault, so the lifecycle
 // comparisons and the compare-and-swap filters, which compare the stored
 // text against a serialised variant, always compare like with like.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
+    #[default]
     #[serde(rename = "")]
     Unset,
     Incomplete,
@@ -953,6 +956,11 @@ impl SubscriptionStatus {
     /// Parse the `subscription_status` column of an order row.
     pub fn from_record(record: &Record) -> Result<Self, WaferError> {
         enum_column(record, "subscription_status")
+    }
+
+    /// Whether this is the column default: the order is not a subscription.
+    pub const fn is_unset(&self) -> bool {
+        matches!(self, Self::Unset)
     }
 
     /// Whether the subscription can never become live again.
@@ -992,9 +1000,9 @@ pub struct GuestOrderStatus {
     /// Where the order stands against the provider's view of it.
     pub reconciliation_status: ReconciliationStatus,
     pub amounts: MoneyBreakdown,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(required)]
-    pub subscription_status: Option<String>,
+    /// Stripe subscription lifecycle state; absent for a one-time order.
+    #[serde(default, skip_serializing_if = "SubscriptionStatus::is_unset")]
+    pub subscription_status: SubscriptionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
     #[schemars(required)]

@@ -264,6 +264,72 @@ async fn guest_order_status_requires_an_unexpired_receipt_and_returns_a_minimal_
     assert!(output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::NotFound).await);
 }
 
+/// The guest view publishes the subscription state as the
+/// `SubscriptionStatus` vocabulary: a Stripe status passes through, the
+/// column default (a one-time order) leaves the field out, and a stored value
+/// outside the set is the data fault every other reader of the column
+/// reports, not text handed to the buyer.
+#[tokio::test]
+async fn guest_order_status_publishes_the_typed_subscription_state() {
+    let ctx = ctx().await;
+    let token = "guest-subscription-token";
+    for (order_id, stored) in [
+        ("order_sub_active", "active"),
+        ("order_one_time", ""),
+        ("order_sub_foreign", "cancelled"),
+    ] {
+        seed(
+            &ctx,
+            PURCHASES_TABLE,
+            order_id,
+            HashMap::from([
+                ("user_id".to_string(), serde_json::json!("")),
+                ("buyer_user_id".to_string(), serde_json::json!("")),
+                ("status".to_string(), serde_json::json!("completed")),
+                (
+                    "reconciliation_status".to_string(),
+                    serde_json::json!("reconciled"),
+                ),
+                ("currency".to_string(), serde_json::json!("USD")),
+                ("subscription_status".to_string(), serde_json::json!(stored)),
+                (
+                    "receipt_token_hash".to_string(),
+                    serde_json::json!(sha256_hex(token.as_bytes())),
+                ),
+                (
+                    "receipt_token_expires_at".to_string(),
+                    serde_json::json!(
+                        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+                    ),
+                ),
+            ]),
+        )
+        .await;
+    }
+    let status_of = |order_id: &str| {
+        let (mut msg, input) = get_msg(&format!("/b/products/orders/{order_id}/status"), "");
+        msg.set_meta("req.query.receipt_token", token);
+        (msg, input)
+    };
+
+    let (msg, input) = status_of("order_sub_active");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert_eq!(body["subscription_status"], "active");
+
+    let (msg, input) = status_of("order_one_time");
+    let body = output_to_json(dispatch(&ctx, msg, input).await).await;
+    assert!(
+        body.get("subscription_status").is_none(),
+        "a one-time order carries no subscription state: {body}"
+    );
+
+    let (msg, input) = status_of("order_sub_foreign");
+    assert!(
+        output_is_error(dispatch(&ctx, msg, input).await, ErrorCode::Internal).await,
+        "a stored status outside SubscriptionStatus must not reach the buyer"
+    );
+}
+
 #[tokio::test]
 async fn anonymous_commerce_routes_have_independent_ip_rate_limits() {
     let ctx = ctx_with(&[

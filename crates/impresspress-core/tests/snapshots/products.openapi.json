@@ -15914,6 +15914,18 @@
                     "type": "string"
                   },
                   "subscription_status": {
+                    "description": "Stripe subscription lifecycle state; absent for a one-time order.",
+                    "enum": [
+                      "",
+                      "incomplete",
+                      "incomplete_expired",
+                      "trialing",
+                      "active",
+                      "past_due",
+                      "unpaid",
+                      "paused",
+                      "canceled"
+                    ],
                     "type": "string"
                   }
                 },

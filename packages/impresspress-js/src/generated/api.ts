@@ -12001,7 +12001,11 @@ export interface paths {
                             subscription_cancel_at_period_end: boolean;
                             /** Format: date-time */
                             subscription_current_period_end?: string;
-                            subscription_status?: string;
+                            /**
+                             * @description Stripe subscription lifecycle state; absent for a one-time order.
+                             * @enum {string}
+                             */
+                            subscription_status?: "" | "incomplete" | "incomplete_expired" | "trialing" | "active" | "past_due" | "unpaid" | "paused" | "canceled";
                         };
                     };
                 };

@@ -546,7 +546,8 @@ export interface GuestOrderStatus {
   status: string;
   reconciliation_status: string;
   amounts: MoneyBreakdown;
-  subscription_status?: string;
+  /** Absent for a one-time order. */
+  subscription_status?: SubscriptionStatus;
   subscription_current_period_end?: string;
   subscription_cancel_at_period_end: boolean;
   paid_at?: string;
@@ -737,7 +738,8 @@ export interface ProviderReconcileResult {
 /**
  * Stripe's subscription lifecycle, as the order views publish it. `""` is the
  * state of every non-subscription order, which is why it is the first value of
- * the published list rather than the field being optional.
+ * the published list; the guest order view (`GuestOrderStatus`) omits the
+ * field for such an order instead.
  */
 export type SubscriptionStatus =
   | ""
@@ -749,6 +751,29 @@ export type SubscriptionStatus =
   | "unpaid"
   | "paused"
   | "canceled";
+
+/** The caller's platform subscription, as `GET /b/products/subscription` returns it. */
+export interface PlatformSubscription {
+  id: string;
+  plan: string;
+  status: SubscriptionStatus;
+  /** Stripe Subscription id, or empty. */
+  stripe_subscription_id: string;
+  /** RFC 3339 end of the grace period after a failed payment, or `null`. */
+  grace_period_end: string | null;
+  addon_projects: number;
+  addon_requests: number;
+  addon_r2_bytes: number;
+  addon_d1_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Response of `GET /b/products/subscription`. */
+export interface PlatformSubscriptionResponse {
+  /** `null` when the caller has no subscription. */
+  subscription: PlatformSubscription | null;
+}
 
 /** The refund ledger's own state, distinct from the provider's `provider_status`. */
 export type RefundStatus = "pending" | "provider_succeeded" | "succeeded" | "failed";
@@ -1308,7 +1333,7 @@ export class ProductsExtension extends ExtensionsService {
     return this.call("products", `purchases/${encodeURIComponent(orderId)}`);
   }
 
-  async getSubscription(): Promise<unknown> {
+  async getSubscription(): Promise<PlatformSubscriptionResponse> {
     return this.call("products", "subscription");
   }
 
