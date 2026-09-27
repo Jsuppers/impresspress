@@ -776,7 +776,7 @@ mod boot_tests {
 
         // Apply admin migrations (creates the wrap_grants table among the
         // other admin tables) through the same pre-wafer DDL runner native's
-        // `server.rs::run` uses — the migration-file-runner exception to the
+        // `impresspress_server::build_native_runtime` uses — the migration-file-runner exception to the
         // no-raw-SQL rule (CLAUDE.md), reusing the real embedded schema.
         crate::migration_helper::apply_ddl_via_service(
             &db,

@@ -2569,6 +2569,7 @@ dependencies = [
  "impresspress-core",
  "impresspress-native",
  "impresspress-password",
+ "impresspress-server",
  "reqwest",
  "serde",
  "serde_json",
@@ -2750,6 +2751,24 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-test",
  "worker",
+]
+
+[[package]]
+name = "impresspress-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "impresspress-core",
+ "impresspress-native",
+ "impresspress-password",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wafer-block",
+ "wafer-core",
+ "wafer-run",
 ]
 
 [[package]]

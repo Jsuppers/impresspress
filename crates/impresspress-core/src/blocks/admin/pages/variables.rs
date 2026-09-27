@@ -6,7 +6,7 @@ use crate::{
     http::err_not_found,
     // `key_can_be_seeded_from_env` lives in `platform_state::variables` because
     // it mirrors the two gates between the process environment and that table —
-    // `cli::server_config::filter_to_declared_keys` and `seed_and_load`'s own
+    // `impresspress_server::filter_to_declared_keys` and `seed_and_load`'s own
     // runtime-owned refusal — and because the bulk release's selection applies
     // it too, so the page and the action cannot disagree about which keys the
     // environment can set.

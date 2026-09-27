@@ -21,7 +21,7 @@
 //! All four of `add_context`'s degradation paths log through `tracing`, which
 //! reaches a subscriber on the two targets that run this code today: the
 //! native server installs one in `impresspress-native::log_init` (from
-//! `cli/server.rs`), and the browser installs one in
+//! `impresspress_server::build_native_runtime`), and the browser installs one in
 //! `impresspress-browser::logger::init_console_tracing` (from
 //! `impresspress-web::initialize`). The Cloudflare Worker installs **no**
 //! `tracing` subscriber — it has a `LoggerService` (`ConsoleLoggerService`),

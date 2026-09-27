@@ -10,7 +10,7 @@
 //! same snapshot the router — and therefore the manifest endpoint — is built
 //! from), `build()` now runs `wafer_core::discovery::generate_webmcp_report`
 //! once and logs each refusal at `warn!`. `build()` runs once per `Wafer`
-//! construction; mirroring `crates/impresspress/src/cli/server.rs`'s native
+//! construction; mirroring `impresspress_server::build_native_runtime`'s native
 //! boot path here exercises the exact same call.
 
 use std::{path::Path, sync::Arc};
@@ -126,7 +126,7 @@ const REFUSAL_WARNING: &str = "webmcp: endpoint opted in to agent-tool exposure 
 
 /// Build one `ImpresspressBuilder` runtime over a scratch sqlite file +
 /// local storage root — the same construction native boot uses
-/// (`crates/impresspress/src/cli/server.rs::run`, minus the admin-table
+/// (`impresspress_server::build_native_runtime`, minus the admin-table
 /// pre-seeding and HTTP-listener steps `build()` itself doesn't need: it is
 /// a synchronous, no-I/O block-registration method). Every block in `extras`
 /// is registered before `block_infos` is captured, so all of them

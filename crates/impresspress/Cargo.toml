@@ -75,6 +75,8 @@ block-fastembed = ["impresspress-core/block-fastembed"]
 # feature blocks). Absorbed today's impresspress (lib) crate.
 impresspress-core = { path = "../impresspress-core", default-features = false }
 impresspress-native = { path = "../impresspress-native" }
+# The native server boot (`run`, `build_native_runtime`) the `serve` flow runs.
+impresspress-server = { path = "../impresspress-server" }
 # The password pepper settings (native reads them from its environment), and
 # the Cloudflare password-hasher protocol names the deploy tooling writes into
 # both Workers' configs.

@@ -895,7 +895,7 @@ async fn import_refuses_a_runtime_owned_variable_key() {
 /// Unlike every key the guard already refuses, a planted one here is NOT
 /// inert. `seed_jwt_secret` writes through `insert_if_absent`, so a row that
 /// is already present wins and auto-generation never fires, and
-/// `cli/server.rs` hands that value to boot as the HMAC key for every session
+/// `impresspress_server::build_native_runtime` hands that value to boot as the HMAC key for every session
 /// JWT and CSRF token. A bundle shared between instances would give each of
 /// them one signing secret its author knows — exactly what per-instance
 /// auto-generation exists to prevent.

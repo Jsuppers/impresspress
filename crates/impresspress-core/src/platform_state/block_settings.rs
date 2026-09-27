@@ -667,9 +667,9 @@ mod tests {
 /// End-to-end tests for [`load_and_seed`] against a real in-memory SQLite
 /// [`DatabaseService`] — the path NATIVE now runs.
 ///
-/// Before the loader was unified, native (`server_config::load_block_settings`)
-/// read the `block_settings` table with a plain `SELECT` and never invoked
-/// the #222 hash-gate. A changed default therefore propagated on Cloudflare
+/// Before the loader was unified, native's own block-settings reader read
+/// the `block_settings` table with a plain `SELECT` and never invoked the
+/// #222 hash-gate. A changed default therefore propagated on Cloudflare
 /// and browser boots but silently NOT on native boots. These
 /// tests pin that the unified loader runs the gate, so a native boot now
 /// re-seeds stale rows.
