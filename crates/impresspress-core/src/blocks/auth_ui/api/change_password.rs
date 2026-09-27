@@ -6,8 +6,8 @@ use wafer_run::{context::Context, InputStream, Message, OutputStream};
 use crate::{
     blocks::{
         auth::{
-            bump_auth_version, check_password, hash_new_password,
-            repo::{local_credentials, tokens, users},
+            check_password, end_sessions_after_password_change, hash_new_password,
+            repo::{local_credentials, users},
             PasswordCheck,
         },
         auth_ui::contracts::MessageResponse,
@@ -158,56 +158,16 @@ pub async fn handle(ctx: &dyn Context, msg: &Message, input: InputStream) -> Out
         Err(response) => return response,
     };
 
-    match local_credentials::update_password(ctx, user_id, &new_hash).await {
-        Ok(_) => {
-            // Revoke all refresh tokens — force re-login with new password.
-            // SEC-032/039: mark rows revoked (don't delete) so the
-            // reuse-detection tombstones survive.
-            //
-            // The credential row has already been updated at this point, so
-            // a revocation failure must NOT be reported as success: a
-            // refresh token obtained before the password change (e.g. by an
-            // attacker who had transient access) would otherwise stay valid
-            // even though the user was told their account was secured.
-            // There is no cross-op transaction primitive available to block
-            // code (`wafer_core::clients::database` has no multi-statement
-            // transaction client), so this is the best available durable
-            // partial-failure signal: log it and surface a non-success
-            // response rather than swallowing it with `.ok()`.
-            match tokens::revoke_all_for_user(ctx, user_id).await {
-                Ok(()) => {
-                    // P2c: invalidate already-issued access JWTs too — refresh
-                    // revocation alone doesn't touch a still-live access token,
-                    // which would otherwise keep authenticating with the old
-                    // password's blessing until its natural expiry. Same
-                    // fail-closed treatment as the revocation above: the
-                    // credential has already changed, so a failed bump must
-                    // not be reported as success.
-                    if let Err(e) = bump_auth_version(ctx, user_id).await {
-                        tracing::error!(
-                            user_id = %user_id,
-                            error = %e,
-                            "password changed but auth_version bump failed"
-                        );
-                        return crud::db_error_internal(
-                            e,
-                            "Password changed but session invalidation failed",
-                        );
-                    }
-                    changed_response(msg)
-                }
-                Err(e) => {
-                    tracing::error!(
-                        user_id = %user_id,
-                        error = %e,
-                        "password changed but refresh-token revocation failed"
-                    );
-                    crud::db_error_internal(e, "Password changed but session revocation failed")
-                }
-            }
-        }
-        Err(e) => crud::db_error_internal(e, "Update failed"),
+    if let Err(e) = local_credentials::update_password(ctx, user_id, &new_hash).await {
+        return crud::db_error_internal(e, "Update failed");
     }
+
+    // The credential has changed, so every session the old password opened
+    // must end, and a failure to end them must not be answered as success.
+    if let Err(e) = end_sessions_after_password_change(ctx, user_id).await {
+        return crud::db_error_internal(e, "Password changed but session invalidation failed");
+    }
+    changed_response(msg)
 }
 
 #[cfg(test)]
@@ -464,17 +424,97 @@ mod tests {
         );
     }
 
+    /// A refresh token the account holds, from a sign-in through the real
+    /// handler.
+    async fn sign_in(ctx: &TestContext, email: &str, password: &str) -> String {
+        let signed_in = output_json(login::handle(ctx, credentials(email, password)).await).await;
+        signed_in["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the sign-in succeeded: {signed_in}"))
+            .to_string()
+    }
+
+    fn refresh_with(token: &str) -> InputStream {
+        InputStream::from_bytes(
+            serde_json::json!({ "refresh_token": token })
+                .to_string()
+                .into_bytes(),
+        )
+    }
+
+    /// A refresh-row revocation that fails must not keep the account's
+    /// sessions alive. The `auth_version` bump is what ends them, so it runs
+    /// whatever the revocation did: the version moves, and the refresh token
+    /// the old password opened — whose row the failed revocation left live —
+    /// is refused.
     #[tokio::test]
-    async fn revocation_failure_does_not_report_success() {
+    async fn a_failed_revocation_still_ends_every_session() {
+        use crate::blocks::{
+            auth::repo::{tokens, users},
+            auth_ui::api::refresh,
+        };
+
         let ctx = TestContext::with_auth_and_crypto().await;
         let user_id = signup_user(&ctx, "alice@example.com", "original-horse-battery1").await;
+        let old_session = sign_in(&ctx, "alice@example.com", "original-horse-battery1").await;
 
         // Fail only the refresh-token revocation write
         // (`tokens::revoke_all_for_user` issues a `database.update_where`
         // against the tokens table); the password credential update itself
         // — a *different* `database.update_where` call, against
         // `local_credentials` — still succeeds.
-        let failing = FailingDbOpContext::new(ctx, vec![("database.update_where", tokens::TABLE)]);
+        let failing =
+            FailingDbOpContext::new(ctx.clone(), vec![("database.update_where", tokens::TABLE)]);
+        let msg = auth_msg("update", "/b/auth/api/change-password", &user_id);
+        let out = handle(
+            &failing,
+            &msg,
+            body("original-horse-battery1", "new-horse-battery-2026"),
+        )
+        .await;
+        let status = output_http_status(out).await;
+
+        assert!(
+            !tokens::find_by_token(&ctx, &old_session)
+                .await
+                .expect("token lookup")
+                .expect("the row is kept")
+                .revoked,
+            "precondition: the revocation really failed, so the row alone is live"
+        );
+        assert_eq!(
+            users::auth_version(&ctx, &user_id).await.unwrap(),
+            1,
+            "a failed revocation must not skip the auth_version bump"
+        );
+        assert!(
+            output_is_error(
+                refresh::handle(&ctx, refresh_with(&old_session)).await,
+                "Unauthenticated"
+            )
+            .await,
+            "a refresh token the old password opened must not outlive the change"
+        );
+        assert_eq!(
+            status, 200,
+            "the bump ended every session, so the change is answered as done"
+        );
+    }
+
+    /// The bump is the invalidation, so a bump that fails is the failure the
+    /// caller hears about: the credential has changed, and an account whose
+    /// version did not move still honours every session the old password
+    /// opened.
+    #[tokio::test]
+    async fn a_failed_bump_is_not_reported_as_success() {
+        use crate::blocks::auth::repo::users;
+
+        let ctx = TestContext::with_auth_and_crypto().await;
+        let user_id = signup_user(&ctx, "abe@example.com", "original-horse-battery1").await;
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.increment_field_where", users::TABLE)],
+        );
 
         let msg = auth_msg("update", "/b/auth/api/change-password", &user_id);
         let out = handle(
@@ -486,8 +526,9 @@ mod tests {
 
         assert!(
             output_is_error(out, "Internal").await,
-            "a revocation failure must not be reported as success"
+            "a password change whose sessions did not end must not report success"
         );
+        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 0);
     }
 
     #[tokio::test]
