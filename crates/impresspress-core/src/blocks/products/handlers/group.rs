@@ -27,7 +27,7 @@ use crate::{
             repo::{self, groups::TABLE as GROUPS_TABLE},
         },
     },
-    http::{err_unauthorized, ok_json},
+    http::{err_unauthenticated, ok_json},
 };
 
 /// User-owned group rows (`/b/products/groups/{id}`), owned via `user_id`.
@@ -115,7 +115,7 @@ pub(super) async fn handle_delete_group(ctx: &dyn Context, msg: &Message) -> Out
 pub(super) async fn handle_user_list_groups(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
-        return err_unauthorized("Not authenticated");
+        return err_unauthenticated("Not authenticated");
     }
 
     let owned = vec![Filter {
@@ -143,7 +143,7 @@ pub(super) async fn handle_user_create_group(
 ) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
-        return err_unauthorized("Not authenticated");
+        return err_unauthenticated("Not authenticated");
     }
 
     let request: CreateOwnGroupRequest = match crud::read_json_body(input).await {

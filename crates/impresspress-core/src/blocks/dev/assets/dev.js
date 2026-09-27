@@ -33,7 +33,8 @@
 // (below).
 var abort = new AbortController();
 
-// A 401/403 means this document is still on screen but its session is not.
+// A 401 means this document is still on screen but its session is not; a 403
+// that its session no longer carries the admin role the tools need.
 // Tearing the tools down is the honest response — an agent left holding
 // tools whose every call now fails would keep retrying against a page that
 // cannot answer, and the human would see no reason why.
@@ -328,7 +329,7 @@ function withProgress(execute) {
       // The LAST call out of the room turns the lights off and does the
       // catch-up once, rather than every call racing to redraw a workspace
       // its siblings are still changing. Skip it once aborted — the handler
-      // already stopped polling, and the endpoints below would just 403.
+      // already stopped polling, and the endpoints below would just refuse.
       if (outstanding === 0 && !abort.signal.aborted) {
         stopPolling();
         await refreshAfterChange();
@@ -394,7 +395,7 @@ var MUTATING = /^(dev_write_file|dev_delete_file|dev_create_block|dev_rollback|d
 // Every name this page registered. `registerTool`'s options bag takes an
 // `AbortSignal`, but a browser (or a polyfill) that ignores it would leave
 // this page's tools live on the agent after the page is gone — with the
-// document's session cookie no longer riding along, so every call 403s. The
+// document's session cookie no longer riding along, so every call is a 401. The
 // list is the fallback: on abort, unregister exactly these by name.
 var registered = [];
 
@@ -444,10 +445,10 @@ function unregisterPageTools() {
 // Their `execute` comes from `toolOptions` (webmcp-core.js) and fetches
 // without going through this file's `api`, so `check` never sees the
 // response — and a refusal arrives as a RESULT (`isError` plus
-// `Request failed (403): …`), never as a rejection. Reading that text back
+// `Request failed (401): …`), never as a rejection. Reading that text back
 // is what lets the same "the session is gone, take the tools away" rule
 // apply to a tool call as to a pane refresh; without it the page would keep
-// offering tools that 403 for the rest of the session.
+// offering tools that are refused for the rest of the session.
 var SESSION_GONE = /^Request failed \((401|403)\)/;
 
 function withSessionCheck(execute) {

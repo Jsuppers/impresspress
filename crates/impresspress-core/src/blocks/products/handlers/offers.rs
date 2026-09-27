@@ -14,7 +14,7 @@ use crate::{
             stripe,
         },
     },
-    http::{err_bad_request, err_conflict, err_not_found, err_unauthorized, ok_json},
+    http::{err_bad_request, err_conflict, err_not_found, err_unauthenticated, ok_json},
 };
 
 #[derive(Clone, Copy)]
@@ -91,7 +91,7 @@ pub(super) async fn verify_product(
     if matches!(access, OfferAccess::Owner) {
         let user_id = msg.user_id();
         if user_id.is_empty() {
-            return Err(err_unauthorized("Not authenticated"));
+            return Err(err_unauthenticated("Not authenticated"));
         }
         // The shared rule, so the offer routes and the product CRUD routes
         // cannot disagree about who owns the same row again.

@@ -14,7 +14,7 @@ use crate::{
         },
     },
     http::{
-        err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthorized, ok_json,
+        err_bad_request, err_forbidden, err_internal, err_not_found, err_unauthenticated, ok_json,
     },
     util::{enum_column, RecordExt},
 };
@@ -176,7 +176,7 @@ pub(super) async fn reconcile_provider_operations(
 
 pub(super) async fn seller_status(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if msg.user_id().is_empty() {
-        return err_unauthorized("Authentication required");
+        return err_unauthenticated("Authentication required");
     }
     match stripe_provider::seller_status(ctx, msg.user_id()).await {
         Ok(account) => ok_json(&account),
@@ -190,7 +190,7 @@ pub(super) async fn seller_onboarding(
     input: InputStream,
 ) -> OutputStream {
     if msg.user_id().is_empty() {
-        return err_unauthorized("Authentication required");
+        return err_unauthenticated("Authentication required");
     }
     let raw = match input.collect_to_bytes().await {
         Ok(bytes) => bytes,
@@ -208,7 +208,7 @@ pub(super) async fn seller_onboarding(
 
 pub(super) async fn seller_dashboard(ctx: &dyn Context, msg: &Message) -> OutputStream {
     if msg.user_id().is_empty() {
-        return err_unauthorized("Authentication required");
+        return err_unauthenticated("Authentication required");
     }
     match stripe_provider::seller_dashboard_link(ctx, msg.user_id()).await {
         Ok(response) => ok_json(&response),
@@ -222,7 +222,7 @@ pub(super) async fn billing_portal(
     input: InputStream,
 ) -> OutputStream {
     if msg.user_id().is_empty() {
-        return err_unauthorized("Authentication required");
+        return err_unauthenticated("Authentication required");
     }
     let raw = match input.collect_to_bytes().await {
         Ok(bytes) => bytes,

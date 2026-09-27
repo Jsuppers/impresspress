@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ImpresspressClient } from "../src/client";
 import { ImpresspressError } from "../src/error";
-import { fakeJsonResponse, fakeBlobResponse, hangingFetch } from "./fixtures";
+import anonymousMe from "./anonymous-me.response.json";
+import { fakeJsonResponse, fakeBlobResponse, hangingFetch, recordedResponse } from "./fixtures";
 
 /**
  * These tests pin every SDK method to the REAL server route it now calls
@@ -122,10 +123,13 @@ describe("AuthService", () => {
     expect(user.name).toBe("New Name");
   });
 
-  it("getUser maps a 401 to null instead of throwing", async () => {
-    fetchMock.mockResolvedValueOnce(
-      fakeJsonResponse({ error: "Unauthorized", message: "Not authenticated" }, 401),
-    );
+  // The server's own answer to `GET /b/auth/api/me` with no session, byte for
+  // byte: `the_sdk_fixture_is_what_an_anonymous_me_answers`
+  // (crates/impresspress-core/tests/request_preamble.rs) fails when the
+  // server stops sending exactly this.
+  it("getUser returns null for the server's real anonymous /me answer", async () => {
+    expect(anonymousMe.status).toBe(401);
+    fetchMock.mockResolvedValueOnce(recordedResponse(anonymousMe));
     const user = await client().auth.getUser();
     expect(user).toBeNull();
   });

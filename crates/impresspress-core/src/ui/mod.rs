@@ -496,10 +496,13 @@ pub fn csrf_blocked_response(msg: &wafer_run::Message) -> wafer_run::OutputStrea
     }
 }
 
-/// Anonymous (or stale-session — identical by the time enforcement runs)
-/// browser request on a protected route: send the user to login with a return
-/// path so they land back where they started after signing in. API callers
-/// (non-HTML `Accept`) keep the JSON 403 contract instead of a redirect.
+/// A request with no identity on a protected route — anonymous, or carrying a
+/// credential that did not verify (identical by the time enforcement runs).
+/// A browser page is sent to login with a return path, so the user lands back
+/// where they started after signing in. An API caller (non-HTML `Accept`)
+/// gets the JSON `401` with its `WWW-Authenticate` challenge
+/// ([`crate::http::err_unauthenticated`]): the status every client reads as
+/// "sign in", which the `403` of [`forbidden_response`] is not.
 ///
 /// The return path is form-encoded via [`crate::util::urlencode`] into a
 /// `?redirect=` query param — the exact param name and encoding the login page
@@ -514,7 +517,7 @@ pub fn unauthenticated_response(msg: &wafer_run::Message) -> wafer_run::OutputSt
         );
         crate::http::redirect(302, &target)
     } else {
-        crate::http::err_forbidden("authentication required")
+        crate::http::err_unauthenticated("authentication required")
     }
 }
 
@@ -1009,22 +1012,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_response_json_accept_stays_403() {
-        // API caller (non-HTML Accept) keeps the JSON 403 contract — status
-        // stays 403 (not 401) so existing API clients/tests don't break.
-        use wafer_block::http_codec;
-        use wafer_run::streams::output::TerminalNotResponse;
+    async fn unauthenticated_response_answers_an_api_caller_401_with_a_challenge() {
+        // An API caller (non-HTML Accept) is told to sign in: 401 and the
+        // WWW-Authenticate challenge RFC 9110 requires on one, not the 403
+        // that means "signed in, but not allowed".
         let mut msg = Message::new("http.request");
         msg.set_meta("req.resource", "/b/chat/hello");
         msg.set_meta("http.header.accept", "application/json");
-        let status = match unauthenticated_response(&msg).collect_buffered().await {
-            Ok(buf) => i64::from(http_codec::resolve_status(&buf.meta, 200)),
-            Err(TerminalNotResponse::Error(err)) => {
-                i64::from(http_codec::resolve_error_status(&err))
-            }
-            Err(other) => panic!("unexpected terminal: {other:?}"),
-        };
-        assert_eq!(status, 403);
+        let parts =
+            wafer_block::http_codec::collect_http_response(unauthenticated_response(&msg)).await;
+        assert_eq!(parts.status, 401);
+        let challenge = parts
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(challenge, Some(crate::http::WWW_AUTHENTICATE));
+        let body = String::from_utf8_lossy(&parts.body);
+        assert!(body.contains("authentication required"), "{body}");
     }
 
     #[tokio::test]

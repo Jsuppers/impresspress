@@ -227,7 +227,7 @@ async fn status_is_admin_only() {
     let member = signed_in_as(&ctx, "user").await;
     assert_eq!(
         output_http_status(ctx.request(anon_msg("retrieve", "/b/dev/api/status")).await).await,
-        403
+        401
     );
     assert_eq!(
         output_http_status(

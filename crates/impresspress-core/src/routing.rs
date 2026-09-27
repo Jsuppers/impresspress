@@ -80,9 +80,12 @@ impl Route {
 pub enum RouteAccess {
     /// No auth check. Anyone can hit this route.
     Public,
-    /// `msg.user_id()` must be non-empty, or the request is rejected with 403.
+    /// `msg.user_id()` must be non-empty. A request with no identity is sent
+    /// to login if it is a browser page and refused `401` otherwise.
     Authenticated,
-    /// User must have the `admin` role (per [`crate::util::is_admin`]) or 403.
+    /// User must have the `admin` role (per [`crate::util::is_admin`]): no
+    /// identity is answered as for `Authenticated`, an identity without the
+    /// role is `403`.
     Admin,
 }
 
@@ -601,16 +604,16 @@ pub fn feature_gate_name(block_name: &str) -> &str {
 }
 
 /// Enforce a route's [`RouteAccess`] tier against the request. Returns
-/// `Some(forbidden_response)` when the caller fails the tier, or `None` to
-/// proceed. Shared by the built-in and extra-route dispatch loops.
+/// `Some(refusal)` when the caller fails the tier, or `None` to proceed.
+/// Shared by the built-in and extra-route dispatch loops.
 fn check_access(access: RouteAccess, msg: &Message) -> Option<OutputStream> {
     match access {
         RouteAccess::Public => None,
         // Missing identity (anonymous OR stale session — crypto.rs leaves
         // `user_id` empty on any invalid token) → send browsers to login with a
-        // return path; keep the JSON 403 for API callers. Both protected tiers
-        // share this: an `Admin` route hit with no identity is a login problem,
-        // not a role problem.
+        // return path; answer API callers 401 with a `WWW-Authenticate`
+        // challenge. Both protected tiers share this: an `Admin` route hit
+        // with no identity is a login problem, not a role problem.
         RouteAccess::Authenticated if msg.user_id().is_empty() => {
             Some(crate::ui::unauthenticated_response(msg))
         }
@@ -1247,7 +1250,7 @@ mod tests {
         // Admin-tier `/b/admin/` prefix. The router still enforces Admin
         // via `RouteAccess::max` (routing.rs:435-440) — `effective_access`
         // must agree, or the manifest would advertise this tool name to
-        // anonymous callers the router then silently 403s.
+        // anonymous callers the router then silently refuses.
         let ep_path = "/b/admin/misdeclared-report";
         let info = BlockInfo::new("impresspress/admin", "0.0.1", "http-handler@v1", "t")
             .endpoints(vec![BlockEndpoint::get(ep_path).auth(AuthLevel::Public)]);
@@ -1274,7 +1277,7 @@ mod tests {
         )
         .await;
         assert!(
-            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            crate::test_support::output_is_error(out, "Unauthenticated").await,
             "the router must reject the anonymous caller despite the endpoint's Public declaration"
         );
     }
@@ -1345,7 +1348,7 @@ mod tests {
         )
         .await;
         assert!(
-            output_is_error(out, "PermissionDenied").await,
+            output_is_error(out, "Unauthenticated").await,
             "the router must reject the anonymous caller, matching the resolver's Admin verdict"
         );
     }
@@ -1511,7 +1514,7 @@ mod tests {
         )
         .await;
         assert!(
-            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            crate::test_support::output_is_error(out, "Unauthenticated").await,
             "an anonymous caller must not reach an Admin-declared endpoint through a Public \
              extra route"
         );
@@ -1721,7 +1724,7 @@ mod tests {
         )
         .await;
         assert!(
-            crate::test_support::output_is_error(out, "PermissionDenied").await,
+            crate::test_support::output_is_error(out, "Unauthenticated").await,
             "an anonymous caller must be denied on an undeclared path, not dispatched"
         );
     }
@@ -1987,7 +1990,7 @@ mod tests {
             &[],
         )
         .await;
-        assert!(crate::test_support::output_is_error(out, "PermissionDenied").await);
+        assert!(crate::test_support::output_is_error(out, "Unauthenticated").await);
     }
 
     /// Task 6 fix-round-1 finding: the products block's own `harness::dispatch`
@@ -2202,7 +2205,7 @@ mod tests {
             )
             .await;
             assert!(
-                output_is_error(denied, "PermissionDenied").await,
+                output_is_error(denied, "Unauthenticated").await,
                 "anonymous {action} {path} must be denied"
             );
 
@@ -2244,9 +2247,13 @@ mod tests {
         let declared = ["/b/admin/settings/", "/b/admin/settings/email"];
         let undeclared = "/b/admin/settings/not-a-tab";
         for path in declared.iter().copied().chain(std::iter::once(undeclared)) {
-            for (label, msg) in [
-                ("anonymous", anon_msg("retrieve", path)),
-                ("non-admin", auth_msg("retrieve", path, "user_1")),
+            for (label, msg, refusal) in [
+                ("anonymous", anon_msg("retrieve", path), "Unauthenticated"),
+                (
+                    "non-admin",
+                    auth_msg("retrieve", path, "user_1"),
+                    "PermissionDenied",
+                ),
             ] {
                 let out = route_to_block(
                     &ctx,
@@ -2258,7 +2265,7 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    output_is_error(out, "PermissionDenied").await,
+                    output_is_error(out, refusal).await,
                     "{label} GET {path} must be denied"
                 );
             }
@@ -2308,9 +2315,13 @@ mod tests {
             ("delete", "/b/legalpages/api/documents/d-1"),
         ];
         for (action, path) in ADMIN_ROWS {
-            for (label, msg) in [
-                ("anonymous", anon_msg(action, path)),
-                ("non-admin", auth_msg(action, path, "user_1")),
+            for (label, msg, refusal) in [
+                ("anonymous", anon_msg(action, path), "Unauthenticated"),
+                (
+                    "non-admin",
+                    auth_msg(action, path, "user_1"),
+                    "PermissionDenied",
+                ),
             ] {
                 let out = route_to_block(
                     &ctx,
@@ -2322,7 +2333,7 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    output_is_error(out, "PermissionDenied").await,
+                    output_is_error(out, refusal).await,
                     "{label} {action} {path} must be denied"
                 );
             }
@@ -2403,7 +2414,7 @@ mod tests {
             )
             .await;
             assert!(
-                output_is_error(out, "PermissionDenied").await,
+                output_is_error(out, "Unauthenticated").await,
                 "anonymous {action} {path} is undeclared and must be denied before dispatch"
             );
         }
@@ -2440,7 +2451,7 @@ mod tests {
         )
         .await;
         assert!(
-            output_is_error(denied, "PermissionDenied").await,
+            output_is_error(denied, "Unauthenticated").await,
             "an anonymous caller must be denied an undeclared path"
         );
 

@@ -7,13 +7,13 @@ use crate::{
         crud,
         products::{contracts::SubscriptionStatusResponse, repo},
     },
-    http::{err_unauthorized, ok_json},
+    http::{err_unauthenticated, ok_json},
 };
 
 pub(super) async fn handle_subscription(ctx: &dyn Context, msg: &Message) -> OutputStream {
     let user_id = msg.user_id().to_string();
     if user_id.is_empty() {
-        return err_unauthorized("Not authenticated");
+        return err_unauthenticated("Not authenticated");
     }
     // A real repository failure must surface as an error, not be reported to
     // the caller as `{"subscription": null}` — indistinguishable from "you

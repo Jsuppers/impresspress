@@ -357,8 +357,10 @@ impl ImpresspressBuilder {
     ///
     /// `access` declares the auth tier:
     /// - [`RouteAccess::Public`] — no auth check.
-    /// - [`RouteAccess::Authenticated`] — rejects empty user_id with 403.
-    /// - [`RouteAccess::Admin`] — requires the `admin` role or 403.
+    /// - [`RouteAccess::Authenticated`] — a request with no identity is sent
+    ///   to login (a browser page) or refused `401` (an API call).
+    /// - [`RouteAccess::Admin`] — as `Authenticated`, and an identity without
+    ///   the `admin` role is refused `403`.
     pub fn add_route(
         mut self,
         prefix: impl Into<String>,

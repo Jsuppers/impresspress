@@ -8,7 +8,7 @@
  *
  *   { "error": "<WaferErrorCode>", "message": "<human message>" }
  *
- * `code` here is that `error` field (e.g. `"NotFound"`, `"Unauthorized"`),
+ * `code` here is that `error` field (e.g. `"NotFound"`, `"Unauthenticated"`),
  * NOT the finer-grained impresspress `ErrorCode` string (e.g.
  * `"invalid_credentials"`) that some handlers additionally attach as
  * structured meta — that value, when present, is surfaced as `detailCode`.

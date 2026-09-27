@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use impresspress_core::{http::err_unauthorized, pipeline::payload_too_large_error};
+use impresspress_core::{http::err_unauthenticated, pipeline::payload_too_large_error};
 use wafer_block::{
     core_types::{LifecycleEvent, WaferError},
     http_codec,
@@ -179,8 +179,8 @@ impl Block for SpaFallbackBlock {
 
 /// Stand-in for `impresspress/router`, the block every declared route resolves
 /// to. It records being reached for the same reason, and answers with
-/// `err_unauthorized` when `unauthorized` is set — the refusal the real router
-/// gives an anonymous caller on a protected `/b/**` route.
+/// `err_unauthenticated` when `unauthorized` is set — the refusal the real
+/// router gives an anonymous API caller on a protected `/b/**` route.
 struct ApiRouterBlock {
     reached: Arc<std::sync::atomic::AtomicBool>,
     unauthorized: bool,
@@ -195,7 +195,7 @@ impl Block for ApiRouterBlock {
         self.reached
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if self.unauthorized {
-            return err_unauthorized("authentication required");
+            return err_unauthenticated("authentication required");
         }
         OutputStream::respond(b"api".to_vec())
     }
@@ -384,8 +384,8 @@ async fn the_413_carries_the_real_middleware_headers() {
 }
 
 /// Every error behind the middleware keeps its headers, not just the 413: a
-/// 401 from a `/b/**` route reaches a cross-origin caller readable, and with
-/// the security headers.
+/// 401 from a `/b/**` route reaches a cross-origin caller readable, with the
+/// security headers, and with its own `WWW-Authenticate` challenge.
 #[tokio::test]
 async fn a_401_on_a_b_route_carries_the_real_middleware_headers() {
     let run = run_site_main("/b/storage/api/buckets/p/objects", false, true).await;
@@ -401,4 +401,16 @@ async fn a_401_on_a_b_route_carries_the_real_middleware_headers() {
     );
     assert_eq!(nosniff, Some("nosniff"), "{:?}", run.parts.headers);
     assert!(csp.is_some(), "{:?}", run.parts.headers);
+    let challenge = run
+        .parts
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("WWW-Authenticate"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        challenge,
+        Some(impresspress_core::http::WWW_AUTHENTICATE),
+        "{:?}",
+        run.parts.headers
+    );
 }

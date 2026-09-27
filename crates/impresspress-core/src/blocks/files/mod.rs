@@ -36,7 +36,7 @@ fn config_vars() -> Vec<ConfigVar> {
 use super::rate_limit::{check_user_rate_limit_with, RateLimit, RateLimitOutcome, UserRateLimiter};
 use crate::{
     endpoint_match::{self, response_schema_of, EndpointRoute},
-    http::{err_not_found, err_unauthorized},
+    http::{err_not_found, err_unauthenticated},
 };
 
 /// Handler for one row of [`ROUTES`]. `AdminOverview` serves both the
@@ -515,7 +515,7 @@ crate::impresspress_feature_block! {
         if user_preamble(route) {
             // Belt and braces under the router's `Authenticated` gate.
             if msg.user_id().is_empty() {
-                return err_unauthorized("Authentication required");
+                return err_unauthenticated("Authentication required");
             }
             // Per-user rate limiting. `create` (upload) gets its own bucket;
             // `retrieve`/everything-else fall back to the read/write split.
