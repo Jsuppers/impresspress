@@ -35,10 +35,15 @@ the two ship together but only one of them runs by default.
   `/_deploy/prepare`, verification and promotion, which replaces the
   placeholder. No plain `wrangler deploy` of either Worker and no
   `impresspress deploy secret` is needed first any more.
-- A deploy to a Worker that exists still needs `IMPRESSPRESS_DEPLOY_TOKEN`,
-  and without it now stops before the build, naming the command that sets a
-  new one (`npx wrangler secret put IMPRESSPRESS_DEPLOY_TOKEN --name
-  <worker_name>`).
+- A deploy to a Worker that exists first sets whichever of those two secrets
+  the Worker does not hold (it lists secret names, never values), so a first
+  deploy that stopped part-way is finished by running it again. A generated
+  deploy token is printed as soon as it is set; if that output is a CI log
+  others can read, rotate it, or export the token before the first deploy.
+- A deploy to a Worker that holds its deploy token still needs
+  `IMPRESSPRESS_DEPLOY_TOKEN`, and without it now stops before the build,
+  naming the command that sets a new one (`npx wrangler secret put
+  IMPRESSPRESS_DEPLOY_TOKEN --name <worker_name>`).
 - D1 runs 1,000 queries per invocation on Workers Free, not 50: a Free-plan
   Worker runs a fresh database's `/_deploy/prepare`, over 250 D1 queries, in
   one invocation, and the Workers limits page caps subrequests to internal
