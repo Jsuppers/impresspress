@@ -413,9 +413,10 @@ impl DbExec for BrowserDatabaseService {
     /// Like [`run_execute`](Self::run_execute) and every other `DbExec`
     /// primitive here, it deliberately does NOT flush to OPFS — flushing is
     /// coalesced once per logical `DatabaseService` call by
-    /// [`BrowserDatabaseService::with_flush`], and `take_where` (this
-    /// primitive's one caller, via the shared [`DbExec::take_where`]) is a
-    /// `custom` entry in the ledger below precisely so it gets that flush.
+    /// [`BrowserDatabaseService::with_flush`], and the shared defaults that
+    /// reach this primitive ([`DbExec::create`], [`DbExec::take_where`],
+    /// [`DbExec::upsert`]) are `custom` entries in the ledger below precisely
+    /// so they get that flush.
     /// See the module doc comment's durability contract.
     async fn run_execute_returning(
         &self,
@@ -780,7 +781,7 @@ wafer_core::forward_database_service! {
             .await
         }
 
-        async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<i64, DatabaseError> {
+        async fn upsert(&self, collection: &str, spec: UpsertSpec) -> Result<Option<Record>, DatabaseError> {
             self.with_flush(DbExec::upsert(self, collection, spec))
                 .await
         }

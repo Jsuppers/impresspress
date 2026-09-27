@@ -1029,7 +1029,11 @@ mod operational_error_tests {
             unreachable!()
         }
 
-        async fn upsert(&self, _collection: &str, _spec: UpsertSpec) -> Result<i64, DatabaseError> {
+        async fn upsert(
+            &self,
+            _collection: &str,
+            _spec: UpsertSpec,
+        ) -> Result<Option<Record>, DatabaseError> {
             unreachable!()
         }
 

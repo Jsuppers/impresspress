@@ -1628,7 +1628,7 @@ wafer_core::forward_database_service! {
             &self,
             collection: &str,
             spec: wafer_core::interfaces::database::service::UpsertSpec,
-        ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+        ) -> Result<Option<wafer_core::interfaces::database::service::Record>, wafer_core::interfaces::database::service::DatabaseError> {
             self.note(|log| log.upserts += 1);
             self.inner.upsert(collection, spec).await
         }
@@ -1853,7 +1853,10 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingReads
         &self,
         collection: &str,
         spec: wafer_core::interfaces::database::service::UpsertSpec,
-    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+    ) -> Result<
+        Option<wafer_core::interfaces::database::service::Record>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
         self.inner.upsert(collection, spec).await
     }
 
@@ -2157,7 +2160,10 @@ impl wafer_core::interfaces::database::service::DatabaseService for FailingWrite
         &self,
         _collection: &str,
         _spec: wafer_core::interfaces::database::service::UpsertSpec,
-    ) -> Result<i64, wafer_core::interfaces::database::service::DatabaseError> {
+    ) -> Result<
+        Option<wafer_core::interfaces::database::service::Record>,
+        wafer_core::interfaces::database::service::DatabaseError,
+    > {
         Err(simulated_write_failure())
     }
 
