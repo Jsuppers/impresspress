@@ -391,6 +391,12 @@ jobs:
           cargo clippy --locked -p impresspress-cloudflare --target wasm32-unknown-unknown --all-targets -- -D warnings
           cargo clippy --locked -p impresspress-cloudflare --features full --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      # The password-hasher Worker's Durable Object class. Behind a feature no
+      # workspace member enables (the main Worker must not export the class),
+      # so without this step it is compiled only by a real deploy.
+      - name: Clippy impresspress-password's Durable Object (wasm32)
+        run: cargo clippy --locked -p impresspress-password --features durable-object --target wasm32-unknown-unknown --all-targets -- -D warnings
+
       # Compile-time DatabaseService conformance assertions (wafer-run #319
       # shared suite) for the D1 + KV-cached adapters. Off-by-default feature so
       # the ~1.3k-line suite never enters the production Worker wasm; this step
@@ -508,7 +514,7 @@ jobs:
         # unconditional behaviour the merge gate has always had.
         if: inputs.pull-request
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/ crates/impresspress-core/ Cargo.toml Cargo.lock)
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..HEAD -- crates/impresspress-cloudflare/ crates/impresspress-core/ crates/impresspress-password/ Cargo.toml Cargo.lock)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -547,6 +553,14 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: cargo test --locked -p impresspress-cloudflare --features full --target wasm32-unknown-unknown --lib
+
+      # The password-hasher Worker's Durable Object class, constructed from a
+      # fake `Env` and asked through its `fetch`, as the runtime does.
+      - name: Run impresspress-password Durable Object wasm tests (Node)
+        if: steps.cloudflare-changes.outputs.skip != 'true'
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked -p impresspress-password --features durable-object --target wasm32-unknown-unknown --lib
 
   browser-wasm-test:
     name: Browser WASM tests (impresspress-browser)

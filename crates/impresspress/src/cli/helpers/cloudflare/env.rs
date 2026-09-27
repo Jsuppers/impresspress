@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-use super::wrangler::{self, CloudflareConfig, D1Config, R2Config};
+use super::wrangler::{self, CloudflareConfig, D1Config, PasswordHasherConfig, R2Config};
 
 /// Default Workers Observability head sampling rate when neither
 /// `IMPRESSPRESS_CLOUDFLARE_HEAD_SAMPLING_RATE` nor `impresspress.toml`'s
@@ -63,6 +63,26 @@ pub struct RawCloudflareConfig {
     /// Ordinary application paths exercised before promotion. TOML-only;
     /// defaults to `/health` for existing consumers.
     pub deploy_smoke_paths: Option<Vec<String>>,
+    /// The password-hasher Worker. Optional: every field has a default.
+    pub password_hasher: Option<RawPasswordHasherConfig>,
+}
+
+/// `[cloudflare.password_hasher]`: the second Worker that hashes and verifies
+/// passwords in a Durable Object (see `impresspress_password::protocol`).
+/// TOML-only.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPasswordHasherConfig {
+    /// The hasher Worker's script name. Defaults to the main Worker's name
+    /// with `impresspress_password::protocol::WORKER_NAME_SUFFIX` appended.
+    pub worker_name: Option<String>,
+    /// How many Durable Object instances hashing is spread across. Defaults
+    /// to `impresspress_password::protocol::DEFAULT_SHARDS`.
+    pub shards: Option<u32>,
+    /// Whether the hasher refuses a stored hash without a pepper
+    /// (`IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED`). Defaults to `false`. Set it
+    /// only once every stored hash is peppered.
+    pub pepper_required: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +208,8 @@ impl RawCloudflareConfig {
             resolve_d1_queries_per_invocation(self.d1_queries_per_invocation)?;
         let crons = resolve_crons(self.crons)?;
         let deploy_smoke_paths = resolve_deploy_smoke_paths(self.deploy_smoke_paths)?;
+        let password_hasher =
+            resolve_password_hasher(self.password_hasher.unwrap_or_default(), &worker_name)?;
         Ok(CloudflareConfig {
             account_id,
             worker_name,
@@ -209,6 +231,7 @@ impl RawCloudflareConfig {
             d1_queries_per_invocation,
             crons,
             deploy_smoke_paths,
+            password_hasher,
         })
     }
 }
@@ -325,6 +348,57 @@ fn resolve_deploy_smoke_paths(paths: Option<Vec<String>>) -> Result<Vec<String>>
         }
     }
     Ok(paths)
+}
+
+/// Resolve `[cloudflare.password_hasher]` against the resolved main Worker
+/// name.
+fn resolve_password_hasher(
+    raw: RawPasswordHasherConfig,
+    main_worker_name: &str,
+) -> Result<PasswordHasherConfig> {
+    use impresspress_password::protocol::{validate_shards, DEFAULT_SHARDS, WORKER_NAME_SUFFIX};
+    let worker_name = raw
+        .worker_name
+        .unwrap_or_else(|| format!("{main_worker_name}{WORKER_NAME_SUFFIX}"));
+    validate_worker_name(&worker_name).with_context(|| {
+        format!(
+            "cloudflare.password_hasher.worker_name {worker_name:?} (defaults to \
+             worker_name + {WORKER_NAME_SUFFIX:?}; set it explicitly if that is too long)"
+        )
+    })?;
+    if worker_name == main_worker_name {
+        bail!(
+            "cloudflare.password_hasher.worker_name must differ from cloudflare.worker_name: \
+             the hasher is a Worker of its own"
+        );
+    }
+    let shards = validate_shards(raw.shards.unwrap_or(DEFAULT_SHARDS))
+        .map_err(|e| anyhow!("cloudflare.password_hasher.shards: {e}"))?;
+    Ok(PasswordHasherConfig {
+        worker_name,
+        shards,
+        pepper_required: raw.pepper_required.unwrap_or(false),
+    })
+}
+
+/// Cloudflare's rule for a Worker script name: 1-63 characters of lowercase
+/// letters, digits and dashes, not starting or ending with a dash.
+fn validate_worker_name(name: &str) -> Result<()> {
+    let valid_chars = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if name.is_empty()
+        || name.len() > 63
+        || !valid_chars
+        || name.starts_with('-')
+        || name.ends_with('-')
+    {
+        bail!(
+            "a Worker name must be 1-63 lowercase letters, digits and dashes, not starting or \
+             ending with a dash"
+        );
+    }
+    Ok(())
 }
 
 fn pick(

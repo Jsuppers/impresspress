@@ -192,7 +192,8 @@ pub(crate) enum PasswordCheck {
 /// A stored hash the configured password pepper cannot check
 /// (`CryptoError::Pepper`, see [`PEPPER_FAULT_PREFIX`]) — a peppered hash
 /// naming a key the deployment no longer holds, or an unpeppered hash while
-/// `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` is on — is a configuration fault:
+/// `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` is on; on Cloudflare these are the
+/// password-hasher Worker's settings — is a configuration fault:
 /// it does not go away by itself, and the fix is the pepper keys or that
 /// account's password. It is logged at error level with the user id and
 /// answered `Err` as a 503, the same answer a transient fault gets, so the
@@ -201,7 +202,8 @@ pub(crate) enum PasswordCheck {
 /// Every other failure says nothing about the password or the stored hash —
 /// the call refused by WRAP, the service unreachable, or the crypto service's
 /// own fault while checking (an `Internal` such as a failed offload to its
-/// blocking pool) — and is `Err`, logged and classified by
+/// blocking pool, or on Cloudflare the password-hasher Worker's Durable
+/// Object not answering) — and is `Err`, logged and classified by
 /// [`credential_check_failed`] (a refusal keeps its 403 or 429, anything else
 /// is a 503).
 pub(crate) async fn check_password(

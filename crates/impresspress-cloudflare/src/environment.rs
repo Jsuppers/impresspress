@@ -28,8 +28,7 @@
 //!
 //! # Security
 //!
-//! This struct holds raw secret material (`jwt_secret`, `deploy_token`, the
-//! password pepper keys). It
+//! This struct holds raw secret material (`jwt_secret`, `deploy_token`). It
 //! deliberately derives neither `Debug` nor `Deserialize`; the one thing that
 //! serialises it is [`identity`], which hashes the bytes and drops them. Do not
 //! log a `CfEnvironment`, and do not put one in a `ReadyRuntime` — the hash is
@@ -126,12 +125,10 @@ pub(crate) struct CfEnvironment {
     deploy_token: Option<String>,
     d1_queries_per_invocation: Option<String>,
 
-    // ── the password pepper: read into the crypto service only ──────────────
-    // Never on a config surface (not in `PROTECTED_ENV_KEYS`,
-    // `BUILDER_WORKER_VAR_KEYS` or `config_value`): see `password_peppers`.
-    password_pepper_key: Option<String>,
-    password_pepper_previous_keys: Option<String>,
-    password_pepper_required: Option<String>,
+    // ── the password hasher: read into the crypto service only ──────────────
+    // The pepper is not here: it is the password-hasher Worker's, read from
+    // that Worker's own secrets (`impresspress_password::protocol`).
+    password_hasher_shards: Option<String>,
 
     // ── the release-asset contract ──────────────────────────────────────────
     release_asset_id: Option<String>,
@@ -216,18 +213,7 @@ impl CfEnvironment {
             deploy_token: secret(env, impresspress_core::config_vars::DEPLOY_TOKEN_KEY),
             d1_queries_per_invocation: var(env, D1_QUERIES_PER_INVOCATION_KEY),
 
-            password_pepper_key: secret(
-                env,
-                impresspress_core::password_pepper::PASSWORD_PEPPER_KEY_VAR,
-            ),
-            password_pepper_previous_keys: secret(
-                env,
-                impresspress_core::password_pepper::PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
-            ),
-            password_pepper_required: var(
-                env,
-                impresspress_core::password_pepper::PASSWORD_PEPPER_REQUIRED_VAR,
-            ),
+            password_hasher_shards: var(env, impresspress_password::protocol::SHARDS_VAR),
 
             release_asset_id: var(env, request_services::RELEASE_ASSET_ID_VAR),
             release_asset_prefix: var(env, request_services::RELEASE_ASSET_PREFIX_VAR),
@@ -344,18 +330,11 @@ impl CfEnvironment {
         self.jwt_secret = Some(value.to_string());
     }
 
-    /// Bind the three password pepper values to the raw strings the Worker
-    /// secrets and var would carry. Test-only, same rule as above.
+    /// Bind `IMPRESSPRESS_PASSWORD_HASHER_SHARDS` to the raw string a Worker
+    /// var would carry. Test-only, same rule as above.
     #[cfg(test)]
-    pub(crate) fn set_password_pepper_for_test(
-        &mut self,
-        key: Option<&str>,
-        previous_keys: Option<&str>,
-        required: Option<&str>,
-    ) {
-        self.password_pepper_key = key.map(str::to_string);
-        self.password_pepper_previous_keys = previous_keys.map(str::to_string);
-        self.password_pepper_required = required.map(str::to_string);
+    pub(crate) fn set_password_hasher_shards_for_test(&mut self, value: &str) {
+        self.password_hasher_shards = Some(value.to_string());
     }
 
     /// Bind `WAFER_RUN__DATABASE__STRICT_SCHEMA` to the raw string a Worker
@@ -439,29 +418,12 @@ impl CfEnvironment {
         self.d1_queries_per_invocation = Some(value.to_string());
     }
 
-    /// The password pepper keys this Worker's crypto service hashes and
-    /// verifies with, from the `IMPRESSPRESS_PASSWORD_PEPPER_KEY` and
-    /// `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` secrets and the
-    /// `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` var.
-    ///
-    /// These go to the crypto service and nowhere else. They are on neither
-    /// Env-owned list, so [`config_map`](Self::config_map) never carries them
-    /// onto a config surface, and `blocks::config` answers an infrastructure
-    /// key from the boot map only — a block asking for one through the config
-    /// client finds nothing, whatever the D1 `variables` table holds.
-    ///
-    /// A value that does not parse is an error naming the var and never
-    /// echoing a key (see [`impresspress_core::password_pepper::password_peppers`]),
-    /// so the runtime is not built: a Worker that hashed without the pepper
-    /// the operator configured would write hashes that never need it.
-    pub(crate) fn password_peppers(
-        &self,
-    ) -> Result<impresspress_core::password_pepper::PasswordPeppers, String> {
-        impresspress_core::password_pepper::password_peppers(
-            self.password_pepper_key.as_deref(),
-            self.password_pepper_previous_keys.as_deref(),
-            self.password_pepper_required.as_deref(),
-        )
+    /// How many password-hasher Durable Object instances this Worker spreads
+    /// hashing across, from the `IMPRESSPRESS_PASSWORD_HASHER_SHARDS` var the
+    /// generated config writes (unset is the default). A value that does not
+    /// parse is an error naming the var, and the runtime is not built.
+    pub(crate) fn password_hasher_shards(&self) -> Result<u32, String> {
+        impresspress_password::protocol::parse_shards(self.password_hasher_shards.as_deref())
     }
 
     /// The deploy-token secret. `None` disables the `/_deploy/*` control plane
@@ -674,13 +636,6 @@ pub(crate) fn config_identity_hash(config: &HashMap<String, String>) -> String {
 pub(crate) mod test_support {
     use super::CfEnvironment;
 
-    /// A pepper key as `openssl rand -base64 32` prints one: 32 bytes of
-    /// `0x2a`.
-    pub(crate) const TEST_PEPPER_KEY: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
-    /// A second, distinct key for the previous-keys list: 32 bytes of `0x2b`.
-    pub(crate) const TEST_PEPPER_PREVIOUS_KEY: &str =
-        "KysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKys=";
-
     /// A [`CfEnvironment`] with every field unbound, for tests that set one
     /// field at a time. Not `Default`: production code must obtain one from
     /// [`CfEnvironment::capture`] and nowhere else.
@@ -697,9 +652,7 @@ pub(crate) mod test_support {
             allow_workers_dev: None,
             deploy_token: None,
             d1_queries_per_invocation: None,
-            password_pepper_key: None,
-            password_pepper_previous_keys: None,
-            password_pepper_required: None,
+            password_hasher_shards: None,
             release_asset_id: None,
             release_asset_prefix: None,
             release_asset_manifest: None,
@@ -751,14 +704,8 @@ pub(crate) mod test_support {
             ("d1_queries_per_invocation", |e| {
                 e.d1_queries_per_invocation = Some("v".to_string())
             }),
-            ("password_pepper_key", |e| {
-                e.password_pepper_key = Some("v".to_string())
-            }),
-            ("password_pepper_previous_keys", |e| {
-                e.password_pepper_previous_keys = Some("v".to_string())
-            }),
-            ("password_pepper_required", |e| {
-                e.password_pepper_required = Some("v".to_string())
+            ("password_hasher_shards", |e| {
+                e.password_hasher_shards = Some("v".to_string())
             }),
             ("release_asset_id", |e| {
                 e.release_asset_id = Some("v".to_string())
@@ -796,7 +743,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use impresspress_core::password_pepper::{
+    use impresspress_password::pepper::{
         PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
     };
     use wasm_bindgen::JsCast;
@@ -898,9 +845,7 @@ mod tests {
             (ALLOW_WORKERS_DEV_KEY, "1"),
             (impresspress_core::config_vars::DEPLOY_TOKEN_KEY, "token"),
             (D1_QUERIES_PER_INVOCATION_KEY, "50"),
-            (PASSWORD_PEPPER_KEY_VAR, TEST_PEPPER_KEY),
-            (PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, TEST_PEPPER_PREVIOUS_KEY),
-            (PASSWORD_PEPPER_REQUIRED_VAR, "true"),
+            (impresspress_password::protocol::SHARDS_VAR, "5"),
             (
                 request_services::RELEASE_ASSET_ID_VAR,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -969,11 +914,7 @@ mod tests {
         assert!(captured.allows_workers_dev());
         assert_eq!(captured.deploy_token(), Some("token"));
         assert_eq!(captured.d1_queries_per_invocation(), Ok(50));
-        let peppers = captured
-            .password_peppers()
-            .expect("a well-formed pepper parses");
-        assert!(peppers.current().is_some() && peppers.is_required());
-        assert_eq!(peppers.previous().len(), 1);
+        assert_eq!(captured.password_hasher_shards(), Ok(5));
         assert_eq!(
             captured.release_asset_vars().prefix,
             Some(".impresspress/releases/v1/immutable/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -1229,23 +1170,28 @@ mod tests {
         );
     }
 
-    /// The pepper keys reach the crypto service and no config surface: a
-    /// block asking for one through the config client must find nothing, and
+    /// The main Worker does not hash, so it does not read the password pepper
+    /// at all: the keys belong to the password-hasher Worker. Bound here by
+    /// mistake, none is read, and none reaches a config surface — a block
+    /// asking for one through the config client finds nothing, and
     /// `blocks::config` serves an infrastructure key from the boot map only,
-    /// which is filled from `config_map`. Put on either Env-owned list, a key
-    /// would be served to every block that asks.
+    /// which is filled from `config_map`.
     #[wasm_bindgen_test]
-    fn the_password_pepper_never_reaches_a_config_surface() {
+    fn the_password_pepper_is_not_read_by_the_main_worker() {
         let pepper_vars = [
             PASSWORD_PEPPER_KEY_VAR,
             PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
             PASSWORD_PEPPER_REQUIRED_VAR,
         ];
-        let env = RecordingEnv::new(&every_key());
+        let mut bindings = every_key();
+        let key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+        bindings.extend(pepper_vars.iter().map(|var| (*var, key)));
+        let env = RecordingEnv::new(&bindings);
         let captured = CfEnvironment::capture(&env.env);
 
         let map = captured.config_map();
         for var in pepper_vars {
+            assert_eq!(env.reads_of(var), 0, "the main Worker read {var}");
             assert!(
                 impresspress_core::config_vars::is_infrastructure_key(var),
                 "{var} must stay infrastructure-prefixed, so the variables table \
@@ -1256,44 +1202,27 @@ mod tests {
             assert!(!map.contains_key(var), "{var} reached the config map");
         }
         for value in map.values() {
-            assert!(
-                !value.contains(TEST_PEPPER_KEY) && !value.contains(TEST_PEPPER_PREVIOUS_KEY),
-                "a pepper key reached the config map under another name",
-            );
+            assert!(!value.contains(key), "a pepper key reached the config map");
         }
     }
 
-    /// `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` is `true` or `false` and
-    /// nothing else, and a malformed key is refused without being echoed.
+    /// `IMPRESSPRESS_PASSWORD_HASHER_SHARDS` is a whole number in range, and
+    /// unset is the default.
     #[wasm_bindgen_test]
-    fn a_malformed_pepper_is_an_error_naming_the_var() {
-        for required in ["1", "yes", "TRUE", ""] {
-            let env = RecordingEnv::new(&[
-                (PASSWORD_PEPPER_KEY_VAR, TEST_PEPPER_KEY),
-                (PASSWORD_PEPPER_REQUIRED_VAR, required),
-            ]);
+    fn the_shard_count_is_validated() {
+        use impresspress_password::protocol::{DEFAULT_SHARDS, SHARDS_VAR};
+        for bad in ["0", "65", "many", ""] {
+            let env = RecordingEnv::new(&[(SHARDS_VAR, bad)]);
             let err = CfEnvironment::capture(&env.env)
-                .password_peppers()
-                .expect_err(required);
-            assert!(
-                err.contains(PASSWORD_PEPPER_REQUIRED_VAR),
-                "{required:?}: {err}"
-            );
+                .password_hasher_shards()
+                .expect_err(bad);
+            assert!(err.contains(SHARDS_VAR), "{bad:?}: {err}");
         }
-
-        let short = "c2hvcnQtcGVwcGVy"; // "short-pepper"
-        let env = RecordingEnv::new(&[(PASSWORD_PEPPER_KEY_VAR, short)]);
-        let err = CfEnvironment::capture(&env.env)
-            .password_peppers()
-            .expect_err("a short key");
-        assert!(err.contains(PASSWORD_PEPPER_KEY_VAR), "{err}");
-        assert!(!err.contains(short), "the error echoed the key: {err}");
-
         let unbound = RecordingEnv::new(&[]);
-        let none = CfEnvironment::capture(&unbound.env)
-            .password_peppers()
-            .expect("unbound is no pepper");
-        assert!(none.current().is_none() && !none.is_required());
+        assert_eq!(
+            CfEnvironment::capture(&unbound.env).password_hasher_shards(),
+            Ok(DEFAULT_SHARDS)
+        );
     }
 
     #[wasm_bindgen_test]

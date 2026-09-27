@@ -75,6 +75,10 @@ block-fastembed = ["impresspress-core/block-fastembed"]
 # feature blocks). Absorbed today's impresspress (lib) crate.
 impresspress-core = { path = "../impresspress-core", default-features = false }
 impresspress-native = { path = "../impresspress-native" }
+# The password pepper settings (native reads them from its environment), and
+# the Cloudflare password-hasher protocol names the deploy tooling writes into
+# both Workers' configs.
+impresspress-password = { path = "../impresspress-password" }
 # Browser-shell asset writer + bundle/template runner used by the
 # sealed × web and embed × web flows. Native std::fs tooling — lives in its
 # own crate so the native binary doesn't compile the wasm-bindgen `impresspress-browser`.

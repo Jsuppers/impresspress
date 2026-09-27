@@ -28,7 +28,9 @@ and back it up: losing it locks out every account it peppered). The key is
 read from the process environment only and is never stored or served as
 config. `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` (rotation) and
 `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED` (`true`/`false`) complete it; read
-RELEASE.md's "password pepper" upgrade note before setting either.
+RELEASE.md's "password pepper" upgrade note before setting either. On
+Cloudflare, passwords are hashed by a separate password-hasher Worker, and the
+pepper is that Worker's secret: see RELEASE.md's "password-hasher Worker" note.
 
 If you commit from this checkout, point git at the repository's hooks once so formatting and clippy run the same way CI does (this needs the nightly toolchain's rustfmt: `rustup toolchain install nightly --component rustfmt`):
 
@@ -41,6 +43,7 @@ git config core.hooksPath .githooks
 ```sh
 cargo test --workspace --exclude impresspress-web --exclude impresspress-cloudflare
 cargo test -p impresspress-cloudflare --target wasm32-unknown-unknown --lib   # needs wasm-bindgen-test-runner
+cargo test -p impresspress-password --features durable-object --target wasm32-unknown-unknown --lib
 NODE_OPTIONS=--import\ ./js/test/node-hooks.mjs wasm-pack test --node crates/impresspress-browser
 ```
 

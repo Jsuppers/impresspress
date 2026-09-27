@@ -237,24 +237,22 @@ pub async fn release_asset_object_key(
     Ok(release.physical_object_key(logical_key))
 }
 
-/// Construct a wasm-compatible [`CryptoService`]: the wafer-block-crypto
-/// HS256 JWT engine (exp-required, per-block HKDF-derived keys — same
-/// policy as native) with Workers-constrained argon2id password hashing.
+/// Construct the Worker's [`CryptoService`]: the wafer-block-crypto HS256
+/// JWT engine (exp-required, per-block HKDF-derived keys — same policy as
+/// native), with password hashing and verification sent to the
+/// password-hasher Worker through `hasher` (see
+/// [`crypto_service`](crate::crypto_service)).
 ///
 /// `jwt_secret` is the HMAC master secret used to sign and verify JWTs.
 /// It must be at least `wafer_block_crypto::primitives::MIN_JWT_SECRET_LEN`
 /// bytes; a missing/short secret surfaces as an error on each sign/verify
 /// rather than failing worker boot.
-///
-/// `peppers` are the password pepper keys the Worker read from its secrets
-/// (`CfEnvironment::password_peppers`); new hashes are peppered with the
-/// current one, stored hashes verified with the one they name.
-pub fn make_jwt_crypto_service(
+pub fn make_crypto_service(
     jwt_secret: String,
-    peppers: wafer_block_crypto::primitives::PasswordPeppers,
+    hasher: crypto_service::PasswordHasher,
 ) -> Arc<dyn CryptoService> {
     Arc::new(crypto_service::ImpresspressCryptoService::new(
-        jwt_secret, peppers,
+        jwt_secret, hasher,
     ))
 }
 

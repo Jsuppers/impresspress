@@ -103,7 +103,38 @@ pub struct CloudflareConfig {
     /// final-version verification and before promotion. Resolution guarantees
     /// a non-empty collection of path-only values.
     pub deploy_smoke_paths: Vec<String>,
+    /// The password-hasher Worker this Worker binds; see
+    /// [`generate_password_hasher`].
+    pub password_hasher: PasswordHasherConfig,
 }
+
+/// The resolved `[cloudflare.password_hasher]` section.
+#[derive(Debug, Clone)]
+pub struct PasswordHasherConfig {
+    /// The hasher Worker's script name, which the main Worker's Durable Object
+    /// binding names as its `script_name`.
+    pub worker_name: String,
+    /// Written into the main Worker's `[vars]` as
+    /// `impresspress_password::protocol::SHARDS_VAR`.
+    pub shards: u32,
+    /// Written into the hasher Worker's `[vars]` as
+    /// `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED`.
+    pub pepper_required: bool,
+}
+
+/// The file [`generate_password_hasher`] writes into the output directory.
+pub const PASSWORD_HASHER_CONFIG_FILE: &str = "wrangler-password-hasher.toml";
+
+/// The hasher Worker's entry module, relative to the directory its config is
+/// written to: the output of `worker-build` in the crate
+/// [`super::password_hasher`] stages.
+const PASSWORD_HASHER_MAIN: &str = "../impresspress-password-hasher/build/worker/shim.mjs";
+
+/// The tag of the one Durable Object migration: the hasher's class, created
+/// SQLite-backed (the only kind the Workers Free plan offers). Migrations are
+/// applied in order and never edited; a later change to the class is a new
+/// entry with a new tag.
+pub const PASSWORD_HASHER_MIGRATION_TAG: &str = "v1";
 
 #[derive(Debug, Clone)]
 pub struct D1Config {
@@ -342,7 +373,13 @@ fn generate_named(
         deep_merge(&mut value, overrides);
     }
 
-    refuse_pepper_keys_in_vars(&value)?;
+    refuse_pepper_keys_in_vars(&value, &cfg.password_hasher.worker_name)?;
+
+    // The crypto service reaches the hasher through this exact binding name,
+    // so a consumer override that replaced `[durable_objects]` (to bind its
+    // own classes, say) must not drop it: restore it, like the version
+    // metadata binding below.
+    install_password_hasher_binding(&mut value, &cfg.password_hasher)?;
 
     // Runtime code relies on this exact internal binding name. Restore it
     // after consumer overrides just like the upload-only build invariant
@@ -467,10 +504,129 @@ fn generate_named(
     let path = out_dir.join(file_name);
     std::fs::write(
         &path,
-        format!("{header}{D1_QUERIES_NOTE}{PASSWORD_PEPPER_NOTE}{body}"),
+        format!(
+            "{header}{D1_QUERIES_NOTE}{}{body}",
+            password_pepper_note(&cfg.password_hasher.worker_name)
+        ),
     )
     .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+/// Generate the password-hasher Worker's config, deployed with plain
+/// `wrangler deploy` BEFORE the main Worker's upload.
+///
+/// The hasher exports the Durable Object class
+/// ([`impresspress_password::protocol::DURABLE_OBJECT_CLASS`]) the main
+/// Worker's crypto service sends every password hash and verification to. It
+/// is a Worker of its own because Cloudflare generates no version preview URLs
+/// for a Worker that implements a Durable Object, and because a version that
+/// changes a Durable Object class's lifecycle — the migration below — cannot be
+/// uploaded with `wrangler versions upload`, only deployed. Neither restriction
+/// touches the main Worker, which only binds the class.
+///
+/// No consumer override file applies here: the hasher has no application
+/// settings. Its secrets (the password pepper) are set on it directly with
+/// `wrangler secret put … --name <hasher>` and survive every deploy; its one
+/// var comes from `[cloudflare.password_hasher].pepper_required`, because a
+/// deploy replaces the vars the dashboard holds.
+pub fn generate_password_hasher(cfg: &CloudflareConfig, out_dir: &Path) -> Result<PathBuf> {
+    use impresspress_password::{pepper::PASSWORD_PEPPER_REQUIRED_VAR, protocol};
+    use toml::Value;
+
+    let hasher = &cfg.password_hasher;
+    let mut root = toml::map::Map::new();
+    root.insert("name".into(), Value::String(hasher.worker_name.clone()));
+    root.insert("account_id".into(), Value::String(cfg.account_id.clone()));
+    root.insert("main".into(), Value::String(PASSWORD_HASHER_MAIN.into()));
+    root.insert(
+        "compatibility_date".into(),
+        Value::String(cfg.compatibility_date.clone()),
+    );
+    // Reached through the main Worker's Durable Object binding only: no
+    // public URL, and no preview URLs (a Durable Object's Worker gets none).
+    root.insert("workers_dev".into(), Value::Boolean(false));
+    root.insert("preview_urls".into(), Value::Boolean(false));
+
+    let mut migration = toml::map::Map::new();
+    migration.insert(
+        "tag".into(),
+        Value::String(PASSWORD_HASHER_MIGRATION_TAG.into()),
+    );
+    migration.insert(
+        "new_sqlite_classes".into(),
+        Value::Array(vec![Value::String(protocol::DURABLE_OBJECT_CLASS.into())]),
+    );
+    root.insert(
+        "migrations".into(),
+        Value::Array(vec![Value::Table(migration)]),
+    );
+
+    let mut vars = toml::map::Map::new();
+    vars.insert(
+        PASSWORD_PEPPER_REQUIRED_VAR.into(),
+        Value::String(hasher.pepper_required.to_string()),
+    );
+    root.insert("vars".into(), Value::Table(vars));
+
+    let mut obs = toml::map::Map::new();
+    obs.insert("enabled".into(), Value::Boolean(true));
+    obs.insert(
+        "head_sampling_rate".into(),
+        Value::Float(cfg.head_sampling_rate),
+    );
+    root.insert("observability".into(), Value::Table(obs));
+
+    let body = toml::to_string_pretty(&Value::Table(root)).context("serialize wrangler.toml")?;
+    let path = out_dir.join(PASSWORD_HASHER_CONFIG_FILE);
+    std::fs::write(
+        &path,
+        format!(
+            "# Generated by `impresspress build --target cloudflare`: the password-hasher \
+             Worker, deployed with `wrangler deploy` before the main Worker. Do not edit.\n\n{}{body}",
+            password_pepper_note(&hasher.worker_name)
+        ),
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Put the main Worker's binding to the hasher's Durable Object class into
+/// `[[durable_objects.bindings]]`, replacing any entry of the same name and
+/// keeping every other.
+fn install_password_hasher_binding(
+    value: &mut toml::Value,
+    hasher: &PasswordHasherConfig,
+) -> Result<()> {
+    use impresspress_password::protocol;
+    let root = value
+        .as_table_mut()
+        .expect("base wrangler config is a table");
+    let durable_objects = root
+        .entry("durable_objects")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("wrangler overrides replaced [durable_objects] with a non-table")?;
+    let bindings = durable_objects
+        .entry("bindings")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("wrangler overrides replaced durable_objects.bindings with a non-array")?;
+    bindings.retain(|binding| {
+        binding.get("name").and_then(toml::Value::as_str) != Some(protocol::BINDING)
+    });
+    let mut binding = toml::map::Map::new();
+    binding.insert("name".into(), toml::Value::String(protocol::BINDING.into()));
+    binding.insert(
+        "class_name".into(),
+        toml::Value::String(protocol::DURABLE_OBJECT_CLASS.into()),
+    );
+    binding.insert(
+        "script_name".into(),
+        toml::Value::String(hasher.worker_name.clone()),
+    );
+    bindings.push(toml::Value::Table(binding));
+    Ok(())
 }
 
 /// What the generated `[vars]` value of [`D1_QUERIES_PER_INVOCATION_KEY`]
@@ -481,26 +637,32 @@ const D1_QUERIES_NOTE: &str =
 limit for the account's plan: 1000 on Workers Paid, 50 on Workers Free. Set it with \
 [cloudflare].d1_queries_per_invocation in impresspress.toml.\n\n";
 
-/// Where the password pepper goes, for someone reading the file: it is not in
-/// it, and must not be.
-const PASSWORD_PEPPER_NOTE: &str =
-    "# Password pepper (optional): generate a key with `openssl rand -base64 32` and set it \
-with `wrangler secret put IMPRESSPRESS_PASSWORD_PEPPER_KEY`, never in [vars]. Back it up \
-outside Cloudflare: losing it locks out every account whose hash it peppered. \
+/// Where the password pepper goes, for someone reading either Worker's file:
+/// it is in neither, and it belongs to the password-hasher Worker.
+fn password_pepper_note(hasher_worker_name: &str) -> String {
+    format!(
+        "# Password pepper (optional): it belongs to the password-hasher Worker, which does \
+the hashing. Generate a key with `openssl rand -base64 32` and set it with `wrangler secret \
+put IMPRESSPRESS_PASSWORD_PEPPER_KEY --name {hasher_worker_name}`, never in [vars]. Back it \
+up outside Cloudflare: losing it locks out every account whose hash it peppered. \
 IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS (a secret too) holds rotated-out keys; \
-IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED = \"true\" may go in [vars].\n\n";
+IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED comes from [cloudflare.password_hasher].pepper_required \
+in impresspress.toml.\n\n"
+    )
+}
 
 /// Refuse a config whose `[vars]`, or any `[env.<name>.vars]`, holds a
-/// password pepper key.
+/// password pepper setting.
 ///
-/// A `[vars]` value is plain text: in this file, in the override file it came
-/// from (which a consumer repo commits) and in the Cloudflare dashboard. The
-/// Worker would still read it, so without this check a pepper put there would
-/// work and quietly stop being a secret. The keys are secrets, set with
-/// `wrangler secret put`. The error names the var, never the value.
-fn refuse_pepper_keys_in_vars(value: &toml::Value) -> Result<()> {
-    use impresspress_core::password_pepper::{
-        PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
+/// The main Worker does not read them: the pepper belongs to the
+/// password-hasher Worker. A key put here would be plain text — in this file,
+/// in the override file it came from (which a consumer repo commits) and in
+/// the Cloudflare dashboard — and would pepper nothing, and a `REQUIRED` here
+/// would require nothing. The error names the var and where it goes, never the
+/// value.
+fn refuse_pepper_keys_in_vars(value: &toml::Value, hasher_worker_name: &str) -> Result<()> {
+    use impresspress_password::pepper::{
+        PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
     };
     // The top-level `[vars]`, and each `[env.<name>.vars]`: wrangler does not
     // inherit `vars` into an environment, so an environment's own table is
@@ -524,10 +686,20 @@ fn refuse_pepper_keys_in_vars(value: &toml::Value) -> Result<()> {
             if vars.contains_key(var) {
                 anyhow::bail!(
                     "{var} is set under {table} in the wrangler overrides, where it is plain \
-                     text (in the file and in the Cloudflare dashboard). Remove it and set it \
-                     with `wrangler secret put {var}`."
+                     text (in the file and in the Cloudflare dashboard), and where the main \
+                     Worker does not read it: the password-hasher Worker does the hashing. \
+                     Remove it and set it with `wrangler secret put {var} --name \
+                     {hasher_worker_name}`."
                 );
             }
+        }
+        if vars.contains_key(PASSWORD_PEPPER_REQUIRED_VAR) {
+            anyhow::bail!(
+                "{PASSWORD_PEPPER_REQUIRED_VAR} is set under {table} in the wrangler overrides, \
+                 where the main Worker does not read it: the password-hasher Worker does the \
+                 hashing. Remove it and set [cloudflare.password_hasher].pepper_required in \
+                 impresspress.toml."
+            );
         }
     }
     Ok(())
@@ -677,6 +849,12 @@ fn base_toml(cfg: &CloudflareConfig, role: ConfigRole) -> toml::Value {
     vars.insert(
         D1_QUERIES_PER_INVOCATION_KEY.into(),
         Value::String(cfg.d1_queries_per_invocation.to_string()),
+    );
+    // How many password-hasher Durable Object instances hashing is spread
+    // across. Always written, the default included, like the D1 limit above.
+    vars.insert(
+        impresspress_password::protocol::SHARDS_VAR.into(),
+        Value::String(cfg.password_hasher.shards.to_string()),
     );
     root.insert("vars".into(), Value::Table(vars));
 

@@ -20,6 +20,122 @@ bundle that changes them. So whenever a release's code half assumes a data
 repair the migration half performs, it has to be called out here — on native
 the two ship together but only one of them runs by default.
 
+### Cloudflare: passwords are hashed by a password-hasher Worker
+
+**What changes.** The main Worker no longer hashes or verifies passwords.
+`impresspress build --target cloudflare` now builds a second, small Worker —
+the **password-hasher Worker**, named `<worker_name>-password-hasher` unless
+`[cloudflare.password_hasher].worker_name` says otherwise — that exports one
+stateless, SQLite-backed Durable Object class, `ImpresspressPasswordHasher`.
+The main Worker binds it (`[[durable_objects.bindings]]`, binding
+`IMPRESSPRESS_PASSWORD_HASHER`, `script_name` = the hasher) and sends every
+password hash and verification there, spread across
+`[cloudflare.password_hasher].shards` instances (default 8, 1-64; written into
+the main Worker's `[vars]` as `IMPRESSPRESS_PASSWORD_HASHER_SHARDS`).
+
+- New hashes are argon2id at OWASP's recommended cost, `m=19456,t=2,p=1` —
+  what native writes — instead of the 4 MiB preset the Worker wrote before.
+  A Free-plan Worker request is documented at 10 ms of CPU and this cost
+  takes about 50-130 ms in wasm32; a Durable Object request is allowed far
+  more. Stored hashes keep verifying (the cost comes from the stored string);
+  nothing re-hashes them on sign-in.
+- Why a separate Worker: Cloudflare generates no version preview URLs for a
+  Worker that implements a Durable Object, and `impresspress deploy` prepares
+  and verifies each version through one; and a Durable Object migration
+  cannot ride `wrangler versions upload`. A Worker that only binds another
+  Worker's class keeps its preview URLs.
+- `impresspress deploy` deploys the hasher FIRST, with plain `wrangler
+  deploy` (which applies its migration, tag `v1`, `new_sqlite_classes`), then
+  takes the main Worker through the usual prepare/verify/promote funnel.
+  Every main Worker version — previews included — calls whichever hasher is
+  live, so the call is versioned: a hasher answers the protocol version of
+  the main Worker release before it as well as its own
+  (`impresspress_password::protocol`). `impresspress serve` runs both Workers
+  in one `wrangler dev` session.
+- **Deploy every release in turn.** The hasher answers the protocol version
+  of the release before its own, not older ones. Deploying a release that is
+  two protocol versions ahead of the live main Worker makes every password
+  operation on the live site answer 503 from the moment the hasher deploys
+  until the new main Worker is promoted.
+- If the hasher cannot answer (missing binding, Durable Object error,
+  unreadable answer), the operation fails: a sign-in answers 503; a sign-up
+  or password change fails with a 500. The main Worker never hashes a
+  password itself instead.
+- Each password operation adds a round trip to the Durable Object, about
+  60-100 ms of wall time, on top of the hash itself. An instance runs one
+  request at a time; shards spread a burst across instances.
+- Durable Object requests count against the Workers Free plan's daily
+  Durable Object allowance: 100,000 requests and 13,000 GB-s of duration a
+  day, reset at 00:00 UTC. Every sign-in, sign-up and password change is one
+  request, and so is a failed sign-in for an unknown email: it burns a
+  verification on purpose, so that it takes as long as a wrong password for
+  a real account, and skipping the call would tell an attacker which emails
+  have accounts. Past either allowance, password operations fail (503 on
+  sign-in) until the reset. **The login rate limit does not protect this
+  allowance**: it is 30 requests a minute per IP (`WAFER_RUN_SHARED__RATE_LIMIT_AUTH`), about
+  43,000 a day from one address, so three addresses can spend the whole
+  day's allowance and lock every user out until 00:00 UTC. On a public
+  Free-plan site, add a Cloudflare WAF rate-limiting rule on
+  `/b/auth/api/login` and `/b/auth/api/signup`, or move to Workers Paid,
+  where Durable Object requests are billed rather than capped.
+- The hasher answers any Worker in the same Cloudflare account that binds
+  its class by script name; see `impresspress_password::protocol` ("Who can
+  call it").
+- The main Worker's wasm is about 11 KB smaller (cargo's output, before
+  wasm-opt); the hasher Worker is about 470 KB (185 KB gzipped) after
+  `worker-build`.
+- `impresspress_cloudflare::make_jwt_crypto_service(jwt_secret, peppers)` is
+  now `make_crypto_service(jwt_secret, PasswordHasher::from_env(&env, shards))`
+  (`impresspress_cloudflare::crypto_service::PasswordHasher`). The password
+  pepper module moved from `impresspress_core::password_pepper` to
+  `impresspress_password::pepper`.
+
+**The pepper moves to the hasher.** The main Worker no longer reads
+`IMPRESSPRESS_PASSWORD_PEPPER_KEY`, `…_PREVIOUS_KEYS` or `…_REQUIRED`, and the
+build refuses them in its `[vars]`. They are the hasher's:
+
+- keys: `openssl rand -base64 32 | npx wrangler secret put
+  IMPRESSPRESS_PASSWORD_PEPPER_KEY --name <hasher worker name>` (and
+  `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` the same way). Secrets survive
+  every deploy of the hasher.
+- `REQUIRED`: `[cloudflare.password_hasher].pepper_required = true` in
+  `impresspress.toml` (a hasher deploy replaces its vars, so it is written
+  from there).
+
+**Who has to act.**
+
+- *A new site:* create the hasher before the main Worker's one-time first
+  `wrangler deploy`, since the binding names its script:
+  `npx wrangler deploy --config
+  target/impresspress-cloudflare/wrangler-password-hasher.toml`, then the main
+  Worker as before.
+- *An existing site without a pepper:* nothing; `impresspress deploy` creates
+  the hasher on its first run.
+- *An existing site with a pepper:* the hasher must hold the keys before the
+  main Worker starts calling it, or every sign-in to a peppered account
+  answers 503 (a pepper fault) and new hashes are written unpeppered.
+  `impresspress deploy` checks this: after deploying the hasher it lists
+  both Workers' secret NAMES (never values), and if the main Worker holds
+  `IMPRESSPRESS_PASSWORD_PEPPER_KEY` or `…_PREVIOUS_KEYS` that the hasher
+  does not, it stops before uploading any main Worker version and prints the
+  `wrangler secret put … --name <hasher>` and `wrangler secret delete …
+  --name <worker_name>` commands to run. To do it ahead of time, after
+  `impresspress build --target cloudflare`:
+  1. `npx wrangler deploy --config
+     target/impresspress-cloudflare/wrangler-password-hasher.toml` (creates
+     the hasher; the live main Worker still hashes on its own meanwhile);
+  2. put the same key(s) on it with `wrangler secret put … --name <hasher>`,
+     and set `pepper_required` if you had `REQUIRED` on;
+  3. `impresspress deploy --target cloudflare`;
+  4. then delete the now-unread secrets from the main Worker (`npx wrangler
+     secret delete IMPRESSPRESS_PASSWORD_PEPPER_KEY --name <worker_name>`, and
+     the previous keys) and drop any `REQUIRED` entry from your
+     `wrangler.overrides.toml`, which the build now refuses.
+- *Rolling the main Worker back* to a release before this one puts hashing
+  back in the main Worker, at the old cost and with the main Worker's own
+  secrets: keep the pepper secrets on it until you no longer need that
+  rollback.
+
 ### WRAP grants: append-only has a column of its own (admin migration 005)
 
 **What changes.** A custom WRAP grant stores append-only access in a new
@@ -105,16 +221,17 @@ and signs every user out, once.
 2. Set it as `IMPRESSPRESS_PASSWORD_PEPPER_KEY`:
    - native: in the process environment (a systemd `EnvironmentFile` with
      mode 0600, the orchestrator's secret store, or `.env`), then restart;
-   - Cloudflare: `openssl rand -base64 32 | npx wrangler secret put
-     IMPRESSPRESS_PASSWORD_PEPPER_KEY --config
-     target/impresspress-cloudflare/wrangler.toml`. **Never under `[vars]`**:
-     a var is plain text in the committed override file and in the
-     dashboard, and the build refuses a pepper key there.
+   - Cloudflare: a secret of the password-hasher Worker, which does the
+     hashing (see *Cloudflare: passwords are hashed by a password-hasher
+     Worker* above): `openssl rand -base64 32 | npx wrangler secret put
+     IMPRESSPRESS_PASSWORD_PEPPER_KEY --name <hasher worker name>`. **Never
+     under `[vars]`**: a var is plain text in the committed override file and
+     in the dashboard, and the build refuses a pepper key there.
 3. From then on, new and changed passwords are peppered. Existing hashes stay
    as they are (nothing re-hashes them on sign-in) and keep verifying.
 4. Only once every stored hash is peppered, set
-   `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED=true` (native env, or a Cloudflare
-   `[vars]` entry through `wrangler_overrides_path`); an unpeppered hash is
+   `IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED=true` (native env, or on Cloudflare
+   `[cloudflare.password_hasher].pepper_required = true`); an unpeppered hash is
    then refused, so nobody who can write the credential table can plant a
    hash of a password they know. Check first — any user this lists is locked
    out once it is on (single quotes, so the shell leaves `$argon2id…` alone):
@@ -131,11 +248,11 @@ and signs every user out, once.
    wrong-password 401 (and is logged as a configuration fault with its user
    id), so someone who knows such an account's password can tell it apart —
    one more reason to run the scan first. The value must be exactly `true`
-   or `false`; anything else fails the boot (native) or every request
-   (Cloudflare) with an error naming the variable.
+   or `false`; anything else fails the boot (native) or every password
+   operation (Cloudflare) with an error naming the variable.
 5. To rotate: move the current key into
-   `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` (comma-separated, a secret on
-   Cloudflare) and set a new current key. Old hashes keep verifying with the
+   `IMPRESSPRESS_PASSWORD_PEPPER_PREVIOUS_KEYS` (comma-separated, a secret of
+   the password-hasher Worker on Cloudflare) and set a new current key. Old hashes keep verifying with the
    key they name, and a hash naming a key the deployment no longer holds
    fails sign-in with a 503. The boot log names each key by its id
    (`password pepper <id> (previous: [<id>, …])`); before dropping an old

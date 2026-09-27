@@ -443,3 +443,70 @@ fn resolve_d1_queries_per_invocation_defaults_to_paid_and_refuses_out_of_range()
         1000
     );
 }
+
+/// `[cloudflare.password_hasher]` is optional: the hasher is named after the
+/// main Worker, spread across the default shard count, and requires no pepper.
+#[test]
+fn the_password_hasher_defaults_follow_the_main_worker() {
+    let cfg = parse_str(FULL_TOML).resolve(fake_env(&[])).unwrap();
+    assert_eq!(cfg.password_hasher.worker_name, "x-password-hasher");
+    assert_eq!(
+        cfg.password_hasher.shards,
+        impresspress_password::protocol::DEFAULT_SHARDS
+    );
+    assert!(!cfg.password_hasher.pepper_required);
+
+    // Named after the main Worker as resolved, env overlay included.
+    let cfg = parse_str(FULL_TOML)
+        .resolve(fake_env(&[(
+            "IMPRESSPRESS_CLOUDFLARE_WORKER_NAME",
+            "site-env",
+        )]))
+        .unwrap();
+    assert_eq!(cfg.password_hasher.worker_name, "site-env-password-hasher");
+}
+
+#[test]
+fn the_password_hasher_section_is_read_and_validated() {
+    let with = |section: &str| format!("{FULL_TOML}\n[cloudflare.password_hasher]\n{section}\n");
+    let cfg = parse_str(&with(
+        "worker_name = \"hasher\"\nshards = 3\npepper_required = true",
+    ))
+    .resolve(fake_env(&[]))
+    .unwrap();
+    assert_eq!(cfg.password_hasher.worker_name, "hasher");
+    assert_eq!(cfg.password_hasher.shards, 3);
+    assert!(cfg.password_hasher.pepper_required);
+
+    for (section, needle) in [
+        ("shards = 0", "IMPRESSPRESS_PASSWORD_HASHER_SHARDS"),
+        ("shards = 65", "IMPRESSPRESS_PASSWORD_HASHER_SHARDS"),
+        ("worker_name = \"x\"", "must differ"),
+        ("worker_name = \"Upper\"", "lowercase"),
+        ("worker_name = \"-dash\"", "lowercase"),
+    ] {
+        let err = format!(
+            "{:#}",
+            parse_str(&with(section))
+                .resolve(fake_env(&[]))
+                .expect_err(section)
+        );
+        assert!(err.contains(needle), "{section}: {err}");
+    }
+
+    // A default name that runs past Cloudflare's 63 characters is refused,
+    // pointing at the setting that fixes it.
+    let long = "a".repeat(50);
+    let err = format!(
+        "{:#}",
+        parse_str(&FULL_TOML.replace("worker_name = \"x\"", &format!("worker_name = \"{long}\"")))
+            .resolve(fake_env(&[]))
+            .expect_err("too long")
+    );
+    assert!(err.contains("password_hasher.worker_name"), "{err}");
+
+    // A misspelt key is an error, not a silently ignored setting.
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("impresspress.toml"), with("shard = 3")).unwrap();
+    assert!(parse(tmp.path()).is_err());
+}

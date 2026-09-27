@@ -5,13 +5,15 @@ use impresspress::cli::helpers::cloudflare::{
     build::WORKER_BUILD_VERSION,
     prepared::{stage_prepared_module, ApplicationArtifactIdentity, PREPARED_TEXT_GLOB},
     wrangler::{
-        generate, generate_candidate_upload, generate_final_upload, generate_triggers,
-        generate_upload, generate_upload_with_release, CloudflareConfig, D1Config, R2Config,
-        ASSET_BASE_URL_VAR, D1_QUERIES_PER_INVOCATION_DEFAULT, D1_QUERIES_PER_INVOCATION_KEY,
-        DEFAULT_CRONS, PREPARED_APPLICATION_BUILD_SHA256_VAR, PREPARED_APPLICATION_ID_VAR,
-        PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR, PREPARED_WAFER_LOCK_IDENTITY_VAR,
-        RELEASE_ASSET_ID_VAR, RELEASE_ASSET_KEYS_SHA256_VAR, RELEASE_ASSET_MANIFEST_SHA256_VAR,
-        RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR, SUGGESTED_SWEEP_CRON,
+        generate, generate_candidate_upload, generate_final_upload, generate_password_hasher,
+        generate_triggers, generate_upload, generate_upload_with_release, CloudflareConfig,
+        D1Config, PasswordHasherConfig, R2Config, ASSET_BASE_URL_VAR,
+        D1_QUERIES_PER_INVOCATION_DEFAULT, D1_QUERIES_PER_INVOCATION_KEY, DEFAULT_CRONS,
+        PASSWORD_HASHER_CONFIG_FILE, PREPARED_APPLICATION_BUILD_SHA256_VAR,
+        PREPARED_APPLICATION_ID_VAR, PREPARED_PLAN_HASH_VAR, PREPARED_PLAN_MODULE_SHA256_VAR,
+        PREPARED_WAFER_LOCK_IDENTITY_VAR, RELEASE_ASSET_ID_VAR, RELEASE_ASSET_KEYS_SHA256_VAR,
+        RELEASE_ASSET_MANIFEST_SHA256_VAR, RELEASE_ASSET_MANIFEST_VAR, RELEASE_ASSET_PREFIX_VAR,
+        SUGGESTED_SWEEP_CRON,
     },
 };
 use impresspress_core::{PreparedRuntimePlan, PreparedRuntimeStructure, WaferLockIdentity};
@@ -39,6 +41,11 @@ fn sample_cfg() -> CloudflareConfig {
         d1_queries_per_invocation: D1_QUERIES_PER_INVOCATION_DEFAULT,
         crons: DEFAULT_CRONS.iter().map(|s| s.to_string()).collect(),
         deploy_smoke_paths: vec!["/health".into()],
+        password_hasher: PasswordHasherConfig {
+            worker_name: "wafer-site-password-hasher".into(),
+            shards: 8,
+            pepper_required: false,
+        },
     }
 }
 
@@ -404,13 +411,14 @@ zone_name = "wafer.run"
     );
 }
 
-/// A password pepper key is a secret: put under `[vars]` through an override
-/// file it would be plain text in a committed file and in the dashboard, and
-/// the Worker would still read it. The build refuses it, naming the var and
-/// never the value; `REQUIRED`, which is not a secret, may be a var.
+/// The pepper belongs to the password-hasher Worker, and the main Worker
+/// reads none of its settings. Put under the main Worker's `[vars]` through an
+/// override file, a key would be plain text in a committed file and in the
+/// dashboard and pepper nothing, and `REQUIRED` would require nothing. The
+/// build refuses each, naming the var and where it goes, never the value.
 #[test]
-fn a_pepper_key_in_vars_is_refused() {
-    use impresspress_core::password_pepper::{
+fn a_pepper_setting_in_the_main_workers_vars_is_refused() {
+    use impresspress_password::pepper::{
         PASSWORD_PEPPER_KEY_VAR, PASSWORD_PEPPER_PREVIOUS_KEYS_VAR, PASSWORD_PEPPER_REQUIRED_VAR,
     };
     let tmp = tempdir().unwrap();
@@ -430,7 +438,9 @@ fn a_pepper_key_in_vars_is_refused() {
         ] {
             let err = format!("{:#}", result.expect_err(var));
             assert!(
-                err.contains(var) && err.contains("wrangler secret put"),
+                err.contains(var)
+                    && err.contains("wrangler secret put")
+                    && err.contains("--name wafer-site-password-hasher"),
                 "{err}"
             );
             assert!(!err.contains(key), "the error echoed the key: {err}");
@@ -458,14 +468,150 @@ fn a_pepper_key_in_vars_is_refused() {
         format!("[vars]\n{PASSWORD_PEPPER_REQUIRED_VAR} = \"true\"\n"),
     )
     .unwrap();
-    let body = fs::read_to_string(generate(&cfg, repo_root, &out).unwrap()).unwrap();
-    assert!(
-        body.contains(&format!("{PASSWORD_PEPPER_REQUIRED_VAR} = \"true\"")),
-        "{body}"
+    let err = format!(
+        "{:#}",
+        generate(&cfg, repo_root, &out).expect_err("REQUIRED")
     );
     assert!(
-        body.contains("wrangler secret put IMPRESSPRESS_PASSWORD_PEPPER_KEY"),
+        err.contains(PASSWORD_PEPPER_REQUIRED_VAR) && err.contains("pepper_required"),
+        "{err}"
+    );
+
+    fs::remove_file(&overrides_path).unwrap();
+    cfg.wrangler_overrides_path = None;
+    let body = fs::read_to_string(generate(&cfg, repo_root, &out).unwrap()).unwrap();
+    assert!(
+        body.contains(
+            "wrangler secret put IMPRESSPRESS_PASSWORD_PEPPER_KEY --name wafer-site-password-hasher"
+        ),
         "the generated file says where the key goes:\n{body}"
+    );
+}
+
+/// Every config the main Worker is generated with — dev/first deploy, the
+/// upload-only candidate and final versions, and the worker-level one — binds
+/// the password-hasher's Durable Object class by script name, and writes the
+/// shard count. None of them declares a migration: the main Worker implements
+/// no class, which is what keeps its version preview URLs.
+#[test]
+fn every_main_worker_config_binds_the_password_hasher_by_script_name() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+    let mut cfg = sample_cfg();
+    cfg.password_hasher.shards = 5;
+
+    for path in [
+        generate(&cfg, repo_root, &out).unwrap(),
+        generate_upload(&cfg, repo_root, &out).unwrap(),
+        generate_triggers(&cfg, repo_root, &out).unwrap(),
+    ] {
+        let body = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["durable_objects"]["bindings"],
+            toml::from_str::<toml::Value>(
+                r#"bindings = [{ name = "IMPRESSPRESS_PASSWORD_HASHER", class_name = "ImpresspressPasswordHasher", script_name = "wafer-site-password-hasher" }]"#
+            )
+            .unwrap()["bindings"],
+            "{}:\n{body}",
+            path.display()
+        );
+        assert_eq!(
+            parsed["vars"]["IMPRESSPRESS_PASSWORD_HASHER_SHARDS"].as_str(),
+            Some("5"),
+            "{body}"
+        );
+        assert!(parsed.get("migrations").is_none(), "{body}");
+    }
+}
+
+/// A consumer override that binds Durable Objects of its own keeps them, and
+/// cannot drop or redirect the hasher binding the crypto service needs.
+#[test]
+fn overrides_cannot_drop_the_password_hasher_binding() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path();
+    let out = repo_root.join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(
+        repo_root.join("wrangler.overrides.toml"),
+        r#"[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+script_name = "rooms"
+
+[[durable_objects.bindings]]
+name = "IMPRESSPRESS_PASSWORD_HASHER"
+class_name = "Elsewhere"
+script_name = "elsewhere"
+"#,
+    )
+    .unwrap();
+    let mut cfg = sample_cfg();
+    cfg.wrangler_overrides_path = Some("wrangler.overrides.toml".into());
+    let body = fs::read_to_string(generate_upload(&cfg, repo_root, &out).unwrap()).unwrap();
+    let parsed: toml::Value = toml::from_str(&body).unwrap();
+    let bindings = parsed["durable_objects"]["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 2, "{body}");
+    assert!(bindings.iter().any(|b| b["name"].as_str() == Some("ROOMS")));
+    let hasher = bindings
+        .iter()
+        .find(|b| b["name"].as_str() == Some("IMPRESSPRESS_PASSWORD_HASHER"))
+        .unwrap();
+    assert_eq!(
+        hasher["class_name"].as_str(),
+        Some("ImpresspressPasswordHasher")
+    );
+    assert_eq!(
+        hasher["script_name"].as_str(),
+        Some("wafer-site-password-hasher")
+    );
+}
+
+/// The password-hasher Worker's config, golden: the SQLite-backed class
+/// migration (the only kind the Free plan offers), no public or preview URL,
+/// the pepper requirement as its one var, and no D1, R2 or build hook — it is
+/// deployed with plain `wrangler deploy` from the artifact the CLI built.
+#[test]
+fn the_password_hasher_config_is_golden() {
+    let tmp = tempdir().unwrap();
+    let out = tmp.path().join("target/impresspress-cloudflare");
+    fs::create_dir_all(&out).unwrap();
+    let mut cfg = sample_cfg();
+    cfg.password_hasher.pepper_required = true;
+    cfg.head_sampling_rate = 0.25;
+    let path = generate_password_hasher(&cfg, &out).unwrap();
+    assert_eq!(path, out.join(PASSWORD_HASHER_CONFIG_FILE));
+    let body = fs::read_to_string(&path).unwrap();
+    let parsed: toml::Value = toml::from_str(&body).unwrap();
+    let expected: toml::Value = toml::from_str(
+        r#"
+name = "wafer-site-password-hasher"
+account_id = "test-acct"
+main = "../impresspress-password-hasher/build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+workers_dev = false
+preview_urls = false
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ImpresspressPasswordHasher"]
+
+[vars]
+IMPRESSPRESS_PASSWORD_PEPPER_REQUIRED = "true"
+
+[observability]
+enabled = true
+head_sampling_rate = 0.25
+"#,
+    )
+    .unwrap();
+    assert_eq!(parsed, expected, "{body}");
+    assert!(
+        body.contains("--name wafer-site-password-hasher"),
+        "the file says where the pepper secrets go:\n{body}"
     );
 }
 

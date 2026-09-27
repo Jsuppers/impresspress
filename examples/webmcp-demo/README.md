@@ -52,11 +52,13 @@ export CLOUDFLARE_ACCOUNT_ID=<account id from `wrangler whoami`>
 export IMPRESSPRESS_CLOUDFLARE_D1_DATABASE_ID=<id from `wrangler d1 create`>
 export IMPRESSPRESS_DEPLOY_TOKEN=<any random string>
 
-impresspress build --target cloudflare       # worker-build + generated wrangler.toml
+impresspress build --target cloudflare       # both Workers + their generated configs
 
 # First deploy only. `impresspress deploy` uses `wrangler versions upload`,
 # which cannot create a Worker (Cloudflare error 10007) — create it once with
-# a plain deploy of the artifact the build just produced:
+# a plain deploy of the artifact the build just produced. The password-hasher
+# Worker first: the main Worker's Durable Object binding names its script.
+wrangler deploy --config target/impresspress-cloudflare/wrangler-password-hasher.toml
 wrangler deploy --config target/impresspress-cloudflare/wrangler.toml
 
 impresspress deploy --target cloudflare secret   # IMPRESSPRESS_DEPLOY_TOKEN + JWT secret, once

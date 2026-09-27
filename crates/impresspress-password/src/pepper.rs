@@ -6,19 +6,25 @@
 //! of the credential table cannot be cracked offline unless the key is stolen
 //! too. That only holds while the key lives somewhere the table does not, so
 //! these keys are `IMPRESSPRESS_*` infrastructure
-//! ([`crate::config_vars::is_infrastructure_key`]) and follow a stricter path
-//! than any other key of that class:
+//! (`impresspress_core::config_vars::is_infrastructure_key`) and follow a
+//! stricter path than any other key of that class:
 //!
-//! - A target reads them straight from where the operator put them — the
-//!   process environment on native, Worker secrets and vars on Cloudflare —
-//!   and hands the parsed [`PasswordPeppers`] to its crypto service.
+//! - The process that hashes reads them straight from where the operator put
+//!   them and builds its [`PasswordPeppers`] from them: the native server from
+//!   its process environment, and on Cloudflare the password-hasher Worker
+//!   ([`crate::protocol`]) from its own secrets and vars. The main Cloudflare
+//!   Worker never holds them: it does not hash.
 //! - They are never put on either config surface (the boot map and the
-//!   `wafer-run/config` service). `blocks::config` answers an infrastructure
-//!   key from the boot map only, so a key missing from it is unreadable
-//!   through `CONFIG_GET` whatever the `variables` table holds, and
+//!   `wafer-run/config` service). `impresspress_core::blocks::config` answers
+//!   an infrastructure key from the boot map only, so a key missing from it is
+//!   unreadable through `CONFIG_GET` whatever the `variables` table holds, and
 //!   `CONFIG_SET` and the admin API refuse to store one.
 //! - The browser target holds no pepper: nothing in a visitor's browser can
 //!   be kept from the visitor.
+//!
+//! This module lives in its own crate rather than in `impresspress-core`
+//! because the password-hasher Worker parses the same three keys by the same
+//! rules and must not link the rest of the runtime.
 //!
 //! # Operating it
 //!

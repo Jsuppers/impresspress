@@ -31,7 +31,7 @@ use crate::{
     environment::{CfEnvironment, BUILDER_WORKER_VAR_KEYS, PROTECTED_ENV_KEYS},
     kv_cached_db, request_services, runner,
     services::{
-        console_logger, make_config_service, make_fetch_network_service, make_jwt_crypto_service,
+        console_logger, make_config_service, make_crypto_service, make_fetch_network_service,
         make_kv_cached_database_service_with_backend, make_r2_storage_service,
     },
 };
@@ -313,7 +313,7 @@ where
         .service_get(impresspress_core::blocks::auth::JWT_SECRET_KEY)
         .unwrap_or_default()
         .to_string();
-    let crypto = request_crypto_service(jwt_secret, environment)?;
+    let crypto = request_crypto_service(env, jwt_secret, environment)?;
     let network = make_fetch_network_service();
     let logger = console_logger(environment.cf_log_level());
 
@@ -606,7 +606,7 @@ pub(crate) fn warm_request_services(
         request_config_surfaces(environment, structural_snapshot, request_config);
 
     let config = make_config_service(config_map);
-    let crypto = request_crypto_service(environment.jwt_secret().to_string(), environment)?;
+    let crypto = request_crypto_service(env, environment.jwt_secret().to_string(), environment)?;
     let network = make_fetch_network_service();
     let logger = console_logger(environment.cf_log_level());
     let config_source: Arc<dyn wafer_run::ConfigSource> = Arc::new(
@@ -626,18 +626,20 @@ pub(crate) fn warm_request_services(
 }
 
 /// The crypto service both fills build: `jwt_secret` for tokens, and the
-/// password pepper from this request's capture of the Worker's secrets.
+/// password-hasher binding, spread across the shard count this request's
+/// capture of the Worker's vars names.
 ///
-/// The pepper reaches the crypto service here and nowhere else — it is on no
-/// config surface — and a pepper that does not parse fails the build rather
-/// than hash without it.
+/// A shard count that does not parse fails the build. A missing binding does
+/// not: each password operation fails instead (see
+/// [`crate::crypto_service::PasswordHasher`]), so the rest of the site serves.
 fn request_crypto_service(
+    env: &worker::Env,
     jwt_secret: String,
     environment: &CfEnvironment,
 ) -> Result<Arc<dyn wafer_core::interfaces::crypto::service::CryptoService>, String> {
-    Ok(make_jwt_crypto_service(
+    Ok(make_crypto_service(
         jwt_secret,
-        environment.password_peppers()?,
+        crate::crypto_service::PasswordHasher::from_env(env, environment.password_hasher_shards()?),
     ))
 }
 
@@ -724,116 +726,50 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
-    use crate::environment::test_support::{
-        empty_environment, TEST_PEPPER_KEY, TEST_PEPPER_PREVIOUS_KEY,
+    use crate::{
+        crypto_service::test_support::FakeHasher, environment::test_support::empty_environment,
     };
 
-    /// With a pepper bound, the crypto service both fills build hashes with
-    /// it: a new hash is peppered, and it verifies.
+    /// The crypto service both fills build hashes through the password-hasher
+    /// binding, across the shard count the Worker var names.
     #[wasm_bindgen_test]
-    async fn the_request_crypto_service_peppers_new_hashes() {
+    async fn the_request_crypto_service_hashes_through_the_hasher_binding() {
+        let fake = FakeHasher::running(Default::default());
         let mut environment = empty_environment();
-        environment.set_password_pepper_for_test(
-            Some(TEST_PEPPER_KEY),
-            Some(TEST_PEPPER_PREVIOUS_KEY),
-            Some("true"),
-        );
-        let crypto = request_crypto_service(String::new(), &environment).expect("valid pepper");
+        environment.set_password_hasher_shards_for_test("2");
+        let crypto =
+            request_crypto_service(&fake.env, String::new(), &environment).expect("valid shards");
 
         let hash = crypto.hash("correct horse").await.expect("hash");
         assert!(
-            hash.starts_with("$argon2id-hmac-sha256$v=19$m=4096,t=2,p=1,pepper="),
-            "the Worker must write a peppered hash when a pepper is bound: {hash}"
+            hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "the Worker's hashes come from the hasher: {hash}"
         );
         crypto
             .compare_hash("correct horse", &hash)
             .await
-            .expect("a peppered hash verifies");
-
-        // Required: a stored unpeppered hash is refused, never accepted.
-        let legacy = wafer_block_crypto::primitives::hash_password(
-            "correct horse",
-            wafer_block_crypto::primitives::Argon2Cost::Constrained,
-        )
-        .expect("legacy hash");
-        match crypto.compare_hash("correct horse", &legacy).await {
-            Err(wafer_core::interfaces::crypto::service::CryptoError::Pepper(_)) => {}
-            other => panic!("a required pepper must refuse an unpeppered hash: {other:?}"),
-        }
+            .expect("verifies");
+        let shards = fake.shards.borrow();
+        assert_eq!(shards.len(), 2);
+        assert!(
+            shards.iter().all(|s| s == "shard-0" || s == "shard-1"),
+            "{shards:?}"
+        );
     }
 
-    /// Not required: a hash stored before the pepper was configured keeps
-    /// verifying, so turning a pepper on locks nobody out.
+    /// A shard count that does not parse fails the build.
     #[wasm_bindgen_test]
-    async fn an_unpeppered_hash_verifies_when_the_pepper_is_not_required() {
-        let legacy = wafer_block_crypto::primitives::hash_password(
-            "correct horse",
-            wafer_block_crypto::primitives::Argon2Cost::Constrained,
-        )
-        .expect("legacy hash");
+    fn a_malformed_shard_count_fails_the_crypto_service() {
+        let fake = FakeHasher::running(Default::default());
         let mut environment = empty_environment();
-        environment.set_password_pepper_for_test(Some(TEST_PEPPER_KEY), None, None);
-        let crypto = request_crypto_service(String::new(), &environment).expect("valid pepper");
-        crypto
-            .compare_hash("correct horse", &legacy)
-            .await
-            .expect("an unpeppered hash verifies while the pepper is optional");
-    }
-
-    /// A malformed pepper fails the build instead of hashing without it.
-    #[wasm_bindgen_test]
-    fn a_malformed_pepper_fails_the_crypto_service() {
-        let mut environment = empty_environment();
-        environment.set_password_pepper_for_test(Some(TEST_PEPPER_KEY), None, Some("yes"));
-        let Err(err) = request_crypto_service(String::new(), &environment) else {
-            panic!("a malformed REQUIRED must fail the build");
+        environment.set_password_hasher_shards_for_test("0");
+        let Err(err) = request_crypto_service(&fake.env, String::new(), &environment) else {
+            panic!("a shard count of 0 must fail the build");
         };
         assert!(
-            err.contains(impresspress_core::password_pepper::PASSWORD_PEPPER_REQUIRED_VAR),
+            err.contains(impresspress_password::protocol::SHARDS_VAR),
             "{err}"
         );
-    }
-
-    /// Neither fill puts a pepper key on a config surface, cold or warm.
-    #[wasm_bindgen_test]
-    fn the_password_pepper_is_on_neither_config_surface() {
-        let mut environment = empty_environment();
-        environment.set_jwt_secret_for_test("jwt");
-        environment.set_password_pepper_for_test(
-            Some(TEST_PEPPER_KEY),
-            Some(TEST_PEPPER_PREVIOUS_KEY),
-            Some("true"),
-        );
-        let vars = [
-            impresspress_core::password_pepper::PASSWORD_PEPPER_KEY_VAR,
-            impresspress_core::password_pepper::PASSWORD_PEPPER_PREVIOUS_KEYS_VAR,
-            impresspress_core::password_pepper::PASSWORD_PEPPER_REQUIRED_VAR,
-        ];
-
-        let (cold, cold_overlay) = structural_runtime_config(structural_config_inputs(
-            &environment,
-            "{}".to_string(),
-            false,
-        ));
-        let (warm, warm_overlay) =
-            request_config_surfaces(&environment, &HashMap::new(), &HashMap::new());
-        for var in vars {
-            assert!(!cold.snapshot_contains(var), "{var} on the cold snapshot");
-            assert_eq!(cold.service_get(var), None, "{var} on the cold service map");
-            assert!(!cold_overlay.contains_key(var), "{var} on the cold overlay");
-            assert!(!warm.contains_key(var), "{var} on the warm config map");
-            assert!(!warm_overlay.contains_key(var), "{var} on the warm overlay");
-        }
-        for value in cold_overlay
-            .values()
-            .chain(warm.values())
-            .chain(warm_overlay.values())
-        {
-            assert!(
-                !value.contains(TEST_PEPPER_KEY) && !value.contains(TEST_PEPPER_PREVIOUS_KEY),
-                "a pepper key reached a config surface under another name",
-            );
-        }
     }
 
     /// The warm-request fill takes every Env-owned key from THIS request's

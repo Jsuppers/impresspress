@@ -15,7 +15,7 @@ use wafer_core::interfaces::crypto::service::{CryptoError, CryptoService};
 /// forgeable tokens at runtime.
 ///
 /// `peppers` come from outside the database the hashes live in (the
-/// process environment; see `impresspress_core::password_pepper`).
+/// process environment; see `impresspress_password::pepper`).
 /// `PasswordPeppers::default()` is no pepper: new hashes are written
 /// unpeppered and a stored peppered hash fails as a missing key.
 pub fn make_jwt_crypto_service(

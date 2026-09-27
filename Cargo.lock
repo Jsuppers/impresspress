@@ -2568,6 +2568,7 @@ dependencies = [
  "impresspress-bundle",
  "impresspress-core",
  "impresspress-native",
+ "impresspress-password",
  "reqwest",
  "serde",
  "serde_json",
@@ -2635,6 +2636,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "impresspress-core",
+ "impresspress-password",
  "js-sys",
  "maud",
  "serde",
@@ -2730,6 +2732,22 @@ dependencies = [
  "wafer-block-sqlite",
  "wafer-core",
  "wafer-run",
+]
+
+[[package]]
+name = "impresspress-password"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wafer-block-crypto",
+ "wafer-core",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+ "worker",
 ]
 
 [[package]]
