@@ -1,16 +1,16 @@
 //! Row-level access over `wafer_run__auth__rate_limits`.
 //!
-//! Sliding-window counters keyed by user/IP, written on the Cloudflare
+//! Fixed-window counters keyed by user/IP, written on the Cloudflare
 //! (`wasm32`) path only — the native `UserRateLimiter` keeps its counters in
 //! an in-memory `Mutex<HashMap>` and never touches the database.
 //!
-//! [`windowed_increment`] is the single fixed-window upsert: the identical
-//! `db::upsert` + read-back pair used to be copied between
-//! `blocks/rate_limit.rs` and `blocks/tickets/abuse.rs`. It takes `now` from
-//! the caller rather than reading a clock, because both call sites are
-//! `cfg(target_arch = "wasm32")` (`std::time` panics there and `js_sys` does
-//! not exist on the host) — a parameter is what lets the shared upsert be
-//! compiled, and tested, on the host.
+//! [`windowed_increment`] is the one fixed-window upsert, shared by the
+//! request limiter in `blocks/rate_limit.rs` and the ticket abuse limiter in
+//! `blocks/tickets/abuse.rs`. It takes `now` from the caller rather than
+//! reading a clock, because both call sites are `cfg(target_arch = "wasm32")`
+//! (`std::time` panics there and `js_sys` does not exist on the host) — a
+//! parameter is what lets the shared upsert be compiled, and tested, on the
+//! host.
 use serde_json::{json, Value};
 use wafer_block::{
     db::{Filter, FilterOp},

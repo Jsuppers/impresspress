@@ -508,17 +508,74 @@ pub async fn set_reset_token(
     Ok(())
 }
 
-/// Clear a user's password-reset token + expiry after a successful reset.
+/// Spend a password-reset token: clear `reset_token` and its expiry on
+/// `user_id`'s row, but only while that row still carries `token_hash`.
 /// Stamps `updated_at`.
-pub async fn clear_reset_token(ctx: &dyn Context, user_id: &str) -> Result<(), WaferError> {
-    let mut data = std::collections::HashMap::new();
+///
+/// The condition and the write are one statement, so of two requests
+/// redeeming the same link only one sees `true`; the other finds the token
+/// already spent and gets `false`. Callers spend the token before writing
+/// anything it authorises, which is what makes a link single-use.
+pub async fn take_reset_token(
+    ctx: &dyn Context,
+    user_id: &str,
+    token_hash: &str,
+) -> Result<bool, WaferError> {
+    let filters = vec![
+        Filter {
+            field: "id".into(),
+            operator: FilterOp::Equal,
+            value: json!(user_id),
+        },
+        Filter {
+            field: "reset_token".into(),
+            operator: FilterOp::Equal,
+            value: json!(token_hash),
+        },
+    ];
+    let mut data = HashMap::new();
     data.insert("reset_token".to_string(), json!(""));
     data.insert("reset_token_expires".to_string(), json!(""));
     data.insert("updated_at".to_string(), json!(now_iso()));
-    db::update(ctx, TABLE, user_id, data)
+    let n = db::update_by_filters_count(ctx, TABLE, filters, data)
         .await
-        .map_err(|e| db_failed(&format!("clear reset_token for {user_id}"), e))?;
-    Ok(())
+        .map_err(|e| db_failed(&format!("take reset_token for {user_id}"), e))?;
+    Ok(n > 0)
+}
+
+/// Put back a reset token [`take_reset_token`] spent, with its original
+/// expiry, so a reset that failed part-way can be retried with the same link.
+/// Stamps `updated_at`.
+///
+/// Only a row whose token is still clear is restored: a link requested since
+/// the take (`set_reset_token` from forgot-password) is the newer one and is
+/// kept. Returns whether the token was restored.
+pub async fn restore_reset_token(
+    ctx: &dyn Context,
+    user_id: &str,
+    token_hash: &str,
+    expires_at: &str,
+) -> Result<bool, WaferError> {
+    let filters = vec![
+        Filter {
+            field: "id".into(),
+            operator: FilterOp::Equal,
+            value: json!(user_id),
+        },
+        Filter {
+            field: "reset_token".into(),
+            operator: FilterOp::Equal,
+            value: json!(""),
+        },
+    ];
+    let mut data = HashMap::new();
+    data.insert("reset_token".to_string(), json!(token_hash));
+    data.insert("reset_token_expires".to_string(), json!(expires_at));
+    data.insert("updated_at".to_string(), json!(now_iso()));
+    let n = db::update_by_filters_count(ctx, TABLE, filters, data)
+        .await
+        .map_err(|e| db_failed(&format!("restore reset_token for {user_id}"), e))?;
+    Ok(n > 0)
 }
 
 /// Update a user's editable profile fields (`display_name`/`name` and
@@ -1583,7 +1640,7 @@ mod typed_client_tests {
     }
 
     #[tokio::test]
-    async fn reset_token_round_trip_and_clear() {
+    async fn reset_token_take_and_restore() {
         let ctx = TestContext::with_auth().await.running_as("wafer-run/auth");
         let id = seed_one(&ctx).await;
 
@@ -1597,7 +1654,39 @@ mod typed_client_tests {
         assert_eq!(found.id, id);
         assert_eq!(found.reset_token_expires, "2099-01-01T00:00:00Z");
 
-        clear_reset_token(&ctx, &id).await.unwrap();
+        assert!(
+            !take_reset_token(&ctx, &id, "other-hash").await.unwrap(),
+            "a token the row does not carry is not taken"
+        );
+        assert!(take_reset_token(&ctx, &id, "rhash").await.unwrap());
+        assert!(find_by_reset_token(&ctx, "rhash").await.unwrap().is_none());
+        assert!(
+            !take_reset_token(&ctx, &id, "rhash").await.unwrap(),
+            "a spent token is not taken twice"
+        );
+
+        assert!(
+            restore_reset_token(&ctx, &id, "rhash", "2099-01-01T00:00:00Z")
+                .await
+                .unwrap()
+        );
+        let restored = find_by_reset_token(&ctx, "rhash")
+            .await
+            .unwrap()
+            .expect("restored");
+        assert_eq!(restored.reset_token_expires, "2099-01-01T00:00:00Z");
+
+        // A newer link wins over a restore of the spent one.
+        take_reset_token(&ctx, &id, "rhash").await.unwrap();
+        set_reset_token(&ctx, &id, "newer", "2099-01-02T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(
+            !restore_reset_token(&ctx, &id, "rhash", "2099-01-01T00:00:00Z")
+                .await
+                .unwrap()
+        );
+        assert!(find_by_reset_token(&ctx, "newer").await.unwrap().is_some());
         assert!(find_by_reset_token(&ctx, "rhash").await.unwrap().is_none());
     }
 

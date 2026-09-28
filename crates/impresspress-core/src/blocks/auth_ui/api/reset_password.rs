@@ -1,4 +1,4 @@
-//! POST /b/auth/api/reset-password — relocated from auth/login.rs in Task 5.
+//! POST /b/auth/api/reset-password — redeem a password-reset link.
 
 use wafer_run::{context::Context, InputStream, OutputStream};
 
@@ -39,7 +39,8 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
 
     // Find user by reset token. The DB column stores `sha256_hex(raw)`;
     // hash the supplied token the same way before comparing.
-    let user = match users::find_by_reset_token(ctx, &sha256_hex(body.token.as_bytes())).await {
+    let token_hash = sha256_hex(body.token.as_bytes());
+    let user = match users::find_by_reset_token(ctx, &token_hash).await {
         Ok(Some(user)) => user,
         // No row carries this digest: the token was already spent or never
         // minted. That is the real invalid token.
@@ -78,27 +79,39 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         }
     }
 
-    // Hash new password
+    // Hash new password. A hasher fault returns here, before the token is
+    // spent, so the caller can retry with the same link.
     let new_hash = match hash_new_password(ctx, &body.new_password).await {
         Ok(hash) => hash,
         Err(response) => return response,
     };
 
+    // Spend the token before writing anything it authorises. The take is
+    // conditional on the row still carrying this token, so of two requests
+    // redeeming one link only the first changes the password; the second is
+    // answered as the spent link it now holds.
+    match users::take_reset_token(ctx, &user.id, &token_hash).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(ErrorCode::InvalidToken, "Invalid or expired reset token")
+        }
+        Err(e) => return crud::db_error_internal(e, "Could not redeem the reset token"),
+    }
+
     // Update credential row (typed path, no password_hash on users table).
     if let Err(e) = local_credentials::update_password(ctx, &user.id, &new_hash).await {
+        restore_token(ctx, &user.id, &token_hash, &user.reset_token_expires).await;
         return crud::db_error_internal(e, "Failed to update password");
     }
 
     // The credential has changed, so every session the old password opened
     // must end — this is the account-recovery path, where a session that
-    // survives is the attacker's. It runs before anything below can return,
-    // so no later failure leaves those sessions live; its own failure is
-    // answered once the reset token is spent.
-    let ended = end_sessions_after_password_change(ctx, &user.id).await;
-
-    // Clear reset token on the users row.
-    if let Err(e) = users::clear_reset_token(ctx, &user.id).await {
-        return crud::db_error_internal(e, "Failed to clear reset token");
+    // survives is the attacker's. A reset whose sessions did not end must not
+    // be answered as success, and it gives the link back: the retry writes
+    // the same password again and ends the sessions this attempt could not.
+    if let Err(e) = end_sessions_after_password_change(ctx, &user.id).await {
+        restore_token(ctx, &user.id, &token_hash, &user.reset_token_expires).await;
+        return crud::db_error_internal(e, "Password reset but session invalidation failed");
     }
 
     // A redeemed reset link is mailbox proof of exactly the same strength as
@@ -126,18 +139,36 @@ pub async fn handle(ctx: &dyn Context, input: InputStream) -> OutputStream {
         );
     }
 
-    // A reset whose sessions did not end must not be answered as success.
-    if let Err(e) = ended {
-        return crud::db_error_internal(e, "Password reset but session invalidation failed");
-    }
-
     ok_json(&MessageResponse {
         message: "Password reset successfully".to_string(),
     })
 }
 
+/// Give back a reset token this request spent, for a reset that failed after
+/// the take. A restore that cannot run leaves the link spent, so the user
+/// requests a new one; that is logged, and the caller's error stands.
+async fn restore_token(ctx: &dyn Context, user_id: &str, token_hash: &str, expires_at: &str) {
+    match users::restore_reset_token(ctx, user_id, token_hash, expires_at).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            user_id = %user_id,
+            "password reset failed and a newer reset link has replaced the spent one"
+        ),
+        Err(e) => tracing::error!(
+            user_id = %user_id,
+            error = %e,
+            "password reset failed and its reset link could not be restored"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     use super::*;
     use crate::{
@@ -281,38 +312,64 @@ mod tests {
         );
     }
 
-    /// Spending the reset token comes after the password write, and a
-    /// failure there is answered as one — but the sessions the old password
-    /// opened have ended by then.
+    /// Whether the handler's answer is the spent-or-unknown-link refusal.
+    async fn is_invalid_token(out: OutputStream) -> bool {
+        matches!(
+            out.collect_buffered().await,
+            Err(wafer_run::TerminalNotResponse::Error(e))
+                if e.detail_code() == Some("invalid_token")
+        )
+    }
+
+    /// Whether `password` signs `email` in, through the real login handler.
+    async fn signs_in(ctx: &TestContext, email: &str, password: &str) -> bool {
+        let creds = serde_json::json!({"email": email, "password": password});
+        let out = login::handle(ctx, InputStream::from_bytes(creds.to_string().into_bytes())).await;
+        !output_is_error(out, "Unauthenticated").await
+    }
+
+    /// The token is spent before anything it authorises is written, so a
+    /// spend that fails changes nothing: the old password and its sessions
+    /// stand, and the same link still works once the database answers.
     #[tokio::test]
-    async fn a_reset_token_that_cannot_be_spent_still_ends_every_session() {
+    async fn a_reset_token_that_cannot_be_spent_changes_nothing() {
         let ctx = ctx_with_crypto().await;
         let user_id = signup_user(&ctx, "ella@example.com", "original-horse-battery1").await;
         let old_session = sign_in(&ctx, "ella@example.com", "original-horse-battery1").await;
         let token = issue_reset_token(&ctx, &user_id).await;
 
-        // `users::clear_reset_token` is the reset's only `database.update`
-        // on the users table before it returns.
-        let failing = FailingDbOpContext::new(ctx.clone(), vec![("database.update", users::TABLE)]);
+        // `users::take_reset_token` is the reset's only
+        // `database.update_where_count` on the users table.
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.update_where_count", users::TABLE)],
+        );
         let out = handle(&failing, body(&token, "new-horse-battery-2026")).await;
         assert!(
             output_is_error(out, "Internal").await,
             "a reset token left unspent is reported"
         );
 
-        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 1);
         assert!(
-            !refreshes(&ctx, &old_session).await,
-            "a refresh token the old password opened must not outlive the reset"
+            signs_in(&ctx, "ella@example.com", "original-horse-battery1").await,
+            "the password is unchanged"
         );
+        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 0);
+        assert!(refreshes(&ctx, &old_session).await, "no session was ended");
+
+        let json = output_json(handle(&ctx, body(&token, "new-horse-battery-2026")).await).await;
+        assert_eq!(json["message"], "Password reset successfully");
     }
 
     /// The bump is the invalidation, so a bump that fails is the failure the
-    /// caller hears about.
+    /// caller hears about — and the link is given back, so retrying it ends
+    /// the sessions this attempt could not. The retry that succeeds spends
+    /// the link for good.
     #[tokio::test]
-    async fn a_failed_bump_is_not_reported_as_success() {
+    async fn a_failed_bump_is_reported_and_keeps_the_link_for_a_retry() {
         let ctx = ctx_with_crypto().await;
         let user_id = signup_user(&ctx, "edna@example.com", "original-horse-battery1").await;
+        let old_session = sign_in(&ctx, "edna@example.com", "original-horse-battery1").await;
         let token = issue_reset_token(&ctx, &user_id).await;
         let failing = FailingDbOpContext::new(
             ctx.clone(),
@@ -326,6 +383,156 @@ mod tests {
             "a reset whose sessions did not end must not report success"
         );
         assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 0);
+
+        let retry = output_json(handle(&ctx, body(&token, "new-horse-battery-2026")).await).await;
+        assert_eq!(
+            retry["message"], "Password reset successfully",
+            "the same link retries the reset: {retry}"
+        );
+        assert_eq!(users::auth_version(&ctx, &user_id).await.unwrap(), 1);
+        assert!(
+            !refreshes(&ctx, &old_session).await,
+            "the retry ends the sessions the first attempt left"
+        );
+
+        assert!(
+            is_invalid_token(handle(&ctx, body(&token, "third-horse-battery-2026")).await).await,
+            "a link that has reset the password is spent"
+        );
+        assert!(signs_in(&ctx, "edna@example.com", "new-horse-battery-2026").await);
+    }
+
+    /// A password write that fails gives the link back too: the stored
+    /// password is untouched and the same link resets it once the write
+    /// goes through.
+    #[tokio::test]
+    async fn a_failed_password_write_keeps_the_link_for_a_retry() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "eve@example.com", "original-horse-battery1").await;
+        let token = issue_reset_token(&ctx, &user_id).await;
+        let failing = FailingDbOpContext::new(
+            ctx.clone(),
+            vec![("database.update_where", local_credentials::TABLE)],
+        );
+
+        let out = handle(&failing, body(&token, "new-horse-battery-2026")).await;
+
+        assert!(output_is_error(out, "Internal").await);
+        assert!(signs_in(&ctx, "eve@example.com", "original-horse-battery1").await);
+        let retry = output_json(handle(&ctx, body(&token, "new-horse-battery-2026")).await).await;
+        assert_eq!(
+            retry["message"], "Password reset successfully",
+            "the same link retries the reset: {retry}"
+        );
+        assert!(signs_in(&ctx, "eve@example.com", "new-horse-battery-2026").await);
+    }
+
+    /// Runs one COMPLETE competing redemption of the same link — through the
+    /// real handler, on the undecorated context — at the moment the request
+    /// under test makes its first database write, after it has read the
+    /// token as live. That forces the interleaving in which both requests saw
+    /// an unspent link.
+    #[derive(Clone)]
+    struct RedeemBeforeTheFirstWrite {
+        inner: TestContext,
+        token: String,
+        already_ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Context for RedeemBeforeTheFirstWrite {
+        fn check_resource_access(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            access: wafer_block::ResourceAccess,
+        ) -> Result<(), wafer_run::WaferError> {
+            self.inner
+                .check_resource_access(resource, resource_type, access)
+        }
+
+        fn resource_access_admitted(
+            &self,
+            resource: &str,
+            resource_type: wafer_run::ResourceType,
+            access: wafer_block::ResourceAccess,
+        ) -> bool {
+            self.inner
+                .resource_access_admitted(resource, resource_type, access)
+        }
+
+        async fn call_block(
+            &self,
+            name: &str,
+            msg: wafer_run::Message,
+            input: InputStream,
+        ) -> OutputStream {
+            let is_write = name == "wafer-run/database"
+                && matches!(
+                    msg.action(),
+                    "database.update" | "database.update_where" | "database.update_where_count"
+                );
+            if is_write && !self.already_ran.swap(true, Ordering::SeqCst) {
+                // The competing redemption runs on the INNER context, so its
+                // own writes do not re-enter this branch.
+                let resp = output_json(
+                    handle(&self.inner, body(&self.token, "winner-horse-battery-2026")).await,
+                )
+                .await;
+                assert_eq!(
+                    resp["message"], "Password reset successfully",
+                    "the competing redemption must succeed: {resp}"
+                );
+            }
+            self.inner.call_block(name, msg, input).await
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.inner.is_cancelled()
+        }
+
+        fn registered_blocks(&self) -> &[wafer_run::BlockInfo] {
+            self.inner.registered_blocks()
+        }
+
+        fn config_get(&self, key: &str) -> Option<&str> {
+            self.inner.config_get(key)
+        }
+
+        fn clone_arc(&self) -> Arc<dyn Context> {
+            Arc::new(self.clone())
+        }
+    }
+
+    /// A reset link is single-use even when two requests redeem it at once:
+    /// the one that spends it first sets the password, and the other is
+    /// refused without writing its own over it.
+    #[tokio::test]
+    async fn two_redemptions_of_one_link_reset_the_password_once() {
+        let ctx = ctx_with_crypto().await;
+        let user_id = signup_user(&ctx, "fern@example.com", "original-horse-battery1").await;
+        let token = issue_reset_token(&ctx, &user_id).await;
+        let racer = RedeemBeforeTheFirstWrite {
+            inner: ctx.clone(),
+            token: token.clone(),
+            already_ran: Arc::new(AtomicBool::new(false)),
+        };
+
+        let out = handle(&racer, body(&token, "loser-horse-battery-2026")).await;
+
+        assert!(
+            racer.already_ran.load(Ordering::SeqCst),
+            "precondition: the competing redemption ran"
+        );
+        assert!(
+            is_invalid_token(out).await,
+            "the second redemption of a link is refused"
+        );
+        assert!(
+            signs_in(&ctx, "fern@example.com", "winner-horse-battery-2026").await,
+            "the first redemption's password stands"
+        );
+        assert!(!signs_in(&ctx, "fern@example.com", "loser-horse-battery-2026").await);
     }
 
     /// The token lookup collapsed a failed read into "Invalid or expired
